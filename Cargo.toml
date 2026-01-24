@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+authors = ["datenkollektiv"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/datenkollektiv/rustyfarian-network"
+
+[workspace.dependencies]
+# External dependencies
+anyhow = "1.0"
+log = "0.4"
+rgb = "0.8"
+
+# ESP32 dependencies
+esp-idf-svc = "0.51"
+
+# Cross-repo dependency (for Wi-Fi LED status)
+led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }

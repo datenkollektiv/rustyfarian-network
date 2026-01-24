@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+.embuild
+
+.idea/
+.claude/
+
+# Local cargo config (use .cargo/config.toml.dist as template)
+.cargo/config.toml
