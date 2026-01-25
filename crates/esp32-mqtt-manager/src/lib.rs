@@ -109,13 +109,15 @@ where
         let incoming_topic = incoming_topic.into();
         let client_id = config.client_id.to_string();
 
-        log::info!("Connecting to MQTT broker at {}:{}", config.host, config.port);
+        log::info!(
+            "Connecting to MQTT broker at {}:{}",
+            config.host,
+            config.port
+        );
 
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(config.client_id),
-            keep_alive_interval: Some(Duration::from_secs(
-                config.keep_alive_secs.unwrap_or(30),
-            )),
+            keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
             ..Default::default()
         };
 

@@ -95,10 +95,7 @@ impl WiFiManager {
     {
         log::info!("Connecting to WiFi SSID: {}", config.ssid);
 
-        let mut wifi = BlockingWifi::wrap(
-            EspWifi::new(modem, sys_loop.clone(), nvs)?,
-            sys_loop,
-        )?;
+        let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
         let ssid = config.ssid.try_into().map_err(|_| {
             anyhow::anyhow!(
@@ -106,11 +103,10 @@ impl WiFiManager {
                 config.ssid
             )
         })?;
-        let password = config.password.try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "WiFi password exceeds maximum length of 64 bytes"
-            )
-        })?;
+        let password = config
+            .password
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("WiFi password exceeds maximum length of 64 bytes"))?;
 
         wifi.set_configuration(&Configuration::Client(ClientConfiguration {
             ssid,
