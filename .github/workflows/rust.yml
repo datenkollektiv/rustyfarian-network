@@ -10,31 +10,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   build:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Cache espup
+        uses: actions/cache@v4
         with:
-          components: rust-src, clippy, rustfmt
-
-      - name: Install ldproxy
-        run: cargo install ldproxy
-
-      - name: Install espup
-        run: cargo install espup
-
-      - name: Setup ESP toolchain
-        run: espup install --targets esp32c6
-
-      - name: Source ESP environment
-        run: |
-          . $HOME/export-esp.sh
-          echo "PATH=$PATH" >> $GITHUB_ENV
-          echo "LIBCLANG_PATH=$LIBCLANG_PATH" >> $GITHUB_ENV
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/.espup
+          key: ${{ runner.os }}-espup-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -45,19 +45,40 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-esp-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install espup
+        run: |
+          if ! command -v espup &> /dev/null; then
+            cargo install espup
+          fi
+
+      - name: Install ldproxy
+        run: |
+          if ! command -v ldproxy &> /dev/null; then
+            cargo install ldproxy
+          fi
+
+      - name: Setup ESP toolchain
+        run: |
+          if [ ! -d "$HOME/.rustup/toolchains/esp" ]; then
+            espup install --targets esp32c6
+          fi
 
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
       - name: Check esp32-wifi-manager
-        run: cargo +esp check -p esp32-wifi-manager
+        run: |
+          . $HOME/export-esp.sh
+          cargo +esp check -p esp32-wifi-manager
 
       - name: Check esp32-mqtt-manager
-        run: cargo +esp check -p esp32-mqtt-manager
+        run: |
+          . $HOME/export-esp.sh
+          cargo +esp check -p esp32-mqtt-manager
 
       - name: Clippy
-        run: cargo +esp clippy -- -D warnings
+        run: |
+          . $HOME/export-esp.sh
+          cargo +esp clippy -- -D warnings
