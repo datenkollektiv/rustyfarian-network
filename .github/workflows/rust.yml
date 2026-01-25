@@ -1,0 +1,54 @@
+name: Rust Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/README.md"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check --color always
+
+  build:
+    name: Build & Clippy (ESP32-C6)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ESP-RS toolchain (RISC-V)
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          ldproxy: true
+
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup cargo config
+        run: cp .cargo/config.toml.dist .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
