@@ -28,45 +28,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache espup
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
-            ~/.rustup/toolchains/esp
-            ~/.espup
-          key: ${{ runner.os }}-espup-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install espup
+      - name: Install espup and ldproxy
         run: |
-          if ! command -v espup &> /dev/null; then
-            cargo install espup
-          fi
-
-      - name: Install ldproxy
-        run: |
-          if ! command -v ldproxy &> /dev/null; then
-            cargo install ldproxy
-          fi
+          cargo install espup ldproxy
 
       - name: Setup ESP toolchain
         run: |
-          if [ ! -d "$HOME/.rustup/toolchains/esp" ]; then
-            espup install --targets esp32c6
-          fi
+          espup install --targets esp32c6
 
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
+
+      - name: Verify toolchain
+        run: |
+          . $HOME/export-esp.sh
+          rustup toolchain list
+          rustup show
 
       - name: Check esp32-wifi-manager
         run: |
