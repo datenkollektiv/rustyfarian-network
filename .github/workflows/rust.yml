@@ -1,70 +1,54 @@
-name: Rust
+name: Rust Continuous Integration
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+    paths-ignore:
+      - "**/README.md"
   pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   format:
+    name: Check Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check --color always
 
   build:
+    name: Build & Clippy (ESP32-C6)
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Setup ESP-RS toolchain (RISC-V)
+        uses: esp-rs/xtensa-toolchain@v1.6
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          default: true
+          ldproxy: true
 
-      - name: Install espup and ldproxy
-        run: |
-          cargo install espup ldproxy
-
-      - name: Setup ESP toolchain
-        run: |
-          espup install --targets esp32c6
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
 
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
-      - name: Verify toolchain
-        run: |
-          . $HOME/export-esp.sh
-          rustup toolchain list
-          rustup show
-
-      - name: Check esp32-wifi-manager
-        run: |
-          . $HOME/export-esp.sh
-          cargo +esp check -p esp32-wifi-manager
-
-      - name: Check esp32-mqtt-manager
-        run: |
-          . $HOME/export-esp.sh
-          cargo +esp check -p esp32-mqtt-manager
+      - name: Build
+        run: cargo build --release
 
       - name: Clippy
-        run: |
-          . $HOME/export-esp.sh
-          cargo +esp clippy -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
