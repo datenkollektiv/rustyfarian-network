@@ -2,8 +2,14 @@
 Cargo.lock
 .embuild
 
+.envrc
+
 .idea/
 .claude/
+.claudeignore
+CLAUDE.md
+inbox/
+outbox/
 
 # Local cargo config (use .cargo/config.toml.dist as template)
 .cargo/config.toml
