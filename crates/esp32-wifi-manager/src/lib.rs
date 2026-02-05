@@ -17,6 +17,21 @@
 //!     println!("Connected with IP: {}", ip);
 //! }
 //! ```
+//!
+//! # Using a Simple GPIO LED
+//!
+//! For boards with a simple on/off LED instead of an RGB LED, use `SimpleLed`:
+//!
+//! ```ignore
+//! use esp32_wifi_manager::{WiFiManager, WiFiConfig, SimpleLed};
+//! use esp_idf_hal::gpio::PinDriver;
+//!
+//! let pin = PinDriver::output(peripherals.pins.gpio8)?;
+//! let mut led = SimpleLed::new(pin);
+//!
+//! let config = WiFiConfig::new("MyNetwork", "password123");
+//! let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), config, Some(&mut led))?;
+//! ```
 
 use std::net::Ipv4Addr;
 use std::thread;
@@ -29,8 +44,8 @@ use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWif
 use led_effects::PulseEffect;
 use rgb::RGB8;
 
-// Re-export StatusLed from led_effects for convenience
-pub use led_effects::StatusLed;
+// Re-export StatusLed and SimpleLed from led_effects for convenience
+pub use led_effects::{SimpleLed, StatusLed};
 
 /// WiFi connection configuration.
 #[derive(Debug, Clone)]

@@ -46,6 +46,24 @@ let mqtt = MqttManager::new(mqtt_config, "commands", |data| {
 mqtt.publish("status", b"online")?;
 ```
 
+## LED Status Feedback
+
+The Wi-Fi manager supports optional LED status feedback during connection.
+For boards with a simple on/off LED (not RGB), use `SimpleLed`:
+
+```rust
+use esp32_wifi_manager::{WiFiManager, WiFiConfig, SimpleLed};
+use esp_idf_hal::gpio::PinDriver;
+
+let pin = PinDriver::output(peripherals.pins.gpio8)?;
+let mut led = SimpleLed::new(pin);
+
+let wifi_config = WiFiConfig::new("MyNetwork", "password123");
+let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, Some(&mut led))?;
+```
+
+For RGB LEDs, implement the `StatusLed` trait from `led-effects`.
+
 ## License
 
 MIT or Apache-2.0
