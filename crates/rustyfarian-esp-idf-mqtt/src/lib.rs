@@ -1,4 +1,4 @@
-//! MQTT client manager for ESP32 projects using ESP-IDF.
+//! MQTT client manager for ESP-IDF projects.
 //!
 //! Provides a simplified wrapper around the ESP-IDF MQTT client with:
 //! - Automatic connection handling
@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use esp32_mqtt_manager::{MqttManager, MqttConfig};
+//! use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig};
 //!
 //! let config = MqttConfig {
 //!     host: "192.168.1.100",

@@ -1,15 +1,17 @@
 [package]
-name = "esp32-mqtt-manager"
+name = "rustyfarian-esp-idf-wifi"
 version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MQTT client manager for ESP32 projects using ESP-IDF"
-keywords = ["mqtt", "esp32", "embedded", "iot"]
+description = "Wi-Fi connection manager for ESP-IDF projects"
+keywords = ["wifi", "esp-idf", "rustyfarian", "embedded", "iot"]
 categories = ["embedded", "network-programming"]
 
 [dependencies]
 anyhow.workspace = true
 esp-idf-svc.workspace = true
+led-effects.workspace = true
 log.workspace = true
+rgb.workspace = true

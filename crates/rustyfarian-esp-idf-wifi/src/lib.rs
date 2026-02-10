@@ -1,4 +1,4 @@
-//! WiFi connection manager for ESP32 projects using ESP-IDF.
+//! Wi-Fi connection manager for ESP-IDF projects.
 //!
 //! Provides a simplified wrapper around the ESP-IDF Wi-Fi client with:
 //! - Automatic connection handling with timeout
@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use esp32_wifi_manager::{WiFiManager, WiFiConfig};
+//! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
 //!
 //! let config = WiFiConfig::new("MyNetwork", "password123");
 //! let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), config, None::<&mut MyLed>)?;
@@ -23,7 +23,7 @@
 //! For boards with a simple on/off LED instead of an RGB LED, use `SimpleLed`:
 //!
 //! ```ignore
-//! use esp32_wifi_manager::{WiFiManager, WiFiConfig, SimpleLed};
+//! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig, SimpleLed};
 //! use esp_idf_hal::gpio::PinDriver;
 //!
 //! let pin = PinDriver::output(peripherals.pins.gpio8)?;
