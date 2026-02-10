@@ -14,7 +14,7 @@ anyhow = "1.0"
 log = "0.4"
 rgb = "0.8"
 
-# ESP32 dependencies
+# ESP-IDF dependencies
 esp-idf-svc = "0.51"
 
 # Cross-repo dependency (for Wi-Fi LED status)

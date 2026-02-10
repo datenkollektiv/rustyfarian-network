@@ -7,10 +7,10 @@ Wi-Fi and MQTT networking libraries for ESP32 projects using ESP-IDF.
 
 ## Crates
 
-| Crate                                             | Description                                                   |
-|:--------------------------------------------------|:--------------------------------------------------------------|
-| [`esp32-wifi-manager`](crates/esp32-wifi-manager) | Wi-Fi connection manager with LED status feedback             |
-| [`esp32-mqtt-manager`](crates/esp32-mqtt-manager) | MQTT client with automatic reconnection and graceful shutdown |
+| Crate                                                               | Description                                                   |
+|:--------------------------------------------------------------------|:--------------------------------------------------------------|
+| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback             |
+| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown |
 
 ## Usage
 
@@ -18,15 +18,15 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-esp32-wifi-manager = { git = "https://github.com/datenkollektiv/esp32-network" }
-esp32-mqtt-manager = { git = "https://github.com/datenkollektiv/esp32-network" }
+rustyfarian-esp-idf-wifi = { git = "https://github.com/datenkollektiv/rustyfarian-network" }
+rustyfarian-esp-idf-mqtt = { git = "https://github.com/datenkollektiv/rustyfarian-network" }
 ```
 
 ## Example
 
 ```rust
-use esp32_wifi_manager::{WiFiManager, WiFiConfig};
-use esp32_mqtt_manager::{MqttManager, MqttConfig};
+use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
+use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig};
 
 // Connect to WiFi
 let wifi_config = WiFiConfig::new("MyNetwork", "password123");
@@ -52,7 +52,7 @@ The Wi-Fi manager supports optional LED status feedback during connection.
 For boards with a simple on/off LED (not RGB), use `SimpleLed`:
 
 ```rust
-use esp32_wifi_manager::{WiFiManager, WiFiConfig, SimpleLed};
+use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig, SimpleLed};
 use esp_idf_hal::gpio::PinDriver;
 
 let pin = PinDriver::output(peripherals.pins.gpio8)?;
