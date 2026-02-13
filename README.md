@@ -44,11 +44,28 @@ if let Some(ip) = wifi.get_ip(10000)? {
 
 // Connect to MQTT
 let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device");
-let mqtt = MqttManager::new(mqtt_config, "commands", |data| {
-    println!("Received: {:?}", data);
+let mut mqtt = MqttManager::new(mqtt_config, &["commands"], |topic, data| {
+    println!("Received on {}: {:?}", topic, data);
 })?;
 
-mqtt.publish("status", b"online")?;
+mqtt.publish("status", "online")?;
+```
+
+### LWT and Retained Messages
+
+```rust
+use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig, LwtConfig};
+use esp_idf_svc::mqtt::client::QoS;
+
+let lwt = LwtConfig::new("device/status", b"offline", QoS::AtLeastOnce, true);
+let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device")
+    .with_lwt(lwt);
+
+let mut mqtt = MqttManager::new(mqtt_config, &["commands"], |topic, data| {
+    println!("Received on {}: {:?}", topic, data);
+})?;
+
+mqtt.publish_with("device/status", b"online", QoS::AtLeastOnce, true)?;
 ```
 
 ## LED Status Feedback
