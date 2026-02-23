@@ -85,7 +85,7 @@ impl WiFiManager {
     ///
     /// # Arguments
     ///
-    /// * `modem` - ESP32 modem peripheral
+    /// * `modem` - ESP-IDF modem peripheral
     /// * `sys_loop` - ESP-IDF system event loop
     /// * `nvs` - Optional NVS partition for storing WiFi credentials
     /// * `config` - Wi-Fi connection configuration

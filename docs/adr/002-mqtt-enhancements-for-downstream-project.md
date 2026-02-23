@@ -34,7 +34,7 @@ Accept all six enhancements as a single coordinated change:
 ### LWT and clean shutdown
 
 The MQTT specification defines that the broker publishes the LWT message only on **unexpected** disconnect (network loss, crash, keep-alive timeout).
-A clean `DISCONNECT` packet — sent by [`MqttManager::shutdown`] — suppresses the LWT.
+A clean `DISCONNECT` packet — sent by `MqttManager::shutdown` — suppresses the LWT.
 This means callers that use LWT for online/offline status should also publish an explicit "offline" retained message during clean shutdown if they want consistent state.
 
 ## Consequences

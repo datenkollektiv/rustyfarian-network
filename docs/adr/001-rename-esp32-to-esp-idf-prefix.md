@@ -42,13 +42,13 @@ Rename both crates using the `rustyfarian-esp-idf-*` convention, dropping the `-
 
 ### Arguments for `rustyfarian-esp-idf-*`
 
-| Factor                     | Analysis                                                                                        |
-|:---------------------------|:------------------------------------------------------------------------------------------------|
-| **Clear ownership**        | The `rustyfarian-` prefix signals this is a community/project crate, not an official esp-rs one |
-| **Accuracy**               | The `esp-idf` infix correctly identifies the framework dependency                               |
-| **Chip compatibility**     | No chip-specific prefix — ESP-IDF supports ESP32, C3, C6, S2, S3 and future variants            |
-| **Cross-repo consistency** | Aligns with `rustyfarian-ws2812` which uses `rustyfarian-esp-idf-ws2812`                        |
-| **Ecosystem respect**      | Avoids squatting on the `esp-idf-*` namespace used by official esp-rs crates                    |
+| Factor                     | Analysis                                                                                                     |
+|:---------------------------|:-------------------------------------------------------------------------------------------------------------|
+| **Clear ownership**        | The `rustyfarian-` prefix signals this is a community/project crate, not an official esp-rs one              |
+| **Accuracy**               | The `esp-idf` infix correctly identifies the framework dependency                                            |
+| **Chip compatibility**     | No chip-specific prefix — ESP-IDF supports ESP32, ESP32-C3, ESP32-C6, ESP32-S2, ESP32-S3 and future variants |
+| **Cross-repo consistency** | Aligns with `rustyfarian-ws2812` which uses `rustyfarian-esp-idf-ws2812`                                     |
+| **Ecosystem respect**      | Avoids squatting on the `esp-idf-*` namespace used by official esp-rs crates                                 |
 
 ### Arguments against
 
