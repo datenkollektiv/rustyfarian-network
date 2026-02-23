@@ -277,6 +277,14 @@ where
         self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
     }
 
+    /// Publishes a retained message with QoS 1.
+    ///
+    /// Convenience wrapper around [`publish_with`](Self::publish_with) for
+    /// messages that should be retained by the broker (e.g. state, online status).
+    pub fn publish_retained(&mut self, topic: &str, payload: &str) -> anyhow::Result<()> {
+        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
+    }
+
     /// Publishes a message with explicit QoS and retain control.
     ///
     /// # Arguments
