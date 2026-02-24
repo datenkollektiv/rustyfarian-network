@@ -195,7 +195,6 @@ where
         let connected_clone = Arc::clone(&connected);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let topic_filters: Vec<String> = topics.clone();
 
         // Spawn background thread for MQTT event processing
         std::thread::spawn(move || {
@@ -219,9 +218,7 @@ where
                         ..
                     } => {
                         log::debug!("Received on '{}': {:?}", topic_str, data);
-                        if topic_filters.iter().any(|t| t.as_str() == topic_str) {
-                            on_message(topic_str, data);
-                        }
+                        on_message(topic_str, data);
                     }
                     EventPayload::Error(e) => {
                         log::error!("MQTT error: {:?}", e);
