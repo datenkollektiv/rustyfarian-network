@@ -47,6 +47,11 @@ use rgb::RGB8;
 // Re-export StatusLed and SimpleLed from led_effects for convenience
 pub use led_effects::{SimpleLed, StatusLed};
 
+/// Green channel brightness for the "connected" LED state.
+///
+/// Kept intentionally dim to avoid blinding the user in dark environments.
+const CONNECTED_LED_BRIGHTNESS: u8 = 20;
+
 /// WiFi connection configuration.
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
@@ -221,7 +226,7 @@ impl WiFiManager {
         log::info!("WiFi netif up");
 
         if wifi.is_connected()? {
-            led.set_color(RGB8::new(0, 20, 0))
+            led.set_color(RGB8::new(0, CONNECTED_LED_BRIGHTNESS, 0))
                 .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
         }
 
