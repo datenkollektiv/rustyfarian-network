@@ -55,8 +55,15 @@ update:
 clean:
     cargo clean
 
-# full pre-commit verification: format, check, lint
-verify: fmt check clippy
+# full pre-commit verification: format, check, lint (local use only — modifies files)
+pre-commit: fmt check clippy
+
+# non-modifying full verification: fails on any anomaly; suggests fix recipe on failure
+verify:
+    cargo fmt -- --check || (printf "\nFormatting issues found — run 'just pre-commit' to auto-fix.\n\n"; exit 1)
+    cargo deny check
+    cargo check
+    cargo clippy --all-targets --workspace -- -D warnings
 
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy
