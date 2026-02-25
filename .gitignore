@@ -14,3 +14,10 @@ archive/
 
 # Local cargo config (use .cargo/config.toml.dist as template)
 .cargo/config.toml
+
+# Tool output captures
+.output.txt
+
+# Temporary script output — use tmp/ for ad-hoc script results
+tmp/*
+!tmp/.gitkeep
