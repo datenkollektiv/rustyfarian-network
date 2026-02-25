@@ -14,7 +14,7 @@ Accepted
 The no-LED path gives callers no control over how long `new()` blocks.
 On hardware where the AP is not immediately reachable (a device boots before the router, or the AP is temporarily out of range), the thread is suspended for the full timeout and then exits with `ESP_ERR_TIMEOUT`, dropping all peripheral drivers.
 
-The standalone firmware (for example, a ESP32-S3 CrowPanel knob board) must remain interactive from the first millisecond of boot.
+The standalone firmware (for example, an ESP32-S3 CrowPanel knob board) must remain interactive from the first millisecond of boot.
 The display, LED ring, and rotary encoder must respond to user input even before Wi-Fi is available.
 With the current no-LED path, nothing is rendered and the encoder is unresponsive until `WiFiManager::new` times out.
 

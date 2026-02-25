@@ -55,6 +55,10 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use rustyfarian_network_pure::wifi::{
+    validate_password, validate_ssid, PASSWORD_MAX_LEN, SSID_MAX_LEN,
+};
+
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -202,16 +206,24 @@ impl WiFiManager {
 
         let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
+        validate_ssid(config.ssid)
+            .map_err(|e| anyhow::anyhow!("WiFi SSID '{}': {}", config.ssid, e))?;
+        validate_password(config.password).map_err(anyhow::Error::msg)?;
+
         let ssid = config.ssid.try_into().map_err(|_| {
             anyhow::anyhow!(
-                "WiFi SSID '{}' exceeds maximum length of 32 bytes",
-                config.ssid
+                "internal: SSID conversion failed after validation (len={}, limit={})",
+                config.ssid.len(),
+                SSID_MAX_LEN
             )
         })?;
-        let password = config
-            .password
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("WiFi password exceeds maximum length of 64 bytes"))?;
+        let password = config.password.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "internal: password conversion failed after validation (len={}, limit={})",
+                config.password.len(),
+                PASSWORD_MAX_LEN
+            )
+        })?;
 
         wifi.set_configuration(&Configuration::Client(ClientConfiguration {
             ssid,

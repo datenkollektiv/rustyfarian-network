@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustyfarian_network_pure::mqtt::connection_wait_iterations;
+
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
 };
@@ -244,7 +246,7 @@ where
 
         // Wait for connection
         let timeout_ms = config.connection_timeout_ms.unwrap_or(5000);
-        let iterations = timeout_ms / 100;
+        let iterations = connection_wait_iterations(timeout_ms);
         log::info!("Waiting for MQTT connection...");
 
         for i in 0..iterations {
@@ -333,7 +335,6 @@ where
     #[allow(deprecated)]
     pub fn shutdown(&mut self) {
         log::info!("Initiating MQTT shutdown");
-        #[allow(deprecated)]
         if let Err(e) = self.send_shutdown_message() {
             log::warn!("Failed to send shutdown message: {:?}", e);
         }
