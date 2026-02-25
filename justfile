@@ -55,6 +55,23 @@ update:
 clean:
     cargo clean
 
+# host target, used to override the workspace ESP-IDF target for pure-logic tests
+host_target := `host=$(rustc -vV 2>/dev/null | grep '^host:' | awk '{print $2}'); if [ -z "$host" ]; then printf 'Error: Failed to determine rustc host target.\n' >&2; exit 1; fi; echo "$host"`
+
+# platform-independent crates that can be compiled and tested on the host
+pure_crates := "-p rustyfarian-network-pure"
+
+# run platform-independent MQTT unit tests (host toolchain, no ESP-IDF needed)
+test-mqtt:
+    cargo test --target {{host_target}} {{pure_crates}} mqtt
+
+# run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
+test-wifi:
+    cargo test --target {{host_target}} {{pure_crates}} wifi
+
+# run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
+test: test-mqtt test-wifi
+
 # full pre-commit verification: format, check, lint (local use only — modifies files)
 pre-commit: fmt check clippy
 
