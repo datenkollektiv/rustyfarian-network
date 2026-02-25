@@ -11,8 +11,25 @@
 //! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
 //!
 //! let config = WiFiConfig::new("MyNetwork", "password123");
-//! let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), config, None::<&mut MyLed>)?;
+//! let wifi = WiFiManager::new_without_led(modem, sys_loop, Some(nvs), config)?;
 //!
+//! if let Some(ip) = wifi.get_ip(10000)? {
+//!     println!("Connected with IP: {}", ip);
+//! }
+//! ```
+//!
+//! # Non-Blocking Connection
+//!
+//! For firmware that must remain interactive during Wi-Fi association:
+//!
+//! ```ignore
+//! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
+//!
+//! let config = WiFiConfig::new("MyNetwork", "password123")
+//!     .connect_nonblocking();
+//! let wifi = WiFiManager::new_without_led(modem, sys_loop, Some(nvs), config)?;
+//!
+//! // new_without_led() returns immediately; association proceeds in the background.
 //! if let Some(ip) = wifi.get_ip(10000)? {
 //!     println!("Connected with IP: {}", ip);
 //! }
@@ -37,6 +54,7 @@ use std::net::Ipv4Addr;
 use std::thread;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -52,30 +70,97 @@ pub use led_effects::{SimpleLed, StatusLed};
 /// Kept intentionally dim to avoid blinding the user in dark environments.
 const CONNECTED_LED_BRIGHTNESS: u8 = 20;
 
-/// WiFi connection configuration.
+/// Default connection timeout when none is specified.
+const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// Polling interval for connection and IP-readiness checks.
+const POLL_INTERVAL_MS: u64 = 100;
+
+/// A no-op LED implementation used by [`WiFiManager::new_without_led`].
+struct NoLed;
+
+impl StatusLed for NoLed {
+    type Error = std::convert::Infallible;
+
+    fn set_color(&mut self, _color: RGB8) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Controls how `WiFiManager::new` handles the Wi-Fi association phase.
+#[derive(Debug, Clone)]
+pub enum ConnectMode {
+    /// Block `WiFiManager::new` until connected or the timeout expires.
+    Blocking {
+        /// Maximum time to wait for association, in seconds.
+        timeout_secs: u64,
+    },
+    /// Initiate association and return immediately.
+    ///
+    /// The ESP-IDF event loop drives the connection in the background.
+    /// Call `get_ip()` or `is_connected()` to check readiness.
+    ///
+    /// **Note:** If an LED driver is provided to `WiFiManager::new`, this mode
+    /// will still block until connected (or timeout) to drive the LED status.
+    NonBlocking,
+}
+
+impl Default for ConnectMode {
+    fn default() -> Self {
+        Self::Blocking {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Wi-Fi connection configuration.
+///
+/// Construct via [`WiFiConfig::new`], then chain builder methods as needed:
+///
+/// ```ignore
+/// let config = WiFiConfig::new("MyNetwork", "password123")
+///     .with_timeout(30)      // optional: override the 10 s default
+///     .connect_nonblocking(); // optional: return immediately from new()
+/// ```
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
-    /// WiFi network SSID
-    pub ssid: &'a str,
-    /// WiFi network password
-    pub password: &'a str,
-    /// Connection timeout in seconds (default: 10)
-    pub connection_timeout_secs: Option<u64>,
+    ssid: &'a str,
+    password: &'a str,
+    connect_mode: ConnectMode,
 }
 
 impl<'a> WiFiConfig<'a> {
     /// Creates a new Wi-Fi configuration.
+    ///
+    /// Defaults to blocking connection with a 10-second timeout.
     pub fn new(ssid: &'a str, password: &'a str) -> Self {
         Self {
             ssid,
             password,
-            connection_timeout_secs: None,
+            connect_mode: ConnectMode::default(),
         }
     }
 
-    /// Sets the connection timeout.
+    /// Sets a blocking connection with the given timeout in seconds.
     pub fn with_timeout(mut self, secs: u64) -> Self {
-        self.connection_timeout_secs = Some(secs);
+        self.connect_mode = ConnectMode::Blocking { timeout_secs: secs };
+        self
+    }
+
+    /// Returns immediately after initiating association.
+    ///
+    /// The ESP-IDF event loop drives the connection in the background.
+    /// Call `get_ip()` or `is_connected()` to check readiness.
+    ///
+    /// # LED limitation
+    ///
+    /// **Non-blocking mode is only effective when no LED driver is provided.**
+    /// If an LED is passed to [`WiFiManager::new`], the constructor falls back to
+    /// blocking behaviour (using the default 10-second timeout) so it can drive
+    /// the LED status indicator.
+    /// A warning is logged when this fallback occurs.
+    pub fn connect_nonblocking(mut self) -> Self {
+        self.connect_mode = ConnectMode::NonBlocking;
         self
     }
 }
@@ -137,18 +222,47 @@ impl WiFiManager {
         wifi.start()?;
         log::info!("WiFi started");
 
-        let timeout_secs = config.connection_timeout_secs.unwrap_or(10);
-
         if let Some(led_driver) = led {
+            let timeout_secs = match config.connect_mode {
+                ConnectMode::Blocking { timeout_secs } => timeout_secs,
+                ConnectMode::NonBlocking => {
+                    log::warn!(
+                        "Non-blocking connection requested but LED driver is present; \
+                         falling back to blocking with {}s timeout",
+                        DEFAULT_TIMEOUT_SECS
+                    );
+                    DEFAULT_TIMEOUT_SECS
+                }
+            };
             Self::connect_with_led(&mut wifi, led_driver, timeout_secs)?;
         } else {
-            wifi.connect()?;
-            log::info!("WiFi connected");
-            wifi.wait_netif_up()?;
-            log::info!("WiFi netif up");
+            match config.connect_mode {
+                ConnectMode::Blocking { timeout_secs } => {
+                    Self::wait_for_connection(&mut wifi, timeout_secs)?;
+                }
+                ConnectMode::NonBlocking => {
+                    wifi.wifi_mut()
+                        .connect()
+                        .context("WiFi connect initiation failed")?;
+                    log::info!("WiFi connect initiated (non-blocking)");
+                }
+            }
         }
 
         Ok(Self { wifi })
+    }
+
+    /// Creates a new Wi-Fi manager without an LED driver.
+    ///
+    /// Equivalent to calling [`WiFiManager::new`] with `None` for the LED,
+    /// but without the need for a type annotation on the `None` argument.
+    pub fn new_without_led(
+        modem: Modem,
+        sys_loop: EspSystemEventLoop,
+        nvs: Option<EspDefaultNvsPartition>,
+        config: WiFiConfig<'_>,
+    ) -> anyhow::Result<Self> {
+        Self::new::<NoLed>(modem, sys_loop, nvs, config, None)
     }
 
     fn connect_with_led<L>(
@@ -225,10 +339,52 @@ impl WiFiManager {
         wifi.wait_netif_up()?;
         log::info!("WiFi netif up");
 
-        if wifi.is_connected()? {
-            led.set_color(RGB8::new(0, CONNECTED_LED_BRIGHTNESS, 0))
-                .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
+        led.set_color(RGB8::new(0, CONNECTED_LED_BRIGHTNESS, 0))
+            .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
+
+        Ok(())
+    }
+
+    /// Internal helper to wait for connection with a timeout (no LED).
+    fn wait_for_connection(
+        wifi: &mut BlockingWifi<EspWifi<'static>>,
+        timeout_secs: u64,
+    ) -> anyhow::Result<()> {
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_secs(timeout_secs);
+        let mut connect_started = false;
+
+        log::info!("WiFi connecting (timeout: {}s)...", timeout_secs);
+
+        loop {
+            if start_time.elapsed() >= timeout {
+                return Err(anyhow::anyhow!(
+                    "Wi-Fi connection timeout after {} seconds",
+                    timeout_secs
+                ));
+            }
+
+            if !connect_started {
+                match wifi.wifi_mut().connect() {
+                    Ok(_) => {
+                        connect_started = true;
+                        log::info!("Connection attempt initiated");
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to start connection: {:?}, will retry", e);
+                    }
+                }
+            }
+
+            if connect_started && wifi.is_connected()? {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
+
+        wifi.wait_netif_up()?;
+        log::info!("WiFi connected and netif up");
 
         Ok(())
     }
@@ -242,18 +398,26 @@ impl WiFiManager {
     /// # Returns
     ///
     /// The assigned IPv4 address, or `None` if timeout expires.
+    ///
+    /// Transient ESP-IDF errors during the polling loop (common during association)
+    /// are logged at `debug` level and treated as "not ready yet" rather than
+    /// propagated to the caller.
     pub fn get_ip(&self, timeout_ms: u64) -> anyhow::Result<Option<Ipv4Addr>> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            if self.wifi.is_connected()? {
-                let ip_info = self.wifi.wifi().sta_netif().get_ip_info()?;
-
-                if !ip_info.ip.is_unspecified() {
-                    log::info!("WiFi IP: {:?}", ip_info.ip);
-                    return Ok(Some(ip_info.ip));
-                }
+            match self.wifi.is_connected() {
+                Ok(true) => match self.wifi.wifi().sta_netif().get_ip_info() {
+                    Ok(ip_info) if !ip_info.ip.is_unspecified() => {
+                        log::info!("WiFi IP: {:?}", ip_info.ip);
+                        return Ok(Some(ip_info.ip));
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::debug!("get_ip_info transient error: {}", e),
+                },
+                Ok(false) => {}
+                Err(e) => log::debug!("is_connected transient error: {}", e),
             }
 
             if start.elapsed() >= timeout {
@@ -261,7 +425,7 @@ impl WiFiManager {
                 return Ok(None);
             }
 
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
 
