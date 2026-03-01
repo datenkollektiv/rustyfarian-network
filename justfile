@@ -69,7 +69,7 @@ test-mqtt:
 test-wifi:
     cargo test --target {{host_target}} {{pure_crates}} wifi
 
-# run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
+# run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
 test: test-mqtt test-wifi
 
 # full pre-commit verification: format, check, lint (local use only — modifies files)
@@ -78,9 +78,7 @@ pre-commit: fmt check clippy
 # non-modifying full verification: fails on any anomaly; suggests fix recipe on failure
 verify:
     just fmt-check || (printf "\nFormatting issues found — run 'just pre-commit' to auto-fix.\n\n"; exit 1)
-    cargo deny check
-    cargo check
-    just clippy
+    just ci
 
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy
