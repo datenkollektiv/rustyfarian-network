@@ -11,7 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `rust-toolchain.toml` pinning the workspace to the `esp` toolchain — rustup now selects the correct toolchain automatically without requiring `source ~/export-esp.sh` for every new shell session
 - `rustyfarian-esp-idf-wifi`: In `NonBlocking` mode, `WiFiManager` now subscribes to `WifiEvent::StaDisconnected` and logs the reason code with a human-readable name (e.g. `NO_AP_FOUND`, `AUTH_FAIL`) at `WARN` level — previously a wrong SSID or unavailable AP was invisible without debug-level logging
-
 - `LwtConfig` struct with `new()` constructor for Last Will and Testament support
 - `MqttConfig::with_lwt()` builder for configuring LWT messages
 - `MqttConfig::with_auth()` builder for MQTT broker authentication
