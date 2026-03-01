@@ -195,6 +195,8 @@ where
 
         let connected = Arc::new(AtomicBool::new(false));
         let connected_clone = Arc::clone(&connected);
+        let connection_error = Arc::new(AtomicBool::new(false));
+        let connection_error_clone = Arc::clone(&connection_error);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
@@ -224,6 +226,7 @@ where
                     }
                     EventPayload::Error(e) => {
                         log::error!("MQTT error: {:?}", e);
+                        connection_error_clone.store(true, Ordering::Relaxed);
                     }
                     EventPayload::Disconnected => {
                         log::info!("MQTT disconnected");
@@ -249,13 +252,27 @@ where
         let iterations = connection_wait_iterations(timeout_ms);
         log::info!("Waiting for MQTT connection...");
 
-        for i in 0..iterations {
+        let mut connected_within_timeout = false;
+        let mut broker_error = false;
+        for _ in 0..iterations {
             if connected.load(Ordering::Relaxed) {
                 log::info!("MQTT connection confirmed");
+                connected_within_timeout = true;
+                break;
+            }
+            if connection_error.load(Ordering::Relaxed) {
+                broker_error = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
-            if i == iterations - 1 {
+        }
+        if !connected_within_timeout {
+            if broker_error {
+                log::warn!(
+                    "MQTT connection failed (broker unreachable) — \
+                     subscribe will be attempted; client will retry when connected"
+                );
+            } else {
                 log::warn!("MQTT connection timeout, attempting subscribe anyway");
             }
         }

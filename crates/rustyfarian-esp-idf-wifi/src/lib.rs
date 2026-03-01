@@ -59,10 +59,10 @@ use rustyfarian_network_pure::wifi::{
     validate_password, validate_ssid, PASSWORD_MAX_LEN, SSID_MAX_LEN,
 };
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
 use led_effects::PulseEffect;
 use rgb::RGB8;
 
@@ -169,9 +169,29 @@ impl<'a> WiFiConfig<'a> {
     }
 }
 
+/// Maps common ESP-IDF Wi-Fi disconnect reason codes to human-readable names.
+///
+/// Codes follow `wifi_err_reason_t` in ESP-IDF.
+/// Returns `None` for unmapped codes so callers can log the raw number instead
+/// of a misleading `"unknown"` string.
+fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
+    match reason {
+        2 => Some("AUTH_EXPIRE"),
+        15 => Some("4WAY_HANDSHAKE_TIMEOUT"),
+        200 => Some("BEACON_TIMEOUT"),
+        201 => Some("NO_AP_FOUND"),
+        202 => Some("AUTH_FAIL"),
+        203 => Some("ASSOC_FAIL"),
+        204 => Some("HANDSHAKE_TIMEOUT"),
+        _ => None,
+    }
+}
+
 /// Wi-Fi connection manager with optional LED status feedback.
 pub struct WiFiManager {
     wifi: BlockingWifi<EspWifi<'static>>,
+    /// Kept alive to receive disconnect-reason log events in non-blocking mode.
+    _disconnect_subscription: Option<EspSystemSubscription<'static>>,
 }
 
 impl WiFiManager {
@@ -204,6 +224,9 @@ impl WiFiManager {
     {
         log::info!("Connecting to WiFi SSID: {}", config.ssid);
 
+        // Clone before sys_loop is consumed by BlockingWifi::wrap; used for the
+        // optional disconnect-event subscription in non-blocking mode.
+        let sys_loop_sub = sys_loop.clone();
         let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
         validate_ssid(config.ssid)
@@ -234,6 +257,35 @@ impl WiFiManager {
         wifi.start()?;
         log::info!("WiFi started");
 
+        // In non-blocking mode, subscribe to disconnect events so failures such as
+        // WIFI_REASON_NO_AP_FOUND are visible at WARN level without enabling debug logs.
+        let disconnect_subscription = if matches!(config.connect_mode, ConnectMode::NonBlocking) {
+            Some(
+                sys_loop_sub
+                    .subscribe::<WifiEvent, _>(|event: WifiEvent<'_>| {
+                        if let WifiEvent::StaDisconnected(info) = event {
+                            let reason = info.reason();
+                            match wifi_disconnect_reason_name(reason) {
+                                Some(name) => log::warn!(
+                                    "WiFi disconnected — reason {} ({}) — \
+                                     check SSID/password and network availability",
+                                    reason,
+                                    name,
+                                ),
+                                None => log::warn!(
+                                    "WiFi disconnected — reason {} (unmapped) — \
+                                     check SSID/password and network availability",
+                                    reason,
+                                ),
+                            }
+                        }
+                    })
+                    .map_err(|e| anyhow::anyhow!("WiFi disconnect subscription failed: {:?}", e))?,
+            )
+        } else {
+            None
+        };
+
         if let Some(led_driver) = led {
             let timeout_secs = match config.connect_mode {
                 ConnectMode::Blocking { timeout_secs } => timeout_secs,
@@ -261,7 +313,10 @@ impl WiFiManager {
             }
         }
 
-        Ok(Self { wifi })
+        Ok(Self {
+            wifi,
+            _disconnect_subscription: disconnect_subscription,
+        })
     }
 
     /// Creates a new Wi-Fi manager without an LED driver.

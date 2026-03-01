@@ -23,10 +23,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup ESP-RS toolchain (RISC-V)
+        uses: esp-rs/xtensa-toolchain@v1.6
         with:
-          components: rustfmt
+          default: true
+          ldproxy: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check --color always
