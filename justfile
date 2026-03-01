@@ -77,10 +77,10 @@ pre-commit: fmt check clippy
 
 # non-modifying full verification: fails on any anomaly; suggests fix recipe on failure
 verify:
-    cargo fmt -- --check || (printf "\nFormatting issues found — run 'just pre-commit' to auto-fix.\n\n"; exit 1)
+    just fmt-check || (printf "\nFormatting issues found — run 'just pre-commit' to auto-fix.\n\n"; exit 1)
     cargo deny check
     cargo check
-    cargo clippy --all-targets --workspace -- -D warnings
+    just clippy
 
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy
