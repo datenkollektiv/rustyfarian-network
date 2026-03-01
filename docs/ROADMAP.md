@@ -43,4 +43,10 @@ Two issues reported by rustbox-backstage (vault-standalone firmware) have been r
 
 ## Planned
 
-_No items currently queued._
+### Grow `rustyfarian-network-pure`
+
+Extract additional platform-independent logic into `rustyfarian-network-pure` so more behaviour
+can be verified on the host without an ESP32 or ESP toolchain.
+
+Candidates include reconnection backoff calculations, MQTT topic validation, and any other
+pure functions that currently live inside the ESP-IDF crates but have no hardware dependency.
