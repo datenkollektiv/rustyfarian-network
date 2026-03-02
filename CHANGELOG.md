@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rustyfarian-esp-idf-lora` crate: LoRa radio abstraction (`LoraRadio` trait), LoRaWAN Class A session types, OTA downlink command parser (`commands.rs`), and `MockLoraRadio` test double — enables host-side unit testing of LoRaWAN application logic without hardware
+- `rustyfarian-esp-idf-lora`: `EspLoraRadio` driver scaffold for the SX1262 on the Heltec WiFi LoRa 32 V3; all methods return graceful errors until hardware integration is complete (see crate module docs for implementation milestones)
 - Custom CodeQL GitHub Actions workflow with ESP toolchain pre-installed to enable full Rust analysis quality (resolves "Low Rust analysis quality" warning from GitHub's default CodeQL setup)
 - `rust-toolchain.toml` pinning the workspace to the `esp` toolchain — rustup now selects the correct toolchain automatically without requiring `source ~/export-esp.sh` for every new shell session
 - `rustyfarian-esp-idf-wifi`: In `NonBlocking` mode, `WiFiManager` now subscribes to `WifiEvent::StaDisconnected` and logs the reason code with a human-readable name (e.g. `NO_AP_FOUND`, `AUTH_FAIL`) at `WARN` level — previously a wrong SSID or unavailable AP was invisible without debug-level logging

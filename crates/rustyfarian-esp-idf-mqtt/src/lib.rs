@@ -28,6 +28,12 @@ use std::time::Duration;
 
 use rustyfarian_network_pure::mqtt::connection_wait_iterations;
 
+/// Poll interval used while waiting for the MQTT broker connection to be confirmed.
+///
+/// Must stay consistent with the `poll_interval_ms` argument passed to
+/// [`connection_wait_iterations`] — both express the same physical interval.
+const POLL_INTERVAL_MS: u64 = 100;
+
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
 };
@@ -264,7 +270,7 @@ where
                 broker_error = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
         if !connected_within_timeout {
             if broker_error {
