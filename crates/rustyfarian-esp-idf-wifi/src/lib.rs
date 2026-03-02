@@ -222,7 +222,7 @@ impl WiFiManager {
         L: StatusLed,
         L::Error: std::fmt::Debug,
     {
-        log::info!("Connecting to WiFi SSID: {}", config.ssid);
+        log::info!("Connecting to WiFi SSID (len={})", config.ssid.len());
 
         // Clone before sys_loop is consumed by BlockingWifi::wrap; used for the
         // optional disconnect-event subscription in non-blocking mode.
@@ -230,7 +230,7 @@ impl WiFiManager {
         let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
         validate_ssid(config.ssid)
-            .map_err(|e| anyhow::anyhow!("WiFi SSID '{}': {}", config.ssid, e))?;
+            .map_err(|e| anyhow::anyhow!("WiFi SSID invalid (len={}): {}", config.ssid.len(), e))?;
         validate_password(config.password).map_err(anyhow::Error::msg)?;
 
         let ssid = config.ssid.try_into().map_err(|_| {

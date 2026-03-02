@@ -43,6 +43,105 @@ Two issues reported by rustbox-backstage (vault-standalone firmware) have been r
 
 ## Planned
 
+### LoRa Radio — `rustyfarian-esp-idf-lora` crate
+
+The `rustyfarian-esp-idf-lora` crate has been adopted into the workspace.
+It provides the `LoraRadio` trait, `LorawanDevice<R>` Class A device, OTA downlink command parser,
+session persistence types, and a `MockLoraRadio` test double (37 host-runnable tests).
+The SX1262 hardware driver and the `lorawan-device` state machine bridge are stubs, gracefully degrading.
+
+<details>
+<summary><strong>Phase 5 — TTN v3 (EU868) OTAA validation</strong></summary>
+
+The goal is end-to-end OTAA join + first uplink + first downlink with the least moving parts.
+All steps use TTN v3 EU868.
+
+**Step 0 — Credentials**
+
+- Create a TTN application and register an end device (LoRaWAN MAC V1.0.3, RP001-1.0.3, OTAA).
+- Record DevEUI (8 bytes), JoinEUI/AppEUI (8 bytes), AppKey (16 bytes).
+- Decide byte order: TTN displays EUIs as big-endian strings; many stacks expect LSB-first in memory.
+  Log DevEUI/JoinEUI as bytes and compare against `lorawan-device` documentation before flashing.
+  See `docs/key-insights.md` — "EUI byte order" for the full pitfall description.
+
+**Step 1 — Gateway & RF sanity**
+
+- Confirm a TTN-connected EU868 gateway is online (TTN Console → Gateways → "connected recently").
+- Place the device within metres for initial tests; use a correct EU868 antenna.
+
+**Step 2 — SX1262 bring-up (before LoRaWAN)**
+
+- Verify SPI mode 0, 8 MHz; confirm NSS/CS, BUSY, RESET, DIO1 pins.
+- Issue a status/sanity command after reset and log the response.
+- Confirm BUSY line goes high during operations and returns low; if BUSY is never handled,
+  every SPI command stalls — see `docs/key-insights.md` — "BUSY pin".
+
+**Step 3 — TTN Live Data setup**
+
+- Open TTN Console → Application → End Device → Live Data (leave open during testing).
+- Enable join-accept and uplink viewing; confirm gateway metadata (RSSI/SNR) is visible.
+
+**Step 4 — OTAA join**
+
+- Firmware must log "joining…" and then either "joined" or the failure reason.
+- In Live Data, expect: join-request uplink(s) → join-accept downlink.
+- If a join-request is visible but no join-accept: wrong AppKey or EUI byte order mismatch.
+- If join-accept is visible in TTN but a device never joins: RX timing or DIO1 IRQ issue
+  (see `docs/key-insights.md` — "DIO1 interrupt" and "RX window").
+- Tune `RX_WINDOW_OFFSET_MS` if windows are missed; start at −200 ms and adjust upward.
+
+**Step 5 — First uplink**
+
+- After joining, send a small payload (1–8 bytes) on FPort 1.
+- TTN Live Data should show the uplink with decoded payload bytes and RSSI/SNR.
+- Do not send it before join completes; `LorawanDevice::send()` guards this but the guard
+  will need to hold once the real state machine is wired.
+
+**Step 6 — First downlink (port 10 OTA commands)**
+
+- In TTN Console, schedule a downlink: FPort 10, payload `01` (CheckUpdate).
+- Trigger an uplink first — downlinks only arrive in RX windows after an uplink.
+- Confirm `parse_ota_command()` receives the payload.
+- Test additional commands: `05` (ReportVersion), `02 01 02 03` (UpdateAvailable 1.2.3).
+
+**Step 7 — Deep sleep / session persistence (Phase 7 readiness)**
+
+- After join, persist `LorawanSessionData` (CRC-32 check: implement before relying on restore).
+- Sleep and wake; confirm TTN accepts subsequent uplinks with incremented `FCntUp`.
+- If `FCntUp` is reset or reused, TTN silently rejects the frames — see `docs/key-insights.md` — "Frame counter reuse".
+
+**Common pitfalls quick reference**
+
+| Symptom                                    | Likely cause                                           |
+|:-------------------------------------------|:-------------------------------------------------------|
+| Join-request visible, no join-accept       | Wrong AppKey or EUI byte order mismatch                |
+| Join-accept in TTN, device stays `Joining` | RX window timing off, or DIO1 IRQ not delivered        |
+| All SPI commands stall / timeout           | BUSY pin not polled before each command                |
+| Downlinks queued but never received        | No uplink to open the RX window; or wrong FPort        |
+| Post-sleep uplinks rejected by TTN         | `FCntUp` reset to 0 (session key/counter not restored) |
+| Never joins but gateway is nearby          | Wrong frequency plan (US915 vs EU868) or no antenna    |
+
+</details>
+
+<details>
+<summary><strong>Post-adoption backlog (from code review)</strong></summary>
+
+These were deferred from the initial adoption and can be addressed in follow-up PRs:
+
+| # | Item                                                                              |
+|--:|:----------------------------------------------------------------------------------|
+| 1 | Builder pattern for `LoraConfig` (private fields, `::builder()`)                  |
+| 2 | `from_hex_strings` returns `Result` with field-level diagnostics                  |
+| 4 | `PartialEq` on `LorawanResponse` / `Downlink`                                     |
+| 5 | Replace manual O(n) FIFO shift in `MockLoraRadio::receive` with `heapless::Deque` |
+| 6 | Implement CRC-32 integrity check in `restore_from_sleep` (Phase 7)                |
+| 7 | Implement `EspLoraRadio` hardware driver (Phase 2–4 milestones)                   |
+| 8 | Wire `LorawanDevice::process()` state machine to `lorawan-device 0.12`            |
+
+</details>
+
+---
+
 ### Grow `rustyfarian-network-pure`
 
 Extract additional platform-independent logic into `rustyfarian-network-pure` so more behaviour

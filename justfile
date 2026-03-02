@@ -23,6 +23,10 @@ check-wifi:
 check-mqtt:
     cargo check -p rustyfarian-esp-idf-mqtt
 
+# check the lora crate
+check-lora:
+    cargo check -p rustyfarian-esp-idf-lora
+
 # run clippy on the entire workspace
 clippy:
     cargo clippy --all-targets --workspace -- -D warnings
@@ -56,7 +60,7 @@ clean:
     cargo clean
 
 # host target, used to override the workspace ESP-IDF target for pure-logic tests
-host_target := `host=$(rustc -vV 2>/dev/null | grep '^host:' | awk '{print $2}'); if [ -z "$host" ]; then printf 'Error: Failed to determine rustc host target.\n' >&2; exit 1; fi; echo "$host"`
+host_target := `host=$(rustc -vV 2>/dev/null | grep '^host:' | awk '{print $2}'); if [ -z "$host" ]; then echo 'Error: Failed to determine rustc host target.' >&2; exit 1; fi; echo "$host"`
 
 # platform-independent crates that can be compiled and tested on the host
 pure_crates := "-p rustyfarian-network-pure"
@@ -69,15 +73,20 @@ test-mqtt:
 test-wifi:
     cargo test --target {{host_target}} {{pure_crates}} wifi
 
+# run lora unit tests on the host (no ESP-IDF required)
+# --no-default-features disables the esp-idf feature so esp-idf-sys is not pulled in
+test-lora:
+    cargo test --target {{host_target}} -p rustyfarian-esp-idf-lora --no-default-features --features mock
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-mqtt test-wifi
+test: test-mqtt test-wifi test-lora
 
 # full pre-commit verification: format, check, lint (local use only — modifies files)
 pre-commit: fmt check clippy
 
 # non-modifying full verification: fails on any anomaly; suggests fix recipe on failure
 verify:
-    just fmt-check || (printf "\nFormatting issues found — run 'just pre-commit' to auto-fix.\n\n"; exit 1)
+    just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
     just ci
 
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
