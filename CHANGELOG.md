@@ -7,10 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `lora-pure`: `LoraRadio` trait docs clarified — `nb::WouldBlock` semantics, `prepare_*` call ordering, and `prepare_rx` re-entry contract after a failed receive window
+- `lora-pure`: `RX_WINDOW_OFFSET_MS` doc made platform-neutral (removed ESP-IDF-specific rationale)
+- `rustyfarian-esp-hal-lora`: stub driver now returns per-operation error variants (`TransmitFailed` from TX methods, `ReceiveFailed` from RX methods) instead of `RadioInitFailed` for all operations
+- `rustyfarian-esp-hal-lora`: `esp32c6` Cargo feature now properly forwards `esp-hal/esp32c6` instead of hardcoding the chip feature inside the dependency declaration
+
 ### Added
 
+- `lora-pure` crate: platform-independent `no_std` library containing the `LoraRadio` trait, all LoRa/LoRaWAN types (`SpreadingFactor`, `Bandwidth`, `CodingRate`, `TxConfig`, `RxConfig`, `RxWindow`, `RxQuality`), `LorawanDevice`, session types, OTA command parser, and `MockLoraRadio` test double — implements ADR 005 (separate crate per HAL, no mutually exclusive feature flags)
+- `rustyfarian-esp-hal-lora` crate: bare-metal `no_std` stub crate for future ESP-HAL LoRa integration; provides `EspHalLoraRadio<S: StatusLed>` implementing `lora_pure::LoraRadio`; all methods return graceful errors pending hardware integration
+- `justfile`: `check-lora-pure` and `check-lora-hal` recipes for targeted crate checks
+
+### Changed
+
+- `rustyfarian-esp-idf-lora`: all pure types (`LoraRadio`, `LoraConfig`, `LorawanDevice`, `MockLoraRadio`, etc.) moved to `lora-pure` and re-exported for backward compatibility; crate now depends on `lora-pure` and is always `std`/ESP-IDF — the `esp-idf`/`mock` feature flags are removed
+- `rustyfarian-esp-idf-lora`: `sx1262_driver.rs` updated to import from `lora_pure::` instead of `crate::`
+- `justfile`: `test-lora` now runs tests from `lora-pure --features mock` (the pure crate hosts all platform-independent tests)
 - `rustyfarian-esp-idf-lora` crate: LoRa radio abstraction (`LoraRadio` trait), LoRaWAN Class A session types, OTA downlink command parser (`commands.rs`), and `MockLoraRadio` test double — enables host-side unit testing of LoRaWAN application logic without hardware
-- `rustyfarian-esp-idf-lora`: `EspLoraRadio` driver scaffold for the SX1262 on the Heltec WiFi LoRa 32 V3; all methods return graceful errors until hardware integration is complete (see crate module docs for implementation milestones)
+- `rustyfarian-esp-idf-lora`: `EspIdfLoraRadio` driver scaffold for the SX1262 on the Heltec WiFi LoRa 32 V3; all methods return graceful errors until hardware integration is complete (see crate module docs for implementation milestones)
 - Custom CodeQL GitHub Actions workflow with ESP toolchain pre-installed to enable full Rust analysis quality (resolves "Low Rust analysis quality" warning from GitHub's default CodeQL setup)
 - `rust-toolchain.toml` pinning the workspace to the `esp` toolchain — rustup now selects the correct toolchain automatically without requiring `source ~/export-esp.sh` for every new shell session
 - `rustyfarian-esp-idf-wifi`: In `NonBlocking` mode, `WiFiManager` now subscribes to `WifiEvent::StaDisconnected` and logs the reason code with a human-readable name (e.g. `NO_AP_FOUND`, `AUTH_FAIL`) at `WARN` level — previously a wrong SSID or unavailable AP was invisible without debug-level logging

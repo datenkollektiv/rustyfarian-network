@@ -1,0 +1,19 @@
+[package]
+name = "lora-pure"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-independent LoRa types, traits, and LoRaWAN protocol logic"
+keywords = ["lora", "lorawan", "embedded", "no-std"]
+categories = ["embedded", "no-std"]
+
+[features]
+mock = []
+
+[dependencies]
+log.workspace = true
+nb.workspace = true
+heapless.workspace = true
+lorawan-device.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "rustyfarian-esp-hal-lora"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LoRa radio driver for ESP-HAL (bare-metal, no_std)"
+keywords = ["lora", "esp-hal", "embedded", "no-std", "sx1262"]
+categories = ["embedded", "no-std"]
+
+[features]
+# No default features: esp-hal requires a bare-metal target, not the ESP-IDF target
+# used by this workspace. Enable the matching chip feature to pull in esp-hal and
+# forward the chip selection to the underlying dependency.
+esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6"]
+
+[dependencies]
+lora-pure.workspace = true
+log.workspace = true
+nb.workspace = true
+led-effects.workspace = true
+esp-hal = { version = "1.0", features = ["unstable"], optional = true }

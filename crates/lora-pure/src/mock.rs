@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use rustyfarian_esp_idf_lora::mock::MockLoraRadio;
-//! use rustyfarian_esp_idf_lora::{LoraConfig, LorawanDevice};
+//! use lora_pure::mock::MockLoraRadio;
+//! use lora_pure::{LoraConfig, LorawanDevice};
 //!
 //! let radio = MockLoraRadio::new();
 //! let config = LoraConfig::default();

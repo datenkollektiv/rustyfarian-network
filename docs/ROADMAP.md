@@ -142,6 +142,32 @@ These were deferred from the initial adoption and can be addressed in follow-up 
 
 ---
 
+### no-std / esp-hal LoRa with ws2812 LED status
+
+With `rustyfarian-esp-hal-ws2812` (v0.3.0) complete in the companion repository,
+this workspace extends to a bare-metal LoRa path via a dedicated `rustyfarian-esp-hal-lora` crate.
+Per ADR 005, mutually exclusive HAL backends require separate crates, not feature flags.
+The target structure is:
+
+```
+lora-pure                      — no_std; LoraRadio trait, TxConfig, RxConfig, config types
+rustyfarian-esp-idf-lora       — std; esp-idf-hal; anyhow errors (existing, refactored)
+rustyfarian-esp-hal-lora       — no_std; esp-hal SPI + GPIO; custom error enum (new)
+```
+
+`rustyfarian-esp-hal-lora` accepts `S: StatusLed` for visual join / uplink / downlink feedback
+via the WS2812 LED on the Heltec V3 board — or `NoLed` for headless configurations.
+
+**Items**
+
+- Extract shared types from `rustyfarian-esp-idf-lora` into a new `lora-pure` crate
+- Update `rustyfarian-esp-idf-lora` to depend on `lora-pure`
+- Create `rustyfarian-esp-hal-lora` crate with `EspHalLoraRadio<S: StatusLed>` stub
+- Implement full `EspHalLoraRadio` using `esp-hal` SPI + GPIO
+- Wire `LorawanDevice<EspHalLoraRadio<S>>` end-to-end (prerequisite for Phase 5 TTN validation)
+
+---
+
 ### Grow `rustyfarian-network-pure`
 
 Extract additional platform-independent logic into `rustyfarian-network-pure` so more behaviour

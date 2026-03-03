@@ -9,18 +9,9 @@ description = "LoRa radio driver and LoRaWAN Class A protocol for embedded proje
 keywords = ["lora", "lorawan", "sx1262", "embedded", "esp32"]
 categories = ["embedded"]
 
-[features]
-default = ["esp-idf"]
-esp-idf = ["dep:esp-idf-hal", "dep:sx126x"]
-# Enables src/mock.rs; no hardware deps.
-# Use in dev-dependencies of downstream crates:
-#   rustyfarian-esp-idf-lora = { ..., features = ["mock"] }
-mock = []
-
 [dependencies]
+lora-pure.workspace = true
 log.workspace = true
 nb.workspace = true
-heapless.workspace = true
-lorawan-device.workspace = true
-sx126x = { workspace = true, optional = true }
-esp-idf-hal = { workspace = true, optional = true }
+esp-idf-hal.workspace = true
+sx126x.workspace = true

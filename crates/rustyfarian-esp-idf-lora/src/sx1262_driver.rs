@@ -1,8 +1,8 @@
 //! SX1262 radio driver for the Heltec WiFi LoRa 32 V3.
 //!
-//! [`EspLoraRadio`] implements [`crate::LoraRadio`] using `sx126x 0.3` and
+//! [`EspIdfLoraRadio`] implements [`lora_pure::LoraRadio`] using `sx126x 0.3` and
 //! ESP-IDF SPI.  An internal `LoraRadioAdapter` (commented out below) will
-//! bridge `EspLoraRadio` to `lorawan-device`'s `PhyRxTx + Timings` traits
+//! bridge `EspIdfLoraRadio` to `lorawan-device`'s `PhyRxTx + Timings` traits
 //! once the API is confirmed on hardware.
 //!
 //! # SPI2 pin assignments (Heltec WiFi LoRa 32 V3)
@@ -57,12 +57,14 @@
 //! 3. Implement `LoraRadioAdapter` PhyRxTx bridge (read lorawan-device/tests/class_a.rs first).
 //! 4. Wire up OTAA join in beekeeper main loop.
 
-use crate::config::LoraConfig;
-use crate::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
+use lora_pure::config::LoraConfig;
+use lora_pure::{
+    Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
+};
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
-/// Error type for [`EspLoraRadio`] operations.
+/// Error type for [`EspIdfLoraRadio`] operations.
 #[derive(Debug)]
 pub enum LoraError {
     /// SPI bus initialisation failed.
@@ -95,7 +97,7 @@ impl core::fmt::Display for LoraError {
     }
 }
 
-// ─── EspLoraRadio ─────────────────────────────────────────────────────────────
+// ─── EspIdfLoraRadio ─────────────────────────────────────────────────────────────
 
 /// SX1262 radio driver for the Heltec WiFi LoRa 32 V3.
 ///
@@ -108,7 +110,7 @@ impl core::fmt::Display for LoraError {
 /// [`new`][Self::new] currently returns `Err(LoraError::RadioInitFailed)`.
 /// The struct fields below (`_radio`, `_spi`) will become the live `sx126x::SX126x`
 /// handle and `SpiDeviceDriver` once the hardware API is confirmed.
-pub struct EspLoraRadio {
+pub struct EspIdfLoraRadio {
     // TODO: Replace these placeholders with the real driver fields:
     //   radio: sx126x::SX126x<PinDriver<'static, Gpio8, Output>, ...>,
     //   spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
@@ -116,7 +118,7 @@ pub struct EspLoraRadio {
     last_snr: i8,
 }
 
-impl EspLoraRadio {
+impl EspIdfLoraRadio {
     /// Attempt to initialise the SX1262.
     ///
     /// Currently returns `Err(LoraError::RadioInitFailed)` — see module-level
@@ -151,7 +153,7 @@ impl EspLoraRadio {
     }
 }
 
-impl LoraRadio for EspLoraRadio {
+impl LoraRadio for EspIdfLoraRadio {
     type Error = LoraError;
 
     fn prepare_tx(&mut self, config: TxConfig, buf: &[u8]) -> Result<(), LoraError> {
@@ -194,11 +196,11 @@ impl LoraRadio for EspLoraRadio {
     }
 
     fn rx_window_offset_ms(&self) -> i32 {
-        crate::RX_WINDOW_OFFSET_MS
+        lora_pure::RX_WINDOW_OFFSET_MS
     }
 
     fn rx_window_duration_ms(&self) -> u32 {
-        crate::RX_WINDOW_DURATION_MS
+        lora_pure::RX_WINDOW_DURATION_MS
     }
 }
 
@@ -208,8 +210,6 @@ impl LoraRadio for EspLoraRadio {
 // EU868 DR0: SF12, BW125, CR4/5.
 // Verify the sx126x crate's exact enum variants before use — they differ from
 // other LoRa crates and must not be assumed.
-
-use crate::{Bandwidth, CodingRate, SpreadingFactor};
 
 /// Map our `SpreadingFactor` to the numeric SF value for sx126x.
 ///
