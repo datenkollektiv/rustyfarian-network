@@ -17,6 +17,9 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
   error messages make that possible.
 - **Driven by real firmware, not speculation** — new features are added when a concrete downstream
   project surfaces a gap; the library stays lean and avoids untested abstractions.
+- **An `esp-hal` LoRa tier** — a dedicated `rustyfarian-esp-hal-lora` crate provides bare-metal LoRa alongside the existing ESP-IDF path.
+  It accepts a `StatusLed` impl (WS2812 or `NoLed`) for visual join / uplink / downlink feedback.
+  The `LoraRadio` trait in the shared `lora-pure` crate keeps the API stable across both tiers.
 
 ## Target Beneficiaries
 
@@ -28,7 +31,7 @@ but with an API clean enough that any ESP32-IDF project can adopt it with confid
 - **Application-layer protocols** — HTTP, CoAP, WebSocket, and similar are out of scope;
   this library stops at Wi-Fi association and MQTT pub/sub.
 - **Provisioning / SoftAP mode** — no captive portal, BLE provisioning, or Wi-Fi setup flows.
-- **`esp-hal` / bare-metal targets** — only ESP-IDF (`std`) is supported; no `no_std` / `esp-hal` target.
+- **Full `no_std` / `esp-hal` Wi-Fi and MQTT** — only ESP-IDF is supported for networking; the `esp-hal` tier is limited to the LoRa radio path.
 
 ## Success Signals
 
@@ -46,3 +49,5 @@ _(none at this time)_
 
 - 2026-03-01 — Initial `VISION.md` created; north star, goals, non-goals, and success signals
   established from first review session.
+- 2026-03-03 — no-std / `esp-hal` LoRa tier added as an active goal; `esp-hal` Wi-Fi/MQTT remains a non-goal.
+  Decision recorded in ADR 004.

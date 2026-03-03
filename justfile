@@ -23,9 +23,17 @@ check-wifi:
 check-mqtt:
     cargo check -p rustyfarian-esp-idf-mqtt
 
-# check the lora crate
+# check the esp-idf lora crate
 check-lora:
     cargo check -p rustyfarian-esp-idf-lora
+
+# check the pure lora crate (no ESP-IDF required)
+check-lora-pure:
+    cargo check -p lora-pure
+
+# check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
+check-lora-hal:
+    cargo check -p rustyfarian-esp-hal-lora --no-default-features
 
 # run clippy on the entire workspace
 clippy:
@@ -74,9 +82,9 @@ test-wifi:
     cargo test --target {{host_target}} {{pure_crates}} wifi
 
 # run lora unit tests on the host (no ESP-IDF required)
-# --no-default-features disables the esp-idf feature so esp-idf-sys is not pulled in
+# Tests live in lora-pure; --features mock enables MockLoraRadio and mock-gated test blocks.
 test-lora:
-    cargo test --target {{host_target}} -p rustyfarian-esp-idf-lora --no-default-features --features mock
+    cargo test --target {{host_target}} -p lora-pure --features mock
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
 test: test-mqtt test-wifi test-lora

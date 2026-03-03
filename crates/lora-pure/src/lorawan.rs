@@ -2,7 +2,7 @@
 //!
 //! [`LorawanDevice`] is generic over any [`crate::LoraRadio`] implementation,
 //! so it can be driven by a [`crate::mock::MockLoraRadio`] in host-side tests
-//! or by [`crate::sx1262_driver::EspLoraRadio`] on the Heltec V3.
+//! or by `rustyfarian_esp_idf_lora::sx1262_driver::EspIdfLoraRadio` on the Heltec V3.
 //!
 //! # Implementation status
 //!
@@ -108,7 +108,7 @@ const _: () = assert!(core::mem::size_of::<LorawanSessionData>() == 56);
 /// Errors returned by [`LorawanDevice`] operations.
 ///
 /// Generic over the radio error type `E` so that `LorawanDevice<MockLoraRadio>`
-/// and `LorawanDevice<EspLoraRadio>` each carry their own concrete error without boxing.
+/// and `LorawanDevice<EspIdfLoraRadio>` each carry their own concrete error without boxing.
 #[derive(Debug)]
 pub enum LorawanError<E: core::fmt::Debug> {
     /// A radio operation failed. Wraps the radio's own error type.

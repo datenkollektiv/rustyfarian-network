@@ -206,45 +206,50 @@ where
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
-        // Spawn background thread for MQTT event processing
-        std::thread::spawn(move || {
-            log::info!("MQTT event loop started");
-            while let Ok(event) = connection.next() {
-                if shutdown_clone.load(Ordering::Relaxed) {
-                    log::info!("MQTT shutdown signal received");
-                    break;
-                }
-                match event.payload() {
-                    EventPayload::Connected(_) => {
-                        log::info!("MQTT connected");
-                        connected_clone.store(true, Ordering::Relaxed);
+        // Spawn background thread for MQTT event processing.
+        // Explicit stack size: the default pthread stack (3 KiB) is too small for
+        // EspLogger::should_log, which walks a BTreeMap and overflows the stack.
+        std::thread::Builder::new()
+            .stack_size(8192)
+            .spawn(move || {
+                log::info!("MQTT event loop started");
+                while let Ok(event) = connection.next() {
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        log::info!("MQTT shutdown signal received");
+                        break;
                     }
-                    EventPayload::Subscribed(id) => {
-                        log::info!("Subscription confirmed (id: {})", id);
-                    }
-                    EventPayload::Received {
-                        data,
-                        topic: Some(topic_str),
-                        ..
-                    } => {
-                        log::debug!("Received on '{}': {:?}", topic_str, data);
-                        on_message(topic_str, data);
-                    }
-                    EventPayload::Error(e) => {
-                        log::error!("MQTT error: {:?}", e);
-                        connection_error_clone.store(true, Ordering::Relaxed);
-                    }
-                    EventPayload::Disconnected => {
-                        log::info!("MQTT disconnected");
-                        if shutdown_clone.load(Ordering::Relaxed) {
-                            break;
+                    match event.payload() {
+                        EventPayload::Connected(_) => {
+                            log::info!("MQTT connected");
+                            connected_clone.store(true, Ordering::Relaxed);
                         }
+                        EventPayload::Subscribed(id) => {
+                            log::info!("Subscription confirmed (id: {})", id);
+                        }
+                        EventPayload::Received {
+                            data,
+                            topic: Some(topic_str),
+                            ..
+                        } => {
+                            log::debug!("Received on '{}': {:?}", topic_str, data);
+                            on_message(topic_str, data);
+                        }
+                        EventPayload::Error(e) => {
+                            log::error!("MQTT error: {:?}", e);
+                            connection_error_clone.store(true, Ordering::Relaxed);
+                        }
+                        EventPayload::Disconnected => {
+                            log::info!("MQTT disconnected");
+                            if shutdown_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            log::info!("MQTT event loop exited");
-        });
+                log::info!("MQTT event loop exited");
+            })
+            .expect("failed to spawn MQTT event loop thread");
 
         let mut manager = Self {
             client,
