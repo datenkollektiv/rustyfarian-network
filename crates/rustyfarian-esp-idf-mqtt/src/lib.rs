@@ -1,38 +1,60 @@
 //! MQTT client manager for ESP-IDF projects.
 //!
-//! Provides a simplified wrapper around the ESP-IDF MQTT client with:
-//! - Automatic connection handling
-//! - Background event loop
-//! - Multi-topic subscription with topic-based dispatch
-//! - Last Will and Testament (LWT) support
-//! - Authentication support
-//! - Configurable QoS and retained message publishing
+//! Provides a persistent, auto-reconnecting MQTT client with lifecycle
+//! callbacks, thread-safe publishing, and pure connection-state validation.
 //!
-//! # Example
+//! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig};
+//! use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig};
+//! use esp_idf_svc::mqtt::client::QoS;
 //!
 //! let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 //!
-//! let mqtt = MqttManager::new(config, &["commands"], |topic, data| {
-//!     println!("Received on {}: {:?}", topic, data);
-//! })?;
+//! let handle = MqttBuilder::new(config)
+//!     .on_connect(|client, _is_clean| {
+//!         client.subscribe("commands/#", QoS::AtLeastOnce)?;
+//!         Ok(())
+//!     })
+//!     .on_disconnect(|| log::warn!("MQTT disconnected"))
+//!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
+//!     .build()?;
 //!
-//! mqtt.publish("status", "online")?;
+//! handle.publish("status", "online")?;
 //! ```
+//!
+//! [`MqttManager`] is still available but deprecated — use [`MqttBuilder`] for
+//! new code.
 
+use anyhow::Context as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustyfarian_network_pure::mqtt::connection_wait_iterations;
+use rustyfarian_network_pure::mqtt::{
+    connection_wait_iterations, format_broker_url, next_state, validate_broker_host,
+    validate_broker_port, validate_client_id, MqttConnectionState, MqttEvent,
+};
 
 /// Poll interval used while waiting for the MQTT broker connection to be confirmed.
 ///
 /// Must stay consistent with the `poll_interval_ms` argument passed to
 /// [`connection_wait_iterations`] — both express the same physical interval.
 const POLL_INTERVAL_MS: u64 = 100;
+
+/// Stack size for the `MqttManager` (legacy) event loop thread.
+///
+/// The default ESP-IDF pthread stack (3 KiB) is too small for
+/// `EspLogger::should_log`, which walks a `BTreeMap` and overflows the stack.
+/// 8 KiB provides sufficient headroom for the event loop and message callbacks.
+const EVENT_LOOP_STACK_SIZE: usize = 8192;
+
+/// Stack size for the `MqttBuilder` event loop thread.
+///
+/// 12 KiB accommodates the `on_connect` callback frames on top of the base
+/// event loop overhead.  Measure on hardware and increase if stack overflows
+/// are observed with deeply nested `on_connect` logic.
+const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
 
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
@@ -71,7 +93,10 @@ impl<'a> LwtConfig<'a> {
 }
 
 /// MQTT broker connection configuration.
-#[derive(Debug, Clone)]
+///
+/// Credentials (`username`, `password`) are redacted in the `Debug` output
+/// (`Some("<redacted>")`) to prevent them from appearing in log files.
+#[derive(Clone)]
 pub struct MqttConfig<'a> {
     /// MQTT broker hostname or IP address
     pub host: &'a str,
@@ -86,6 +111,31 @@ pub struct MqttConfig<'a> {
     lwt: Option<LwtConfig<'a>>,
     username: Option<&'a str>,
     password: Option<&'a str>,
+}
+
+impl<'a> std::fmt::Debug for MqttConfig<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_username: Option<&'static str> = if self.username.is_some() {
+            Some("<redacted>")
+        } else {
+            None
+        };
+        let redacted_password: Option<&'static str> = if self.password.is_some() {
+            Some("<redacted>")
+        } else {
+            None
+        };
+        f.debug_struct("MqttConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("keep_alive_secs", &self.keep_alive_secs)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("lwt", &self.lwt)
+            .field("username", &redacted_username)
+            .field("password", &redacted_password)
+            .finish()
+    }
 }
 
 impl<'a> MqttConfig<'a> {
@@ -166,6 +216,19 @@ where
     /// # Returns
     ///
     /// A connected MQTT manager, or an error if the connection fails.
+    ///
+    /// # Deprecation
+    ///
+    /// This constructor does not expose reconnect lifecycle callbacks, making it
+    /// impossible to re-subscribe after an automatic broker reconnect.
+    /// Use [`MqttBuilder`] instead: it handles reconnection transparently and
+    /// avoids the heap-corruption risk that existed in earlier versions of this
+    /// method.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use MqttBuilder (via MqttBuilder::new) instead; \
+                MqttManager::new does not re-subscribe after auto-reconnect"
+    )]
     pub fn new(
         config: MqttConfig<'_>,
         incoming_topics: &[&str],
@@ -206,22 +269,20 @@ where
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
-        // Spawn background thread for MQTT event processing.
-        // Explicit stack size: the default pthread stack (3 KiB) is too small for
-        // EspLogger::should_log, which walks a BTreeMap and overflows the stack.
+        // Spawn a background thread for MQTT event processing.
         std::thread::Builder::new()
-            .stack_size(8192)
+            .stack_size(EVENT_LOOP_STACK_SIZE)
             .spawn(move || {
                 log::info!("MQTT event loop started");
                 while let Ok(event) = connection.next() {
-                    if shutdown_clone.load(Ordering::Relaxed) {
+                    if shutdown_clone.load(Ordering::Acquire) {
                         log::info!("MQTT shutdown signal received");
                         break;
                     }
                     match event.payload() {
                         EventPayload::Connected(_) => {
                             log::info!("MQTT connected");
-                            connected_clone.store(true, Ordering::Relaxed);
+                            connected_clone.store(true, Ordering::Release);
                         }
                         EventPayload::Subscribed(id) => {
                             log::info!("Subscription confirmed (id: {})", id);
@@ -236,11 +297,12 @@ where
                         }
                         EventPayload::Error(e) => {
                             log::error!("MQTT error: {:?}", e);
-                            connection_error_clone.store(true, Ordering::Relaxed);
+                            connection_error_clone.store(true, Ordering::Release);
                         }
                         EventPayload::Disconnected => {
                             log::info!("MQTT disconnected");
-                            if shutdown_clone.load(Ordering::Relaxed) {
+                            connected_clone.store(false, Ordering::Release);
+                            if shutdown_clone.load(Ordering::Acquire) {
                                 break;
                             }
                         }
@@ -249,8 +311,9 @@ where
                 }
                 log::info!("MQTT event loop exited");
             })
-            .expect("failed to spawn MQTT event loop thread");
+            .context("failed to spawn MQTT event loop thread")?;
 
+        let shutdown_for_err = Arc::clone(&shutdown);
         let mut manager = Self {
             client,
             client_id,
@@ -264,34 +327,32 @@ where
         log::info!("Waiting for MQTT connection...");
 
         let mut connected_within_timeout = false;
-        let mut broker_error = false;
         for _ in 0..iterations {
-            if connected.load(Ordering::Relaxed) {
+            if connected.load(Ordering::Acquire) {
                 log::info!("MQTT connection confirmed");
                 connected_within_timeout = true;
                 break;
             }
-            if connection_error.load(Ordering::Relaxed) {
-                broker_error = true;
+            if connection_error.load(Ordering::Acquire) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
-        if !connected_within_timeout {
-            if broker_error {
-                log::warn!(
-                    "MQTT connection failed (broker unreachable) — \
-                     subscribe will be attempted; client will retry when connected"
-                );
-            } else {
-                log::warn!("MQTT connection timeout, attempting subscribe anyway");
-            }
-        }
 
-        // Subscribe to all topics
-        for topic in &topics {
-            manager.client.subscribe(topic.as_str(), QoS::AtLeastOnce)?;
-            log::info!("Subscribed to '{}'", topic);
+        if connected_within_timeout {
+            // Subscribe to all topics only when connected — calling subscribe() on an
+            // unconnected EspMqttClient corrupts the ESP-IDF heap.
+            for topic in &topics {
+                manager.client.subscribe(topic.as_str(), QoS::AtLeastOnce)?;
+                log::info!("Subscribed to '{}'", topic);
+            }
+        } else {
+            log::warn!(
+                "[mqtt] connection failed — skipping subscribe to avoid heap corruption; \
+                 caller should retry after a delay"
+            );
+            shutdown_for_err.store(true, Ordering::Release);
+            return Err(anyhow::anyhow!("MQTT broker unreachable within timeout"));
         }
 
         Ok(manager)
@@ -367,7 +428,7 @@ where
             log::warn!("Failed to send shutdown message: {:?}", e);
         }
         // Then signal the background thread to stop
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
     }
 }
 
@@ -377,5 +438,347 @@ where
 {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+// ── Builder API ───────────────────────────────────────────────────────────────
+
+/// Callback invoked on every (re)connect.
+///
+/// Receives `&mut EspMqttClient<'_>` for subscriptions and retained publishes,
+/// and a `bool` that is `true` for a clean session.
+type OnConnectCallback =
+    Box<dyn Fn(&mut EspMqttClient<'_>, bool) -> anyhow::Result<()> + Send + 'static>;
+
+/// Callback invoked for each incoming message with `(topic, payload)`.
+type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
+
+/// Builder for a persistent, auto-reconnecting MQTT manager.
+///
+/// Use [`MqttBuilder::new`] to obtain a builder, configure callbacks, then
+/// call [`build`](MqttBuilder::build) to start the background event loop and
+/// receive an [`MqttHandle`].
+///
+/// # Reconnection
+///
+/// The underlying `EspMqttClient` reconnects automatically.
+/// [`on_connect`](MqttBuilder::on_connect) is called on every (re)connect;
+/// use it for subscriptions and retained-state publishes.
+///
+/// # Thread safety
+///
+/// The [`MqttHandle`] returned by `build` is cheaply cloneable and safe to
+/// use from any thread.
+/// When the last clone is dropped the event loop exits at the next MQTT
+/// event boundary.
+///
+/// # Example
+///
+/// ```ignore
+/// use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig, LwtConfig};
+/// use esp_idf_svc::mqtt::client::QoS;
+///
+/// let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
+///
+/// let handle = MqttBuilder::new(config)
+///     .on_connect(|client, _is_clean| {
+///         client.subscribe("commands/#", QoS::AtLeastOnce)?;
+///         client.enqueue("device/status", QoS::AtLeastOnce, true, b"online")?;
+///         Ok(())
+///     })
+///     .on_disconnect(|| log::warn!("MQTT disconnected"))
+///     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
+///     .build()?;
+///
+/// // `build()` returns immediately; connection happens in the background.
+/// handle.publish("events/boot", "ok")?;
+/// ```
+pub struct MqttBuilder<'a> {
+    config: MqttConfig<'a>,
+    on_connect: Option<OnConnectCallback>,
+    on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
+    on_message: Option<OnMessageCallback>,
+}
+
+impl<'a> MqttBuilder<'a> {
+    /// Creates a new builder from the given configuration.
+    pub fn new(config: MqttConfig<'a>) -> Self {
+        Self {
+            config,
+            on_connect: None,
+            on_disconnect: None,
+            on_message: None,
+        }
+    }
+
+    /// Registers a callback invoked on every (re)connect.
+    ///
+    /// `is_clean_session` is `true` when the broker reports a clean session
+    /// (no retained state from a previous session), and `false` when the
+    /// previous session was resumed.
+    ///
+    /// Use the `client` parameter to call `subscribe()` and `enqueue()`.
+    /// Subscriptions placed here are automatically re-established on every
+    /// automatic reconnection.
+    ///
+    /// If the callback returns `Err`, the error is logged with `warn!` and the
+    /// event loop continues.  The next automatic reconnection will invoke the
+    /// callback again.
+    ///
+    /// # Note
+    ///
+    /// The callback is invoked by the event loop thread while it holds
+    /// exclusive access to the MQTT client.  Do **not** call
+    /// [`MqttHandle::publish`] from inside this callback — use
+    /// `client.enqueue()` directly instead.
+    pub fn on_connect<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut EspMqttClient<'_>, bool) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.on_connect = Some(Box::new(f));
+        self
+    }
+
+    /// Registers a callback invoked immediately when the connection drops.
+    ///
+    /// The callback is invoked by the event loop thread and must return
+    /// quickly.  The ESP-IDF layer will attempt to reconnect automatically.
+    pub fn on_disconnect<F>(mut self, f: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        self.on_disconnect = Some(Box::new(f));
+        self
+    }
+
+    /// Registers a callback invoked for each incoming message.
+    ///
+    /// Called with `(topic, payload)` for every `Received` event.
+    pub fn on_message<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &[u8]) + Send + 'static,
+    {
+        self.on_message = Some(Box::new(f));
+        self
+    }
+
+    /// Starts the background event loop and returns an [`MqttHandle`].
+    ///
+    /// Returns immediately — the initial broker connection happens in the
+    /// background.  The caller can start its main loop before the broker is
+    /// reachable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid or if the ESP-IDF
+    /// MQTT client cannot be initialised.
+    pub fn build(self) -> anyhow::Result<MqttHandle> {
+        let config = self.config;
+
+        // Validate configuration fields eagerly so callers get clear errors.
+        validate_broker_host(config.host)
+            .map_err(|e| anyhow::anyhow!("invalid MQTT host: {}", e))?;
+        validate_broker_port(config.port)
+            .map_err(|e| anyhow::anyhow!("invalid MQTT port: {}", e))?;
+        validate_client_id(config.client_id)
+            .map_err(|e| anyhow::anyhow!("invalid MQTT client_id: {}", e))?;
+
+        // Build owned copies of all string fields.
+        // esp_mqtt_client_init() calls strdup() on each of these immediately,
+        // so they only need to live through the EspMqttClient::new() call below.
+        // No Box::leak required.
+        let url = format_broker_url(config.host, config.port);
+        let client_id = config.client_id.to_string();
+        let username = config.username.map(|s| s.to_string());
+        let password = config.password.map(|s| s.to_string());
+        let lwt_topic = config.lwt.as_ref().map(|l| l.topic.to_string());
+        let lwt_payload = config.lwt.as_ref().map(|l| l.payload.to_vec());
+
+        let lwt_cfg = lwt_topic
+            .as_ref()
+            .zip(config.lwt.as_ref())
+            .map(|(topic, lwt)| LwtConfiguration {
+                topic: topic.as_str(),
+                payload: lwt_payload.as_deref().unwrap_or(&[]),
+                qos: lwt.qos,
+                retain: lwt.retain,
+            });
+
+        let mqtt_cfg = MqttClientConfiguration {
+            client_id: Some(client_id.as_str()),
+            keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
+            lwt: lwt_cfg,
+            username: username.as_deref(),
+            password: password.as_deref(),
+            ..Default::default()
+        };
+
+        let (client, mut connection) =
+            EspMqttClient::new(&url, &mqtt_cfg).context("failed to create EspMqttClient")?;
+        // url, client_id, username, password, lwt_topic, lwt_payload and mqtt_cfg
+        // are all dropped here — the C library has already strdup'd what it needs.
+
+        let shared_client = Arc::new(Mutex::new(client));
+        let client_for_thread = Arc::clone(&shared_client);
+
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_for_thread = Arc::clone(&connected);
+        let connected_for_handle = Arc::clone(&connected);
+
+        // Alive token: the thread holds a Weak reference; when the last
+        // MqttHandle clone is dropped (taking the Arc<()> refcount to zero),
+        // upgrade() returns None and the event loop exits at the next event.
+        let alive = Arc::new(());
+        let alive_weak = Arc::downgrade(&alive);
+
+        let on_connect = self.on_connect;
+        let on_disconnect = self.on_disconnect;
+        let on_message = self.on_message;
+
+        std::thread::Builder::new()
+            .stack_size(BUILDER_EVENT_LOOP_STACK_SIZE)
+            .spawn(move || {
+                log::info!("[mqtt] builder event loop started");
+                let mut state = MqttConnectionState::Connecting;
+
+                loop {
+                    // Exit when all MqttHandle clones have been dropped.
+                    if alive_weak.upgrade().is_none() {
+                        log::info!("[mqtt] all handles dropped, exiting event loop");
+                        break;
+                    }
+
+                    let event = match connection.next() {
+                        Ok(e) => e,
+                        Err(_) => {
+                            log::info!("[mqtt] builder event loop: connection closed, exiting");
+                            break;
+                        }
+                    };
+
+                    match event.payload() {
+                        EventPayload::Connected(is_clean) => {
+                            if let Some(next) = next_state(state, MqttEvent::Connected) {
+                                state = next;
+                                connected_for_thread.store(true, Ordering::Release);
+                                log::info!("[mqtt] connected (clean_session={})", is_clean);
+                                if let Some(ref f) = on_connect {
+                                    let mut guard = client_for_thread.lock().unwrap();
+                                    if let Err(e) = f(&mut guard, is_clean) {
+                                        log::warn!("[mqtt] on_connect callback failed: {:#}", e);
+                                    }
+                                }
+                            }
+                        }
+                        EventPayload::Disconnected => {
+                            if let Some(next) = next_state(state, MqttEvent::Disconnected) {
+                                state = next;
+                                connected_for_thread.store(false, Ordering::Release);
+                                log::info!("[mqtt] disconnected");
+                                if let Some(ref f) = on_disconnect {
+                                    f();
+                                }
+                            }
+                        }
+                        EventPayload::Received {
+                            data,
+                            topic: Some(topic_str),
+                            ..
+                        } => {
+                            if let Some(ref f) = on_message {
+                                f(topic_str, data);
+                            }
+                        }
+                        EventPayload::Subscribed(id) => {
+                            log::info!("[mqtt] subscription confirmed (id: {})", id);
+                        }
+                        EventPayload::Error(e) => {
+                            log::error!("[mqtt] error: {:?}", e);
+                        }
+                        _ => {}
+                    }
+                }
+
+                log::info!("[mqtt] builder event loop exited");
+            })
+            .context("failed to spawn MQTT builder event loop thread")?;
+
+        Ok(MqttHandle {
+            client: shared_client,
+            connected: connected_for_handle,
+            _alive: alive,
+        })
+    }
+}
+
+/// Cheaply cloneable MQTT handle returned by [`MqttBuilder::build`].
+///
+/// Publish from any thread using `&self`.
+/// When the last clone is dropped the background event loop exits at the
+/// next MQTT event boundary (keepalive pings ensure this happens promptly).
+///
+/// # Example
+///
+/// ```ignore
+/// let handle2 = handle.clone();
+/// std::thread::spawn(move || {
+///     handle2.publish("sensors/temp", "22.5").unwrap();
+/// });
+/// ```
+#[derive(Clone)]
+pub struct MqttHandle {
+    client: Arc<Mutex<EspMqttClient<'static>>>,
+    connected: Arc<AtomicBool>,
+    // Keeps the event loop alive.  When the last clone is dropped the
+    // Arc refcount reaches zero, and the thread's Weak::upgrade() returns
+    // None, causing the event loop to exit.
+    _alive: Arc<()>,
+}
+
+impl MqttHandle {
+    /// Publishes a message with QoS 1 and no retain flag.
+    pub fn publish(&self, topic: &str, payload: &str) -> anyhow::Result<()> {
+        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
+    }
+
+    /// Publishes a retained message with QoS 1.
+    ///
+    /// Retained messages are stored by the broker and delivered to new
+    /// subscribers immediately.  Use for persistent device state (e.g.
+    /// online/offline status).
+    pub fn publish_retained(&self, topic: &str, payload: &str) -> anyhow::Result<()> {
+        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
+    }
+
+    /// Publishes a message with explicit QoS and retain control.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic`   - The topic to publish to
+    /// * `payload` - The message payload
+    /// * `qos`     - Quality of Service level
+    /// * `retain`  - Whether the broker should retain this message
+    pub fn publish_with(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> anyhow::Result<()> {
+        log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
+        let mut guard = self
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
+        guard.enqueue(topic, qos, retain, payload)?;
+        Ok(())
+    }
+
+    /// Returns `true` if the most recent event was `Connected`.
+    ///
+    /// Uses `Ordering::Acquire` to ensure visibility of any state written
+    /// by the event loop thread before the flag was set.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 }
