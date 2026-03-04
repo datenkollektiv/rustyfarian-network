@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rustyfarian-esp-idf-mqtt`: `MqttBuilder` API via `MqttBuilder::new(config)` with `.on_connect()`, `.on_disconnect()`, and `.on_message()` lifecycle callbacks; `on_connect` receives a `bool` indicating whether this is a clean session (no broker-side state preserved), enabling callers to skip redundant re-subscriptions on session resume
+- `rustyfarian-esp-idf-mqtt`: `MqttHandle` returned by `MqttBuilder::build()` — cloneable, thread-safe MQTT handle that accepts `&self` for publish calls from any thread without requiring `&mut` access
+- `rustyfarian-esp-idf-mqtt`: `MqttHandle::is_connected()` for synchronous connection-state polling, replacing the need to infer disconnection from publish-failure counts
+- `rustyfarian-network-pure`: `validate_client_id`, `validate_topic`, `validate_broker_host`, `validate_broker_port` — pure MQTT input validation functions, host-testable
+- `rustyfarian-network-pure`: `format_broker_url` — pure broker URL construction extracted from `MqttManager`
+- `rustyfarian-network-pure`: `MqttConnectionState`, `MqttEvent`, and `next_state()` — pure connection state machine with fully tested transition table, encoding the invariants that `on_connect` never fires while already connected and `on_disconnect` never fires before the first successful connection
 - `lora-pure` crate: platform-independent `no_std` library containing the `LoraRadio` trait, all LoRa/LoRaWAN types (`SpreadingFactor`, `Bandwidth`, `CodingRate`, `TxConfig`, `RxConfig`, `RxWindow`, `RxQuality`), `LorawanDevice`, session types, OTA command parser, and `MockLoraRadio` test double — implements ADR 005 (separate crate per HAL, no mutually exclusive feature flags)
 - `rustyfarian-esp-hal-lora` crate: bare-metal `no_std` stub crate for future ESP-HAL LoRa integration; provides `EspHalLoraRadio<S: StatusLed>` implementing `lora_pure::LoraRadio`; all methods return graceful errors pending hardware integration
 - `justfile`: `check-lora-pure` and `check-lora-hal` recipes for targeted crate checks
@@ -42,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rustyfarian-esp-idf-mqtt`: `MqttBuilder::build()` no longer leaks config strings via `Box::leak`; `esp_mqtt_client_init()` copies credentials with `strdup()` during init, so owned `String` values borrowed only for the constructor call are sufficient — no `'static` lifetime required for config fields
+- `rustyfarian-esp-idf-mqtt`: `MqttConfig` no longer derives `Debug` automatically; a manual `Debug` impl redacts `username` and `password` fields with `"<redacted>"` to prevent credentials appearing in log output (resolves CodeQL `cleartext-logging` alert)
+- `rustyfarian-esp-idf-mqtt`: `MqttManager::new` no longer calls `subscribe()` on an unconnected client; previously, when the broker was unreachable within the timeout, the unconditional subscribe caused ESP-IDF heap corruption that manifested later as a FreeRTOS `heap_caps_free` assertion failure
+- `rustyfarian-esp-idf-mqtt`: `EventPayload::Disconnected` now correctly clears the internal connected flag so connection state is accurate after a broker drop
+- `rustyfarian-esp-idf-mqtt`: thread-spawn failure in `MqttManager::new` now propagates as an `anyhow::Error` instead of panicking with `.expect()`
+- `rustyfarian-esp-idf-mqtt`: all `AtomicBool` accesses on the `connected` and `shutdown` flags upgraded from `Ordering::Relaxed` to `Ordering::Acquire`/`Release` to establish correct happens-before relationships across threads
 - `rustyfarian-esp-idf-mqtt`: `MqttManager::new` no longer logs "MQTT connection timeout" when the broker is unreachable (`ESP_FAIL`); a dedicated `connection_error` flag now distinguishes a definitive connection failure from a genuine timeout, and the loop exits early instead of waiting for the full timeout duration
 - `rustyfarian-network-pure`: `connection_wait_iterations` now uses `u64::div_ceil` instead of manual ceiling division, resolving a `clippy::manual_div_ceil` warning
 - `rustyfarian-network-pure`: `empty_password_is_valid` test suppresses `clippy::unnecessary_owned_empty_strings` via `#[allow]` to preserve the `&String::new()` workaround that prevents CodeQL false-positive "hardcoded credential" alerts
@@ -52,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rustyfarian-esp-idf-mqtt`: `MqttManager::new()` deprecated in favour of `MqttBuilder`; it will be removed in 0.3.0
 - `WiFiManager::new` SSID and password length validation is now performed once by `validate_ssid` / `validate_password` from `rustyfarian-network-pure`; the subsequent `try_into` conversion failure is now treated as an internal invariant violation and includes the actual length and limit for diagnostics
 - `validate_password` error message capitalised to match `validate_ssid` style
 - `rustyfarian-network-pure` crate metadata: removed misleading `"no-std"` category (crate is standard `std` Rust)
