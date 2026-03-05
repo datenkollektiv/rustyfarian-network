@@ -89,6 +89,36 @@ test-lora:
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
 test: test-mqtt test-wifi test-lora
 
+# ── Examples ────────────────────────────────────────────────────────────────
+
+# build a named example in a given crate (release mode)
+build-example crate example:
+    cargo build --release --example {{example}} -p {{crate}}
+
+# build and flash a named example; crate auto-detected from example name
+flash example:
+    scripts/flash.sh "{{example}}"
+
+# build, flash, and open the serial monitor
+run example: (flash example)
+    espflash monitor
+
+# open the serial monitor for an already-flashed device
+monitor:
+    espflash monitor
+
+# convenience: build the blocking Wi-Fi connect example
+build-wifi-connect:
+    just build-example rustyfarian-esp-idf-wifi idf_c3_connect
+
+# convenience: build the non-blocking Wi-Fi connect example
+build-wifi-connect-nonblocking:
+    just build-example rustyfarian-esp-idf-wifi idf_c3_connect_nonblocking
+
+# convenience: build the MQTT builder example
+build-mqtt:
+    just build-example rustyfarian-esp-idf-mqtt idf_c3_mqtt
+
 # full pre-commit verification: format, check, lint (local use only — modifies files)
 pre-commit: fmt check clippy
 

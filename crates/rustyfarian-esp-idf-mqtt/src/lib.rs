@@ -665,7 +665,6 @@ impl<'a> MqttBuilder<'a> {
                         EventPayload::Connected(is_clean) => {
                             if let Some(next) = next_state(state, MqttEvent::Connected) {
                                 state = next;
-                                connected_for_thread.store(true, Ordering::Release);
                                 log::info!("[mqtt] connected (clean_session={})", is_clean);
                                 if let Some(ref f) = on_connect {
                                     let mut guard = client_for_thread.lock().unwrap();
@@ -673,6 +672,11 @@ impl<'a> MqttBuilder<'a> {
                                         log::warn!("[mqtt] on_connect callback failed: {:#}", e);
                                     }
                                 }
+                                // Set connected AFTER the on_connect callback releases the
+                                // mutex.  This prevents publish_with() callers from racing
+                                // for the mutex while on_connect still holds it, which could
+                                // cause both threads to deadlock inside esp_mqtt_client_enqueue.
+                                connected_for_thread.store(true, Ordering::Release);
                             }
                         }
                         EventPayload::Disconnected => {
@@ -779,7 +783,12 @@ impl MqttHandle {
         Ok(())
     }
 
-    /// Returns `true` if the most recent event was `Connected`.
+    /// Returns `true` if the client is connected **and** the `on_connect`
+    /// callback has completed.
+    ///
+    /// The flag is set only after `on_connect` releases the internal mutex,
+    /// so a caller that sees `true` and immediately calls `publish_with()`
+    /// is guaranteed to find the mutex free — no race with the event loop.
     ///
     /// Uses `Ordering::Acquire` to ensure visibility of any state written
     /// by the event loop thread before the flag was set.

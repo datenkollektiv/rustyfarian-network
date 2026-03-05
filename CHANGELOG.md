@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rustyfarian-esp-idf-mqtt`: `MqttHandle::is_connected()` now returns `true` only after the `on_connect` callback has completed and released the internal mutex.
+  Previously the flag was set before the callback ran, creating a race window where a concurrent `publish_with()` caller could try to lock the same mutex while the event loop thread held it, potentially deadlocking both threads inside `esp_mqtt_client_enqueue()`.
+
 ### Changed
 
 - `lora-pure`: `LoraRadio` trait docs clarified — `nb::WouldBlock` semantics, `prepare_*` call ordering, and `prepare_rx` re-entry contract after a failed receive window
