@@ -589,7 +589,12 @@ impl<'a> MqttBuilder<'a> {
         // No Box::leak required.
         let url = format_broker_url(config.host, config.port);
         let client_id = config.client_id.to_string();
+        // codeql[rust/cleartext-logging] - credentials are passed to the MQTT
+        // broker via EspMqttClient::new(); this is required for authentication
+        // and is not a logging operation.  esp_mqtt_client_init() strdup()'s
+        // these values immediately; they are never written to any log sink here.
         let username = config.username.map(|s| s.to_string());
+        // codeql[rust/cleartext-logging]
         let password = config.password.map(|s| s.to_string());
         let lwt_topic = config.lwt.as_ref().map(|l| l.topic.to_string());
         let lwt_payload = config.lwt.as_ref().map(|l| l.payload.to_vec());
