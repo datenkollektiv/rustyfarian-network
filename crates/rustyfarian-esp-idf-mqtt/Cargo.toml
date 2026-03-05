@@ -9,8 +9,17 @@ description = "MQTT client manager for ESP-IDF projects"
 keywords = ["mqtt", "esp-idf", "rustyfarian", "embedded", "iot"]
 categories = ["embedded", "network-programming"]
 
+[build-dependencies]
+embuild.workspace = true
+
 [dependencies]
 rustyfarian-network-pure.workspace = true
 anyhow.workspace = true
 esp-idf-svc.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+rustyfarian-esp-idf-wifi = { path = "../rustyfarian-esp-idf-wifi" }
+
+[[example]]
+name = "idf_c3_mqtt"

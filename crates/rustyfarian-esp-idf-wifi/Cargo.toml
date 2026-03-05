@@ -9,6 +9,15 @@ description = "Wi-Fi connection manager for ESP-IDF projects"
 keywords = ["wifi", "esp-idf", "rustyfarian", "embedded", "iot"]
 categories = ["embedded", "network-programming"]
 
+[[example]]
+name = "idf_c3_connect"
+
+[[example]]
+name = "idf_c3_connect_nonblocking"
+
+[build-dependencies]
+embuild.workspace = true
+
 [dependencies]
 rustyfarian-network-pure.workspace = true
 anyhow.workspace = true

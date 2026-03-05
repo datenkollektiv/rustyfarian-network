@@ -45,6 +45,12 @@ a pattern common in application development but rare in embedded Rust.
 | [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback                                    |
 | [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown                        |
 
+## Examples
+
+```sh
+just run idf_c3_connect
+```
+
 ## Usage
 
 Add to your `Cargo.toml`:

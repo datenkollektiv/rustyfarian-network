@@ -20,6 +20,7 @@ nb = "1"
 rgb = "0.8"
 
 # ESP-IDF dependencies
+embuild = "0.33"
 esp-idf-svc = "0.51"
 esp-idf-hal = "0.45"
 

@@ -34,6 +34,27 @@ with no compiler error to aid diagnosis.
 Fix: always run `just fmt` then `just verify` in that order; see the `## Completion Gate` section
 in `CLAUDE.md`.
 
+**Every crate that builds examples against ESP-IDF must have a `build.rs` that calls `embuild::espidf::sysenv::output()`.**
+`cargo:rustc-link-arg` emitted by `esp-idf-sys`'s build script does **not** automatically propagate
+through transitive dependencies to the final binary linker.
+Without this, `ldproxy` panics with `Cannot locate argument '--ldproxy-linker <linker>'`
+even when the PATH and `RUSTC_LINKER` env var are correctly set.
+`sysenv::output()` reads `DEP_ESP_IDF_SVC_EMBUILD_LINK_ARGS` (set by `esp-idf-svc` via the
+`links = "esp_idf"` propagation chain) and re-emits each entry as `cargo:rustc-link-arg`,
+which reaches the example binary's linker invocation.
+Also required: set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so `embuild` detects
+ldproxy and emits `--ldproxy-linker` as part of those args (not only as metadata).
+
+**`LIBCLANG_PATH` is the only env var from `~/export-esp.sh` needed for riscv32 (ESP32-C3/C6) projects.**
+The riscv32 cross-compiler (`riscv32-esp-elf-gcc`) is managed entirely by `esp-idf-sys`'s CMake build
+and does not need to be on PATH.
+The Xtensa PATH entry in `export-esp.sh` is only relevant for Xtensa targets (ESP32-S2/S3/classic).
+The only missing piece in a fresh shell is `LIBCLANG_PATH`, which `bindgen`/`esp-idf-sys` need to find
+the Clang headers.
+Permanent fix: add `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` to `.envrc`.
+`~/.espup/esp-clang` is a stable symlink created by `espup install` that always points to the
+current versioned `esp-clang/lib` directory, so it survives `espup update` without manual editing.
+
 ---
 
 ## ESP-IDF Event Loop (`esp-idf-svc`)
