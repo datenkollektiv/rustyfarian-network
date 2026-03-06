@@ -1,23 +1,53 @@
 # Roadmap
 
-This document tracks planned improvements and upcoming work for the `rustyfarian-network` workspace.
+*Last updated: March 2026*
 
-Items in **Planned** are accepted and queued for the next development cycle.
-Completed items are documented in `CHANGELOG.md` and archived at the bottom of this file.
+The MQTT Builder API, `lora-pure` crate, `rustyfarian-esp-hal-lora` stub, and first runnable examples (`idf_c3_connect`, `idf_c3_mqtt`) shipped in the last development cycle.
+Multi-chip build and flash support (ESP32-C3/C6 auto-detection, IDF-built bootloader) is in place.
+Near-term focus is TTN v3 EU868 OTAA validation for LoRa and the `idf_esp32_mqtt` example for classic ESP32.
+The dual-HAL WiFi tier (ADR 006 → `wifi-pure` → `rustyfarian-esp-hal-wifi`) is planned for mid-term and fully scoped.
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "cScale0": "#c8f7c5",
+    "cScaleLabel0": "#1b5e20",
+    "cScale1": "#fff3cd",
+    "cScaleLabel1": "#7a5a00",
+    "cScale2": "#e3f2fd",
+    "cScaleLabel2": "#0d47a1"
+  }
+}}%%
+
+timeline
+    title rustyfarian-network Roadmap
+
+    Near term : Multi-chip flash + bootloader fix + script arg guards (done)
+              : lora-pure crate (done)
+              : rustyfarian-esp-hal-lora stub (done)
+              : MQTT Builder API + pure state machine (done)
+              : idf_c3_connect + idf_c3_mqtt examples (done)
+              : idf_esp32_mqtt example — MQTT on classic ESP32 (Xtensa)
+              : Phase 5 — TTN v3 EU868 OTAA validation
+
+    Mid term  : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
+              : no-std WiFi — ADR 006 + wifi-pure + rustyfarian-esp-hal-wifi stub (phases 1–4)
+              : Grow rustyfarian-network-pure — backoff, topic validation, pure extractions
+
+    Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
+              : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
+              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after esp-hal WiFi)
+```
 
 ---
 
-## Planned
+## Near term detail
 
-### LoRa Radio — `rustyfarian-esp-idf-lora` crate
-
-The `rustyfarian-esp-idf-lora` crate has been adopted into the workspace.
-It provides the `LoraRadio` trait, `LorawanDevice<R>` Class A device, OTA downlink command parser,
-session persistence types, and a `MockLoraRadio` test double (37 host-runnable tests).
-The SX1262 hardware driver and the `lorawan-device` state machine bridge are stubs, gracefully degrading.
+### Phase 5 — TTN v3 EU868 OTAA validation
 
 <details>
-<summary><strong>Phase 5 — TTN v3 (EU868) OTAA validation</strong></summary>
+<summary><strong>Validation checklist</strong></summary>
 
 The goal is end-to-end OTAA join + first uplink + first downlink with the least moving parts.
 All steps use TTN v3 EU868.
@@ -89,10 +119,14 @@ All steps use TTN v3 EU868.
 
 </details>
 
-<details>
-<summary><strong>Post-adoption backlog (from code review)</strong></summary>
+---
 
-These were deferred from the initial adoption and can be addressed in follow-up PRs:
+## Mid term detail
+
+### LoRa post-adoption backlog
+
+<details>
+<summary><strong>Deferred items from initial adoption</strong></summary>
 
 | # | Item                                                                              |
 |--:|:----------------------------------------------------------------------------------|
@@ -106,47 +140,12 @@ These were deferred from the initial adoption and can be addressed in follow-up 
 
 </details>
 
----
-
-### no-std / esp-hal LoRa with ws2812 LED status
-
-With `rustyfarian-esp-hal-ws2812` (v0.3.0) complete in the companion repository,
-this workspace extends to a bare-metal LoRa path via a dedicated `rustyfarian-esp-hal-lora` crate.
-Per ADR 005, mutually exclusive HAL backends require separate crates, not feature flags.
-The target structure is:
-
-```
-lora-pure                      — no_std; LoraRadio trait, TxConfig, RxConfig, config types
-rustyfarian-esp-idf-lora       — std; esp-idf-hal; anyhow errors (existing, refactored)
-rustyfarian-esp-hal-lora       — no_std; esp-hal SPI + GPIO; custom error enum (new)
-```
-
-`rustyfarian-esp-hal-lora` accepts `S: StatusLed` for visual join / uplink / downlink feedback
-via the WS2812 LED on the Heltec V3 board — or `NoLed` for headless configurations.
-
-**Items**
-
-- Extract shared types from `rustyfarian-esp-idf-lora` into a new `lora-pure` crate
-- Update `rustyfarian-esp-idf-lora` to depend on `lora-pure`
-- Create `rustyfarian-esp-hal-lora` crate with `EspHalLoraRadio<S: StatusLed>` stub
-- Implement full `EspHalLoraRadio` using `esp-hal` SPI + GPIO
-- Wire `LorawanDevice<EspHalLoraRadio<S>>` end-to-end (prerequisite for Phase 5 TTN validation)
-
----
-
-### `idf_esp32_mqtt` example — MQTT on classic ESP32 (Xtensa)
-
-Add an `idf_esp32_mqtt` example to `rustyfarian-esp-idf-mqtt` targeting `xtensa-esp32-espidf` /
-`MCU=esp32`, as the natural Xtensa parallel to `idf_c3_mqtt`.
-Requires extending `scripts/build-example.sh` and `scripts/flash.sh` with an `esp32` chip case,
-and adding the `xtensa-esp32-espidf` target block to `.cargo/config.toml.dist`.
-
----
-
 ### no-std / esp-hal WiFi
 
-Extend the dual-HAL pattern established by ADR 005 from LoRa to Wi-Fi.
-This mirrors the `lora-pure` + `rustyfarian-esp-idf-lora` + `rustyfarian-esp-hal-lora` structure.
+<details>
+<summary><strong>Scoping and implementation plan</strong></summary>
+
+Extends the dual-HAL pattern (ADR 005) from LoRa to Wi-Fi.
 Target crate layout:
 
 ```
@@ -158,13 +157,13 @@ rustyfarian-esp-hal-wifi     — no_std; esp-hal + esp-wifi 0.14.0; ESP32-C3/C6 
 **Dependency stack (agent-verified, 2026-03-06)**
 
 - `esp-wifi 0.14.0` — production-ready since Dec 2024; supports ESP32-C3 and ESP32-C6;
-  compatible with `esp-hal 1.0.0` (already in workspace); bundles `smoltcp 0.11.0` — no separate version needed
+  compatible with `esp-hal 1.0.0` (already in workspace); bundles `smoltcp 0.11.0`
 - `smoltcp 0.11.0` — `no_std`, `0BSD` licence (**requires adding `"0BSD"` to `deny.toml` allow list**)
 - `minimq 0.8.1` — clear winner for a future `rustyfarian-esp-hal-mqtt` crate;
   designed for embedded + smoltcp; maintained by QUARTIQ; MIT OR Apache-2.0
 - Rejected: `mqttrust` (abandoned 2023), `rust-mqtt` (unmaintained), `paho-mqtt` (EPL-2.0, requires `std`)
 
-**Extractable types for `wifi-pure` (agent audit of `lib.rs`)**
+**Extractable types for `wifi-pure`**
 
 | Symbol                                                                   | Currently in                         | Move to                     |
 |:-------------------------------------------------------------------------|:-------------------------------------|:----------------------------|
@@ -175,9 +174,6 @@ rustyfarian-esp-hal-wifi     — no_std; esp-hal + esp-wifi 0.14.0; ESP32-C3/C6 
 | `wifi_disconnect_reason_name`                                            | `rustyfarian-esp-idf-wifi` (private) | `wifi-pure` (pub, testable) |
 | `SSID_MAX_LEN`, `PASSWORD_MAX_LEN`, `validate_ssid`, `validate_password` | `rustyfarian-network-pure::wifi`     | `wifi-pure`                 |
 | `WiFiManager` and all `esp-idf-svc` types                                | `rustyfarian-esp-idf-wifi`           | stays                       |
-
-`rustyfarian-esp-idf-wifi` re-exports all moved types with `pub use` to preserve the public API surface.
-Migration churn: ~100 lines deleted from `lib.rs`, 6–8 lines added to `wifi-pure/src/lib.rs`, 3-line `pub use` block back in `rustyfarian-esp-idf-wifi`.
 
 **`WifiDriver` trait (proposed surface)**
 
@@ -203,7 +199,7 @@ No `get_ip` in the trait — IP address retrieval is ESP-IDF-specific (`sta_neti
 
 No default features — stub compiles on host without esp-hal.
 
-**Build pipeline additions (agent plan)**
+**Build pipeline additions**
 
 New `justfile` recipes:
 - `check-wifi-pure` — host check for `wifi-pure`
@@ -214,8 +210,6 @@ New `.cargo/config.toml.dist` blocks:
 - `[target.riscv32imc-unknown-none-elf]` — linker `riscv32-esp-elf-gcc`, runner espflash
 - `[target.riscv32imac-unknown-none-elf]` — same
 
-`scripts/build-example.sh` chip-detection extended for `hal_*` prefix → bare-metal target + `--features esp32c3/6`.
-
 **Phased implementation**
 
 1. Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)
@@ -225,15 +219,7 @@ New `.cargo/config.toml.dist` blocks:
 5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
 6. Add `hal_c3_connect` and `hal_c6_connect` examples
 
----
-
-### Grow `rustyfarian-network-pure`
-
-Extract additional platform-independent logic into `rustyfarian-network-pure` so more behaviour
-can be verified on the host without an ESP32 or ESP toolchain.
-
-Candidates include reconnection backoff calculations, MQTT topic validation, and any other
-pure functions that currently live inside the ESP-IDF crates but have no hardware dependency.
+</details>
 
 ---
 
