@@ -1,4 +1,4 @@
-//! MQTT client example for ESP32-C3 using the `MqttBuilder` API.
+//! MQTT client example for ESP32 using the `MqttBuilder` API.
 //!
 //! Demonstrates all three `MqttBuilder` callbacks:
 //!
@@ -22,7 +22,7 @@
 //! | `WIFI_SSID` | `""` | Wi-Fi network name |
 //! | `WIFI_PASS` | `""` | Wi-Fi password |
 //! | `MQTT_HOST` | (required) | MQTT broker IP or hostname |
-//! | `MQTT_CLIENT_ID` | `esp32c3-demo` | Unique device identifier |
+//! | `MQTT_CLIENT_ID` | `esp32-demo` | Unique device identifier |
 //!
 //! With [direnv](https://direnv.net/) and a populated `.envrc`, all variables are set automatically.
 //!
@@ -33,7 +33,7 @@
 //! ```
 //!
 //! ```sh
-//! just flash rustyfarian-esp-idf-mqtt idf_c3_mqtt
+//! just flash rustyfarian-esp-idf-mqtt idf_esp32_mqtt
 //! ```
 
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -56,7 +56,7 @@ const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
 };
 const MQTT_CLIENT_ID: &str = match option_env!("MQTT_CLIENT_ID") {
     Some(id) => id,
-    None => "esp32c3-mqtt",
+    None => "esp32-mqtt",
 };
 
 fn main() -> anyhow::Result<()> {

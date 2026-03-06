@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lora-pure` crate: platform-independent `no_std` library containing the `LoraRadio` trait, all LoRa/LoRaWAN types (`SpreadingFactor`, `Bandwidth`, `CodingRate`, `TxConfig`, `RxConfig`, `RxWindow`, `RxQuality`), `LorawanDevice`, session types, OTA command parser, and `MockLoraRadio` test double — implements ADR 005 (separate crate per HAL, no mutually exclusive feature flags)
 - `rustyfarian-esp-hal-lora` crate: bare-metal `no_std` stub crate for future ESP-HAL LoRa integration; provides `EspHalLoraRadio<S: StatusLed>` implementing `lora_pure::LoraRadio`; all methods return graceful errors pending hardware integration
 - `justfile`: `check-lora-pure` and `check-lora-hal` recipes for targeted crate checks
+- `idf_esp32_mqtt` example for `rustyfarian-esp-idf-mqtt` targeting `xtensa-esp32-espidf` / `MCU=esp32` — the Xtensa parallel to `idf_c3_mqtt`
 
 ### Changed
 
