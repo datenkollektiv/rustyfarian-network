@@ -23,3 +23,6 @@ rustyfarian-esp-idf-wifi = { path = "../rustyfarian-esp-idf-wifi" }
 
 [[example]]
 name = "idf_c3_mqtt"
+
+[[example]]
+name = "idf_esp32_mqtt"

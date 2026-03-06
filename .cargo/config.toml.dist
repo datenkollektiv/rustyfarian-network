@@ -21,6 +21,15 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
+# ESP-IDF for classic ESP32 (xtensa-esp32, dual-core LX6)
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "--cfg", "espidf_time64",
+    "-C", "force-frame-pointers",
+]
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
