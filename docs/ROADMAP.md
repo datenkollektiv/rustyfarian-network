@@ -134,6 +134,99 @@ via the WS2812 LED on the Heltec V3 board — or `NoLed` for headless configurat
 
 ---
 
+### `idf_esp32_mqtt` example — MQTT on classic ESP32 (Xtensa)
+
+Add an `idf_esp32_mqtt` example to `rustyfarian-esp-idf-mqtt` targeting `xtensa-esp32-espidf` /
+`MCU=esp32`, as the natural Xtensa parallel to `idf_c3_mqtt`.
+Requires extending `scripts/build-example.sh` and `scripts/flash.sh` with an `esp32` chip case,
+and adding the `xtensa-esp32-espidf` target block to `.cargo/config.toml.dist`.
+
+---
+
+### no-std / esp-hal WiFi
+
+Extend the dual-HAL pattern established by ADR 005 from LoRa to Wi-Fi.
+This mirrors the `lora-pure` + `rustyfarian-esp-idf-lora` + `rustyfarian-esp-hal-lora` structure.
+Target crate layout:
+
+```
+wifi-pure                    — no_std; WiFiConfig, ConnectMode, WifiDriver trait, disconnect reason map
+rustyfarian-esp-idf-wifi     — std; esp-idf-svc (existing, refactored to depend on wifi-pure)
+rustyfarian-esp-hal-wifi     — no_std; esp-hal + esp-wifi 0.14.0; ESP32-C3/C6 bare-metal
+```
+
+**Dependency stack (agent-verified, 2026-03-06)**
+
+- `esp-wifi 0.14.0` — production-ready since Dec 2024; supports ESP32-C3 and ESP32-C6;
+  compatible with `esp-hal 1.0.0` (already in workspace); bundles `smoltcp 0.11.0` — no separate version needed
+- `smoltcp 0.11.0` — `no_std`, `0BSD` licence (**requires adding `"0BSD"` to `deny.toml` allow list**)
+- `minimq 0.8.1` — clear winner for a future `rustyfarian-esp-hal-mqtt` crate;
+  designed for embedded + smoltcp; maintained by QUARTIQ; MIT OR Apache-2.0
+- Rejected: `mqttrust` (abandoned 2023), `rust-mqtt` (unmaintained), `paho-mqtt` (EPL-2.0, requires `std`)
+
+**Extractable types for `wifi-pure` (agent audit of `lib.rs`)**
+
+| Symbol                                                                   | Currently in                         | Move to                     |
+|:-------------------------------------------------------------------------|:-------------------------------------|:----------------------------|
+| `WiFiConfig<'a>`                                                         | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
+| `ConnectMode`                                                            | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
+| `DEFAULT_TIMEOUT_SECS`                                                   | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
+| `POLL_INTERVAL_MS`                                                       | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
+| `wifi_disconnect_reason_name`                                            | `rustyfarian-esp-idf-wifi` (private) | `wifi-pure` (pub, testable) |
+| `SSID_MAX_LEN`, `PASSWORD_MAX_LEN`, `validate_ssid`, `validate_password` | `rustyfarian-network-pure::wifi`     | `wifi-pure`                 |
+| `WiFiManager` and all `esp-idf-svc` types                                | `rustyfarian-esp-idf-wifi`           | stays                       |
+
+`rustyfarian-esp-idf-wifi` re-exports all moved types with `pub use` to preserve the public API surface.
+Migration churn: ~100 lines deleted from `lib.rs`, 6–8 lines added to `wifi-pure/src/lib.rs`, 3-line `pub use` block back in `rustyfarian-esp-idf-wifi`.
+
+**`WifiDriver` trait (proposed surface)**
+
+```rust
+pub trait WifiDriver {
+    type Error: core::fmt::Debug;
+    fn configure(&mut self, ssid: &str, password: &str) -> Result<(), Self::Error>;
+    fn start(&mut self) -> Result<(), Self::Error>;
+    fn connect(&mut self) -> Result<(), Self::Error>;
+    fn is_connected(&self) -> Result<bool, Self::Error>;
+    fn wait_netif_up(&mut self) -> Result<(), Self::Error>;
+}
+```
+
+No `get_ip` in the trait — IP address retrieval is ESP-IDF-specific (`sta_netif()`).
+
+**`rustyfarian-esp-hal-wifi` chip features**
+
+| Feature   | Cargo target                   | MCU      |
+|:----------|:-------------------------------|:---------|
+| `esp32c3` | `riscv32imc-unknown-none-elf`  | ESP32-C3 |
+| `esp32c6` | `riscv32imac-unknown-none-elf` | ESP32-C6 |
+
+No default features — stub compiles on host without esp-hal.
+
+**Build pipeline additions (agent plan)**
+
+New `justfile` recipes:
+- `check-wifi-pure` — host check for `wifi-pure`
+- `check-wifi-hal` — `cargo check -p rustyfarian-esp-hal-wifi --no-default-features`
+- `test-wifi` — `cargo test -p wifi-pure --features mock`
+
+New `.cargo/config.toml.dist` blocks:
+- `[target.riscv32imc-unknown-none-elf]` — linker `riscv32-esp-elf-gcc`, runner espflash
+- `[target.riscv32imac-unknown-none-elf]` — same
+
+`scripts/build-example.sh` chip-detection extended for `hal_*` prefix → bare-metal target + `--features esp32c3/6`.
+
+**Phased implementation**
+
+1. Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)
+2. Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports
+3. Create `rustyfarian-esp-hal-wifi` stub (compile-only, `EspHalWifiManager` returns errors)
+4. Add `check-wifi-pure`, `check-wifi-hal`, `test-wifi` to `justfile`; add bare-metal target blocks to config dist
+5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
+6. Add `hal_c3_connect` and `hal_c6_connect` examples
+
+---
+
 ### Grow `rustyfarian-network-pure`
 
 Extract additional platform-independent logic into `rustyfarian-network-pure` so more behaviour

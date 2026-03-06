@@ -75,7 +75,7 @@ pub use led_effects::{SimpleLed, StatusLed};
 const CONNECTED_LED_BRIGHTNESS: u8 = 20;
 
 /// Default connection timeout when none is specified.
-const DEFAULT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Polling interval for connection and IP-readiness checks.
 const POLL_INTERVAL_MS: u64 = 100;
@@ -123,7 +123,7 @@ impl Default for ConnectMode {
 ///
 /// ```ignore
 /// let config = WiFiConfig::new("MyNetwork", "password123")
-///     .with_timeout(30)      // optional: override the 10 s default
+///     .with_timeout(60)      // optional: override the 30 s default
 ///     .connect_nonblocking(); // optional: return immediately from new()
 /// ```
 #[derive(Debug, Clone)]
