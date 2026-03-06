@@ -55,6 +55,23 @@ Permanent fix: add `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` to `.envrc`.
 `~/.espup/esp-clang` is a stable symlink created by `espup install` that always points to the
 current versioned `esp-clang/lib` directory, so it survives `espup update` without manual editing.
 
+**`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader that is incompatible with v5.3.3 app binaries.**
+When `espflash flash` runs without `--bootloader`, it writes its own bundled v5.5.1 bootloader.
+That bootloader uses a different MMU page size (32 KB vs 64 KB in v5.3.3) and may reject the app
+with `Image requires efuse blk rev <= v0.99, but chip is v1.3`.
+Fix: always pass `--bootloader <path>` pointing to the IDF-built bootloader that `esp-idf-sys`
+places at `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin`.
+Also pass `--ignore-app-descriptor` to prevent espflash from performing its own chip-model check.
+See `scripts/flash.sh` for the implemented solution.
+
+**ESP32-C3 requires target `riscv32imc-esp-espidf` and `MCU=esp32c3` — not the C6 defaults.**
+ESP32-C3 is `riscv32imc` (no atomics extension); ESP32-C6 is `riscv32imac`.
+Building with `MCU=esp32c6` and `riscv32imac-esp-espidf` produces an image whose ESP-IDF chip
+metadata (including `max_efuse_blk_rev`) is wrong for the C3.
+The workspace default in `.cargo/config.toml` is C6 because that is the primary RISC-V target,
+but `scripts/flash.sh` and `scripts/build-example.sh` extract the chip from the example name
+(`idf_c3_*` → C3, `idf_c6_*` → C6) and set `MCU` and `--target` accordingly.
+
 ---
 
 ## ESP-IDF Event Loop (`esp-idf-svc`)

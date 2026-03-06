@@ -91,11 +91,11 @@ test: test-mqtt test-wifi test-lora
 
 # ── Examples ────────────────────────────────────────────────────────────────
 
-# build a named example in a given crate (release mode)
-build-example crate example:
-    cargo build --release --example {{example}} -p {{crate}}
+# build a named example; chip and crate auto-detected from example name
+build-example example:
+    scripts/build-example.sh "{{example}}"
 
-# build and flash a named example; crate auto-detected from example name
+# build and flash a named example; chip and crate auto-detected from example name
 flash example:
     scripts/flash.sh "{{example}}"
 
@@ -109,15 +109,22 @@ monitor:
 
 # convenience: build the blocking Wi-Fi connect example
 build-wifi-connect:
-    just build-example rustyfarian-esp-idf-wifi idf_c3_connect
+    just build-example idf_c3_connect
 
 # convenience: build the non-blocking Wi-Fi connect example
 build-wifi-connect-nonblocking:
-    just build-example rustyfarian-esp-idf-wifi idf_c3_connect_nonblocking
+    just build-example idf_c3_connect_nonblocking
 
 # convenience: build the MQTT builder example
 build-mqtt:
-    just build-example rustyfarian-esp-idf-mqtt idf_c3_mqtt
+    just build-example idf_c3_mqtt
+
+# clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
+clean-idf:
+    cargo clean -p rustyfarian-esp-idf-wifi
+    cargo clean -p rustyfarian-esp-idf-mqtt
+    rm -rf target/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
+    rm -rf target/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
 
 # full pre-commit verification: format, check, lint (local use only — modifies files)
 pre-commit: fmt check clippy

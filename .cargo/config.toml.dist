@@ -1,9 +1,21 @@
 [build]
 target = "riscv32imac-esp-espidf"
 
+# ESP-IDF for ESP32-C6 / ESP32-H2 (riscv32imac, with atomics)
+# Note: runner does not open the serial monitor automatically.
+# Use `just monitor` (or `espflash monitor`) to attach after flashing.
 [target.riscv32imac-esp-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "--cfg", "espidf_time64",
+    "-C", "force-frame-pointers",
+]
+
+# ESP-IDF for ESP32-C3 (riscv32imc, no atomics)
+[target.riscv32imc-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --ignore-app-descriptor"
 rustflags = [
     "--cfg", "espidf_time64",
     "-C", "force-frame-pointers",
@@ -15,4 +27,5 @@ build-std = ["std", "panic_abort"]
 [env]
 MCU = "esp32c6"
 # Note: this variable is not used by the pio builder (`cargo build --features pio`)
+# scripts/flash.sh and scripts/build-example.sh override MCU per chip from the example name.
 ESP_IDF_VERSION = "v5.3.3"

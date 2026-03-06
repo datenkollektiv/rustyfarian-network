@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-During internal review of ADR 004 in this project, an incorrect naming rationale was discovered.
+During an internal review of ADR 004 in this project, an incorrect naming rationale was discovered.
 That ADR claimed the crate should retain the name `rustyfarian-esp-idf-lora` despite hosting `esp-hal` support because a sister project's crate (`rustyfarian-esp-idf-ws2812`) uses a single Cargo package with feature flags to support both stacks.
 
 This claim is factually incorrect.
@@ -108,13 +108,13 @@ preserving the semantic accuracy of the semver contract.
 
 Independent research confirmed this pattern across multiple authoritative sources:
 
-| Source | Pattern |
-|:-------|:--------|
-| `embedded-hal` v1.0 (Jan 2024) | Split into `embedded-hal`, `embedded-hal-async`, `embedded-hal-nb`, `embedded-hal-bus` — one crate per execution model, not feature flags |
-| `esp-rs` organization | `esp-idf-hal` and `esp-hal` are entirely separate packages with separate version histories |
-| WS2812 ecosystem | `ws2812-esp32-rmt-driver` (esp-idf) and `esp-hal-smartled` (esp-hal) — separate crates; the former's README explicitly directs `esp-hal` users to the latter |
-| `lora-phy` / `lora-rs` | Workspace of focused `no_std` crates; hardware integration via trait implementation, not feature flags |
-| Rust API Guidelines (C-FEATURE) | Features must be additive and named directly; mutually exclusive backends violate this rule |
+| Source                          | Pattern                                                                                                                                                      |
+|:--------------------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `embedded-hal` v1.0 (Jan 2024)  | Split into `embedded-hal`, `embedded-hal-async`, `embedded-hal-nb`, `embedded-hal-bus` — one crate per execution model, not feature flags                    |
+| `esp-rs` organization           | `esp-idf-hal` and `esp-hal` are entirely separate packages with separate version histories                                                                   |
+| WS2812 ecosystem                | `ws2812-esp32-rmt-driver` (esp-idf) and `esp-hal-smartled` (esp-hal) — separate crates; the former's README explicitly directs `esp-hal` users to the latter |
+| `lora-phy` / `lora-rs`          | Workspace of focused `no_std` crates; hardware integration via trait implementation, not feature flags                                                       |
+| Rust API Guidelines (C-FEATURE) | Features must be additive and named directly; mutually exclusive backends violate this rule                                                                  |
 
 Detailed source citations are available in
 [`docs/hal-naming-and-packaging-conventions.md`](../hal-naming-and-packaging-conventions.md).

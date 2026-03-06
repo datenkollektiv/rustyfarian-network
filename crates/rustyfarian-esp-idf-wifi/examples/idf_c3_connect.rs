@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     let config = WiFiConfig::new(ssid, password);
     let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), config)?;
 
-    match wifi.get_ip(10_000)? {
+    match wifi.get_ip(30_000)? {
         Some(ip) => log::info!("Connected — IP address: {}", ip),
         None => log::error!("IP address not assigned within timeout"),
     }
