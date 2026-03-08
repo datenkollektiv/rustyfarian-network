@@ -38,7 +38,19 @@ MCU="$mcu" cargo build --release --target "$target" --example "$example" -p "$pk
 
 # Use the IDF-built bootloader; espflash 4.x bundles v5.5.1 which is incompatible
 # with v5.3.3 binaries.
-bl=$(ls -t "$PWD/target/$target/release/build/esp-idf-sys-"*/out/build/bootloader/bootloader.bin 2>/dev/null | head -1 || true)
+bl_candidates=( "$PWD/target/$target/release/build"/esp-idf-sys-*/out/build/bootloader/bootloader.bin )
+bl=""
+if [ ${#bl_candidates[@]} -gt 0 ] && [ -e "${bl_candidates[0]}" ]; then
+    if [ ${#bl_candidates[@]} -gt 1 ]; then
+        printf 'Error: multiple IDF-built bootloaders found for target "%s".\n' "$target" >&2
+        printf 'Please clean old builds or remove unused esp-idf-sys-* build directories.\nCandidates:\n' >&2
+        for cand in "${bl_candidates[@]}"; do
+            printf '  %s\n' "$cand" >&2
+        done
+        exit 1
+    fi
+    bl="${bl_candidates[0]}"
+fi
 if [ -n "$bl" ]; then
     printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
     espflash flash --bootloader "$bl" --ignore-app-descriptor "target/$target/release/examples/$example"
