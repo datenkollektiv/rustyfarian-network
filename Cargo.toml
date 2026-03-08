@@ -23,10 +23,12 @@ rgb = "0.8"
 embuild = "0.33"
 esp-idf-svc = "0.51"
 esp-idf-hal = "0.45"
+embedded-hal = "1"
 
 # LoRa / LoRaWAN dependencies
 heapless = "0.8"
 lorawan-device = { version = "0.12", default-features = false, features = ["default-crypto", "region-eu868", "region-us915"] }
+lora-modulation = "0.1"
 sx126x = "0.3"
 
 # Cross-repo dependency (for Wi-Fi LED status)

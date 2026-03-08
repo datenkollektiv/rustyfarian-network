@@ -1,9 +1,7 @@
 //! SX1262 radio driver for the Heltec WiFi LoRa 32 V3.
 //!
 //! [`EspIdfLoraRadio`] implements [`lora_pure::LoraRadio`] using `sx126x 0.3` and
-//! ESP-IDF SPI.  An internal `LoraRadioAdapter` (commented out below) will
-//! bridge `EspIdfLoraRadio` to `lorawan-device`'s `PhyRxTx + Timings` traits
-//! once the API is confirmed on hardware.
+//! ESP-IDF SPI.
 //!
 //! # SPI2 pin assignments (Heltec WiFi LoRa 32 V3)
 //!
@@ -35,27 +33,42 @@
 //!     dio1.subscribe(|| { DIO1_FLAG.store(true, Ordering::Release); })?;
 //! }
 //! dio1.enable_interrupt()?;
-//! // After DIO1 fires: re-arm with dio1.enable_interrupt() from task context.
 //! ```
 //!
-//! # Critical mapping table (implement before RF testing)
+//! The main loop polls `DIO1_FLAG` and delivers `RadioEvent(Phy(()))` to the
+//! lorawan-device state machine when it fires.
 //!
-//! Both `lorawan-device` and `sx126x` define independent enums for SF, BW, CR.
-//! Map them explicitly in the `prepare_tx` implementation — no automatic
-//! conversion exists. EU868 DR0 = SF12, BW125, CR4/5.
+//! # TCXO note
 //!
-//! # Implementation status
+//! The Heltec V3 uses a TCXO (32 MHz) powered from DIO3.
+//! Without `tcxo_opts` in `Config`, `init()` succeeds silently but produces no RF output.
+//! Always pass `tcxo_opts: Some((TcxoVoltage::Volt1_8, TcxoDelay::from_ms(5)))`.
 //!
-//! This driver returns `Err(LoraError::RadioInitFailed)` from all methods.
-//! The constructor always returns `Err`.
-//! Beekeeper wraps the result in `Option<>` and boots without LoRa until this
-//! implementation is completed (see HIGH RISK note in `docs/phase-5-plan.md`).
+//! # IQ inversion
 //!
-//! Implementation milestones:
-//! 1. Verify SPI communication: read GetStatus register, confirm chip responds.
-//! 2. Implement `prepare_tx` / `transmit` / `prepare_rx` / `receive`.
-//! 3. Implement `LoraRadioAdapter` PhyRxTx bridge (read lorawan-device/tests/class_a.rs first).
-//! 4. Wire up OTAA join in beekeeper main loop.
+//! LoRaWAN uplinks use standard IQ; downlinks use inverted IQ.
+//! `prepare_rx` sets the inverted flag before each RX window.
+//! `prepare_tx` restores standard IQ before each uplink.
+
+use embedded_hal::digital::OutputPin;
+use esp_idf_hal::{
+    gpio::{Gpio12, Gpio13, Gpio14, GpioError, Input, Output, PinDriver},
+    spi::{SpiDeviceDriver, SpiDriver},
+};
+use sx126x::{
+    calc_rf_freq,
+    conf::Config,
+    op::{
+        calib::CalibParam,
+        irq::{IrqMask, IrqMaskBit},
+        modulation::{LoRaBandWidth, LoRaSpreadFactor, LoraCodingRate, LoraModParams},
+        packet::{LoRaCrcType, LoRaHeaderType, LoRaInvertIq, LoRaPacketParams, PacketType},
+        rxtx::{DeviceSel, PaConfig, RampTime, RxTxTimeout, TxParams},
+        tcxo::{TcxoDelay, TcxoVoltage},
+        StandbyConfig,
+    },
+    SX126x,
+};
 
 use lora_pure::config::LoraConfig;
 use lora_pure::{
@@ -71,6 +84,8 @@ pub enum LoraError {
     SpiInitFailed,
     /// Radio hardware not responding or configuration rejected.
     RadioInitFailed,
+    /// RF configuration contains an unsupported spreading factor, bandwidth, or coding rate.
+    InvalidRfConfig,
     /// Frame transmission failed.
     TransmitFailed,
     /// Frame reception failed.
@@ -88,6 +103,7 @@ impl core::fmt::Display for LoraError {
         match self {
             Self::SpiInitFailed => write!(f, "SPI init failed"),
             Self::RadioInitFailed => write!(f, "radio init failed"),
+            Self::InvalidRfConfig => write!(f, "unsupported RF config (SF/BW/CR)"),
             Self::TransmitFailed => write!(f, "transmit failed"),
             Self::ReceiveFailed => write!(f, "receive failed"),
             Self::Timeout => write!(f, "radio timeout"),
@@ -97,95 +113,347 @@ impl core::fmt::Display for LoraError {
     }
 }
 
-// ─── EspIdfLoraRadio ─────────────────────────────────────────────────────────────
+// ─── Type aliases ─────────────────────────────────────────────────────────────
+
+type SpiBus<'d> = SpiDeviceDriver<'d, SpiDriver<'d>>;
+type RstPin<'d> = PinDriver<'d, Gpio12, Output>;
+type BusyPin<'d> = PinDriver<'d, Gpio13, Input>;
+type Dio1Pin<'d> = PinDriver<'d, Gpio14, Input>;
+
+// ─── EspIdfLoraRadio ─────────────────────────────────────────────────────────
 
 /// SX1262 radio driver for the Heltec WiFi LoRa 32 V3.
 ///
-/// Owns the SX126x configuration handle and the SPI device driver together.
-/// `sx126x 0.3` passes `&mut spi` on every call but `LoraRadio`/`PhyRxTx` methods
-/// receive no SPI parameter — owning both in one struct avoids borrow conflicts.
+/// Owns the SX126x handle together with the SPI device driver.
+/// `sx126x 0.3` takes ownership of the SPI device — owning everything in one
+/// struct avoids borrow conflicts during `LoraRadio` method calls.
 ///
-/// # Implementation status
+/// # Antenna pin (`ANT`)
 ///
-/// [`new`][Self::new] currently returns `Err(LoraError::RadioInitFailed)`.
-/// The struct fields below (`_radio`, `_spi`) will become the live `sx126x::SX126x`
-/// handle and `SpiDeviceDriver` once the hardware API is confirmed.
-pub struct EspIdfLoraRadio {
-    // TODO: Replace these placeholders with the real driver fields:
-    //   radio: sx126x::SX126x<PinDriver<'static, Gpio8, Output>, ...>,
-    //   spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
+/// The SX126x constructor requires an antenna GPIO, but the Heltec V3 controls
+/// the RF switch internally via `SetDio2AsRfSwitchCtrl` (called by `init()`).
+/// Pass any spare output GPIO held high — the pin value is never used by `init()`.
+pub struct EspIdfLoraRadio<'d, ANT> {
+    radio: SX126x<SpiBus<'d>, RstPin<'d>, BusyPin<'d>, ANT, Dio1Pin<'d>>,
     last_rssi: i16,
     last_snr: i8,
+    /// Wall-clock time at which the last `set_tx()` was issued.
+    /// Used to report measured on-air time when `TxDone` fires.
+    tx_start: Option<std::time::Instant>,
 }
 
-impl EspIdfLoraRadio {
-    /// Attempt to initialise the SX1262.
+impl<'d, ANT> EspIdfLoraRadio<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    /// Initialise the SX1262 and return a ready-to-use radio driver.
     ///
-    /// Currently returns `Err(LoraError::RadioInitFailed)` — see module-level
-    /// implementation status note. Pass the live ESP-IDF peripherals once the
-    /// `sx126x 0.3` constructor API is verified on hardware.
+    /// # Parameters
     ///
-    /// Expected final signature (subject to sx126x 0.3 API verification):
-    /// ```rust,ignore
-    /// pub fn new(
-    ///     spi: SpiDeviceDriver<'static, SpiDriver<'static>>,
-    ///     cs:   PinDriver<'static, Gpio8,  Output>,
-    ///     rst:  PinDriver<'static, Gpio12, Output>,
-    ///     busy: PinDriver<'static, Gpio13, Input>,
-    ///     dio1: PinDriver<'static, Gpio14, Input>,
-    ///     config: &LoraConfig,
-    /// ) -> Result<Self, LoraError>
-    /// ```
-    pub fn new(_config: &LoraConfig) -> Result<Self, LoraError> {
-        // Step 1 (to implement): init SPI2 at SPI mode 0, 8 MHz.
-        // Step 2 (to implement): call SX126x::new(cs, rst, busy, dio1).
-        // Step 3 (to implement): call radio.init(&mut spi) to verify communication.
-        //   Confirm by reading GetStatus — log the result before proceeding.
-        // Step 4 (to implement): configure packet type, sync word, DIO1 IRQ mask.
-        //
-        // See docs/phase-5-plan.md §"sx1262_driver.rs" for the full init sequence.
-        log::warn!(
-            "SX1262 driver: hardware integration pending — \
-             LoRa will be unavailable until the PhyRxTx bridge is implemented. \
-             Wi-Fi OTA continues normally."
-        );
-        Err(LoraError::RadioInitFailed)
+    /// - `spi` — SPI device driver configured for SPI mode 0 at 8 MHz with GPIO 8 as CS.
+    /// - `rst` — GPIO 12 configured as output (active-low reset).
+    /// - `busy` — GPIO 13 configured as input.
+    /// - `ant` — spare output GPIO held high; DIO2 controls the RF switch internally.
+    /// - `dio1` — GPIO 14 configured as input; the caller's ISR sets a shared flag on
+    ///   rising edge, which the main loop delivers as a `Phy(())` event.
+    /// - `_config` — LoRaWAN credentials (used by the LoRaWAN layer, not the radio driver).
+    pub fn new(
+        spi: SpiBus<'d>,
+        rst: RstPin<'d>,
+        busy: BusyPin<'d>,
+        ant: ANT,
+        dio1: Dio1Pin<'d>,
+        _config: &LoraConfig,
+    ) -> Result<Self, LoraError> {
+        let mut radio = SX126x::new(spi, (rst, busy, ant, dio1));
+        radio
+            .init(heltec_v3_eu868_config())
+            .map_err(|_| LoraError::RadioInitFailed)?;
+        log::info!("SX1262 initialized");
+        Ok(Self {
+            radio,
+            last_rssi: 0,
+            last_snr: 0,
+            tx_start: None,
+        })
+    }
+
+    /// Return the radio to RC-oscillator standby, aborting any in-progress RX or TX.
+    ///
+    /// Best-effort: errors are ignored since this is called during cancellation paths
+    /// where we want to reset state regardless.
+    pub fn cancel_rx(&mut self) {
+        let _ = self.radio.set_standby(StandbyConfig::StbyRc);
+        let _ = self.radio.clear_irq_status(IrqMask::all());
+        self.tx_start = None;
     }
 }
 
-impl LoraRadio for EspIdfLoraRadio {
+/// Build the EU868 `Config` for the Heltec WiFi LoRa 32 V3.
+///
+/// Initialises at DR0 (SF12/BW125/CR4-5) with TCXO enabled.
+/// Callers may re-issue `set_mod_params` to switch data rate before each frame.
+fn heltec_v3_eu868_config() -> Config {
+    let irq_mask = IrqMask::none()
+        .combine(IrqMaskBit::TxDone)
+        .combine(IrqMaskBit::RxDone)
+        .combine(IrqMaskBit::CrcErr)
+        .combine(IrqMaskBit::Timeout);
+
+    Config {
+        packet_type: PacketType::LoRa,
+
+        // LoRaWAN public network sync word for SX1262.
+        // 0x3444 for SX1262 — NOT 0x34 as used by SX1276.
+        sync_word: 0x3444,
+
+        calib_param: CalibParam::all(),
+
+        // EU868 DR0: SF12, BW125, CR4/5.
+        // LDRO is mandatory at SF12/BW125 — symbol duration is ~524 ms (> 16 ms threshold).
+        mod_params: LoraModParams::default()
+            .set_spread_factor(LoRaSpreadFactor::SF12)
+            .set_bandwidth(LoRaBandWidth::BW125)
+            .set_coding_rate(LoraCodingRate::CR4_5)
+            .set_low_dr_opt(true)
+            .into(),
+
+        pa_config: PaConfig::default()
+            .set_pa_duty_cycle(0x04)
+            .set_hp_max(0x07)
+            .set_device_sel(DeviceSel::SX1262),
+
+        // Initial packet params for uplinks (IQ=Standard).
+        // Re-issue set_packet_params() with IQ=Inverted before each RX window.
+        packet_params: Some(
+            LoRaPacketParams::default()
+                .set_preamble_len(8)
+                .set_header_type(LoRaHeaderType::VarLen)
+                .set_payload_len(255)
+                .set_crc_type(LoRaCrcType::CrcOn)
+                .set_invert_iq(LoRaInvertIq::Standard)
+                .into(),
+        ),
+
+        tx_params: TxParams::default()
+            .set_power_dbm(14)
+            .set_ramp_time(RampTime::Ramp200u),
+
+        dio1_irq_mask: irq_mask,
+        dio2_irq_mask: IrqMask::none(),
+        dio3_irq_mask: IrqMask::none(),
+
+        // set_rf_frequency() takes a PLL register value — use calc_rf_freq(), never raw Hz.
+        rf_freq: calc_rf_freq(868_100_000.0, 32_000_000.0),
+        rf_frequency: 868_100_000,
+
+        // CRITICAL: without tcxo_opts, init() succeeds but produces no RF output.
+        tcxo_opts: Some((TcxoVoltage::Volt1_8, TcxoDelay::from_ms(5))),
+    }
+}
+
+// ─── LoraRadio impl ───────────────────────────────────────────────────────────
+
+impl<'d, ANT> LoraRadio for EspIdfLoraRadio<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
     type Error = LoraError;
 
     fn prepare_tx(&mut self, config: TxConfig, buf: &[u8]) -> Result<(), LoraError> {
-        // TODO: Map `TxConfig` → sx126x `PacketConfig`.
-        // See `sf_to_sx126x`, `bw_to_sx126x`, `cr_to_sx126x` helpers below.
-        // Call: radio.set_packet_params(), radio.set_rf_frequency(),
-        //        radio.set_tx_params(), radio.write_buffer()
-        let _ = (config, buf);
-        Err(LoraError::RadioInitFailed)
+        let mod_params = LoraModParams::default()
+            .set_spread_factor(sf_to_sx126x(config.sf))
+            .set_bandwidth(bw_to_sx126x(config.bw))
+            .set_coding_rate(cr_to_sx126x(config.cr))
+            .set_low_dr_opt(ldro_required(config.sf, config.bw))
+            .into();
+        self.radio
+            .set_mod_params(mod_params)
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        let pkt_params = LoRaPacketParams::default()
+            .set_preamble_len(8)
+            .set_header_type(LoRaHeaderType::VarLen)
+            .set_payload_len(buf.len() as u8)
+            .set_crc_type(LoRaCrcType::CrcOn)
+            .set_invert_iq(LoRaInvertIq::Standard)
+            .into();
+        self.radio
+            .set_packet_params(pkt_params)
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        let rf_freq = calc_rf_freq(config.freq_hz as f32, 32_000_000.0);
+        self.radio
+            .set_rf_frequency(rf_freq)
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        self.radio
+            .write_buffer(0x00, buf)
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        // Apply TX power from the lorawan-device request (ADR / join / retry levels).
+        let tx_params = TxParams::default()
+            .set_power_dbm(config.power_dbm)
+            .set_ramp_time(RampTime::Ramp200u);
+        self.radio
+            .set_tx_params(tx_params)
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        // Start TX.  DIO1 fires when transmission is complete.
+        // 6 000 ms is a conservative upper bound that covers SF12/BW125 at maximum
+        // LoRaWAN payload length with margin.  Using 0 (infinite) risks an unrecoverable
+        // hang if DIO1 never fires due to a wiring or IRQ-mask issue.
+        self.tx_start = Some(std::time::Instant::now());
+        self.radio
+            .set_tx(RxTxTimeout::from_ms(6_000))
+            .map_err(|_| LoraError::TransmitFailed)?;
+
+        Ok(())
     }
 
+    /// Poll for TX completion.
+    ///
+    /// Called from the `PhyRxTx::handle_event(Phy(()))` handler after DIO1 fires.
+    /// The main loop clears `DIO1_FLAG` before delivering the `Phy` event, so
+    /// this function reads IRQ status directly rather than re-checking the flag.
     fn transmit(&mut self) -> nb::Result<u32, LoraError> {
-        // TODO: radio.set_tx(timeout), poll DIO1_FLAG, return Ok(on_air_ms).
-        Err(nb::Error::Other(LoraError::RadioInitFailed))
+        let irq = self
+            .radio
+            .get_irq_status()
+            .map_err(|_| nb::Error::Other(LoraError::IrqStatusReadFailed))?;
+        self.radio
+            .clear_irq_status(IrqMask::all())
+            .map_err(|_| nb::Error::Other(LoraError::TransmitFailed))?;
+
+        if irq.timeout() {
+            self.tx_start = None;
+            return Err(nb::Error::Other(LoraError::Timeout));
+        }
+        if !irq.tx_done() {
+            return Err(nb::Error::WouldBlock);
+        }
+
+        let on_air_ms = self
+            .tx_start
+            .take()
+            .map(|t| t.elapsed().as_millis() as u32)
+            .unwrap_or(0);
+        Ok(on_air_ms)
     }
 
     fn prepare_rx(&mut self, config: RxConfig, window: RxWindow) -> Result<(), LoraError> {
-        // TODO: Map `RxConfig` → PacketConfig, set frequency, call radio.set_rx().
-        let _ = (config, window);
-        Err(LoraError::RadioInitFailed)
+        // `window` is informational only here: lorawan-device already encodes the correct
+        // frequency and data rate for RX1 vs RX2 in `config`, so no further dispatch is needed.
+        // The adapter passes it through for logging.
+        log::debug!(
+            "prepare_rx: window={:?} freq={}Hz sf={:?} bw={:?}",
+            window,
+            config.freq_hz,
+            config.sf,
+            config.bw
+        );
+        let mod_params = LoraModParams::default()
+            .set_spread_factor(sf_to_sx126x(config.sf))
+            .set_bandwidth(bw_to_sx126x(config.bw))
+            .set_coding_rate(cr_to_sx126x(config.cr))
+            .set_low_dr_opt(ldro_required(config.sf, config.bw))
+            .into();
+        self.radio
+            .set_mod_params(mod_params)
+            .map_err(|_| LoraError::ReceiveFailed)?;
+
+        // Downlinks always use inverted IQ — this differentiates them from uplinks.
+        let pkt_params = LoRaPacketParams::default()
+            .set_preamble_len(8)
+            .set_header_type(LoRaHeaderType::VarLen)
+            .set_payload_len(255)
+            .set_crc_type(LoRaCrcType::CrcOn)
+            .set_invert_iq(LoRaInvertIq::Inverted)
+            .into();
+        self.radio
+            .set_packet_params(pkt_params)
+            .map_err(|_| LoraError::ReceiveFailed)?;
+
+        let rf_freq = calc_rf_freq(config.freq_hz as f32, 32_000_000.0);
+        self.radio
+            .set_rf_frequency(rf_freq)
+            .map_err(|_| LoraError::ReceiveFailed)?;
+
+        // Open the RX window immediately.  DIO1 fires when a packet arrives or the
+        // window times out (SX1262 hardware timeout after RX_WINDOW_DURATION_MS).
+        self.radio
+            .set_rx(RxTxTimeout::from_ms(lora_pure::RX_WINDOW_DURATION_MS))
+            .map_err(|_| LoraError::ReceiveFailed)?;
+
+        Ok(())
     }
 
+    /// Poll for a received packet.
+    ///
+    /// Called from the `PhyRxTx::handle_event(Phy(()))` handler after DIO1 fires.
+    /// The main loop clears `DIO1_FLAG` before delivering the `Phy` event, so
+    /// this function reads IRQ status directly rather than re-checking the flag.
     fn receive(&mut self, buf: &mut [u8]) -> nb::Result<(usize, RxQuality), LoraError> {
-        // TODO: Check DIO1_FLAG, read IRQ status, read FIFO, get packet status.
-        let _ = buf;
-        Err(nb::Error::Other(LoraError::RadioInitFailed))
+        let irq = self
+            .radio
+            .get_irq_status()
+            .map_err(|_| nb::Error::Other(LoraError::IrqStatusReadFailed))?;
+        self.radio
+            .clear_irq_status(IrqMask::all())
+            .map_err(|_| nb::Error::Other(LoraError::ReceiveFailed))?;
+
+        if irq.timeout() {
+            // RX window expired with no packet — terminal outcome for this window.
+            return Err(nb::Error::Other(LoraError::Timeout));
+        }
+        if irq.crc_err() {
+            return Err(nb::Error::Other(LoraError::ReceiveFailed));
+        }
+        if !irq.rx_done() {
+            return Err(nb::Error::WouldBlock);
+        }
+
+        let status = self
+            .radio
+            .get_rx_buffer_status()
+            .map_err(|_| nb::Error::Other(LoraError::ReceiveFailed))?;
+        let len = status.payload_length_rx() as usize;
+        let offset = status.rx_start_buffer_pointer();
+
+        // Reject frames larger than the caller's buffer.  A truncated LoRaWAN frame
+        // always fails its MIC check, so passing partial data upward has no value.
+        // In practice the lorawan-device adapter always passes a 256-byte buffer
+        // (the LoRaWAN max PHY payload), so this guard is purely defensive.
+        if len > buf.len() {
+            log::warn!(
+                "receive: payload {} bytes exceeds buffer {} bytes — dropping frame",
+                len,
+                buf.len()
+            );
+            return Err(nb::Error::Other(LoraError::ReceiveFailed));
+        }
+
+        self.radio
+            .read_buffer(offset, &mut buf[..len])
+            .map_err(|_| nb::Error::Other(LoraError::ReceiveFailed))?;
+
+        let (rssi, snr) = self
+            .radio
+            .get_packet_status()
+            .ok()
+            .map(|s| (s.rssi_pkt() as i16, s.snr_pkt() as i8))
+            .unwrap_or((0, 0));
+        self.last_rssi = rssi;
+        self.last_snr = snr;
+
+        Ok((len, RxQuality { rssi, snr }))
     }
 
     fn set_frequency(&mut self, freq_hz: u32) -> Result<(), LoraError> {
-        // TODO: radio.set_rf_frequency(freq_hz, &mut self.spi)
-        let _ = freq_hz;
-        Err(LoraError::RadioInitFailed)
+        let rf_freq = calc_rf_freq(freq_hz as f32, 32_000_000.0);
+        self.radio
+            .set_rf_frequency(rf_freq)
+            .map_err(|_| LoraError::RadioInitFailed)
     }
 
     fn rx_quality(&self) -> RxQuality {
@@ -205,80 +473,242 @@ impl LoraRadio for EspIdfLoraRadio {
 }
 
 // ─── SF/BW/CR mapping helpers ─────────────────────────────────────────────────
-//
-// These will be called from `prepare_tx` once sx126x 0.3 is wired up.
-// EU868 DR0: SF12, BW125, CR4/5.
-// Verify the sx126x crate's exact enum variants before use — they differ from
-// other LoRa crates and must not be assumed.
 
-/// Map our `SpreadingFactor` to the numeric SF value for sx126x.
-///
-/// Replace the `u8` return with the `sx126x` SF enum type once the API is confirmed.
-#[allow(dead_code)]
-fn sf_to_sx126x(sf: SpreadingFactor) -> u8 {
+fn sf_to_sx126x(sf: SpreadingFactor) -> LoRaSpreadFactor {
     match sf {
-        SpreadingFactor::SF7 => 7,
-        SpreadingFactor::SF8 => 8,
-        SpreadingFactor::SF9 => 9,
-        SpreadingFactor::SF10 => 10,
-        SpreadingFactor::SF11 => 11,
-        SpreadingFactor::SF12 => 12,
+        SpreadingFactor::SF7 => LoRaSpreadFactor::SF7,
+        SpreadingFactor::SF8 => LoRaSpreadFactor::SF8,
+        SpreadingFactor::SF9 => LoRaSpreadFactor::SF9,
+        SpreadingFactor::SF10 => LoRaSpreadFactor::SF10,
+        SpreadingFactor::SF11 => LoRaSpreadFactor::SF11,
+        SpreadingFactor::SF12 => LoRaSpreadFactor::SF12,
     }
 }
 
-/// Map our `Bandwidth` to Hz for sx126x (which typically uses Hz values).
-///
-/// Replace `u32` with the `sx126x` BW enum type once the API is confirmed.
-#[allow(dead_code)]
-fn bw_to_sx126x(bw: Bandwidth) -> u32 {
+fn bw_to_sx126x(bw: Bandwidth) -> LoRaBandWidth {
     match bw {
-        Bandwidth::BW125 => 125_000,
-        Bandwidth::BW250 => 250_000,
-        Bandwidth::BW500 => 500_000,
+        Bandwidth::BW125 => LoRaBandWidth::BW125,
+        Bandwidth::BW250 => LoRaBandWidth::BW250,
+        Bandwidth::BW500 => LoRaBandWidth::BW500,
     }
 }
 
-/// Map our `CodingRate` to the sx126x coding rate discriminant.
-///
-/// Replace `u8` with the `sx126x` CR enum type once the API is confirmed.
-#[allow(dead_code)]
-fn cr_to_sx126x(cr: CodingRate) -> u8 {
+fn cr_to_sx126x(cr: CodingRate) -> LoraCodingRate {
     match cr {
-        CodingRate::Cr45 => 1,
-        CodingRate::Cr46 => 2,
-        CodingRate::Cr47 => 3,
-        CodingRate::Cr48 => 4,
+        CodingRate::Cr45 => LoraCodingRate::CR4_5,
+        CodingRate::Cr46 => LoraCodingRate::CR4_6,
+        CodingRate::Cr47 => LoraCodingRate::CR4_7,
+        CodingRate::Cr48 => LoraCodingRate::CR4_8,
     }
+}
+
+/// LDRO is required when: BW=125 kHz and SF≥11, or BW=250 kHz and SF=12.
+fn ldro_required(sf: SpreadingFactor, bw: Bandwidth) -> bool {
+    matches!(
+        (sf, bw),
+        (
+            SpreadingFactor::SF11 | SpreadingFactor::SF12,
+            Bandwidth::BW125
+        ) | (SpreadingFactor::SF12, Bandwidth::BW250)
+    )
 }
 
 // ─── LoraRadioAdapter (PhyRxTx bridge) ────────────────────────────────────────
-//
-// This internal type bridges `LoraRadio` to `lorawan-device`'s `PhyRxTx + Timings`.
-// It is NOT part of the public crate API.
-//
-// Implementation approach:
-// 1. Read `lorawan-device/tests/class_a.rs` to understand the exact `PhyRxTx` API.
-// 2. Implement `PhyRxTx::handle_event(Event::RadioEvent(...))` by checking the
-//    DIO1 flag and routing to the appropriate `LoraRadio` method.
-// 3. Implement `Timings::get_rx_window_offset_ms()` by delegating to `LoraRadio`.
-//
-// If the `PhyRxTx` bridge proves unworkable (HIGH RISK), fall back to
-// `lorawan-encoding` with a hand-written Class A state machine.
-//
-// #[allow(dead_code)]
-// struct LoraRadioAdapter<R: LoraRadio>(R);
-//
-// impl<R: LoraRadio> PhyRxTx for LoraRadioAdapter<R> {
-//     type PhyError = R::Error;
-//     fn handle_event(&mut self, event: Event<Self>) -> Result<Response<Self>, ...> {
-//         match event {
-//             Event::TimeoutFired => { /* advance timing */ }
-//             Event::RadioEvent(phy_response) => { /* route DIO1 */ }
-//         }
-//     }
-// }
-//
-// impl<R: LoraRadio> Timings for LoraRadioAdapter<R> {
-//     fn get_rx_window_offset_ms(&self) -> i32 { self.0.rx_window_offset_ms() }
-//     fn get_rx_window_duration_ms(&self) -> u32 { self.0.rx_window_duration_ms() }
-// }
+
+use lorawan_device::{
+    nb_device::radio::{
+        Event as LdRadioEvent, PhyRxTx, Response as LdRadioResponse, RxQuality as LdRxQuality,
+    },
+    Timings,
+};
+
+/// Internal state of the radio operation currently in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioOp {
+    Idle,
+    Txing,
+    Rxing,
+}
+
+/// Bridges [`EspIdfLoraRadio`] to [`lorawan_device`]'s `PhyRxTx + Timings` traits.
+///
+/// The `lorawan-device` nb state machine drives the radio via `PhyRxTx::handle_event`.
+/// This adapter translates the lorawan-device event types to the lower-level
+/// `LoraRadio` calls and manages the RX buffer used by `get_received_packet`.
+pub struct LoraRadioAdapter<'d, ANT> {
+    radio: EspIdfLoraRadio<'d, ANT>,
+    rx_buf: [u8; 256],
+    rx_len: usize,
+    op: RadioOp,
+}
+
+impl<'d, ANT> LoraRadioAdapter<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    /// Wrap an initialised [`EspIdfLoraRadio`] in the lorawan-device adapter.
+    pub fn new(radio: EspIdfLoraRadio<'d, ANT>) -> Self {
+        Self {
+            radio,
+            rx_buf: [0u8; 256],
+            rx_len: 0,
+            op: RadioOp::Idle,
+        }
+    }
+}
+
+impl<'d, ANT> core::fmt::Debug for LoraRadioAdapter<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoraRadioAdapter")
+            .field("op", &self.op)
+            .field("rx_len", &self.rx_len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Map `lora-modulation` types (used by lorawan-device) to `lora_pure` types.
+///
+/// Returns `Err(LoraError::InvalidRfConfig)` for any unrecognised parameter value.
+fn map_rf_config(
+    rf: &lorawan_device::nb_device::radio::RfConfig,
+) -> Result<(u32, SpreadingFactor, Bandwidth, CodingRate), LoraError> {
+    use lora_modulation::{Bandwidth as LmBw, CodingRate as LmCr, SpreadingFactor as LmSf};
+
+    let sf = match rf.bb.sf {
+        LmSf::_7 => SpreadingFactor::SF7,
+        LmSf::_8 => SpreadingFactor::SF8,
+        LmSf::_9 => SpreadingFactor::SF9,
+        LmSf::_10 => SpreadingFactor::SF10,
+        LmSf::_11 => SpreadingFactor::SF11,
+        LmSf::_12 => SpreadingFactor::SF12,
+        _ => return Err(LoraError::InvalidRfConfig),
+    };
+    let bw = match rf.bb.bw {
+        LmBw::_125KHz => Bandwidth::BW125,
+        LmBw::_250KHz => Bandwidth::BW250,
+        LmBw::_500KHz => Bandwidth::BW500,
+        _ => return Err(LoraError::InvalidRfConfig),
+    };
+    let cr = match rf.bb.cr {
+        LmCr::_4_5 => CodingRate::Cr45,
+        LmCr::_4_6 => CodingRate::Cr46,
+        LmCr::_4_7 => CodingRate::Cr47,
+        LmCr::_4_8 => CodingRate::Cr48,
+    };
+    Ok((rf.frequency, sf, bw, cr))
+}
+
+impl<'d, ANT> PhyRxTx for LoraRadioAdapter<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    /// The DIO1 interrupt fires with `()` — the adapter clears the flag internally.
+    type PhyEvent = ();
+    type PhyError = LoraError;
+    type PhyResponse = ();
+
+    const MAX_RADIO_POWER: u8 = 22;
+
+    fn get_mut_radio(&mut self) -> &mut Self {
+        self
+    }
+
+    fn get_received_packet(&mut self) -> &mut [u8] {
+        &mut self.rx_buf[..self.rx_len]
+    }
+
+    fn handle_event(
+        &mut self,
+        event: LdRadioEvent<Self>,
+    ) -> Result<LdRadioResponse<Self>, Self::PhyError> {
+        match event {
+            LdRadioEvent::TxRequest(tx_config, buf) => {
+                let (freq, sf, bw, cr) = map_rf_config(&tx_config.rf)?;
+                let lp_tx = TxConfig {
+                    freq_hz: freq,
+                    sf,
+                    bw,
+                    cr,
+                    power_dbm: tx_config.pw,
+                };
+                self.radio.prepare_tx(lp_tx, buf)?;
+                self.op = RadioOp::Txing;
+                Ok(LdRadioResponse::Txing)
+            }
+
+            LdRadioEvent::RxRequest(rf_config) => {
+                // Reset stale RX data from a previous window before opening a new one.
+                self.rx_len = 0;
+                let (freq, sf, bw, cr) = map_rf_config(&rf_config)?;
+                let lp_rx = RxConfig {
+                    freq_hz: freq,
+                    sf,
+                    bw,
+                    cr,
+                };
+                // lorawan-device 0.12 `RxRequest` does not expose which window (RX1/RX2)
+                // is being opened — the correct frequency and DR are already encoded in
+                // `rf_config`.  `RxWindow::Rx1` is passed as a placeholder for logging;
+                // it does not affect hardware configuration.
+                self.radio.prepare_rx(lp_rx, RxWindow::Rx1)?;
+                self.op = RadioOp::Rxing;
+                Ok(LdRadioResponse::Rxing)
+            }
+
+            LdRadioEvent::CancelRx => {
+                // Stop any in-progress RX and clear stale packet data.
+                self.radio.cancel_rx();
+                self.rx_len = 0;
+                self.op = RadioOp::Idle;
+                Ok(LdRadioResponse::Idle)
+            }
+
+            LdRadioEvent::Phy(()) => match self.op {
+                RadioOp::Txing => match self.radio.transmit() {
+                    Ok(on_air_ms) => {
+                        self.op = RadioOp::Idle;
+                        Ok(LdRadioResponse::TxDone(on_air_ms))
+                    }
+                    Err(nb::Error::WouldBlock) => Ok(LdRadioResponse::Txing),
+                    Err(nb::Error::Other(e)) => Err(e),
+                },
+                RadioOp::Rxing => match self.radio.receive(&mut self.rx_buf) {
+                    Ok((len, quality)) => {
+                        self.rx_len = len;
+                        self.op = RadioOp::Idle;
+                        Ok(LdRadioResponse::RxDone(LdRxQuality::new(
+                            quality.rssi,
+                            quality.snr,
+                        )))
+                    }
+                    Err(nb::Error::WouldBlock) => Ok(LdRadioResponse::Rxing),
+                    Err(nb::Error::Other(LoraError::Timeout)) => {
+                        // Normal outcome: RX window closed with no downlink received.
+                        // Return Idle so lorawan-device can proceed (e.g. open RX2 or retry).
+                        self.rx_len = 0;
+                        self.op = RadioOp::Idle;
+                        Ok(LdRadioResponse::Idle)
+                    }
+                    Err(nb::Error::Other(e)) => Err(e),
+                },
+                RadioOp::Idle => Ok(LdRadioResponse::Idle),
+            },
+        }
+    }
+}
+
+impl<'d, ANT> Timings for LoraRadioAdapter<'d, ANT>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    fn get_rx_window_offset_ms(&self) -> i32 {
+        self.radio.rx_window_offset_ms()
+    }
+
+    fn get_rx_window_duration_ms(&self) -> u32 {
+        self.radio.rx_window_duration_ms()
+    }
+}

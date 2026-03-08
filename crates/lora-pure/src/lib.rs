@@ -33,15 +33,30 @@ pub use lorawan::{
 /// Default RX window opening offset in milliseconds.
 ///
 /// Opening early compensates for runtime scheduling and driver initialisation latency.
+/// A negative value means "open this many ms before the LoRaWAN-specified window time".
+///
 /// HAL implementations may override [`LoraRadio::rx_window_offset_ms`] to tune this
 /// for their hardware characteristics.
-pub const RX_WINDOW_OFFSET_MS: i32 = -200;
+pub const RX_WINDOW_OFFSET_MS: i32 = -500;
 
 /// Default RX window duration in milliseconds.
 ///
-/// 500 ms gives enough time to detect a LoRaWAN preamble at any supported
-/// data rate while remaining within LoRaWAN Class A timing constraints.
-pub const RX_WINDOW_DURATION_MS: u32 = 500;
+/// At SF12/BW125 the preamble is 8 × 32.8 ms = 262 ms.
+/// With `RX_WINDOW_OFFSET_MS = -500` the radio opens 500 ms early, giving
+/// ≈ 800 ms of combined coverage around the nominal LoRaWAN window time.
+/// Once a preamble is detected the SX1262 continues receiving the full packet
+/// regardless of this timeout — so 800 ms is sufficient to latch any packet
+/// that starts arriving within the window without risking overlap with the
+/// next scheduled window.
+///
+/// # RX1/RX2 overlap check (EU868 Class A)
+///
+/// With these defaults, RX1 occupies the interval `[t_rx1 − 500ms, t_rx1 + 300ms]`.
+/// RX2 opens at `t_rx1 + 1 000ms`, leaving a 700 ms gap — safely clear of RX1.
+///
+/// HAL implementations may override [`LoraRadio::rx_window_duration_ms`] to reduce
+/// power usage on lower-latency platforms where a smaller opening margin is sufficient.
+pub const RX_WINDOW_DURATION_MS: u32 = 800;
 
 // ─── Core radio types ─────────────────────────────────────────────────────────
 

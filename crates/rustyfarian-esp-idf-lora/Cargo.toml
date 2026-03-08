@@ -10,8 +10,20 @@ keywords = ["lora", "lorawan", "sx1262", "embedded", "esp32"]
 categories = ["embedded"]
 
 [dependencies]
+anyhow.workspace = true
 lora-pure.workspace = true
 log.workspace = true
 nb.workspace = true
-esp-idf-hal.workspace = true
+embedded-hal.workspace = true
+esp-idf-hal = { workspace = true, features = ["critical-section"] }
+esp-idf-svc.workspace = true
 sx126x.workspace = true
+lorawan-device.workspace = true
+lora-modulation.workspace = true
+rand_core = { version = "0.6", default-features = false }
+
+[build-dependencies]
+embuild.workspace = true
+
+[[example]]
+name = "idf_esp32s3_join"

@@ -13,11 +13,24 @@ categories = ["embedded", "no-std"]
 # No default features: esp-hal requires a bare-metal target, not the ESP-IDF target
 # used by this workspace. Enable the matching chip feature to pull in esp-hal and
 # forward the chip selection to the underlying dependency.
-esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6"]
+esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6"]
+esp32c3 = ["dep:esp-hal", "esp-hal/esp32c3", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c3"]
+esp32   = ["dep:esp-hal", "esp-hal/esp32",   "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32"]
+esp32s3 = ["dep:esp-hal", "esp-hal/esp32s3", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32s3", "dep:esp-println", "esp-println/esp32s3", "esp-println/uart"]
+unstable = ["esp-hal/unstable"]
+rt = ["esp-hal/rt"]
 
 [dependencies]
 lora-pure.workspace = true
 log.workspace = true
 nb.workspace = true
 led-effects.workspace = true
+embedded-hal = "1.0"
+embedded-hal-bus = { version = "0.2", default-features = false }
 esp-hal = { version = "1.0", features = ["unstable"], optional = true }
+esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, optional = true }
+esp-println = { version = "0.13.1", default-features = false, optional = true }
+
+[[example]]
+name = "hal_esp32s3_join"
+required-features = ["esp32s3", "rt"]
