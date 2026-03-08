@@ -30,6 +30,43 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
+# ESP-IDF for ESP32-S3 (xtensa-esp32s3, dual-core LX7)
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "--cfg", "espidf_time64",
+    "-C", "force-frame-pointers",
+]
+
+# Bare-metal (no ESP-IDF) for ESP32 (xtensa-esp32, dual-core LX6)
+# Requires `cargo +esp` and xtensa-esp-elf-gcc from espup.
+# `-Tlinkall.x` is the esp-hal top-level linker script; it includes memory.x,
+# alias.x, hal-defaults.x (which INCLUDEs device.x from the PAC), and the
+# chip-specific section layout.  Without this flag the linker never processes
+# any of those scripts, leaving all PAC interrupt stubs and __stack_chk_guard
+# unresolved.
+# `-fno-stack-protector` suppresses stack-guard references injected by
+# GCC 15.2 (esp-15.2.0_20250920) into esp-hal's init function.
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "link-arg=-fno-stack-protector",
+    "-C", "force-frame-pointers",
+]
+
+# Bare-metal (no ESP-IDF) for ESP32-S3 (xtensa-esp32s3, dual-core LX7)
+# Requires `cargo +esp` and xtensa-esp-elf-gcc from espup.
+# Same linker-script and stack-protector requirements as xtensa-esp32-none-elf.
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "link-arg=-fno-stack-protector",
+    "-C", "force-frame-pointers",
+]
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
@@ -38,3 +75,7 @@ MCU = "esp32c6"
 # Note: this variable is not used by the pio builder (`cargo build --features pio`)
 # scripts/flash.sh and scripts/build-example.sh override MCU per chip from the example name.
 ESP_IDF_VERSION = "v5.3.3"
+# embuild (used by esp-idf-sys) checks RUSTC_LINKER to detect ldproxy and emit
+# --ldproxy-linker as a rustc-link-arg.  Cargo only sets RUSTC_LINKER for the
+# host-side build script when it is explicitly present here.
+RUSTC_LINKER = "ldproxy"

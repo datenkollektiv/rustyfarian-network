@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rustyfarian-esp-idf-lora`: `LoraRadioAdapter` struct — bridges `EspIdfLoraRadio` to
+  `lorawan-device 0.12`'s `PhyRxTx + Timings` traits, enabling the nb state machine to drive
+  the SX1262 via the lorawan-device protocol stack
+- `rustyfarian-esp-idf-lora`: `idf_esp32s3_join` example — OTAA join test for the Heltec WiFi
+  LoRa 32 V3 (ESP32-S3 + SX1262) against TTN v3 EU868; credentials set via compile-time env vars
+- `rustyfarian-esp-idf-lora`: `build.rs` added; `lorawan-device`, `lora-modulation`, and
+  `rand_core` added as dependencies to support the `PhyRxTx` bridge and the join example
+- `scripts/build-example.sh` and `scripts/flash.sh`: extended `idf` branch to handle `join`/`lora`
+  package detection and `esp32s3` chip targeting with Xtensa toolchain activation
+- `justfile`: `build-lora-idf-esp32s3` convenience recipe for building `idf_esp32s3_join`
+- `docs/heltec-wifi-lora-32-v3.md`: hardware reference for the Heltec WiFi LoRa 32 V3 —
+  SX1262 pin assignments, TCXO/DIO3 power requirement, correct initialisation sequence with
+  byte-level SPI detail, `esp-hal 1.0` wiring pattern, and common bring-up failure modes
+- `rustyfarian-esp-hal-lora`: `hal_esp32s3_join` example rewritten from stub to real SX1262
+  hardware bring-up; performs reset → `SetDIO3AsTCXOCtrl` (1.8 V TCXO) →
+  `SetDio2AsRfSwitchCtrl` → `GetStatus` and decodes chip mode + command status;
+  expected output is `0x22` (STDBY_RC, cmd ok)
+- `rustyfarian-esp-hal-lora`: `embedded-hal 1.0` and `embedded-hal-bus 0.2` added as
+  dependencies; SPI transactions use `ExclusiveDevice::new_no_delay` wrapping `esp-hal`'s
+  `SpiBus` into an `SpiDevice`
+
 ### Fixed
 
 - `rustyfarian-esp-idf-mqtt`: `MqttHandle::is_connected()` now returns `true` only after the `on_connect` callback has completed and released the internal mutex.
@@ -21,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/host-target.sh`: extracted host-triple detection to a standalone script (mirrors `rustyfarian-ws2812`); `justfile` now delegates to it instead of inlining the `rustc -vV | awk` construct
+- `.cargo/config.toml.dist`: added `[target.xtensa-esp32-none-elf]` and `[target.xtensa-esp32s3-none-elf]` sections with `-Tlinkall.x` and `-fno-stack-protector` rustflags required by bare-metal esp-hal builds with GCC 15.2
+- `justfile`: `build-lora-esp32s3` convenience alias for `just build-example hal_esp32s3_join`
+- `rustyfarian-esp-hal-lora`: `hal_esp32s3_join` example demonstrating a bare-metal LoRaWAN join attempt on the Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262); prints stub status to UART and halts — hardware integration pending
+- `rustyfarian-esp-hal-lora`: `esp32s3`, `esp32`, and `esp32c3` chip features (mirror of existing `esp32c6`), plus `unstable` and `rt` forwarding features required by `esp-hal` 1.0 for bare-metal examples
+- `scripts/build-example.sh`: dual-HAL support — `hal_*` prefix routes to bare-metal targets with per-chip feature flags and Xtensa toolchain sourcing; `idf_*` prefix preserves existing behaviour
+- `scripts/flash.sh`: dual-HAL support — `hal_*` prefix builds bare-metal binary and flashes with the IDF-built bootloader sourced from the IDF target's release cache
+- `scripts/ensure-bootloader.sh`: new helper that checks the IDF-built v5.3.3 bootloader cache and triggers an IDF example build to populate it if absent; required before flashing bare-metal HAL examples
+- `scripts/xtensa-toolchain.sh`: new helper sourced by build and flash scripts to inject `xtensa-esp-elf-gcc` into PATH for ESP32 Xtensa bare-metal builds
 - `rustyfarian-esp-idf-mqtt`: `MqttBuilder` API via `MqttBuilder::new(config)` with `.on_connect()`, `.on_disconnect()`, and `.on_message()` lifecycle callbacks; `on_connect` receives a `bool` indicating whether this is a clean session (no broker-side state preserved), enabling callers to skip redundant re-subscriptions on session resume
 - `rustyfarian-esp-idf-mqtt`: `MqttHandle` returned by `MqttBuilder::build()` — cloneable, thread-safe MQTT handle that accepts `&self` for publish calls from any thread without requiring `&mut` access
 - `rustyfarian-esp-idf-mqtt`: `MqttHandle::is_connected()` for synchronous connection-state polling, replacing the need to infer disconnection from publish-failure counts

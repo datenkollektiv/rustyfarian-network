@@ -68,7 +68,7 @@ clean:
     cargo clean
 
 # host target, used to override the workspace ESP-IDF target for pure-logic tests
-host_target := `host=$(rustc -vV 2>/dev/null | grep '^host:' | awk '{print $2}'); if [ -z "$host" ]; then echo 'Error: Failed to determine rustc host target.' >&2; exit 1; fi; echo "$host"`
+host_target := `scripts/host-target.sh`
 
 # platform-independent crates that can be compiled and tested on the host
 pure_crates := "-p rustyfarian-network-pure"
@@ -118,6 +118,14 @@ build-wifi-connect-nonblocking:
 # convenience: build the MQTT builder example
 build-mqtt:
     just build-example idf_c3_mqtt
+
+# convenience: build the ESP32-S3 bare-metal LoRa join example
+build-lora-esp32s3:
+    just build-example hal_esp32s3_join
+
+# convenience: build the ESP-IDF LoRa OTAA join example for Heltec WiFi LoRa 32 V3 (ESP32-S3)
+build-lora-idf-esp32s3:
+    just build-example idf_esp32s3_join
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:

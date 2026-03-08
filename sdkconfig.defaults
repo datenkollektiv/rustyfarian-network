@@ -1,0 +1,7 @@
+# sdkconfig.defaults for rustyfarian-esp-idf-lora
+#
+# The LoRaWAN join operation (AES-128 key derivation) combined with the
+# lorawan-device Device<_, _, _, 256> struct exceeds the ESP-IDF default
+# main task stack of 3584 bytes.  32 KB is enough headroom for the full
+# OTAA crypto call stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768

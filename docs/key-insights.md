@@ -64,6 +64,15 @@ places at `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/boot
 Also pass `--ignore-app-descriptor` to prevent espflash from performing its own chip-model check.
 See `scripts/flash.sh` for the implemented solution.
 
+**Bare-metal Xtensa targets (`xtensa-esp32-none-elf`, `xtensa-esp32s3-none-elf`) require `-Tlinkall.x` and `-fno-stack-protector` in rustflags — without them the linker fails with two classes of undefined-reference errors.**
+The esp-hal top-level linker script `linkall.x` includes `memory.x`, `alias.x`, `hal-defaults.x`, and the chip-specific section layout.
+`hal-defaults.x` contains the line `INCLUDE "device.x"`, which is produced by the PAC (e.g. `esp32s3`) crate's build script and provides `PROVIDE(TG0_T0_LEVEL = DefaultHandler)` and ~60 other peripheral interrupt stubs.
+Without `-Tlinkall.x`, none of these scripts are processed, so the linker sees every PAC interrupt vector as an undefined symbol and reports them one per line — making the real cause easy to miss.
+The second error (`undefined reference to '__stack_chk_guard'`) appears because GCC 15.2 (`esp-15.2.0_20250920`) injects stack-protection check calls into `esp_hal::init`, but without a linker script the guard variable is never defined.
+`-C link-arg=-fno-stack-protector` is passed to GCC-as-linker-driver which forwards it back to the compiler stage at link time, suppressing the injected guard reference.
+Both flags belong in `[target.xtensa-esp32-none-elf]` and `[target.xtensa-esp32s3-none-elf]` sections in `.cargo/config.toml.dist` — the workspace default config does not include bare-metal Xtensa sections.
+The `riscv32*-unknown-none-elf` targets do not need `-fno-stack-protector` because GCC 15.2 does not inject stack protection for RISC-V bare-metal.
+
 **ESP32-C3 requires target `riscv32imc-esp-espidf` and `MCU=esp32c3` — not the C6 defaults.**
 ESP32-C3 is `riscv32imc` (no atomics extension); ESP32-C6 is `riscv32imac`.
 Building with `MCU=esp32c6` and `riscv32imac-esp-espidf` produces an image whose ESP-IDF chip
@@ -71,6 +80,29 @@ metadata (including `max_efuse_blk_rev`) is wrong for the C3.
 The workspace default in `.cargo/config.toml` is C6 because that is the primary RISC-V target,
 but `scripts/flash.sh` and `scripts/build-example.sh` extract the chip from the example name
 (`idf_c3_*` → C3, `idf_c6_*` → C6) and set `MCU` and `--target` accordingly.
+
+**`sdkconfig.defaults` must be placed at the workspace root for embuild to pick it up — not in the crate root.**
+In a Cargo workspace, `embuild` (used by `esp-idf-sys`) resolves `sdkconfig.defaults` relative to the workspace root (where the top-level `Cargo.toml` lives), not relative to the crate that's being built.
+Placing the file in a crate subdirectory (e.g. `crates/rustyfarian-esp-idf-lora/sdkconfig.defaults`) is silently ignored: `esp-idf-sys` recompiles but CMake reconfigures without the custom settings, and the generated `sdkconfig` retains all defaults.
+Fix: place `sdkconfig.defaults` at the workspace root and declare it in `build.rs` as `cargo:rerun-if-changed=../../sdkconfig.defaults`.
+The main task stack is commonly the first setting needed: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` is sufficient for full LoRaWAN OTAA crypto on ESP-IDF.
+
+**`sx126x 0.3` requires `esp-idf-hal` with `features = ["critical-section"]` when used in an ESP-IDF std build.**
+`sx126x` unconditionally depends on the `critical-section` crate and calls `critical_section::with()` internally.
+The backend (`_critical_section_1_0_acquire` / `_critical_section_1_0_release` symbols) must be provided by the HAL.
+`esp-idf-hal 0.45` provides a FreeRTOS-backed implementation in `src/task.rs`, but only when the `critical-section` feature is enabled.
+Without it, the linker fails with `undefined reference to '_critical_section_1_0_acquire'` even though `esp-idf-hal` is already in the dependency tree.
+Fix: in any ESP-IDF crate that uses `sx126x`, declare `esp-idf-hal = { workspace = true, features = ["critical-section"] }`.
+
+**`just verify` does not compile Xtensa IDF targets — missing target sections in `.cargo/config.toml` pass verification but fail to build.**
+`just verify` compiles only the workspace default target (`riscv32imac-esp-espidf`).
+Xtensa ESP-IDF targets (`xtensa-esp32-espidf`, `xtensa-esp32s3-espidf`) and bare-metal targets are never exercised.
+If `.cargo/config.toml` is missing a `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"`,
+`just verify` passes clean but `just build-example idf_esp32s3_*` fails with `ldproxy` panicking
+(`Cannot locate argument '--ldproxy-linker <linker>'`) because the linker is never invoked through ldproxy.
+Fix: ensure every ESP-IDF target used by examples has its own `[target.*]` section in both
+`.cargo/config.toml` and `.cargo/config.toml.dist`.
+Completion gate for hardware examples: run `just build-example <name>` in addition to `just verify`.
 
 ---
 
@@ -139,3 +171,22 @@ Queuing a downlink in TTN Console does not transmit it until the next uplink's R
 If the device is idle (no uplinks), the queued downlink sits indefinitely.
 Implication for OTA command validation (port 10): always trigger a test uplink first, then check
 whether the downlink arrives in that uplink's receive window.
+
+---
+
+## sx126x 0.3 API
+
+**`LoraCodingRate` not `LoRaCodingRate`**
+In `sx126x 0.3`, the coding rate type is `op::modulation::LoraCodingRate` (lowercase `o` in `Lora`), NOT `LoRaCodingRate`.
+The bandwidth and spread-factor types DO use the `LoRa` prefix (`LoRaBandWidth`, `LoRaSpreadFactor`).
+The inconsistency is in the crate itself — match the actual crate spelling exactly.
+
+**`set_low_dr_opt` not `set_low_data_rate_opt`**
+The LDRO setter on `LoraModParams` is `.set_low_dr_opt(bool)`, not `.set_low_data_rate_opt(bool)`.
+The compiler's `help:` suggestion is reliable — always check it when method names differ from docs or specs.
+
+**`OutputPin<Error = GpioError>` required for ANT pin**
+`sx126x 0.3`'s `SX126x::new` uses a single `TPINERR` type variable for ALL pin error types: `TNRST: OutputPin<Error = TPINERR>`, `TBUSY: InputPin<Error = TPINERR>`, etc.
+Rust infers `TPINERR = GpioError` from the concrete `PinDriver` types.
+Any generic `ANT` parameter must therefore also declare `OutputPin<Error = GpioError>` — a bare `OutputPin` bound causes a type mismatch error.
+Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = GpioError>`.

@@ -120,6 +120,20 @@ let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, Some(&mut l
 
 For RGB LEDs, implement the `StatusLed` trait from `led-effects`.
 
+## Development Setup
+
+After cloning, run the one-time setup before building or running examples:
+
+```sh
+just setup-toolchain
+just setup-cargo-config
+```
+
+`setup-cargo-config` copies `.cargo/config.toml.dist` to `.cargo/config.toml`, which
+configures linker settings and target-specific flags for ESP32, ESP32-S3, and bare-metal
+Xtensa targets.
+Without this step, builds for those targets will fail with linker or toolchain errors.
+
 ## License
 
 MIT or Apache-2.0
