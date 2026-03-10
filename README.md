@@ -44,6 +44,9 @@ a pattern common in application development but rare in embedded Rust.
 | [`rustyfarian-network-pure`](crates/rustyfarian-network-pure) | Platform-independent primitives — validation, timing math; unit-testable on the host |
 | [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback                                    |
 | [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown                        |
+| [`lora-pure`](crates/lora-pure)                               | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host  |
+| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                   |
+| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress        |
 
 ## Examples
 
@@ -65,39 +68,49 @@ rustyfarian-esp-idf-mqtt = { git = "https://github.com/datenkollektiv/rustyfaria
 
 ```rust
 use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
-use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig};
+use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig};
+use esp_idf_svc::mqtt::client::QoS;
 
-// Connect to WiFi
 let wifi_config = WiFiConfig::new("MyNetwork", "password123");
 let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, None::<&mut MyLed>)?;
 
-// Wait for IP
 if let Some(ip) = wifi.get_ip(10000)? {
     println!("Connected with IP: {}", ip);
 }
 
-// Connect to MQTT
 let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device");
-let mut mqtt = MqttManager::new(mqtt_config, &["commands"], |topic, data| {
-    println!("Received on {}: {:?}", topic, data);
-})?;
+let mqtt = MqttBuilder::new(mqtt_config)
+    .on_connect(|client, _clean_session| {
+        client.subscribe("commands", QoS::AtMostOnce)?;
+        Ok(())
+    })
+    .on_message(|topic, data| {
+        println!("Received on {}: {:?}", topic, data);
+    })
+    .build()?;
 
-mqtt.publish("status", "online")?;
+mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
 ```
 
 ### LWT and Retained Messages
 
 ```rust
-use rustyfarian_esp_idf_mqtt::{MqttManager, MqttConfig, LwtConfig};
+use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig, LwtConfig};
 use esp_idf_svc::mqtt::client::QoS;
 
 let lwt = LwtConfig::new("device/status", b"offline", QoS::AtLeastOnce, true);
 let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device")
     .with_lwt(lwt);
 
-let mut mqtt = MqttManager::new(mqtt_config, &["commands"], |topic, data| {
-    println!("Received on {}: {:?}", topic, data);
-})?;
+let mqtt = MqttBuilder::new(mqtt_config)
+    .on_connect(|client, _clean_session| {
+        client.subscribe("commands", QoS::AtMostOnce)?;
+        Ok(())
+    })
+    .on_message(|topic, data| {
+        println!("Received on {}: {:?}", topic, data);
+    })
+    .build()?;
 
 mqtt.publish_with("device/status", b"online", QoS::AtLeastOnce, true)?;
 ```
