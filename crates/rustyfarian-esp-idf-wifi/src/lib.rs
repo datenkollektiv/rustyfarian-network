@@ -212,7 +212,7 @@ impl WiFiManager {
     /// - Red pulse: Connection timeout (loops forever)
     /// - Green: Connected successfully
     pub fn new<L>(
-        modem: Modem,
+        modem: Modem<'static>,
         sys_loop: EspSystemEventLoop,
         nvs: Option<EspDefaultNvsPartition>,
         config: WiFiConfig<'_>,
@@ -324,7 +324,7 @@ impl WiFiManager {
     /// Equivalent to calling [`WiFiManager::new`] with `None` for the LED,
     /// but without the need for a type annotation on the `None` argument.
     pub fn new_without_led(
-        modem: Modem,
+        modem: Modem<'static>,
         sys_loop: EspSystemEventLoop,
         nvs: Option<EspDefaultNvsPartition>,
         config: WiFiConfig<'_>,

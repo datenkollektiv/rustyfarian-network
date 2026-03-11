@@ -2,10 +2,8 @@
 
 *Last updated: March 2026*
 
-The MQTT Builder API, `lora-pure` crate, `rustyfarian-esp-hal-lora` stub, and first runnable examples (`idf_c3_connect`, `idf_c3_mqtt`, `idf_esp32_mqtt`) shipped in the last development cycle.
-The immediate near-term focus is extending the script infrastructure for bare-metal (`hal_*`) examples, starting with a `hal_esp32_join` LoRaWAN join example for `rustyfarian-esp-hal-lora` on classic ESP32.
-This aligns tooling with `rustyfarian-ws2812` (which already handles dual-HAL examples) and requires extending `build-example.sh` and `flash.sh` for `hal_*` prefixes, bare-metal Cargo targets, and Xtensa toolchain sourcing.
-TTN v3 EU868 OTAA validation follows immediately after.
+The dual-HAL script infrastructure, `LoraRadioAdapter` bridging `EspIdfLoraRadio` to `lorawan-device 0.12`, and the `idf_esp32s3_join` OTAA join example all shipped in the last development cycle.
+The immediate near-term focus is Phase 5 — TTN v3 EU868 OTAA validation: extending `idf_esp32s3_join` to send a first uplink and receive a downlink, then validating end-to-end on real hardware against a TTN v3 EU868 application.
 The dual-HAL WiFi tier (ADR 006 → `wifi-pure` → `rustyfarian-esp-hal-wifi`) is planned for mid-term and fully scoped.
 
 ```mermaid

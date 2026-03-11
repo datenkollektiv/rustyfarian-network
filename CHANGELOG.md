@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bump `esp-idf-hal` 0.45→0.46, `esp-idf-svc` 0.51→0.52, `heapless` 0.8→0.9, `embedded-hal-bus` 0.2→0.3, `esp-println` 0.13→0.16: `PinDriver` pin-type parameter removed (type-erased), `PinDriver::input` now requires explicit `Pull` argument, `Modem` requires `'static` lifetime
 - `rustyfarian-esp-idf-lora`: all pure types moved to `lora-pure` and re-exported; `esp-idf`/`mock` feature flags removed; `lora-pure` trait docs clarified; `rustyfarian-esp-hal-lora` stub returns per-operation error variants; `esp32c6` feature properly forwards to `esp-hal`
 - `rustyfarian-esp-idf-wifi`: `WiFiConfig` fields privatised; `ConnectMode` enum replaces `connection_timeout_secs`; `WiFiManager::new_without_led()` added; `NonBlocking` mode logs disconnect reason at `WARN` and propagates initiation errors
 - `rustyfarian-esp-idf-mqtt`: `MqttManager::new()` deprecated in favour of `MqttBuilder` (removal target 0.3.0); `WiFiManager::new` SSID/password validation now delegates to `rustyfarian-network-pure`
