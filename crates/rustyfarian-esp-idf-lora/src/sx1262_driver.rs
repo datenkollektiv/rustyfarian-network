@@ -23,11 +23,12 @@
 //!
 //! ```rust,ignore
 //! use std::sync::atomic::{AtomicBool, Ordering};
-//! use esp_idf_hal::gpio::{InterruptType, PinDriver};
+//! use esp_idf_hal::gpio::{InterruptType, PinDriver, Pull};
 //!
 //! pub static DIO1_FLAG: AtomicBool = AtomicBool::new(false);
 //!
-//! let mut dio1 = PinDriver::input(peripherals.pins.gpio14)?;
+//! // Floating: DIO1 is driven by the SX1262 — no internal pull needed.
+//! let mut dio1 = PinDriver::input(peripherals.pins.gpio14, Pull::Floating)?;
 //! dio1.set_interrupt_type(InterruptType::PosEdge)?;
 //! unsafe {
 //!     dio1.subscribe(|| { DIO1_FLAG.store(true, Ordering::Release); })?;
@@ -52,7 +53,7 @@
 
 use embedded_hal::digital::OutputPin;
 use esp_idf_hal::{
-    gpio::{Gpio12, Gpio13, Gpio14, GpioError, Input, Output, PinDriver},
+    gpio::{GpioError, Input, Output, PinDriver},
     spi::{SpiDeviceDriver, SpiDriver},
 };
 use sx126x::{
@@ -116,9 +117,9 @@ impl core::fmt::Display for LoraError {
 // ─── Type aliases ─────────────────────────────────────────────────────────────
 
 type SpiBus<'d> = SpiDeviceDriver<'d, SpiDriver<'d>>;
-type RstPin<'d> = PinDriver<'d, Gpio12, Output>;
-type BusyPin<'d> = PinDriver<'d, Gpio13, Input>;
-type Dio1Pin<'d> = PinDriver<'d, Gpio14, Input>;
+type RstPin<'d> = PinDriver<'d, Output>;
+type BusyPin<'d> = PinDriver<'d, Input>;
+type Dio1Pin<'d> = PinDriver<'d, Input>;
 
 // ─── EspIdfLoraRadio ─────────────────────────────────────────────────────────
 

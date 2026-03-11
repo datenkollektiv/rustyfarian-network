@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use esp_idf_hal::{
-    gpio::{InterruptType, PinDriver},
+    gpio::{InterruptType, PinDriver, Pull},
     spi::{SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig},
     units::FromValueType,
 };
@@ -83,7 +83,8 @@ fn main() -> anyhow::Result<()> {
 
     // ─── DIO1 interrupt (GPIO 14) ─────────────────────────────────────────────
 
-    let mut dio1 = PinDriver::input(peripherals.pins.gpio14)?;
+    // Floating: DIO1 is driven by the SX1262 — no internal pull needed.
+    let mut dio1 = PinDriver::input(peripherals.pins.gpio14, Pull::Floating)?;
     dio1.set_interrupt_type(InterruptType::PosEdge)?;
     // SAFETY: the ISR closure captures only `DIO1_FLAG` which is `'static`.
     // No data race: `AtomicBool` with `Release`/`Acquire` ordering.
@@ -120,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     // ─── Radio pins ───────────────────────────────────────────────────────────
 
     let rst = PinDriver::output(peripherals.pins.gpio12)?; // RST — active low
-    let busy = PinDriver::input(peripherals.pins.gpio13)?; // BUSY — active high
+    let busy = PinDriver::input(peripherals.pins.gpio13, Pull::Floating)?; // BUSY — driven by SX1262
     let ant = PinDriver::output(peripherals.pins.gpio0)?; // spare GPIO; DIO2 controls RF switch
 
     // ─── EspIdfLoraRadio ──────────────────────────────────────────────────────

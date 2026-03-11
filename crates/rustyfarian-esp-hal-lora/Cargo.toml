@@ -26,10 +26,10 @@ log.workspace = true
 nb.workspace = true
 led-effects.workspace = true
 embedded-hal = "1.0"
-embedded-hal-bus = { version = "0.2", default-features = false }
+embedded-hal-bus = { version = "0.3", default-features = false }
 esp-hal = { version = "1.0", features = ["unstable"], optional = true }
 esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, optional = true }
-esp-println = { version = "0.13.1", default-features = false, optional = true }
+esp-println = { version = "0.16", default-features = false, optional = true }
 
 [[example]]
 name = "hal_esp32s3_join"
