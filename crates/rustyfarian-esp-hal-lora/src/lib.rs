@@ -1,4 +1,3 @@
-#![no_std]
 //! LoRa radio driver for ESP-HAL projects (bare-metal, no_std).
 //!
 //! This crate provides [`EspHalLoraRadio`], an implementation of the
@@ -18,6 +17,8 @@
 //! [`EspHalLoraRadio`] accepts a generic `S: StatusLed` at construction time,
 //! enabling WS2812 RGB LED feedback (join, uplink, downlink states) or
 //! [`led_effects::NoLed`] for headless configurations.
+
+#![no_std]
 
 pub use lora_pure::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
