@@ -127,6 +127,23 @@ let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, Some(&mut l
 
 For RGB LEDs, implement the `StatusLed` trait from `led-effects`.
 
+## Hardware Examples
+
+Each crate includes runnable examples for specific ESP32 targets.
+List all examples with `just` and build one with:
+
+```sh
+just build-example idf_c3_connect
+```
+
+To flash to a connected board:
+
+```sh
+just flash idf_c3_connect
+```
+
+See `crates/*/examples/` for the full set, including Wi-Fi, MQTT, and LoRaWAN OTAA join demos.
+
 ## Development Setup
 
 After cloning, run the one-time setup before building or running examples:
