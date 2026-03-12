@@ -136,7 +136,7 @@ pub struct WiFiConfig<'a> {
 impl<'a> WiFiConfig<'a> {
     /// Creates a new Wi-Fi configuration.
     ///
-    /// Defaults to blocking connection with a 10-second timeout.
+    /// Defaults to blocking connection with a 30-second timeout.
     pub fn new(ssid: &'a str, password: &'a str) -> Self {
         Self {
             ssid,
@@ -160,7 +160,7 @@ impl<'a> WiFiConfig<'a> {
     ///
     /// **Non-blocking mode is only effective when no LED driver is provided.**
     /// If an LED is passed to [`WiFiManager::new`], the constructor falls back to
-    /// blocking behaviour (using the default 10-second timeout) so it can drive
+    /// blocking behaviour (using the default 30-second timeout) so it can drive
     /// the LED status indicator.
     /// A warning is logged when this fallback occurs.
     pub fn connect_nonblocking(mut self) -> Self {

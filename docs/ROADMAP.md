@@ -22,14 +22,7 @@ The dual-HAL WiFi tier (ADR 006 → `wifi-pure` → `rustyfarian-esp-hal-wifi`) 
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : Multi-chip flash + bootloader fix + script arg guards (done)
-              : lora-pure crate (done)
-              : rustyfarian-esp-hal-lora stub (done)
-              : MQTT Builder API + pure state machine (done)
-              : idf_c3_connect + idf_c3_mqtt examples (done)
-              : idf_esp32_mqtt example — MQTT on classic ESP32 (Xtensa) (done)
-              : hal_esp32s3_join example + dual-HAL script infrastructure (done)
-              : Phase 5 — TTN v3 EU868 OTAA validation
+    Near term : Phase 5 — TTN v3 EU868 OTAA validation
 
     Mid term  : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
               : no-std WiFi — ADR 006 + wifi-pure + rustyfarian-esp-hal-wifi stub (phases 1–4)
@@ -225,6 +218,16 @@ New `.cargo/config.toml.dist` blocks:
 
 <details>
 <summary><strong>Completed</strong></summary>
+
+### Near-term deliverables (shipped)
+
+- Multi-chip flash + bootloader fix + script arg guards
+- `lora-pure` crate
+- `rustyfarian-esp-hal-lora` stub
+- MQTT Builder API + pure state machine
+- `idf_c3_connect` + `idf_c3_mqtt` examples
+- `idf_esp32_mqtt` example — MQTT on classic ESP32 (Xtensa)
+- `hal_esp32s3_join` example + dual-HAL script infrastructure
 
 ### MQTT Enhancements
 

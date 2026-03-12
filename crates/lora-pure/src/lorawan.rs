@@ -8,7 +8,7 @@
 //!
 //! The public API and all persistent state types are fully defined here.
 //! The internal state machine wiring to `lorawan-device`'s `nb_device` module
-//! is a HIGH RISK item (see `docs/phase-5-plan.md`): the exact `PhyRxTx` bridge
+//! is a HIGH RISK item (see `docs/ROADMAP.md`): the exact `PhyRxTx` bridge
 //! API needs to be verified against `lorawan-device 0.12` on hardware before the
 //! `process()` implementation can advance the real LoRaWAN state machine.
 //!
@@ -190,7 +190,7 @@ pub struct Downlink {
 /// # Integration status
 ///
 /// The internal wiring to `lorawan-device`'s `nb_device::Device` is pending
-/// hardware verification (see HIGH RISK note in `docs/phase-5-plan.md`).
+/// hardware verification (see HIGH RISK note in `docs/ROADMAP.md`).
 /// The current `process()` implementation returns [`LorawanResponse::NoUpdate`]
 /// until the `PhyRxTx` bridge is completed.
 /// All other parts of the beekeeper firmware continue to function normally.
@@ -269,7 +269,7 @@ impl<R: LoraRadio> LorawanDevice<R> {
         //   };
         //   match self.inner.handle_event(event) { ... }
         //
-        // See docs/phase-5-plan.md §"Main Loop Timing — Critical Constraint".
+        // See docs/ROADMAP.md §"Main Loop Timing — Critical Constraint".
         Ok(LorawanResponse::NoUpdate)
     }
 

@@ -48,12 +48,6 @@ a pattern common in application development but rare in embedded Rust.
 | [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                   |
 | [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress        |
 
-## Examples
-
-```sh
-just run idf_c3_connect
-```
-
 ## Usage
 
 Add to your `Cargo.toml`:
