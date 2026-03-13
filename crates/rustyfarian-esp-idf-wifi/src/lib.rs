@@ -55,9 +55,6 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use rustyfarian_network_pure::wifi::{
-    validate_password, validate_ssid, PASSWORD_MAX_LEN, SSID_MAX_LEN,
-};
 
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
@@ -65,6 +62,12 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
 use led_effects::PulseEffect;
 use rgb::RGB8;
+
+// Re-export all pure types from wifi-pure
+pub use wifi_pure::{
+    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, WiFiConfig,
+    WifiDriver, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
+};
 
 // Re-export StatusLed and SimpleLed from led_effects for convenience
 pub use led_effects::{SimpleLed, StatusLed};
@@ -74,12 +77,6 @@ pub use led_effects::{SimpleLed, StatusLed};
 /// Kept intentionally dim to avoid blinding the user in dark environments.
 const CONNECTED_LED_BRIGHTNESS: u8 = 20;
 
-/// Default connection timeout when none is specified.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-
-/// Polling interval for connection and IP-readiness checks.
-const POLL_INTERVAL_MS: u64 = 100;
-
 /// A no-op LED implementation used by [`WiFiManager::new_without_led`].
 struct NoLed;
 
@@ -88,102 +85,6 @@ impl StatusLed for NoLed {
 
     fn set_color(&mut self, _color: RGB8) -> Result<(), Self::Error> {
         Ok(())
-    }
-}
-
-/// Controls how `WiFiManager::new` handles the Wi-Fi association phase.
-#[derive(Debug, Clone)]
-pub enum ConnectMode {
-    /// Block `WiFiManager::new` until connected or the timeout expires.
-    Blocking {
-        /// Maximum time to wait for association, in seconds.
-        timeout_secs: u64,
-    },
-    /// Initiate association and return immediately.
-    ///
-    /// The ESP-IDF event loop drives the connection in the background.
-    /// Call `get_ip()` or `is_connected()` to check readiness.
-    ///
-    /// **Note:** If an LED driver is provided to `WiFiManager::new`, this mode
-    /// will still block until connected (or timeout) to drive the LED status.
-    NonBlocking,
-}
-
-impl Default for ConnectMode {
-    fn default() -> Self {
-        Self::Blocking {
-            timeout_secs: DEFAULT_TIMEOUT_SECS,
-        }
-    }
-}
-
-/// Wi-Fi connection configuration.
-///
-/// Construct via [`WiFiConfig::new`], then chain builder methods as needed:
-///
-/// ```ignore
-/// let config = WiFiConfig::new("MyNetwork", "password123")
-///     .with_timeout(60)      // optional: override the 30 s default
-///     .connect_nonblocking(); // optional: return immediately from new()
-/// ```
-#[derive(Debug, Clone)]
-pub struct WiFiConfig<'a> {
-    ssid: &'a str,
-    password: &'a str,
-    connect_mode: ConnectMode,
-}
-
-impl<'a> WiFiConfig<'a> {
-    /// Creates a new Wi-Fi configuration.
-    ///
-    /// Defaults to blocking connection with a 30-second timeout.
-    pub fn new(ssid: &'a str, password: &'a str) -> Self {
-        Self {
-            ssid,
-            password,
-            connect_mode: ConnectMode::default(),
-        }
-    }
-
-    /// Sets a blocking connection with the given timeout in seconds.
-    pub fn with_timeout(mut self, secs: u64) -> Self {
-        self.connect_mode = ConnectMode::Blocking { timeout_secs: secs };
-        self
-    }
-
-    /// Returns immediately after initiating association.
-    ///
-    /// The ESP-IDF event loop drives the connection in the background.
-    /// Call `get_ip()` or `is_connected()` to check readiness.
-    ///
-    /// # LED limitation
-    ///
-    /// **Non-blocking mode is only effective when no LED driver is provided.**
-    /// If an LED is passed to [`WiFiManager::new`], the constructor falls back to
-    /// blocking behaviour (using the default 30-second timeout) so it can drive
-    /// the LED status indicator.
-    /// A warning is logged when this fallback occurs.
-    pub fn connect_nonblocking(mut self) -> Self {
-        self.connect_mode = ConnectMode::NonBlocking;
-        self
-    }
-}
-
-/// Maps common ESP-IDF Wi-Fi disconnect reason codes to human-readable names.
-///
-/// Codes follow `wifi_err_reason_t` in ESP-IDF.
-/// Returns `None` for unmapped codes so callers can log the raw number instead
-/// of a misleading `"unknown"` string.
-fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
-    match reason {
-        2 => Some("AUTH_EXPIRE"),
-        15 => Some("4WAY_HANDSHAKE_TIMEOUT"),
-        200 => Some("BEACON_TIMEOUT"),
-        201 => Some("NO_AP_FOUND"),
-        202 => Some("AUTH_FAIL"),
-        203 => Some("ASSOC_FAIL"),
-        204 => Some("HANDSHAKE_TIMEOUT"),
-        _ => None,
     }
 }
 

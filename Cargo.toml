@@ -12,6 +12,7 @@ repository = "https://github.com/datenkollektiv/rustyfarian-network"
 # Workspace-internal
 rustyfarian-network-pure = { path = "crates/rustyfarian-network-pure" }
 lora-pure = { path = "crates/lora-pure" }
+wifi-pure = { path = "crates/wifi-pure" }
 
 # External dependencies
 anyhow = "1.0"
