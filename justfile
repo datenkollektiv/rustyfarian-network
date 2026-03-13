@@ -31,6 +31,10 @@ check-lora:
 check-lora-pure:
     cargo check -p lora-pure
 
+# check the pure wifi crate (no ESP-IDF required)
+check-wifi-pure:
+    cargo check -p wifi-pure
+
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
     cargo check -p rustyfarian-esp-hal-lora --no-default-features
@@ -71,7 +75,7 @@ clean:
 host_target := `scripts/host-target.sh`
 
 # platform-independent crates that can be compiled and tested on the host
-pure_crates := "-p rustyfarian-network-pure"
+pure_crates := "-p rustyfarian-network-pure -p wifi-pure"
 
 # run platform-independent MQTT unit tests (host toolchain, no ESP-IDF needed)
 test-mqtt:
@@ -79,7 +83,7 @@ test-mqtt:
 
 # run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
 test-wifi:
-    cargo test --target {{host_target}} {{pure_crates}} wifi
+    cargo test --target {{host_target}} -p wifi-pure --features mock
 
 # run lora unit tests on the host (no ESP-IDF required)
 # Tests live in lora-pure; --features mock enables MockLoraRadio and mock-gated test blocks.

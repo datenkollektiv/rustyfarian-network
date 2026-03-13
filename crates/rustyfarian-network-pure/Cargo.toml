@@ -8,3 +8,6 @@ repository.workspace = true
 description = "Platform-independent primitives for rustyfarian-network crates"
 keywords = ["wifi", "mqtt", "esp-idf", "rustyfarian", "embedded"]
 categories = ["embedded"]
+
+[dependencies]
+wifi-pure.workspace = true

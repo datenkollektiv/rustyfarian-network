@@ -5,4 +5,6 @@
 //! can be compiled and tested on any host target.
 
 pub mod mqtt;
+
+#[deprecated(since = "0.2.0", note = "depend on `wifi-pure` directly")]
 pub mod wifi;

@@ -19,7 +19,7 @@ name = "idf_c3_connect_nonblocking"
 embuild.workspace = true
 
 [dependencies]
-rustyfarian-network-pure.workspace = true
+wifi-pure.workspace = true
 anyhow.workspace = true
 esp-idf-svc.workspace = true
 led-effects.workspace = true

@@ -22,7 +22,7 @@ Phase 5 LoRa validation moves to midterm, alongside the LoRa post-adoption backl
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : no-std WiFi — ADR 006 + wifi-pure + rustyfarian-esp-hal-wifi stub (phases 1–4)
+    Near term : no-std WiFi — ADR 006 (done) + wifi-pure + rustyfarian-esp-hal-wifi stub (phases 2–4)
               : Grow rustyfarian-network-pure — backoff, topic validation, pure extractions
 
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
@@ -109,7 +109,7 @@ New `.cargo/config.toml.dist` blocks:
 
 **Phased implementation**
 
-1. Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)
+1. ~~Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)~~ — done
 2. Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports
 3. Create `rustyfarian-esp-hal-wifi` stub (compile-only, `EspHalWifiManager` returns errors)
 4. Add `check-wifi-pure`, `check-wifi-hal`, `test-wifi` to `justfile`; add bare-metal target blocks to config dist
