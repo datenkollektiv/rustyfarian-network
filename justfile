@@ -1,7 +1,9 @@
 # Rustyfarian Network — development tasks
 #
-# All crates depend on esp-idf-svc and require the ESP-IDF toolchain.
-# Run `just setup-toolchain` and `just setup-cargo-config` first.
+# ESP-IDF crates require the ESP-IDF toolchain (`just setup-toolchain`).
+# Pure crates (rustyfarian-network-pure, wifi-pure, lora-pure) compile and
+# test on any host without the ESP toolchain.
+# Run `just setup-cargo-config` to create the local cargo config.
 
 # list available recipes (default)
 _default:

@@ -3,7 +3,8 @@
 *Last updated: March 2026*
 
 The dual-HAL Wi-Fi foundation (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub) is complete through Phase 4.
-Near-term focus is on growing `rustyfarian-network-pure` with shared pure logic (backoff done, topic validation and further extractions next).
+Near-term focus was on growing `rustyfarian-network-pure` with shared pure logic — backoff, topic validation, and publish/subscribe guards are all shipped.
+The remaining near-term item is removing the deprecated `rustyfarian-network-pure::wifi` shim to complete the `wifi-pure` migration.
 Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation moves to midterm.
 
 ```mermaid
@@ -23,7 +24,7 @@ timeline
     title rustyfarian-network Roadmap
 
     Near term : no-std WiFi — ADR 006 (done) + wifi-pure (done) + esp-hal-wifi stub (done)
-              : Grow rustyfarian-network-pure — backoff (done), topic validation, pure extractions
+              : Grow rustyfarian-network-pure — backoff (done), topic validation (done), deprecated wifi shim removal
 
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
@@ -230,6 +231,9 @@ All steps use TTN v3 EU868.
 - `idf_esp32_mqtt` example — MQTT on classic ESP32 (Xtensa)
 - `hal_esp32s3_join` example + dual-HAL script infrastructure
 - `rustyfarian-esp-hal-wifi` stub — bare-metal Wi-Fi driver skeleton with `WifiDriver` impl, `check-wifi-hal` recipe, RISC-V bare-metal target blocks
+- `ExponentialBackoff` iterator in `rustyfarian-network-pure::backoff` — 7 host tests
+- MQTT topic validation — `validate_publish_topic`, `validate_subscribe_filter`, `topic_matches_filter` in `rustyfarian-network-pure::mqtt` — 29 host tests; validation guards wired into `MqttHandle::subscribe()` and `publish_with()`
+- CI: pure-crate test job — runs all host tests (`rustyfarian-network-pure`, `wifi-pure`, `lora-pure`) in GitHub Actions
 
 ### MQTT Enhancements
 
