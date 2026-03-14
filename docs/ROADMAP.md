@@ -22,7 +22,7 @@ Phase 5 LoRa validation moves to midterm, alongside the LoRa post-adoption backl
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : no-std WiFi — ADR 006 (done) + wifi-pure + rustyfarian-esp-hal-wifi stub (phases 2–4)
+    Near term : no-std WiFi — ADR 006 (done) + wifi-pure (done) + rustyfarian-esp-hal-wifi stub (phases 3–4)
               : Grow rustyfarian-network-pure — backoff, topic validation, pure extractions
 
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
@@ -80,12 +80,12 @@ pub trait WifiDriver {
     fn configure(&mut self, ssid: &str, password: &str) -> Result<(), Self::Error>;
     fn start(&mut self) -> Result<(), Self::Error>;
     fn connect(&mut self) -> Result<(), Self::Error>;
+    fn disconnect(&mut self) -> Result<(), Self::Error>;
     fn is_connected(&self) -> Result<bool, Self::Error>;
-    fn wait_netif_up(&mut self) -> Result<(), Self::Error>;
 }
 ```
 
-No `get_ip` in the trait — IP address retrieval is ESP-IDF-specific (`sta_netif()`).
+No `get_ip` or `wait_netif_up` in the trait — IP address retrieval and netif readiness are HAL-specific.
 
 **`rustyfarian-esp-hal-wifi` chip features**
 
@@ -110,9 +110,9 @@ New `.cargo/config.toml.dist` blocks:
 **Phased implementation**
 
 1. ~~Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)~~ — done
-2. Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports
+2. ~~Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports~~ — done
 3. Create `rustyfarian-esp-hal-wifi` stub (compile-only, `EspHalWifiManager` returns errors)
-4. Add `check-wifi-pure`, `check-wifi-hal`, `test-wifi` to `justfile`; add bare-metal target blocks to config dist
+4. Add `check-wifi-hal` to `justfile`; add bare-metal target blocks to config dist (partial: `check-wifi-pure` and `test-wifi` already added in phase 2)
 5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
 6. Add `hal_c3_connect` and `hal_c6_connect` examples
 
@@ -222,6 +222,7 @@ All steps use TTN v3 EU868.
 ### Near-term deliverables (shipped)
 
 - Multi-chip flash + bootloader fix + script arg guards
+- `wifi-pure` crate — platform-independent Wi-Fi types, `WifiDriver` trait, `MockWifiDriver`, 14 host tests
 - `lora-pure` crate
 - `rustyfarian-esp-hal-lora` stub
 - MQTT Builder API + pure state machine
