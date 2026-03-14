@@ -40,21 +40,112 @@ pub fn validate_client_id(client_id: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Maximum UTF-8 byte length of an MQTT topic string (MQTT 3.1.1 §4.7).
+pub const TOPIC_MAX_LEN: usize = 65535;
+
 /// Returns `Ok(())` if `topic` is a valid MQTT topic string.
 ///
-/// Rejects empty strings, strings longer than 65535 UTF-8 bytes (the MQTT
-/// maximum), and strings containing the NUL character (`\0`).
+/// Rejects empty strings, strings longer than [`TOPIC_MAX_LEN`] UTF-8 bytes
+/// (the MQTT maximum), and strings containing the NUL character (`\0`).
 pub fn validate_topic(topic: &str) -> Result<(), &'static str> {
     if topic.is_empty() {
         return Err("MQTT topic must not be empty");
     }
-    if topic.len() > 65535 {
+    if topic.len() > TOPIC_MAX_LEN {
         return Err("MQTT topic exceeds the 65535-byte maximum");
     }
     if topic.contains('\0') {
         return Err("MQTT topic must not contain the NUL character");
     }
     Ok(())
+}
+
+/// Returns `Ok(())` if `topic` is valid as a publish topic.
+///
+/// Calls [`validate_topic`] for base checks, then additionally rejects topics
+/// containing `+` or `#` (wildcards are forbidden in publish topics per
+/// MQTT 3.1.1 §3.3.2).
+pub fn validate_publish_topic(topic: &str) -> Result<(), &'static str> {
+    validate_topic(topic)?;
+    if topic.contains('+') {
+        return Err("MQTT publish topic must not contain the '+' wildcard");
+    }
+    if topic.contains('#') {
+        return Err("MQTT publish topic must not contain the '#' wildcard");
+    }
+    Ok(())
+}
+
+/// Returns `Ok(())` if `filter` is a valid MQTT subscription filter.
+///
+/// Calls [`validate_topic`] for base checks, then validates MQTT 3.1.1 §4.7
+/// positional rules for wildcards:
+/// - `+` must occupy an entire level (preceded by `/` or at start, followed by
+///   `/` or at end).
+/// - `#` must be the last character and either be the sole character or
+///   immediately preceded by `/`.
+pub fn validate_subscribe_filter(filter: &str) -> Result<(), &'static str> {
+    validate_topic(filter)?;
+
+    let bytes = filter.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'+' {
+            let before_ok = i == 0 || bytes[i - 1] == b'/';
+            let after_ok = i + 1 == bytes.len() || bytes[i + 1] == b'/';
+            if !before_ok || !after_ok {
+                return Err("MQTT subscribe filter '+' must occupy an entire level");
+            }
+        } else if b == b'#' {
+            let is_last = i + 1 == bytes.len();
+            let before_ok = i == 0 || bytes[i - 1] == b'/';
+            if !is_last || !before_ok {
+                return Err(
+                    "MQTT subscribe filter '#' must be the last character and follow '/' or be sole",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if `topic` matches the subscription `filter`.
+///
+/// Implements MQTT 3.1.1 §4.7 topic matching rules:
+/// - `+` in the filter matches exactly one level in the topic.
+/// - `#` in the filter matches zero or more remaining levels.
+/// - Topics beginning with `$` do not match filters beginning with `+` or `#`
+///   (MQTT §4.7.2).
+pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
+    // MQTT §4.7.2: $-prefixed topics don't match leading + or #
+    if topic.starts_with('$')
+        && (filter == "#" || filter.starts_with('+') || filter.starts_with("/#"))
+    {
+        return false;
+    }
+
+    let mut topic_levels = topic.split('/');
+    let mut filter_levels = filter.split('/');
+
+    loop {
+        match (topic_levels.next(), filter_levels.next()) {
+            // Filter exhausted: topic must also be exhausted for a match
+            (None, None) => return true,
+            (Some(_), None) => return false,
+            (None, Some(f)) => {
+                // # matches zero remaining levels
+                return f == "#";
+            }
+            (Some(_), Some("#")) => return true,
+            (Some(_), Some("+")) => {
+                // + matches exactly one level — continue
+            }
+            (Some(t), Some(f)) => {
+                if t != f {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Returns `Ok(())` if `host` is a non-empty broker hostname or IP address.
@@ -134,9 +225,10 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_wait_iterations, format_broker_url, next_state, validate_broker_host,
-        validate_broker_port, validate_client_id, validate_topic, MqttConnectionState, MqttEvent,
-        CLIENT_ID_MAX_LEN,
+        connection_wait_iterations, format_broker_url, next_state, topic_matches_filter,
+        validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
+        validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent,
+        CLIENT_ID_MAX_LEN, TOPIC_MAX_LEN,
     };
 
     // ── connection_wait_iterations ───────────────────────────────────────────
@@ -351,5 +443,171 @@ mod tests {
     #[test]
     fn shutting_down_ignores_shutdown_requested() {
         assert_transition(S::ShuttingDown, E::ShutdownRequested, None);
+    }
+
+    // ── validate_publish_topic ───────────────────────────────────────────────
+
+    #[test]
+    fn publish_topic_rejects_empty() {
+        assert!(validate_publish_topic("").is_err());
+    }
+
+    #[test]
+    fn publish_topic_rejects_plus_wildcard() {
+        assert!(validate_publish_topic("sensors/+/temp").is_err());
+    }
+
+    #[test]
+    fn publish_topic_rejects_hash_wildcard() {
+        assert!(validate_publish_topic("sensors/#").is_err());
+    }
+
+    #[test]
+    fn publish_topic_rejects_nul() {
+        assert!(validate_publish_topic("topic\0name").is_err());
+    }
+
+    #[test]
+    fn publish_topic_rejects_overlength() {
+        let t = "t".repeat(TOPIC_MAX_LEN + 1);
+        assert!(validate_publish_topic(&t).is_err());
+    }
+
+    #[test]
+    fn publish_topic_accepts_normal() {
+        assert!(validate_publish_topic("sensors/temperature").is_ok());
+    }
+
+    #[test]
+    fn publish_topic_accepts_leading_slash() {
+        assert!(validate_publish_topic("/sensors/temperature").is_ok());
+    }
+
+    #[test]
+    fn publish_topic_accepts_trailing_slash() {
+        assert!(validate_publish_topic("sensors/temperature/").is_ok());
+    }
+
+    // ── validate_subscribe_filter ────────────────────────────────────────────
+
+    #[test]
+    fn subscribe_filter_accepts_single_level_wildcard() {
+        assert!(validate_subscribe_filter("sensors/+/temp").is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_accepts_multi_level_wildcard() {
+        assert!(validate_subscribe_filter("sensors/#").is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_accepts_plus_alone() {
+        assert!(validate_subscribe_filter("+").is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_accepts_hash_alone() {
+        assert!(validate_subscribe_filter("#").is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_accepts_multiple_plus() {
+        assert!(validate_subscribe_filter("+/+/+").is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_rejects_plus_not_at_boundary() {
+        assert!(validate_subscribe_filter("sport+").is_err());
+    }
+
+    #[test]
+    fn subscribe_filter_rejects_hash_not_last() {
+        assert!(validate_subscribe_filter("sport/#/trailing").is_err());
+    }
+
+    #[test]
+    fn subscribe_filter_rejects_empty() {
+        assert!(validate_subscribe_filter("").is_err());
+    }
+
+    #[test]
+    fn subscribe_filter_rejects_nul() {
+        assert!(validate_subscribe_filter("topic\0filter").is_err());
+    }
+
+    // ── topic_matches_filter ─────────────────────────────────────────────────
+
+    #[test]
+    fn match_exact() {
+        assert!(topic_matches_filter(
+            "sensors/temperature",
+            "sensors/temperature"
+        ));
+    }
+
+    #[test]
+    fn match_single_level_wildcard() {
+        assert!(topic_matches_filter("sensors/temperature", "sensors/+"));
+    }
+
+    #[test]
+    fn match_multi_level_wildcard() {
+        assert!(topic_matches_filter(
+            "sensors/room/temperature",
+            "sensors/#"
+        ));
+    }
+
+    #[test]
+    fn match_hash_alone_matches_all() {
+        assert!(topic_matches_filter("sensors/room/temperature", "#"));
+    }
+
+    #[test]
+    fn no_match_wrong_depth() {
+        assert!(!topic_matches_filter(
+            "sensors/temperature/extra",
+            "sensors/+"
+        ));
+    }
+
+    #[test]
+    fn no_match_different_value() {
+        assert!(!topic_matches_filter(
+            "sensors/humidity",
+            "sensors/temperature"
+        ));
+    }
+
+    #[test]
+    fn match_empty_level_with_plus() {
+        // Topic "sensors//temp" has an empty middle level; + must match it
+        assert!(topic_matches_filter("sensors//temp", "sensors/+/temp"));
+    }
+
+    #[test]
+    fn dollar_topic_not_matched_by_hash() {
+        assert!(!topic_matches_filter("$SYS/monitor", "#"));
+    }
+
+    #[test]
+    fn dollar_topic_not_matched_by_plus() {
+        assert!(!topic_matches_filter("$SYS/monitor", "+/monitor"));
+    }
+
+    #[test]
+    fn dollar_topic_matched_by_dollar_hash() {
+        assert!(topic_matches_filter("$SYS/monitor", "$SYS/#"));
+    }
+
+    #[test]
+    fn dollar_topic_matched_by_dollar_plus() {
+        assert!(topic_matches_filter("$SYS/monitor", "$SYS/+"));
+    }
+
+    #[test]
+    fn match_trailing_hash_zero_levels() {
+        // "sport/tennis/#" should match "sport/tennis" (zero additional levels)
+        assert!(topic_matches_filter("sport/tennis", "sport/tennis/#"));
     }
 }
