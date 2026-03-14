@@ -39,6 +39,10 @@ check-wifi-pure:
 check-lora-hal:
     cargo check -p rustyfarian-esp-hal-lora --no-default-features
 
+# check the esp-hal wifi stub (no-default-features to avoid esp-hal target conflict)
+check-wifi-hal:
+    cargo check -p rustyfarian-esp-hal-wifi --no-default-features
+
 # run clippy on the entire workspace
 clippy:
     cargo clippy --all-targets --workspace -- -D warnings

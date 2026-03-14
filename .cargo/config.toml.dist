@@ -67,6 +67,22 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
+# Bare-metal (no ESP-IDF) for ESP32-C3 (riscv32imc, no atomics)
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
+# Bare-metal (no ESP-IDF) for ESP32-C6 (riscv32imac, with atomics)
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --ignore-app-descriptor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
