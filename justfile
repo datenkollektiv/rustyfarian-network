@@ -81,6 +81,10 @@ host_target := `scripts/host-target.sh`
 # platform-independent crates that can be compiled and tested on the host
 pure_crates := "-p rustyfarian-network-pure -p wifi-pure"
 
+# run platform-independent backoff unit tests (host toolchain, no ESP-IDF needed)
+test-backoff:
+    cargo test --target {{host_target}} -p rustyfarian-network-pure backoff
+
 # run platform-independent MQTT unit tests (host toolchain, no ESP-IDF needed)
 test-mqtt:
     cargo test --target {{host_target}} {{pure_crates}} mqtt
@@ -95,7 +99,7 @@ test-lora:
     cargo test --target {{host_target}} -p lora-pure --features mock
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-mqtt test-wifi test-lora
+test: test-backoff test-mqtt test-wifi test-lora
 
 # ── Examples ────────────────────────────────────────────────────────────────
 

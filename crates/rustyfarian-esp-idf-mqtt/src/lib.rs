@@ -33,7 +33,8 @@ use std::time::Duration;
 
 use rustyfarian_network_pure::mqtt::{
     connection_wait_iterations, format_broker_url, next_state, validate_broker_host,
-    validate_broker_port, validate_client_id, MqttConnectionState, MqttEvent,
+    validate_broker_port, validate_client_id, validate_publish_topic, validate_subscribe_filter,
+    MqttConnectionState, MqttEvent,
 };
 
 /// Poll interval used while waiting for the MQTT broker connection to be confirmed.
@@ -343,6 +344,8 @@ where
             // Subscribe to all topics only when connected — calling subscribe() on an
             // unconnected EspMqttClient corrupts the ESP-IDF heap.
             for topic in &topics {
+                validate_subscribe_filter(topic.as_str())
+                    .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
                 manager.client.subscribe(topic.as_str(), QoS::AtLeastOnce)?;
                 log::info!("Subscribed to '{}'", topic);
             }
@@ -388,6 +391,8 @@ where
         qos: QoS,
         retain: bool,
     ) -> anyhow::Result<()> {
+        validate_publish_topic(topic)
+            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
         log::debug!("Publishing to '{}': {:?}", topic, payload);
         self.client.enqueue(topic, qos, retain, payload)?;
         Ok(())
@@ -653,6 +658,7 @@ impl<'a> MqttBuilder<'a> {
                         break;
                     }
 
+                    log::debug!("[mqtt] event loop: waiting for next event...");
                     let event = match connection.next() {
                         Ok(e) => e,
                         Err(_) => {
@@ -660,6 +666,7 @@ impl<'a> MqttBuilder<'a> {
                             break;
                         }
                     };
+                    log::info!("[mqtt] event loop: received event: {:?}", event.payload());
 
                     match event.payload() {
                         EventPayload::Connected(is_clean) => {
@@ -774,12 +781,37 @@ impl MqttHandle {
         qos: QoS,
         retain: bool,
     ) -> anyhow::Result<()> {
+        validate_publish_topic(topic)
+            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
         log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
         let mut guard = self
             .client
             .lock()
             .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
         guard.enqueue(topic, qos, retain, payload)?;
+        Ok(())
+    }
+
+    /// Subscribes to a topic.
+    ///
+    /// # Important
+    ///
+    /// Do **not** call this from inside the `on_connect` callback — in
+    /// esp-idf-svc 0.52+, `subscribe()` blocks until the broker sends
+    /// SUBACK, which requires the event loop to process the response.
+    /// Since the event loop is blocked inside the callback, this deadlocks.
+    ///
+    /// Instead, call `subscribe()` after `build()` once [`is_connected`]
+    /// returns `true`.
+    pub fn subscribe(&self, topic: &str, qos: QoS) -> anyhow::Result<()> {
+        validate_subscribe_filter(topic)
+            .map_err(|e| anyhow::anyhow!("invalid subscribe filter: {}", e))?;
+        log::debug!("[mqtt] subscribing to '{}'", topic);
+        let mut guard = self
+            .client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
+        guard.subscribe(topic, qos)?;
         Ok(())
     }
 

@@ -56,3 +56,25 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --workspace -- -D warnings
+
+  test:
+    name: Pure-crate Tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ESP-RS toolchain (RISC-V)
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          ldproxy: false
+
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run pure-crate tests
+        run: |
+          cargo test -p rustyfarian-network-pure
+          cargo test -p wifi-pure --features mock
+          cargo test -p lora-pure --features mock
