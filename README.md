@@ -39,14 +39,16 @@ a pattern common in application development but rare in embedded Rust.
 
 ## Crates
 
-| Crate                                                         | Description                                                                          |
-|:--------------------------------------------------------------|:-------------------------------------------------------------------------------------|
-| [`rustyfarian-network-pure`](crates/rustyfarian-network-pure) | Platform-independent primitives — validation, timing math; unit-testable on the host |
-| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback                                    |
-| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown                        |
-| [`lora-pure`](crates/lora-pure)                               | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host  |
-| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                   |
-| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress        |
+| Crate                                                         | Description                                                                               |
+|:--------------------------------------------------------------|:------------------------------------------------------------------------------------------|
+| [`rustyfarian-network-pure`](crates/rustyfarian-network-pure) | Platform-independent primitives — validation, timing math; unit-testable on the host      |
+| [`wifi-pure`](crates/wifi-pure)                               | Platform-independent Wi-Fi types, traits, and validation; `no_std`; unit-testable on host |
+| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback                                         |
+| [`rustyfarian-esp-hal-wifi`](crates/rustyfarian-esp-hal-wifi) | Wi-Fi driver stub for bare-metal `esp-hal` targets; full implementation in progress       |
+| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown                             |
+| [`lora-pure`](crates/lora-pure)                               | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host       |
+| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                        |
+| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress             |
 
 ## Usage
 
