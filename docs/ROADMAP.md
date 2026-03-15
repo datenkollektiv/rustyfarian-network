@@ -4,7 +4,7 @@
 
 The dual-HAL Wi-Fi foundation (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub) is complete through Phase 4.
 Near-term focus was on growing `rustyfarian-network-pure` with shared pure logic — backoff, topic validation, and publish/subscribe guards are all shipped.
-The remaining near-term item is removing the deprecated `rustyfarian-network-pure::wifi` shim to complete the `wifi-pure` migration.
+The remaining near-term items are removing the deprecated `rustyfarian-network-pure::wifi` shim to complete the `wifi-pure` migration, and extracting the ESP-NOW abstraction layer from downstream firmware crates (ADR 007).
 Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation moves to midterm.
 
 ```mermaid
@@ -25,6 +25,7 @@ timeline
 
     Near term : no-std WiFi — ADR 006 (done) + wifi-pure (done) + esp-hal-wifi stub (done)
               : Grow rustyfarian-network-pure — backoff (done), topic validation (done), deprecated wifi shim removal
+              : ESP-NOW — espnow-pure + rustyfarian-esp-idf-espnow (ADR 007)
 
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
@@ -116,6 +117,56 @@ New `.cargo/config.toml.dist` blocks:
 4. ~~Add `check-wifi-hal` to `justfile`; add bare-metal target blocks to config dist~~ — done (partial: `check-wifi-pure` and `test-wifi` already added in phase 2)
 5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
 6. Add `hal_c3_connect` and `hal_c6_connect` examples
+
+</details>
+
+### ESP-NOW abstraction
+
+<details>
+<summary><strong>Implementation plan</strong></summary>
+
+Three downstream firmware crates in `rustbox-backstage` (`firmware-rgb-puzzle-brain`, `firmware-rgb-matrix`, `firmware-rgb-nunchuck`) each contain ~155 lines of nearly identical ESP-NOW FFI wrapper code.
+This duplicated code is extracted into `rustyfarian-network` following the dual-HAL pattern (ADR 005).
+
+Target crate layout:
+
+```
+espnow-pure                      — #![no_std]; trait, types, constants, mock
+rustyfarian-esp-idf-espnow       — std; wraps esp_idf_sys FFI, implements trait
+```
+
+No `rustyfarian-esp-hal-espnow` stub — there is no bare-metal ESP-NOW use case today.
+The naming convention is established; the crate can be added when needed.
+
+**Phase 1 — `espnow-pure`**
+
+- `EspNowDriver` trait (`add_peer`, `remove_peer`, `send`, `try_recv`)
+- `EspNowEvent` (fixed-size received frame), `PeerConfig`, `MacAddress` type alias
+- Constants: `MAX_DATA_LEN` (250), `BROADCAST_MAC`, `DEFAULT_RX_CHANNEL_CAPACITY` (32)
+- `validate_payload()` length check
+- `MockEspNowDriver` test double (behind `mock` feature)
+- ~10 host tests
+
+**Phase 2 — `rustyfarian-esp-idf-espnow`**
+
+- Static `Mutex<Option<SyncSender<EspNowEvent>>>` + unsafe receive callback
+- `EspIdfEspNow::init()` / `init_with_capacity()` constructors
+- `impl EspNowDriver` delegating to raw `esp_idf_sys` FFI
+- `impl Drop` for `esp_now_deinit` + sender cleanup
+- Re-exports from `espnow-pure`
+
+**Phase 3 — Workspace integration**
+
+- Workspace dep, justfile recipes (`check-espnow-pure`, `check-espnow`, `test-espnow`), README, CHANGELOG
+
+**Phase 4 — ADR 007**
+
+- Records the extraction decision, why raw FFI over `esp-idf-svc::espnow`, and why no bare-metal stub
+
+**Downstream migration (out of scope)**
+
+Each downstream firmware crate replaces `src/espnow.rs` (~155 lines) with ~10 lines using the library.
+The `rgb-puzzle-protocol` crate is unchanged — it encodes/decodes puzzle-specific messages with no transport dependency.
 
 </details>
 
