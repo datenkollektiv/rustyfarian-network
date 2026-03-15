@@ -101,6 +101,21 @@ It has no dependency on the transport layer and is unchanged by this extraction.
 - **One more crate pair to maintain** (mitigated by thin driver code and shared trait)
 - **Raw FFI is unsafe** — the receive callback and static sender require `unsafe` blocks that must be audited carefully (mitigated by extracting the pattern once rather than maintaining three copies)
 
+## Implementation Notes
+
+### `esp-idf-svc` used over raw FFI (2026-03-15)
+
+The original decision recommended raw `esp_idf_sys` FFI.
+During implementation, we chose `esp-idf-svc::espnow::EspNow` instead:
+
+- Handles version-conditional callback signatures (`esp_idf_version_major = "4"` vs v5) — getting these wrong causes silent UB
+- Singleton enforcement via internal `TAKEN` mutex
+- `Drop` calls `esp_now_deinit` and clears callbacks automatically
+- `register_recv_cb` accepts a closure — the `sync_channel` bridge fits naturally
+- Already a workspace dependency — zero new deps
+
+The trait boundary (`EspNowDriver`) means this is a non-breaking internal choice, as anticipated in the original decision.
+
 ## References
 
 - [ADR 005 — Crate Naming Convention for Dual-HAL Drivers](005-crate-naming-for-dual-hal-drivers.md)

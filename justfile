@@ -41,6 +41,10 @@ check-wifi-pure:
 check-espnow-pure:
     cargo check -p espnow-pure
 
+# check the esp-idf espnow crate
+check-espnow:
+    cargo check -p rustyfarian-esp-idf-espnow
+
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
     cargo check -p rustyfarian-esp-hal-lora --no-default-features

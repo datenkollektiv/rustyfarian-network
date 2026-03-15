@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dual-HAL script infrastructure: `build-example.sh` and `flash.sh` extended for `hal_*` bare-metal targets with per-chip feature flags; `ensure-bootloader.sh`, `xtensa-toolchain.sh`, and `host-target.sh` helpers added; xtensa bare-metal target sections added to `.cargo/config.toml.dist`
 - `rustyfarian-esp-idf-mqtt`: `MqttBuilder` API returning a cloneable `MqttHandle` with `on_connect`, `on_disconnect`, and `on_message` lifecycle callbacks; `MqttHandle::is_connected()` for synchronous connection-state polling
 - `rustyfarian-network-pure`: MQTT input validation functions (`validate_client_id`, `validate_topic`, `validate_broker_host`, `validate_broker_port`, `format_broker_url`) and `MqttConnectionState` pure state machine; `idf_esp32_mqtt` example targeting Xtensa ESP32; `docs/heltec-wifi-lora-32-v3.md` hardware reference
+- `espnow-pure` crate: platform-independent `no_std` library with the `EspNowDriver` trait, `EspNowEvent`, `PeerConfig`, `MacAddress`, validation, and `MockEspNowDriver` test double (ADR 007)
+- `rustyfarian-esp-idf-espnow` crate: ESP-IDF driver implementing `EspNowDriver` via `esp-idf-svc::espnow::EspNow` with `sync_channel`-based receive bridge
 
 ### Fixed
 

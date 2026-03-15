@@ -119,7 +119,7 @@ impl PeerConfig {
 ///
 /// # Implementors
 ///
-/// - `rustyfarian_esp_idf_wifi::EspNowManager` — ESP-IDF driver (future)
+/// - `rustyfarian_esp_idf_espnow::EspIdfEspNow` — ESP-IDF driver
 /// - [`mock::MockEspNowDriver`] — test double (behind `mock` feature / `#[cfg(test)]`)
 pub trait EspNowDriver {
     /// Driver-specific error type.
