@@ -1,0 +1,13 @@
+[package]
+name = "espnow-pure"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-independent ESP-NOW types, traits, and validation"
+keywords = ["espnow", "embedded", "no-std", "esp32"]
+categories = ["embedded", "no-std"]
+
+[features]
+mock = []

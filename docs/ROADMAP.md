@@ -25,7 +25,7 @@ timeline
 
     Near term : no-std WiFi — ADR 006 (done) + wifi-pure (done) + esp-hal-wifi stub (done)
               : Grow rustyfarian-network-pure — backoff (done), topic validation (done), deprecated wifi shim removal
-              : ESP-NOW — espnow-pure + rustyfarian-esp-idf-espnow (ADR 007)
+              : ESP-NOW — espnow-pure (done) + rustyfarian-esp-idf-espnow (ADR 007)
 
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
@@ -138,14 +138,14 @@ rustyfarian-esp-idf-espnow       — std; wraps esp_idf_sys FFI, implements trai
 No `rustyfarian-esp-hal-espnow` stub — there is no bare-metal ESP-NOW use case today.
 The naming convention is established; the crate can be added when needed.
 
-**Phase 1 — `espnow-pure`**
+**~~Phase 1 — `espnow-pure`~~** — done
 
-- `EspNowDriver` trait (`add_peer`, `remove_peer`, `send`, `try_recv`)
-- `EspNowEvent` (fixed-size received frame), `PeerConfig`, `MacAddress` type alias
-- Constants: `MAX_DATA_LEN` (250), `BROADCAST_MAC`, `DEFAULT_RX_CHANNEL_CAPACITY` (32)
-- `validate_payload()` length check
-- `MockEspNowDriver` test double (behind `mock` feature)
-- ~10 host tests
+- ~~`EspNowDriver` trait (`add_peer`, `remove_peer`, `send`, `try_recv`)~~
+- ~~`EspNowEvent` (fixed-size received frame), `PeerConfig`, `MacAddress` type alias~~
+- ~~Constants: `MAX_DATA_LEN` (250), `BROADCAST_MAC`, `DEFAULT_RX_CHANNEL_CAPACITY` (32)~~
+- ~~`validate_payload()` length check~~
+- ~~`MockEspNowDriver` test double (behind `mock` feature)~~
+- ~~10 host tests, workspace integration, justfile recipes~~
 
 **Phase 2 — `rustyfarian-esp-idf-espnow`**
 
@@ -157,11 +157,13 @@ The naming convention is established; the crate can be added when needed.
 
 **Phase 3 — Workspace integration**
 
-- Workspace dep, justfile recipes (`check-espnow-pure`, `check-espnow`, `test-espnow`), README, CHANGELOG
+- ~~Workspace dep, justfile recipes (`check-espnow-pure`, `test-espnow`)~~ — done
+- `check-espnow` recipe (after Phase 2)
+- README and CHANGELOG updates (after Phase 2)
 
-**Phase 4 — ADR 007**
+**~~Phase 4 — ADR 007~~** — done
 
-- Records the extraction decision, why raw FFI over `esp-idf-svc::espnow`, and why no bare-metal stub
+- ~~Records the extraction decision, why raw FFI over `esp-idf-svc::espnow`, and why no bare-metal stub~~
 
 **Downstream migration (out of scope)**
 

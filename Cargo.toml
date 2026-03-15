@@ -13,6 +13,7 @@ repository = "https://github.com/datenkollektiv/rustyfarian-network"
 rustyfarian-network-pure = { path = "crates/rustyfarian-network-pure" }
 lora-pure = { path = "crates/lora-pure" }
 wifi-pure = { path = "crates/wifi-pure" }
+espnow-pure = { path = "crates/espnow-pure" }
 
 # External dependencies
 anyhow = "1.0"
