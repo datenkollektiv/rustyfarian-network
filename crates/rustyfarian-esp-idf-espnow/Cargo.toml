@@ -1,0 +1,19 @@
+[package]
+name = "rustyfarian-esp-idf-espnow"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ESP-NOW driver for ESP-IDF projects"
+keywords = ["espnow", "esp-idf", "rustyfarian", "embedded", "iot"]
+categories = ["embedded", "network-programming"]
+
+[build-dependencies]
+embuild.workspace = true
+
+[dependencies]
+espnow-pure.workspace = true
+anyhow.workspace = true
+esp-idf-svc.workspace = true
+log.workspace = true

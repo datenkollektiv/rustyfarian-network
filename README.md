@@ -49,6 +49,8 @@ a pattern common in application development but rare in embedded Rust.
 | [`lora-pure`](crates/lora-pure)                               | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host       |
 | [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                        |
 | [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress             |
+| [`espnow-pure`](crates/espnow-pure)                               | Platform-independent ESP-NOW types, traits, and validation; `no_std`; unit-testable on host |
+| [`rustyfarian-esp-idf-espnow`](crates/rustyfarian-esp-idf-espnow) | ESP-NOW driver for ESP-IDF projects, implementing the `EspNowDriver` trait                  |
 
 ## Usage
 
