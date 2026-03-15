@@ -37,6 +37,10 @@ check-lora-pure:
 check-wifi-pure:
     cargo check -p wifi-pure
 
+# check the pure espnow crate (no ESP-IDF required)
+check-espnow-pure:
+    cargo check -p espnow-pure
+
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
     cargo check -p rustyfarian-esp-hal-lora --no-default-features
@@ -81,7 +85,7 @@ clean:
 host_target := `scripts/host-target.sh`
 
 # platform-independent crates that can be compiled and tested on the host
-pure_crates := "-p rustyfarian-network-pure -p wifi-pure"
+pure_crates := "-p rustyfarian-network-pure -p wifi-pure -p espnow-pure"
 
 # run platform-independent backoff unit tests (host toolchain, no ESP-IDF needed)
 test-backoff:
@@ -100,8 +104,13 @@ test-wifi:
 test-lora:
     cargo test --target {{host_target}} -p lora-pure --features mock
 
+# run espnow unit tests on the host (no ESP-IDF required)
+# Tests live in espnow-pure; --features mock enables MockEspNowDriver and mock-gated test blocks.
+test-espnow:
+    cargo test --target {{host_target}} -p espnow-pure --features mock
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-wifi test-lora
+test: test-backoff test-mqtt test-wifi test-lora test-espnow
 
 # ── Examples ────────────────────────────────────────────────────────────────
 
