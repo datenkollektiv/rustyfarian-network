@@ -14,7 +14,7 @@ Several factors motivate extending the pattern to Wi-Fi:
 - **`esp-wifi 0.14.0`** (Dec 2024) provides production-ready bare-metal Wi-Fi for ESP32-C3 and ESP32-C6, compatible with `esp-hal 1.0.0` (already in the workspace).
   It bundles `smoltcp 0.11.0` for the TCP/IP stack.
 - **Extractable pure logic exists** — `WiFiConfig`, `ConnectMode`, `DEFAULT_TIMEOUT_SECS`, `POLL_INTERVAL_MS`, and `wifi_disconnect_reason_name` are platform-independent and currently locked inside the ESP-IDF crate.
-  SSID/password validation already lives in `rustyfarian-network-pure::wifi` but belongs closer to the Wi-Fi driver crates.
+  SSID/password validation previously lived in `rustyfarian-network-pure::wifi` and has been moved to `wifi-pure`.
 - **The LoRa path is blocked on hardware** — the LoRa radio for TTN v3 validation is unavailable, making the Wi-Fi dual-HAL tier the highest-value near-term work.
 
 The LoRa tier's three-crate split (`lora-pure`, `rustyfarian-esp-idf-lora`, `rustyfarian-esp-hal-lora`) serves as a direct template.
@@ -42,7 +42,7 @@ rustyfarian-esp-hal-wifi         — no_std; esp-hal + esp-wifi 0.14.0; ESP32-C3
 | `DEFAULT_TIMEOUT_SECS`                                                   | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
 | `POLL_INTERVAL_MS`                                                       | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
 | `wifi_disconnect_reason_name`                                            | `rustyfarian-esp-idf-wifi` (private) | `wifi-pure` (pub, testable) |
-| `SSID_MAX_LEN`, `PASSWORD_MAX_LEN`, `validate_ssid`, `validate_password` | `rustyfarian-network-pure::wifi`     | `wifi-pure`                 |
+| `SSID_MAX_LEN`, `PASSWORD_MAX_LEN`, `validate_ssid`, `validate_password` | `rustyfarian-network-pure::wifi` (removed) | `wifi-pure`                 |
 
 A `mock` feature provides a test double, following the `lora-pure` convention.
 
@@ -108,7 +108,7 @@ No breaking change for existing consumers.
 ### Negative / Risks
 
 - **New licence** — `smoltcp 0.11.0` uses `0BSD`, which must be added to the `deny.toml` allow list
-- **Refactoring scope** — extracting `wifi-pure` from `rustyfarian-esp-idf-wifi` and relocating validators from `rustyfarian-network-pure::wifi` requires coordinated changes across three crates
+- **Refactoring scope** — extracting `wifi-pure` from `rustyfarian-esp-idf-wifi` and relocating validators from `rustyfarian-network-pure` required coordinated changes across three crates (completed; the `wifi` shim module has been removed)
 - **Two drivers to maintain** — both `esp-idf` and `esp-hal` paths must be tested on actual hardware (mitigated by keeping drivers thin and delegating shared logic to `wifi-pure`)
 - **Trait evolution** — the `WifiDriver` trait is initial; `esp-hal` implementation may reveal methods that need adding or signatures that need changing before the trait stabilises
 

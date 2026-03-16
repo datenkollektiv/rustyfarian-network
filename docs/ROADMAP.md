@@ -3,7 +3,6 @@
 *Last updated: March 2026*
 
 All near-term work is complete.
-The deprecated `rustyfarian-network-pure::wifi` shim is the last cleanup item before shifting focus to mid-term.
 Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation is the next major feature.
 
 ```mermaid
@@ -22,8 +21,6 @@ Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` im
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : Remove deprecated rustyfarian-network-pure::wifi shim
-
     Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5-6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
@@ -31,16 +28,6 @@ timeline
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after esp-hal WiFi)
 ```
-
----
-
-## Near term detail
-
-### Remove deprecated `rustyfarian-network-pure::wifi` shim
-
-The `wifi` module in `rustyfarian-network-pure` is a `pub use wifi_pure::*` re-export deprecated since 0.2.0.
-No code consumers remain — only documentation references in `docs/adr/006-no-std-esp-hal-wifi.md`.
-Delete the module, remove the `pub mod wifi` declaration, and update documentation references.
 
 ---
 

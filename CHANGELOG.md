@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-idf-wifi`: `WiFiConfig` fields privatised; `ConnectMode` enum replaces `connection_timeout_secs`; `WiFiManager::new_without_led()` added; `NonBlocking` mode logs disconnect reason at `WARN` and propagates initiation errors
 - `rustyfarian-esp-idf-mqtt`: `MqttManager::new()` deprecated in favour of `MqttBuilder` (removal target 0.3.0); multi-topic subscription (`&[&str]`); topic-based dispatch (callback receives `(&str, &[u8])` instead of `&[u8]`); SSID/password validation delegates to `rustyfarian-network-pure`
 
+### Removed
+
+- `rustyfarian-network-pure::wifi` shim module — deprecated since 0.2.0; depend on `wifi-pure` directly
+
 ### Deprecated
 
 - `MqttManager::new()` — use `MqttBuilder` instead (removal target 0.3.0)
