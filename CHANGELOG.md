@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::init_with_radio()` starts and owns the Wi-Fi radio for ESP-NOW-only devices (ADR 008)
 - `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::default_interface()` returns the correct `WifiInterface` based on init mode
 - `espnow-pure`: `PeerConfig::with_ap_interface()` builder method for ESP-NOW-only devices
+- `rustyfarian-esp-idf-mqtt`: configurable MQTT task stack size via `MqttConfig::with_task_stack_size()`; default raised to 8 KiB (from ESP-IDF's 6 KiB) to prevent TLS stack overflow
 
 ## [0.1.0] - 2026-03-16
 

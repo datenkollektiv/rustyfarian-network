@@ -74,6 +74,14 @@ const EVENT_LOOP_STACK_SIZE: usize = 8192;
 /// are observed with deeply nested `on_connect` logic.
 const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
 
+/// Default stack size for the ESP-IDF MQTT client task.
+///
+/// ESP-IDF defaults to 6144 bytes, which overflows during TLS negotiation
+/// error paths — corrupting the heap and crashing `pthread_exit`.
+/// 8 KiB provides sufficient headroom for TLS handshakes on ESP32.
+/// Override via [`MqttConfig::with_task_stack_size`] if needed.
+const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
+
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
 };
@@ -146,6 +154,10 @@ pub struct MqttConfig<'a> {
     pub keep_alive_secs: Option<u64>,
     /// Connection timeout in milliseconds (default: 5000)
     pub connection_timeout_ms: Option<u64>,
+    /// Stack size for the ESP-IDF MQTT client task (default: 8192).
+    ///
+    /// Set via [`with_task_stack_size`](Self::with_task_stack_size).
+    pub task_stack_size: usize,
     lwt: Option<LwtConfig<'a>>,
     username: Option<&'a str>,
     password: Option<&'a str>,
@@ -169,6 +181,7 @@ impl<'a> std::fmt::Debug for MqttConfig<'a> {
             .field("client_id", &self.client_id)
             .field("keep_alive_secs", &self.keep_alive_secs)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("task_stack_size", &self.task_stack_size)
             .field("lwt", &self.lwt)
             .field("username", &redacted_username)
             .field("password", &redacted_password)
@@ -185,6 +198,7 @@ impl<'a> MqttConfig<'a> {
             client_id,
             keep_alive_secs: None,
             connection_timeout_ms: None,
+            task_stack_size: DEFAULT_MQTT_TASK_STACK_SIZE,
             lwt: None,
             username: None,
             password: None,
@@ -216,6 +230,17 @@ impl<'a> MqttConfig<'a> {
     pub fn with_auth(mut self, username: &'a str, password: &'a str) -> Self {
         self.username = Some(username);
         self.password = Some(password);
+        self
+    }
+
+    /// Overrides the ESP-IDF MQTT client task stack size.
+    ///
+    /// Defaults to 8192 bytes (8 KiB), which provides sufficient headroom
+    /// for TLS handshakes on ESP32.
+    /// Increase to 16384 (16 KiB) if stack overflows are observed during
+    /// TLS negotiation on resource-constrained targets.
+    pub fn with_task_stack_size(mut self, bytes: usize) -> Self {
+        self.task_stack_size = bytes;
         self
     }
 }
@@ -291,6 +316,7 @@ where
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(config.client_id),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
+            task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: config.username,
             password: config.password,
@@ -654,6 +680,7 @@ impl<'a> MqttBuilder<'a> {
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(client_id.as_str()),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
+            task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: username.as_deref(),
             password: password.as_deref(),
