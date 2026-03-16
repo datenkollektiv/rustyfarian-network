@@ -2,10 +2,9 @@
 
 *Last updated: March 2026*
 
-The dual-HAL Wi-Fi foundation (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub) is complete through Phase 4.
-Near-term focus was on growing `rustyfarian-network-pure` with shared pure logic — backoff, topic validation, and publish/subscribe guards are all shipped.
-The remaining near-term items are removing the deprecated `rustyfarian-network-pure::wifi` shim to complete the `wifi-pure` migration, and extracting the ESP-NOW abstraction layer from downstream firmware crates (ADR 007).
-Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation moves to midterm.
+All near-term work is complete.
+The deprecated `rustyfarian-network-pure::wifi` shim is the last cleanup item before shifting focus to mid-term.
+Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation is the next major feature.
 
 ```mermaid
 %%{init: {
@@ -23,11 +22,9 @@ Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` im
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : no-std WiFi — ADR 006 (done) + wifi-pure (done) + esp-hal-wifi stub (done)
-              : Grow rustyfarian-network-pure — backoff (done), topic validation (done), deprecated wifi shim removal
-              : ESP-NOW — espnow-pure (done) + rustyfarian-esp-idf-espnow (ADR 007)
+    Near term : Remove deprecated rustyfarian-network-pure::wifi shim
 
-    Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5–6)
+    Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5-6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
 
@@ -39,55 +36,29 @@ timeline
 
 ## Near term detail
 
-### no-std / esp-hal WiFi
+### Remove deprecated `rustyfarian-network-pure::wifi` shim
+
+The `wifi` module in `rustyfarian-network-pure` is a `pub use wifi_pure::*` re-export deprecated since 0.2.0.
+No code consumers remain — only documentation references in `docs/adr/006-no-std-esp-hal-wifi.md`.
+Delete the module, remove the `pub mod wifi` declaration, and update documentation references.
+
+---
+
+## Mid term detail
+
+### Full `EspHalWifiManager` implementation
 
 <details>
-<summary><strong>Scoping and implementation plan</strong></summary>
+<summary><strong>Remaining phases from the WiFi dual-HAL plan</strong></summary>
 
-Extends the dual-HAL pattern (ADR 005) from LoRa to Wi-Fi.
-Target crate layout:
-
-```
-wifi-pure                    — no_std; WiFiConfig, ConnectMode, WifiDriver trait, disconnect reason map
-rustyfarian-esp-idf-wifi     — std; esp-idf-svc (existing, refactored to depend on wifi-pure)
-rustyfarian-esp-hal-wifi     — no_std; esp-hal + esp-wifi 0.14.0; ESP32-C3/C6 bare-metal
-```
+Phases 1-4 (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub, justfile recipes) are complete.
+The remaining work implements the actual bare-metal Wi-Fi driver.
 
 **Dependency stack (agent-verified, 2026-03-06)**
 
 - `esp-wifi 0.14.0` — production-ready since Dec 2024; supports ESP32-C3 and ESP32-C6;
   compatible with `esp-hal 1.0.0` (already in workspace); bundles `smoltcp 0.11.0`
 - `smoltcp 0.11.0` — `no_std`, `0BSD` licence (**requires adding `"0BSD"` to `deny.toml` allow list**)
-- `minimq 0.8.1` — clear winner for a future `rustyfarian-esp-hal-mqtt` crate;
-  designed for embedded + smoltcp; maintained by QUARTIQ; MIT OR Apache-2.0
-- Rejected: `mqttrust` (abandoned 2023), `rust-mqtt` (unmaintained), `paho-mqtt` (EPL-2.0, requires `std`)
-
-**Extractable types for `wifi-pure`**
-
-| Symbol                                                                   | Currently in                         | Move to                     |
-|:-------------------------------------------------------------------------|:-------------------------------------|:----------------------------|
-| `WiFiConfig<'a>`                                                         | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
-| `ConnectMode`                                                            | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
-| `DEFAULT_TIMEOUT_SECS`                                                   | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
-| `POLL_INTERVAL_MS`                                                       | `rustyfarian-esp-idf-wifi`           | `wifi-pure`                 |
-| `wifi_disconnect_reason_name`                                            | `rustyfarian-esp-idf-wifi` (private) | `wifi-pure` (pub, testable) |
-| `SSID_MAX_LEN`, `PASSWORD_MAX_LEN`, `validate_ssid`, `validate_password` | `rustyfarian-network-pure::wifi`     | `wifi-pure`                 |
-| `WiFiManager` and all `esp-idf-svc` types                                | `rustyfarian-esp-idf-wifi`           | stays                       |
-
-**`WifiDriver` trait (proposed surface)**
-
-```rust
-pub trait WifiDriver {
-    type Error: core::fmt::Debug;
-    fn configure(&mut self, ssid: &str, password: &str) -> Result<(), Self::Error>;
-    fn start(&mut self) -> Result<(), Self::Error>;
-    fn connect(&mut self) -> Result<(), Self::Error>;
-    fn disconnect(&mut self) -> Result<(), Self::Error>;
-    fn is_connected(&self) -> Result<bool, Self::Error>;
-}
-```
-
-No `get_ip` or `wait_netif_up` in the trait — IP address retrieval and netif readiness are HAL-specific.
 
 **`rustyfarian-esp-hal-wifi` chip features**
 
@@ -96,85 +67,12 @@ No `get_ip` or `wait_netif_up` in the trait — IP address retrieval and netif r
 | `esp32c3` | `riscv32imc-unknown-none-elf`  | ESP32-C3 |
 | `esp32c6` | `riscv32imac-unknown-none-elf` | ESP32-C6 |
 
-No default features — stub compiles on host without esp-hal.
+**Remaining phases**
 
-**Build pipeline additions**
-
-New `justfile` recipes:
-- `check-wifi-pure` — host check for `wifi-pure`
-- `check-wifi-hal` — `cargo check -p rustyfarian-esp-hal-wifi --no-default-features`
-- `test-wifi` — `cargo test -p wifi-pure --features mock`
-
-New `.cargo/config.toml.dist` blocks:
-- `[target.riscv32imc-unknown-none-elf]` — linker `riscv32-esp-elf-gcc`, runner espflash
-- `[target.riscv32imac-unknown-none-elf]` — same
-
-**Phased implementation**
-
-1. ~~Author ADR 006 (no-std Wi-Fi dual-HAL decision, modelled on ADR 004/005)~~ — done
-2. ~~Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports~~ — done
-3. ~~Create `rustyfarian-esp-hal-wifi` stub (compile-only, `EspHalWifiManager` returns errors)~~ — done
-4. ~~Add `check-wifi-hal` to `justfile`; add bare-metal target blocks to config dist~~ — done (partial: `check-wifi-pure` and `test-wifi` already added in phase 2)
 5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
 6. Add `hal_c3_connect` and `hal_c6_connect` examples
 
 </details>
-
-### ESP-NOW abstraction
-
-<details>
-<summary><strong>Implementation plan</strong></summary>
-
-Three downstream firmware crates in `rustbox-backstage` (`firmware-rgb-puzzle-brain`, `firmware-rgb-matrix`, `firmware-rgb-nunchuck`) each contain ~155 lines of nearly identical ESP-NOW FFI wrapper code.
-This duplicated code is extracted into `rustyfarian-network` following the dual-HAL pattern (ADR 005).
-
-Target crate layout:
-
-```
-espnow-pure                      — #![no_std]; trait, types, constants, mock
-rustyfarian-esp-idf-espnow       — std; wraps esp_idf_sys FFI, implements trait
-```
-
-No `rustyfarian-esp-hal-espnow` stub — there is no bare-metal ESP-NOW use case today.
-The naming convention is established; the crate can be added when needed.
-
-**~~Phase 1 — `espnow-pure`~~** — done
-
-- ~~`EspNowDriver` trait (`add_peer`, `remove_peer`, `send`, `try_recv`)~~
-- ~~`EspNowEvent` (fixed-size received frame), `PeerConfig`, `MacAddress` type alias~~
-- ~~Constants: `MAX_DATA_LEN` (250), `BROADCAST_MAC`, `DEFAULT_RX_CHANNEL_CAPACITY` (32)~~
-- ~~`validate_payload()` length check~~
-- ~~`MockEspNowDriver` test double (behind `mock` feature)~~
-- ~~10 host tests, workspace integration, justfile recipes~~
-
-**Phase 2 — `rustyfarian-esp-idf-espnow`**
-
-- Static `Mutex<Option<SyncSender<EspNowEvent>>>` + unsafe receive callback
-- `EspIdfEspNow::init()` / `init_with_capacity()` constructors
-- `impl EspNowDriver` delegating to raw `esp_idf_sys` FFI
-- `impl Drop` for `esp_now_deinit` + sender cleanup
-- Re-exports from `espnow-pure`
-
-**Phase 3 — Workspace integration**
-
-- ~~Workspace dep, justfile recipes (`check-espnow-pure`, `test-espnow`)~~ — done
-- `check-espnow` recipe (after Phase 2)
-- README and CHANGELOG updates (after Phase 2)
-
-**~~Phase 4 — ADR 007~~** — done
-
-- ~~Records the extraction decision, why raw FFI over `esp-idf-svc::espnow`, and why no bare-metal stub~~
-
-**Downstream migration (out of scope)**
-
-Each downstream firmware crate replaces `src/espnow.rs` (~155 lines) with ~10 lines using the library.
-The `rgb-puzzle-protocol` crate is unchanged — it encodes/decodes puzzle-specific messages with no transport dependency.
-
-</details>
-
----
-
-## Mid term detail
 
 ### Phase 5 — TTN v3 EU868 OTAA validation
 
@@ -265,47 +163,5 @@ All steps use TTN v3 EU868.
 | 6 | Implement CRC-32 integrity check in `restore_from_sleep` (Phase 7)                |
 | 7 | Implement `EspLoraRadio` hardware driver (Phase 2-4 milestones)                   |
 | 8 | Wire `LorawanDevice::process()` state machine to `lorawan-device 0.12`            |
-
-</details>
-
----
-
-<details>
-<summary><strong>Completed</strong></summary>
-
-### Near-term deliverables (shipped)
-
-- Multi-chip flash + bootloader fix + script arg guards
-- `wifi-pure` crate — platform-independent Wi-Fi types, `WifiDriver` trait, `MockWifiDriver`, 14 host tests
-- `lora-pure` crate
-- `rustyfarian-esp-hal-lora` stub
-- MQTT Builder API + pure state machine
-- `idf_c3_connect` + `idf_c3_mqtt` examples
-- `idf_esp32_mqtt` example — MQTT on classic ESP32 (Xtensa)
-- `hal_esp32s3_join` example + dual-HAL script infrastructure
-- `rustyfarian-esp-hal-wifi` stub — bare-metal Wi-Fi driver skeleton with `WifiDriver` impl, `check-wifi-hal` recipe, RISC-V bare-metal target blocks
-- `ExponentialBackoff` iterator in `rustyfarian-network-pure::backoff` — 7 host tests
-- MQTT topic validation — `validate_publish_topic`, `validate_subscribe_filter`, `topic_matches_filter` in `rustyfarian-network-pure::mqtt` — 29 host tests; validation guards wired into `MqttHandle::subscribe()` and `publish_with()`
-- CI: pure-crate test job — runs all host tests (`rustyfarian-network-pure`, `wifi-pure`, `lora-pure`) in GitHub Actions
-
-### MQTT Enhancements
-
-Driven by [ADR 002](adr/002-mqtt-enhancements-for-downstream-project.md), the `rustyfarian-esp-idf-mqtt` crate was expanded with support for Last Will and Testament, authentication, multi-topic subscription, topic-based callback dispatch, and retained-message publishing.
-
-- `LwtConfig` struct with `new()` constructor for Last Will and Testament support
-- `MqttConfig::with_lwt()` builder for attaching an LWT configuration
-- `MqttConfig::with_auth()` builder for broker authentication
-- Multi-topic subscription: constructor accepts `&[&str]` instead of a single topic
-- Topic-based dispatch: callback signature changes from `Fn(&[u8])` to `Fn(&str, &[u8])`
-- `MqttManager::publish_with()` for explicit QoS and retain control
-- `send_startup_message()` and `send_shutdown_message()` deprecated in favour of `publish_with()`
-
-### Wi-Fi Reliability Fixes
-
-Two issues reported by rustbox-backstage (vault-standalone firmware) were resolved in `rustyfarian-esp-idf-wifi`.
-
-- `WiFiManager::get_ip` now treats transient `is_connected()` and `get_ip_info()` errors as "not ready yet" rather than propagating them; the polling loop continues until the timeout fires, honouring the documented `Ok(Some(ip))` / `Ok(None)` contract
-- `ConnectMode` enum replaces the `connection_timeout_secs` field on `WiFiConfig`; timeout only lives inside `Blocking { timeout_secs }`, so it cannot be set in a context where it would have no effect
-- `WiFiConfig::connect_nonblocking()` builder sets `NonBlocking` mode; `WiFiManager::new` fires `EspWifi::connect()` and returns immediately, letting the ESP-IDF event loop drive association in the background — see [ADR 003](adr/003-wifi-nonblocking-connect.md)
 
 </details>
