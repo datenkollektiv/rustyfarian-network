@@ -35,6 +35,26 @@ pub type MacAddress = [u8; 6];
 /// Broadcast MAC address — addressed frames are delivered to all peers.
 pub const BROADCAST_MAC: MacAddress = [0xFF; 6];
 
+// ─── WifiInterface ──────────────────────────────────────────────────────────
+
+/// Wi-Fi interface used for ESP-NOW peer communication.
+///
+/// - [`Sta`](WifiInterface::Sta) — station interface; the standard choice for
+///   ESP-NOW, including devices that start Wi-Fi without connecting to an AP.
+/// - [`Ap`](WifiInterface::Ap) — soft-AP interface; needed only when the device
+///   runs its own access point and routes ESP-NOW frames through it.
+///
+/// Maps to `wifi_interface_t` on ESP-IDF; platform-independent crates use
+/// this enum so they remain free of ESP-IDF types.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WifiInterface {
+    /// Station interface (default).
+    #[default]
+    Sta,
+    /// Soft-AP interface.
+    Ap,
+}
+
 // ─── Validation ─────────────────────────────────────────────────────────────
 
 /// Returns `Ok(())` if `data` fits within the ESP-NOW payload limit, or an
@@ -95,17 +115,21 @@ pub struct PeerConfig {
     pub channel: u8,
     /// Whether link-layer encryption is enabled for this peer.
     pub encrypt: bool,
+    /// Wi-Fi interface for this peer (default: [`WifiInterface::Sta`]).
+    pub interface: WifiInterface,
 }
 
 impl PeerConfig {
     /// Create a new peer configuration with default settings.
     ///
-    /// Defaults: `channel = 0` (current channel), `encrypt = false`.
+    /// Defaults: `channel = 0` (current channel), `encrypt = false`,
+    /// `interface = WifiInterface::Sta`.
     pub fn new(mac: MacAddress) -> Self {
         Self {
             mac,
             channel: 0,
             encrypt: false,
+            interface: WifiInterface::Sta,
         }
     }
 }
@@ -190,6 +214,23 @@ mod tests {
         assert_eq!(config.mac, mac);
         assert_eq!(config.channel, 0);
         assert!(!config.encrypt);
+        assert_eq!(config.interface, WifiInterface::Sta);
+    }
+
+    #[test]
+    fn peer_config_with_ap_interface() {
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let config = PeerConfig {
+            interface: WifiInterface::Ap,
+            ..PeerConfig::new(mac)
+        };
+        assert_eq!(config.interface, WifiInterface::Ap);
+        assert_eq!(config.mac, mac);
+    }
+
+    #[test]
+    fn wifi_interface_default_is_sta() {
+        assert_eq!(WifiInterface::default(), WifiInterface::Sta);
     }
 
     // ── Constant tests ───────────────────────────────────────────────────
@@ -239,8 +280,22 @@ mod tests {
         driver.add_peer(&config).unwrap();
         let peers = driver.peer_list();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0], mac);
+        assert_eq!(peers[0], (mac, WifiInterface::Sta));
         driver.remove_peer(&mac).unwrap();
         assert!(driver.peer_list().is_empty());
+    }
+
+    #[test]
+    fn mock_add_peer_with_ap_interface() {
+        let driver = mock::MockEspNowDriver::new();
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let config = PeerConfig {
+            interface: WifiInterface::Ap,
+            ..PeerConfig::new(mac)
+        };
+        driver.add_peer(&config).unwrap();
+        let peers = driver.peer_list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0], (mac, WifiInterface::Ap));
     }
 }
