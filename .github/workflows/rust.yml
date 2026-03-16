@@ -1,44 +1,28 @@
-name: Rust Continuous Integration
+name: CI
 
 on:
   push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/README.md"
+    branches: ["main"]
   pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  format:
-    name: Check Formatting
+  check-and-test:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.6
-        with:
-          default: true
-          ldproxy: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check --color always
-
-  build:
-    name: Build & Clippy (ESP32-C6)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup ESP-RS toolchain (RISC-V)
@@ -49,39 +33,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable caching
+      - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
-      - name: Build
-        run: cargo build --release
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
 
-      - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+      - name: Deny (licenses, advisories, bans)
+        run: cargo deny check
 
-  test:
-    name: Pure-crate Tests (host)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check workspace
+        run: cargo check --workspace --release
 
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.6
-        with:
-          default: true
-          ldproxy: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Enable caching
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run pure-crate tests
+      - name: Test pure crates
+        shell: bash
         run: |
-          cargo test -p rustyfarian-network-pure
-          cargo test -p wifi-pure --features mock
-          cargo test -p lora-pure --features mock
-          cargo test -p espnow-pure --features mock
+          host_target="$(rustc -vV | awk '/^host:/ {print $2}')"
+          cargo test -p rustyfarian-network-pure --target "${host_target}"
+          cargo test -p wifi-pure --features mock --target "${host_target}"
+          cargo test -p lora-pure --features mock --target "${host_target}"
+          cargo test -p espnow-pure --features mock --target "${host_target}"

@@ -172,6 +172,29 @@ verify:
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy
 
+# ── Local CI via act ───────────────────────────────────────────────────────
+
+# Run CI workflow locally via act (requires Docker + act)
+act-ci:
+    act -j check-and-test
+
+# Run format-check workflow locally via act (requires Docker + act)
+act-fmt:
+    act -j fmt
+
+# Run clippy workflow locally via act (requires Docker + act)
+act-clippy:
+    act -j clippy
+
+# Run audit workflow locally via act (requires Docker + act)
+act-audit:
+    act -j audit
+
+# Run all CI workflows locally via act (requires Docker + act)
+act-all: act-fmt act-clippy act-ci act-audit
+
+# ── Setup ─────────────────────────────────────────────────────────────────
+
 # set up local cargo config from the template
 setup-cargo-config:
     cp .cargo/config.toml.dist .cargo/config.toml
