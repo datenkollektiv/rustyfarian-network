@@ -132,6 +132,14 @@ impl PeerConfig {
             interface: WifiInterface::Sta,
         }
     }
+
+    /// Sets the Wi-Fi interface to [`WifiInterface::Ap`].
+    ///
+    /// Use this for peers on ESP-NOW-only devices that have no STA connection.
+    pub fn with_ap_interface(mut self) -> Self {
+        self.interface = WifiInterface::Ap;
+        self
+    }
 }
 
 // ─── EspNowDriver trait ──────────────────────────────────────────────────────
@@ -220,12 +228,11 @@ mod tests {
     #[test]
     fn peer_config_with_ap_interface() {
         let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-        let config = PeerConfig {
-            interface: WifiInterface::Ap,
-            ..PeerConfig::new(mac)
-        };
+        let config = PeerConfig::new(mac).with_ap_interface();
         assert_eq!(config.interface, WifiInterface::Ap);
         assert_eq!(config.mac, mac);
+        assert_eq!(config.channel, 0);
+        assert!(!config.encrypt);
     }
 
     #[test]
