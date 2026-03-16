@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-idf-mqtt`: non-blocking `MqttHandle::try_publish`, `try_publish_retained`, and `try_publish_with` with `TryPublishError` for time-critical loops
 - `wifi-pure`: `WifiPowerSave` enum (`None`, `MinModem`, `MaxModem`) and `WiFiConfig::with_power_save()` builder method
 - `rustyfarian-esp-idf-wifi`: applies configured power save mode via `esp_wifi_set_ps()` after Wi-Fi start
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::init_with_radio()` starts and owns the Wi-Fi radio for ESP-NOW-only devices (ADR 008)
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::default_interface()` returns the correct `WifiInterface` based on init mode
+- `espnow-pure`: `PeerConfig::with_ap_interface()` builder method for ESP-NOW-only devices
 
 ## [0.1.0] - 2026-03-16
 
