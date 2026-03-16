@@ -3,7 +3,9 @@
 [![CI](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-esp--toolchain-orange.svg)](https://github.com/esp-rs/rust)
-[![Last Commit](https://img.shields.io/github/last-commit/datenkollektiv/rustyfarian-network)](https://github.com/datenkollektiv/rustyfarian-network/commits/)
+[![cargo fmt](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/fmt.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/fmt.yml)
+[![cargo clippy](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml)
+[![cargo audit](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml)
 
 Wi-Fi and MQTT networking libraries for ESP32 projects using ESP-IDF.
 
