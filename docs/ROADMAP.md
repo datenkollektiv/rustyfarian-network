@@ -25,7 +25,8 @@ timeline
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
 
-    Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
+    Long term : Evaluate ESP-IDF v5.5.2 coex fix for ESP-NOW send failures
+              : Full EspHalLoraRadio hardware driver (after TTN validation)
               : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after esp-hal WiFi)
 ```
 
@@ -135,6 +136,12 @@ All steps use TTN v3 EU868.
 | Never joins but gateway is nearby          | Wrong frequency plan (US915 vs EU868) or no antenna    |
 
 </details>
+
+### Research
+
+| # | Item                                                                                                                       |
+|--:|:---------------------------------------------------------------------------------------------------------------------------|
+| 1 | Evaluate ESP-IDF v5.5.2 — contains fix for "ESP-NOW send failure when coexistence is enabled"; track for next ESP-IDF bump |
 
 ### LoRa post-adoption backlog
 
