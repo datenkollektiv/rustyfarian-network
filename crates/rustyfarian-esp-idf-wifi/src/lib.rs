@@ -66,7 +66,8 @@ use rgb::RGB8;
 // Re-export all pure types from wifi-pure
 pub use wifi_pure::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, WiFiConfig,
-    WifiDriver, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
+    WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
+    SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from led_effects for convenience
@@ -156,7 +157,15 @@ impl WiFiManager {
         }))?;
 
         wifi.start()?;
-        log::info!("WiFi started");
+
+        let ps_mode = match config.power_save {
+            WifiPowerSave::None => esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE,
+            WifiPowerSave::MinModem => esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM,
+            WifiPowerSave::MaxModem => esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_MAX_MODEM,
+        };
+        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_ps(ps_mode) })
+            .context("failed to set WiFi power save mode")?;
+        log::info!("WiFi started, power save: {:?}", config.power_save);
 
         // In non-blocking mode, subscribe to disconnect events so failures such as
         // WIFI_REASON_NO_AP_FOUND are visible at WARN level without enabling debug logs.

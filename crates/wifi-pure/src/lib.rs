@@ -82,6 +82,27 @@ impl Default for ConnectMode {
     }
 }
 
+// ─── WifiPowerSave ──────────────────────────────────────────────────────────
+
+/// Wi-Fi power save mode passed to `esp_wifi_set_ps()` after starting Wi-Fi.
+///
+/// # ESP-NOW caveat
+///
+/// `esp-idf-svc` `EspNow::take()` internally forces `WIFI_PS_NONE`,
+/// overriding whatever mode was set here.
+/// This setting is most useful for battery-powered devices that use
+/// Wi-Fi *without* ESP-NOW.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WifiPowerSave {
+    /// Radio always on. Best latency, highest power draw.
+    #[default]
+    None,
+    /// Minimum modem sleep — radio sleeps between DTIM beacon intervals.
+    MinModem,
+    /// Maximum modem sleep — radio sleeps as long as possible.
+    MaxModem,
+}
+
 // ─── WiFiConfig ─────────────────────────────────────────────────────────────
 
 /// Wi-Fi connection configuration.
@@ -90,14 +111,16 @@ impl Default for ConnectMode {
 ///
 /// ```ignore
 /// let config = WiFiConfig::new("MyNetwork", "password123")
-///     .with_timeout(60)      // optional: override the 30 s default
-///     .connect_nonblocking(); // optional: return immediately from new()
+///     .with_timeout(60)                    // optional: override the 30 s default
+///     .connect_nonblocking()                    // optional: return immediately from new()
+///     .with_power_save(WifiPowerSave::MinModem); // optional: modem sleep for battery savings
 /// ```
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
     pub ssid: &'a str,
     pub password: &'a str,
     pub connect_mode: ConnectMode,
+    pub power_save: WifiPowerSave,
 }
 
 impl<'a> WiFiConfig<'a> {
@@ -109,6 +132,7 @@ impl<'a> WiFiConfig<'a> {
             ssid,
             password,
             connect_mode: ConnectMode::default(),
+            power_save: WifiPowerSave::default(),
         }
     }
 
@@ -132,6 +156,19 @@ impl<'a> WiFiConfig<'a> {
     /// A warning is logged when this fallback occurs.
     pub fn connect_nonblocking(mut self) -> Self {
         self.connect_mode = ConnectMode::NonBlocking;
+        self
+    }
+
+    /// Sets the Wi-Fi power save mode applied after `wifi.start()`.
+    ///
+    /// Defaults to [`WifiPowerSave::None`] (radio always on).
+    ///
+    /// # ESP-NOW caveat
+    ///
+    /// `esp-idf-svc` `EspNow::take()` internally forces `WIFI_PS_NONE`,
+    /// overriding whatever mode is set here.
+    pub fn with_power_save(mut self, mode: WifiPowerSave) -> Self {
+        self.power_save = mode;
         self
     }
 }
@@ -331,6 +368,43 @@ mod tests {
         driver.disconnect().unwrap();
         assert!(!driver.is_connected().unwrap());
     }
+
+    // ── WifiPowerSave tests ──────────────────────────────────────────────
+
+    #[test]
+    fn power_save_default_is_none() {
+        assert_eq!(WifiPowerSave::default(), WifiPowerSave::None);
+    }
+
+    #[test]
+    fn wifi_config_default_power_save_is_none() {
+        let config = test_config();
+        assert_eq!(config.power_save, WifiPowerSave::None);
+    }
+
+    #[test]
+    fn wifi_config_power_save_min_modem() {
+        let config = test_config().with_power_save(WifiPowerSave::MinModem);
+        assert_eq!(config.power_save, WifiPowerSave::MinModem);
+    }
+
+    #[test]
+    fn wifi_config_power_save_max_modem() {
+        let config = test_config().with_power_save(WifiPowerSave::MaxModem);
+        assert_eq!(config.power_save, WifiPowerSave::MaxModem);
+    }
+
+    #[test]
+    fn wifi_config_chained_builders() {
+        let config = test_config()
+            .with_timeout(60)
+            .with_power_save(WifiPowerSave::MinModem)
+            .connect_nonblocking();
+        assert!(matches!(config.connect_mode, ConnectMode::NonBlocking));
+        assert_eq!(config.power_save, WifiPowerSave::MinModem);
+    }
+
+    // ── MockWifiDriver tests ────────────────────────────────────────────
 
     #[test]
     fn mock_driver_fail_connect() {

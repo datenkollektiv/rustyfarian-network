@@ -22,7 +22,7 @@
 //! assert_eq!(driver.connect_count, 1);
 //! ```
 
-use crate::WifiDriver;
+use crate::{WifiDriver, WifiPowerSave};
 
 /// Error type for [`MockWifiDriver`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub struct MockWifiDriver {
     pub netif_up: bool,
     pub connect_count: u32,
     pub fail_connect: bool,
+    pub power_save: WifiPowerSave,
 }
 
 impl MockWifiDriver {
@@ -60,6 +61,7 @@ impl MockWifiDriver {
             netif_up: false,
             connect_count: 0,
             fail_connect: false,
+            power_save: WifiPowerSave::default(),
         }
     }
 }
