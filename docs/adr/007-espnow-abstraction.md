@@ -62,25 +62,26 @@ rustyfarian-esp-idf-espnow       — std; wraps esp_idf_sys FFI, implements trai
 
 **`espnow-pure` (implemented)**
 
-| Item | Purpose |
-|:-----|:--------|
-| `MacAddress` | `[u8; 6]` type alias |
-| `MAX_DATA_LEN` | 250-byte ESP-NOW payload limit |
-| `BROADCAST_MAC` | `[0xFF; 6]` |
-| `validate_payload()` | Payload length check |
-| `EspNowEvent` | Fixed-size received frame (no heap) |
-| `PeerConfig` | Peer registration config with defaults |
-| `EspNowDriver` | Trait: `add_peer`, `remove_peer`, `send`, `try_recv` |
-| `MockEspNowDriver` | Test double (behind `mock` feature) |
+| Item                 | Purpose                                                             |
+|:---------------------|:--------------------------------------------------------------------|
+| `MacAddress`         | `[u8; 6]` type alias                                                |
+| `MAX_DATA_LEN`       | 250-byte ESP-NOW payload limit                                      |
+| `BROADCAST_MAC`      | `[0xFF; 6]`                                                         |
+| `validate_payload()` | Payload length check                                                |
+| `EspNowEvent`        | Fixed-size received frame (no heap)                                 |
+| `WifiInterface`      | STA / AP enum for peer interface selection                          |
+| `PeerConfig`         | Peer registration config (`mac`, `channel`, `encrypt`, `interface`) |
+| `EspNowDriver`       | Trait: `add_peer`, `remove_peer`, `send`, `try_recv`                |
+| `MockEspNowDriver`   | Test double (behind `mock` feature)                                 |
 
 **`rustyfarian-esp-idf-espnow` (planned)**
 
-| Component | What it replaces |
-|:----------|:-----------------|
+| Component                                             | What it replaces               |
+|:------------------------------------------------------|:-------------------------------|
 | Static `Mutex<Option<SyncSender>>` + receive callback | ~30 lines per downstream crate |
-| `EspIdfEspNow::init()` / `init_with_capacity()` | ~20 lines per downstream crate |
-| `impl EspNowDriver` | ~40 lines per downstream crate |
-| `impl Drop` (deinit + cleanup) | ~10 lines per downstream crate |
+| `EspIdfEspNow::init()` / `init_with_capacity()`       | ~20 lines per downstream crate |
+| `impl EspNowDriver`                                   | ~40 lines per downstream crate |
+| `impl Drop` (deinit + cleanup)                        | ~10 lines per downstream crate |
 
 ### What stays downstream
 

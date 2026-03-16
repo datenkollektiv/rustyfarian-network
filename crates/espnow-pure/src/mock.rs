@@ -27,7 +27,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use crate::{EspNowDriver, EspNowEvent, MacAddress, PeerConfig};
+use crate::{EspNowDriver, EspNowEvent, MacAddress, PeerConfig, WifiInterface};
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ impl core::fmt::Display for MockEspNowError {
 // ─── Inner state ─────────────────────────────────────────────────────────────
 
 struct MockState {
-    peers: Vec<MacAddress>,
+    peers: Vec<(MacAddress, WifiInterface)>,
     sent: Vec<(MacAddress, Vec<u8>)>,
     rx_queue: VecDeque<EspNowEvent>,
     fail_send: bool,
@@ -109,8 +109,8 @@ impl MockEspNowDriver {
         self.state.borrow().sent.clone()
     }
 
-    /// Copies the list of registered peer MAC addresses for assertion in tests.
-    pub fn peer_list(&self) -> Vec<MacAddress> {
+    /// Copies the list of registered peers as `(mac, interface)` pairs.
+    pub fn peer_list(&self) -> Vec<(MacAddress, WifiInterface)> {
         self.state.borrow().peers.clone()
     }
 }
@@ -125,12 +125,15 @@ impl EspNowDriver for MockEspNowDriver {
     type Error = MockEspNowError;
 
     fn add_peer(&self, config: &PeerConfig) -> Result<(), Self::Error> {
-        self.state.borrow_mut().peers.push(config.mac);
+        self.state
+            .borrow_mut()
+            .peers
+            .push((config.mac, config.interface));
         Ok(())
     }
 
     fn remove_peer(&self, mac: &MacAddress) -> Result<(), Self::Error> {
-        self.state.borrow_mut().peers.retain(|p| p != mac);
+        self.state.borrow_mut().peers.retain(|(m, _)| m != mac);
         Ok(())
     }
 

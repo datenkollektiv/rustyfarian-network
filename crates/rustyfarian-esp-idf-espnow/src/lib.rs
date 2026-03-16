@@ -17,8 +17,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo};
 pub use espnow_pure::{
-    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, BROADCAST_MAC, DEFAULT_RX_CHANNEL_CAPACITY,
-    MAX_DATA_LEN,
+    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, WifiInterface, BROADCAST_MAC,
+    DEFAULT_RX_CHANNEL_CAPACITY, MAX_DATA_LEN,
 };
 
 /// ESP-IDF implementation of [`EspNowDriver`].
@@ -70,6 +70,10 @@ impl EspNowDriver for EspIdfEspNow {
             peer_addr: config.mac,
             channel: config.channel,
             encrypt: config.encrypt,
+            ifidx: match config.interface {
+                espnow_pure::WifiInterface::Sta => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA,
+                espnow_pure::WifiInterface::Ap => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
+            },
             ..Default::default()
         };
         self.esp_now
