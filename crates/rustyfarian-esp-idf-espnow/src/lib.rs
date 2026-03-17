@@ -11,6 +11,39 @@
 //! driver.add_peer(&config).unwrap();
 //! driver.send(&config.mac, b"hello").unwrap();
 //! ```
+//!
+//! # Recommended `sdkconfig` options
+//!
+//! ## Wi-Fi + ESP-NOW coexistence (same chip)
+//!
+//! ```text
+//! CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+//! CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+//! CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+//! ```
+//!
+//! Disabling A-MPDU eliminates ADDBA/DELBA management frame exchanges that
+//! monopolise the radio and starve ESP-NOW receives.
+//! The software coexistence arbiter enables fair time-division multiplexing.
+//! MQTT and other small-payload Wi-Fi traffic sees negligible throughput loss.
+//!
+//! `esp-idf-svc` `EspNow::take()` already calls `esp_wifi_set_ps(WIFI_PS_NONE)`
+//! internally — consumers do not need to set this manually.
+//!
+//! ## ESP-NOW only (no Wi-Fi AP connection)
+//!
+//! ```text
+//! CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_PEER_NUM=0
+//! ```
+//!
+//! Disables encrypted peer slots (saves RAM when encryption is unused).
+//! No AMPDU or coex settings needed since there is no Wi-Fi connection
+//! competing for the radio.
+//!
+//! ## ESP-NOW + Wi-Fi on separate chips (two-MCU architecture)
+//!
+//! No special `sdkconfig` needed on either chip — radio contention is
+//! eliminated by design.
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
