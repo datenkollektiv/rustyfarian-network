@@ -89,18 +89,19 @@ const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
 
 /// Cyan LED colour for the MQTT connecting state.
 ///
-/// Distinct from Wi-Fi's blue `(0, 0, 255)` so both boot phases are visually
-/// distinguishable during the boot sequence.
-pub const MQTT_CONNECTING_COLOR: (u8, u8, u8) = (0, 180, 180);
+/// Re-exported from [`rustyfarian_network_pure::status_colors::MQTT_CONNECTING`].
+pub const MQTT_CONNECTING_COLOR: (u8, u8, u8) =
+    rustyfarian_network_pure::status_colors::MQTT_CONNECTING;
 
 /// Red LED colour for connection timeout/failure.
-pub const MQTT_ERROR_COLOR: (u8, u8, u8) = (255, 0, 0);
+///
+/// Re-exported from [`rustyfarian_network_pure::status_colors::ERROR`].
+pub const MQTT_ERROR_COLOR: (u8, u8, u8) = rustyfarian_network_pure::status_colors::ERROR;
 
 /// Green channel brightness for the "connected" LED state.
 ///
-/// Matches Wi-Fi's `CONNECTED_LED_BRIGHTNESS` — intentionally dim to avoid
-/// blinding the user in dark environments.
-pub const CONNECTED_LED_BRIGHTNESS: u8 = 20;
+/// Derived from [`rustyfarian_network_pure::status_colors::CONNECTED`].
+pub const CONNECTED_LED_BRIGHTNESS: u8 = rustyfarian_network_pure::status_colors::CONNECTED.1;
 
 /// LED update interval during the connection wait loop (milliseconds).
 ///
