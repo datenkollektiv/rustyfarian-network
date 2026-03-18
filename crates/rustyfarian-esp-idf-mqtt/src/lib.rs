@@ -44,9 +44,14 @@
 //! new code.
 
 use anyhow::Context as _;
+use led_effects::PulseEffect;
+use rgb::RGB8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+// Re-export StatusLed and SimpleLed from led_effects for convenience
+pub use led_effects::{SimpleLed, StatusLed};
 
 use rustyfarian_network_pure::mqtt::{
     connection_wait_iterations, format_broker_url, next_state, validate_broker_host,
@@ -81,6 +86,32 @@ const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
 /// 8 KiB provides sufficient headroom for TLS handshakes on ESP32.
 /// Override via [`MqttConfig::with_task_stack_size`] if needed.
 const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
+
+/// Cyan LED colour for the MQTT connecting state.
+///
+/// Distinct from Wi-Fi's blue `(0, 0, 255)` so both boot phases are visually
+/// distinguishable during the boot sequence.
+pub const MQTT_CONNECTING_COLOR: (u8, u8, u8) = (0, 180, 180);
+
+/// Red LED colour for connection timeout/failure.
+pub const MQTT_ERROR_COLOR: (u8, u8, u8) = (255, 0, 0);
+
+/// Green channel brightness for the "connected" LED state.
+///
+/// Matches Wi-Fi's `CONNECTED_LED_BRIGHTNESS` — intentionally dim to avoid
+/// blinding the user in dark environments.
+pub const CONNECTED_LED_BRIGHTNESS: u8 = 20;
+
+/// LED update interval during the connection wait loop (milliseconds).
+///
+/// 50 ms matches Wi-Fi's `connect_with_led()` cadence for a consistent
+/// pulse animation speed across both boot phases.
+pub const LED_POLL_INTERVAL_MS: u64 = 50;
+
+/// Number of red-pulse frames shown on connection timeout.
+///
+/// 20 frames at 50 ms = 1 second of error indication before returning.
+pub const ERROR_PULSE_FRAMES: u32 = 20;
 
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
@@ -788,6 +819,77 @@ impl<'a> MqttBuilder<'a> {
             connected: connected_for_handle,
             _alive: alive,
         })
+    }
+
+    /// Starts the background event loop, waits for the initial broker
+    /// connection with LED feedback, and returns an [`MqttHandle`].
+    ///
+    /// This is the blocking counterpart to [`build`](Self::build).
+    /// While waiting, the LED pulses cyan; on success it turns steady green;
+    /// on timeout it flashes red for one second before returning an error.
+    ///
+    /// Uses [`MqttConfig::connection_timeout_ms`] (default: 5000 ms) as the
+    /// connection deadline.
+    /// The LED borrow is released when this method returns.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig, StatusLed};
+    ///
+    /// let handle = MqttBuilder::new(config)
+    ///     .on_connect(|client, _| {
+    ///         client.subscribe("commands/#", QoS::AtLeastOnce)?;
+    ///         Ok(())
+    ///     })
+    ///     .build_and_wait(&mut status_led)?;
+    /// ```
+    pub fn build_and_wait<L>(self, led: &mut L) -> anyhow::Result<MqttHandle>
+    where
+        L: StatusLed,
+        L::Error: std::fmt::Debug,
+    {
+        let timeout_ms = self.config.connection_timeout_ms.unwrap_or(5000);
+        let handle = self.build()?;
+
+        let mut pulse = PulseEffect::new();
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+
+        log::info!(
+            "[mqtt] waiting for connection (timeout: {} ms)...",
+            timeout_ms
+        );
+
+        loop {
+            if handle.is_connected() {
+                log::info!("[mqtt] connection confirmed");
+                if let Err(e) = led.set_color(RGB8::new(0, CONNECTED_LED_BRIGHTNESS, 0)) {
+                    log::warn!("[mqtt] LED error (non-fatal): {:?}", e);
+                }
+                return Ok(handle);
+            }
+
+            if start.elapsed() >= timeout {
+                log::error!("[mqtt] connection timeout after {} ms", timeout_ms);
+                for _ in 0..ERROR_PULSE_FRAMES {
+                    if let Err(e) = led.set_color(pulse.update(MQTT_ERROR_COLOR)) {
+                        log::warn!("[mqtt] LED error (non-fatal): {:?}", e);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(LED_POLL_INTERVAL_MS));
+                }
+                return Err(anyhow::anyhow!(
+                    "MQTT broker unreachable within {} ms",
+                    timeout_ms
+                ));
+            }
+
+            if let Err(e) = led.set_color(pulse.update(MQTT_CONNECTING_COLOR)) {
+                log::warn!("[mqtt] LED error (non-fatal): {:?}", e);
+            }
+            std::thread::sleep(Duration::from_millis(LED_POLL_INTERVAL_MS));
+        }
     }
 }
 
