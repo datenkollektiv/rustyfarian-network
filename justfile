@@ -77,9 +77,9 @@ doc-open:
 deny:
     cargo deny check
 
-# update dependencies
-update:
-    cargo update
+# update dependencies (pass package flags to update specific crates, e.g. just update -p led-effects)
+update *args:
+    cargo update {{args}}
 
 # clean build artifacts
 clean:

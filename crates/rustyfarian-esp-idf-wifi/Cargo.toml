@@ -15,6 +15,9 @@ name = "idf_c3_connect"
 [[example]]
 name = "idf_c3_connect_nonblocking"
 
+[[example]]
+name = "idf_c6_connect_nonblocking_rgb"
+
 [build-dependencies]
 embuild.workspace = true
 
@@ -25,3 +28,6 @@ esp-idf-svc.workspace = true
 led-effects.workspace = true
 log.workspace = true
 rgb.workspace = true
+
+[dev-dependencies]
+rustyfarian-esp-idf-ws2812.workspace = true
