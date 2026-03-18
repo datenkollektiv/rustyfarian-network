@@ -155,7 +155,7 @@ All steps use TTN v3 EU868.
 | 4 | `PartialEq` on `LorawanResponse` / `Downlink`                                     |
 | 5 | Replace manual O(n) FIFO shift in `MockLoraRadio::receive` with `heapless::Deque` |
 | 6 | Implement CRC-32 integrity check in `restore_from_sleep` (Phase 7)                |
-| 7 | Implement `EspLoraRadio` hardware driver (Phase 2-4 milestones)                   |
+| 7 | Implement `EspHalLoraRadio` hardware driver (Phase 2-4 milestones)                |
 | 8 | Wire `LorawanDevice::process()` state machine to `lorawan-device 0.12`            |
 
 </details>

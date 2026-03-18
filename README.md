@@ -1,4 +1,4 @@
-# Rustyfarian Network Related Crates
+# Rustyfarian Network
 
 [![CI](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -7,7 +7,7 @@
 [![cargo clippy](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml)
 [![cargo audit](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml)
 
-Wi-Fi and MQTT networking libraries for ESP32 projects using ESP-IDF.
+Wi-Fi, MQTT, LoRa, and ESP-NOW networking libraries for ESP32 projects.
 
 > Note: Large parts of this library (and documentation) were developed with the assistance of AI tools.
 > All generated code has been reviewed and curated by the maintainer.
