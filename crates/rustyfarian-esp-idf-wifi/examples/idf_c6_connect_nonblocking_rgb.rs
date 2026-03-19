@@ -8,9 +8,10 @@
 //! - Dim green for 5 seconds, then fade to black (power saving)
 //! - LED is free for other uses after fade-out
 //!
-//! The example uses `new_without_led()` + non-blocking mode so it owns the LED
-//! throughout the entire sequence. WiFiManager initiates association in the
-//! background; the example polls `is_connected()` while driving the animation.
+//! This example uses non-blocking mode so it owns the LED throughout the entire
+//! sequence.
+//! WiFiManager initiates association in the background; the example polls
+//! `is_connected()` while driving the animation.
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build time**.
 //! With [direnv](https://direnv.net/) and a populated `.envrc`, these are set automatically.
@@ -32,22 +33,27 @@ use std::time::Duration;
 
 use led_effects::{PulseEffect, StatusLed};
 use rgb::RGB8;
-use rustyfarian_esp_idf_wifi::{WiFiConfig, WiFiManager};
+use rustyfarian_esp_idf_wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 use rustyfarian_esp_idf_ws2812::WS2812RMT;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
+const SSID: &str = match option_env!("WIFI_SSID") {
+    Some(s) => s,
+    None => "",
+};
+const PASSWORD: &str = match option_env!("WIFI_PASS") {
+    Some(s) => s,
+    None => "",
+};
+
 const FRAME_MS: u64 = 50;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-
-    let ssid = option_env!("WIFI_SSID").unwrap_or("");
-    let password = option_env!("WIFI_PASS")
-        .ok_or_else(|| anyhow::anyhow!("WIFI_PASS must be set at build time"))?;
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -56,9 +62,10 @@ fn main() -> anyhow::Result<()> {
     let mut led = WS2812RMT::new(peripherals.pins.gpio8)?;
     let mut pulse = PulseEffect::new();
 
-    // Non-blocking: WiFiManager initiates association and returns immediately.
-    let config = WiFiConfig::new(ssid, password).connect_nonblocking();
-    let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), config)?;
+    let config = WiFiConfig::new(SSID, PASSWORD)
+        .connect_nonblocking()
+        .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
+    let wifi = WiFiManager::init(config)?;
     log::info!("Wi-Fi connect initiated");
 
     // Phase 1: blue pulse while waiting for association.
@@ -81,14 +88,10 @@ fn main() -> anyhow::Result<()> {
         thread::sleep(Duration::from_millis(FRAME_MS));
     }
 
-    // Phase 3: steady dim green for 5 seconds.
-    let dim_green = RGB8::new(0, 20, 0);
-    led.set_color(dim_green)?;
-
-    match wifi.get_ip(30_000)? {
-        Some(ip) => log::info!("Connected — IP address: {}", ip),
-        None => log::error!("IP address not assigned within timeout"),
-    }
+    // Phase 3: steady dim green while waiting for DHCP.
+    led.set_color(RGB8::new(0, 20, 0))?;
+    let ip = wifi.wait_connected(30_000)?;
+    log::info!("Connected — IP: {}", ip);
 
     thread::sleep(Duration::from_secs(5));
 
@@ -100,13 +103,5 @@ fn main() -> anyhow::Result<()> {
     led.set_color(RGB8::new(0, 0, 0))?;
     log::info!("LED off — power saving mode");
 
-    // LED is now free for other uses.
-    loop {
-        match wifi.is_connected() {
-            Ok(true) => log::info!("Wi-Fi status: connected"),
-            Ok(false) => log::warn!("Wi-Fi status: disconnected"),
-            Err(e) => log::error!("Wi-Fi status check failed: {:#}", e),
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    Ok(())
 }

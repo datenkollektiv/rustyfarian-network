@@ -3,7 +3,8 @@
 *Last updated: March 2026*
 
 All near-term work is complete.
-Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` implementation is the next major feature.
+`EspHalWifiManager` is implemented (ADR 006 Phase 5-6).
+Phase 5 LoRa validation remains blocked on hardware.
 
 ```mermaid
 %%{init: {
@@ -21,7 +22,7 @@ Phase 5 LoRa validation remains blocked on hardware; full `EspHalWifiManager` im
 timeline
     title rustyfarian-network Roadmap
 
-    Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (phases 5-6)
+    Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (done, phases 5-6)
               : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
 
@@ -42,11 +43,11 @@ timeline
 Phases 1-4 (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub, justfile recipes) are complete.
 The remaining work implements the actual bare-metal Wi-Fi driver.
 
-**Dependency stack (agent-verified, 2026-03-06)**
+**Dependency stack (verified 2026-03-19)**
 
-- `esp-wifi 0.14.0` — production-ready since Dec 2024; supports ESP32-C3 and ESP32-C6;
-  compatible with `esp-hal 1.0.0` (already in workspace); bundles `smoltcp 0.11.0`
-- `smoltcp 0.11.0` — `no_std`, `0BSD` licence (**requires adding `"0BSD"` to `deny.toml` allow list**)
+- `esp-radio 0.17.0` — successor to `esp-wifi` (renamed); supports ESP32-C3 and ESP32-C6;
+  compatible with `esp-hal 1.0.0`; requires `esp-rtos 0.2.0` (scheduler) and `esp-alloc 0.9.0` (heap)
+- `smoltcp 0.12.0` — `no_std`, `0BSD` licence (added to `deny.toml` allow list)
 
 **`rustyfarian-esp-hal-wifi` chip features**
 
@@ -57,8 +58,8 @@ The remaining work implements the actual bare-metal Wi-Fi driver.
 
 **Remaining phases**
 
-5. Implement full `EspHalWifiManager` using `esp-wifi 0.14.0` + `smoltcp`
-6. Add `hal_c3_connect` and `hal_c6_connect` examples
+5. ~~Implement full `EspHalWifiManager` using `esp-radio 0.17.0`~~ (done)
+6. ~~Add `hal_c3_connect` and `hal_c6_connect` examples~~ (done)
 
 </details>
 

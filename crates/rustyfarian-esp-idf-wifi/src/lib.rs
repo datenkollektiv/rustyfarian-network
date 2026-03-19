@@ -8,10 +8,11 @@
 //! # Example
 //!
 //! ```ignore
-//! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig};
+//! use rustyfarian_esp_idf_wifi::{WiFiManager, WiFiConfig, WiFiConfigExt};
 //!
-//! let config = WiFiConfig::new("MyNetwork", "password123");
-//! let wifi = WiFiManager::new_without_led(modem, sys_loop, Some(nvs), config)?;
+//! let config = WiFiConfig::new("MyNetwork", "password123")
+//!     .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
+//! let wifi = WiFiManager::init(config)?;
 //!
 //! if let Some(ip) = wifi.get_ip(10000)? {
 //!     println!("Connected with IP: {}", ip);
@@ -75,6 +76,51 @@ pub use led_effects::{SimpleLed, StatusLed};
 
 use rustyfarian_network_pure::status_colors;
 
+/// ESP-IDF Wi-Fi configuration bundled with the hardware peripherals needed for init.
+///
+/// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfigExt::with_peripherals],
+/// then passed to [`WiFiManager::init`].
+pub struct IdfWifiConfig<'a> {
+    ssid: &'a str,
+    password: &'a str,
+    connect_mode: ConnectMode,
+    power_save: WifiPowerSave,
+    modem: Modem<'static>,
+    sys_loop: EspSystemEventLoop,
+    nvs: Option<EspDefaultNvsPartition>,
+}
+
+/// Extension trait that adds [`with_peripherals`][WiFiConfigExt::with_peripherals]
+/// to [`WiFiConfig`], producing an [`IdfWifiConfig`] ready for [`WiFiManager::init`].
+pub trait WiFiConfigExt<'a> {
+    /// Bundles this configuration with the ESP-IDF peripherals required for Wi-Fi.
+    fn with_peripherals(
+        self,
+        modem: Modem<'static>,
+        sys_loop: EspSystemEventLoop,
+        nvs: Option<EspDefaultNvsPartition>,
+    ) -> IdfWifiConfig<'a>;
+}
+
+impl<'a> WiFiConfigExt<'a> for WiFiConfig<'a> {
+    fn with_peripherals(
+        self,
+        modem: Modem<'static>,
+        sys_loop: EspSystemEventLoop,
+        nvs: Option<EspDefaultNvsPartition>,
+    ) -> IdfWifiConfig<'a> {
+        IdfWifiConfig {
+            ssid: self.ssid,
+            password: self.password,
+            connect_mode: self.connect_mode,
+            power_save: self.power_save,
+            modem,
+            sys_loop,
+            nvs,
+        }
+    }
+}
+
 /// A no-op LED implementation used by [`WiFiManager::new_without_led`].
 struct NoLed;
 
@@ -94,6 +140,26 @@ pub struct WiFiManager {
 }
 
 impl WiFiManager {
+    /// Initializes Wi-Fi from a bundled configuration — the recommended entry point.
+    ///
+    /// Mirrors the [`EspHalWifiManager::init`] API from the bare-metal crate
+    /// so both ESP-IDF and esp-hal projects use the same builder flow:
+    ///
+    /// ```ignore
+    /// let config = WiFiConfig::new("MyNetwork", "password123")
+    ///     .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
+    /// let wifi = WiFiManager::init(config)?;
+    /// ```
+    pub fn init(config: IdfWifiConfig<'_>) -> anyhow::Result<Self> {
+        let wifi_config = WiFiConfig {
+            ssid: config.ssid,
+            password: config.password,
+            connect_mode: config.connect_mode,
+            power_save: config.power_save,
+        };
+        Self::new_without_led(config.modem, config.sys_loop, config.nvs, wifi_config)
+    }
+
     /// Creates a new Wi-Fi manager and connects to the network.
     ///
     /// # Arguments
@@ -362,6 +428,17 @@ impl WiFiManager {
         log::info!("WiFi connected and netif up");
 
         Ok(())
+    }
+
+    /// Blocks until the Wi-Fi station is associated and an IP address is
+    /// assigned via DHCP.
+    ///
+    /// Returns the assigned IPv4 address, or `Err` if the timeout elapses.
+    /// Mirrors [`rustyfarian_esp_hal_wifi::WiFiManager::wait_connected`] so
+    /// both ESP-IDF and esp-hal projects use the same call.
+    pub fn wait_connected(&self, timeout_ms: u64) -> anyhow::Result<Ipv4Addr> {
+        self.get_ip(timeout_ms)?
+            .ok_or_else(|| anyhow::anyhow!("Wi-Fi connection timeout after {} ms", timeout_ms))
     }
 
     /// Waits for an IP address to be assigned.
