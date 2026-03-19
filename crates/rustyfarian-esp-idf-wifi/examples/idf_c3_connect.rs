@@ -20,7 +20,7 @@
 //! ```
 //!
 //! ```sh
-//! just flash rustyfarian-esp-idf-wifi idf_c3_connect
+//! just flash idf_c3_connect
 //! ```
 
 use std::thread;
