@@ -10,9 +10,45 @@ keywords = ["wifi", "esp-hal", "embedded", "no-std"]
 categories = ["embedded", "no-std", "network-programming"]
 
 [features]
-esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6"]
-esp32c3 = ["dep:esp-hal", "esp-hal/esp32c3"]
+# No default features: bare-metal targets require explicit chip selection.
+# Enabling a chip feature pulls in esp-hal, esp-radio, esp-rtos, and esp-alloc.
+esp32c6 = [
+    "dep:esp-hal", "esp-hal/esp32c6",
+    "dep:esp-radio", "esp-radio/esp32c6", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/smoltcp", "esp-radio/unstable",
+    "dep:esp-rtos", "esp-rtos/esp32c6", "esp-rtos/esp-radio", "esp-rtos/esp-alloc",
+    "dep:esp-alloc",
+    "dep:smoltcp",
+    "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6",
+    "dep:esp-println", "esp-println/esp32c6", "esp-println/jtag-serial",
+]
+esp32c3 = [
+    "dep:esp-hal", "esp-hal/esp32c3",
+    "dep:esp-radio", "esp-radio/esp32c3", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/smoltcp", "esp-radio/unstable",
+    "dep:esp-rtos", "esp-rtos/esp32c3", "esp-rtos/esp-radio", "esp-rtos/esp-alloc",
+    "dep:esp-alloc",
+    "dep:smoltcp",
+    "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c3",
+    "dep:esp-println", "esp-println/esp32c3", "esp-println/uart",
+]
+unstable = ["esp-hal/unstable"]
+rt = ["esp-hal/rt"]
 
 [dependencies]
 wifi-pure.workspace = true
+led-effects.workspace = true
+log.workspace = true
 esp-hal = { version = "1.0", features = ["unstable"], optional = true }
+esp-radio = { workspace = true, optional = true }
+esp-rtos = { workspace = true, optional = true }
+esp-alloc = { workspace = true, optional = true }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-raw"], optional = true }
+esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, optional = true }
+esp-println = { version = "0.16", default-features = false, optional = true }
+
+[[example]]
+name = "hal_c6_connect"
+required-features = ["esp32c6", "rt"]
+
+[[example]]
+name = "hal_c3_connect"
+required-features = ["esp32c3", "rt"]

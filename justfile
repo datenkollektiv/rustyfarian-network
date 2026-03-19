@@ -103,13 +103,11 @@ test-mqtt:
 test-wifi:
     cargo test --target {{host_target}} -p wifi-pure --features mock
 
-# run lora unit tests on the host (no ESP-IDF required)
-# Tests live in lora-pure; --features mock enables MockLoraRadio and mock-gated test blocks.
+# run platform-independent LoRa unit tests (host toolchain, no ESP-IDF needed)
 test-lora:
     cargo test --target {{host_target}} -p lora-pure --features mock
 
-# run espnow unit tests on the host (no ESP-IDF required)
-# Tests live in espnow-pure; --features mock enables MockEspNowDriver and mock-gated test blocks.
+# run platform-independent ESP-NOW unit tests (host toolchain, no ESP-IDF needed)
 test-espnow:
     cargo test --target {{host_target}} -p espnow-pure --features mock
 
@@ -117,6 +115,17 @@ test-espnow:
 test: test-backoff test-mqtt test-wifi test-lora test-espnow
 
 # ── Examples ────────────────────────────────────────────────────────────────
+
+# list all available hardware examples
+examples:
+    #!/usr/bin/env bash
+    echo "Available examples (use with: just run <example>):"
+    echo ""
+    for f in crates/*/examples/*.rs; do
+        name=$(basename "$f" .rs)
+        crate=$(echo "$f" | cut -d/ -f2)
+        printf "  %-40s  (%s)\n" "$name" "$crate"
+    done
 
 # build a named example; chip and crate auto-detected from example name
 build-example example:
@@ -126,33 +135,19 @@ build-example example:
 flash example:
     scripts/flash.sh "{{example}}"
 
-# build, flash, and open the serial monitor
-run example: (flash example)
-    espflash monitor
+# build, flash, and open the serial monitor (run without args to list examples)
+run *example:
+    #!/usr/bin/env bash
+    if [ -z "{{example}}" ]; then
+        just examples
+    else
+        just flash "{{example}}"
+        espflash monitor
+    fi
 
 # open the serial monitor for an already-flashed device
 monitor:
     espflash monitor
-
-# convenience: build the blocking Wi-Fi connect example
-build-wifi-connect:
-    just build-example idf_c3_connect
-
-# convenience: build the non-blocking Wi-Fi connect example
-build-wifi-connect-nonblocking:
-    just build-example idf_c3_connect_nonblocking
-
-# convenience: build the MQTT builder example
-build-mqtt:
-    just build-example idf_c3_mqtt
-
-# convenience: build the ESP32-S3 bare-metal LoRa join example
-build-lora-esp32s3:
-    just build-example hal_esp32s3_join
-
-# convenience: build the ESP-IDF LoRa OTAA join example for Heltec WiFi LoRa 32 V3 (ESP32-S3)
-build-lora-idf-esp32s3:
-    just build-example idf_esp32s3_join
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:
@@ -174,24 +169,14 @@ ci: fmt-check deny check clippy
 
 # ── Local CI via act ───────────────────────────────────────────────────────
 
-# Run CI workflow locally via act (requires Docker + act)
-act-ci:
-    act -j check-and-test
-
-# Run format-check workflow locally via act (requires Docker + act)
-act-fmt:
-    act -j fmt
-
-# Run clippy workflow locally via act (requires Docker + act)
-act-clippy:
-    act -j clippy
-
-# Run audit workflow locally via act (requires Docker + act)
-act-audit:
-    act -j audit
-
-# Run all CI workflows locally via act (requires Docker + act)
-act-all: act-fmt act-clippy act-ci act-audit
+# run all CI workflows locally via act (requires Docker + act)
+act *job:
+    #!/usr/bin/env bash
+    if [ -z "{{job}}" ]; then
+        just act fmt && just act clippy && just act ci && just act audit
+    else
+        act -j "{{job}}"
+    fi
 
 # ── Setup ─────────────────────────────────────────────────────────────────
 

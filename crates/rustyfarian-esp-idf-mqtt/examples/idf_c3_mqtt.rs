@@ -29,7 +29,7 @@
 //! # Build and flash
 //!
 //! ```sh
-//! WIFI_SSID="MyNetwork" WIFI_PASS="<your-password>" just build-mqtt
+//! WIFI_SSID="MyNetwork" WIFI_PASS="<your-password>" just build-example idf_c3_mqtt
 //! ```
 //!
 //! ```sh

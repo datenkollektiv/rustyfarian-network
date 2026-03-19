@@ -38,10 +38,12 @@ pub const PASSWORD_MAX_LEN: usize = 64;
 /// Returns `Ok(())` if `ssid` fits within the ESP-IDF limit, or an error
 /// message suitable for wrapping with `anyhow::anyhow!`.
 pub fn validate_ssid(ssid: &str) -> Result<(), &'static str> {
-    if ssid.len() <= SSID_MAX_LEN {
-        Ok(())
-    } else {
+    if ssid.is_empty() {
+        Err("SSID must not be empty")
+    } else if ssid.len() > SSID_MAX_LEN {
         Err("SSID exceeds maximum length of 32 bytes")
+    } else {
+        Ok(())
     }
 }
 
@@ -250,8 +252,8 @@ mod tests {
     // ── Validation tests (migrated from rustyfarian-network-pure) ────────
 
     #[test]
-    fn empty_ssid_is_valid() {
-        assert!(validate_ssid("").is_ok());
+    fn empty_ssid_is_rejected() {
+        assert!(validate_ssid("").is_err());
     }
 
     #[test]

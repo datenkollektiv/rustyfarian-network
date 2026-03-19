@@ -33,6 +33,11 @@ lorawan-device = { version = "0.12", default-features = false, features = ["defa
 lora-modulation = "0.1"
 sx126x = "0.3"
 
+# Bare-metal (esp-hal) dependencies
+esp-radio = { version = "0.17", default-features = false }
+esp-rtos = { version = "0.2", default-features = false }
+esp-alloc = { version = "0.9" }
+
 # Cross-repo dependencies (for Wi-Fi LED status)
 led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }
 rustyfarian-esp-idf-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }

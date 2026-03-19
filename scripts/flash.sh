@@ -82,7 +82,8 @@ case "$prefix" in
         # Bare-metal HAL examples: detect package from feature name
         case "$example" in
             *join*) pkg="rustyfarian-esp-hal-lora" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "join".\n' "$example" >&2; exit 1 ;;
+            *connect*) pkg="rustyfarian-esp-hal-wifi" ;;
+            *) printf 'Cannot detect crate for example "%s".\nName must contain "join" or "connect".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set targets
@@ -109,9 +110,9 @@ case "$prefix" in
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            cargo +esp build --release -Zbuild-std=core --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo +esp build --release -Zbuild-std=core,alloc --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         else
-            cargo build --release --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo build --release -Zbuild-std=core,alloc --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         fi
 
         # Get bootloader from IDF target's release cache; HAL targets don't produce bootloaders
