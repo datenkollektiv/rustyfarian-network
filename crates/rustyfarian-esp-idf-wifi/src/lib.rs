@@ -73,10 +73,7 @@ pub use wifi_pure::{
 // Re-export StatusLed and SimpleLed from led_effects for convenience
 pub use led_effects::{SimpleLed, StatusLed};
 
-/// Green channel brightness for the "connected" LED state.
-///
-/// Kept intentionally dim to avoid blinding the user in dark environments.
-const CONNECTED_LED_BRIGHTNESS: u8 = 20;
+use rustyfarian_network_pure::status_colors;
 
 /// A no-op LED implementation used by [`WiFiManager::new_without_led`].
 struct NoLed;
@@ -265,7 +262,7 @@ impl WiFiManager {
 
                 // Brief red pulse to indicate failure before returning error
                 for _ in 0..20 {
-                    led.set_color(pulse_effect.update((255, 0, 0)))
+                    led.set_color(pulse_effect.update(status_colors::ERROR))
                         .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
                     thread::sleep(Duration::from_millis(50));
                 }
@@ -307,7 +304,7 @@ impl WiFiManager {
             }
 
             // Pulse blue light
-            led.set_color(pulse_effect.update((0, 0, 255)))
+            led.set_color(pulse_effect.update(status_colors::WIFI_CONNECTING))
                 .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
             thread::sleep(Duration::from_millis(50));
         }
@@ -316,7 +313,8 @@ impl WiFiManager {
         wifi.wait_netif_up()?;
         log::info!("WiFi netif up");
 
-        led.set_color(RGB8::new(0, CONNECTED_LED_BRIGHTNESS, 0))
+        let (r, g, b) = status_colors::CONNECTED;
+        led.set_color(RGB8::new(r, g, b))
             .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
 
         Ok(())

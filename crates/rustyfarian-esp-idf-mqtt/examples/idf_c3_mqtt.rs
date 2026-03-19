@@ -33,7 +33,7 @@
 //! ```
 //!
 //! ```sh
-//! just flash rustyfarian-esp-idf-mqtt idf_c3_mqtt
+//! just flash idf_c3_mqtt
 //! ```
 
 use esp_idf_svc::hal::peripherals::Peripherals;
