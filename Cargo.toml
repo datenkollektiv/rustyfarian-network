@@ -38,6 +38,10 @@ esp-radio = { version = "0.17", default-features = false }
 esp-rtos = { version = "0.2", default-features = false }
 esp-alloc = { version = "0.9" }
 
+# Bare-metal debugging
+esp-backtrace = { version = "0.18", default-features = false, features = ["panic-handler", "println"] }
+
 # Cross-repo dependencies (for Wi-Fi LED status)
 led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }
 rustyfarian-esp-idf-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }
+rustyfarian-esp-hal-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", default-features = false, features = ["led-effects"] }

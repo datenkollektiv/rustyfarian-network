@@ -56,8 +56,8 @@ case "$prefix" in
         # Bare-metal HAL examples: detect package from feature name
         case "$example" in
             *join*) pkg="rustyfarian-esp-hal-lora" ;;
-            *connect*) pkg="rustyfarian-esp-hal-wifi" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "join" or "connect".\n' "$example" >&2; exit 1 ;;
+            *connect*|*wifi*) pkg="rustyfarian-esp-hal-wifi" ;;
+            *) printf 'Cannot detect crate for example "%s".\nName must contain "join", "connect", or "wifi".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set Cargo target
@@ -72,6 +72,11 @@ case "$prefix" in
 
         # Base features
         hal_features="${mcu},unstable,rt"
+
+        # Append optional features based on example name
+        case "$example" in
+            *_rgb*) hal_features="${hal_features},rustyfarian-esp-hal-ws2812" ;;
+        esac
 
         printf 'Building %s for bare-metal %s (MCU=%s)...\n' "$example" "$target" "$mcu"
 

@@ -1,23 +1,14 @@
-//! Bare-metal Wi-Fi connect example for ESP32-C3.
+//! Bare-metal Wi-Fi connect example for ESP32-C3 Super Mini.
 //!
 //! Demonstrates [`WiFiManager`] connecting to a WPA2 access point using
 //! `esp-radio` on a bare-metal (no_std) target.
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build time**.
-//! With [direnv](https://direnv.net/) and a populated `.envrc`, these are set automatically.
-//!
-//! # Components
-//!
-//! - ESP32-C3 development board
-//! - USB cable
 //!
 //! # Build and Flash
 //!
 //! ```sh
 //! WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example hal_c3_connect
-//! ```
-//!
-//! ```sh
 //! just flash hal_c3_connect
 //! ```
 
@@ -26,12 +17,12 @@
 
 extern crate alloc;
 
-esp_bootloader_esp_idf::esp_app_desc!();
-
-use esp_hal::clock::CpuClock;
+use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
 use rustyfarian_esp_hal_wifi::{WiFiConfig, WiFiConfigExt, WiFiManager, WifiError};
+
+esp_bootloader_esp_idf::esp_app_desc!();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -42,14 +33,8 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
     None => "",
 };
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
-    loop {}
-}
-
 fn run() -> Result<(), WifiError> {
-    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
@@ -57,6 +42,7 @@ fn run() -> Result<(), WifiError> {
         peripherals.WIFI,
     );
     let mut wifi = WiFiManager::init(config)?;
+    println!("Wi-Fi connect initiated");
 
     let ip = wifi.wait_connected(30_000)?;
     println!("Wi-Fi connected — IP: {}", ip);
@@ -66,6 +52,7 @@ fn run() -> Result<(), WifiError> {
 
 #[main]
 fn main() -> ! {
+    esp_println::logger::init_logger(log::LevelFilter::Info);
     if let Err(e) = run() {
         println!("FATAL: {}", e);
     }

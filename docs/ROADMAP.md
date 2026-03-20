@@ -2,9 +2,9 @@
 
 *Last updated: March 2026*
 
-All near-term work is complete.
-`EspHalWifiManager` is implemented (ADR 006 Phase 5-6).
-Phase 5 LoRa validation remains blocked on hardware.
+`EspHalWifiManager` is complete with unified `WiFiManager::init()` API, DHCP via smoltcp, and full API parity between ESP-IDF and esp-hal crates.
+TTN v3 LoRa validation remains blocked on hardware.
+Next milestone: release v0.2.0 with the accumulated post-0.1.0 features.
 
 ```mermaid
 %%{init: {
@@ -22,46 +22,53 @@ Phase 5 LoRa validation remains blocked on hardware.
 timeline
     title rustyfarian-network Roadmap
 
-    Mid term  : Full EspHalWifiManager + hal_c3_connect / hal_c6_connect examples (done, phases 5-6)
-              : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
+    Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW radio init
+              : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
+
+    Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
 
     Long term : Evaluate ESP-IDF v5.5.2 coex fix for ESP-NOW send failures
               : Full EspHalLoraRadio hardware driver (after TTN validation)
-              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after esp-hal WiFi)
+              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (esp-hal WiFi dependency resolved)
 ```
 
 ---
 
-## Mid term detail
-
-### Full `EspHalWifiManager` implementation
+## Completed
 
 <details>
-<summary><strong>Remaining phases from the WiFi dual-HAL plan</strong></summary>
+<summary><strong>Delivered since v0.1.0</strong></summary>
 
-Phases 1-4 (ADR 006, `wifi-pure`, `rustyfarian-esp-hal-wifi` stub, justfile recipes) are complete.
-The remaining work implements the actual bare-metal Wi-Fi driver.
-
-**Dependency stack (verified 2026-03-19)**
-
-- `esp-radio 0.17.0` — successor to `esp-wifi` (renamed); supports ESP32-C3 and ESP32-C6;
-  compatible with `esp-hal 1.0.0`; requires `esp-rtos 0.2.0` (scheduler) and `esp-alloc 0.9.0` (heap)
-- `smoltcp 0.12.0` — `no_std`, `0BSD` licence (added to `deny.toml` allow list)
-
-**`rustyfarian-esp-hal-wifi` chip features**
-
-| Feature   | Cargo target                   | MCU      |
-|:----------|:-------------------------------|:---------|
-| `esp32c3` | `riscv32imc-unknown-none-elf`  | ESP32-C3 |
-| `esp32c6` | `riscv32imac-unknown-none-elf` | ESP32-C6 |
-
-**Remaining phases**
-
-5. ~~Implement full `EspHalWifiManager` using `esp-radio 0.17.0`~~ (done)
-6. ~~Add `hal_c3_connect` and `hal_c6_connect` examples~~ (done)
+- `EspHalWifiManager` with `esp-radio 0.17.0` — full `WifiDriver` impl, `WiFiConfigExt`, `wait_connected` with DHCP, `hal_c3_connect` / `hal_c6_connect` examples (ADR 006 Phases 1-6)
+- Unified `WiFiManager::init(config)` API across ESP-IDF and esp-hal crates
+- `validate_ssid` rejects empty SSIDs (shared in `wifi-pure`)
+- `status_colors` module in `rustyfarian-network-pure`
+- `MqttBuilder::build_and_wait()` with `StatusLed` support
+- Non-blocking `MqttHandle::try_publish` / `try_publish_retained` / `try_publish_with`
+- `WifiPowerSave` enum and `WiFiConfig::with_power_save()`
+- `EspIdfEspNow::init_with_radio()` for ESP-NOW-only devices (ADR 008)
+- Configurable MQTT task stack size (default raised to 8 KiB)
+- Justfile cleanup: removed convenience recipes, consolidated `act` into single recipe with optional job arg
 
 </details>
+
+<details>
+<summary><strong>Delivered in v0.1.0</strong></summary>
+
+- `wifi-pure`, `lora-pure`, `espnow-pure` — platform-independent crates with traits and mocks
+- `rustyfarian-esp-idf-lora` with `LoraRadioAdapter` bridging to `lorawan-device 0.12`
+- `rustyfarian-esp-idf-espnow` — ESP-NOW driver implementing `EspNowDriver` trait
+- `MqttBuilder` API with lifecycle callbacks, LWT, auth
+- `rustyfarian-network-pure` — MQTT validation, state machine, `ExponentialBackoff`
+- Dual-HAL script infrastructure (`build-example.sh`, `flash.sh`)
+- CI: pure-crate test job for all host tests
+
+</details>
+
+---
+
+## Mid term detail
 
 ### Phase 5 — TTN v3 EU868 OTAA validation
 
