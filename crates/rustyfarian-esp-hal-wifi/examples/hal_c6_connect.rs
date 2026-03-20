@@ -1,7 +1,7 @@
 //! Bare-metal Wi-Fi connect example for ESP32-C6.
 //!
 //! Demonstrates [`WiFiManager`] connecting to a WPA2 access point using
-//! `esp-radio` on a bare-metal (no_std) target.
+//! `esp-wifi` on a bare-metal (no_std) target.
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build time**.
 //! With [direnv](https://direnv.net/) and a populated `.envrc`, these are set automatically.
@@ -24,14 +24,12 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
-esp_bootloader_esp_idf::esp_app_desc!();
-
-use esp_hal::clock::CpuClock;
+use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
 use rustyfarian_esp_hal_wifi::{WiFiConfig, WiFiConfigExt, WiFiManager, WifiError};
+
+esp_bootloader_esp_idf::esp_app_desc!();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -42,18 +40,13 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
     None => "",
 };
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
-    loop {}
-}
-
 fn run() -> Result<(), WifiError> {
-    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
-        peripherals.SW_INTERRUPT,
+        peripherals.RNG,
+        peripherals.RADIO_CLK,
         peripherals.WIFI,
     );
     let mut wifi = WiFiManager::init(config)?;
@@ -66,6 +59,7 @@ fn run() -> Result<(), WifiError> {
 
 #[main]
 fn main() -> ! {
+    esp_println::logger::init_logger_from_env();
     if let Err(e) = run() {
         println!("FATAL: {}", e);
     }

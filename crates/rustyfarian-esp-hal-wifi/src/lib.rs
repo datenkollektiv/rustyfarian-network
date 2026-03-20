@@ -5,20 +5,15 @@
 //!
 //! # Quick start
 //!
-//! The caller only needs to initialize the HAL with maximum CPU clock.
-//! `WiFiManager::init` handles the heap, scheduler, radio, and Wi-Fi:
-//!
 //! ```ignore
-//! use esp_hal::clock::CpuClock;
 //! use rustyfarian_esp_hal_wifi::{WiFiManager, WiFiConfig, WiFiConfigExt};
 //!
-//! let peripherals = esp_hal::init(
-//!     esp_hal::Config::default().with_cpu_clock(CpuClock::max()),
-//! );
+//! let peripherals = esp_hal::init(esp_hal::Config::default());
 //!
 //! let config = WiFiConfig::new("MyNetwork", "password123")
 //!     .with_peripherals(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
-//! let wifi = WiFiManager::init(config).unwrap();
+//! let mut wifi = WiFiManager::init(config)?;
+//! let ip = wifi.wait_connected(30_000)?;
 //! ```
 //!
 //! After association, call [`WiFiManager::take_sta_device`] to obtain the
@@ -33,8 +28,8 @@ pub use wifi_pure::{
     SSID_MAX_LEN,
 };
 
-// Re-export StatusLed and SimpleLed from led_effects for convenience
-pub use led_effects::{SimpleLed, StatusLed};
+// Re-export StatusLed, SimpleLed, and NoLed from led_effects for convenience
+pub use led_effects::{NoLed, SimpleLed, StatusLed};
 
 // ─── Real implementation (behind chip feature gates) ────────────────────────
 
@@ -47,15 +42,19 @@ mod driver {
     use esp_radio::wifi::{
         ClientConfig, Interfaces, ModeConfig, PowerSaveMode, WifiController, WifiDevice,
     };
+    use led_effects::{NoLed, PulseEffect, StatusLed};
+    use rgb::RGB8;
     use wifi_pure::{validate_password, validate_ssid, WiFiConfig, WifiDriver, WifiPowerSave};
+
+    // Mirrored from rustyfarian_network_pure::status_colors (which is not no_std).
+    const WIFI_CONNECTING: (u8, u8, u8) = (0, 0, 255);
+    const CONNECTED: (u8, u8, u8) = (0, 20, 0);
+    const ERROR: (u8, u8, u8) = (255, 0, 0);
 
     /// Minimum heap size for the Wi-Fi radio stack (bytes).
     const WIFI_HEAP_SIZE: usize = 72 * 1024;
 
     /// Heap backing store for the Wi-Fi radio stack.
-    ///
-    /// Placed in the library so the application does not need to call
-    /// `esp_alloc::heap_allocator!()` when using [`WiFiManager::init`].
     static mut WIFI_HEAP: core::mem::MaybeUninit<[u8; WIFI_HEAP_SIZE]> =
         core::mem::MaybeUninit::uninit();
 
@@ -69,7 +68,7 @@ mod driver {
 
     /// Wi-Fi configuration bundled with the hardware peripherals needed for init.
     ///
-    /// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfig::with_peripherals],
+    /// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfigExt::with_peripherals],
     /// then passed to [`WiFiManager::init`].
     pub struct HalWifiConfig<'a> {
         ssid: &'a str,
@@ -145,69 +144,47 @@ mod driver {
     /// Bare-metal Wi-Fi manager for ESP-HAL targets.
     ///
     /// Wraps an `esp-radio` [`WifiController`] and implements the [`WifiDriver`] trait.
-    ///
-    /// # Quick start
-    ///
-    /// ```ignore
-    /// let peripherals = esp_hal::init(
-    ///     esp_hal::Config::default().with_cpu_clock(CpuClock::max()),
-    /// );
-    ///
-    /// let config = WiFiConfig::new("MyNetwork", "password123")
-    ///     .with_peripherals(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
-    /// let mut wifi = WiFiManager::init(config)?;
-    /// let ip = wifi.wait_connected(30_000)?;
-    /// ```
-    ///
-    /// [`init`][Self::init] handles heap allocation, the RTOS scheduler, radio
-    /// init, STA configuration, and connection initiation.
-    /// The only prerequisite is `esp_hal::init` with `CpuClock::max()`.
-    ///
-    /// For advanced use (e.g. sharing the scheduler with other subsystems),
-    /// [`new`][Self::new] accepts pre-initialized `esp-radio` objects.
-    ///
-    /// # Network stack
-    ///
-    /// [`wait_connected`][Self::wait_connected] runs a DHCP client internally
-    /// and returns the assigned IP.
-    /// For custom network stacks, call [`take_sta_device`][Self::take_sta_device]
-    /// instead and drive `smoltcp` or `embassy-net` yourself.
-    pub struct WiFiManager<'d> {
+    /// The `S` parameter controls LED status feedback during connection:
+    /// use [`NoLed`] (the default) for headless operation, or pass any
+    /// [`StatusLed`] implementation to [`init_with_led`][Self::init_with_led].
+    pub struct WiFiManager<'d, S: StatusLed = NoLed> {
         controller: WifiController<'d>,
         sta_device: Option<WifiDevice<'d>>,
         power_save: WifiPowerSave,
+        led: S,
     }
 
-    impl<'d> WiFiManager<'d> {
+    impl WiFiManager<'_, NoLed> {
         /// Initializes the heap, scheduler, radio, and Wi-Fi — then configures,
         /// starts, and begins association in a single call.
         ///
-        /// # Prerequisites
+        /// Uses [`NoLed`] for status feedback (no visual output).
+        /// For LED feedback during connection, use [`init_with_led`][WiFiManager::init_with_led].
+        pub fn init(config: HalWifiConfig<'_>) -> Result<WiFiManager<'static, NoLed>, WifiError> {
+            Self::init_inner(config, NoLed)
+        }
+    }
+
+    impl<'d, S: StatusLed> WiFiManager<'d, S>
+    where
+        S::Error: core::fmt::Debug,
+    {
+        /// Initializes Wi-Fi with LED status feedback during connection.
         ///
-        /// The application must call `esp_hal::init` before this method.
-        /// `CpuClock::max()` is **required** — the Wi-Fi radio blob needs
-        /// at least 80 MHz and works reliably only at the maximum clock.
-        ///
-        /// ```ignore
-        /// let peripherals = esp_hal::init(
-        ///     esp_hal::Config::default().with_cpu_clock(CpuClock::max()),
-        /// );
-        /// ```
-        ///
-        /// # What `init` does
-        ///
-        /// 1. Allocates a 72 KiB heap for the Wi-Fi radio stack
-        /// 2. Starts the `esp-rtos` scheduler
-        /// 3. Initializes the radio via `esp_radio::init()`
-        /// 4. Creates the Wi-Fi controller and network interfaces
-        /// 5. Configures STA mode with the SSID/password from `config`
-        /// 6. Starts the Wi-Fi hardware and applies power-save settings
-        /// 7. Initiates association (non-blocking)
-        ///
-        /// After `init` returns, call [`wait_connected`][Self::wait_connected]
-        /// or poll [`is_connected`][WifiDriver::is_connected] to wait for
-        /// association to complete.
-        pub fn init(config: HalWifiConfig<'_>) -> Result<WiFiManager<'static>, WifiError> {
+        /// Identical to [`init`][WiFiManager::init] but stores an LED driver that
+        /// [`wait_connected`][Self::wait_connected] uses for visual feedback:
+        /// blue pulse while associating, red pulse on timeout, dim green on success.
+        pub fn init_with_led(
+            config: HalWifiConfig<'_>,
+            led: S,
+        ) -> Result<WiFiManager<'static, S>, WifiError> {
+            Self::init_inner(config, led)
+        }
+
+        fn init_inner(
+            config: HalWifiConfig<'_>,
+            led: S,
+        ) -> Result<WiFiManager<'static, S>, WifiError> {
             // Set up the heap for Wi-Fi radio buffers.
             unsafe {
                 esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
@@ -238,6 +215,7 @@ mod driver {
                 controller,
                 sta_device: Some(interfaces.sta),
                 power_save: config.power_save,
+                led,
             };
 
             manager.configure(config.ssid, config.password)?;
@@ -248,29 +226,26 @@ mod driver {
         }
 
         /// Creates a Wi-Fi manager from pre-initialized `esp-radio` objects.
-        ///
-        /// Use this when you need to manage the scheduler or radio lifecycle
-        /// separately (e.g. sharing `esp-rtos` with other subsystems).
-        /// For the common case, prefer [`init`][Self::init].
         pub fn new(
             controller: WifiController<'d>,
             interfaces: Interfaces<'d>,
             power_save: WifiPowerSave,
+            led: S,
         ) -> Self {
             Self {
                 controller,
                 sta_device: Some(interfaces.sta),
                 power_save,
+                led,
             }
         }
 
         /// Blocks until the Wi-Fi station is associated and an IP address is
         /// assigned via DHCP.
         ///
-        /// Returns the assigned IPv4 address, or `Err` if the timeout elapses
-        /// before association + DHCP completes.
-        ///
-        /// Internally runs a smoltcp DHCP client on the STA `WifiDevice`.
+        /// If an LED was provided via [`init_with_led`][Self::init_with_led],
+        /// this method pulses blue during association, briefly pulses red on
+        /// timeout, and sets dim green on success.
         pub fn wait_connected(
             &mut self,
             timeout_ms: u64,
@@ -280,6 +255,7 @@ mod driver {
             use smoltcp::wire::{EthernetAddress, HardwareAddress};
 
             let delay = esp_hal::delay::Delay::new();
+            let mut pulse = PulseEffect::new();
 
             // Wait for L2 association first.
             let start = esp_hal::time::Instant::now();
@@ -290,7 +266,19 @@ mod driver {
                 }
                 if start.elapsed().as_millis() >= timeout_ms {
                     log::error!("Wi-Fi association timeout after {} ms", timeout_ms);
+
+                    for _ in 0..20 {
+                        if let Err(e) = self.led.set_color(pulse.update(ERROR)) {
+                            log::warn!("LED error: {:?}", e);
+                        }
+                        delay.delay_millis(50);
+                    }
+
                     return Err(WifiError::ConnectFailed);
+                }
+
+                if let Err(e) = self.led.set_color(pulse.update(WIFI_CONNECTING)) {
+                    log::warn!("LED error: {:?}", e);
                 }
                 delay.delay_millis(wifi_pure::POLL_INTERVAL_MS as u32);
             }
@@ -312,6 +300,14 @@ mod driver {
             loop {
                 if start.elapsed().as_millis() >= timeout_ms {
                     log::error!("DHCP timeout after {} ms", timeout_ms);
+
+                    for _ in 0..20 {
+                        if let Err(e) = self.led.set_color(pulse.update(ERROR)) {
+                            log::warn!("LED error: {:?}", e);
+                        }
+                        delay.delay_millis(50);
+                    }
+
                     return Err(WifiError::ConnectFailed);
                 }
 
@@ -321,15 +317,23 @@ mod driver {
                 if let Some(dhcpv4::Event::Configured(config)) = socket.poll() {
                     let ip = config.address.address();
                     log::info!("DHCP assigned IP: {}", ip);
+
+                    let (r, g, b) = CONNECTED;
+                    if let Err(e) = self.led.set_color(RGB8::new(r, g, b)) {
+                        log::warn!("LED error: {:?}", e);
+                    }
+
                     return Ok(ip);
                 }
 
+                if let Err(e) = self.led.set_color(pulse.update(WIFI_CONNECTING)) {
+                    log::warn!("LED error: {:?}", e);
+                }
                 delay.delay_millis(50);
             }
         }
 
-        /// Convenience alias for [`wait_connected`][Self::wait_connected], matching
-        /// the [`WiFiManager::get_ip`][rustyfarian_esp_idf_wifi] API.
+        /// Convenience alias for [`wait_connected`][Self::wait_connected].
         pub fn get_ip(&mut self, timeout_ms: u64) -> Result<smoltcp::wire::Ipv4Address, WifiError> {
             self.wait_connected(timeout_ms)
         }
@@ -338,18 +342,10 @@ mod driver {
         /// `smoltcp` or `embassy-net` stack.
         ///
         /// This is a **single-use** method — returns `None` on subsequent calls.
-        /// After taking the device, [`wait_connected`][Self::wait_connected] and
-        /// [`get_ip`][Self::get_ip] will fail because they need the device for DHCP.
-        /// Use this only when you want full control over the network stack.
         pub fn take_sta_device(&mut self) -> Option<WifiDevice<'d>> {
             self.sta_device.take()
         }
 
-        /// Maps the portable power-save enum to the esp-radio variant.
-        ///
-        /// Only modem-based power saving is supported (radio sleep between
-        /// DTIM beacons). Deep sleep and AP-specific power management are
-        /// not handled by this driver.
         fn map_power_save(ps: WifiPowerSave) -> PowerSaveMode {
             match ps {
                 WifiPowerSave::None => PowerSaveMode::None,
@@ -359,7 +355,10 @@ mod driver {
         }
     }
 
-    impl<'d> WifiDriver for WiFiManager<'d> {
+    impl<'d, S: StatusLed> WifiDriver for WiFiManager<'d, S>
+    where
+        S::Error: core::fmt::Debug,
+    {
         type Error = WifiError;
 
         fn configure(&mut self, ssid: &str, password: &str) -> Result<(), WifiError> {
@@ -421,29 +420,20 @@ pub use driver::{HalWifiConfig, WiFiConfigExt, WiFiManager, WifiError};
 mod stub {
     use wifi_pure::WifiDriver;
 
-    /// Error type for [`WiFiManager`] operations.
     #[derive(Debug)]
     pub enum WifiError {
-        /// Operation not yet implemented on this platform.
         NotSupported,
     }
 
     impl core::fmt::Display for WifiError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            match self {
-                Self::NotSupported => write!(f, "Wi-Fi not supported on this platform"),
-            }
+            write!(f, "Wi-Fi not supported on this platform")
         }
     }
 
-    /// Bare-metal Wi-Fi manager stub (no chip feature active).
-    ///
-    /// All methods return [`WifiError::NotSupported`].
-    /// Enable a chip feature (e.g. `esp32c6`) to get the real implementation.
     pub struct WiFiManager;
 
     impl WiFiManager {
-        /// Create a stub Wi-Fi manager.
         pub fn new() -> Self {
             Self
         }
@@ -457,23 +447,18 @@ mod stub {
 
     impl WifiDriver for WiFiManager {
         type Error = WifiError;
-
         fn configure(&mut self, _ssid: &str, _password: &str) -> Result<(), Self::Error> {
             Err(WifiError::NotSupported)
         }
-
         fn start(&mut self) -> Result<(), Self::Error> {
             Err(WifiError::NotSupported)
         }
-
         fn connect(&mut self) -> Result<(), Self::Error> {
             Err(WifiError::NotSupported)
         }
-
         fn disconnect(&mut self) -> Result<(), Self::Error> {
             Err(WifiError::NotSupported)
         }
-
         fn is_connected(&self) -> Result<bool, Self::Error> {
             Err(WifiError::NotSupported)
         }
