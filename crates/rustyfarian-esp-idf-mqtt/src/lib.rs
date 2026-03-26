@@ -40,6 +40,18 @@
 //! }
 //! ```
 //!
+//! ## Battery-optimized configuration
+//!
+//! On thermally constrained boards (e.g. ESP32-C3 Super Mini) where MQTT is
+//! telemetry-only, increase the reconnect interval to reduce power draw when
+//! the broker is offline:
+//!
+//! ```ignore
+//! let config = MqttConfig::new("192.168.1.100", 1883, "sensor-01")
+//!     .with_reconnect_timeout(60_000)  // retry every 60 s (default: 10 s)
+//!     .with_keep_alive(120);           // keep-alive every 2 min
+//! ```
+//!
 //! [`MqttManager`] is still available but deprecated — use [`MqttBuilder`] for
 //! new code.
 
@@ -186,6 +198,11 @@ pub struct MqttConfig<'a> {
     pub keep_alive_secs: Option<u64>,
     /// Connection timeout in milliseconds (default: 5000)
     pub connection_timeout_ms: Option<u64>,
+    /// Interval between automatic reconnection attempts in milliseconds.
+    ///
+    /// When `None` (the default), the ESP-IDF default of 10 000 ms is used.
+    /// Set via [`with_reconnect_timeout`](Self::with_reconnect_timeout).
+    pub reconnect_timeout_ms: Option<u64>,
     /// Stack size for the ESP-IDF MQTT client task (default: 8192).
     ///
     /// Set via [`with_task_stack_size`](Self::with_task_stack_size).
@@ -213,6 +230,7 @@ impl<'a> std::fmt::Debug for MqttConfig<'a> {
             .field("client_id", &self.client_id)
             .field("keep_alive_secs", &self.keep_alive_secs)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("reconnect_timeout_ms", &self.reconnect_timeout_ms)
             .field("task_stack_size", &self.task_stack_size)
             .field("lwt", &self.lwt)
             .field("username", &redacted_username)
@@ -230,6 +248,7 @@ impl<'a> MqttConfig<'a> {
             client_id,
             keep_alive_secs: None,
             connection_timeout_ms: None,
+            reconnect_timeout_ms: None,
             task_stack_size: DEFAULT_MQTT_TASK_STACK_SIZE,
             lwt: None,
             username: None,
@@ -246,6 +265,25 @@ impl<'a> MqttConfig<'a> {
     /// Sets the connection timeout.
     pub fn with_timeout(mut self, ms: u64) -> Self {
         self.connection_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Sets the interval between automatic reconnection attempts.
+    ///
+    /// When the broker is unreachable, the ESP-IDF MQTT client retries at
+    /// this interval.  The default is 10 000 ms.  Battery-powered or
+    /// thermally constrained devices may want 30 000–60 000 ms to reduce
+    /// power draw during prolonged broker outages.
+    ///
+    /// This does not affect the initial connection wait controlled by
+    /// [`with_timeout`](Self::with_timeout).
+    ///
+    /// ```ignore
+    /// let config = MqttConfig::new("192.168.1.100", 1883, "sensor-01")
+    ///     .with_reconnect_timeout(30_000); // retry every 30 s instead of 10 s
+    /// ```
+    pub fn with_reconnect_timeout(mut self, ms: u64) -> Self {
+        self.reconnect_timeout_ms = Some(ms);
         self
     }
 
@@ -348,6 +386,7 @@ where
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(config.client_id),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
+            reconnect_timeout: config.reconnect_timeout_ms.map(Duration::from_millis),
             task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: config.username,
@@ -712,6 +751,7 @@ impl<'a> MqttBuilder<'a> {
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(client_id.as_str()),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
+            reconnect_timeout: config.reconnect_timeout_ms.map(Duration::from_millis),
             task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: username.as_deref(),
