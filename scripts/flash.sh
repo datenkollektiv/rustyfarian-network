@@ -13,6 +13,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Optional: set ESPFLASH_PORT to target a specific serial port
+port_args=()
+if [ -n "${ESPFLASH_PORT:-}" ]; then
+    port_args=(--port "$ESPFLASH_PORT")
+fi
+
 if [ $# -lt 1 ]; then
     printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join\n' "$0" >&2
     exit 2
@@ -28,9 +34,10 @@ case "$prefix" in
         # ESP-IDF HAL examples: detect package from feature name
         case "$example" in
             *mqtt*)    pkg="rustyfarian-esp-idf-mqtt" ;;
-            *connect*) pkg="rustyfarian-esp-idf-wifi" ;;
+            *connect*|*wifi*) pkg="rustyfarian-esp-idf-wifi" ;;
             *join*|*lora*) pkg="rustyfarian-esp-idf-lora" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "join", or "lora".\n' "$example" >&2; exit 1 ;;
+            *espnow*)  pkg="rustyfarian-esp-idf-espnow" ;;
+            *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", or "espnow".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set MCU / Cargo target
@@ -71,10 +78,10 @@ case "$prefix" in
         fi
         if [ -n "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash --bootloader "$bl" --ignore-app-descriptor "target/$target/release/examples/$example"
+            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "target/$target/release/examples/$example"
         else
             printf 'Warning: IDF-built bootloader not found, using espflash default (may fail on boot).\n' >&2
-            espflash flash --ignore-app-descriptor "target/$target/release/examples/$example"
+            espflash flash "${port_args[@]}" --ignore-app-descriptor "target/$target/release/examples/$example"
         fi
         ;;
 
@@ -137,7 +144,7 @@ case "$prefix" in
 
         if [ -n "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash --bootloader "$bl" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
+            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
         else
             printf 'Warning: no IDF-built bootloader cached for %s; using espflash default (may fail on boot for some chips).\n' "$chip" >&2
             espflash flash --ignore-app-descriptor "target/$hal_target/release/examples/$example"

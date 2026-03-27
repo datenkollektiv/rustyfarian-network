@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `espnow-pure`: `ScanConfig::with_probe_timeout()` and `DEFAULT_PROBE_TIMEOUT` (100 ms) — per-channel probe timeout is now configurable
 - `rustyfarian-esp-hal-wifi`: `EspHalWifiManager` with real `WifiDriver` implementation using `esp-radio 0.17.0` for bare-metal ESP32-C3/C6 (ADR 006 Phase 5); `hal_c3_connect` and `hal_c6_connect` examples
 - `rustyfarian-network-pure`: `status_colors` module with shared LED colour palette (`BOOT`, `WIFI_CONNECTING`, `MQTT_CONNECTING`, `CONNECTED`, `ERROR`, `OFFLINE`)
 - `rustyfarian-esp-idf-mqtt`: `MqttBuilder::build_and_wait()` with `StatusLed` support for visual boot feedback (cyan pulse while connecting, green on success, red on timeout)
@@ -24,6 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `espnow-pure`: `PeerConfig::with_ap_interface()` builder method for ESP-NOW-only devices
 - `rustyfarian-esp-idf-mqtt`: configurable MQTT task stack size via `MqttConfig::with_task_stack_size()`; default raised to 8 KiB (from ESP-IDF's 6 KiB) to prevent TLS stack overflow
 - `rustyfarian-esp-idf-mqtt`: configurable reconnect interval via `MqttConfig::with_reconnect_timeout()` for battery-powered and thermally constrained devices (default: ESP-IDF 10 s)
+- `espnow-pure`: `ScanConfig`, `ScanResult`, and `DEFAULT_SCAN_CHANNELS` types for ESP-NOW channel scanning configuration
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::scan_for_peer()` probes Wi-Fi channels to find a peer by MAC-layer ACK (ADR 009)
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::init_with_radio_scanning()` convenience constructor combining radio init and channel scan
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::send_and_wait()` blocks until MAC-layer ACK via send callback — use for reliable delivery detection
+- `rustyfarian-esp-idf-espnow`: `idf_c3_espnow_coordinator` and `idf_c3_espnow_scout` examples with onboard LED status feedback
+- Justfile: `ESPFLASH_PORT` env var for multi-board setups, `fresh-run` and `erase-flash` recipes, `--non-interactive` monitor
+- Build scripts: `*wifi*` and `*espnow*` crate auto-detection in `build-example.sh` and `flash.sh`
+
+### Changed
+
+- `rustyfarian-esp-idf-espnow`: `default_interface()` always returns `WifiInterface::Sta` — `init_with_radio()` starts in STA mode, not AP (fixes `ESP_ERR_ESPNOW_IF` on send)
+- `sdkconfig.defaults`: added `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
+
+### Fixed
+
+- `rustyfarian-esp-idf-espnow`: `scan_for_peer()` and `send_and_wait()` now serialise their send-callback registration through an internal mutex — concurrent calls can no longer steal each other's ACKs
+- `rustyfarian-esp-idf-espnow`: ACK wait now loops on the condvar to absorb spurious wakeups; previously a single `wait_timeout` could return early without an ACK
+- `rustyfarian-esp-idf-espnow`: `idf_c3_espnow_scout` example — `parse_mac()` is now strict and returns `Result`; malformed MAC strings fail fast instead of silently substituting `0x00` for invalid hex digits
+- `rustyfarian-esp-idf-espnow`: `idf_c3_espnow_coordinator` example — checks `esp_wifi_get_channel`/`esp_wifi_get_mac` return codes and logs a warning on failure instead of printing stale buffers
+- `rustyfarian-esp-idf-espnow`: `scan_for_peer()` removes stale peer registration before scanning — fixes `ESP_ERR_ESPNOW_EXIST` on retry
+- `rustyfarian-esp-idf-espnow`: channel scan uses `register_send_cb` with `Condvar` for real MAC-layer ACK detection — `esp_now_send()` is asynchronous and returns before the ACK arrives
 
 ## [0.1.0] - 2026-03-16
 

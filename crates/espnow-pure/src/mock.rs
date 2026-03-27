@@ -51,6 +51,7 @@ struct MockState {
     sent: Vec<(MacAddress, Vec<u8>)>,
     rx_queue: VecDeque<EspNowEvent>,
     fail_send: bool,
+    scan_respond_on_channel: Option<u8>,
 }
 
 impl MockState {
@@ -60,6 +61,7 @@ impl MockState {
             sent: Vec::new(),
             rx_queue: VecDeque::new(),
             fail_send: false,
+            scan_respond_on_channel: None,
         }
     }
 }
@@ -112,6 +114,25 @@ impl MockEspNowDriver {
     /// Copies the list of registered peers as `(mac, interface)` pairs.
     pub fn peer_list(&self) -> Vec<(MacAddress, WifiInterface)> {
         self.state.borrow().peers.clone()
+    }
+
+    /// Configure the mock to simulate a peer responding on the given channel.
+    ///
+    /// This is a storage knob only — `espnow-pure` itself contains no scanning
+    /// logic (channel scanning is ESP-IDF-specific).  Downstream crates can
+    /// read this back via [`scan_respond_channel`](Self::scan_respond_channel)
+    /// to drive their own scan-dependent test logic; the mock's
+    /// [`EspNowDriver`] methods do not consult this value.
+    pub fn set_scan_respond_channel(&self, channel: u8) {
+        self.state.borrow_mut().scan_respond_on_channel = Some(channel);
+    }
+
+    /// Returns the channel the mock is configured to respond on, or `None`.
+    ///
+    /// See [`set_scan_respond_channel`](Self::set_scan_respond_channel) — this
+    /// is storage only and is not wired into any driver behaviour.
+    pub fn scan_respond_channel(&self) -> Option<u8> {
+        self.state.borrow().scan_respond_on_channel
     }
 }
 
