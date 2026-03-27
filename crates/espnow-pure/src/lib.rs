@@ -27,6 +27,22 @@ pub const MAX_DATA_LEN: usize = 250;
 /// Default capacity for an ESP-NOW receive channel.
 pub const DEFAULT_RX_CHANNEL_CAPACITY: usize = 32;
 
+/// Default channels to scan when probing for a peer.
+///
+/// Covers channels 1-13 (EU/JP region).  US/CA regulatory domains restrict
+/// 2.4 GHz to channels 1-11; if your peer might land on a channel that is not
+/// allowed in your region the radio will silently fail to send on it.  Use
+/// [`ScanConfig::with_channels`] with a region-appropriate slice when this
+/// matters (e.g. `&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]` for US).
+pub const DEFAULT_SCAN_CHANNELS: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+
+/// Default per-channel probe timeout when scanning for a peer.
+///
+/// MAC-layer ACKs typically arrive within ~5 ms; 100 ms leaves margin for
+/// retries and radio contention.  Override with
+/// [`ScanConfig::with_probe_timeout`].
+pub const DEFAULT_PROBE_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(100);
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A 6-byte IEEE 802.11 MAC address.
@@ -135,11 +151,63 @@ impl PeerConfig {
 
     /// Sets the Wi-Fi interface to [`WifiInterface::Ap`].
     ///
-    /// Use this for peers on ESP-NOW-only devices that have no STA connection.
+    /// Only useful when the device is running in `WIFI_MODE_AP` or
+    /// `WIFI_MODE_APSTA`.  Devices using `init_with_radio()` start in
+    /// STA mode and should use [`WifiInterface::Sta`] (the default).
     pub fn with_ap_interface(mut self) -> Self {
         self.interface = WifiInterface::Ap;
         self
     }
+}
+
+// ─── ScanConfig ─────────────────────────────────────────────────────────────
+
+/// Configuration for ESP-NOW channel scanning.
+///
+/// Controls which channels to probe, what payload to send as the probe
+/// frame, and how long to wait for the MAC-layer ACK on each channel.
+/// The peer ACKs at the MAC layer regardless of payload content.
+#[derive(Debug, Clone)]
+pub struct ScanConfig<'a> {
+    /// Channels to scan, in order (default: [`DEFAULT_SCAN_CHANNELS`]).
+    pub channels: &'a [u8],
+    /// Payload sent as the probe frame.
+    pub probe_data: &'a [u8],
+    /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
+    pub probe_timeout: core::time::Duration,
+}
+
+impl<'a> ScanConfig<'a> {
+    /// Create a scan config with default channels (1-13), the given probe
+    /// payload, and the default probe timeout.
+    pub fn new(probe_data: &'a [u8]) -> Self {
+        Self {
+            channels: &DEFAULT_SCAN_CHANNELS,
+            probe_data,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
+        }
+    }
+
+    /// Override the channel list to scan.
+    pub fn with_channels(mut self, channels: &'a [u8]) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// Override the per-channel probe timeout.
+    pub fn with_probe_timeout(mut self, timeout: core::time::Duration) -> Self {
+        self.probe_timeout = timeout;
+        self
+    }
+}
+
+// ─── ScanResult ─────────────────────────────────────────────────────────────
+
+/// Result of a successful channel scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanResult {
+    /// The Wi-Fi channel on which the peer responded.
+    pub channel: u8,
 }
 
 // ─── EspNowDriver trait ──────────────────────────────────────────────────────
@@ -290,6 +358,46 @@ mod tests {
         assert_eq!(peers[0], (mac, WifiInterface::Sta));
         driver.remove_peer(&mac).unwrap();
         assert!(driver.peer_list().is_empty());
+    }
+
+    // ── ScanConfig / ScanResult tests ─────────────────────────────────────
+
+    #[test]
+    fn scan_config_default_channels() {
+        let config = ScanConfig::new(b"probe");
+        assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
+        assert_eq!(config.probe_data, b"probe");
+        assert_eq!(config.probe_timeout, DEFAULT_PROBE_TIMEOUT);
+    }
+
+    #[test]
+    fn scan_config_custom_channels() {
+        let channels = [1, 6, 11];
+        let config = ScanConfig::new(b"ping").with_channels(&channels);
+        assert_eq!(config.channels, &[1, 6, 11]);
+    }
+
+    #[test]
+    fn scan_config_custom_probe_timeout() {
+        let timeout = core::time::Duration::from_millis(250);
+        let config = ScanConfig::new(b"ping").with_probe_timeout(timeout);
+        assert_eq!(config.probe_timeout, timeout);
+    }
+
+    #[test]
+    fn scan_result_equality() {
+        assert_eq!(ScanResult { channel: 6 }, ScanResult { channel: 6 });
+        assert_ne!(ScanResult { channel: 6 }, ScanResult { channel: 11 });
+    }
+
+    // ── Mock scan tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn mock_scan_respond_channel() {
+        let driver = mock::MockEspNowDriver::new();
+        assert!(driver.scan_respond_channel().is_none());
+        driver.set_scan_respond_channel(6);
+        assert_eq!(driver.scan_respond_channel(), Some(6));
     }
 
     #[test]

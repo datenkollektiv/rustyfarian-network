@@ -22,7 +22,7 @@ Next milestone: release v0.2.0 with the accumulated post-0.1.0 features.
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW radio init
+    Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
               : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
@@ -50,6 +50,10 @@ timeline
 - `EspIdfEspNow::init_with_radio()` for ESP-NOW-only devices (ADR 008)
 - Configurable MQTT task stack size (default raised to 8 KiB)
 - Justfile cleanup: removed convenience recipes, consolidated `act` into single recipe with optional job arg
+- `scan_for_peer()` and `send_and_wait()` for ESP-NOW channel scanning with MAC-layer ACK detection (ADR 009)
+- `idf_c3_espnow_coordinator` and `idf_c3_espnow_scout` examples with LED feedback
+- `default_interface()` fix: always STA (amends ADR 008)
+- `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
 
 </details>
 

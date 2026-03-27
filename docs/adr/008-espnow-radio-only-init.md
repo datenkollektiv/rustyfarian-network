@@ -2,7 +2,15 @@
 
 ## Status
 
-Accepted
+Accepted (amended — see ADR 009 for `WifiInterface` correction)
+
+> **Amendment (2026-03-28):** The original decision recommended `WifiInterface::Ap`
+> for `init_with_radio()` peers.
+> Hardware testing revealed that `EspWifi::new().start()`
+> defaults to STA mode; using the AP interface causes `ESP_ERR_ESPNOW_IF` because no
+> AP interface is active.
+> `default_interface()` now always returns `WifiInterface::Sta`.
+> See [ADR 009](009-espnow-channel-scanning.md) for the full analysis.
 
 ## Context
 
@@ -15,12 +23,10 @@ wifi.start()?;
 let espnow = EspIdfEspNow::init()?;
 ```
 
-Additionally, ESP-NOW-only devices must manually override `PeerConfig::interface` from the default `WifiInterface::Sta` to `WifiInterface::Ap`, because there is no STA connection.
-This is a known ESP-NOW quirk that catches every new consumer and wastes debugging time.
-
-Evidence from downstream firmware:
-- `firmware-rgb-matrix/src/main.rs` — raw `EspWifi::new()` + `.start()`
-- `firmware-rgb-nunchuck/src/main.rs` — same pattern + manual `brain_peer.interface = WifiInterface::Ap`
+Additionally, ESP-NOW-only devices originally required manual interface decisions in
+application code.
+This proved error-prone because the radio started by `EspWifi::new().start()` is STA by default,
+and forcing AP interface selection caused `ESP_ERR_ESPNOW_IF`.
 
 ### Design decisions under evaluation
 
@@ -32,13 +38,13 @@ A separate struct would duplicate the `EspNowDriver` trait implementation.
 
 **WifiInterface auto-detection**
 
-Consumers who use `init_with_radio()` (no STA connection) always need `WifiInterface::Ap` on their peers.
-The driver knows whether it owns the radio, so it can expose a `default_interface()` method to guide callers.
+`init_with_radio()` starts the radio in STA mode.
+The driver can expose `default_interface()` so callers do not guess interface mode.
 
 **PeerConfig ergonomics**
 
 `PeerConfig` in `espnow-pure` defaults `interface` to `Sta`.
-A builder method for the AP case would eliminate the field-level override that every ESP-NOW-only device needs.
+An AP builder remains useful only for explicit AP/APSTA deployments.
 
 ## Decision
 
@@ -51,17 +57,19 @@ Leave the existing `init()` unchanged for devices that manage Wi-Fi themselves.
   Existing `init()` sets it to `None`; `init_with_radio()` stores `Some(wifi)`.
 
 - Add `init_with_radio(modem, sys_loop, nvs)` method that:
-  1. Creates `EspWifi::new(modem, sys_loop, nvs)` and calls `.start()`
-  2. Stores the `EspWifi` instance to keep the radio alive
-  3. Delegates to the existing `init_with_capacity()` logic for ESP-NOW setup
+  1. Creates `EspWifi::new(modem, sys_loop, nvs)` and calls `.start()`.
+  2. Stores the `EspWifi` instance to keep the radio alive.
+  3. Delegates to the existing `init_with_capacity()` logic for ESP-NOW setup.
 
-- Add `default_interface()` method returning `WifiInterface::Ap` when the driver owns the radio, `WifiInterface::Sta` otherwise.
+- Add `default_interface()` method returning `WifiInterface::Sta`.
+  `init_with_radio()` and `init()` both operate with an active STA interface.
 
 - Add `esp-idf-hal` workspace dependency to `Cargo.toml` (for `Modem` type).
 
 ### Changes to `espnow-pure`
 
-- Add `PeerConfig::with_ap_interface()` builder method — sets `interface` to `WifiInterface::Ap`.
+- Add `PeerConfig::with_ap_interface()` builder method.
+  This is optional and intended for explicit AP/APSTA flows.
 
 ### What stays unchanged
 
@@ -73,10 +81,10 @@ Leave the existing `init()` unchanged for devices that manage Wi-Fi themselves.
 
 ### Positive
 
-- **Eliminates boilerplate** — ESP-NOW-only firmware drops ~8 lines of manual radio init per crate
-- **Eliminates the `WifiInterface::Ap` gotcha** — `default_interface()` + `with_ap_interface()` make the correct choice obvious
-- **Backwards compatible** — existing `init()` callers are unaffected
-- **Radio lifetime is safe** — `EspWifi` stored in the struct prevents accidental drop
+- **Eliminates boilerplate** — ESP-NOW-only firmware drops ~8 lines of manual radio init per crate.
+- **Eliminates interface-mode guesswork** — `default_interface()` now points callers to STA, preventing `ESP_ERR_ESPNOW_IF` from AP misconfiguration.
+- **Backwards compatible** — existing `init()` callers are unaffected.
+- **Radio lifetime is safe** — `EspWifi` stored in the struct prevents accidental drop.
 
 ### Negative
 
@@ -86,4 +94,4 @@ Leave the existing `init()` unchanged for devices that manage Wi-Fi themselves.
 ## References
 
 - [ADR 007 — ESP-NOW Abstraction Layer](007-espnow-abstraction.md)
-- Feature request: `review-queue/espnow-radio-only-init.md`
+- [Review queue: init-with-radio-defaults-to-softap](../../review-queue/init-with-radio-defaults-to-softap.md)
