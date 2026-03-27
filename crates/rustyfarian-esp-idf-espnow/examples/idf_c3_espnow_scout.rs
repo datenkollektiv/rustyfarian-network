@@ -1,0 +1,152 @@
+//! ESP-NOW scout example for ESP32-C3 Super Mini.
+//!
+//! Starts the Wi-Fi radio without connecting to an AP, then scans channels
+//! 1-13 to find the coordinator by MAC-layer ACK.  Once the channel is
+//! discovered, the scout sends a message every second.
+//!
+//! The onboard LED (GPIO 8, active low) shows connection status:
+//! - **off** — scanning / not connected
+//! - **on** — coordinator found, sending successfully
+//! - **blink** — send failed, re-scanning
+//!
+//! If sending fails (coordinator unreachable), the scout re-scans.
+//!
+//! Set `COORDINATOR_MAC` at build time to the coordinator's STA MAC address.
+//! The coordinator prints its MAC on boot — look for the
+//! "Coordinator STA MAC: ..." log line.
+//!
+//! # Components
+//!
+//! - ESP32-C3 Super Mini (onboard LED on GPIO 8)
+//! - USB cable
+//!
+//! # Build and Flash
+//!
+//! ```sh
+//! COORDINATOR_MAC="aa:bb:cc:dd:ee:ff" just build-example idf_c3_espnow_scout
+//! ```
+//!
+//! ```sh
+//! just flash idf_c3_espnow_scout
+//! ```
+
+use rustyfarian_esp_idf_espnow::{EspIdfEspNow, EspNowDriver, MacAddress, ScanConfig};
+
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::gpio::PinDriver;
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+const COORDINATOR_MAC_STR: &str = match option_env!("COORDINATOR_MAC") {
+    Some(s) => s,
+    None => "FF:FF:FF:FF:FF:FF",
+};
+
+fn parse_mac(s: &str) -> MacAddress {
+    let mut mac = [0u8; 6];
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+
+    while i < 6 && pos < bytes.len() {
+        let hi = hex_nibble(bytes[pos]);
+        let lo = if pos + 1 < bytes.len() && bytes[pos + 1] != b':' {
+            pos += 1;
+            hex_nibble(bytes[pos])
+        } else {
+            let v = hi;
+            mac[i] = v;
+            i += 1;
+            pos += 1;
+            if pos < bytes.len() && bytes[pos] == b':' {
+                pos += 1;
+            }
+            continue;
+        };
+        mac[i] = (hi << 4) | lo;
+        i += 1;
+        pos += 1;
+        if pos < bytes.len() && bytes[pos] == b':' {
+            pos += 1;
+        }
+    }
+    mac
+}
+
+const fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
+
+    let coordinator_mac = parse_mac(COORDINATOR_MAC_STR);
+    log::info!(
+        "Target coordinator MAC: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        coordinator_mac[0],
+        coordinator_mac[1],
+        coordinator_mac[2],
+        coordinator_mac[3],
+        coordinator_mac[4],
+        coordinator_mac[5],
+    );
+
+    let peripherals = Peripherals::take()?;
+    let sys_loop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+
+    // ── Onboard LED (GPIO 8, active low) ────────────────────────────────
+    let mut led = PinDriver::output(peripherals.pins.gpio8)?;
+    led.set_high()?; // LED off (active low)
+
+    // ── ESP-NOW with channel scanning ───────────────────────────────────
+    let scan_config = ScanConfig::new(b"scout-probe");
+
+    log::info!("Scanning for coordinator ...");
+    let (espnow, result) = EspIdfEspNow::init_with_radio_scanning(
+        peripherals.modem,
+        sys_loop,
+        Some(nvs),
+        &coordinator_mac,
+        &scan_config,
+    )?;
+
+    log::info!(
+        "Coordinator found on channel {} — starting send loop",
+        result.channel
+    );
+    led.set_low()?; // LED on — connected
+
+    // ── Main loop ───────────────────────────────────────────────────────
+    let mut seq: u32 = 0;
+    loop {
+        seq += 1;
+        let msg = format!("hello #{seq}");
+
+        match espnow.send(&coordinator_mac, msg.as_bytes()) {
+            Ok(()) => {
+                log::info!("TX #{}: \"{}\" — ACK received", seq, msg);
+                led.set_low()?; // LED on
+            }
+            Err(e) => {
+                log::warn!("TX #{} failed: {} — re-scanning ...", seq, e);
+                led.set_high()?; // LED off during scan
+                match espnow.scan_for_peer(&coordinator_mac, &scan_config) {
+                    Ok(r) => {
+                        log::info!("Re-scan: coordinator now on channel {}", r.channel);
+                        led.set_low()?; // LED on — reconnected
+                    }
+                    Err(e) => log::error!("Re-scan failed: {}", e),
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}

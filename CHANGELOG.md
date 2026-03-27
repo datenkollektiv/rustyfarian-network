@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `espnow-pure`: `PeerConfig::with_ap_interface()` builder method for ESP-NOW-only devices
 - `rustyfarian-esp-idf-mqtt`: configurable MQTT task stack size via `MqttConfig::with_task_stack_size()`; default raised to 8 KiB (from ESP-IDF's 6 KiB) to prevent TLS stack overflow
 - `rustyfarian-esp-idf-mqtt`: configurable reconnect interval via `MqttConfig::with_reconnect_timeout()` for battery-powered and thermally constrained devices (default: ESP-IDF 10 s)
+- `espnow-pure`: `ScanConfig`, `ScanResult`, and `DEFAULT_SCAN_CHANNELS` types for ESP-NOW channel scanning configuration
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::scan_for_peer()` probes Wi-Fi channels to find a peer by MAC-layer ACK (ADR 009)
+- `rustyfarian-esp-idf-espnow`: `EspIdfEspNow::init_with_radio_scanning()` convenience constructor combining radio init and channel scan
 
 ## [0.1.0] - 2026-03-16
 
