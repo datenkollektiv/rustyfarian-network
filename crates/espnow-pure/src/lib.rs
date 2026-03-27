@@ -27,6 +27,9 @@ pub const MAX_DATA_LEN: usize = 250;
 /// Default capacity for an ESP-NOW receive channel.
 pub const DEFAULT_RX_CHANNEL_CAPACITY: usize = 32;
 
+/// Default channels to scan when probing for a peer (EU region: 1-13).
+pub const DEFAULT_SCAN_CHANNELS: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A 6-byte IEEE 802.11 MAC address.
@@ -140,6 +143,46 @@ impl PeerConfig {
         self.interface = WifiInterface::Ap;
         self
     }
+}
+
+// ─── ScanConfig ─────────────────────────────────────────────────────────────
+
+/// Configuration for ESP-NOW channel scanning.
+///
+/// Controls which channels to probe and what payload to send as the probe
+/// frame.  The peer ACKs at the MAC layer regardless of payload content.
+#[derive(Debug, Clone)]
+pub struct ScanConfig<'a> {
+    /// Channels to scan, in order (default: [`DEFAULT_SCAN_CHANNELS`]).
+    pub channels: &'a [u8],
+    /// Payload sent as the probe frame.
+    pub probe_data: &'a [u8],
+}
+
+impl<'a> ScanConfig<'a> {
+    /// Create a scan config with default channels (1-13) and the given probe
+    /// payload.
+    pub fn new(probe_data: &'a [u8]) -> Self {
+        Self {
+            channels: &DEFAULT_SCAN_CHANNELS,
+            probe_data,
+        }
+    }
+
+    /// Override the channel list to scan.
+    pub fn with_channels(mut self, channels: &'a [u8]) -> Self {
+        self.channels = channels;
+        self
+    }
+}
+
+// ─── ScanResult ─────────────────────────────────────────────────────────────
+
+/// Result of a successful channel scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanResult {
+    /// The Wi-Fi channel on which the peer responded.
+    pub channel: u8,
 }
 
 // ─── EspNowDriver trait ──────────────────────────────────────────────────────
@@ -290,6 +333,38 @@ mod tests {
         assert_eq!(peers[0], (mac, WifiInterface::Sta));
         driver.remove_peer(&mac).unwrap();
         assert!(driver.peer_list().is_empty());
+    }
+
+    // ── ScanConfig / ScanResult tests ─────────────────────────────────────
+
+    #[test]
+    fn scan_config_default_channels() {
+        let config = ScanConfig::new(b"probe");
+        assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
+        assert_eq!(config.probe_data, b"probe");
+    }
+
+    #[test]
+    fn scan_config_custom_channels() {
+        let channels = [1, 6, 11];
+        let config = ScanConfig::new(b"ping").with_channels(&channels);
+        assert_eq!(config.channels, &[1, 6, 11]);
+    }
+
+    #[test]
+    fn scan_result_equality() {
+        assert_eq!(ScanResult { channel: 6 }, ScanResult { channel: 6 });
+        assert_ne!(ScanResult { channel: 6 }, ScanResult { channel: 11 });
+    }
+
+    // ── Mock scan tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn mock_scan_respond_channel() {
+        let driver = mock::MockEspNowDriver::new();
+        assert!(driver.scan_respond_channel().is_none());
+        driver.set_scan_respond_channel(6);
+        assert_eq!(driver.scan_respond_channel(), Some(6));
     }
 
     #[test]
