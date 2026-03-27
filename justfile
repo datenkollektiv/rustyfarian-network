@@ -131,6 +131,9 @@ examples:
 build-example example:
     scripts/build-example.sh "{{example}}"
 
+# serial port for espflash (auto-detected when empty; set for multi-board setups)
+export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
+
 # build and flash a named example; chip and crate auto-detected from example name
 flash example:
     scripts/flash.sh "{{example}}"
@@ -142,12 +145,36 @@ run *example:
         just examples
     else
         just flash "{{example}}"
-        espflash monitor
+        if [ -n "$ESPFLASH_PORT" ]; then
+            espflash monitor --non-interactive --port "$ESPFLASH_PORT"
+        else
+            espflash monitor --non-interactive
+        fi
+    fi
+
+# erase flash (NVS + app), rebuild from clean, flash, and monitor
+fresh-run example:
+    cargo clean
+    just erase-flash
+    just run {{example}}
+
+# erase entire flash (NVS, app, bootloader) — fixes stale WiFi credentials and corrupt state
+erase-flash:
+    #!/usr/bin/env bash
+    if [ -n "$ESPFLASH_PORT" ]; then
+        espflash erase-flash --port "$ESPFLASH_PORT"
+    else
+        espflash erase-flash
     fi
 
 # open the serial monitor for an already-flashed device
 monitor:
-    espflash monitor
+    #!/usr/bin/env bash
+    if [ -n "$ESPFLASH_PORT" ]; then
+        espflash monitor --non-interactive --port "$ESPFLASH_PORT"
+    else
+        espflash monitor --non-interactive
+    fi
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:

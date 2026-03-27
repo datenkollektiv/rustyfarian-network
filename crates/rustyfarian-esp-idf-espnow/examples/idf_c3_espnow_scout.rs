@@ -30,7 +30,7 @@
 //! just flash idf_c3_espnow_scout
 //! ```
 
-use rustyfarian_esp_idf_espnow::{EspIdfEspNow, EspNowDriver, MacAddress, ScanConfig};
+use rustyfarian_esp_idf_espnow::{EspIdfEspNow, MacAddress, ScanConfig};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
@@ -105,23 +105,28 @@ fn main() -> anyhow::Result<()> {
     let mut led = PinDriver::output(peripherals.pins.gpio8)?;
     led.set_high()?; // LED off (active low)
 
-    // ── ESP-NOW with channel scanning ───────────────────────────────────
+    // ── ESP-NOW with channel scanning (retry until coordinator is found) ─
     let scan_config = ScanConfig::new(b"scout-probe");
 
-    log::info!("Scanning for coordinator ...");
-    let (espnow, result) = EspIdfEspNow::init_with_radio_scanning(
-        peripherals.modem,
-        sys_loop,
-        Some(nvs),
-        &coordinator_mac,
-        &scan_config,
-    )?;
+    let espnow = EspIdfEspNow::init_with_radio(peripherals.modem, sys_loop, Some(nvs))?;
 
-    log::info!(
-        "Coordinator found on channel {} — starting send loop",
-        result.channel
-    );
-    led.set_low()?; // LED on — connected
+    loop {
+        log::info!("Scanning for coordinator ...");
+        match espnow.scan_for_peer(&coordinator_mac, &scan_config) {
+            Ok(result) => {
+                log::info!(
+                    "Coordinator found on channel {} — starting send loop",
+                    result.channel
+                );
+                led.set_low()?; // LED on — connected
+                break;
+            }
+            Err(_) => {
+                log::warn!("Coordinator not found — retrying in 2s ...");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
 
     // ── Main loop ───────────────────────────────────────────────────────
     let mut seq: u32 = 0;
@@ -129,9 +134,9 @@ fn main() -> anyhow::Result<()> {
         seq += 1;
         let msg = format!("hello #{seq}");
 
-        match espnow.send(&coordinator_mac, msg.as_bytes()) {
+        match espnow.send_and_wait(&coordinator_mac, msg.as_bytes(), 100) {
             Ok(()) => {
-                log::info!("TX #{}: \"{}\" — ACK received", seq, msg);
+                log::info!("TX #{}: \"{}\" — ACK", seq, msg);
                 led.set_low()?; // LED on
             }
             Err(e) => {

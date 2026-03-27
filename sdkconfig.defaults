@@ -1,7 +1,10 @@
-# sdkconfig.defaults for rustyfarian-esp-idf-lora
+# sdkconfig.defaults — shared ESP-IDF build configuration
 #
-# The LoRaWAN join operation (AES-128 key derivation) combined with the
-# lorawan-device Device<_, _, _, 256> struct exceeds the ESP-IDF default
-# main task stack of 3584 bytes.  32 KB is enough headroom for the full
-# OTAA crypto call stack.
+# embuild resolves this file from the workspace root (not crate subdirectories).
+
+# 32 KB main task stack for LoRaWAN OTAA crypto (AES-128 key derivation).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# Disable WiFi NVS caching — forces fresh credentials from firmware on every boot.
+# Prevents stale cached BSSID/PMK/channel from causing silent auth failures.
+CONFIG_ESP_WIFI_NVS_ENABLED=n
