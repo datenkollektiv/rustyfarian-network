@@ -22,6 +22,23 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     println!("hal_c6_wifi_raw: init done");
 
+     // ESP32-C6 has two physically separate SRAM banks that must be registered
+    // with esp_alloc individually.  Both calls add regions to the same global
+    // esp_alloc::HEAP — this is one allocator with two backing regions, not two
+    // independent allocators.
+    //
+    // Region 1 — reclaimed IRAM (64 KiB, DMA-accessible):
+    //   After esp_hal::init() the ROM/bootloader's reserved IRAM is freed.
+    //   The `#[esp_hal::ram(reclaimed)]` attribute places this buffer there.
+    //   The WiFi firmware blob's RX/TX ring buffers must live in DMA-accessible
+    //   memory, so this region must be registered before esp_radio::init().
+    //
+    // Region 2 — regular DRAM (36 KiB):
+    //   General-purpose heap for alloc::String, Box, Vec, etc.
+    //   Not required to be DMA-accessible.
+    //
+    // (ESP32-C3's single contiguous SRAM covers both needs, so hal_c3_wifi_raw
+    // uses one call: esp_alloc::heap_allocator!(size: 72 * 1024).)
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     esp_alloc::heap_allocator!(size: 36 * 1024);
     println!("heap ready");
