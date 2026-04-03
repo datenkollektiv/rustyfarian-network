@@ -318,8 +318,7 @@ mod driver {
                     let ip = config.address.address();
                     log::info!("DHCP assigned IP: {}", ip);
 
-                    let (r, g, b) = CONNECTED;
-                    if let Err(e) = self.led.set_color(RGB8::new(r, g, b)) {
+                    if let Err(e) = self.led.set_color(RGB8::from(CONNECTED)) {
                         log::warn!("LED error: {:?}", e);
                     }
 

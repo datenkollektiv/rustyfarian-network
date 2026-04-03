@@ -379,8 +379,7 @@ impl WiFiManager {
         wifi.wait_netif_up()?;
         log::info!("WiFi netif up");
 
-        let (r, g, b) = status_colors::CONNECTED;
-        led.set_color(RGB8::new(r, g, b))
+        led.set_color(RGB8::from(status_colors::CONNECTED))
             .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
 
         Ok(())
