@@ -22,7 +22,7 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     println!("hal_c6_wifi_raw: init done");
 
-     // ESP32-C6 has two physically separate SRAM banks that must be registered
+    // ESP32-C6 has two physically separate SRAM banks that must be registered
     // with esp_alloc individually.  Both calls add regions to the same global
     // esp_alloc::HEAP — this is one allocator with two backing regions, not two
     // independent allocators.

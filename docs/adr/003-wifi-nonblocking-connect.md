@@ -36,7 +36,7 @@ pub enum ConnectMode {
 }
 ```
 
-`ConnectMode` defaults to `Blocking { timeout_secs: 10 }`, preserving current behaviour for callers that do not opt in.
+`ConnectMode` defaults to `Blocking { timeout_secs: 30 }`, preserving current behaviour for callers that do not opt in.
 The existing `.with_timeout(secs)` builder method sets `Blocking { timeout_secs: secs }`.
 A new `.connect_nonblocking()` builder method sets `NonBlocking`.
 

@@ -82,6 +82,12 @@ mod driver {
     /// Extension trait that adds [`with_peripherals`][WiFiConfigExt::with_peripherals]
     /// to [`WiFiConfig`], producing a [`HalWifiConfig`] ready for
     /// [`WiFiManager::init`].
+    ///
+    /// **Note on `connect_mode`:** This bare-metal path currently uses a blocking
+    /// poll loop (`smoltcp` + DHCP).
+    /// `ConnectMode::NonBlocking` is not implemented on this path yet.
+    /// `with_peripherals` ignores `connect_mode`, so calling
+    /// `.connect_nonblocking()` before `with_peripherals` has no effect.
     pub trait WiFiConfigExt<'a> {
         /// Bundles this configuration with the ESP32 peripherals required for
         /// bare-metal Wi-Fi.
