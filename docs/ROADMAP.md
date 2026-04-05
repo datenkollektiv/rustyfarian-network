@@ -1,26 +1,31 @@
 # Roadmap
 
-*Last updated: March 2026*
+*Last updated: April 2026*
 
 `EspHalWifiManager` is complete with unified `WiFiManager::init()` API, DHCP via smoltcp, and full API parity between ESP-IDF and esp-hal crates.
 TTN v3 LoRa validation remains blocked on hardware.
 Next milestone: release v0.2.0 with the accumulated post-0.1.0 features.
+Wi-Fi Radio Power Configuration v1 is designed and ready for implementation.
 
 ```mermaid
 %%{init: {
   "theme": "base",
   "themeVariables": {
-    "cScale0": "#c8f7c5",
-    "cScaleLabel0": "#1b5e20",
-    "cScale1": "#fff3cd",
-    "cScaleLabel1": "#7a5a00",
-    "cScale2": "#e3f2fd",
-    "cScaleLabel2": "#0d47a1"
+    "cScale0": "#e8f5e9",
+    "cScaleLabel0": "#2e7d32",
+    "cScale1": "#c8f7c5",
+    "cScaleLabel1": "#1b5e20",
+    "cScale2": "#fff3cd",
+    "cScaleLabel2": "#7a5a00",
+    "cScale3": "#e3f2fd",
+    "cScaleLabel3": "#0d47a1"
   }
 }}%%
 
 timeline
     title rustyfarian-network Roadmap
+
+    Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
 
     Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
               : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
