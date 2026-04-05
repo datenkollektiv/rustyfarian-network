@@ -25,7 +25,6 @@ timeline
     title rustyfarian-network Roadmap
 
     Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
-              : ESP-NOW Peripheral Command Framework v1 — frame envelope, system tags, CommandFrame parsing (feature-doc)
 
     Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
               : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
@@ -60,6 +59,7 @@ timeline
 - `default_interface()` fix: always STA (amends ADR 008)
 - `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
 - Wi-Fi Radio Power Config v1 — `TxPowerLevel` enum, `with_tx_power()` builder, ESP-IDF `esp_wifi_set_max_tx_power()`, ESP-NOW auto-burst during scanning
+- ESP-NOW Peripheral Command Framework v1 — `CommandFrame` zero-copy parser, `SystemCommand` enum (Ping/SelfTest/Identify), response helpers in `espnow-pure`
 
 </details>
 
