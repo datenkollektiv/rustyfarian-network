@@ -5,6 +5,7 @@
 //! - [`EspNowDriver`] — hardware-agnostic ESP-NOW driver interface
 //! - [`EspNowEvent`] — received frame (fixed-size, no heap)
 //! - [`PeerConfig`] — peer registration parameters
+//! - [`PeerTracker`] — heartbeat-based peer liveness tracking
 //! - [`mock::MockEspNowDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -16,8 +17,16 @@
 
 #![no_std]
 
+pub mod command;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+pub mod tracker;
+
+pub use command::{
+    parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
+    TAG_SELF_TEST,
+};
+pub use tracker::PeerTracker;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
