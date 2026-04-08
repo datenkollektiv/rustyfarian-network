@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rustyfarian-esp-hal-wifi`: opt-in `embassy` Cargo feature that activates the embassy ecosystem (`embassy-executor 0.9`, `embassy-net 0.7`, `embassy-time 0.5`, `static_cell 2.1`, `embedded-io-async 0.6`) and `esp-rtos/embassy` — foundation for async Wi-Fi support (see `docs/features/embassy-feature-flag-v1.md`); off by default, no behavioural change when unused
+- `rustyfarian-esp-hal-wifi`: `WiFiManager::init_async()` async companion API behind the `embassy` feature — returns an `AsyncWifiHandle { controller, stack, runner }` wired into an `embassy-net` stack with automatic DHCPv4, replacing the manual `smoltcp` poll loop used by the blocking path; `AsyncWifiHandle::wait_for_ip().await` mirrors the blocking `wait_connected()` convenience (see `docs/features/wifi-manager-async-v1.md`)
+- `rustyfarian-esp-hal-wifi`: `hal_c3_connect_async` example — first async bare-metal Wi-Fi demo on ESP32-C3, uses `#[esp_rtos::main]` with two spawned tasks (`wifi_task` for association + reconnection, `net_task` for the embassy-net runner), prints the DHCP-assigned IP and idles asynchronously (see `docs/features/hal-c3-connect-async-example-v1.md`)
+- Build scripts: `scripts/build-example.sh` now appends the `embassy` feature automatically for any `hal_*_async*` example
+- Justfile: `check-wifi-hal-embassy` recipe that verifies the `embassy` feature compiles for ESP32-C6 (`riscv32imac-unknown-none-elf`) and ESP32-C3 (`riscv32imc-unknown-none-elf`)
 - `espnow-pure`: `PeerTracker` — heartbeat-based peer liveness tracker with online/offline transition detection, extracted from rustbox-rgb-puzzle brain firmware
 - `espnow-pure`: `ScanConfig::with_probe_timeout()` and `DEFAULT_PROBE_TIMEOUT` (100 ms) — per-channel probe timeout is now configurable
 - `espnow-pure`: `ScanConfig::with_burst_timeout()` and `DEFAULT_BURST_TIMEOUT` (3 s) — bounds total time the radio spends at boosted TX power during peer discovery
@@ -21,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-hal-wifi`: stores `TxPowerLevel` config; logs warning that `esp-radio 0.17` does not expose TX power API
 - `rustyfarian-esp-idf-espnow`: `scan_for_peer()` auto-bursts TX power to maximum during channel scanning, restores previous level after scan completes
 - `espnow-pure`: `command` module — `CommandFrame<'a>` zero-copy parser, `SystemCommand` enum (`Ping`, `SelfTest`, `Identify`), tag range helpers, and response payload builders for the ESP-NOW Peripheral Command Framework (see `docs/features/espnow-peripheral-command-framework-v1.md`)
+- `rustyfarian-esp-hal-wifi`: `ActiveLowLed<P>` adapter — implements `StatusLed` with inverted polarity for onboard LEDs wired active-low (e.g. ESP32-C3 Super Mini GPIO8)
+- `rustyfarian-esp-hal-wifi`: `hal_c3_connect_async_led` example — async Wi-Fi connect with spawned `led_task` that blinks the onboard GPIO8 LED during connection, holds steady once IP acquired; uses `AtomicBool` for task coordination
+- `rustyfarian-esp-hal-wifi`: `hal_c6_connect_async_led` example — async Wi-Fi connect with spawned `led_task` that pulses the onboard WS2812 RGB LED (GPIO8) blue via `PulseEffect` during connection, holds dim green once connected
+- Build scripts: `build-example.sh` and `flash.sh` auto-detect `rustyfarian-esp-hal-ws2812` feature for `hal_c6_*_led*` examples
 - Justfile: `check-wifi-hal-embassy` recipe that verifies the `embassy` feature compiles for ESP32-C6 (`riscv32imac-unknown-none-elf`) and ESP32-C3 (`riscv32imc-unknown-none-elf`)
 - `rustyfarian-esp-hal-wifi`: `EspHalWifiManager` with real `WifiDriver` implementation using `esp-radio 0.17.0` for bare-metal ESP32-C3/C6 (ADR 006 Phase 5); `hal_c3_connect` and `hal_c6_connect` examples
 - `rustyfarian-network-pure`: `status_colors` module with shared LED colour palette (`BOOT`, `WIFI_CONNECTING`, `MQTT_CONNECTING`, `CONNECTED`, `ERROR`, `OFFLINE`)

@@ -18,6 +18,15 @@
 //!
 //! After association, call [`WiFiManager::take_sta_device`] to obtain the
 //! `WifiDevice` for use with `smoltcp` or `embassy-net`.
+//!
+//! # Async (embassy) support
+//!
+//! When the `embassy` Cargo feature is enabled, [`WiFiManager::init_async`]
+//! returns an [`AsyncWifiHandle`] carrying the `WifiController`, an
+//! `embassy_net::Stack`, and a `Runner` ready to be spawned in an
+//! `#[embassy_executor::task]`. DHCPv4 is handled by `embassy-net`
+//! automatically — call [`AsyncWifiHandle::wait_for_ip`] to await the first
+//! lease.
 
 #![no_std]
 
@@ -30,6 +39,51 @@ pub use wifi_pure::{
 
 // Re-export StatusLed, SimpleLed, and NoLed from led_effects for convenience
 pub use led_effects::{NoLed, SimpleLed, StatusLed};
+
+// ─── ActiveLowLed ──────────────────────────────────────────────────────────
+
+/// Active-low GPIO LED adapter for the [`StatusLed`] trait.
+///
+/// Identical to [`SimpleLed`] but inverts the polarity: the pin is driven
+/// **low** to turn the LED on and **high** to turn it off.
+///
+/// Many dev boards (e.g. ESP32-C3 Super Mini) wire their onboard LED
+/// between VCC and a GPIO pin, so pulling the pin low completes the
+/// circuit and lights the LED.
+///
+/// Use with [`WiFiManager::init_with_led`] for connection status feedback
+/// on boards with an active-low LED.
+pub struct ActiveLowLed<P: embedded_hal::digital::OutputPin> {
+    pin: P,
+    threshold: u8,
+}
+
+impl<P: embedded_hal::digital::OutputPin> ActiveLowLed<P> {
+    /// Creates a new `ActiveLowLed` with the default brightness threshold (10).
+    pub fn new(pin: P) -> Self {
+        Self {
+            pin,
+            threshold: led_effects::DEFAULT_BRIGHTNESS_THRESHOLD,
+        }
+    }
+
+    /// Creates a new `ActiveLowLed` with a custom brightness threshold.
+    pub fn with_threshold(pin: P, threshold: u8) -> Self {
+        Self { pin, threshold }
+    }
+}
+
+impl<P: embedded_hal::digital::OutputPin> StatusLed for ActiveLowLed<P> {
+    type Error = P::Error;
+
+    fn set_color(&mut self, color: rgb::RGB8) -> Result<(), Self::Error> {
+        if led_effects::exceeds_threshold(color, self.threshold) {
+            self.pin.set_low() // Active-low: low = LED on
+        } else {
+            self.pin.set_high() // Active-low: high = LED off
+        }
+    }
+}
 
 // ─── Real implementation (behind chip feature gates) ────────────────────────
 
@@ -52,13 +106,6 @@ mod driver {
     const WIFI_CONNECTING: (u8, u8, u8) = (0, 0, 255);
     const CONNECTED: (u8, u8, u8) = (0, 20, 0);
     const ERROR: (u8, u8, u8) = (255, 0, 0);
-
-    /// Minimum heap size for the Wi-Fi radio stack (bytes).
-    const WIFI_HEAP_SIZE: usize = 72 * 1024;
-
-    /// Heap backing store for the Wi-Fi radio stack.
-    static mut WIFI_HEAP: core::mem::MaybeUninit<[u8; WIFI_HEAP_SIZE]> =
-        core::mem::MaybeUninit::uninit();
 
     fn smoltcp_now() -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_millis(
@@ -166,8 +213,15 @@ mod driver {
     }
 
     impl WiFiManager<'_, NoLed> {
-        /// Initializes the heap, scheduler, radio, and Wi-Fi — then configures,
+        /// Initializes the scheduler, radio, and Wi-Fi — then configures,
         /// starts, and begins association in a single call.
+        ///
+        /// # Heap requirement
+        ///
+        /// The caller must set up the heap via `esp_alloc::heap_allocator!`
+        /// **before** calling this method. On ESP32-C3 a single 72 KiB region
+        /// suffices; on ESP32-C6 two regions are needed (64 KiB reclaimed IRAM
+        /// for Wi-Fi DMA + 36 KiB DRAM). See the chip-specific examples.
         ///
         /// Uses [`NoLed`] for status feedback (no visual output).
         /// For LED feedback during connection, use [`init_with_led`][WiFiManager::init_with_led].
@@ -196,15 +250,6 @@ mod driver {
             config: HalWifiConfig<'_>,
             led: S,
         ) -> Result<WiFiManager<'static, S>, WifiError> {
-            // Set up the heap for Wi-Fi radio buffers.
-            unsafe {
-                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                    core::ptr::addr_of_mut!(WIFI_HEAP) as *mut u8,
-                    WIFI_HEAP_SIZE,
-                    esp_alloc::MemoryCapability::Internal.into(),
-                ));
-            }
-
             let timg = TimerGroup::new(config.timg0);
             let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
             esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
@@ -367,6 +412,120 @@ mod driver {
         }
     }
 
+    // ─── Async (embassy) companion ──────────────────────────────────────────
+
+    /// Handle returned by [`WiFiManager::init_async`] carrying the components
+    /// needed to drive Wi-Fi from async tasks.
+    ///
+    /// Users are expected to spawn two tasks: one that owns the
+    /// [`WifiController`] and runs its reconnection logic, and one that owns
+    /// the [`embassy_net::Runner`] and calls `runner.run().await`.
+    /// The [`embassy_net::Stack`] is `Copy` and can be shared with any number
+    /// of socket tasks.
+    #[cfg(feature = "embassy")]
+    pub struct AsyncWifiHandle {
+        /// Wi-Fi controller for `wifi_task` — owns association state.
+        pub controller: WifiController<'static>,
+        /// Network stack handle for opening sockets; `Copy`able.
+        pub stack: embassy_net::Stack<'static>,
+        /// Runner for `net_task` — `runner.run().await` must be polled
+        /// continuously in a dedicated task.
+        pub runner: embassy_net::Runner<'static, WifiDevice<'static>>,
+    }
+
+    #[cfg(feature = "embassy")]
+    impl WiFiManager<'static, NoLed> {
+        /// Initializes the scheduler, radio, and Wi-Fi, starts association,
+        /// and hands off control to `embassy-net`.
+        ///
+        /// Returns an [`AsyncWifiHandle`] with the components required to
+        /// drive Wi-Fi from async tasks. The caller is responsible for
+        /// spawning a task that owns `handle.controller` (association loop)
+        /// and a task that calls `handle.runner.run().await` (network stack).
+        ///
+        /// The initial association is started before this function returns;
+        /// the `wifi_task` only needs to handle subsequent disconnects.
+        ///
+        /// DHCPv4 is configured automatically — await
+        /// [`AsyncWifiHandle::wait_for_ip`] to block until the first lease.
+        ///
+        /// # Heap requirement
+        ///
+        /// The caller must set up the heap via `esp_alloc::heap_allocator!`
+        /// **before** calling this method. On ESP32-C3 a single 72 KiB region
+        /// suffices; on ESP32-C6 two regions are needed (64 KiB reclaimed IRAM
+        /// for Wi-Fi DMA + 36 KiB DRAM). See the chip-specific async examples.
+        ///
+        /// # Socket budget
+        ///
+        /// The `embassy-net` stack is sized with `StackResources<3>`, which
+        /// covers DHCP plus one TCP and one UDP socket — the baseline used by
+        /// `embassy-net`'s own examples. Applications that need more
+        /// concurrent sockets must build their own stack from
+        /// [`take_sta_device`][WiFiManager::take_sta_device].
+        ///
+        /// # One-shot
+        ///
+        /// This function must be called at most once per boot — it
+        /// initializes a `static` `StackResources` via [`StaticCell`] and
+        /// will panic on the second call.
+        pub fn init_async(config: HalWifiConfig<'_>) -> Result<AsyncWifiHandle, WifiError> {
+            Self::init_inner(config, NoLed)?.into_async_handle()
+        }
+
+        fn into_async_handle(mut self) -> Result<AsyncWifiHandle, WifiError> {
+            use embassy_net::{Config, DhcpConfig, StackResources};
+            use static_cell::StaticCell;
+
+            let sta_device = self.sta_device.take().ok_or_else(|| {
+                log::error!("STA device already taken — cannot build embassy-net stack");
+                WifiError::ConfigureFailed
+            })?;
+
+            static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+            let resources = RESOURCES.init(StackResources::<3>::new());
+
+            // Seed the stack's local-port RNG from the monotonic clock.
+            // This is not cryptographic — it is used only by `embassy-net` for
+            // ephemeral source-port randomization. Upgrade to the `esp-hal` RNG
+            // peripheral if `init_async` ever gains access to it.
+            let seed = esp_hal::time::Instant::now()
+                .duration_since_epoch()
+                .as_micros();
+
+            let (stack, runner) = embassy_net::new(
+                sta_device,
+                Config::dhcpv4(DhcpConfig::default()),
+                resources,
+                seed,
+            );
+
+            Ok(AsyncWifiHandle {
+                controller: self.controller,
+                stack,
+                runner,
+            })
+        }
+    }
+
+    #[cfg(feature = "embassy")]
+    impl AsyncWifiHandle {
+        /// Awaits until the `embassy-net` stack has an IPv4 configuration
+        /// (either via DHCP or static) and returns the full configuration:
+        /// CIDR address, default gateway, and DNS servers.
+        ///
+        /// Mirrors the blocking [`WiFiManager::wait_connected`] convenience.
+        /// For more control (custom timeout, concurrent LED animation),
+        /// poll [`embassy_net::Stack::config_v4`] directly alongside other
+        /// futures with `embassy_futures::select`.
+        pub async fn wait_for_ip(&self) -> embassy_net::StaticConfigV4 {
+            self.stack.wait_config_up().await;
+            self.stack
+                .config_v4()
+                .expect("stack reports config up but has no IPv4 config")
+        }
+    }
+
     impl<'d, S: StatusLed> WifiDriver for WiFiManager<'d, S>
     where
         S::Error: core::fmt::Debug,
@@ -432,6 +591,9 @@ mod driver {
 
 #[cfg(any(feature = "esp32c6", feature = "esp32c3"))]
 pub use driver::{HalWifiConfig, WiFiConfigExt, WiFiManager, WifiError};
+
+#[cfg(all(feature = "embassy", any(feature = "esp32c6", feature = "esp32c3")))]
+pub use driver::AsyncWifiHandle;
 
 // ─── Stub fallback (no chip feature — host compilation) ─────────────────────
 

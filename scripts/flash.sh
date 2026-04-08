@@ -108,7 +108,10 @@ case "$prefix" in
 
         # Append optional features based on example name
         case "$example" in
-            *_rgb*) hal_features="${hal_features},rustyfarian-esp-hal-ws2812" ;;
+            *_rgb*|hal_c6_*_led*) hal_features="${hal_features},rustyfarian-esp-hal-ws2812" ;;
+        esac
+        case "$example" in
+            *_async*) hal_features="${hal_features},embassy" ;;
         esac
 
         # Ensure IDF-built bootloader is cached
