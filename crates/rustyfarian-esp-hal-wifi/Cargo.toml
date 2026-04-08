@@ -35,9 +35,21 @@ esp32c3 = [
 ]
 unstable = ["esp-hal/unstable"]
 rt = ["esp-hal/rt"]
+# Opt-in async support via the embassy ecosystem. Orthogonal to chip selection —
+# enable alongside `esp32c6` or `esp32c3`. Activates `esp-rtos/embassy` which
+# supplies the embassy-time driver and executor wiring.
+embassy = [
+    "dep:embassy-executor",
+    "dep:embassy-net",
+    "dep:embassy-time",
+    "dep:static_cell",
+    "dep:embedded-io-async",
+    "esp-rtos?/embassy",
+]
 
 [dependencies]
 wifi-pure.workspace = true
+embedded-hal.workspace = true
 led-effects.workspace = true
 rgb.workspace = true
 log.workspace = true
@@ -51,6 +63,15 @@ esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, optional
 esp-println = { version = "0.16", default-features = false, optional = true }
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 
+# Embassy (optional — activated by the `embassy` feature)
+embassy-executor = { workspace = true, optional = true }
+embassy-net = { workspace = true, optional = true, features = ["dhcpv4", "proto-ipv4", "medium-ethernet"] }
+embassy-time = { workspace = true, optional = true }
+static_cell = { workspace = true, optional = true }
+# Re-exported via the `embassy` feature for downstream socket code that needs
+# `AsyncRead` / `AsyncWrite`. Not used inside this crate yet.
+embedded-io-async = { workspace = true, optional = true }
+
 [[example]]
 name = "hal_c6_connect"
 required-features = ["esp32c6", "rt"]
@@ -60,12 +81,24 @@ name = "hal_c3_connect"
 required-features = ["esp32c3", "rt"]
 
 [[example]]
+name = "hal_c3_connect_async"
+required-features = ["esp32c3", "rt", "embassy"]
+
+[[example]]
 name = "hal_c6_wifi_raw"
 required-features = ["esp32c6", "rt"]
 
 [[example]]
+name = "hal_c3_connect_async_led"
+required-features = ["esp32c3", "rt", "embassy"]
+
+[[example]]
 name = "hal_c3_wifi_raw"
 required-features = ["esp32c3", "rt"]
+
+[[example]]
+name = "hal_c6_connect_async_led"
+required-features = ["esp32c6", "rt", "embassy", "rustyfarian-esp-hal-ws2812"]
 
 [[example]]
 name = "hal_c6_connect_nonblocking_rgb"

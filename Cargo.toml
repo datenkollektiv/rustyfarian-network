@@ -38,6 +38,13 @@ esp-radio = { version = "0.17", default-features = false }
 esp-rtos = { version = "0.2", default-features = false }
 esp-alloc = { version = "0.9" }
 
+# Embassy async ecosystem (opt-in via the `embassy` feature on HAL crates)
+embassy-executor = { version = "0.9", default-features = false }
+embassy-net = { version = "0.7", default-features = false }
+embassy-time = { version = "0.5", default-features = false }
+static_cell = { version = "2.1" }
+embedded-io-async = { version = "0.6" }
+
 # Bare-metal debugging
 esp-backtrace = { version = "0.18", default-features = false, features = ["panic-handler", "println"] }
 

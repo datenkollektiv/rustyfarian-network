@@ -27,6 +27,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use esp_backtrace as _;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::Level;
@@ -64,11 +66,14 @@ fn run() -> Result<(), WifiError> {
     );
     let delay = Delay::new();
 
+    // ESP32-C6 requires two heap regions: reclaimed IRAM for Wi-Fi DMA + DRAM.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 36 * 1024);
+
     // Init Wi-Fi first — RMT can be set up after.
     let wifi_config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
-        peripherals.RNG,
-        peripherals.RADIO_CLK,
+        peripherals.SW_INTERRUPT,
         peripherals.WIFI,
     );
     let mut wifi = WiFiManager::init(wifi_config)?;
@@ -90,12 +95,12 @@ fn run() -> Result<(), WifiError> {
     println!("LED ready");
 
     // Phase 1: blue pulse while waiting for L2 association.
-    let start = esp_hal::time::now();
+    let start = esp_hal::time::Instant::now();
     loop {
         if wifi.is_connected()? {
             break;
         }
-        let elapsed_ms = (esp_hal::time::now() - start).to_millis();
+        let elapsed_ms = (esp_hal::time::Instant::now() - start).as_millis();
         if elapsed_ms >= TIMEOUT_MS {
             println!("Wi-Fi association timeout");
             for _ in 0..20 {

@@ -36,6 +36,9 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
 fn run() -> Result<(), WifiError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
+    // ESP32-C3 has contiguous SRAM — a single 72 KiB heap region is sufficient.
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
     let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
         peripherals.SW_INTERRUPT,

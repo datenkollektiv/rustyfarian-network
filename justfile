@@ -53,6 +53,12 @@ check-lora-hal:
 check-wifi-hal:
     cargo check -p rustyfarian-esp-hal-wifi --no-default-features
 
+# check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
+# `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
+check-wifi-hal-embassy:
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy
+
 # run clippy on the entire workspace
 clippy:
     cargo clippy --all-targets --workspace -- -D warnings

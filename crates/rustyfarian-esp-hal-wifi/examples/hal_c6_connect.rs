@@ -24,6 +24,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use esp_backtrace as _;
 use esp_hal::main;
 use esp_println::println;
@@ -43,10 +45,13 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
 fn run() -> Result<(), WifiError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
+    // ESP32-C6 requires two heap regions: reclaimed IRAM for Wi-Fi DMA + DRAM.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 36 * 1024);
+
     let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
-        peripherals.RNG,
-        peripherals.RADIO_CLK,
+        peripherals.SW_INTERRUPT,
         peripherals.WIFI,
     );
     let mut wifi = WiFiManager::init(config)?;
