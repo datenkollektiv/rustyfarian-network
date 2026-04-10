@@ -5,7 +5,6 @@
 `EspHalWifiManager` is complete with unified `WiFiManager::init()` API, DHCP via smoltcp, and full API parity between ESP-IDF and esp-hal crates.
 TTN v3 LoRa validation remains blocked on hardware.
 Next milestone: release v0.2.0 with the accumulated post-0.1.0 features.
-Wi-Fi Radio Power Configuration v1 is designed and ready for implementation.
 
 ```mermaid
 %%{init: {
@@ -26,6 +25,7 @@ timeline
     title rustyfarian-network Roadmap
 
     Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
+              : ESP-NOW Peripheral Command Framework v1 — frame envelope, system tags, CommandFrame parsing (feature-doc)
 
     Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
               : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
@@ -59,6 +59,7 @@ timeline
 - `idf_c3_espnow_coordinator` and `idf_c3_espnow_scout` examples with LED feedback
 - `default_interface()` fix: always STA (amends ADR 008)
 - `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
+- Wi-Fi Radio Power Config v1 — `TxPowerLevel` enum, `with_tx_power()` builder, ESP-IDF `esp_wifi_set_max_tx_power()`, ESP-NOW auto-burst during scanning
 
 </details>
 

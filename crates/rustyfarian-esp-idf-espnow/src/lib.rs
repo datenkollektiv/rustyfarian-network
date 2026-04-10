@@ -235,40 +235,68 @@ impl EspIdfEspNow {
 
         let _cb = self.register_ack_cb(&ack_status, "scanning")?;
 
-        for &channel in config.channels {
-            log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
+        // Auto-burst: boost TX power to maximum during channel scanning
+        // to maximise discovery range, then restore the previous level.
+        let mut saved_tx_power: i8 = 0;
+        let have_saved_power =
+            unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power) }
+                == esp_idf_svc::sys::ESP_OK;
 
-            // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
-            // Wi-Fi subsystem, which is initialised by init_with_radio().
-            // channel is a valid u8 (1-13).
-            let ret = unsafe {
-                esp_idf_svc::sys::esp_wifi_set_channel(
-                    channel,
-                    esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-                )
-            };
-            if ret != esp_idf_svc::sys::ESP_OK {
-                log::warn!("Failed to set channel {}: error code {}", channel, ret);
-                continue;
-            }
-
-            ack_status.reset();
-
-            if self.send(mac, config.probe_data).is_err() {
-                continue;
-            }
-
-            match ack_status.wait(config.probe_timeout) {
-                Some(true) => return Ok(ScanResult { channel }),
-                Some(false) => log::debug!("No ACK on channel {}", channel),
-                None => log::debug!("Send timeout on channel {}", channel),
-            }
+        // TxPowerLevel::Max = 78 quarter-dBm (~19.5 dBm); kept in sync
+        // with wifi_pure::TxPowerLevel::Max.to_quarter_dbm().
+        let burst_power: i8 = 78;
+        if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
+            != esp_idf_svc::sys::ESP_OK
+        {
+            log::warn!("Failed to boost TX power for scanning — continuing at current level");
         }
 
-        anyhow::bail!(
-            "peer not found on any of the {} scanned channels",
-            config.channels.len()
-        )
+        let scan_result = (|| -> anyhow::Result<ScanResult> {
+            for &channel in config.channels {
+                log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
+
+                // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
+                // Wi-Fi subsystem, which is initialised by init_with_radio().
+                // channel is a valid u8 (1-13).
+                let ret = unsafe {
+                    esp_idf_svc::sys::esp_wifi_set_channel(
+                        channel,
+                        esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                    )
+                };
+                if ret != esp_idf_svc::sys::ESP_OK {
+                    log::warn!("Failed to set channel {}: error code {}", channel, ret);
+                    continue;
+                }
+
+                ack_status.reset();
+
+                if self.send(mac, config.probe_data).is_err() {
+                    continue;
+                }
+
+                match ack_status.wait(config.probe_timeout) {
+                    Some(true) => return Ok(ScanResult { channel }),
+                    Some(false) => log::debug!("No ACK on channel {}", channel),
+                    None => log::debug!("Send timeout on channel {}", channel),
+                }
+            }
+
+            anyhow::bail!(
+                "peer not found on any of the {} scanned channels",
+                config.channels.len()
+            )
+        })();
+
+        // Restore TX power after scanning regardless of outcome
+        if have_saved_power
+            && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
+                != esp_idf_svc::sys::ESP_OK
+        {
+            log::warn!("Failed to restore TX power after scanning");
+        }
+
+        scan_result
     }
 
     /// Send data and wait for the MAC-layer ACK.

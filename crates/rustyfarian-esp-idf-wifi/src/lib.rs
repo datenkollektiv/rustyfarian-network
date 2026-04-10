@@ -66,9 +66,9 @@ use rgb::RGB8;
 
 // Re-export all pure types from wifi-pure
 pub use wifi_pure::{
-    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, WiFiConfig,
-    WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
-    SSID_MAX_LEN,
+    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, TxPowerLevel,
+    WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+    POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from led_effects for convenience
@@ -85,6 +85,7 @@ pub struct IdfWifiConfig<'a> {
     password: &'a str,
     connect_mode: ConnectMode,
     power_save: WifiPowerSave,
+    tx_power: TxPowerLevel,
     modem: Modem<'static>,
     sys_loop: EspSystemEventLoop,
     nvs: Option<EspDefaultNvsPartition>,
@@ -114,6 +115,7 @@ impl<'a> WiFiConfigExt<'a> for WiFiConfig<'a> {
             password: self.password,
             connect_mode: self.connect_mode,
             power_save: self.power_save,
+            tx_power: self.tx_power,
             modem,
             sys_loop,
             nvs,
@@ -156,6 +158,7 @@ impl WiFiManager {
             password: config.password,
             connect_mode: config.connect_mode,
             power_save: config.power_save,
+            tx_power: config.tx_power,
         };
         Self::new_without_led(config.modem, config.sys_loop, config.nvs, wifi_config)
     }
@@ -229,6 +232,15 @@ impl WiFiManager {
         esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_ps(ps_mode) })
             .context("failed to set WiFi power save mode")?;
         log::info!("WiFi started, power save: {:?}", config.power_save);
+
+        let tx_power = config.tx_power.to_quarter_dbm();
+        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power) })
+            .context("failed to set WiFi TX power")?;
+        log::info!(
+            "WiFi TX power set to {:?} ({} quarter-dBm)",
+            config.tx_power,
+            tx_power
+        );
 
         // In non-blocking mode, subscribe to disconnect events so failures such as
         // WIFI_REASON_NO_AP_FOUND are visible at WARN level without enabling debug logs.

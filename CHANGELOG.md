@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `espnow-pure`: `ScanConfig::with_probe_timeout()` and `DEFAULT_PROBE_TIMEOUT` (100 ms) — per-channel probe timeout is now configurable
+- `wifi-pure`: `TxPowerLevel` enum (`Lowest`, `Low`, `Medium`, `High`, `Max`) with `to_quarter_dbm()` mapping to ESP-IDF quarter-dBm values; `WiFiConfig::with_tx_power()` builder method (see `docs/features/wifi-radio-power-config-v1.md`)
 - `rustyfarian-esp-hal-wifi`: `EspHalWifiManager` with real `WifiDriver` implementation using `esp-radio 0.17.0` for bare-metal ESP32-C3/C6 (ADR 006 Phase 5); `hal_c3_connect` and `hal_c6_connect` examples
 - `rustyfarian-network-pure`: `status_colors` module with shared LED colour palette (`BOOT`, `WIFI_CONNECTING`, `MQTT_CONNECTING`, `CONNECTED`, `ERROR`, `OFFLINE`)
 - `rustyfarian-esp-idf-mqtt`: `MqttBuilder::build_and_wait()` with `StatusLed` support for visual boot feedback (cyan pulse while connecting, green on success, red on timeout)

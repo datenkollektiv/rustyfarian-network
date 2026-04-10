@@ -23,9 +23,9 @@
 
 // Re-export all pure types from wifi-pure (matching rustyfarian-esp-idf-wifi parity)
 pub use wifi_pure::{
-    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, WiFiConfig,
-    WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
-    SSID_MAX_LEN,
+    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, TxPowerLevel,
+    WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+    POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed, SimpleLed, and NoLed from led_effects for convenience
@@ -44,7 +44,9 @@ mod driver {
     };
     use led_effects::{NoLed, PulseEffect, StatusLed};
     use rgb::RGB8;
-    use wifi_pure::{validate_password, validate_ssid, WiFiConfig, WifiDriver, WifiPowerSave};
+    use wifi_pure::{
+        validate_password, validate_ssid, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
+    };
 
     // Mirrored from rustyfarian_network_pure::status_colors (which is not no_std).
     const WIFI_CONNECTING: (u8, u8, u8) = (0, 0, 255);
@@ -74,6 +76,7 @@ mod driver {
         ssid: &'a str,
         password: &'a str,
         power_save: WifiPowerSave,
+        tx_power: TxPowerLevel,
         timg0: esp_hal::peripherals::TIMG0<'static>,
         sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
         wifi: esp_hal::peripherals::WIFI<'static>,
@@ -110,6 +113,7 @@ mod driver {
                 ssid: self.ssid,
                 password: self.password,
                 power_save: self.power_save,
+                tx_power: self.tx_power,
                 timg0,
                 sw_interrupt,
                 wifi,
@@ -157,6 +161,7 @@ mod driver {
         controller: WifiController<'d>,
         sta_device: Option<WifiDevice<'d>>,
         power_save: WifiPowerSave,
+        tx_power: TxPowerLevel,
         led: S,
     }
 
@@ -221,6 +226,7 @@ mod driver {
                 controller,
                 sta_device: Some(interfaces.sta),
                 power_save: config.power_save,
+                tx_power: config.tx_power,
                 led,
             };
 
@@ -242,6 +248,7 @@ mod driver {
                 controller,
                 sta_device: Some(interfaces.sta),
                 power_save,
+                tx_power: TxPowerLevel::default(),
                 led,
             }
         }
@@ -388,6 +395,13 @@ mod driver {
             let ps = Self::map_power_save(self.power_save);
             if let Err(e) = self.controller.set_power_saving(ps) {
                 log::warn!("Failed to set power save mode (non-fatal): {:?}", e);
+            }
+
+            if self.tx_power != TxPowerLevel::default() {
+                log::warn!(
+                    "TX power level {:?} configured but esp-radio 0.17 does not expose tx_power API — using radio default",
+                    self.tx_power
+                );
             }
 
             log::info!("Wi-Fi started, power save: {:?}", self.power_save);
