@@ -105,6 +105,55 @@ pub enum WifiPowerSave {
     MaxModem,
 }
 
+// ─── TxPowerLevel ──────────────────────────────────────────────────────────
+
+/// Transmit power level for the Wi-Fi radio.
+///
+/// Abstracts raw dBm values (which vary by chip) into five intuitive tiers.
+/// The exact dBm mapping is determined by the HAL backend; see each backend's
+/// documentation for chip-specific details.
+///
+/// ESP-IDF uses `esp_wifi_set_max_tx_power()` with quarter-dBm units [8..84].
+/// The default mapping is:
+///
+/// | Level    | Quarter-dBm | Approx dBm |
+/// |:---------|:------------|:-----------|
+/// | `Lowest` | 8           | 2          |
+/// | `Low`    | 34          | 8.5        |
+/// | `Medium` | 52          | 13         |
+/// | `High`   | 68          | 17         |
+/// | `Max`    | 78          | 19.5       |
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TxPowerLevel {
+    /// Minimum transmit power (~2 dBm). Best for close-range, low-heat use.
+    Lowest,
+    /// Low transmit power (~8.5 dBm).
+    Low,
+    /// Medium transmit power (~13 dBm). Balanced range and power draw.
+    #[default]
+    Medium,
+    /// High transmit power (~17 dBm).
+    High,
+    /// Maximum transmit power (~19.5 dBm). Best range, highest power draw.
+    Max,
+}
+
+impl TxPowerLevel {
+    /// Returns the ESP-IDF quarter-dBm value for this power level.
+    ///
+    /// Used by ESP-IDF backends to call `esp_wifi_set_max_tx_power()`.
+    /// Range: [8..84] where each unit is 0.25 dBm.
+    pub fn to_quarter_dbm(self) -> i8 {
+        match self {
+            Self::Lowest => 8,  // 2 dBm
+            Self::Low => 34,    // 8.5 dBm
+            Self::Medium => 52, // 13 dBm
+            Self::High => 68,   // 17 dBm
+            Self::Max => 78,    // 19.5 dBm
+        }
+    }
+}
+
 // ─── WiFiConfig ─────────────────────────────────────────────────────────────
 
 /// Wi-Fi connection configuration.
@@ -113,9 +162,10 @@ pub enum WifiPowerSave {
 ///
 /// ```ignore
 /// let config = WiFiConfig::new("MyNetwork", "password123")
-///     .with_timeout(60)                    // optional: override the 30 s default
-///     .connect_nonblocking()                    // optional: return immediately from new()
-///     .with_power_save(WifiPowerSave::MinModem); // optional: modem sleep for battery savings
+///     .with_timeout(60)                        // optional: override the 30 s default
+///     .connect_nonblocking()                   // optional: return immediately from new()
+///     .with_power_save(WifiPowerSave::MinModem) // optional: modem sleep for battery savings
+///     .with_tx_power(TxPowerLevel::Low);       // optional: reduce transmit power
 /// ```
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
@@ -123,6 +173,7 @@ pub struct WiFiConfig<'a> {
     pub password: &'a str,
     pub connect_mode: ConnectMode,
     pub power_save: WifiPowerSave,
+    pub tx_power: TxPowerLevel,
 }
 
 impl<'a> WiFiConfig<'a> {
@@ -135,6 +186,7 @@ impl<'a> WiFiConfig<'a> {
             password,
             connect_mode: ConnectMode::default(),
             power_save: WifiPowerSave::default(),
+            tx_power: TxPowerLevel::default(),
         }
     }
 
@@ -171,6 +223,17 @@ impl<'a> WiFiConfig<'a> {
     /// overriding whatever mode is set here.
     pub fn with_power_save(mut self, mode: WifiPowerSave) -> Self {
         self.power_save = mode;
+        self
+    }
+
+    /// Sets the Wi-Fi transmit power level applied after `wifi.start()`.
+    ///
+    /// Defaults to [`TxPowerLevel::Medium`] (~13 dBm).
+    ///
+    /// Lower levels reduce power draw and heat; higher levels increase range.
+    /// The exact dBm mapping depends on the chip — see [`TxPowerLevel`].
+    pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
+        self.tx_power = level;
         self
     }
 }
@@ -401,9 +464,58 @@ mod tests {
         let config = test_config()
             .with_timeout(60)
             .with_power_save(WifiPowerSave::MinModem)
+            .with_tx_power(TxPowerLevel::Low)
             .connect_nonblocking();
         assert!(matches!(config.connect_mode, ConnectMode::NonBlocking));
         assert_eq!(config.power_save, WifiPowerSave::MinModem);
+        assert_eq!(config.tx_power, TxPowerLevel::Low);
+    }
+
+    // ── TxPowerLevel tests ────────────────────────────────────────────────
+
+    #[test]
+    fn tx_power_default_is_medium() {
+        assert_eq!(TxPowerLevel::default(), TxPowerLevel::Medium);
+    }
+
+    #[test]
+    fn wifi_config_default_tx_power_is_medium() {
+        let config = test_config();
+        assert_eq!(config.tx_power, TxPowerLevel::Medium);
+    }
+
+    #[test]
+    fn wifi_config_with_tx_power() {
+        let config = test_config().with_tx_power(TxPowerLevel::Lowest);
+        assert_eq!(config.tx_power, TxPowerLevel::Lowest);
+    }
+
+    #[test]
+    fn tx_power_quarter_dbm_values() {
+        assert_eq!(TxPowerLevel::Lowest.to_quarter_dbm(), 8);
+        assert_eq!(TxPowerLevel::Low.to_quarter_dbm(), 34);
+        assert_eq!(TxPowerLevel::Medium.to_quarter_dbm(), 52);
+        assert_eq!(TxPowerLevel::High.to_quarter_dbm(), 68);
+        assert_eq!(TxPowerLevel::Max.to_quarter_dbm(), 78);
+    }
+
+    #[test]
+    fn tx_power_quarter_dbm_range_valid() {
+        for level in [
+            TxPowerLevel::Lowest,
+            TxPowerLevel::Low,
+            TxPowerLevel::Medium,
+            TxPowerLevel::High,
+            TxPowerLevel::Max,
+        ] {
+            let v = level.to_quarter_dbm();
+            assert!(
+                (8..=84).contains(&v),
+                "{:?} maps to {} which is outside [8, 84]",
+                level,
+                v
+            );
+        }
     }
 
     // ── MockWifiDriver tests ────────────────────────────────────────────

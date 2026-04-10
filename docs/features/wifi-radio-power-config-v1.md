@@ -28,11 +28,12 @@
 ## State
 
 - [x] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Session Log
 
 - 2026-04-03 — Feature doc created via /feature dialog
 - 2026-04-03 — Added auto-burst during discovery with timeout
+- 2026-04-10 — Implemented: `TxPowerLevel` enum in `wifi-pure` with 5 levels and `to_quarter_dbm()` mapping. ESP-IDF backend calls `esp_wifi_set_max_tx_power()` after `wifi.start()`. esp-hal backend stores config but logs warning (esp-radio 0.17 lacks TX power API). ESP-NOW `scan_for_peer()` auto-bursts to max TX power during scanning with save/restore. 24 wifi-pure tests pass including 6 new TxPowerLevel tests. `just verify` and `just build-example` (hal_c3_connect, hal_c3_connect_async) all pass clean.
