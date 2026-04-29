@@ -228,3 +228,42 @@ Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = G
 The query traces taint from any string literal into a credential-named parameter and raises a Critical alert regardless of context; test helpers like `WiFiConfig::new("ssid", "pass")` trigger it on the second parameter.
 Fix: define test fixtures with non-credential names (e.g. `TEST_PSK`) and route them through a helper (e.g. `test_config()`); for empty passwords use `&String::new()` instead of `""`.
 The indirection breaks the direct literal-to-credential-parameter flow that CodeQL traces — see `crates/wifi-pure/src/lib.rs` test module.
+
+## OTA MVP — Three-Crate Triad
+
+**`#![no_std]` test code cannot use `format!` or `.to_string()` even on the host target.**
+The `cargo test` harness links against `std`, but the crate's `#![no_std]` attribute still blocks implicit `std` imports inside `#[cfg(test)] mod tests` blocks.
+Workaround: use `core::fmt::Write` into a `heapless::String` buffer, or explicitly `use alloc::string::ToString` if the crate has `extern crate alloc`.
+Surface: building tests for `crates/ota-pure/`.
+
+**`esp-idf-svc 0.52.x` requires `embedded-svc 0.29`, not `0.28`.**
+Pinning `embedded-svc = "0.28"` in `[workspace.dependencies]` while `esp-idf-svc 0.52` transitively pulls `0.29` produces a silent trait-version mismatch: `Headers::content_len` is defined in both crate versions, but `EspHttpConnection` only implements it for `0.29`.
+The error surfaces at compile time in code that calls `client.content_len()` and is non-obvious because both `embedded-svc` versions exist in the dep graph and the trait import lookups can collide.
+Fix: declare `embedded-svc = "0.29"` to align with the version `esp-idf-svc 0.52` pulls.
+
+**`esp-storage 0.9.0` changed `FlashStorage::new()` from zero-arg to taking `esp_hal::peripherals::FLASH<'d>`.**
+Older versions of `esp-storage` exposed `FlashStorage::new()` with no arguments; the 0.9 release made the peripheral explicit and consumes ownership.
+Any wrapper crate must expose this peripheral in its public constructor or store `FlashStorage` directly — `EspHalOtaManager::new()` therefore takes `(config, FLASH<'d>)` and is generic over `'d`.
+Calling `FlashStorage::new()` more than once per boot panics.
+Surface: `crates/rustyfarian-esp-hal-ota/src/manager.rs`.
+
+**`embassy-net::TcpSocket` does not implement `embedded_io_async::Write`.**
+Use the inherent `socket.write(&buf).await` method directly in a partial-write-safe loop.
+Trying to import `embedded_io_async::Write` and call `.write_all()` on a `TcpSocket` fails to compile with "trait not implemented".
+
+**`smoltcp` raises a `compile_error!` if `embassy-net` is pulled in without `proto-ipv4` + `tcp` + `medium-ethernet` features.**
+The features must be declared on the optional `embassy-net` dep in the consuming crate's `Cargo.toml`, not just on the application-level network stack.
+Failure mode: `cargo check` produces an unrelated-looking smoltcp `compile_error!` deep in the dep graph; the fix is to add the features to the lib crate's `embassy-net` declaration.
+See `crates/rustyfarian-esp-hal-ota/Cargo.toml` for the working pattern.
+
+**Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon.**
+`u64::from_str` accepts a leading `+`, but RFC 7230 §3.3.2 requires `1*DIGIT` (no sign).
+A permissive parser paired with a stricter upstream cache becomes a request-smuggling primitive.
+Similarly, RFC 7230 §3.2.4 forbids whitespace between header name and colon — accepting `Content-Length\t: 0` makes the name fail case-insensitive comparison and silently disables the duplicate-CL check.
+Both rejections live in `crates/rustyfarian-esp-hal-ota/src/http.rs::parse_header` and `HeaderState::feed`; the dedicated host tests cover both vectors.
+
+**Logging URLs that may contain RFC 3986 userinfo leaks credentials.**
+Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS is rejected; logging the URL verbatim spills credentials into `espflash monitor` output.
+Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
+The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
+See `crates/rustyfarian-esp-idf-ota/src/downloader.rs::url_for_log`.

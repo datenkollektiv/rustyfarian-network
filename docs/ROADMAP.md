@@ -5,7 +5,7 @@
 The bare-metal stack is now aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
 The bare-metal Wi-Fi surface is now async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
 TTN v3 LoRa validation remains blocked on hardware.
-Next milestone: release v0.2.0 with the accumulated post-0.1.0 features (including this upgrade), then OTA MVP work resumes on the new stack.
+Next milestone: release v0.2.0 with the accumulated post-0.1.0 features (including this upgrade), then deliver the OTA MVP three-crate triad — design locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/ota-mvp-v1.md`](features/ota-mvp-v1.md), unblocked by the April 2026 stack landing.
 
 ```mermaid
 %%{init: {
@@ -28,7 +28,9 @@ timeline
     Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
 
     Near term : Release v0.2.0 — EspHalWifiManager, async Wi-Fi on the April 2026 esp-hal wave, status_colors, non-blocking publish, power save, ESP-NOW channel scanning, command framework
-            : OTA MVP — unblocked by the April 2026 stack upgrade landing
+              : OTA MVP Stage 1 — ota-pure (Version, StreamingVerifier, ImageMetadata, OtaState, OtaError) host-tested
+              : OTA MVP Stage 2 — rustyfarian-esp-idf-ota (OtaSession::fetch_and_apply / mark_valid / rollback) on ESP32-C3 via EspOta + EspHttpConnection
+              : OTA MVP Stage 3 — rustyfarian-esp-hal-ota async over embassy-net + esp_bootloader_esp_idf::OtaUpdater with strict internal HTTP/1.1 GET (ADR 011)
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
@@ -78,6 +80,38 @@ timeline
 - CI: pure-crate test job for all host tests
 
 </details>
+
+---
+
+## Near term detail
+
+### OTA MVP — Three-Crate Dual-Stack Firmware Update
+
+Locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and detailed in [`docs/features/ota-mvp-v1.md`](features/ota-mvp-v1.md).
+Requested by `rustyfarian-ferriswheel-demo` (sibling repo).
+All public APIs are explicitly marked experimental for the MVP; stabilization is owned by the future `ota-library` feature.
+
+**Stage gates** (consumer pulls each stage via path-deps as it lands):
+
+|  # | Crate                     | Owner         | Pass criteria                                                                                                            |
+|---:|:--------------------------|:--------------|:-------------------------------------------------------------------------------------------------------------------------|
+|  1 | `ota-pure`                | network repo  | `cargo test -p ota-pure --features mock` passes on host; `just verify` clean                                             |
+|  2 | `rustyfarian-esp-idf-ota` | consumer demo | ESP32-C3 firmware fetches over Wi-Fi, validates SHA-256, swaps, reboots, calls `mark_valid`; truncated `.bin` rolls back |
+|  3 | `rustyfarian-esp-hal-ota` | consumer demo | Identical hardware behaviour to Stage 2 on the same ESP32-C3 board, bare-metal async path                                |
+
+**MVP scope (locked by feature request + ADR 011):**
+
+- Plain HTTP/1.1 only — no TLS (deferred to `ota-hardened`)
+- Streaming SHA-256 integrity check — never holds the full image in RAM
+- Bare-metal HTTP client is hand-rolled and **internal** (strict subset: `HTTP/1.1 200 OK` + single `Content-Length`, rejects redirects/chunked/oversized) — not a workspace HTTP API
+- Demo enables bootloader rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`) and marks the running image valid after Wi-Fi association + 30 s wall-clock dwell
+- 1 MiB OTA slot reference layout for ESP32-C3 SuperMini (4 MiB flash); demo owns the actual `partitions.csv`
+
+**Out of scope (deferred to `ota-hardened` / `ota-library`):**
+
+- TLS / HTTPS, Ed25519 signature verification, brown-out safety, automated rollback test in CI, multi-device concurrency, API stabilization, mock implementation
+
+Once Stage 3 lands, this entry moves into the Completed band.
 
 ---
 

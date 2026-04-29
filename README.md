@@ -7,7 +7,7 @@
 [![cargo clippy](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml)
 [![cargo audit](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/audit.yml)
 
-Wi-Fi, MQTT, LoRa, and ESP-NOW networking libraries for ESP32 projects.
+Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA support libraries for ESP32 projects.
 
 > Note: Large parts of this library (and documentation) were developed with the assistance of AI tools.
 > All generated code has been reviewed and curated by the maintainer.
@@ -23,7 +23,8 @@ Wi-Fi, MQTT, LoRa, and ESP-NOW networking libraries for ESP32 projects.
 - A growing platform-independent layer (`rustyfarian-network-pure`) that can be unit-tested on the host
 - Minimal friction: a few lines of `Cargo.toml` and no surprises
 
-**Out of scope:** Application-layer protocols (HTTP, CoAP, WebSocket) and provisioning/SoftAP flows.
+**Out of scope:** General-purpose application-layer clients (HTTP, CoAP, WebSocket) and provisioning/SoftAP flows.
+The OTA crates (`rustyfarian-esp-idf-ota`, `rustyfarian-esp-hal-ota`) carry their own internal HTTP/1.1 GET clients for firmware download, but these are implementation details and not published as reusable workspace HTTP APIs.
 
 *Full vision, success signals, and open questions: [VISION.md](./VISION.md)*
 
@@ -41,18 +42,21 @@ a pattern common in application development but rare in embedded Rust.
 
 ## Crates
 
-| Crate                                                         | Description                                                                               |
-|:--------------------------------------------------------------|:------------------------------------------------------------------------------------------|
-| [`rustyfarian-network-pure`](crates/rustyfarian-network-pure) | Platform-independent primitives — validation, timing math; unit-testable on the host      |
-| [`wifi-pure`](crates/wifi-pure)                               | Platform-independent Wi-Fi types, traits, and validation; `no_std`; unit-testable on host |
-| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi) | Wi-Fi connection manager with LED status feedback                                         |
-| [`rustyfarian-esp-hal-wifi`](crates/rustyfarian-esp-hal-wifi) | Wi-Fi driver stub for bare-metal `esp-hal` targets; full implementation in progress       |
-| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt) | MQTT client with automatic reconnection and graceful shutdown                             |
-| [`lora-pure`](crates/lora-pure)                               | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host       |
-| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora) | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                        |
-| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora) | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress             |
+| Crate                                                             | Description                                                                                 |
+|:------------------------------------------------------------------|:--------------------------------------------------------------------------------------------|
+| [`rustyfarian-network-pure`](crates/rustyfarian-network-pure)     | Platform-independent primitives — validation, timing math; unit-testable on the host        |
+| [`wifi-pure`](crates/wifi-pure)                                   | Platform-independent Wi-Fi types, traits, and validation; `no_std`; unit-testable on host   |
+| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi)     | Wi-Fi connection manager with LED status feedback                                           |
+| [`rustyfarian-esp-hal-wifi`](crates/rustyfarian-esp-hal-wifi)     | Wi-Fi driver stub for bare-metal `esp-hal` targets; full implementation in progress         |
+| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt)     | MQTT client with automatic reconnection and graceful shutdown                               |
+| [`lora-pure`](crates/lora-pure)                                   | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host         |
+| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora)     | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                          |
+| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora)     | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress               |
 | [`espnow-pure`](crates/espnow-pure)                               | Platform-independent ESP-NOW types, traits, and validation; `no_std`; unit-testable on host |
 | [`rustyfarian-esp-idf-espnow`](crates/rustyfarian-esp-idf-espnow) | ESP-NOW driver for ESP-IDF projects, implementing the `EspNowDriver` trait                  |
+| [`ota-pure`](crates/ota-pure)                                     | Platform-independent OTA primitives — `Version`, streaming SHA-256, sidecar metadata        |
+| [`rustyfarian-esp-idf-ota`](crates/rustyfarian-esp-idf-ota)       | ESP-IDF OTA driver — **blocking**; streaming download, SHA-256 verify, partition swap, rollback |
+| [`rustyfarian-esp-hal-ota`](crates/rustyfarian-esp-hal-ota)       | Bare-metal OTA driver — **async-only**; strict HTTP/1.1 over `embassy-net` + `OtaUpdater` (MVP) |
 
 ## Usage
 

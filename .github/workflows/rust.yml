@@ -56,3 +56,5 @@ jobs:
           cargo test -p wifi-pure --features mock --target "${host_target}"
           cargo test -p lora-pure --features mock --target "${host_target}"
           cargo test -p espnow-pure --features mock --target "${host_target}"
+          cargo test -p ota-pure --target "${host_target}"
+          cargo test -p rustyfarian-esp-hal-ota --no-default-features --target "${host_target}"
