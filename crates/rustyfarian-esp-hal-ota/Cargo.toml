@@ -1,0 +1,59 @@
+[package]
+name = "rustyfarian-esp-hal-ota"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bare-metal OTA driver — esp_bootloader_esp_idf::OtaUpdater + strict HTTP/1.1 over embassy-net"
+keywords = ["ota", "esp32", "embassy", "no-std"]
+categories = ["embedded", "no-std"]
+
+[features]
+default = []
+
+esp32c3 = [
+    "dep:esp-hal", "esp-hal/esp32c3",
+    "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c3",
+    "dep:esp-storage", "esp-storage/esp32c3",
+    "dep:embedded-storage",
+]
+esp32c6 = [
+    "dep:esp-hal", "esp-hal/esp32c6",
+    "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6",
+    "dep:esp-storage", "esp-storage/esp32c6",
+    "dep:embedded-storage",
+]
+esp32 = [
+    "dep:esp-hal", "esp-hal/esp32",
+    "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32",
+    "dep:esp-storage", "esp-storage/esp32",
+    "dep:embedded-storage",
+]
+unstable = ["esp-hal?/unstable"]
+rt = ["esp-hal?/rt"]
+embassy = [
+    "dep:embassy-net",
+    "dep:embassy-time",
+]
+
+[dependencies]
+ota-pure.workspace = true
+log.workspace = true
+sha2 = { workspace = true, default-features = false }
+
+# Chip deps (optional, activated by chip features)
+esp-hal = { workspace = true, optional = true }
+esp-bootloader-esp-idf = { workspace = true, optional = true }
+esp-storage = { workspace = true, optional = true }
+# Explicitly declared to bring Storage/ReadStorage traits into scope in manager.rs.
+# Pinned at the workspace root alongside esp-storage; both are constrained by
+# what esp-bootloader-esp-idf 0.5.0 + esp-storage 0.9.0 require.
+embedded-storage = { workspace = true, optional = true }
+
+# Embassy stack (optional, activated by `embassy` feature).
+# The smoltcp features (proto-ipv4, socket-tcp, medium-ethernet) are required
+# by smoltcp's compile-time checks and must match what the application stack
+# activates. These mirror the features used in rustyfarian-esp-hal-wifi.
+embassy-net = { workspace = true, optional = true, features = ["proto-ipv4", "tcp", "medium-ethernet"] }
+embassy-time = { workspace = true, optional = true }

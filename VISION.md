@@ -20,6 +20,7 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
 - **An `esp-hal` bare-metal tier** — dedicated `rustyfarian-esp-hal-*` crates provide bare-metal alternatives alongside the existing ESP-IDF path.
   This generalises the earlier LoRa-only `esp-hal` goal into a workspace-wide pattern: separate crates per HAL tier with shared `*-pure` crates for platform-independent types and traits (see [ADR 005](docs/adr/005-crate-naming-for-dual-hal-drivers.md)).
   Active: `rustyfarian-esp-hal-lora` (LoRa radio driver) and `rustyfarian-esp-hal-wifi` (Wi-Fi via `esp-wifi 0.14.0`, in progress).
+- **OTA as firmware-update plumbing** — OTA support may live in this workspace when it reuses the same Wi-Fi, bootloader, partition-table, and dual-HAL foundations as the networking crates.
 
 ## Target Beneficiaries
 
@@ -28,8 +29,8 @@ but with an API clean enough that any ESP32-IDF project can adopt it with confid
 
 ## Non-Goals
 
-- **Application-layer protocols** — HTTP, CoAP, WebSocket, and similar are out of scope;
-  this library stops at Wi-Fi association and MQTT pub/sub.
+- **General-purpose application-layer clients** — HTTP, CoAP, WebSocket, and similar reusable clients are out of scope.
+  Feature-specific private transports may exist behind crate APIs, such as OTA fetching, but are not exported as protocol libraries.
 - **Provisioning / SoftAP mode** — no captive portal, BLE provisioning, or Wi-Fi setup flows.
 - **Full `no_std` / `esp-hal` MQTT** — MQTT over bare-metal Wi-Fi (`rustyfarian-esp-hal-mqtt`) is a long-term goal but not an active workstream; Wi-Fi association is the current `esp-hal` frontier.
 
@@ -54,3 +55,5 @@ _(none at this time)_
 - 2026-03-12 — `esp-hal` Wi-Fi promoted from non-goal to active goal; LoRa path blocked on hardware.
   `rustyfarian-esp-hal-wifi` added to long-term goals; non-goal narrowed to `esp-hal` MQTT only.
   The `esp-hal` goal was generalised from LoRa-only to a workspace-wide dual-HAL pattern (ADR 005).
+- 2026-04-29 — OTA accepted as firmware-update plumbing in this workspace, with private transports only.
+  General-purpose HTTP clients remain a non-goal (ADR 011).

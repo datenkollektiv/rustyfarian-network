@@ -41,6 +41,27 @@ check-wifi-pure:
 check-espnow-pure:
     cargo check -p espnow-pure
 
+# check the pure ota crate (no ESP-IDF required)
+check-ota-pure:
+    cargo check -p ota-pure
+
+# check the esp-idf ota crate
+check-ota-idf:
+    cargo check -p rustyfarian-esp-idf-ota
+
+# check the esp-hal ota stub (no-default-features to avoid esp-hal target conflict)
+check-ota-hal:
+    cargo check -p rustyfarian-esp-hal-ota --no-default-features
+
+# check the esp-hal ota crate with chip + embassy features (ESP32-C6 + ESP32-C3)
+check-ota-hal-embassy:
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy
+
+# run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
+test-ota-hal:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-ota --no-default-features
+
 # check the esp-idf espnow crate
 check-espnow:
     cargo check -p rustyfarian-esp-idf-espnow
@@ -117,8 +138,12 @@ test-lora:
 test-espnow:
     cargo test --target {{host_target}} -p espnow-pure --features mock
 
+# run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
+test-ota:
+    cargo test --target {{host_target}} -p ota-pure
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-wifi test-lora test-espnow
+test: test-backoff test-mqtt test-wifi test-lora test-espnow test-ota test-ota-hal
 
 # ── Examples ────────────────────────────────────────────────────────────────
 
