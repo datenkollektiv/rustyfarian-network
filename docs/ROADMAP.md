@@ -4,7 +4,7 @@
 
 `EspHalWifiManager` is complete with unified `WiFiManager::init()` API, DHCP via smoltcp, and full API parity between ESP-IDF and esp-hal crates.
 TTN v3 LoRa validation remains blocked on hardware.
-Next milestone: release v0.2.0 with the accumulated post-0.1.0 features.
+Next milestone: align the bare-metal stack on the April 2026 esp-hal wave (prerequisite for the OTA MVP), then release v0.2.0 with the accumulated post-0.1.0 features.
 
 ```mermaid
 %%{init: {
@@ -26,8 +26,10 @@ timeline
 
     Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
 
-    Near term : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
+    Near term : esp-hal Stack Upgrade — April 2026 wave (must land before OTA MVP work resumes)
+              : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
               : WiFiManager LED integration for esp-hal (StatusLed support, matching ESP-IDF)
+              : OTA MVP — gated on the April 2026 stack upgrade landing first
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
