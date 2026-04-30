@@ -137,7 +137,9 @@ examples:
 build-example example:
     scripts/build-example.sh "{{example}}"
 
-# serial port for espflash (auto-detected when empty; set for multi-board setups)
+# serial port for espflash; honoured verbatim if set, otherwise scripts/detect-port.sh
+# narrows espflash auto-detect to USB serial devices (usbmodem/usbserial on macOS,
+# ttyUSB/ttyACM on Linux) so paired Bluetooth ports do not get picked.
 export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
 
 # build and flash a named example; chip and crate auto-detected from example name
@@ -147,15 +149,15 @@ flash example:
 # build, flash, and open the serial monitor (run without args to list examples)
 run *example:
     #!/usr/bin/env bash
+    set -euo pipefail
     if [ -z "{{example}}" ]; then
         just examples
     else
         just flash "{{example}}"
-        if [ -n "$ESPFLASH_PORT" ]; then
-            espflash monitor --non-interactive --port "$ESPFLASH_PORT"
-        else
-            espflash monitor --non-interactive
-        fi
+        port="$(scripts/detect-port.sh)"
+        port_args=()
+        [ -n "$port" ] && port_args=(--port "$port")
+        espflash monitor --non-interactive "${port_args[@]}"
     fi
 
 # erase flash (NVS + app), rebuild from clean, flash, and monitor
@@ -167,20 +169,20 @@ fresh-run example:
 # erase entire flash (NVS, app, bootloader) — fixes stale WiFi credentials and corrupt state
 erase-flash:
     #!/usr/bin/env bash
-    if [ -n "$ESPFLASH_PORT" ]; then
-        espflash erase-flash --port "$ESPFLASH_PORT"
-    else
-        espflash erase-flash
-    fi
+    set -euo pipefail
+    port="$(scripts/detect-port.sh)"
+    port_args=()
+    [ -n "$port" ] && port_args=(--port "$port")
+    espflash erase-flash "${port_args[@]}"
 
 # open the serial monitor for an already-flashed device
 monitor:
     #!/usr/bin/env bash
-    if [ -n "$ESPFLASH_PORT" ]; then
-        espflash monitor --non-interactive --port "$ESPFLASH_PORT"
-    else
-        espflash monitor --non-interactive
-    fi
+    set -euo pipefail
+    port="$(scripts/detect-port.sh)"
+    port_args=()
+    [ -n "$port" ] && port_args=(--port "$port")
+    espflash monitor --non-interactive "${port_args[@]}"
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:

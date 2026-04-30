@@ -2,9 +2,10 @@
 
 *Last updated: April 2026*
 
-`EspHalWifiManager` is complete with unified `WiFiManager::init()` API, DHCP via smoltcp, and full API parity between ESP-IDF and esp-hal crates.
+The bare-metal stack is now aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
+The bare-metal Wi-Fi surface is now async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
 TTN v3 LoRa validation remains blocked on hardware.
-Next milestone: align the bare-metal stack on the April 2026 esp-hal wave (prerequisite for the OTA MVP), then release v0.2.0 with the accumulated post-0.1.0 features.
+Next milestone: release v0.2.0 with the accumulated post-0.1.0 features (including this upgrade), then OTA MVP work resumes on the new stack.
 
 ```mermaid
 %%{init: {
@@ -26,9 +27,8 @@ timeline
 
     Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
 
-    Near term : esp-hal Stack Upgrade — April 2026 wave (must land before OTA MVP work resumes)
-              : Release v0.2.0 — EspHalWifiManager, status_colors, non-blocking publish, power save, ESP-NOW channel scanning
-              : OTA MVP — gated on the April 2026 stack upgrade landing first
+    Near term : Release v0.2.0 — EspHalWifiManager, async Wi-Fi on the April 2026 esp-hal wave, status_colors, non-blocking publish, power save, ESP-NOW channel scanning, command framework
+            : OTA MVP — unblocked by the April 2026 stack upgrade landing
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
@@ -61,7 +61,8 @@ timeline
 - `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
 - Wi-Fi Radio Power Config v1 — `TxPowerLevel` enum, `with_tx_power()` builder, ESP-IDF `esp_wifi_set_max_tx_power()`, ESP-NOW auto-burst during scanning
 - ESP-NOW Peripheral Command Framework v1 — `CommandFrame` zero-copy parser, `SystemCommand` enum (Ping/SelfTest/Identify), response helpers in `espnow-pure`
-- WiFiManager LED integration for esp-hal — `WiFiManager::init_with_led()` in `rustyfarian-esp-hal-wifi`, `ActiveLowLed<P>` adapter, `hal_c3_connect_async_led` and `hal_c6_connect_async_led` examples (StatusLed support matching ESP-IDF)
+- WiFiManager LED integration for esp-hal — `ActiveLowLed<P>` adapter, `hal_c3_connect_async_led` and `hal_c6_connect_async_led` examples (StatusLed support matching ESP-IDF; the synchronous `init_with_led` was later removed when the stack moved to esp-radio 0.18 — LED feedback now wires via spawned tasks alongside `init_async`)
+- esp-hal Stack Upgrade — April 2026 wave: workspace exact-pinned to `esp-hal 1.1.0`, `esp-rtos 0.3.0`, `esp-radio 0.18.0`, `esp-bootloader-esp-idf 0.5.0`, `esp-alloc 0.10.0`, `esp-println 0.17.0`, `esp-backtrace 0.19.0`, `embassy-executor 0.10.0`, `embassy-net 0.8.0`, `embassy-time 0.5.1`, `embassy-sync 0.8.0`, `smoltcp 0.12.0`. `rustyfarian-esp-hal-wifi` collapsed to async-only (`WiFiManager::init_async` + `AsyncWifiHandle`) — sync surface and direct `smoltcp` integration removed (BREAKING for the bare-metal Wi-Fi consumers; `embassy` feature is now effectively required). Hardware-validated on ESP32-C3-DevKitM-1 and ESP32-C6-DevKitC-1; LoRa example builds clean for ESP32-S3 (Phase 5 hardware run separate). Tooling: `scripts/detect-port.sh` filters espflash's auto-detect to USB serial devices on macOS. See `docs/features/esp-hal-stack-upgrade-april-2026-v1.md`.
 
 </details>
 

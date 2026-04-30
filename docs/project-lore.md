@@ -91,6 +91,59 @@ Upstream release waves then cannot reach into this workspace without a deliberat
 
 ---
 
+## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)
+
+**`esp-radio 0.18` deleted the `smoltcp` feature and the `smoltcp::phy::Device` impl on `WifiDevice` — the bare-metal Wi-Fi controller is now async-only and tied to `embassy-net`.**
+The 0.17 `smoltcp` Cargo feature is gone; the `wifi` feature now pulls `embassy-net-driver` instead.
+Any blocking poll loop that drove `smoltcp::iface::Interface` directly off `WifiDevice` (the `WiFiManager::wait_connected` + DHCP path used in the network workspace before the upgrade) has no equivalent in 0.18 — the option is to drop the sync surface and route everything through `embassy-net`.
+Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 'smoltcp' has been removed (#4870)`) and verified by grep against the unpacked source: zero `smoltcp` references in `wifi/mod.rs`, only `impl Driver for Interface<'_>` (`embassy_net_driver::Driver`) remains.
+
+**`esp-radio 0.18` rename map (any HAL crate consuming the bare-metal Wi-Fi surface needs to apply these):**
+- `WifiDevice<'d, MODE>` → `Interface<'d>` (the `MODE` generic is gone — `embassy_net::Runner<'static, Interface<'static>>` replaces `Runner<'static, WifiDevice<'static>>`)
+- `ModeConfig` → `Config`; `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`
+- `ClientConfig` → `StationConfig` (lives at `esp_radio::wifi::sta::StationConfig` — the `sta` submodule is `pub` but `StationConfig` is **not** re-exported at `esp_radio::wifi`, so `use esp_radio::wifi::{StationConfig, ...}` fails with `E0603 private struct`; import the full path instead)
+- The old top-level `Config` → `ControllerConfig`
+- `Interfaces.sta` → `Interfaces.station`
+- `WifiEvent::StaDisconnected` → `WifiEvent::StationDisconnected`
+- `WifiError::Disconnected` is now a tuple variant `Disconnected(DisconnectedStationInfo)` — pattern matches that previously used the unit variant break
+- `controller.is_connected()` returns `bool` directly, not `Result<bool, WifiError>`
+- `controller.connect()`, `disconnect()`, `start()` (sync) — all removed; replacements are `connect_async().await`, `disconnect_async().await`; `set_config()` is now idempotent and implicitly starts the controller and begins association
+- `controller.wait_for_event(WifiEvent::StaDisconnected)` removed; replacement is `controller.wait_for_disconnect_async().await -> Result<DisconnectedStationInfo, WifiError>`
+- `esp_radio::wifi::new()` signature is now `(WIFI<'d>, ControllerConfig)` — the prior `radio_ref` parameter is gone; `esp_radio::init()` is now `pub(crate)` and not part of user code
+
+**`StationConfig::with_ssid` accepts `&str` directly via `Into<Ssid>` — calling `.into()` first triggers `E0283`.**
+The compiler can't pick between `&str → Ssid` and `&str → &str` when the `&str.into()` is bare.
+Pass the `&str` literal directly: `StationConfig::default().with_ssid(ssid).with_password(password.into())`.
+The password setter still needs `.into()` because its parameter type is the more specific `Password`, not a trait object.
+
+**`esp-hal 1.1.0` split the RMT TX builder: `configure_tx(pin, config)` is gone — the new pattern is `configure_tx(&config).unwrap().with_pin(pin)`.**
+The pin moved from the `configure_tx` parameter to a chained `.with_pin(...)` call so that channel configuration can be reused independently of pin assignment.
+The reference migration is in the `rustyfarian-ws2812` repo's CHANGELOG entry for the April 2026 wave (file: `crates/rustyfarian-esp-hal-ws2812/examples/hal_c6_*.rs`).
+
+**`embassy-executor 0.10` removed `Spawner::must_spawn`; `#[embassy_executor::task]` macros now return `Result<SpawnToken<...>, SpawnError>`.**
+Old: `spawner.must_spawn(my_task(arg));`
+New: `spawner.spawn(my_task(arg).unwrap());` — the `.unwrap()` goes on the **task call** (which returns `Result`), not on `spawner.spawn` (which returns `()`).
+The compiler hint `consider using Result::expect to unwrap the Result<SpawnToken, SpawnError>` is correct in spirit but its suggested edit is wrong (it places `.expect("REASON")` after the closing paren of `spawn`, where it would be applied to `()`).
+
+---
+
+## Flashing & Serial (espflash 4.x)
+
+**`espflash`'s auto-detect picks Bluetooth ports on Macs with paired headsets, then fails with the generic "Error while connecting to device".**
+On macOS every paired Bluetooth device shows up under `/dev/cu.*` (`/dev/cu.B21S-HC15130245`, `/dev/cu.fluffisNC700`, `/dev/cu.Bluetooth-Incoming-Port`, …) and `espflash`'s probe order can land on one of them before the actual USB-JTAG device (`/dev/cu.usbmodem1101`).
+The error message gives no hint about which port was tried.
+Fix: `scripts/detect-port.sh` filters candidates to USB serial devices only (`usbmodem*`, `usbserial*`, `SLAB_USBtoUART*`, `wchusbserial*` on macOS; `ttyUSB*`, `ttyACM*` on Linux) and only auto-picks when exactly one matches; otherwise it prints the candidate list and lets `espflash` error out with its own message.
+`flash.sh`, `just run`, `just monitor`, and `just erase-flash` all use the helper.
+`ESPFLASH_PORT=…` still wins when set explicitly.
+
+**`espflash monitor` from `just run` lingers after the user thinks it has exited and locks the port for the next flash.**
+Symptom: `[INFO ] Serial port: '/dev/cu.usbmodem1101'` followed by `Error: Failed to open serial port /dev/cu.usbmodem1101 — Error while connecting to device`.
+This is a *different* failure mode from auto-detect picking the wrong port — here the right port is selected but `open()` fails because another process holds it.
+Diagnose: `lsof /dev/cu.usbmodem1101` shows the holding `espflash` PID; kill it and retry.
+Common cause: closing a terminal tab without sending SIGINT to the foreground `espflash monitor`, leaving the process orphaned and still holding the FD.
+
+---
+
 ## ESP-IDF Event Loop (`esp-idf-svc`)
 
 **`EspEventLoop::subscribe` requires the callback to accept the event type by value, not by reference.**

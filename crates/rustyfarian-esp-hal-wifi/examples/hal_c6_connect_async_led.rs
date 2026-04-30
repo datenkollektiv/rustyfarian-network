@@ -35,7 +35,7 @@ use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
 use esp_hal::time::Rate;
 use esp_hal::Blocking;
 use esp_println::println;
-use esp_radio::wifi::{WifiController, WifiDevice, WifiEvent};
+use esp_radio::wifi::{Interface, WifiController};
 use led_effects::{PulseEffect, StatusLed};
 use rgb::RGB8;
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
@@ -55,7 +55,10 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
 const NUM_LEDS: usize = 1;
 const N: usize = buffer_size(NUM_LEDS);
 
-/// Shared flag: `false` = connecting (pulse), `true` = connected (steady green).
+/// Shared flag: `false` = no IPv4 config (LED pulses blue), `true` = config up (LED steady green).
+/// Owned by `link_status_task`, which watches `embassy_net::Stack::wait_config_up`
+/// and `wait_config_down` so the LED tracks the current DHCP state — including
+/// after the first disconnect/reconnect cycle.
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[esp_rtos::main]
@@ -77,10 +80,13 @@ async fn main(spawner: Spawner) {
         .with_idle_output_level(Level::Low)
         .with_idle_output(true)
         .with_carrier_modulation(false);
+    // esp-hal 1.1.0 split RMT TX setup: `configure_tx(pin, config)` is gone —
+    // the new pattern is `configure_tx(&config).unwrap().with_pin(pin)`.
     let channel = rmt
         .channel0
-        .configure_tx(peripherals.GPIO8, rmt_config)
-        .unwrap();
+        .configure_tx(&rmt_config)
+        .unwrap()
+        .with_pin(peripherals.GPIO8);
     let led = Ws2812Rmt::<Blocking, N>::new(channel);
     println!("LED ready");
 
@@ -111,9 +117,10 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.must_spawn(wifi_task(controller));
-    spawner.must_spawn(net_task(runner));
-    spawner.must_spawn(led_task(led));
+    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(led_task(led).unwrap());
+    spawner.spawn(link_status_task(stack).unwrap());
 
     println!("Waiting for DHCPv4 lease (LED pulsing blue)...");
     stack.wait_config_up().await;
@@ -125,10 +132,24 @@ async fn main(spawner: Spawner) {
         v4.address, v4.gateway
     );
 
-    CONNECTED.store(true, Ordering::Relaxed);
-
     loop {
         Timer::after(Duration::from_secs(10)).await;
+    }
+}
+
+/// Owns the `CONNECTED` flag.  Toggling it on association events alone is not
+/// enough — a brief disconnect/reconnect race can leave the controller saying
+/// "connected" while the embassy-net stack is still waiting for a new DHCP
+/// lease, so the user-visible signal is whether the IP-layer config is up.
+/// Watches both edges (`wait_config_up` and `wait_config_down`) and updates
+/// the flag every time DHCP comes back up after a drop, not just on first boot.
+#[embassy_executor::task]
+async fn link_status_task(stack: embassy_net::Stack<'static>) {
+    loop {
+        stack.wait_config_up().await;
+        CONNECTED.store(true, Ordering::Relaxed);
+        stack.wait_config_down().await;
+        CONNECTED.store(false, Ordering::Relaxed);
     }
 }
 
@@ -156,18 +177,22 @@ async fn led_task(mut led: Ws2812Rmt<'static, Blocking, N>) {
 // only handles reconnection after a disconnect event.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
+    // `wait_for_disconnect_async` and `connect_async` replace the
+    // sync `wait_for_event` + `connect` pair removed in esp-radio 0.18.
+    // The LED `CONNECTED` flag is owned by `link_status_task` watching
+    // `embassy_net::Stack` config-up/config-down edges — not toggled here,
+    // because a successful L2 reconnect does not yet imply a new DHCP lease.
     loop {
-        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+        let _ = controller.wait_for_disconnect_async().await;
         println!("Wi-Fi disconnected — attempting to reconnect");
-        CONNECTED.store(false, Ordering::Relaxed);
         Timer::after(Duration::from_millis(500)).await;
-        if let Err(e) = controller.connect() {
+        if let Err(e) = controller.connect_async().await {
             println!("reconnect failed: {:?}", e);
         }
     }
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, Interface<'static>>) -> ! {
     runner.run().await
 }

@@ -453,8 +453,9 @@ impl WiFiManager {
     /// assigned via DHCP.
     ///
     /// Returns the assigned IPv4 address, or `Err` if the timeout elapses.
-    /// Mirrors [`rustyfarian_esp_hal_wifi::WiFiManager::wait_connected`] so
-    /// both ESP-IDF and esp-hal projects use the same call.
+    /// The bare-metal counterpart in `rustyfarian-esp-hal-wifi` is
+    /// `AsyncWifiHandle::wait_for_ip().await` (`esp-radio 0.18` made the
+    /// HAL Wi-Fi surface async-only).
     pub fn wait_connected(&self, timeout_ms: u64) -> anyhow::Result<Ipv4Addr> {
         self.get_ip(timeout_ms)?
             .ok_or_else(|| anyhow::anyhow!("Wi-Fi connection timeout after {} ms", timeout_ms))

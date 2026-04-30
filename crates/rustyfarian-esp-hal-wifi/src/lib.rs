@@ -1,43 +1,38 @@
-//! Wi-Fi driver for ESP-HAL projects (bare-metal, no_std).
+//! Wi-Fi driver for ESP-HAL projects (bare-metal, `no_std`).
 //!
-//! Provides [`WiFiManager`], a [`WifiDriver`] implementation that
-//! connects to a WPA2 access point using `esp-radio` on bare-metal targets.
+//! Provides a thin async wrapper around `esp-radio 0.18`'s Wi-Fi controller.
+//! In `esp-radio 0.18` the bare-metal Wi-Fi controller is async-only — the
+//! synchronous `connect`/`disconnect`/`start` methods that existed in 0.17
+//! were removed, and direct `smoltcp` integration was deleted in favour of
+//! `embassy-net`.  As a result this crate now exposes a single async entry
+//! point: [`WiFiManager::init_async`], which returns an [`AsyncWifiHandle`]
+//! wired into an `embassy-net` stack with automatic DHCPv4.
+//!
+//! The `embassy` Cargo feature is therefore effectively required for any
+//! Wi-Fi use on bare-metal targets.
 //!
 //! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_hal_wifi::{WiFiManager, WiFiConfig, WiFiConfigExt};
+//! use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiManager, WiFiConfig, WiFiConfigExt};
 //!
 //! let peripherals = esp_hal::init(esp_hal::Config::default());
+//! esp_alloc::heap_allocator!(size: 72 * 1024);
 //!
 //! let config = WiFiConfig::new("MyNetwork", "password123")
 //!     .with_peripherals(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
-//! let mut wifi = WiFiManager::init(config)?;
-//! let ip = wifi.wait_connected(30_000)?;
+//! let AsyncWifiHandle { controller, stack, runner } = WiFiManager::init_async(config)?;
+//! // spawn `runner.run().await` and a task that owns `controller`
 //! ```
-//!
-//! After association, call [`WiFiManager::take_sta_device`] to obtain the
-//! `WifiDevice` for use with `smoltcp` or `embassy-net`.
-//!
-//! # Async (embassy) support
-//!
-//! When the `embassy` Cargo feature is enabled, [`WiFiManager::init_async`]
-//! returns an [`AsyncWifiHandle`] carrying the `WifiController`, an
-//! `embassy_net::Stack`, and a `Runner` ready to be spawned in an
-//! `#[embassy_executor::task]`. DHCPv4 is handled by `embassy-net`
-//! automatically — call [`AsyncWifiHandle::wait_for_ip`] to await the first
-//! lease.
 
 #![no_std]
 
-// Re-export all pure types from wifi-pure (matching rustyfarian-esp-idf-wifi parity)
 pub use wifi_pure::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, TxPowerLevel,
     WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
     POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
-// Re-export StatusLed, SimpleLed, and NoLed from led_effects for convenience
 pub use led_effects::{NoLed, SimpleLed, StatusLed};
 
 // ─── ActiveLowLed ──────────────────────────────────────────────────────────
@@ -50,9 +45,6 @@ pub use led_effects::{NoLed, SimpleLed, StatusLed};
 /// Many dev boards (e.g. ESP32-C3 Super Mini) wire their onboard LED
 /// between VCC and a GPIO pin, so pulling the pin low completes the
 /// circuit and lights the LED.
-///
-/// Use with [`WiFiManager::init_with_led`] for connection status feedback
-/// on boards with an active-low LED.
 pub struct ActiveLowLed<P: embedded_hal::digital::OutputPin> {
     pin: P,
     threshold: u8,
@@ -78,47 +70,44 @@ impl<P: embedded_hal::digital::OutputPin> StatusLed for ActiveLowLed<P> {
 
     fn set_color(&mut self, color: rgb::RGB8) -> Result<(), Self::Error> {
         if led_effects::exceeds_threshold(color, self.threshold) {
-            self.pin.set_low() // Active-low: low = LED on
+            self.pin.set_low()
         } else {
-            self.pin.set_high() // Active-low: high = LED off
+            self.pin.set_high()
         }
     }
 }
 
-// ─── Real implementation (behind chip feature gates) ────────────────────────
+// ─── Feature-gate guard ─────────────────────────────────────────────────────
+//
+// `esp-radio 0.18` made the bare-metal Wi-Fi controller async-only, so the
+// chip features only produce a working driver in combination with `embassy`.
+// Surface that as a compile-time error rather than silently falling through to
+// the host stub when a user enables a chip feature without `embassy`.
+#[cfg(all(
+    any(feature = "esp32c6", feature = "esp32c3"),
+    not(feature = "embassy")
+))]
+compile_error!(
+    "rustyfarian-esp-hal-wifi on bare-metal requires the `embassy` feature \
+     (esp-radio 0.18 is async-only). Enable both: --features <chip>,embassy"
+);
 
-#[cfg(any(feature = "esp32c6", feature = "esp32c3"))]
+// ─── Real implementation (behind chip + embassy feature gates) ──────────────
+
+#[cfg(all(feature = "embassy", any(feature = "esp32c6", feature = "esp32c3")))]
 mod driver {
-    extern crate alloc;
-
+    use embassy_net::{Config as NetConfig, DhcpConfig, Runner, Stack, StackResources};
     use esp_hal::interrupt::software::SoftwareInterruptControl;
     use esp_hal::timer::timg::TimerGroup;
-    use esp_radio::wifi::{
-        ClientConfig, Interfaces, ModeConfig, PowerSaveMode, WifiController, WifiDevice,
-    };
-    use led_effects::{NoLed, PulseEffect, StatusLed};
-    use rgb::RGB8;
-    use wifi_pure::{
-        validate_password, validate_ssid, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
-    };
-
-    // Mirrored from rustyfarian_network_pure::status_colors (which is not no_std).
-    const WIFI_CONNECTING: (u8, u8, u8) = (0, 0, 255);
-    const CONNECTED: (u8, u8, u8) = (0, 20, 0);
-    const ERROR: (u8, u8, u8) = (255, 0, 0);
-
-    fn smoltcp_now() -> smoltcp::time::Instant {
-        smoltcp::time::Instant::from_millis(
-            esp_hal::time::Instant::now()
-                .duration_since_epoch()
-                .as_millis() as i64,
-        )
-    }
+    use esp_radio::wifi::sta::StationConfig;
+    use esp_radio::wifi::{Config, ControllerConfig, Interface, PowerSaveMode, WifiController};
+    use static_cell::StaticCell;
+    use wifi_pure::{validate_password, validate_ssid, TxPowerLevel, WiFiConfig, WifiPowerSave};
 
     /// Wi-Fi configuration bundled with the hardware peripherals needed for init.
     ///
     /// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfigExt::with_peripherals],
-    /// then passed to [`WiFiManager::init`].
+    /// then passed to [`WiFiManager::init_async`].
     pub struct HalWifiConfig<'a> {
         ssid: &'a str,
         password: &'a str,
@@ -131,13 +120,7 @@ mod driver {
 
     /// Extension trait that adds [`with_peripherals`][WiFiConfigExt::with_peripherals]
     /// to [`WiFiConfig`], producing a [`HalWifiConfig`] ready for
-    /// [`WiFiManager::init`].
-    ///
-    /// **Note on `connect_mode`:** This bare-metal path currently uses a blocking
-    /// poll loop (`smoltcp` + DHCP).
-    /// `ConnectMode::NonBlocking` is not implemented on this path yet.
-    /// `with_peripherals` ignores `connect_mode`, so calling
-    /// `.connect_nonblocking()` before `with_peripherals` has no effect.
+    /// [`WiFiManager::init_async`].
     pub trait WiFiConfigExt<'a> {
         /// Bundles this configuration with the ESP32 peripherals required for
         /// bare-metal Wi-Fi.
@@ -171,16 +154,8 @@ mod driver {
     /// Error type for [`WiFiManager`] operations.
     #[derive(Debug)]
     pub enum WifiError {
-        /// Validation or configuration of the Wi-Fi driver failed.
+        /// SSID or password validation failed before reaching the radio.
         ConfigureFailed,
-        /// Wi-Fi hardware failed to start.
-        StartFailed,
-        /// Association with the AP failed or was refused.
-        ConnectFailed,
-        /// Disconnect request failed.
-        DisconnectFailed,
-        /// Radio initialization failed.
-        RadioInitFailed,
         /// An underlying `esp-radio` driver error.
         Driver(esp_radio::wifi::WifiError),
     }
@@ -189,332 +164,174 @@ mod driver {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 Self::ConfigureFailed => write!(f, "Wi-Fi configuration failed"),
-                Self::StartFailed => write!(f, "Wi-Fi start failed"),
-                Self::ConnectFailed => write!(f, "Wi-Fi connect failed"),
-                Self::DisconnectFailed => write!(f, "Wi-Fi disconnect failed"),
-                Self::RadioInitFailed => write!(f, "radio initialization failed"),
                 Self::Driver(inner) => write!(f, "Wi-Fi driver error: {:?}", inner),
             }
         }
     }
 
-    /// Bare-metal Wi-Fi manager for ESP-HAL targets.
-    ///
-    /// Wraps an `esp-radio` [`WifiController`] and implements the [`WifiDriver`] trait.
-    /// The `S` parameter controls LED status feedback during connection:
-    /// use [`NoLed`] (the default) for headless operation, or pass any
-    /// [`StatusLed`] implementation to [`init_with_led`][Self::init_with_led].
-    pub struct WiFiManager<'d, S: StatusLed = NoLed> {
-        controller: WifiController<'d>,
-        sta_device: Option<WifiDevice<'d>>,
-        power_save: WifiPowerSave,
-        tx_power: TxPowerLevel,
-        led: S,
-    }
-
-    impl WiFiManager<'_, NoLed> {
-        /// Initializes the scheduler, radio, and Wi-Fi — then configures,
-        /// starts, and begins association in a single call.
-        ///
-        /// # Heap requirement
-        ///
-        /// The caller must set up the heap via `esp_alloc::heap_allocator!`
-        /// **before** calling this method. On ESP32-C3 a single 72 KiB region
-        /// suffices; on ESP32-C6 two regions are needed (64 KiB reclaimed IRAM
-        /// for Wi-Fi DMA + 36 KiB DRAM). See the chip-specific examples.
-        ///
-        /// Uses [`NoLed`] for status feedback (no visual output).
-        /// For LED feedback during connection, use [`init_with_led`][WiFiManager::init_with_led].
-        pub fn init(config: HalWifiConfig<'_>) -> Result<WiFiManager<'static, NoLed>, WifiError> {
-            Self::init_inner(config, NoLed)
+    fn map_power_save(ps: WifiPowerSave) -> PowerSaveMode {
+        match ps {
+            WifiPowerSave::None => PowerSaveMode::None,
+            WifiPowerSave::MinModem => PowerSaveMode::Minimum,
+            WifiPowerSave::MaxModem => PowerSaveMode::Maximum,
         }
     }
-
-    impl<'d, S: StatusLed> WiFiManager<'d, S>
-    where
-        S::Error: core::fmt::Debug,
-    {
-        /// Initializes Wi-Fi with LED status feedback during connection.
-        ///
-        /// Identical to [`init`][WiFiManager::init] but stores an LED driver that
-        /// [`wait_connected`][Self::wait_connected] uses for visual feedback:
-        /// blue pulse while associating, red pulse on timeout, dim green on success.
-        pub fn init_with_led(
-            config: HalWifiConfig<'_>,
-            led: S,
-        ) -> Result<WiFiManager<'static, S>, WifiError> {
-            Self::init_inner(config, led)
-        }
-
-        fn init_inner(
-            config: HalWifiConfig<'_>,
-            led: S,
-        ) -> Result<WiFiManager<'static, S>, WifiError> {
-            let timg = TimerGroup::new(config.timg0);
-            let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
-            esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
-
-            let radio_init = esp_radio::init().map_err(|e| {
-                log::error!("Radio init failed: {:?}", e);
-                WifiError::RadioInitFailed
-            })?;
-
-            // Leak the radio controller — it's a one-time init that must outlive
-            // the WifiController, and bare-metal firmware never deallocates it.
-            let radio_ref: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(radio_init));
-
-            let (controller, interfaces) =
-                esp_radio::wifi::new(radio_ref, config.wifi, Default::default())
-                    .map_err(WifiError::Driver)?;
-
-            let mut manager = WiFiManager {
-                controller,
-                sta_device: Some(interfaces.sta),
-                power_save: config.power_save,
-                tx_power: config.tx_power,
-                led,
-            };
-
-            manager.configure(config.ssid, config.password)?;
-            manager.start()?;
-            manager.connect()?;
-
-            Ok(manager)
-        }
-
-        /// Creates a Wi-Fi manager from pre-initialized `esp-radio` objects.
-        pub fn new(
-            controller: WifiController<'d>,
-            interfaces: Interfaces<'d>,
-            power_save: WifiPowerSave,
-            led: S,
-        ) -> Self {
-            Self {
-                controller,
-                sta_device: Some(interfaces.sta),
-                power_save,
-                tx_power: TxPowerLevel::default(),
-                led,
-            }
-        }
-
-        /// Blocks until the Wi-Fi station is associated and an IP address is
-        /// assigned via DHCP.
-        ///
-        /// If an LED was provided via [`init_with_led`][Self::init_with_led],
-        /// this method pulses blue during association, briefly pulses red on
-        /// timeout, and sets dim green on success.
-        pub fn wait_connected(
-            &mut self,
-            timeout_ms: u64,
-        ) -> Result<smoltcp::wire::Ipv4Address, WifiError> {
-            use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
-            use smoltcp::socket::dhcpv4;
-            use smoltcp::wire::{EthernetAddress, HardwareAddress};
-
-            let delay = esp_hal::delay::Delay::new();
-            let mut pulse = PulseEffect::new();
-
-            // Wait for L2 association first.
-            let start = esp_hal::time::Instant::now();
-            loop {
-                if self.controller.is_connected().unwrap_or(false) {
-                    log::info!("Wi-Fi associated");
-                    break;
-                }
-                if start.elapsed().as_millis() >= timeout_ms {
-                    log::error!("Wi-Fi association timeout after {} ms", timeout_ms);
-
-                    for _ in 0..20 {
-                        if let Err(e) = self.led.set_color(pulse.update(ERROR)) {
-                            log::warn!("LED error: {:?}", e);
-                        }
-                        delay.delay_millis(50);
-                    }
-
-                    return Err(WifiError::ConnectFailed);
-                }
-
-                if let Err(e) = self.led.set_color(pulse.update(WIFI_CONNECTING)) {
-                    log::warn!("LED error: {:?}", e);
-                }
-                delay.delay_millis(wifi_pure::POLL_INTERVAL_MS as u32);
-            }
-
-            // Run DHCP to obtain an IP address.
-            let device = self.sta_device.as_mut().ok_or_else(|| {
-                log::error!("STA device already taken");
-                WifiError::ConfigureFailed
-            })?;
-
-            let mac = esp_radio::wifi::sta_mac();
-            let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
-            let mut iface = Interface::new(IfaceConfig::new(hw_addr), device, smoltcp_now());
-
-            let mut socket_storage = [smoltcp::iface::SocketStorage::EMPTY; 1];
-            let mut sockets = SocketSet::new(&mut socket_storage[..]);
-            let dhcp_handle = sockets.add(dhcpv4::Socket::new());
-
-            loop {
-                if start.elapsed().as_millis() >= timeout_ms {
-                    log::error!("DHCP timeout after {} ms", timeout_ms);
-
-                    for _ in 0..20 {
-                        if let Err(e) = self.led.set_color(pulse.update(ERROR)) {
-                            log::warn!("LED error: {:?}", e);
-                        }
-                        delay.delay_millis(50);
-                    }
-
-                    return Err(WifiError::ConnectFailed);
-                }
-
-                iface.poll(smoltcp_now(), device, &mut sockets);
-
-                let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
-                if let Some(dhcpv4::Event::Configured(config)) = socket.poll() {
-                    let ip = config.address.address();
-                    log::info!("DHCP assigned IP: {}", ip);
-
-                    if let Err(e) = self.led.set_color(RGB8::from(CONNECTED)) {
-                        log::warn!("LED error: {:?}", e);
-                    }
-
-                    return Ok(ip);
-                }
-
-                if let Err(e) = self.led.set_color(pulse.update(WIFI_CONNECTING)) {
-                    log::warn!("LED error: {:?}", e);
-                }
-                delay.delay_millis(50);
-            }
-        }
-
-        /// Convenience alias for [`wait_connected`][Self::wait_connected].
-        pub fn get_ip(&mut self, timeout_ms: u64) -> Result<smoltcp::wire::Ipv4Address, WifiError> {
-            self.wait_connected(timeout_ms)
-        }
-
-        /// Takes ownership of the STA `WifiDevice` for use with a custom
-        /// `smoltcp` or `embassy-net` stack.
-        ///
-        /// This is a **single-use** method — returns `None` on subsequent calls.
-        pub fn take_sta_device(&mut self) -> Option<WifiDevice<'d>> {
-            self.sta_device.take()
-        }
-
-        fn map_power_save(ps: WifiPowerSave) -> PowerSaveMode {
-            match ps {
-                WifiPowerSave::None => PowerSaveMode::None,
-                WifiPowerSave::MinModem => PowerSaveMode::Minimum,
-                WifiPowerSave::MaxModem => PowerSaveMode::Maximum,
-            }
-        }
-    }
-
-    // ─── Async (embassy) companion ──────────────────────────────────────────
 
     /// Handle returned by [`WiFiManager::init_async`] carrying the components
     /// needed to drive Wi-Fi from async tasks.
     ///
-    /// Users are expected to spawn two tasks: one that owns the
-    /// [`WifiController`] and runs its reconnection logic, and one that owns
-    /// the [`embassy_net::Runner`] and calls `runner.run().await`.
-    /// The [`embassy_net::Stack`] is `Copy` and can be shared with any number
-    /// of socket tasks.
-    #[cfg(feature = "embassy")]
+    /// The caller spawns two tasks: one that owns the [`WifiController`] and
+    /// runs reconnection logic, and one that owns the [`embassy_net::Runner`]
+    /// and calls `runner.run().await`.  The [`embassy_net::Stack`] is `Copy`
+    /// and can be shared with any number of socket tasks.
     pub struct AsyncWifiHandle {
-        /// Wi-Fi controller for `wifi_task` — owns association state.
+        /// Wi-Fi controller for the reconnection task — owns association state.
         pub controller: WifiController<'static>,
         /// Network stack handle for opening sockets; `Copy`able.
-        pub stack: embassy_net::Stack<'static>,
-        /// Runner for `net_task` — `runner.run().await` must be polled
+        pub stack: Stack<'static>,
+        /// Runner for the network task — `runner.run().await` must be polled
         /// continuously in a dedicated task.
-        pub runner: embassy_net::Runner<'static, WifiDevice<'static>>,
+        pub runner: Runner<'static, Interface<'static>>,
     }
 
-    #[cfg(feature = "embassy")]
-    impl WiFiManager<'static, NoLed> {
-        /// Initializes the scheduler, radio, and Wi-Fi, starts association,
-        /// and hands off control to `embassy-net`.
+    /// Bare-metal Wi-Fi manager namespace.
+    ///
+    /// In `esp-radio 0.18` the controller is async-only, so this type is a
+    /// unit struct that exposes the [`init_async`][WiFiManager::init_async]
+    /// constructor.  All useful work happens on the returned
+    /// [`AsyncWifiHandle`] and the spawned tasks driving it.
+    pub struct WiFiManager;
+
+    impl WiFiManager {
+        /// Initialises the scheduler and the Wi-Fi radio, applies the station
+        /// configuration (which implicitly starts the controller and begins
+        /// association in `esp-radio 0.18`), and hands off control to
+        /// `embassy-net`.
         ///
-        /// Returns an [`AsyncWifiHandle`] with the components required to
-        /// drive Wi-Fi from async tasks. The caller is responsible for
-        /// spawning a task that owns `handle.controller` (association loop)
-        /// and a task that calls `handle.runner.run().await` (network stack).
+        /// # Readiness
         ///
-        /// The initial association is started before this function returns;
-        /// the `wifi_task` only needs to handle subsequent disconnects.
-        ///
-        /// DHCPv4 is configured automatically — await
-        /// [`AsyncWifiHandle::wait_for_ip`] to block until the first lease.
+        /// Association is **initiated** before this function returns — but it
+        /// is **not awaited**.  The function returns as soon as the controller
+        /// has been configured and the embassy-net stack has been built; the
+        /// radio is still negotiating with the AP at that moment, and DHCPv4
+        /// has not yet completed.  Callers that need to know when the link
+        /// is usable must `await` [`AsyncWifiHandle::wait_for_ip`] (or watch
+        /// `Stack::wait_config_up` themselves).  The spawned `wifi_task` only
+        /// needs to handle subsequent disconnects.
         ///
         /// # Heap requirement
         ///
         /// The caller must set up the heap via `esp_alloc::heap_allocator!`
-        /// **before** calling this method. On ESP32-C3 a single 72 KiB region
+        /// **before** calling this method.  On ESP32-C3 a single 72 KiB region
         /// suffices; on ESP32-C6 two regions are needed (64 KiB reclaimed IRAM
-        /// for Wi-Fi DMA + 36 KiB DRAM). See the chip-specific async examples.
+        /// for Wi-Fi DMA + 36 KiB DRAM).  See the chip-specific async examples.
         ///
         /// # Socket budget
         ///
         /// The `embassy-net` stack is sized with `StackResources<3>`, which
         /// covers DHCP plus one TCP and one UDP socket — the baseline used by
-        /// `embassy-net`'s own examples. Applications that need more
-        /// concurrent sockets must build their own stack from
-        /// [`take_sta_device`][WiFiManager::take_sta_device].
+        /// `embassy-net`'s own examples.  Applications that need more
+        /// concurrent sockets must build their own stack on top of the
+        /// `Interface` returned by `esp_radio::wifi::new(..)`:
+        ///
+        /// ```ignore
+        /// let (controller, interfaces) =
+        ///     esp_radio::wifi::new(peripherals.WIFI, ControllerConfig::default())?;
+        /// // configure `controller` as in `init_async` above ...
+        /// static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+        /// let resources = RESOURCES.init(StackResources::<8>::new());
+        /// let (stack, runner) = embassy_net::new(
+        ///     interfaces.station,
+        ///     NetConfig::dhcpv4(DhcpConfig::default()),
+        ///     resources,
+        ///     seed,
+        /// );
+        /// ```
         ///
         /// # One-shot
         ///
-        /// This function must be called at most once per boot — it
-        /// initializes a `static` `StackResources` via [`StaticCell`] and
-        /// will panic on the second call.
+        /// Call at most once per boot — a `static` `StackResources` is
+        /// initialised via [`StaticCell`] and a second call will panic.
         pub fn init_async(config: HalWifiConfig<'_>) -> Result<AsyncWifiHandle, WifiError> {
-            Self::init_inner(config, NoLed)?.into_async_handle()
-        }
+            validate_ssid(config.ssid).map_err(|_| WifiError::ConfigureFailed)?;
+            validate_password(config.password).map_err(|_| WifiError::ConfigureFailed)?;
 
-        fn into_async_handle(mut self) -> Result<AsyncWifiHandle, WifiError> {
-            use embassy_net::{Config, DhcpConfig, StackResources};
-            use static_cell::StaticCell;
+            // 1. Start the scheduler (esp-radio requires a running scheduler).
+            let timg = TimerGroup::new(config.timg0);
+            let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
+            esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
 
-            let sta_device = self.sta_device.take().ok_or_else(|| {
-                log::error!("STA device already taken — cannot build embassy-net stack");
-                WifiError::ConfigureFailed
-            })?;
+            // 2. Construct the Wi-Fi controller.  In esp-radio 0.18 the radio
+            //    init that used to be a separate `esp_radio::init()` call is
+            //    folded into `wifi::new`; the function takes only the WIFI
+            //    peripheral and a `ControllerConfig`.
+            let (mut controller, interfaces) =
+                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
+                    .map_err(WifiError::Driver)?;
 
+            // 3. Apply station mode + credentials.  `set_config` is idempotent
+            //    in 0.18 and implicitly starts the controller and initiates
+            //    association — the explicit `start()`/`connect()` calls that
+            //    existed in 0.17 are gone.
+            let station = StationConfig::default()
+                .with_ssid(config.ssid)
+                .with_password(config.password.into());
+            controller
+                .set_config(&Config::Station(station))
+                .map_err(WifiError::Driver)?;
+
+            // 4. Power save (non-fatal if it fails).
+            let ps = map_power_save(config.power_save);
+            if let Err(e) = controller.set_power_saving(ps) {
+                log::warn!("Failed to set power save mode (non-fatal): {:?}", e);
+            }
+
+            if config.tx_power != TxPowerLevel::default() {
+                log::warn!(
+                    "TX power level {:?} configured but esp-radio 0.18 does not expose tx_power API — using radio default",
+                    config.tx_power
+                );
+            }
+
+            log::info!(
+                "Wi-Fi configured (SSID len={}), power save: {:?}",
+                config.ssid.len(),
+                config.power_save,
+            );
+
+            // 5. Build the embassy-net stack on top of the STA interface.
+            //    DHCP + one TCP + one UDP baseline (matches embassy-net examples).
             static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
             let resources = RESOURCES.init(StackResources::<3>::new());
 
             // Seed the stack's local-port RNG from the monotonic clock.
             // This is not cryptographic — it is used only by `embassy-net` for
-            // ephemeral source-port randomization. Upgrade to the `esp-hal` RNG
-            // peripheral if `init_async` ever gains access to it.
+            // ephemeral source-port randomization.  Upgrade to the `esp-hal`
+            // RNG peripheral if `init_async` ever gains access to it.
             let seed = esp_hal::time::Instant::now()
                 .duration_since_epoch()
                 .as_micros();
 
             let (stack, runner) = embassy_net::new(
-                sta_device,
-                Config::dhcpv4(DhcpConfig::default()),
+                interfaces.station,
+                NetConfig::dhcpv4(DhcpConfig::default()),
                 resources,
                 seed,
             );
 
             Ok(AsyncWifiHandle {
-                controller: self.controller,
+                controller,
                 stack,
                 runner,
             })
         }
     }
 
-    #[cfg(feature = "embassy")]
     impl AsyncWifiHandle {
         /// Awaits until the `embassy-net` stack has an IPv4 configuration
         /// (either via DHCP or static) and returns the full configuration:
         /// CIDR address, default gateway, and DNS servers.
         ///
-        /// Mirrors the blocking [`WiFiManager::wait_connected`] convenience.
         /// For more control (custom timeout, concurrent LED animation),
         /// poll [`embassy_net::Stack::config_v4`] directly alongside other
         /// futures with `embassy_futures::select`.
@@ -525,96 +342,37 @@ mod driver {
                 .expect("stack reports config up but has no IPv4 config")
         }
     }
-
-    impl<'d, S: StatusLed> WifiDriver for WiFiManager<'d, S>
-    where
-        S::Error: core::fmt::Debug,
-    {
-        type Error = WifiError;
-
-        fn configure(&mut self, ssid: &str, password: &str) -> Result<(), WifiError> {
-            validate_ssid(ssid).map_err(|_| WifiError::ConfigureFailed)?;
-            validate_password(password).map_err(|_| WifiError::ConfigureFailed)?;
-
-            let client_config = ClientConfig::default()
-                .with_ssid(ssid.into())
-                .with_password(password.into());
-
-            self.controller
-                .set_config(&ModeConfig::Client(client_config))
-                .map_err(WifiError::Driver)?;
-
-            log::info!("Wi-Fi configured (SSID len={}, bare-metal)", ssid.len());
-            Ok(())
-        }
-
-        fn start(&mut self) -> Result<(), WifiError> {
-            self.controller.start().map_err(WifiError::Driver)?;
-
-            let ps = Self::map_power_save(self.power_save);
-            if let Err(e) = self.controller.set_power_saving(ps) {
-                log::warn!("Failed to set power save mode (non-fatal): {:?}", e);
-            }
-
-            if self.tx_power != TxPowerLevel::default() {
-                log::warn!(
-                    "TX power level {:?} configured but esp-radio 0.17 does not expose tx_power API — using radio default",
-                    self.tx_power
-                );
-            }
-
-            log::info!("Wi-Fi started, power save: {:?}", self.power_save);
-            Ok(())
-        }
-
-        fn connect(&mut self) -> Result<(), WifiError> {
-            self.controller.connect().map_err(WifiError::Driver)?;
-            log::info!("Wi-Fi connect initiated");
-            Ok(())
-        }
-
-        fn disconnect(&mut self) -> Result<(), WifiError> {
-            self.controller.disconnect().map_err(WifiError::Driver)?;
-            log::info!("Wi-Fi disconnected");
-            Ok(())
-        }
-
-        fn is_connected(&self) -> Result<bool, WifiError> {
-            match self.controller.is_connected() {
-                Ok(connected) => Ok(connected),
-                Err(esp_radio::wifi::WifiError::Disconnected) => Ok(false),
-                Err(e) => Err(WifiError::Driver(e)),
-            }
-        }
-    }
 }
 
-#[cfg(any(feature = "esp32c6", feature = "esp32c3"))]
-pub use driver::{HalWifiConfig, WiFiConfigExt, WiFiManager, WifiError};
-
 #[cfg(all(feature = "embassy", any(feature = "esp32c6", feature = "esp32c3")))]
-pub use driver::AsyncWifiHandle;
+pub use driver::{AsyncWifiHandle, HalWifiConfig, WiFiConfigExt, WiFiManager, WifiError};
 
-// ─── Stub fallback (no chip feature — host compilation) ─────────────────────
+// ─── Stub fallback (no chip feature — host / doc / test builds) ─────────────
+//
+// The chip-without-embassy combination is rejected by the `compile_error!`
+// above, so this branch only fires when no chip feature is selected.
 
 #[cfg(not(any(feature = "esp32c6", feature = "esp32c3")))]
 mod stub {
-    use wifi_pure::WifiDriver;
-
+    /// Wi-Fi error placeholder for host builds.
     #[derive(Debug)]
     pub enum WifiError {
+        /// Wi-Fi requires a chip feature (`esp32c3` or `esp32c6`) on
+        /// bare-metal targets.
         NotSupported,
     }
 
     impl core::fmt::Display for WifiError {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(f, "Wi-Fi not supported on this platform")
+            write!(f, "Wi-Fi not supported on this build configuration")
         }
     }
 
+    /// Wi-Fi manager placeholder for host builds.
     pub struct WiFiManager;
 
     impl WiFiManager {
+        /// Stub constructor that mirrors the real type's surface.
         pub fn new() -> Self {
             Self
         }
@@ -623,25 +381,6 @@ mod stub {
     impl Default for WiFiManager {
         fn default() -> Self {
             Self::new()
-        }
-    }
-
-    impl WifiDriver for WiFiManager {
-        type Error = WifiError;
-        fn configure(&mut self, _ssid: &str, _password: &str) -> Result<(), Self::Error> {
-            Err(WifiError::NotSupported)
-        }
-        fn start(&mut self) -> Result<(), Self::Error> {
-            Err(WifiError::NotSupported)
-        }
-        fn connect(&mut self) -> Result<(), Self::Error> {
-            Err(WifiError::NotSupported)
-        }
-        fn disconnect(&mut self) -> Result<(), Self::Error> {
-            Err(WifiError::NotSupported)
-        }
-        fn is_connected(&self) -> Result<bool, Self::Error> {
-            Err(WifiError::NotSupported)
         }
     }
 }
