@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ $# -lt 1 ]; then
-    printf 'Usage: %s <chip>\n  chip: c3 | esp32 | esp32s3\n' "$0" >&2
+    printf 'Usage: %s <chip>\n  chip: c3 | c6 | esp32 | esp32s3\n' "$0" >&2
     exit 2
 fi
 
@@ -47,7 +47,7 @@ case "$chip" in
         exit 0
         ;;
     *)
-        printf 'Error: Unknown chip "%s". Supported: c3, esp32, esp32s3\n' "$chip" >&2
+        printf 'Error: Unknown chip "%s". Supported: c3, c6, esp32, esp32s3\n' "$chip" >&2
         exit 1
         ;;
 esac
