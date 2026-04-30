@@ -12,12 +12,16 @@ categories = ["embedded", "no-std", "network-programming"]
 [features]
 # No default features: bare-metal targets require explicit chip selection.
 # Enabling a chip feature pulls in esp-hal, esp-radio, esp-rtos, and esp-alloc.
+#
+# As of esp-radio 0.18 the bare-metal Wi-Fi controller is async-only and
+# direct `smoltcp` integration was removed in favour of `embassy-net`, so the
+# `embassy` feature is effectively required to do anything useful on top of
+# the chip feature.
 esp32c6 = [
     "dep:esp-hal", "esp-hal/esp32c6",
-    "dep:esp-radio", "esp-radio/esp32c6", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/smoltcp", "esp-radio/unstable", "esp-radio/log-04",
+    "dep:esp-radio", "esp-radio/esp32c6", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/unstable", "esp-radio/log-04",
     "dep:esp-rtos", "esp-rtos/esp32c6", "esp-rtos/esp-radio", "esp-rtos/esp-alloc",
     "dep:esp-alloc",
-    "dep:smoltcp",
     "dep:esp-backtrace", "esp-backtrace/esp32c6",
     "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6",
     "dep:esp-println", "esp-println/esp32c6", "esp-println/jtag-serial", "esp-println/log-04",
@@ -25,19 +29,17 @@ esp32c6 = [
 ]
 esp32c3 = [
     "dep:esp-hal", "esp-hal/esp32c3",
-    "dep:esp-radio", "esp-radio/esp32c3", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/smoltcp", "esp-radio/unstable", "esp-radio/log-04",
+    "dep:esp-radio", "esp-radio/esp32c3", "esp-radio/wifi", "esp-radio/esp-alloc", "esp-radio/unstable", "esp-radio/log-04",
     "dep:esp-rtos", "esp-rtos/esp32c3", "esp-rtos/esp-radio", "esp-rtos/esp-alloc",
     "dep:esp-alloc",
-    "dep:smoltcp",
     "dep:esp-backtrace", "esp-backtrace/esp32c3",
     "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c3",
     "dep:esp-println", "esp-println/esp32c3", "esp-println/uart", "esp-println/log-04",
 ]
 unstable = ["esp-hal/unstable"]
 rt = ["esp-hal/rt"]
-# Opt-in async support via the embassy ecosystem. Orthogonal to chip selection —
-# enable alongside `esp32c6` or `esp32c3`. Activates `esp-rtos/embassy` which
-# supplies the embassy-time driver and executor wiring.
+# Opt-in async support via the embassy ecosystem. As of esp-radio 0.18 this
+# feature is required alongside any chip feature for a working Wi-Fi build.
 embassy = [
     "dep:embassy-executor",
     "dep:embassy-net",
@@ -53,14 +55,13 @@ embedded-hal.workspace = true
 led-effects.workspace = true
 rgb.workspace = true
 log.workspace = true
-esp-hal = { version = "1.0", features = ["unstable"], optional = true }
+esp-hal = { workspace = true, features = ["unstable"], optional = true }
 esp-radio = { workspace = true, optional = true }
 esp-rtos = { workspace = true, optional = true }
 esp-alloc = { workspace = true, optional = true }
-smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-raw"], optional = true }
 esp-backtrace = { workspace = true, optional = true }
-esp-bootloader-esp-idf = { version = "0.4.0", default-features = false, optional = true }
-esp-println = { version = "0.16", default-features = false, optional = true }
+esp-bootloader-esp-idf = { workspace = true, optional = true }
+esp-println = { workspace = true, optional = true }
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 
 # Embassy (optional — activated by the `embassy` feature)
@@ -73,33 +74,13 @@ static_cell = { workspace = true, optional = true }
 embedded-io-async = { workspace = true, optional = true }
 
 [[example]]
-name = "hal_c6_connect"
-required-features = ["esp32c6", "rt"]
-
-[[example]]
-name = "hal_c3_connect"
-required-features = ["esp32c3", "rt"]
-
-[[example]]
 name = "hal_c3_connect_async"
 required-features = ["esp32c3", "rt", "embassy"]
-
-[[example]]
-name = "hal_c6_wifi_raw"
-required-features = ["esp32c6", "rt"]
 
 [[example]]
 name = "hal_c3_connect_async_led"
 required-features = ["esp32c3", "rt", "embassy"]
 
 [[example]]
-name = "hal_c3_wifi_raw"
-required-features = ["esp32c3", "rt"]
-
-[[example]]
 name = "hal_c6_connect_async_led"
 required-features = ["esp32c6", "rt", "embassy", "rustyfarian-esp-hal-ws2812"]
-
-[[example]]
-name = "hal_c6_connect_nonblocking_rgb"
-required-features = ["esp32c6", "rt", "rustyfarian-esp-hal-ws2812"]

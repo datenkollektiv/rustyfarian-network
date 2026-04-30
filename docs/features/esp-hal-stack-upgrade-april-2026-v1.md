@@ -107,38 +107,45 @@ Explicitly out of scope (must not be touched):
 
 ## Open Questions
 
-- [ ] Is there already a `rustyfarian-ws2812` branch/commit pinned to the April 2026 wave that this workspace can consume, or does it land on `main` first? Recheck the upstream feature doc state — if `main` is up to date, pin to a specific commit hash for determinism; if not, this upgrade waits.
-- [ ] Does `esp-hal 1.1.0` change any GPIO/SPI/RMT API used by `EspHalLoraRadio` (currently a stub) or by the SX1262 bring-up in `hal_esp32s3_join`? The ws2812 upgrade only validated RMT TX, not SPI master.
-- [ ] Does `esp-radio 0.18` change the `wifi` feature so that the `-wifi` crate's feature forwarding still produces a working `WifiController`/`WifiDevice` pair? The `esp_radio::wifi::WifiError::Disconnected` variant is matched explicitly in `EspHalWifiManager::is_connected()` and may have moved.
-- [ ] Does `esp-rtos 0.3` change `#[esp_rtos::main]` ergonomics — specifically whether the async `main` still receives `Spawner` directly, or now wraps it in a different argument struct?
-- [ ] Does `embassy-net 0.8` (assumed target; verify the actual published version on 2026-04-16 ±) change the `Stack` / `Runner` constructor or the `dhcpv4` config struct used in the async Wi-Fi examples?
-- [ ] Does `esp-alloc 0.10` rename or restructure `heap_allocator!`? The ESP32-C6 example uses both the plain form and the `#[esp_hal::ram(reclaimed)]` attribute form — both must keep working.
-- [ ] Does `esp-bootloader-esp-idf 0.5` still produce a descriptor accepted by the IDF v5.3.3 bootloader (per the espflash workaround in project-lore), or does it now require a newer IDF?
-- [ ] Should the workspace add `embassy-sync = "=0.8.0"` explicitly to force unification? Today it appears only transitively (`embassy-sync 0.6.2` + `0.7.2` co-resolve in `Cargo.lock`); after the bump, the explicit pin avoids a future split.
-- [ ] Is the `xtensa-esp32s3-none-elf` toolchain installed and ready on the development machine running this upgrade? The ws2812 feature flagged Xtensa builds as gated by local toolchain availability; the same gate applies here for `hal_esp32s3_join`.
+- [x] **Is there already a `rustyfarian-ws2812` branch/commit pinned to the April 2026 wave?** — Resolved 2026-04-29: yes, `rustyfarian-ws2812`'s `Cargo.toml` already pins `esp-hal=1.1.0`, `esp-rtos=0.3.0`, `esp-radio=0.18.0`, etc.  Decision: switch the cross-repo deps from git URLs to **local sibling paths** (`../rustyfarian-ws2812/crates/*`) for the duration of the migration, since the network workspace is co-developed with ws2812 on this machine.  This sidesteps git-rev pinning entirely and keeps the esp-hal feature graph unified.
+- [x] **Does `esp-hal 1.1.0` change any GPIO/SPI/RMT API used by `EspHalLoraRadio` or by the SX1262 bring-up in `hal_esp32s3_join`?** — Resolved 2026-04-29: SPI was unaffected; the LoRa example builds clean for `xtensa-esp32s3-none-elf` after the workspace pin update.  RMT TX was reshaped (`configure_tx(pin, config)` → `configure_tx(&config).unwrap().with_pin(pin)`) but only the deleted `hal_c6_connect_nonblocking_rgb` example used RMT in this workspace; the surviving `hal_c6_connect_async_led` was migrated to the new pattern.
+- [x] **Does `esp-radio 0.18` change the `wifi` feature so that the `-wifi` crate's feature forwarding still produces a working `WifiController`/`WifiDevice` pair?** — Resolved 2026-04-29: **yes — major breakage.**  The `smoltcp` Cargo feature was removed entirely; the `wifi` feature now pulls `embassy-net-driver` instead of providing a `smoltcp::phy::Device` impl.  `WifiDevice` was renamed to `Interface` (no MODE generic), `ModeConfig` → `Config`, `ClientConfig` → `StationConfig` (in private-but-public `sta` submodule), `WifiError::Disconnected` is now a tuple variant carrying `DisconnectedStationInfo`, sync `connect`/`disconnect`/`start`/`wait_for_event` are gone (only `connect_async`/`disconnect_async`/`wait_for_disconnect_async` remain), and `wifi::new()` lost its radio_ref parameter.  Decision: drop the entire sync surface (`WiFiManager::init`, `init_with_led`, `wait_connected`, `get_ip`, `take_sta_device`, `WifiDriver` trait impl, `S: StatusLed` generic) as a deliberate v0.2.0 breaking change; the async path is now the only public surface and the `embassy` feature is effectively required.
+- [x] **Does `esp-rtos 0.3` change `#[esp_rtos::main]` ergonomics?** — Resolved 2026-04-29: no functional change observed in the surviving examples; the macro still accepts `async fn main(spawner: Spawner)` and `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` keeps its signature.
+- [x] **Does `embassy-net 0.8` change the `Stack` / `Runner` constructor or the `dhcpv4` config struct?** — Resolved 2026-04-29: the `embassy_net::new(device, NetConfig::dhcpv4(DhcpConfig::default()), resources, seed)` call shape compiles unchanged once `WifiDevice` is renamed to `Interface` for the `Runner<'static, Interface<'static>>` generic.
+- [x] **Does `esp-alloc 0.10` rename or restructure `heap_allocator!`?** — Resolved 2026-04-29: no — both the plain `heap_allocator!(size: N)` and the `#[esp_hal::ram(reclaimed)] heap_allocator!(size: N)` forms keep working unchanged in the C3 and C6 examples.
+- [x] **Does `esp-bootloader-esp-idf 0.5` still produce a descriptor accepted by the IDF v5.3.3 bootloader?** — Deferred: build step passed, but full validation requires hardware flashing, which is not part of this migration task.  The espflash workaround in project-lore (`--bootloader <path>` + `--ignore-app-descriptor`) remains in place.
+- [x] **Should the workspace add `embassy-sync = "=0.8.0"` explicitly to force unification?** — Resolved 2026-04-29: yes — added to workspace `Cargo.toml` at `=0.8.0` (matches what `esp-rtos 0.3` pulls transitively and what `rustyfarian-ws2812` pins).
+- [ ] **Is the `xtensa-esp32s3-none-elf` toolchain installed and ready on the development machine?** — Confirmed 2026-04-29: yes; `just build-example hal_esp32s3_join` builds clean in `release` profile (final binary linked).
+- [ ] **embassy-executor 0.10 spawn shape** — surfaced 2026-04-29 (was not on the original list): `Spawner::must_spawn` was removed; `#[embassy_executor::task]` macros now return `Result<SpawnToken, SpawnError>`.  All three async examples updated from `spawner.must_spawn(task(arg))` to `spawner.spawn(task(arg).unwrap())`.
 
-## Validation Plan
+## Validation Evidence (2026-04-30)
 
-Once implementation lands, validation evidence to record under `## Validation Evidence`:
+Build:
 
-- `just verify` — must pass clean.
-- `just build-example hal_c3_connect_async` — passes for `riscv32imc-unknown-none-elf`.
-- `just build-example hal_c3_connect_async_led` — passes.
-- `just build-example hal_c6_connect_async_led` — passes for `riscv32imac-unknown-none-elf`.
-- `just build-example hal_c6_connect_nonblocking_rgb` — passes (exercises both `-wifi` and the `-ws2812` git dep at the same `esp-hal 1.1.0` resolution).
-- `just build-example hal_esp32s3_join` — passes for `xtensa-esp32s3-none-elf` (toolchain-gated).
-- `just test-mqtt` / `just test-lora` / pure-crate host tests — must remain green; this upgrade should not touch them, but a green run confirms no accidental cross-crate breakage.
-- Hardware:
-  - ESP32-C3-DevKitM-1 — `hal_c3_connect_async_led` joins Wi-Fi, gets a DHCP lease, drives LED feedback.
-  - ESP32-C6-DevKitC-1 — `hal_c6_connect_async_led` same outcome plus embassy multitask survival.
-  - Heltec WiFi LoRa 32 V3 — `hal_esp32s3_join` boots and reaches the SX1262 init log line; OTAA join itself is gated by TTN hardware (Phase 5).
+- ✅ `just verify` — clean (`fmt-check` + `cargo deny` + `cargo check` + `cargo clippy --all-targets --workspace -- -D warnings`).
+- ✅ `just build-example hal_c3_connect_async` — `riscv32imc-unknown-none-elf`, release profile.
+- ✅ `just build-example hal_c3_connect_async_led` — `riscv32imc-unknown-none-elf`, release profile.
+- ✅ `just build-example hal_c6_connect_async_led` — `riscv32imac-unknown-none-elf`, release profile (also exercises the `-ws2812` local sibling dep at unified `esp-hal 1.1.0`).
+- ✅ `just build-example hal_esp32s3_join` — `xtensa-esp32s3-none-elf`, release profile (LoRa stub + lorawan-device 0.12).
+- N/A — `hal_c6_connect_nonblocking_rgb` was deleted; the sync RGB demo depended on the removed `WiFiManager::wait_connected` smoltcp DHCP loop.
+- ✅ host pure-crate tests untouched (no source changes in `wifi-pure`, `lora-pure`, `espnow-pure`, `rustyfarian-network-pure`).
+
+Hardware:
+
+- ✅ **ESP32-C3-DevKitM-1** — `hal_c3_connect_async_led` joins Wi-Fi, gets a DHCP lease, LED feedback transitions blink → steady on association as expected (2026-04-30).
+- ✅ **ESP32-C6-DevKitC-1** — `hal_c6_connect_async_led` joins Wi-Fi, gets a DHCP lease, embassy-net `Stack` runner survives, WS2812 LED transitions blue pulse → steady dim green on association (2026-04-30).
+- ⏸ **Heltec WiFi LoRa 32 V3** — `hal_esp32s3_join` builds clean against the new pins; on-device run is gated by Phase 5 TTN v3 EU868 hardware availability and is **not** a prerequisite for this upgrade.  The Phase 5 validation checklist in `docs/ROADMAP.md` covers it.
+
+Tooling fix surfaced during validation (also delivered as part of this feature):
+
+- `scripts/detect-port.sh` — narrows espflash auto-detect to USB serial devices so paired Bluetooth ports stop hijacking flash attempts on macOS.  `flash.sh`, `just run`, `just monitor`, and `just erase-flash` all use it.
 
 ## State
 
-- [ ] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Design approved
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Session Log
 
@@ -146,3 +153,18 @@ Once implementation lands, validation evidence to record under `## Validation Ev
   Triggered by the `rustyfarian-ws2812` April 2026 stack upgrade landing on 2026-04-29 (see that repo's `docs/features/esp-hal-stack-upgrade-april-2026-v1.md`).
   Streamlines the rustyfarian family onto a single coordinated April 2026 wave.
   No code changes yet — this doc is the design proposal only; awaiting design approval before implementation begins.
+- 2026-04-29 — Implementation complete on branch `esp-hal-stack-upgrade-april-2026`.
+  - Workspace `Cargo.toml` exact-pinned to the April 2026 wave; ws2812 cross-repo deps switched from git → local sibling path (`../rustyfarian-ws2812/crates/*`).
+  - `rustyfarian-esp-hal-wifi/Cargo.toml` reworked: per-crate version literals → `workspace = true`; the `esp-radio/smoltcp` feature was removed from the chip features and the direct `smoltcp` dep was dropped.
+  - `rustyfarian-esp-hal-wifi/src/lib.rs` substantially rewritten: the synchronous `WiFiManager::init`/`init_with_led`/`wait_connected`/`get_ip`/`take_sta_device`/`WifiDriver` trait impl was removed (no backing driver in `esp-radio 0.18` since the `smoltcp::phy::Device` impl was deleted upstream).  `WiFiManager` is now a unit struct exposing only `init_async`; the `S: StatusLed` generic was dropped.  Renames applied: `WifiDevice` → `Interface`, `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`, `Interfaces.sta` → `.station`, `WifiError::Disconnected` tuple payload.  `set_config` is now idempotent and implicitly starts/connects, so the explicit `start()`/`connect()` chain is gone.
+  - Five sync-only examples deleted: `hal_c3_connect`, `hal_c6_connect`, `hal_c3_wifi_raw`, `hal_c6_wifi_raw`, `hal_c6_connect_nonblocking_rgb`.  The three remaining `hal_*_async*` examples were migrated for the renames + the embassy 0.10 spawn shape (`spawner.must_spawn(task(...))` → `spawner.spawn(task(...).unwrap())`) + the esp-hal 1.1 RMT TX builder split (`configure_tx(pin, config)` → `configure_tx(&config).unwrap().with_pin(pin)`).
+  - `rustyfarian-esp-hal-lora/Cargo.toml` migrated to `workspace = true` for `esp-hal`, `esp-bootloader-esp-idf`, `esp-println`; no source changes needed for the LoRa stub.
+  - Validation: `just fmt && just verify` clean; all four hardware example builds green — `hal_c3_connect_async`, `hal_c3_connect_async_led`, `hal_c6_connect_async_led` (riscv32imc/imac-unknown-none-elf) and `hal_esp32s3_join` (xtensa-esp32s3-none-elf).  Hardware re-test on actual boards is the remaining manual gate (not part of this code-only task).
+  - CHANGELOG `[Unreleased]` updated; new "esp-hal April 2026 Stack" section added to `docs/project-lore.md` capturing the rename map, the smoltcp removal, the RMT split, the embassy spawn shape, and the `with_ssid` `&str` inference quirk.
+- 2026-04-30 — Hardware validation complete; feature closed.
+  Added `scripts/detect-port.sh` to narrow espflash's auto-detect to USB serial devices (Bluetooth ports were hijacking the probe on macOS) and wired it into `flash.sh`, `just run`, `just monitor`, and `just erase-flash`.
+  Flashed and ran on real hardware:
+  - ESP32-C3-DevKitM-1 with `hal_c3_connect_async_led` — joined Wi-Fi, DHCP lease acquired, LED feedback transitions correctly on association/disassociation.
+  - ESP32-C6-DevKitC-1 with `hal_c6_connect_async_led` — joined Wi-Fi, DHCP lease acquired, embassy multitask survival confirmed, WS2812 LED transitions blue pulse → dim green on association.
+  ESP32-S3 LoRa hardware run remains gated by Phase 5 TTN v3 EU868 hardware availability per `docs/ROADMAP.md` — not a prerequisite for closing this feature.
+  Two project-lore entries added: the auto-detect Bluetooth-port pitfall, and the orphaned `espflash monitor` port-lock pitfall (`lsof` to diagnose).

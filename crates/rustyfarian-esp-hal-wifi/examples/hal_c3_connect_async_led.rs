@@ -34,7 +34,7 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_println::println;
-use esp_radio::wifi::{WifiController, WifiDevice, WifiEvent};
+use esp_radio::wifi::{Interface, WifiController};
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -48,7 +48,10 @@ const PASSWORD: &str = match option_env!("WIFI_PASS") {
     None => "",
 };
 
-/// Shared flag: `false` = connecting (blink), `true` = connected (steady).
+/// Shared flag: `false` = no IPv4 config (LED blinks), `true` = config up (LED steady).
+/// Owned by `link_status_task`, which watches `embassy_net::Stack::wait_config_up`
+/// and `wait_config_down` so the LED tracks the current DHCP state — including
+/// after the first disconnect/reconnect cycle.
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[esp_rtos::main]
@@ -85,9 +88,10 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.must_spawn(wifi_task(controller));
-    spawner.must_spawn(net_task(runner));
-    spawner.must_spawn(led_task(led));
+    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(led_task(led).unwrap());
+    spawner.spawn(link_status_task(stack).unwrap());
 
     println!("Waiting for DHCPv4 lease (LED blinking)...");
     stack.wait_config_up().await;
@@ -99,11 +103,24 @@ async fn main(spawner: Spawner) {
         v4.address, v4.gateway
     );
 
-    // Signal the LED task to hold steady.
-    CONNECTED.store(true, Ordering::Relaxed);
-
     loop {
         Timer::after(Duration::from_secs(10)).await;
+    }
+}
+
+/// Owns the `CONNECTED` flag.  Toggling it on association events alone is not
+/// enough — a brief disconnect/reconnect race can leave the controller saying
+/// "connected" while the embassy-net stack is still waiting for a new DHCP
+/// lease, so the user-visible signal is whether the IP-layer config is up.
+/// Watches both edges (`wait_config_up` and `wait_config_down`) and updates
+/// the flag every time DHCP comes back up after a drop, not just on first boot.
+#[embassy_executor::task]
+async fn link_status_task(stack: embassy_net::Stack<'static>) {
+    loop {
+        stack.wait_config_up().await;
+        CONNECTED.store(true, Ordering::Relaxed);
+        stack.wait_config_down().await;
+        CONNECTED.store(false, Ordering::Relaxed);
     }
 }
 
@@ -135,18 +152,22 @@ async fn led_task(mut led: Output<'static>) {
 // only handles reconnection after a disconnect event.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
+    // `wait_for_disconnect_async` and `connect_async` replace the
+    // sync `wait_for_event` + `connect` pair removed in esp-radio 0.18.
+    // The LED `CONNECTED` flag is owned by `link_status_task` watching
+    // `embassy_net::Stack` config-up/config-down edges — not toggled here,
+    // because a successful L2 reconnect does not yet imply a new DHCP lease.
     loop {
-        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+        let _ = controller.wait_for_disconnect_async().await;
         println!("Wi-Fi disconnected — attempting to reconnect");
-        CONNECTED.store(false, Ordering::Relaxed);
         Timer::after(Duration::from_millis(500)).await;
-        if let Err(e) = controller.connect() {
+        if let Err(e) = controller.connect_async().await {
             println!("reconnect failed: {:?}", e);
         }
     }
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, Interface<'static>>) -> ! {
     runner.run().await
 }

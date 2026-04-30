@@ -13,10 +13,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Optional: set ESPFLASH_PORT to target a specific serial port
+# Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
+# usbmodem/usbserial (macOS) or ttyUSB/ttyACM (Linux) device — espflash's own
+# auto-detect picks Bluetooth devices on Macs with headphones paired and fails
+# with the generic "Error while connecting to device".  See scripts/detect-port.sh.
 port_args=()
-if [ -n "${ESPFLASH_PORT:-}" ]; then
-    port_args=(--port "$ESPFLASH_PORT")
+detected_port="$("$SCRIPT_DIR/detect-port.sh")"
+if [ -n "$detected_port" ]; then
+    port_args=(--port "$detected_port")
 fi
 
 if [ $# -lt 1 ]; then
@@ -150,7 +154,7 @@ case "$prefix" in
             espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
         else
             printf 'Warning: no IDF-built bootloader cached for %s; using espflash default (may fail on boot for some chips).\n' "$chip" >&2
-            espflash flash --ignore-app-descriptor "target/$hal_target/release/examples/$example"
+            espflash flash "${port_args[@]}" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
         fi
         ;;
 

@@ -30,7 +30,7 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_radio::wifi::{WifiController, WifiDevice, WifiEvent};
+use esp_radio::wifi::{Interface, WifiController};
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -78,8 +78,8 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.must_spawn(wifi_task(controller));
-    spawner.must_spawn(net_task(runner));
+    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
 
     println!("Waiting for DHCPv4 lease...");
     stack.wait_config_up().await;
@@ -101,17 +101,20 @@ async fn main(spawner: Spawner) {
 // only handles reconnection after a disconnect event.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
+    // `wait_for_disconnect_async` + `connect_async` replace the sync
+    // `wait_for_event(StaDisconnected)` + `connect` pair removed in
+    // esp-radio 0.18.
     loop {
-        controller.wait_for_event(WifiEvent::StaDisconnected).await;
+        let _ = controller.wait_for_disconnect_async().await;
         println!("Wi-Fi disconnected — attempting to reconnect");
         Timer::after(Duration::from_millis(500)).await;
-        if let Err(e) = controller.connect() {
+        if let Err(e) = controller.connect_async().await {
             println!("reconnect failed: {:?}", e);
         }
     }
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, Interface<'static>>) -> ! {
     runner.run().await
 }
