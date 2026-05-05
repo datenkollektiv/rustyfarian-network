@@ -1,10 +1,10 @@
-# Key Insights
+# Project Lore
 
 This file records non-obvious technical discoveries: facts that caused surprising
 failures, took significant time to debug, or would save a future developer 30+
 minutes if known upfront.
 
-Refer to `CLAUDE.md` and the `/key-insights` skill for recording guidelines.
+Refer to `CLAUDE.md` and the `/project-lore` skill for recording guidelines.
 
 ---
 
@@ -34,26 +34,16 @@ with no compiler error to aid diagnosis.
 Fix: always run `just fmt` then `just verify` in that order; see the `## Completion Gate` section
 in `CLAUDE.md`.
 
-**Every crate that builds examples against ESP-IDF must have a `build.rs` that calls `embuild::espidf::sysenv::output()`.**
-`cargo:rustc-link-arg` emitted by `esp-idf-sys`'s build script does **not** automatically propagate
-through transitive dependencies to the final binary linker.
-Without this, `ldproxy` panics with `Cannot locate argument '--ldproxy-linker <linker>'`
-even when the PATH and `RUSTC_LINKER` env var are correctly set.
-`sysenv::output()` reads `DEP_ESP_IDF_SVC_EMBUILD_LINK_ARGS` (set by `esp-idf-svc` via the
-`links = "esp_idf"` propagation chain) and re-emits each entry as `cargo:rustc-link-arg`,
-which reaches the example binary's linker invocation.
-Also required: set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so `embuild` detects
-ldproxy and emits `--ldproxy-linker` as part of those args (not only as metadata).
+**Every crate that builds examples against ESP-IDF needs a `build.rs` calling `embuild::espidf::sysenv::output()`.**
+`cargo:rustc-link-arg` emitted by `esp-idf-sys` does not propagate through transitive deps to the example binary's linker.
+`sysenv::output()` re-reads those args from `DEP_ESP_IDF_SVC_EMBUILD_LINK_ARGS` and re-emits them locally; without it, `ldproxy` panics with `Cannot locate argument '--ldproxy-linker <linker>'` despite a correct PATH.
+Fix: add the `build.rs`, and set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so embuild emits `--ldproxy-linker` as a real link arg, not just metadata.
 
 **`LIBCLANG_PATH` is the only env var from `~/export-esp.sh` needed for riscv32 (ESP32-C3/C6) projects.**
-The riscv32 cross-compiler (`riscv32-esp-elf-gcc`) is managed entirely by `esp-idf-sys`'s CMake build
-and does not need to be on PATH.
-The Xtensa PATH entry in `export-esp.sh` is only relevant for Xtensa targets (ESP32-S2/S3/classic).
-The only missing piece in a fresh shell is `LIBCLANG_PATH`, which `bindgen`/`esp-idf-sys` need to find
-the Clang headers.
-Permanent fix: add `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` to `.envrc`.
-`~/.espup/esp-clang` is a stable symlink created by `espup install` that always points to the
-current versioned `esp-clang/lib` directory, so it survives `espup update` without manual editing.
+The riscv32 cross-compiler is managed by `esp-idf-sys`'s CMake build and never needs to be on PATH; the Xtensa PATH entry only matters for Xtensa targets.
+`bindgen`/`esp-idf-sys` need `LIBCLANG_PATH` to locate the Clang headers — that is the only missing piece in a fresh shell.
+Fix: add `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` to `.envrc`.
+`~/.espup/esp-clang` is a stable symlink maintained by `espup`, so it survives `espup update` without manual edits.
 
 **`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader that is incompatible with v5.3.3 app binaries.**
 When `espflash flash` runs without `--bootloader`, it writes its own bundled v5.5.1 bootloader.
@@ -64,22 +54,16 @@ places at `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/boot
 Also pass `--ignore-app-descriptor` to prevent espflash from performing its own chip-model check.
 See `scripts/flash.sh` for the implemented solution.
 
-**Bare-metal Xtensa targets (`xtensa-esp32-none-elf`, `xtensa-esp32s3-none-elf`) require `-Tlinkall.x` and `-fno-stack-protector` in rustflags — without them the linker fails with two classes of undefined-reference errors.**
-The esp-hal top-level linker script `linkall.x` includes `memory.x`, `alias.x`, `hal-defaults.x`, and the chip-specific section layout.
-`hal-defaults.x` contains the line `INCLUDE "device.x"`, which is produced by the PAC (e.g. `esp32s3`) crate's build script and provides `PROVIDE(TG0_T0_LEVEL = DefaultHandler)` and ~60 other peripheral interrupt stubs.
-Without `-Tlinkall.x`, none of these scripts are processed, so the linker sees every PAC interrupt vector as an undefined symbol and reports them one per line — making the real cause easy to miss.
-The second error (`undefined reference to '__stack_chk_guard'`) appears because GCC 15.2 (`esp-15.2.0_20250920`) injects stack-protection check calls into `esp_hal::init`, but without a linker script the guard variable is never defined.
-`-C link-arg=-fno-stack-protector` is passed to GCC-as-linker-driver which forwards it back to the compiler stage at link time, suppressing the injected guard reference.
-Both flags belong in `[target.xtensa-esp32-none-elf]` and `[target.xtensa-esp32s3-none-elf]` sections in `.cargo/config.toml.dist` — the workspace default config does not include bare-metal Xtensa sections.
-The `riscv32*-unknown-none-elf` targets do not need `-fno-stack-protector` because GCC 15.2 does not inject stack protection for RISC-V bare-metal.
+**Bare-metal Xtensa targets (`xtensa-esp32-none-elf`, `xtensa-esp32s3-none-elf`) require `-Tlinkall.x` and `-fno-stack-protector` in rustflags.**
+Without `-Tlinkall.x`, esp-hal's linker chain (which pulls in PAC-generated `device.x` providing ~60 peripheral interrupt stubs) is never processed, and every PAC interrupt vector appears as an undefined reference — burying the real cause in noise.
+Without `-C link-arg=-fno-stack-protector`, GCC 15.2 injects stack-guard calls into `esp_hal::init` that resolve to an undefined `__stack_chk_guard`.
+Fix: add both flags to `[target.xtensa-esp32*-none-elf]` sections in `.cargo/config.toml.dist`.
+RISC-V bare-metal targets are unaffected — GCC 15.2 does not inject stack protection there.
 
-**ESP32-C3 requires target `riscv32imc-esp-espidf` and `MCU=esp32c3` — not the C6 defaults.**
+**ESP32-C3 requires target `riscv32imc-esp-espidf` and `MCU=esp32c3` — not the workspace C6 defaults.**
 ESP32-C3 is `riscv32imc` (no atomics extension); ESP32-C6 is `riscv32imac`.
-Building with `MCU=esp32c6` and `riscv32imac-esp-espidf` produces an image whose ESP-IDF chip
-metadata (including `max_efuse_blk_rev`) is wrong for the C3.
-The workspace default in `.cargo/config.toml` is C6 because that is the primary RISC-V target,
-but `scripts/flash.sh` and `scripts/build-example.sh` extract the chip from the example name
-(`idf_c3_*` → C3, `idf_c6_*` → C6) and set `MCU` and `--target` accordingly.
+Building C3 firmware with the C6 target produces an image whose ESP-IDF chip metadata (including `max_efuse_blk_rev`) is wrong, which the bootloader rejects.
+Fix: `scripts/flash.sh` and `scripts/build-example.sh` derive the chip from the example prefix (`idf_c3_*` → C3) and override both `MCU` and `--target`; new examples must follow the prefix convention.
 
 **`sdkconfig.defaults` must be placed at the workspace root for embuild to pick it up — not in the crate root.**
 In a Cargo workspace, `embuild` (used by `esp-idf-sys`) resolves `sdkconfig.defaults` relative to the workspace root (where the top-level `Cargo.toml` lives), not relative to the crate that's being built.
@@ -94,15 +78,16 @@ The backend (`_critical_section_1_0_acquire` / `_critical_section_1_0_release` s
 Without it, the linker fails with `undefined reference to '_critical_section_1_0_acquire'` even though `esp-idf-hal` is already in the dependency tree.
 Fix: in any ESP-IDF crate that uses `sx126x`, declare `esp-idf-hal = { workspace = true, features = ["critical-section"] }`.
 
-**`just verify` does not compile Xtensa IDF targets — missing target sections in `.cargo/config.toml` pass verification but fail to build.**
-`just verify` compiles only the workspace default target (`riscv32imac-esp-espidf`).
-Xtensa ESP-IDF targets (`xtensa-esp32-espidf`, `xtensa-esp32s3-espidf`) and bare-metal targets are never exercised.
-If `.cargo/config.toml` is missing a `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"`,
-`just verify` passes clean but `just build-example idf_esp32s3_*` fails with `ldproxy` panicking
-(`Cannot locate argument '--ldproxy-linker <linker>'`) because the linker is never invoked through ldproxy.
-Fix: ensure every ESP-IDF target used by examples has its own `[target.*]` section in both
-`.cargo/config.toml` and `.cargo/config.toml.dist`.
-Completion gate for hardware examples: run `just build-example <name>` in addition to `just verify`.
+**`just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`) — Xtensa IDF and bare-metal targets are never exercised.**
+A missing `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"` passes verify clean but `just build-example idf_esp32s3_*` panics with `Cannot locate argument '--ldproxy-linker <linker>'`.
+Fix: add a `[target.*]` section for every ESP-IDF target used by an example, in both `.cargo/config.toml` and `.cargo/config.toml.dist`.
+Completion gate: run `just build-example <name>` for every hardware example in addition to `just verify`.
+
+**Cross-repo git dependencies without `tag` or `rev` track the default branch — upstream version bumps that touch a `links = "..."` crate silently break workspace resolution.**
+A `links = "..."` declaration (e.g. `esp-println`, `esp-idf-sys`) tells Cargo only one version may exist in the dependency graph.
+When an unpinned git dep adopts a new release wave that bumps the linked crate, the workspace's existing constraint and the upstream's new constraint cannot coexist, producing `failed to select a version for <crate>` — the error names the linked crate, not the unpinned git dep that introduced the conflict.
+Fix: always pin cross-repo git deps with `tag = "vX.Y.Z"` (or `rev = "<sha>"`).
+Upstream release waves then cannot reach into this workspace without a deliberate, coordinated bump.
 
 ---
 
@@ -126,24 +111,15 @@ Fix: store the subscription in the owning struct (e.g. as `Option<EspSystemSubsc
 
 ## LoRaWAN / TTN v3 (EU868)
 
-**EUI byte order is the single most common cause of silent join failure.**
-TTN Console displays DevEUI and JoinEUI as big-endian hex strings (e.g. `70B3D57ED005ABCD`).
-Many embedded LoRaWAN stacks — including `lorawan-device` — expect the in-memory `[u8; 8]` in
-LSB-first (little-endian / reversed) order.
-`LoraConfig::from_hex_strings()` currently preserves string order (MSB-first).
-If the underlying stack expects reversed order, OTAA join will fail silently:
-the network server sees a valid join request, but the device never receives the join acceptance
-(or the keys derived are wrong).
-Validation step: after constructing the config, log DevEUI/JoinEUI **as bytes** and compare
-with what the `lorawan-device` crate documentation specifies for your region stack.
+**EUI byte order is the single most common cause of silent OTAA join failure.**
+TTN displays DevEUI/JoinEUI as big-endian hex strings; `lorawan-device` (and most embedded LoRaWAN stacks) expect the in-memory `[u8; 8]` in LSB-first order.
+`LoraConfig::from_hex_strings()` preserves the string order (MSB-first), so callers must `.reverse()` both EUIs before constructing `DevEui`/`AppEui`.
+Symptom of a mismatch: the network server logs a valid join request, but the device never sees the join-accept (or derives wrong session keys).
+Validation: log both EUIs as bytes and compare against the stack's documented order before flashing.
 
 **"Join-accept sent by TTN; device never joins" almost always means an RX window issue — not wrong keys.**
-When TTN Live Data shows a join-accept downlink was transmitted but the device stays in `Joining` state:
-- The RX1 window opens ≈1 s after the TX burst ends; RX2 opens ≈2 s after.
-- `RX_WINDOW_OFFSET_MS = -200` is a reasonable starting offset — tune upward (less negative) if windows are still missed.
-- If DIO1 (radio interrupt) is not wired or the interrupt flag is never cleared, the radio completion
-  event is never delivered to the LoRaWAN state machine regardless of RF quality.
-- If the BUSY line is not handled, every SPI command stalls and the RX window is entered late or never.
+RX1 opens ≈1 s after the TX burst ends; RX2 opens ≈2 s after; `RX_WINDOW_OFFSET_MS = -200` is a reasonable starting point — tune upward (less negative) if windows are still missed.
+Two common upstream causes are documented as separate entries below — DIO1 interrupt not delivered, and BUSY pin not handled — both block the radio completion event from reaching the LoRaWAN state machine in time.
 
 **DIO1 interrupt isn’t delivered → radio events never reach the state machine.**
 The SX1262 signals TX/RX completion via DIO1.
@@ -195,10 +171,7 @@ Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = G
 
 ## CodeQL / GitHub Advanced Security
 
-**CodeQL's `rust/hard-coded-cryptographic-value` query flags string literals passed to parameters named `password`, `credential`, or similar — even in test code.**
-The query performs taint analysis: if a string literal flows into a function parameter whose name matches a credential keyword, it raises a Critical alert regardless of context.
-Test helpers like `WiFiConfig::new("ssid", "pass")` trigger it because the second parameter is named `password`.
-Fix: define test fixture constants with non-credential names (e.g. `TEST_PSK`) and route them through a helper function (e.g. `test_config()`).
-This breaks the direct literal-to-password-parameter flow that CodeQL traces.
-For empty passwords, use `&String::new()` instead of `""` — the indirection also defeats the pattern match.
-See `crates/wifi-pure/src/lib.rs` test module for the implemented pattern.
+**CodeQL's `rust/hard-coded-cryptographic-value` query flags string literals reaching parameters named `password`, `credential`, or similar — even in test code.**
+The query traces taint from any string literal into a credential-named parameter and raises a Critical alert regardless of context; test helpers like `WiFiConfig::new("ssid", "pass")` trigger it on the second parameter.
+Fix: define test fixtures with non-credential names (e.g. `TEST_PSK`) and route them through a helper (e.g. `test_config()`); for empty passwords use `&String::new()` instead of `""`.
+The indirection breaks the direct literal-to-credential-parameter flow that CodeQL traces — see `crates/wifi-pure/src/lib.rs` test module.

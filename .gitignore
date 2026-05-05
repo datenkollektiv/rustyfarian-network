@@ -8,6 +8,7 @@ Cargo.lock
 .idea/
 .claude/
 .claudeignore
+.codex/
 CLAUDE.md
 inbox/
 outbox/

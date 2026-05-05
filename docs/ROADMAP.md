@@ -84,7 +84,7 @@ All steps use TTN v3 EU868.
 - Record DevEUI (8 bytes), JoinEUI/AppEUI (8 bytes), AppKey (16 bytes).
 - Decide byte order: TTN displays EUIs as big-endian strings; many stacks expect LSB-first in memory.
   Log DevEUI/JoinEUI as bytes and compare against `lorawan-device` documentation before flashing.
-  See `docs/key-insights.md` — "EUI byte order" for the full pitfall description.
+  See `docs/project-lore.md` — "EUI byte order" for the full pitfall description.
 
 **Step 1 — Gateway & RF sanity**
 
@@ -96,7 +96,7 @@ All steps use TTN v3 EU868.
 - Verify SPI mode 0, 8 MHz; confirm NSS/CS, BUSY, RESET, DIO1 pins.
 - Issue a status/sanity command after reset and log the response.
 - Confirm BUSY line goes high during operations and returns low; if BUSY is never handled,
-  every SPI command stalls — see `docs/key-insights.md` — "BUSY pin".
+  every SPI command stalls — see `docs/project-lore.md` — "BUSY pin".
 
 **Step 3 — TTN Live Data setup**
 
@@ -109,7 +109,7 @@ All steps use TTN v3 EU868.
 - In Live Data, expect: join-request uplink(s) → join-accept downlink.
 - If a join-request is visible but no join-accept: wrong AppKey or EUI byte order mismatch.
 - If join-accept is visible in TTN but a device never joins: RX timing or DIO1 IRQ issue
-  (see `docs/key-insights.md` — "DIO1 interrupt" and "RX window").
+  (see `docs/project-lore.md` — "DIO1 interrupt" and "RX window").
 - Tune `RX_WINDOW_OFFSET_MS` if windows are missed; start at -200 ms and adjust upward.
 
 **Step 5 — First uplink**
@@ -130,7 +130,7 @@ All steps use TTN v3 EU868.
 
 - After join, persist `LorawanSessionData` (CRC-32 check: implement before relying on restore).
 - Sleep and wake; confirm TTN accepts subsequent uplinks with incremented `FCntUp`.
-- If `FCntUp` is reset or reused, TTN silently rejects the frames — see `docs/key-insights.md` — "Frame counter reuse".
+- If `FCntUp` is reset or reused, TTN silently rejects the frames — see `docs/project-lore.md` — "Frame counter reuse".
 
 **Common pitfalls quick reference**
 
