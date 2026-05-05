@@ -234,13 +234,21 @@ impl WiFiManager {
         log::info!("WiFi started, power save: {:?}", config.power_save);
 
         let tx_power = config.tx_power.to_quarter_dbm();
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power) })
-            .context("failed to set WiFi TX power")?;
-        log::info!(
-            "WiFi TX power set to {:?} ({} quarter-dBm)",
-            config.tx_power,
-            tx_power
-        );
+        match esp_idf_svc::sys::esp!(unsafe {
+            esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power)
+        }) {
+            Ok(()) => log::info!(
+                "WiFi TX power set to {:?} ({} quarter-dBm)",
+                config.tx_power,
+                tx_power
+            ),
+            Err(e) => log::warn!(
+                "Failed to set WiFi TX power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
+                config.tx_power,
+                tx_power,
+                e
+            ),
+        }
 
         // In non-blocking mode, subscribe to disconnect events so failures such as
         // WIFI_REASON_NO_AP_FOUND are visible at WARN level without enabling debug logs.

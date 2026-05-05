@@ -123,6 +123,13 @@ pub enum WifiPowerSave {
 /// | `Medium` | 52          | 13         |
 /// | `High`   | 68          | 17         |
 /// | `Max`    | 78          | 19.5       |
+///
+/// These values are heuristic defaults intended to span the usable range of
+/// supported ESP32 chips.
+/// Local regulatory limits, antenna design, and per-board layout may require
+/// lower settings — pick the lowest level that meets your range needs.
+/// The backend may also clamp the requested value to the chip's effective
+/// maximum, so the actual radiated power can differ from the table above.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum TxPowerLevel {
     /// Minimum transmit power (~2 dBm). Best for close-range, low-heat use.

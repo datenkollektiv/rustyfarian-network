@@ -43,6 +43,15 @@ pub const DEFAULT_SCAN_CHANNELS: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 
 /// [`ScanConfig::with_probe_timeout`].
 pub const DEFAULT_PROBE_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(100);
 
+/// Default total burst timeout for a peer scan.
+///
+/// Caps the wall-clock time the radio spends at boosted TX power during a
+/// scan, regardless of how many channels remain.  At default settings
+/// (13 channels × 100 ms probe) the loop already finishes in ~1.3 s; this
+/// only kicks in for long custom probe timeouts or large channel lists.
+/// Override with [`ScanConfig::with_burst_timeout`].
+pub const DEFAULT_BURST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(3);
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A 6-byte IEEE 802.11 MAC address.
@@ -175,16 +184,23 @@ pub struct ScanConfig<'a> {
     pub probe_data: &'a [u8],
     /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
     pub probe_timeout: core::time::Duration,
+    /// Total burst timeout (default: [`DEFAULT_BURST_TIMEOUT`] = 3 s).
+    ///
+    /// The scan loop checks elapsed time before each channel and stops
+    /// early once this limit is reached.  Bounds the time the radio
+    /// spends at boosted TX power during peer discovery.
+    pub burst_timeout: core::time::Duration,
 }
 
 impl<'a> ScanConfig<'a> {
     /// Create a scan config with default channels (1-13), the given probe
-    /// payload, and the default probe timeout.
+    /// payload, the default probe timeout, and the default burst timeout.
     pub fn new(probe_data: &'a [u8]) -> Self {
         Self {
             channels: &DEFAULT_SCAN_CHANNELS,
             probe_data,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            burst_timeout: DEFAULT_BURST_TIMEOUT,
         }
     }
 
@@ -197,6 +213,16 @@ impl<'a> ScanConfig<'a> {
     /// Override the per-channel probe timeout.
     pub fn with_probe_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.probe_timeout = timeout;
+        self
+    }
+
+    /// Override the total burst timeout.
+    ///
+    /// The scan loop stops early once this elapsed time is reached, even
+    /// if channels remain unprobed.  Use this to cap how long the radio
+    /// runs at boosted TX power if discovery fails.
+    pub fn with_burst_timeout(mut self, timeout: core::time::Duration) -> Self {
+        self.burst_timeout = timeout;
         self
     }
 }
@@ -368,6 +394,7 @@ mod tests {
         assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
         assert_eq!(config.probe_data, b"probe");
         assert_eq!(config.probe_timeout, DEFAULT_PROBE_TIMEOUT);
+        assert_eq!(config.burst_timeout, DEFAULT_BURST_TIMEOUT);
     }
 
     #[test]
@@ -382,6 +409,13 @@ mod tests {
         let timeout = core::time::Duration::from_millis(250);
         let config = ScanConfig::new(b"ping").with_probe_timeout(timeout);
         assert_eq!(config.probe_timeout, timeout);
+    }
+
+    #[test]
+    fn scan_config_custom_burst_timeout() {
+        let timeout = core::time::Duration::from_secs(5);
+        let config = ScanConfig::new(b"ping").with_burst_timeout(timeout);
+        assert_eq!(config.burst_timeout, timeout);
     }
 
     #[test]

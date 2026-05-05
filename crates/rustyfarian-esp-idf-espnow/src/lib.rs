@@ -226,6 +226,14 @@ impl EspIdfEspNow {
         Ok((driver, result))
     }
 
+    /// Scan the channels in `config` for the peer at `mac`.
+    ///
+    /// Note on radio side-effects: TX power is a global radio setting.
+    /// While the burst is active, any concurrent Wi-Fi or ESP-NOW
+    /// transmissions on this chip also go out at the boosted level.
+    /// On dual-radio (Wi-Fi + ESP-NOW on the same chip) deployments,
+    /// schedule scans during quiet periods if predictable per-frame
+    /// power matters.
     fn scan_channels(
         &self,
         mac: &MacAddress,
@@ -257,7 +265,19 @@ impl EspIdfEspNow {
         }
 
         let scan_result = (|| -> anyhow::Result<ScanResult> {
+            let burst_start = Instant::now();
+            let mut probed = 0usize;
+
             for &channel in config.channels {
+                if burst_start.elapsed() >= config.burst_timeout {
+                    log::debug!(
+                        "Burst timeout {:?} reached after {} channels; stopping scan",
+                        config.burst_timeout,
+                        probed
+                    );
+                    break;
+                }
+
                 log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
 
                 // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
@@ -280,6 +300,8 @@ impl EspIdfEspNow {
                     continue;
                 }
 
+                probed += 1;
+
                 match ack_status.wait(config.probe_timeout) {
                     Some(true) => return Ok(ScanResult { channel }),
                     Some(false) => log::debug!("No ACK on channel {}", channel),
@@ -288,7 +310,8 @@ impl EspIdfEspNow {
             }
 
             anyhow::bail!(
-                "peer not found on any of the {} scanned channels",
+                "peer not found after probing {} of {} configured channels",
+                probed,
                 config.channels.len()
             )
         })();
