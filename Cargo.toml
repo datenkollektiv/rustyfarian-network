@@ -37,7 +37,7 @@ lora-modulation = "0.1"
 sx126x = "0.3"
 
 # Bare-metal (esp-hal) dependencies — exact pins for the April 2026 release wave
-# (coordinated with rustyfarian-ws2812; see docs/features/esp-hal-stack-upgrade-april-2026-v1.md).
+# (coordinated with rustyfarian-ws2812; see docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md).
 # These crates ship as a monorepo wave; mixing minor versions across them produces
 # feature-unification conflicts in the Wi-Fi `embassy-net-driver` + `esp-alloc` graph.
 esp-hal = { version = "=1.1.0" }

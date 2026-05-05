@@ -10,9 +10,9 @@ Cargo.lock
 .claudeignore
 .codex/
 CLAUDE.md
-inbox/
-outbox/
-archive/
+/inbox/
+/outbox/
+/archive/
 
 # Local cargo config (use .cargo/config.toml.dist as template)
 .cargo/config.toml

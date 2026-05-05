@@ -115,8 +115,8 @@ Explicitly out of scope (must not be touched):
 - [x] **Does `esp-alloc 0.10` rename or restructure `heap_allocator!`?** — Resolved 2026-04-29: no — both the plain `heap_allocator!(size: N)` and the `#[esp_hal::ram(reclaimed)] heap_allocator!(size: N)` forms keep working unchanged in the C3 and C6 examples.
 - [x] **Does `esp-bootloader-esp-idf 0.5` still produce a descriptor accepted by the IDF v5.3.3 bootloader?** — Deferred: build step passed, but full validation requires hardware flashing, which is not part of this migration task.  The espflash workaround in project-lore (`--bootloader <path>` + `--ignore-app-descriptor`) remains in place.
 - [x] **Should the workspace add `embassy-sync = "=0.8.0"` explicitly to force unification?** — Resolved 2026-04-29: yes — added to workspace `Cargo.toml` at `=0.8.0` (matches what `esp-rtos 0.3` pulls transitively and what `rustyfarian-ws2812` pins).
-- [ ] **Is the `xtensa-esp32s3-none-elf` toolchain installed and ready on the development machine?** — Confirmed 2026-04-29: yes; `just build-example hal_esp32s3_join` builds clean in `release` profile (final binary linked).
-- [ ] **embassy-executor 0.10 spawn shape** — surfaced 2026-04-29 (was not on the original list): `Spawner::must_spawn` was removed; `#[embassy_executor::task]` macros now return `Result<SpawnToken, SpawnError>`.  All three async examples updated from `spawner.must_spawn(task(arg))` to `spawner.spawn(task(arg).unwrap())`.
+- [x] **Is the `xtensa-esp32s3-none-elf` toolchain installed and ready on the development machine?** — Confirmed 2026-04-29: yes; `just build-example hal_esp32s3_join` builds clean in `release` profile (final binary linked).
+- [x] **embassy-executor 0.10 spawn shape** — surfaced 2026-04-29 (was not on the original list): `Spawner::must_spawn` was removed; `#[embassy_executor::task]` macros now return `Result<SpawnToken, SpawnError>`.  All three async examples updated from `spawner.must_spawn(task(arg))` to `spawner.spawn(task(arg).unwrap())`.
 
 ## Validation Evidence (2026-04-30)
 
