@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Pinned cross-repo `rustyfarian-ws2812` git dependencies (`led-effects`, `rustyfarian-esp-idf-ws2812`, `rustyfarian-esp-hal-ws2812`) to tag `v0.4.0`; v0.5.0 adopts the April 2026 esp-hal release wave (`esp-println 0.17`, `esp-backtrace ≥0.19`) which conflicts with this workspace's current esp-* baseline
+
 ### Added
 
 - `rustyfarian-esp-hal-wifi`: `EspHalWifiManager` with real `WifiDriver` implementation using `esp-radio 0.17.0` for bare-metal ESP32-C3/C6 (ADR 006 Phase 5); `hal_c3_connect` and `hal_c6_connect` examples

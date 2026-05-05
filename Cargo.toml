@@ -42,6 +42,8 @@ esp-alloc = { version = "0.9" }
 esp-backtrace = { version = "0.18", default-features = false, features = ["panic-handler", "println"] }
 
 # Cross-repo dependencies (for Wi-Fi LED status)
-led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }
-rustyfarian-esp-idf-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812" }
-rustyfarian-esp-hal-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", default-features = false, features = ["led-effects"] }
+# Pinned to v0.4.0: v0.5.0 adopts the April 2026 esp-hal release wave (esp-println 0.17,
+# esp-backtrace ≥0.19) which conflicts with this workspace's current esp-* baseline.
+led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.4.0" }
+rustyfarian-esp-idf-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.4.0" }
+rustyfarian-esp-hal-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.4.0", default-features = false, features = ["led-effects"] }
