@@ -1,11 +1,12 @@
 # Roadmap
 
-*Last updated: April 2026*
+*Last updated: May 2026*
 
 The bare-metal stack is now aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
 The bare-metal Wi-Fi surface is now async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
+The OTA MVP three-crate triad (`ota-pure`, `rustyfarian-esp-idf-ota`, `rustyfarian-esp-hal-ota`) has landed on `main` per [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md); all public APIs are explicitly marked experimental and remain unreleased until v0.2.0.
 TTN v3 LoRa validation remains blocked on hardware.
-Next milestone: release v0.2.0 with the accumulated post-0.1.0 features (including this upgrade), then deliver the OTA MVP three-crate triad — design locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/ota-mvp-v1.md`](features/ota-mvp-v1.md), unblocked by the April 2026 stack landing.
+Next milestone: cut v0.2.0 bundling the accumulated post-0.1.0 features (April 2026 stack upgrade, async Wi-Fi, OTA MVP, command framework, power-save, ESP-NOW channel scanning).
 
 ```mermaid
 %%{init: {
@@ -25,12 +26,7 @@ Next milestone: release v0.2.0 with the accumulated post-0.1.0 features (includi
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Wi-Fi Radio Power Config v1 — TX power levels, power-save enum, auto-burst during discovery (feature-doc)
-
-    Near term : Release v0.2.0 — EspHalWifiManager, async Wi-Fi on the April 2026 esp-hal wave, status_colors, non-blocking publish, power save, ESP-NOW channel scanning, command framework
-              : OTA MVP Stage 1 — ota-pure (Version, StreamingVerifier, ImageMetadata, OtaState, OtaError) host-tested
-              : OTA MVP Stage 2 — rustyfarian-esp-idf-ota (OtaSession::fetch_and_apply / mark_valid / rollback) on ESP32-C3 via EspOta + EspHttpConnection
-              : OTA MVP Stage 3 — rustyfarian-esp-hal-ota async over embassy-net + esp_bootloader_esp_idf::OtaUpdater with strict internal HTTP/1.1 GET (ADR 011)
+    Near term : Release v0.2.0 — EspHalWifiManager, async Wi-Fi on the April 2026 esp-hal wave, OTA MVP triad, status_colors, non-blocking publish, power save, ESP-NOW channel scanning, command framework
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
@@ -64,7 +60,8 @@ timeline
 - Wi-Fi Radio Power Config v1 — `TxPowerLevel` enum, `with_tx_power()` builder, ESP-IDF `esp_wifi_set_max_tx_power()`, ESP-NOW auto-burst during scanning
 - ESP-NOW Peripheral Command Framework v1 — `CommandFrame` zero-copy parser, `SystemCommand` enum (Ping/SelfTest/Identify), response helpers in `espnow-pure`
 - WiFiManager LED integration for esp-hal — `ActiveLowLed<P>` adapter, `hal_c3_connect_async_led` and `hal_c6_connect_async_led` examples (StatusLed support matching ESP-IDF; the synchronous `init_with_led` was later removed when the stack moved to esp-radio 0.18 — LED feedback now wires via spawned tasks alongside `init_async`)
-- esp-hal Stack Upgrade — April 2026 wave: workspace exact-pinned to `esp-hal 1.1.0`, `esp-rtos 0.3.0`, `esp-radio 0.18.0`, `esp-bootloader-esp-idf 0.5.0`, `esp-alloc 0.10.0`, `esp-println 0.17.0`, `esp-backtrace 0.19.0`, `embassy-executor 0.10.0`, `embassy-net 0.8.0`, `embassy-time 0.5.1`, `embassy-sync 0.8.0`, `smoltcp 0.12.0`. `rustyfarian-esp-hal-wifi` collapsed to async-only (`WiFiManager::init_async` + `AsyncWifiHandle`) — sync surface and direct `smoltcp` integration removed (BREAKING for the bare-metal Wi-Fi consumers; `embassy` feature is now effectively required). Hardware-validated on ESP32-C3-DevKitM-1 and ESP32-C6-DevKitC-1; LoRa example builds clean for ESP32-S3 (Phase 5 hardware run separate). Tooling: `scripts/detect-port.sh` filters espflash's auto-detect to USB serial devices on macOS. See `docs/features/esp-hal-stack-upgrade-april-2026-v1.md`.
+- esp-hal Stack Upgrade — April 2026 wave: workspace exact-pinned to `esp-hal 1.1.0`, `esp-rtos 0.3.0`, `esp-radio 0.18.0`, `esp-bootloader-esp-idf 0.5.0`, `esp-alloc 0.10.0`, `esp-println 0.17.0`, `esp-backtrace 0.19.0`, `embassy-executor 0.10.0`, `embassy-net 0.8.0`, `embassy-time 0.5.1`, `embassy-sync 0.8.0`, `smoltcp 0.12.0`. `rustyfarian-esp-hal-wifi` collapsed to async-only (`WiFiManager::init_async` + `AsyncWifiHandle`) — sync surface and direct `smoltcp` integration removed (BREAKING for the bare-metal Wi-Fi consumers; `embassy` feature is now effectively required). Hardware-validated on ESP32-C3-DevKitM-1 and ESP32-C6-DevKitC-1; LoRa example builds clean for ESP32-S3 (Phase 5 hardware run separate). Tooling: `scripts/detect-port.sh` filters espflash's auto-detect to USB serial devices on macOS. See `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`.
+- OTA MVP — three-crate dual-stack firmware update: `ota-pure` (no_std, host-tested), `rustyfarian-esp-idf-ota` (blocking, ESP-IDF), `rustyfarian-esp-hal-ota` (async, bare-metal via `embassy-net` + `esp_bootloader_esp_idf::OtaUpdater`). Streaming SHA-256 verify, partition swap, rollback; strict internal HTTP/1.1 GET parser. All public APIs explicitly experimental (locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md)).
 
 </details>
 
@@ -87,7 +84,7 @@ timeline
 
 ### OTA MVP — Three-Crate Dual-Stack Firmware Update
 
-Locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and detailed in [`docs/features/ota-mvp-v1.md`](features/ota-mvp-v1.md).
+Locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and detailed in [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md).
 Requested by `rustyfarian-ferriswheel-demo` (sibling repo).
 All public APIs are explicitly marked experimental for the MVP; stabilization is owned by the future `ota-library` feature.
 

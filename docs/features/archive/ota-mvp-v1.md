@@ -502,15 +502,15 @@ Under `## [Unreleased]`, add to the `### Added` section:
 
 ## State Checklist
 
-- [ ] Design approved
-- [ ] Stage 1 implemented (`ota-pure` crate, tests, justfile recipes)
-- [ ] Stage 2 implemented (`rustyfarian-esp-idf-ota` crate, demo integration in consumer repo)
-- [ ] Stage 3 implemented (`rustyfarian-esp-hal-ota` crate, bare-metal demo in consumer repo)
-- [ ] `just verify` clean (formatting, clippy, deny)
-- [ ] `just build-example` validates demo builds on hardware targets (ESP32-C3 IDF and bare-metal)
-- [ ] `cargo doc --no-deps -p ota-pure -p rustyfarian-esp-idf-ota -p rustyfarian-esp-hal-ota --open` shows all public types documented
-- [ ] README and ROADMAP updated
-- [ ] CHANGELOG entries confirmed (keep-a-changelog format)
+- [x] Design approved
+- [x] Stage 1 implemented (`ota-pure` crate, tests, justfile recipes) — 37 host unit tests
+- [x] Stage 2 implemented (`rustyfarian-esp-idf-ota` crate, demo integration in consumer repo)
+- [x] Stage 3 implemented (`rustyfarian-esp-hal-ota` crate, bare-metal demo in consumer repo) — 33 host parser tests
+- [x] `just verify` clean (formatting, clippy, deny)
+- [x] `just build-example` validates demo builds on hardware targets (ESP32-C3 IDF and bare-metal)
+- [x] `cargo doc --no-deps -p ota-pure -p rustyfarian-esp-idf-ota -p rustyfarian-esp-hal-ota` shows all public types documented
+- [x] README and ROADMAP updated
+- [x] CHANGELOG entries confirmed (keep-a-changelog format)
 
 ## Open Questions
 
@@ -520,3 +520,5 @@ The four ADR 011 decisions fully constrain the design; consumer feature doc and 
 ## Session Log
 
 **2026-05-01** — Feature design doc created from `review-queue/ota-mvp-three-crates.md`, locked by ADR 011, beekeeper lift inventory completed. Four crates' public surface, Cargo.toml patterns, lift sources, HTTP strictness constraint, stage gates, and workspace integration all specified. Ready for Stage 1 implementation.
+
+**2026-05-05** — All three stages delivered on the `ota-mvp` branch (commits `b5a2445`, `9a55c0c`, plus PR-review follow-ups). Public surface matches the design above with two additions surfaced during implementation: `EspHalOtaManager::new(config, FLASH<'d>)` takes the FLASH peripheral (`esp-storage 0.9` consumes it at construction) instead of the zero-arg shape originally sketched, and `OtaError::DownloadFailed { status: 0 }` is reserved as a sentinel for protocol-shape rejections from the bare-metal HTTP client. PR-review follow-ups also tightened error-mapping (read-error → `ServerUnreachable`, early-EOF → `DownloadFailed { status: 0 }`, rollback-failure → `FlashWriteFailed`), added an internal `log::warn!` at the `HttpError` → `OtaError` boundary, and tagged all three crates as **experimental API** in CHANGELOG and README. `just verify`, `just test-ota` (37/37), `just test-ota-hal` (33/33) all green. Archived.
