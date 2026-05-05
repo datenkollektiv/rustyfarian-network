@@ -238,13 +238,18 @@ impl EspIdfEspNow {
         // Auto-burst: boost TX power to maximum during channel scanning
         // to maximise discovery range, then restore the previous level.
         let mut saved_tx_power: i8 = 0;
+        // SAFETY: esp_wifi_get_max_tx_power is an FFI call into the ESP-IDF
+        // Wi-Fi subsystem, which is initialised by init_with_radio().
+        // It writes the current TX power to the &mut i8 we pass in.
         let have_saved_power =
             unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power) }
                 == esp_idf_svc::sys::ESP_OK;
 
-        // TxPowerLevel::Max = 78 quarter-dBm (~19.5 dBm); kept in sync
-        // with wifi_pure::TxPowerLevel::Max.to_quarter_dbm().
-        let burst_power: i8 = 78;
+        let burst_power = wifi_pure::TxPowerLevel::Max.to_quarter_dbm();
+        // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
+        // Wi-Fi subsystem, which is initialised by init_with_radio().
+        // burst_power comes from TxPowerLevel::Max which is within the
+        // valid [8, 84] quarter-dBm range required by the API.
         if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
             != esp_idf_svc::sys::ESP_OK
         {
@@ -288,7 +293,12 @@ impl EspIdfEspNow {
             )
         })();
 
-        // Restore TX power after scanning regardless of outcome
+        // Restore TX power after scanning regardless of outcome.
+        // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
+        // Wi-Fi subsystem, which is initialised by init_with_radio().
+        // saved_tx_power was previously read from esp_wifi_get_max_tx_power
+        // (and only used here when have_saved_power is true), so the value
+        // is guaranteed to be in the valid range the API itself produced.
         if have_saved_power
             && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
                 != esp_idf_svc::sys::ESP_OK
