@@ -36,7 +36,7 @@ use esp_hal::time::Rate;
 use esp_hal::Blocking;
 use esp_println::println;
 use esp_radio::wifi::{Interface, WifiController};
-use led_effects::{PulseEffect, StatusLed};
+use pennant::{PulseEffect, StatusLed};
 use rgb::RGB8;
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
 use rustyfarian_esp_hal_ws2812::{buffer_size, Ws2812Rmt, RMT_CLK_DIV};

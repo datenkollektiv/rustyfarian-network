@@ -52,7 +52,7 @@ embassy = [
 [dependencies]
 wifi-pure.workspace = true
 embedded-hal.workspace = true
-led-effects.workspace = true
+pennant.workspace = true
 rgb.workspace = true
 log.workspace = true
 esp-hal = { workspace = true, features = ["unstable"], optional = true }

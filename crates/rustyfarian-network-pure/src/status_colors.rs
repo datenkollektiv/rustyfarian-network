@@ -1,7 +1,7 @@
 //! Shared LED status colour palette for the rustyfarian boot sequence.
 //!
 //! All colours are `(R, G, B)` tuples — compatible with
-//! [`led_effects::PulseEffect::update`] and convertible to `rgb::RGB8`
+//! [`pennant::PulseEffect::update`] and convertible to `rgb::RGB8`
 //! without pulling in the `rgb` crate here.
 //!
 //! Wi-Fi and MQTT crates use these values so that every consumer gets a

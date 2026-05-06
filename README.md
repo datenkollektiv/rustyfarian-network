@@ -135,7 +135,7 @@ let wifi_config = WiFiConfig::new("MyNetwork", "password123");
 let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, Some(&mut led))?;
 ```
 
-For RGB LEDs, implement the `StatusLed` trait from `led-effects`.
+For RGB LEDs, implement the `StatusLed` trait from `pennant`.
 
 ## Hardware Examples
 

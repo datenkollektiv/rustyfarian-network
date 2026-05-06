@@ -33,7 +33,7 @@ pub use wifi_pure::{
     POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
-pub use led_effects::{NoLed, SimpleLed, StatusLed};
+pub use pennant::{NoLed, SimpleLed, StatusLed};
 
 // ─── ActiveLowLed ──────────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ impl<P: embedded_hal::digital::OutputPin> ActiveLowLed<P> {
     pub fn new(pin: P) -> Self {
         Self {
             pin,
-            threshold: led_effects::DEFAULT_BRIGHTNESS_THRESHOLD,
+            threshold: pennant::DEFAULT_BRIGHTNESS_THRESHOLD,
         }
     }
 
@@ -69,7 +69,7 @@ impl<P: embedded_hal::digital::OutputPin> StatusLed for ActiveLowLed<P> {
     type Error = P::Error;
 
     fn set_color(&mut self, color: rgb::RGB8) -> Result<(), Self::Error> {
-        if led_effects::exceeds_threshold(color, self.threshold) {
+        if pennant::exceeds_threshold(color, self.threshold) {
             self.pin.set_low()
         } else {
             self.pin.set_high()

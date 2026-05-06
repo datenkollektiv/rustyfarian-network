@@ -31,7 +31,7 @@
 use std::thread;
 use std::time::Duration;
 
-use led_effects::{PulseEffect, StatusLed};
+use pennant::{PulseEffect, StatusLed};
 use rgb::RGB8;
 use rustyfarian_esp_idf_wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 use rustyfarian_esp_idf_ws2812::WS2812RMT;

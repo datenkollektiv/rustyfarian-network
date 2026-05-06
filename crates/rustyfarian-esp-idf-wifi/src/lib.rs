@@ -2,7 +2,7 @@
 //!
 //! Provides a simplified wrapper around the ESP-IDF Wi-Fi client with:
 //! - Automatic connection handling with timeout
-//! - Optional LED status indicator via the `StatusLed` trait from `led_effects`
+//! - Optional LED status indicator via the `StatusLed` trait from `pennant`
 //! - IP address acquisition with polling
 //!
 //! # Example
@@ -61,7 +61,7 @@ use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
-use led_effects::PulseEffect;
+use pennant::PulseEffect;
 use rgb::RGB8;
 
 // Re-export all pure types from wifi-pure
@@ -71,8 +71,8 @@ pub use wifi_pure::{
     POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
-// Re-export StatusLed and SimpleLed from led_effects for convenience
-pub use led_effects::{SimpleLed, StatusLed};
+// Re-export StatusLed and SimpleLed from pennant for convenience
+pub use pennant::{SimpleLed, StatusLed};
 
 use rustyfarian_network_pure::status_colors;
 

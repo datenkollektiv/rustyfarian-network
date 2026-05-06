@@ -4,9 +4,9 @@
 //! is verified on a Heltec V3 board. All methods currently return stub errors
 //! matching the operation attempted (e.g. [`LoraError::TransmitFailed`] from TX methods).
 
-use led_effects::StatusLed;
 use lora_pure::config::LoraConfig;
 use lora_pure::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
+use pennant::StatusLed;
 
 /// Error type for [`EspHalLoraRadio`] operations.
 #[derive(Debug)]
@@ -44,7 +44,7 @@ impl core::fmt::Display for LoraError {
 /// SX1262 radio driver for ESP-HAL targets.
 ///
 /// Accepts a `StatusLed` implementation for visual feedback:
-/// - Use [`led_effects::NoLed`] for headless configurations.
+/// - Use [`pennant::NoLed`] for headless configurations.
 /// - Use `rustyfarian_esp_hal_ws2812::Ws2812RmtDriver` for WS2812 LED feedback.
 ///
 /// # Implementation status

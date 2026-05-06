@@ -26,7 +26,7 @@ wifi-pure.workspace = true
 rustyfarian-network-pure.workspace = true
 anyhow.workspace = true
 esp-idf-svc.workspace = true
-led-effects.workspace = true
+pennant.workspace = true
 log.workspace = true
 rgb.workspace = true
 

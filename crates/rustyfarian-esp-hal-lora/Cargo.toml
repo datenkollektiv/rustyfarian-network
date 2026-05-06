@@ -24,7 +24,7 @@ rt = ["esp-hal/rt"]
 lora-pure.workspace = true
 log.workspace = true
 nb.workspace = true
-led-effects.workspace = true
+pennant.workspace = true
 embedded-hal = "1.0"
 embedded-hal-bus = { version = "0.3", default-features = false }
 esp-hal = { workspace = true, features = ["unstable"], optional = true }

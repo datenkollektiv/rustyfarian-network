@@ -68,7 +68,15 @@ esp-backtrace = { version = "=0.19.0", default-features = false, features = ["pa
 
 # Cross-repo dependencies — pinned to the April 2026 wave release of `rustyfarian-ws2812`.
 # v0.5.0 ships the matching exact pins for esp-hal/esp-rtos/esp-radio, so the resolved
-# feature graph stays unified with this workspace's bare-metal stack.
-led-effects = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.5.0" }
+# feature graph stays unified with this workspace's bare-metal stack. The release also
+# renamed `led-effects` → `pennant` and `ws2812-pure` → `bunting`. `pennant` is
+# published on crates.io but we keep it as a git dep so it shares a source with the
+# (still-unpublished) HAL drivers — otherwise Cargo would compile two distinct copies
+# and `StatusLed`/`PulseEffect` types would not unify across the HAL boundary.
+# `hal` feature pulls in `SimpleLed` (the `embedded-hal` `OutputPin` adapter for
+# simple on/off GPIO LEDs), which is re-exported by the Wi-Fi and MQTT crates.
+# Pre-rename `led-effects` exposed `SimpleLed` unconditionally; v0.5.0 split it
+# behind a feature.
+pennant = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.5.0", features = ["hal"] }
 rustyfarian-esp-idf-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.5.0" }
-rustyfarian-esp-hal-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.5.0", default-features = false, features = ["led-effects"] }
+rustyfarian-esp-hal-ws2812 = { git = "https://github.com/datenkollektiv/rustyfarian-ws2812", tag = "v0.5.0", default-features = false, features = ["pennant"] }

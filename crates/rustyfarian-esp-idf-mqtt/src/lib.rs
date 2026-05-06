@@ -56,14 +56,14 @@
 //! new code.
 
 use anyhow::Context as _;
-use led_effects::PulseEffect;
+use pennant::PulseEffect;
 use rgb::RGB8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// Re-export StatusLed and SimpleLed from led_effects for convenience
-pub use led_effects::{SimpleLed, StatusLed};
+// Re-export StatusLed and SimpleLed from pennant for convenience
+pub use pennant::{SimpleLed, StatusLed};
 
 use rustyfarian_network_pure::mqtt::{
     connection_wait_iterations, format_broker_url, next_state, validate_broker_host,

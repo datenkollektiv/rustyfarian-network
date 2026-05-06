@@ -16,7 +16,7 @@
 //!
 //! [`EspHalLoraRadio`] accepts a generic `S: StatusLed` at construction time,
 //! enabling WS2812 RGB LED feedback (join, uplink, downlink states) or
-//! [`led_effects::NoLed`] for headless configurations.
+//! [`pennant::NoLed`] for headless configurations.
 
 #![no_std]
 
