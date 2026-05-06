@@ -2,11 +2,10 @@
 
 *Last updated: May 2026*
 
-The bare-metal stack is now aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
-The bare-metal Wi-Fi surface is now async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
-The OTA MVP three-crate triad (`ota-pure`, `rustyfarian-esp-idf-ota`, `rustyfarian-esp-hal-ota`) has landed on `main` per [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md); all public APIs are explicitly marked experimental and remain unreleased until v0.2.0.
+The bare-metal stack is aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
+The bare-metal Wi-Fi surface is async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
 TTN v3 LoRa validation remains blocked on hardware.
-Next milestone: cut v0.2.0 bundling the accumulated post-0.1.0 features (April 2026 stack upgrade, async Wi-Fi, OTA MVP, command framework, power-save, ESP-NOW channel scanning).
+A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Mid term: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
 
 ```mermaid
 %%{init: {
@@ -26,89 +25,24 @@ Next milestone: cut v0.2.0 bundling the accumulated post-0.1.0 features (April 2
 timeline
     title rustyfarian-network Roadmap
 
-    Near term : Release v0.2.0 — EspHalWifiManager, async Wi-Fi on the April 2026 esp-hal wave, OTA MVP triad, status_colors, non-blocking publish, power save, ESP-NOW channel scanning, command framework
+    Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
+
+    Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
+              : README 2D crate-status table — protocols × HAL tiers with maturity per cell
+              : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule
+              : pennant crates.io coordination checkpoint — release-plan note before ws2812 v0.6
+              : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
-              : LoRa post-adoption backlog — builder pattern, CRC-32, hardware driver, state machine
+              : OTA security model doc — threat model, rollback policy, signed-manifest question
+              : WifiDriver async/sync trait ADR — document trait duality + first paragraph of wifi-pure rustdoc
+              : Contract tests in wifi-pure — run_contract_tests<D: WifiDriver>() conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
+              : LoRa post-adoption backlog — PartialEq, heapless Deque FIFO, CRC-32, hardware driver, state machine
 
-    Long term : Evaluate ESP-IDF v5.5.2 coex fix for ESP-NOW send failures
-              : Full EspHalLoraRadio hardware driver (after TTN validation)
-              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (esp-hal WiFi dependency resolved)
+    Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
+              : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
+              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after async MQTT ADR)
 ```
-
----
-
-## Completed
-
-<details>
-<summary><strong>Delivered since v0.1.0</strong></summary>
-
-- `EspHalWifiManager` with `esp-radio 0.17.0` — full `WifiDriver` impl, `WiFiConfigExt`, `wait_connected` with DHCP, `hal_c3_connect` / `hal_c6_connect` examples (ADR 006 Phases 1-6)
-- Unified `WiFiManager::init(config)` API across ESP-IDF and esp-hal crates
-- `validate_ssid` rejects empty SSIDs (shared in `wifi-pure`)
-- `status_colors` module in `rustyfarian-network-pure`
-- `MqttBuilder::build_and_wait()` with `StatusLed` support
-- Non-blocking `MqttHandle::try_publish` / `try_publish_retained` / `try_publish_with`
-- `WifiPowerSave` enum and `WiFiConfig::with_power_save()`
-- `EspIdfEspNow::init_with_radio()` for ESP-NOW-only devices (ADR 008)
-- Configurable MQTT task stack size (default raised to 8 KiB)
-- Justfile cleanup: removed convenience recipes, consolidated `act` into single recipe with optional job arg
-- `scan_for_peer()` and `send_and_wait()` for ESP-NOW channel scanning with MAC-layer ACK detection (ADR 009)
-- `idf_c3_espnow_coordinator` and `idf_c3_espnow_scout` examples with LED feedback
-- `default_interface()` fix: always STA (amends ADR 008)
-- `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
-- Wi-Fi Radio Power Config v1 — `TxPowerLevel` enum, `with_tx_power()` builder, ESP-IDF `esp_wifi_set_max_tx_power()`, ESP-NOW auto-burst during scanning
-- ESP-NOW Peripheral Command Framework v1 — `CommandFrame` zero-copy parser, `SystemCommand` enum (Ping/SelfTest/Identify), response helpers in `espnow-pure`
-- WiFiManager LED integration for esp-hal — `ActiveLowLed<P>` adapter, `hal_c3_connect_async_led` and `hal_c6_connect_async_led` examples (StatusLed support matching ESP-IDF; the synchronous `init_with_led` was later removed when the stack moved to esp-radio 0.18 — LED feedback now wires via spawned tasks alongside `init_async`)
-- esp-hal Stack Upgrade — April 2026 wave: workspace exact-pinned to `esp-hal 1.1.0`, `esp-rtos 0.3.0`, `esp-radio 0.18.0`, `esp-bootloader-esp-idf 0.5.0`, `esp-alloc 0.10.0`, `esp-println 0.17.0`, `esp-backtrace 0.19.0`, `embassy-executor 0.10.0`, `embassy-net 0.8.0`, `embassy-time 0.5.1`, `embassy-sync 0.8.0`, `smoltcp 0.12.0`. `rustyfarian-esp-hal-wifi` collapsed to async-only (`WiFiManager::init_async` + `AsyncWifiHandle`) — sync surface and direct `smoltcp` integration removed (BREAKING for the bare-metal Wi-Fi consumers; `embassy` feature is now effectively required). Hardware-validated on ESP32-C3-DevKitM-1 and ESP32-C6-DevKitC-1; LoRa example builds clean for ESP32-S3 (Phase 5 hardware run separate). Tooling: `scripts/detect-port.sh` filters espflash's auto-detect to USB serial devices on macOS. See `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`.
-- OTA MVP — three-crate dual-stack firmware update: `ota-pure` (no_std, host-tested), `rustyfarian-esp-idf-ota` (blocking, ESP-IDF), `rustyfarian-esp-hal-ota` (async, bare-metal via `embassy-net` + `esp_bootloader_esp_idf::OtaUpdater`). Streaming SHA-256 verify, partition swap, rollback; strict internal HTTP/1.1 GET parser. All public APIs explicitly experimental (locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md)).
-
-</details>
-
-<details>
-<summary><strong>Delivered in v0.1.0</strong></summary>
-
-- `wifi-pure`, `lora-pure`, `espnow-pure` — platform-independent crates with traits and mocks
-- `rustyfarian-esp-idf-lora` with `LoraRadioAdapter` bridging to `lorawan-device 0.12`
-- `rustyfarian-esp-idf-espnow` — ESP-NOW driver implementing `EspNowDriver` trait
-- `MqttBuilder` API with lifecycle callbacks, LWT, auth
-- `rustyfarian-network-pure` — MQTT validation, state machine, `ExponentialBackoff`
-- Dual-HAL script infrastructure (`build-example.sh`, `flash.sh`)
-- CI: pure-crate test job for all host tests
-
-</details>
-
----
-
-## Near term detail
-
-### OTA MVP — Three-Crate Dual-Stack Firmware Update
-
-Locked by [ADR 011](adr/011-ota-crate-hosting-and-transport.md) and detailed in [`docs/features/archive/ota-mvp-v1.md`](features/archive/ota-mvp-v1.md).
-Requested by `rustyfarian-ferriswheel-demo` (sibling repo).
-All public APIs are explicitly marked experimental for the MVP; stabilization is owned by the future `ota-library` feature.
-
-**Stage gates** (consumer pulls each stage via path-deps as it lands):
-
-|  # | Crate                     | Owner         | Pass criteria                                                                                                            |
-|---:|:--------------------------|:--------------|:-------------------------------------------------------------------------------------------------------------------------|
-|  1 | `ota-pure`                | network repo  | `cargo test -p ota-pure --features mock` passes on host; `just verify` clean                                             |
-|  2 | `rustyfarian-esp-idf-ota` | consumer demo | ESP32-C3 firmware fetches over Wi-Fi, validates SHA-256, swaps, reboots, calls `mark_valid`; truncated `.bin` rolls back |
-|  3 | `rustyfarian-esp-hal-ota` | consumer demo | Identical hardware behaviour to Stage 2 on the same ESP32-C3 board, bare-metal async path                                |
-
-**MVP scope (locked by feature request + ADR 011):**
-
-- Plain HTTP/1.1 only — no TLS (deferred to `ota-hardened`)
-- Streaming SHA-256 integrity check — never holds the full image in RAM
-- Bare-metal HTTP client is hand-rolled and **internal** (strict subset: `HTTP/1.1 200 OK` + single `Content-Length`, rejects redirects/chunked/oversized) — not a workspace HTTP API
-- Demo enables bootloader rollback (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`) and marks the running image valid after Wi-Fi association + 30 s wall-clock dwell
-- 1 MiB OTA slot reference layout for ESP32-C3 SuperMini (4 MiB flash); demo owns the actual `partitions.csv`
-
-**Out of scope (deferred to `ota-hardened` / `ota-library`):**
-
-- TLS / HTTPS, Ed25519 signature verification, brown-out safety, automated rollback test in CI, multi-device concurrency, API stabilization, mock implementation
-
-Once Stage 3 lands, this entry moves into the Completed band.
 
 ---
 
@@ -200,10 +134,10 @@ All steps use TTN v3 EU868.
 <details>
 <summary><strong>Deferred items from initial adoption</strong></summary>
 
+Items #1 (builder) and #2 (`from_hex_strings` Result) promoted to Near term on 2026-05-06.
+
 | # | Item                                                                              |
 |--:|:----------------------------------------------------------------------------------|
-| 1 | Builder pattern for `LoraConfig` (private fields, `::builder()`)                  |
-| 2 | `from_hex_strings` returns `Result` with field-level diagnostics                  |
 | 4 | `PartialEq` on `LorawanResponse` / `Downlink`                                     |
 | 5 | Replace manual O(n) FIFO shift in `MockLoraRadio::receive` with `heapless::Deque` |
 | 6 | Implement CRC-32 integrity check in `restore_from_sleep` (Phase 7)                |
