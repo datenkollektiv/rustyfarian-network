@@ -26,31 +26,26 @@ Before any release:
 - [ ] At least one hardware example builds via `just build-example <name>` for each tier touched (sanity check; not exhaustive)
 - [ ] `cargo audit` shows no new advisories beyond those allow-listed in `deny.toml`
 - [ ] `CHANGELOG.md` `[Unreleased]` has entries for the target version
-- [ ] All 13 crates' `version = "X.Y.Z"` in `crates/*/Cargo.toml` are consistent
+- [ ] `[workspace.package].version` in root `Cargo.toml` matches the target version; no member crate overrides it (each declares `version.workspace = true`)
 
 ## Version Bump
 
-Files to update when bumping the version:
-- `crates/espnow-pure/Cargo.toml` — `version`
-- `crates/lora-pure/Cargo.toml` — `version`
-- `crates/ota-pure/Cargo.toml` — `version`
-- `crates/wifi-pure/Cargo.toml` — `version`
-- `crates/rustyfarian-network-pure/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-hal-lora/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-hal-ota/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-hal-wifi/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-idf-espnow/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-idf-lora/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-idf-mqtt/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-idf-ota/Cargo.toml` — `version`
-- `crates/rustyfarian-esp-idf-wifi/Cargo.toml` — `version`
+Single source of truth: `[workspace.package].version` in the root `Cargo.toml`.
+Each member crate inherits via `version.workspace = true`, so a release bump is one edit.
 
 Post-release bump target: none (next-version bump happens when the next `[Unreleased]` block is finalised)
 
 ## Publish
 
 **Target registry:** none — tag-only on GitHub
-**Publish command:** `git push origin main --follow-tags`
+**Tag command (on the release commit):**
+
+```sh
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+**Branch push:** `git push origin main` (or open a PR from `prepare-release` → `main` and merge)
 **Credentials:** standard GitHub push credentials (no registry tokens needed)
 **Signing:** not required (commit / tag GPG signing optional, follow whatever git is already configured to do)
 
