@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-06
+
 ### Changed
 
 - **BREAKING** `rustyfarian-esp-hal-wifi`: removed the synchronous `WiFiManager::init`, `init_with_led`, `wait_connected`, `get_ip`, `take_sta_device`, and the `WifiDriver` trait impl, along with the `S: StatusLed` generic on `WiFiManager` and the `WifiError::{StartFailed, ConnectFailed, DisconnectFailed, RadioInitFailed}` variants — `esp-radio 0.18` removed direct `smoltcp` integration and made the bare-metal Wi-Fi controller async-only, so the sync surface no longer has a backing driver. The async path (`WiFiManager::init_async` + `AsyncWifiHandle`) is now the only public surface; the `embassy` Cargo feature is therefore effectively required alongside any chip feature
 - **BREAKING** `rustyfarian-esp-hal-wifi`: removed the `hal_c3_connect`, `hal_c6_connect`, `hal_c3_wifi_raw`, `hal_c6_wifi_raw`, and `hal_c6_connect_nonblocking_rgb` examples — all depended on the deleted sync smoltcp path; the three remaining `hal_*_async*` examples cover ESP32-C3 + ESP32-C6 in headless and LED-feedback variants
+- **April 2026 esp-hal stack wave** — coordinated workspace-wide bump of every bare-metal crate to exact pins (`Cargo.toml` `[workspace.dependencies]`): `esp-hal 1.0.0`→`=1.1.0`, `esp-rtos 0.2.0`→`=0.3.0`, `esp-radio 0.17.0`→`=0.18.0`, `esp-bootloader-esp-idf 0.4.0`→`=0.5.0`, `esp-alloc 0.9.0`→`=0.10.0`, `esp-println 0.16.1`→`=0.17.0`, `esp-backtrace 0.18.1`→`=0.19.0`; embassy ecosystem `embassy-executor 0.9`→`=0.10.0`, `embassy-net 0.7`→`=0.8.0`, `embassy-time 0.5`→`=0.5.1`, `embassy-sync` newly pinned at `=0.8.0`. `smoltcp` is now exact-pinned at `=0.12.0` but is no longer a direct dependency of `rustyfarian-esp-hal-wifi` — `esp-radio 0.18` removed the `smoltcp` feature in favour of `embassy-net-driver`. Coordinated with `rustyfarian-ws2812`'s April 2026 wave (see `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`)
+- ws2812 cross-repo dependencies (`led-effects`, `rustyfarian-esp-idf-ws2812`, `rustyfarian-esp-hal-ws2812`) re-pinned from `tag = "v0.4.0"` to `tag = "v0.5.0"` — v0.5.0 is the April 2026 wave release that ships the matching exact pins for `esp-hal`/`esp-rtos`/`esp-radio`, so the resolved feature graph stays unified with this workspace's bare-metal stack
+- **BREAKING** `rustyfarian-esp-hal-wifi`: API renames flowing through from `esp-radio 0.18` — `WifiDevice` → `Interface`, `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`, `Interfaces.sta` → `.station`, `WifiEvent::StaDisconnected` → `StationDisconnected`, `WifiError::Disconnected` is now a tuple variant carrying `DisconnectedStationInfo`, `controller.is_connected()` returns `bool` directly (not `Result`), `controller.connect()`/`disconnect()` are async-only (`connect_async`/`disconnect_async`), `controller.wait_for_event(StaDisconnected)` becomes `wait_for_disconnect_async`, `esp_radio::wifi::new()` is now `(WIFI, ControllerConfig)` (the radio init parameter is gone — radio init is implicit)
+- **BREAKING** `rustyfarian-esp-hal-wifi`: `set_config` is now idempotent in `esp-radio 0.18` and implicitly starts the controller and initiates association — the explicit `start()`/`connect()` calls that existed in 0.17 are no longer needed (or available)
+- `rustyfarian-esp-idf-espnow`: `default_interface()` always returns `WifiInterface::Sta` — `init_with_radio()` starts in STA mode, not AP (fixes `ESP_ERR_ESPNOW_IF` on send)
+- `sdkconfig.defaults`: added `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
 
 ### Added
 
@@ -57,15 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Justfile: `ESPFLASH_PORT` env var for multi-board setups, `fresh-run` and `erase-flash` recipes, `--non-interactive` monitor
 - Build scripts: `*wifi*` and `*espnow*` crate auto-detection in `build-example.sh` and `flash.sh`
 
-### Changed
-
-- **April 2026 esp-hal stack wave** — coordinated workspace-wide bump of every bare-metal crate to exact pins (`Cargo.toml` `[workspace.dependencies]`): `esp-hal 1.0.0`→`=1.1.0`, `esp-rtos 0.2.0`→`=0.3.0`, `esp-radio 0.17.0`→`=0.18.0`, `esp-bootloader-esp-idf 0.4.0`→`=0.5.0`, `esp-alloc 0.9.0`→`=0.10.0`, `esp-println 0.16.1`→`=0.17.0`, `esp-backtrace 0.18.1`→`=0.19.0`; embassy ecosystem `embassy-executor 0.9`→`=0.10.0`, `embassy-net 0.7`→`=0.8.0`, `embassy-time 0.5`→`=0.5.1`, `embassy-sync` newly pinned at `=0.8.0`. `smoltcp` is now exact-pinned at `=0.12.0` but is no longer a direct dependency of `rustyfarian-esp-hal-wifi` — `esp-radio 0.18` removed the `smoltcp` feature in favour of `embassy-net-driver`. Coordinated with `rustyfarian-ws2812`'s April 2026 wave (see `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`)
-- ws2812 cross-repo dependencies (`led-effects`, `rustyfarian-esp-idf-ws2812`, `rustyfarian-esp-hal-ws2812`) re-pinned from `tag = "v0.4.0"` to `tag = "v0.5.0"` — v0.5.0 is the April 2026 wave release that ships the matching exact pins for `esp-hal`/`esp-rtos`/`esp-radio`, so the resolved feature graph stays unified with this workspace's bare-metal stack
-- **BREAKING** `rustyfarian-esp-hal-wifi`: API renames flowing through from `esp-radio 0.18` — `WifiDevice` → `Interface`, `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`, `Interfaces.sta` → `.station`, `WifiEvent::StaDisconnected` → `StationDisconnected`, `WifiError::Disconnected` is now a tuple variant carrying `DisconnectedStationInfo`, `controller.is_connected()` returns `bool` directly (not `Result`), `controller.connect()`/`disconnect()` are async-only (`connect_async`/`disconnect_async`), `controller.wait_for_event(StaDisconnected)` becomes `wait_for_disconnect_async`, `esp_radio::wifi::new()` is now `(WIFI, ControllerConfig)` (the radio init parameter is gone — radio init is implicit)
-- **BREAKING** `rustyfarian-esp-hal-wifi`: `set_config` is now idempotent in `esp-radio 0.18` and implicitly starts the controller and initiates association — the explicit `start()`/`connect()` calls that existed in 0.17 are no longer needed (or available)
-- `rustyfarian-esp-idf-espnow`: `default_interface()` always returns `WifiInterface::Sta` — `init_with_radio()` starts in STA mode, not AP (fixes `ESP_ERR_ESPNOW_IF` on send)
-- `sdkconfig.defaults`: added `CONFIG_ESP_WIFI_NVS_ENABLED=n` to prevent stale WiFi credential caching
-
 ### Fixed
 
 - `rustyfarian-esp-idf-espnow`: `scan_for_peer()` and `send_and_wait()` now serialise their send-callback registration through an internal mutex — concurrent calls can no longer steal each other's ACKs
@@ -88,3 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dual-HAL script infrastructure: `build-example.sh`, `flash.sh`, `ensure-bootloader.sh`, and `xtensa-toolchain.sh` for `hal_*` bare-metal targets
 - Examples: `idf_c3_connect`, `idf_c3_mqtt`, `idf_esp32_mqtt`; hardware reference `docs/heltec-wifi-lora-32-v3.md`
 - CI: pure-crate test job for all host tests (`rustyfarian-network-pure`, `wifi-pure`, `lora-pure`, `espnow-pure`)
+
+[Unreleased]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/datenkollektiv/rustyfarian-network/releases/tag/v0.1.0
