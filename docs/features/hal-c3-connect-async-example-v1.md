@@ -63,3 +63,87 @@ Source: `docs/embassy-integration-research.md` — example code sketch under Opt
 - 2026-04-08 — Feature doc created from `docs/embassy-integration-research.md`
 - 2026-04-08 — Implemented: `examples/hal_c3_connect_async.rs` using `#[esp_rtos::main]` with two spawned tasks (`wifi_task` + `net_task`). Destructures `AsyncWifiHandle` (stack is `Copy`, keeps main's reference while moving controller/runner into tasks). `esp_alloc::heap_allocator!(size: 72 * 1024)` — single-region on C3. `WiFiManager::init_async` internally calls `esp_rtos::start()` via `init_inner`, which works from inside the embassy executor created by `#[esp_rtos::main]` (the macro creates the executor but does not start the RTOS — that is still the user's/library's responsibility). Added `[[example]] required-features = ["esp32c3", "rt", "embassy"]` to the crate Cargo.toml. `scripts/build-example.sh` grew a `*_async*` case that appends the `embassy` feature automatically, mirroring the existing `*_rgb*` pattern. `just fmt`, `just verify`, and `just build-example hal_c3_connect_async` all pass clean.
 - 2026-04-10 — Fixed `scripts/flash.sh` missing the `*_async*` → `embassy` feature detection that `build-example.sh` already had. Hardware validation on real ESP32-C3: build, flash, Wi-Fi connect, and DHCP lease all confirmed working. AP reconnect loop test still pending.
+
+---
+
+## Debugging Session: AuthenticationExpired on WPA2 AP (2026-05-15)
+
+### Environment
+
+- Hardware: ESP32-C3 Super Mini
+- Network: WPA2 AP with two virtual SSIDs on the same physical radio
+- Crate stack: `rustyfarian-esp-hal-wifi` v0.2.1, `esp-radio 0.18.0`, `esp-rtos 0.2.0`
+- Reference: `rustyfarian-esp-idf-wifi` using `esp-idf-svc` connects without issue on the same C3 board
+
+### Symptom
+
+`connect_async()` always fails with:
+
+```
+connect failed: Disconnected(DisconnectedStationInfo {
+    ssid: "<ssid>",
+    reason: AuthenticationExpired,
+    rssi: -33
+})
+```
+
+`WIFI_REASON_AUTH_EXPIRE` = reason code 2.
+The AP sends a Deauthentication frame before the WPA2 4-way handshake completes.
+Signal strength is excellent (-33 to -40 dBm) — not a range issue.
+
+### Key facts established
+
+- Two virtual SSIDs on the same physical AP; same channel 11.
+- Secondary SSID appeared in `scan_async` results; primary target SSID did NOT appear in the scan despite excellent signal.
+- The ESP-IDF C stack is used by both IDF and esp-radio; differences are in how they call it.
+- esp-radio 0.18.0 `wifi_init_config_t` has `nvs_enable: 0` — NVS (PMKSA cache) is disabled.
+- `apply_sta_config` in esp-radio sets `pmf_cfg: { capable: true, required: false }` (hardcoded, not configurable via `StationConfig`).
+- `StationConfig::default()` fields: `auth_method: Wpa2Personal`, `failure_retry_cnt: 1`, `beacon_timeout: 6`, `scan_method: Fast`.
+- These map to identical `wifi_sta_config_t` C fields as `esp-idf-svc`'s `ClientConfiguration::default()` — no difference found at the C config level.
+
+### Failed attempt 1 — set_config before every connect_async
+
+**Hypothesis:** `scan_async` clears the station config stored in the Wi-Fi driver. After the scan, `connect_async` runs with empty SSID/password and the AP rejects the association.
+
+**Change:** Added `controller.set_config(&Config::Station(station))` inside the `wifi_task` loop, immediately before every `connect_async()` call. Also applied to both LED examples and `lib.rs`.
+
+**Result (hardware log):**
+```
+Scanning...
+  AccessPointInfo { ssid: "<secondary-ssid>", channel: 11,
+    signal_strength: -73, auth_method: Some(Wpa2Personal), ... }
+Waiting for DHCPv4 lease...
+connect failed: Disconnected(..., reason: AuthenticationExpired, rssi: -40)
+```
+
+Scan produced output (confirmed set_config was applied). Primary SSID still not in scan results. Auth still fails. **Hypothesis disproved** — the station config was not the cause.
+
+### Failed attempt 2 — remove scan_async before connecting
+
+**Hypothesis:** The full channel scan (active, 10–20 ms per channel) puts the radio in a post-scan state that adds latency to the subsequent auth exchange. The target SSID is not in the scan's BSSID→channel cache, so `connect_async` must probe for it internally, adding further latency. Combined, the ESP32's own auth timer expires before the AP's response arrives. Supporting reasoning: the IDF variant does not scan at all and succeeds.
+
+**Change:** Removed `scan_async` and its import from `hal_c3_connect_async.rs`. Cleaned up stale "scan clears config" comments in LED examples and `lib.rs`.
+
+**Result (hardware log):**
+```
+Initializing Wi-Fi (async)...
+INFO - Wi-Fi configured, power save: None
+Waiting for DHCPv4 lease...
+connect failed: Disconnected(..., reason: AuthenticationExpired, rssi: -33)
+connect failed: Disconnected(..., reason: AuthenticationExpired, rssi: -33)
+```
+
+Scan removal made no difference. **Hypothesis disproved.** The scan was not interfering with auth timing.
+
+### Resolution — TX power (2026-05-18)
+
+**Root cause confirmed:** ESP32-C3 Super Mini PCB antenna reflects RF back into the chip at full TX power (~20 dBm), corrupting WPA2 auth frames.
+Reproduced on a phone hotspot (isolated from AP-specific configuration); fixed by calling `esp_wifi_set_max_tx_power(34)` (8.5 dBm) after `set_config` triggers `esp_wifi_start`.
+See `docs/project-lore.md` "esp-hal April 2026 Stack" for the full entry; fix lives in `WiFiManager::init_async` and `hal_c3_connect_async_upstream.rs`.
+
+### Current state of the code (as of 2026-05-18)
+
+- No `scan_async` in `hal_c3_connect_async.rs` (removed; the IDF variant never scanned either).
+- `wifi_task` calls `set_config` before every `connect_async` — retained as defensive practice.
+- `lib.rs` `init_async` calls `esp_wifi_set_max_tx_power(34)` immediately after `set_config`.
+- `StationConfig`: `Wpa2Personal`, no explicit BSSID, no explicit channel.

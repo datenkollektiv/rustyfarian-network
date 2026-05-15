@@ -7,8 +7,9 @@
 //!
 //! Two tasks are spawned alongside the main task:
 //!
-//! * `wifi_task` — owns the [`WifiController`] and keeps the station
-//!   associated, reconnecting after any `StaDisconnected` event.
+//! * `wifi_task` — owns the [`WifiController`] and reconnects after any
+//!   `StaDisconnected` event. Credentials are applied once in
+//!   [`WiFiManager::init_async`]; `connect_async` reuses them on every attempt.
 //! * `net_task` — drives the `embassy-net` stack by calling `runner.run()`.
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build
@@ -30,10 +31,13 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_radio::wifi::{scan::ScanConfig, Interface, WifiController};
+use esp_radio::wifi::{Interface, WifiController};
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+const RECONNECT_DELAY_MS: u64 = 500;
+const CONNECT_BACKOFF_MS: u64 = 5000;
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -73,23 +77,10 @@ async fn main(spawner: Spawner) {
     // Destructure: `stack` is `Copy`, so we keep our own copy before moving
     // `controller` and `runner` into their tasks.
     let AsyncWifiHandle {
-        mut controller,
+        controller,
         stack,
         runner,
     } = handle;
-
-    // Scan before connecting — mirrors the official embassy_dhcp example.
-    // The active scan lets the radio settle and builds its BSSID/channel cache
-    // before the first association attempt.
-    println!("Scanning...");
-    match controller.scan_async(&ScanConfig::default()).await {
-        Ok(aps) => {
-            for ap in &aps {
-                println!("  {:?}", ap);
-            }
-        }
-        Err(e) => println!("Scan failed (continuing anyway): {:?}", e),
-    }
 
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
@@ -111,8 +102,8 @@ async fn main(spawner: Spawner) {
 }
 
 // Handles both the initial association and any subsequent reconnects.
-// `set_config` starts the radio but does NOT initiate association in
-// esp-radio 0.18 — `connect_async` must always be called explicitly.
+// Credentials were configured in `WiFiManager::init_async`; calling
+// `connect_async` directly reuses those settings without resetting driver state.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
     loop {
@@ -121,12 +112,15 @@ async fn wifi_task(mut controller: WifiController<'static>) {
                 // Connected — block until the link drops.
                 let _ = controller.wait_for_disconnect_async().await;
                 println!("Wi-Fi disconnected — reconnecting...");
+                // Short delay: we know the AP exists, reconnect promptly.
+                Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
             }
             Err(e) => {
                 println!("connect failed: {:?}", e);
+                // Longer backoff: AP may be unreachable or credentials wrong.
+                Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
             }
         }
-        Timer::after(Duration::from_millis(500)).await;
     }
 }
 

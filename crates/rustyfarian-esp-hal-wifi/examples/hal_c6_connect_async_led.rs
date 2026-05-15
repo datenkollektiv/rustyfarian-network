@@ -43,6 +43,9 @@ use rustyfarian_esp_hal_ws2812::{buffer_size, Ws2812Rmt, RMT_CLK_DIV};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+const RECONNECT_DELAY_MS: u64 = 500;
+const CONNECT_BACKOFF_MS: u64 = 5000;
+
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
@@ -174,6 +177,8 @@ async fn led_task(mut led: Ws2812Rmt<'static, Blocking, N>) {
 }
 
 // Handles both the initial association and subsequent reconnects.
+// Credentials were configured in `WiFiManager::init_async`; calling
+// `connect_async` directly reuses those settings without resetting driver state.
 // The LED `CONNECTED` flag is owned by `link_status_task` watching
 // `embassy_net::Stack` config-up/config-down edges — not toggled here,
 // because a successful L2 reconnect does not yet imply a new DHCP lease.
@@ -184,12 +189,13 @@ async fn wifi_task(mut controller: WifiController<'static>) {
             Ok(_) => {
                 let _ = controller.wait_for_disconnect_async().await;
                 println!("Wi-Fi disconnected — reconnecting...");
+                Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
             }
             Err(e) => {
                 println!("connect failed: {:?}", e);
+                Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
             }
         }
-        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
