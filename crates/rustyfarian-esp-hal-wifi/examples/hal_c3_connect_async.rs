@@ -30,7 +30,7 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_radio::wifi::{Interface, WifiController};
+use esp_radio::wifi::{scan::ScanConfig, Interface, WifiController};
 use rustyfarian_esp_hal_wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -73,10 +73,23 @@ async fn main(spawner: Spawner) {
     // Destructure: `stack` is `Copy`, so we keep our own copy before moving
     // `controller` and `runner` into their tasks.
     let AsyncWifiHandle {
-        controller,
+        mut controller,
         stack,
         runner,
     } = handle;
+
+    // Scan before connecting — mirrors the official embassy_dhcp example.
+    // The active scan lets the radio settle and builds its BSSID/channel cache
+    // before the first association attempt.
+    println!("Scanning...");
+    match controller.scan_async(&ScanConfig::default()).await {
+        Ok(aps) => {
+            for ap in &aps {
+                println!("  {:?}", ap);
+            }
+        }
+        Err(e) => println!("Scan failed (continuing anyway): {:?}", e),
+    }
 
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
@@ -97,20 +110,23 @@ async fn main(spawner: Spawner) {
     }
 }
 
-// Initial association is started by `WiFiManager::init_async`; this task
-// only handles reconnection after a disconnect event.
+// Handles both the initial association and any subsequent reconnects.
+// `set_config` starts the radio but does NOT initiate association in
+// esp-radio 0.18 — `connect_async` must always be called explicitly.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
-    // `wait_for_disconnect_async` + `connect_async` replace the sync
-    // `wait_for_event(StaDisconnected)` + `connect` pair removed in
-    // esp-radio 0.18.
     loop {
-        let _ = controller.wait_for_disconnect_async().await;
-        println!("Wi-Fi disconnected — attempting to reconnect");
-        Timer::after(Duration::from_millis(500)).await;
-        if let Err(e) = controller.connect_async().await {
-            println!("reconnect failed: {:?}", e);
+        match controller.connect_async().await {
+            Ok(_) => {
+                // Connected — block until the link drops.
+                let _ = controller.wait_for_disconnect_async().await;
+                println!("Wi-Fi disconnected — reconnecting...");
+            }
+            Err(e) => {
+                println!("connect failed: {:?}", e);
+            }
         }
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 

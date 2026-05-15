@@ -203,21 +203,21 @@ mod driver {
     pub struct WiFiManager;
 
     impl WiFiManager {
-        /// Initialises the scheduler and the Wi-Fi radio, applies the station
-        /// configuration (which implicitly starts the controller and begins
-        /// association in `esp-radio 0.18`), and hands off control to
-        /// `embassy-net`.
+        /// Initialises the scheduler and the Wi-Fi radio, sets the station
+        /// credentials before the radio starts, and builds the `embassy-net`
+        /// stack — but does **not** initiate association.
         ///
         /// # Readiness
         ///
-        /// Association is **initiated** before this function returns — but it
-        /// is **not awaited**.  The function returns as soon as the controller
-        /// has been configured and the embassy-net stack has been built; the
-        /// radio is still negotiating with the AP at that moment, and DHCPv4
-        /// has not yet completed.  Callers that need to know when the link
-        /// is usable must `await` [`AsyncWifiHandle::wait_for_ip`] (or watch
-        /// `Stack::wait_config_up` themselves).  The spawned `wifi_task` only
-        /// needs to handle subsequent disconnects.
+        /// This function returns as soon as the controller has been configured
+        /// and the `embassy-net` stack has been built.  No connection attempt
+        /// has been made yet.  The caller is responsible for both the initial
+        /// association and all subsequent reconnects: spawn a `wifi_task` that
+        /// calls `controller.connect_async()` in a loop, then
+        /// `controller.wait_for_disconnect_async()` to block until the link
+        /// drops.  Callers that need to know when DHCP has completed must
+        /// `await` [`AsyncWifiHandle::wait_for_ip`] (or poll
+        /// `Stack::wait_config_up` directly).
         ///
         /// # Heap requirement
         ///
@@ -261,24 +261,24 @@ mod driver {
             let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
             esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
 
-            // 2. Construct the Wi-Fi controller.  In esp-radio 0.18 the radio
-            //    init that used to be a separate `esp_radio::init()` call is
-            //    folded into `wifi::new`; the function takes only the WIFI
-            //    peripheral and a `ControllerConfig`.
-            let (mut controller, interfaces) =
-                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
-                    .map_err(WifiError::Driver)?;
-
-            // 3. Apply station mode + credentials.  `set_config` is idempotent
-            //    in 0.18 and implicitly starts the controller and initiates
-            //    association — the explicit `start()`/`connect()` calls that
-            //    existed in 0.17 are gone.
+            // 2. Build the station config and pass it as `initial_config` so that
+            //    `esp_wifi_set_config` is called with real credentials BEFORE
+            //    `esp_wifi_start()` fires inside `wifi::new`.  Calling
+            //    `set_config` a second time after start (the previous approach)
+            //    does not reliably propagate credentials to the firmware on
+            //    bare-metal — the IDF driver always sets config before start.
             let station = StationConfig::default()
                 .with_ssid(config.ssid)
                 .with_password(config.password.into());
-            controller
-                .set_config(&Config::Station(station))
-                .map_err(WifiError::Driver)?;
+            let controller_cfg =
+                ControllerConfig::default().with_initial_config(Config::Station(station));
+
+            // 3. Construct the Wi-Fi controller.  `wifi::new` applies
+            //    `initial_config` (our real credentials) then calls
+            //    `esp_wifi_start()` — credentials are set before the radio
+            //    starts, matching the IDF init sequence.
+            let (mut controller, interfaces) =
+                esp_radio::wifi::new(config.wifi, controller_cfg).map_err(WifiError::Driver)?;
 
             // 4. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);
@@ -293,9 +293,21 @@ mod driver {
                 );
             }
 
+            if config.password.is_empty() {
+                log::warn!(
+                    "Wi-Fi password is empty — auth will fail on WPA2/WPA3 networks; \
+                     set WIFI_PASS at build time (option_env! captures at compile time, not runtime)"
+                );
+            }
+
             log::info!(
-                "Wi-Fi configured (SSID len={}), power save: {:?}",
+                "Wi-Fi configured (SSID len={}, password: {}), power save: {:?}",
                 config.ssid.len(),
+                if config.password.is_empty() {
+                    "absent"
+                } else {
+                    "present"
+                },
                 config.power_save,
             );
 

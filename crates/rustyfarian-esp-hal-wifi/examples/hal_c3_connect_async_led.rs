@@ -148,22 +148,23 @@ async fn led_task(mut led: Output<'static>) {
     }
 }
 
-// Initial association is started by `WiFiManager::init_async`; this task
-// only handles reconnection after a disconnect event.
+// Handles both the initial association and subsequent reconnects.
+// The LED `CONNECTED` flag is owned by `link_status_task` watching
+// `embassy_net::Stack` config-up/config-down edges — not toggled here,
+// because a successful L2 reconnect does not yet imply a new DHCP lease.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
-    // `wait_for_disconnect_async` and `connect_async` replace the
-    // sync `wait_for_event` + `connect` pair removed in esp-radio 0.18.
-    // The LED `CONNECTED` flag is owned by `link_status_task` watching
-    // `embassy_net::Stack` config-up/config-down edges — not toggled here,
-    // because a successful L2 reconnect does not yet imply a new DHCP lease.
     loop {
-        let _ = controller.wait_for_disconnect_async().await;
-        println!("Wi-Fi disconnected — attempting to reconnect");
-        Timer::after(Duration::from_millis(500)).await;
-        if let Err(e) = controller.connect_async().await {
-            println!("reconnect failed: {:?}", e);
+        match controller.connect_async().await {
+            Ok(_) => {
+                let _ = controller.wait_for_disconnect_async().await;
+                println!("Wi-Fi disconnected — reconnecting...");
+            }
+            Err(e) => {
+                println!("connect failed: {:?}", e);
+            }
         }
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 

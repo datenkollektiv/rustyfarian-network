@@ -26,6 +26,7 @@ timeline
     title rustyfarian-network Roadmap
 
     Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
+              : MQTT startup message — `.with_startup_message()` opt-in on MqttBuilder (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell
