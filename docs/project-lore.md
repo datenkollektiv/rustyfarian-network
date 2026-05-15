@@ -107,7 +107,7 @@ Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 
 - `WifiEvent::StaDisconnected` → `WifiEvent::StationDisconnected`
 - `WifiError::Disconnected` is now a tuple variant `Disconnected(DisconnectedStationInfo)` — pattern matches that previously used the unit variant break
 - `controller.is_connected()` returns `bool` directly, not `Result<bool, WifiError>`
-- `controller.connect()`, `disconnect()`, `start()` (sync) — all removed; replacements are `connect_async().await`, `disconnect_async().await`; `set_config()` is now idempotent and implicitly starts the controller and begins association
+- `controller.connect()`, `disconnect()`, `start()` (sync) — all removed; replacements are `connect_async().await`, `disconnect_async().await`; `set_config()` is now idempotent and starts the radio (`esp_wifi_start`) but does **not** initiate association — `connect_async()` must still be called explicitly
 - `controller.wait_for_event(WifiEvent::StaDisconnected)` removed; replacement is `controller.wait_for_disconnect_async().await -> Result<DisconnectedStationInfo, WifiError>`
 - `esp_radio::wifi::new()` signature is now `(WIFI<'d>, ControllerConfig)` — the prior `radio_ref` parameter is gone; `esp_radio::init()` is now `pub(crate)` and not part of user code
 

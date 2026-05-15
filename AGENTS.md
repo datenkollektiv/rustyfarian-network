@@ -5,7 +5,7 @@
 
 ## Project Overview
 
-`rustyfarian-network` is a Rust workspace providing Wi-Fi, MQTT, LoRa, and ESP-NOW networking libraries for ESP32 firmware.
+`rustyfarian-network` is a Rust workspace providing Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA networking libraries for ESP32 firmware.
 Two implementation tiers coexist: an ESP-IDF tier (`rustyfarian-esp-idf-*`, std-based) and a bare-metal `esp-hal` tier (`rustyfarian-esp-hal-*`, no_std).
 Both tiers share platform-independent `*-pure` crates that compile and unit-test on any host without the ESP toolchain.
 
@@ -19,6 +19,7 @@ ADRs in `docs/adr/` document each architectural split.
 | `wifi-pure`                  | `rustyfarian-esp-idf-wifi`   | `rustyfarian-esp-hal-wifi`  |
 | `lora-pure`                  | `rustyfarian-esp-idf-lora`   | `rustyfarian-esp-hal-lora`  |
 | `espnow-pure`                | `rustyfarian-esp-idf-espnow` | (not yet)                   |
+| `ota-pure`                   | `rustyfarian-esp-idf-ota`    | `rustyfarian-esp-hal-ota`   |
 | `rustyfarian-network-pure`   | `rustyfarian-esp-idf-mqtt`   | (planned)                   |
 
 Pure crates contain validation, types, traits, state machines, and timing math.
@@ -41,7 +42,7 @@ just run <name>            # flash + serial monitor
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.
 `just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
-Pure crates iterate fast without the ESP toolchain — see `just check-wifi-pure`, `just test-wifi`, etc.
+Pure crates iterate fast without the ESP toolchain — see `just check-wifi-pure`, `just test-wifi`, `just test-ota`, etc.
 
 ## Key Conventions
 
@@ -53,6 +54,13 @@ Pure crates iterate fast without the ESP toolchain — see `just check-wifi-pure
 - **Project lore** in `docs/project-lore.md` records non-obvious technical discoveries (failures that took >15 min to diagnose, or root causes not obvious from the error message). Read it before debugging anything ESP-IDF / `esp-hal` / LoRaWAN.
 - **Cross-repo git deps** must be pinned with `tag` or `rev` — the workspace pulls in `links = "..."` crates that fail to resolve if upstream bumps without coordination.
 - **License:** dual MIT / Apache-2.0 (see `LICENSE`).
+
+## Coding Principles
+
+- **State assumptions** before starting. If a task has multiple valid interpretations, present them rather than picking silently.
+- **Simplicity first.** Minimum code that solves the problem. No features beyond what was asked. No abstractions for single-use code. No error handling for impossible scenarios.
+- **Surgical changes.** Touch only what the task requires. Do not improve adjacent code, comments, or formatting. Every changed line should trace directly to the user's request.
+- When your changes create orphans (unused imports, variables, functions), remove them. Do not remove pre-existing dead code unless asked.
 
 ## Important Files
 
