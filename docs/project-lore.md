@@ -120,6 +120,14 @@ The password setter still needs `.into()` because its parameter type is the more
 The pin moved from the `configure_tx` parameter to a chained `.with_pin(...)` call so that channel configuration can be reused independently of pin assignment.
 The reference migration is in the `rustyfarian-ws2812` repo's CHANGELOG entry for the April 2026 wave (file: `crates/rustyfarian-esp-hal-ws2812/examples/hal_c6_*.rs`).
 
+**ESP32-C3 bare-metal Wi-Fi (esp-radio 0.18) fails with `AuthenticationExpired` (reason 2) on every WPA2 AP because the binary blob transmits at full power (~20 dBm), which the Super Mini PCB antenna reflects back into the chip and corrupts auth frames.**
+ESP-IDF limits TX power internally for regulatory compliance; the bare-metal blob does not.
+The same hardware and credentials connect fine under the ESP-IDF std stack.
+Fix: declare `esp_wifi_set_max_tx_power` via `extern "C"` (the symbol is already linked transitively via `esp-radio`) and call it immediately after `controller.set_config()` — `set_config` triggers `esp_wifi_start()` internally, and the call must come *after* that; calling it before returns `ESP_ERR_WIFI_NOT_STARTED` (error 12290 / `0x3002`).
+Use `esp_wifi_set_max_tx_power(34)` (34 × 0.25 dBm = 8.5 dBm).
+Workaround lives in `WiFiManager::init_async` (`crates/rustyfarian-esp-hal-wifi/src/lib.rs`) and in `hal_c3_connect_async_upstream.rs` for the upstream-verbatim example.
+Upstream references: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
+
 **`embassy-executor 0.10` removed `Spawner::must_spawn`; `#[embassy_executor::task]` macros now return `Result<SpawnToken<...>, SpawnError>`.**
 Old: `spawner.must_spawn(my_task(arg));`
 New: `spawner.spawn(my_task(arg).unwrap());` — the `.unwrap()` goes on the **task call** (which returns `Result`), not on `spawner.spawn` (which returns `()`).

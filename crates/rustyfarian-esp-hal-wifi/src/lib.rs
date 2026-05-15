@@ -248,6 +248,18 @@ mod driver {
         /// );
         /// ```
         ///
+        /// # TX-power policy
+        ///
+        /// When `tx_power` is left at [`TxPowerLevel::Medium`] (the default),
+        /// `init_async` silently overrides it to [`TxPowerLevel::Low`] (8.5 dBm).
+        ///
+        /// This is a deliberate library-wide default: PCB-antenna boards such as
+        /// the ESP32-C3/C6 Super Mini reflect RF energy at full power (~20 dBm),
+        /// corrupting WPA2 auth frames.  8.5 dBm is a safe baseline for all
+        /// bare-metal builds; callers with external antennas can raise it by
+        /// passing an explicit [`TxPowerLevel`] via
+        /// [`WiFiConfig::with_tx_power`][wifi_pure::WiFiConfig::with_tx_power].
+        ///
         /// # One-shot
         ///
         /// Call at most once per boot — a `static` `StackResources` is
@@ -261,36 +273,66 @@ mod driver {
             let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
             esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
 
-            // 2. Build the station config and pass it as `initial_config` so that
-            //    `esp_wifi_set_config` is called with real credentials BEFORE
-            //    `esp_wifi_start()` fires inside `wifi::new`.  Calling
-            //    `set_config` a second time after start (the previous approach)
-            //    does not reliably propagate credentials to the firmware on
-            //    bare-metal — the IDF driver always sets config before start.
+            // 2. Construct the Wi-Fi controller with a default ControllerConfig
+            //    (empty station config).  Credentials are applied via an explicit
+            //    `set_config` call immediately after `wifi::new` returns (step 3).
+            let (mut controller, interfaces) =
+                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
+                    .map_err(WifiError::Driver)?;
+
+            // 3. Apply station credentials.  esp_radio::wifi::new already called
+            //    set_config internally with an empty StationConfig (which starts the
+            //    radio driver via esp_wifi_start).  This call updates the SSID/password
+            //    so wifi_task's first connect_async uses the real credentials.
             let station = StationConfig::default()
                 .with_ssid(config.ssid)
                 .with_password(config.password.into());
-            let controller_cfg =
-                ControllerConfig::default().with_initial_config(Config::Station(station));
+            controller
+                .set_config(&Config::Station(station))
+                .map_err(WifiError::Driver)?;
 
-            // 3. Construct the Wi-Fi controller.  `wifi::new` applies
-            //    `initial_config` (our real credentials) then calls
-            //    `esp_wifi_start()` — credentials are set before the radio
-            //    starts, matching the IDF init sequence.
-            let (mut controller, interfaces) =
-                esp_radio::wifi::new(config.wifi, controller_cfg).map_err(WifiError::Driver)?;
+            // 4. Limit TX power to 8.5 dBm (34 × 0.25 dBm).
+            //
+            // ESP32-C3/C6 Super Mini and similar PCB-antenna boards reflect RF energy
+            // back into the chip at full power (~20 dBm), corrupting WPA2 auth frames
+            // and causing every AP to deauth with reason 2 (AuthenticationExpired).
+            // ESP-IDF limits TX power internally for regulatory compliance; the
+            // bare-metal blob does not.  This call must come after set_config() (step 3)
+            // because that is what triggers esp_wifi_start() — calling it before returns
+            // ESP_ERR_WIFI_NOT_STARTED (0x3002).
+            //
+            // The symbol is already in the linked binary via esp-radio's dependency on
+            // esp-wifi-sys; no extra crate dependency is needed.
+            //
+            // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
+            extern "C" {
+                fn esp_wifi_set_max_tx_power(power: i8) -> i32;
+            }
+            // Default to Low (8.5 dBm) if the caller left tx_power at Medium (the
+            // wifi_pure default). Medium (~13 dBm) still causes auth failures on
+            // PCB-antenna boards; Low is the safe baseline for bare-metal.
+            let quarter_dbm = if config.tx_power == TxPowerLevel::default() {
+                TxPowerLevel::Low.to_quarter_dbm()
+            } else {
+                config.tx_power.to_quarter_dbm()
+            };
+            // SAFETY: `esp_wifi_set_max_tx_power` is provided by esp-wifi-sys (linked
+            // by every esp-radio build); it is only valid after esp_wifi_start(), which
+            // step 3's set_config() triggers.  `to_quarter_dbm()` returns values in
+            // [8, 78] — all within the SDK-documented valid range [8, 84].
+            let rc = unsafe { esp_wifi_set_max_tx_power(quarter_dbm) };
+            if rc != 0 {
+                log::warn!(
+                    "esp_wifi_set_max_tx_power({}) failed with code {:#010x} (non-fatal)",
+                    quarter_dbm,
+                    rc
+                );
+            }
 
-            // 4. Power save (non-fatal if it fails).
+            // 5. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);
             if let Err(e) = controller.set_power_saving(ps) {
                 log::warn!("Failed to set power save mode (non-fatal): {:?}", e);
-            }
-
-            if config.tx_power != TxPowerLevel::default() {
-                log::warn!(
-                    "TX power level {:?} configured but esp-radio 0.18 does not expose tx_power API — using radio default",
-                    config.tx_power
-                );
             }
 
             if config.password.is_empty() {
