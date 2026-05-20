@@ -34,7 +34,7 @@ use std::time::Duration;
 use pennant::{PulseEffect, StatusLed};
 use rgb::RGB8;
 use rustyfarian_esp_idf_wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
-use rustyfarian_esp_idf_ws2812::WS2812RMT;
+use rustyfarian_esp_idf_ws2812::Ws2812Rmt;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let mut led = WS2812RMT::new(peripherals.pins.gpio8)?;
+    let mut led = Ws2812Rmt::new(peripherals.pins.gpio8)?;
     let mut pulse = PulseEffect::new();
 
     let config = WiFiConfig::new(SSID, PASSWORD)
