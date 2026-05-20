@@ -31,7 +31,6 @@ timeline
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell
               : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule
-              : pennant crates.io coordination checkpoint — release-plan note before ws2812 v0.6
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
