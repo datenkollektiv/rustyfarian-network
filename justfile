@@ -126,6 +126,10 @@ test-backoff:
 test-mqtt:
     cargo test --target {{host_target}} {{pure_crates}} mqtt
 
+# run subscriber-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
+test-subscriber-thread:
+    cargo test --target {{host_target}} -p rustyfarian-network-pure subscriber_thread
+
 # run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
 test-wifi:
     cargo test --target {{host_target}} -p wifi-pure --features mock
@@ -143,7 +147,7 @@ test-ota:
     cargo test --target {{host_target}} -p ota-pure
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-wifi test-lora test-espnow test-ota test-ota-hal
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal
 
 # ── Examples ────────────────────────────────────────────────────────────────
 
