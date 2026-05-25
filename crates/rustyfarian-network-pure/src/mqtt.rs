@@ -222,6 +222,76 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
     }
 }
 
+// ── Subscriber thread ────────────────────────────────────────────────────────
+
+/// MQTT Quality of Service level.
+///
+/// Platform-neutral mirror of `esp_idf_svc::mqtt::client::QoS`.
+/// Used by [`SubscribeClient`] and [`spawn_subscriber_thread`] so that
+/// the subscriber thread machinery can be compiled and tested on any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QoS {
+    AtMostOnce,
+    AtLeastOnce,
+    ExactlyOnce,
+}
+
+/// Minimal MQTT subscribe surface used by [`spawn_subscriber_thread`].
+///
+/// Implemented for `EspMqttClient<'static>` in `rustyfarian-esp-idf-mqtt`
+/// and for test doubles on the host.
+pub trait SubscribeClient {
+    fn subscribe_topic(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()>;
+}
+
+/// Spawns a short-lived thread that subscribes `client` to each topic in `topics`.
+///
+/// The thread runs independently so that a blocking `subscribe_topic` implementation
+/// (e.g. `EspMqttClient::subscribe` on esp-idf-svc 0.52+, which waits for SUBACK)
+/// does not prevent the caller (event loop thread) from processing further events.
+///
+/// # Stale-thread safety
+///
+/// On rapid reconnects, an earlier subscriber thread may still be running when a
+/// new `Connected` event fires and spawns a fresh one.  Both threads share the
+/// same `Arc<Mutex<C>>`, so they serialize behind the mutex.  The stale thread
+/// either completes a harmless duplicate subscribe (brokers accept this per
+/// MQTT §3.8), or if the client has since disconnected, `subscribe_topic` returns
+/// an error that is logged as a warning.  Either outcome is safe and the fresh
+/// thread on the new connection will re-subscribe correctly.
+///
+/// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
+/// Pass the platform-specific constant (e.g. 8192) for embedded targets.
+pub fn spawn_subscriber_thread<C>(
+    client: std::sync::Arc<std::sync::Mutex<C>>,
+    topics: Vec<(String, QoS)>,
+    stack_size: usize,
+) where
+    C: SubscribeClient + Send + 'static,
+{
+    let mut builder = std::thread::Builder::new();
+    if stack_size > 0 {
+        builder = builder.stack_size(stack_size);
+    }
+    if let Err(e) = builder.spawn(move || {
+        let mut guard = match client.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!("[mqtt] subscriber thread: client mutex poisoned: {}", e);
+                return;
+            }
+        };
+        for (topic, qos) in &topics {
+            match guard.subscribe_topic(topic.as_str(), *qos) {
+                Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
+                Err(e) => log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e),
+            }
+        }
+    }) {
+        log::warn!("[mqtt] failed to spawn subscriber thread: {:#}", e);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -609,5 +679,111 @@ mod tests {
     fn match_trailing_hash_zero_levels() {
         // "sport/tennis/#" should match "sport/tennis" (zero additional levels)
         assert!(topic_matches_filter("sport/tennis", "sport/tennis/#"));
+    }
+
+    // ── spawn_subscriber_thread ──────────────────────────────────────────────
+
+    use super::{spawn_subscriber_thread, QoS, SubscribeClient};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    struct BlockingMockClient {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        subscribed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SubscribeClient for BlockingMockClient {
+        fn subscribe_topic(&mut self, topic: &str, _qos: QoS) -> anyhow::Result<()> {
+            let (lock, cvar) = &*self.gate;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cvar.wait(ready).unwrap();
+            }
+            self.subscribed.lock().unwrap().push(topic.to_string());
+            Ok(())
+        }
+    }
+
+    fn wait_for_count(subscribed: &Arc<Mutex<Vec<String>>>, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if subscribed.lock().unwrap().len() == n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "subscribe never completed within 2 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Regression test for the SUBACK deadlock (esp-idf-svc 0.52+).
+    ///
+    /// The old architecture called `subscribe()` on the event loop thread inside
+    /// the `Connected` handler.  `subscribe()` blocks until SUBACK, but the event
+    /// loop can only receive SUBACK by calling `connection.next()` — which it cannot
+    /// do while blocked inside the handler.
+    ///
+    /// The fix spawns a separate subscriber thread.  This test verifies that the
+    /// spawner returns in <100 ms even while the mock's `subscribe_topic` is still
+    /// blocking — a regression that would reliably catch any revert to the old
+    /// inline pattern.
+    #[test]
+    fn subscriber_thread_does_not_block_caller() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let subscribed = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&subscribed),
+        }));
+
+        let before = std::time::Instant::now();
+        spawn_subscriber_thread(
+            client,
+            vec![("commands/#".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+        let elapsed = before.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "spawn_subscriber_thread blocked for {elapsed:?}; \
+             event loop thread would have deadlocked"
+        );
+        assert!(subscribed.lock().unwrap().is_empty());
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        wait_for_count(&subscribed, 1);
+        assert_eq!(subscribed.lock().unwrap()[0], "commands/#");
+    }
+
+    /// All registered topics are subscribed in order when the mock is non-blocking.
+    #[test]
+    fn subscriber_thread_subscribes_all_topics() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let subscribed = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&subscribed),
+        }));
+
+        spawn_subscriber_thread(
+            client,
+            vec![
+                ("commands/#".to_string(), QoS::AtLeastOnce),
+                ("ota/manifest".to_string(), QoS::AtLeastOnce),
+            ],
+            0,
+        );
+
+        wait_for_count(&subscribed, 2);
+        assert_eq!(
+            subscribed.lock().unwrap().as_slice(),
+            ["commands/#", "ota/manifest"]
+        );
     }
 }

@@ -11,3 +11,5 @@ categories = ["embedded"]
 
 [dependencies]
 wifi-pure.workspace = true
+anyhow.workspace = true
+log.workspace = true

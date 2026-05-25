@@ -12,10 +12,7 @@
 //! let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 //!
 //! let handle = MqttBuilder::new(config)
-//!     .on_connect(|client, _is_clean| {
-//!         client.subscribe("commands/#", QoS::AtLeastOnce)?;
-//!         Ok(())
-//!     })
+//!     .subscribe("commands/#", QoS::AtLeastOnce)
 //!     .on_disconnect(|| log::warn!("MQTT disconnected"))
 //!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
 //!     .build()?;
@@ -66,9 +63,9 @@ use std::time::Duration;
 pub use pennant::{SimpleLed, StatusLed};
 
 use rustyfarian_network_pure::mqtt::{
-    connection_wait_iterations, format_broker_url, next_state, validate_broker_host,
-    validate_broker_port, validate_client_id, validate_publish_topic, validate_subscribe_filter,
-    MqttConnectionState, MqttEvent,
+    connection_wait_iterations, format_broker_url, next_state, spawn_subscriber_thread,
+    validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
+    validate_subscribe_filter, MqttConnectionState, MqttEvent, QoS as PureQoS, SubscribeClient,
 };
 
 /// Poll interval used while waiting for the MQTT broker connection to be confirmed.
@@ -90,6 +87,12 @@ const EVENT_LOOP_STACK_SIZE: usize = 8192;
 /// event loop overhead.  Measure on hardware and increase if stack overflows
 /// are observed with deeply nested `on_connect` logic.
 const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
+
+/// Stack size for the per-connect subscriber thread.
+///
+/// Spawned once per connect/reconnect to call `subscribe()` outside the event
+/// loop thread, avoiding the SUBACK deadlock on `esp-idf-svc 0.52+`.
+const SUBSCRIBER_STACK_SIZE: usize = 8192;
 
 /// Default stack size for the ESP-IDF MQTT client task.
 ///
@@ -582,6 +585,53 @@ where
 
 // ── Builder API ───────────────────────────────────────────────────────────────
 
+/// Newtype wrapper around `EspMqttClient<'static>`.
+///
+/// Exists solely to satisfy the orphan rule: `SubscribeClient` is defined in
+/// `rustyfarian-network-pure` and `EspMqttClient` is defined in `esp-idf-svc`,
+/// so neither crate can implement the trait for the other.  Wrapping the client
+/// in a local type makes the `impl` legal without changing runtime behaviour.
+/// `Deref`/`DerefMut` forward all other method calls transparently.
+struct SubscribableClient(EspMqttClient<'static>);
+
+impl std::ops::Deref for SubscribableClient {
+    type Target = EspMqttClient<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SubscribableClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl SubscribeClient for SubscribableClient {
+    fn subscribe_topic(&mut self, topic: &str, qos: PureQoS) -> anyhow::Result<()> {
+        self.0
+            .subscribe(topic, pure_to_idf_qos(qos))
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+}
+
+fn pure_to_idf_qos(q: PureQoS) -> QoS {
+    match q {
+        PureQoS::AtMostOnce => QoS::AtMostOnce,
+        PureQoS::AtLeastOnce => QoS::AtLeastOnce,
+        PureQoS::ExactlyOnce => QoS::ExactlyOnce,
+    }
+}
+
+fn idf_to_pure_qos(q: QoS) -> PureQoS {
+    match q {
+        QoS::AtMostOnce => PureQoS::AtMostOnce,
+        QoS::AtLeastOnce => PureQoS::AtLeastOnce,
+        QoS::ExactlyOnce => PureQoS::ExactlyOnce,
+    }
+}
+
 /// Callback invoked on every (re)connect.
 ///
 /// Receives `&mut EspMqttClient<'_>` for subscriptions and retained publishes,
@@ -620,8 +670,8 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 /// let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 ///
 /// let handle = MqttBuilder::new(config)
+///     .subscribe("commands/#", QoS::AtLeastOnce)
 ///     .on_connect(|client, _is_clean| {
-///         client.subscribe("commands/#", QoS::AtLeastOnce)?;
 ///         client.enqueue("device/status", QoS::AtLeastOnce, true, b"online")?;
 ///         Ok(())
 ///     })
@@ -637,6 +687,7 @@ pub struct MqttBuilder<'a> {
     on_connect: Option<OnConnectCallback>,
     on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
     on_message: Option<OnMessageCallback>,
+    subscribe_topics: Vec<(String, PureQoS)>,
 }
 
 impl<'a> MqttBuilder<'a> {
@@ -647,7 +698,45 @@ impl<'a> MqttBuilder<'a> {
             on_connect: None,
             on_disconnect: None,
             on_message: None,
+            subscribe_topics: Vec::new(),
         }
+    }
+
+    /// Registers a topic to subscribe to on every (re)connect.
+    ///
+    /// Subscriptions are sent from a short-lived thread spawned after the
+    /// [`on_connect`](Self::on_connect) callback returns, outside the event
+    /// loop thread.  This avoids the SUBACK deadlock present when calling
+    /// `client.subscribe()` from inside the callback on `esp-idf-svc 0.52+`.
+    ///
+    /// # Semantics
+    ///
+    /// - **Lifecycle**: when at least one topic is registered, a subscriber
+    ///   thread is spawned on every `Connected` event (initial connect and
+    ///   every automatic reconnect).
+    /// - **`is_connected()`**: flips to `true` immediately when `on_connect`
+    ///   returns, which is *before* the subscriber thread has sent the SUBSCRIBE
+    ///   packets.  Do not assume subscriptions are active the instant
+    ///   `is_connected()` returns `true`.
+    /// - **Failures**: subscribe errors are logged as warnings and not
+    ///   propagated.  Failed subscriptions are retried automatically on the
+    ///   next reconnect.
+    /// - **Duplicates**: registering the same `(topic, qos)` pair more than
+    ///   once is intentionally preserved — duplicate SUBSCRIBE packets are
+    ///   handled safely by brokers per MQTT §3.8.
+    ///
+    /// Call this method once per topic; it can be chained:
+    ///
+    /// ```ignore
+    /// MqttBuilder::new(config)
+    ///     .subscribe("commands/#", QoS::AtLeastOnce)
+    ///     .subscribe("ota/manifest", QoS::AtLeastOnce)
+    ///     .build()?;
+    /// ```
+    pub fn subscribe(mut self, topic: impl Into<String>, qos: QoS) -> Self {
+        self.subscribe_topics
+            .push((topic.into(), idf_to_pure_qos(qos)));
+        self
     }
 
     /// Registers a callback invoked on every (re)connect.
@@ -656,9 +745,12 @@ impl<'a> MqttBuilder<'a> {
     /// (no retained state from a previous session), and `false` when the
     /// previous session was resumed.
     ///
-    /// Use the `client` parameter to call `subscribe()` and `enqueue()`.
-    /// Subscriptions placed here are automatically re-established on every
-    /// automatic reconnection.
+    /// Use the `client` parameter only for `enqueue()` calls (retained-state
+    /// publishes).  **Do not call `client.subscribe()` here** — on
+    /// `esp-idf-svc 0.52+`, `subscribe()` blocks until the broker sends
+    /// SUBACK, and the event loop thread cannot process that response while
+    /// blocked inside this callback.  Register subscriptions with
+    /// [`.subscribe()`](MqttBuilder::subscribe) on the builder instead.
     ///
     /// If the callback returns `Err`, the error is logged with `warn!` and the
     /// event loop continues.  The next automatic reconnection will invoke the
@@ -721,6 +813,10 @@ impl<'a> MqttBuilder<'a> {
             .map_err(|e| anyhow::anyhow!("invalid MQTT port: {}", e))?;
         validate_client_id(config.client_id)
             .map_err(|e| anyhow::anyhow!("invalid MQTT client_id: {}", e))?;
+        for (topic, _) in &self.subscribe_topics {
+            validate_subscribe_filter(topic.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
+        }
 
         // Build owned copies of all string fields.
         // esp_mqtt_client_init() calls strdup() on each of these immediately,
@@ -764,7 +860,7 @@ impl<'a> MqttBuilder<'a> {
         // url, client_id, username, password, lwt_topic, lwt_payload and mqtt_cfg
         // are all dropped here — the C library has already strdup'd what it needs.
 
-        let shared_client = Arc::new(Mutex::new(client));
+        let shared_client = Arc::new(Mutex::new(SubscribableClient(client)));
         let client_for_thread = Arc::clone(&shared_client);
 
         let connected = Arc::new(AtomicBool::new(false));
@@ -780,6 +876,7 @@ impl<'a> MqttBuilder<'a> {
         let on_connect = self.on_connect;
         let on_disconnect = self.on_disconnect;
         let on_message = self.on_message;
+        let subscribe_topics = self.subscribe_topics;
 
         std::thread::Builder::new()
             .stack_size(BUILDER_EVENT_LOOP_STACK_SIZE)
@@ -814,6 +911,13 @@ impl<'a> MqttBuilder<'a> {
                                     if let Err(e) = f(&mut guard, is_clean) {
                                         log::warn!("[mqtt] on_connect callback failed: {:#}", e);
                                     }
+                                }
+                                if !subscribe_topics.is_empty() {
+                                    spawn_subscriber_thread(
+                                        Arc::clone(&client_for_thread),
+                                        subscribe_topics.clone(),
+                                        SUBSCRIBER_STACK_SIZE,
+                                    );
                                 }
                                 // Set connected AFTER the on_connect callback releases the
                                 // mutex.  This prevents publish_with() callers from racing
@@ -879,10 +983,7 @@ impl<'a> MqttBuilder<'a> {
     /// use rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttConfig, StatusLed};
     ///
     /// let handle = MqttBuilder::new(config)
-    ///     .on_connect(|client, _| {
-    ///         client.subscribe("commands/#", QoS::AtLeastOnce)?;
-    ///         Ok(())
-    ///     })
+    ///     .subscribe("commands/#", QoS::AtLeastOnce)
     ///     .build_and_wait(&mut status_led)?;
     /// ```
     pub fn build_and_wait<L>(self, led: &mut L) -> anyhow::Result<MqttHandle>
@@ -950,7 +1051,7 @@ impl<'a> MqttBuilder<'a> {
 /// ```
 #[derive(Clone)]
 pub struct MqttHandle {
-    client: Arc<Mutex<EspMqttClient<'static>>>,
+    client: Arc<Mutex<SubscribableClient>>,
     connected: Arc<AtomicBool>,
     // Keeps the event loop alive.  When the last clone is dropped the
     // Arc refcount reaches zero, and the thread's Weak::upgrade() returns
@@ -1085,12 +1186,22 @@ impl MqttHandle {
         Ok(())
     }
 
-    /// Returns `true` if the client is connected **and** the `on_connect`
+    /// Returns `true` if the MQTT transport is connected and the `on_connect`
     /// callback has completed.
     ///
     /// The flag is set only after `on_connect` releases the internal mutex,
     /// so a caller that sees `true` and immediately calls `publish_with()`
     /// is guaranteed to find the mutex free — no race with the event loop.
+    ///
+    /// # Subscriptions may still be in flight
+    ///
+    /// Topics registered via [`MqttBuilder::subscribe`] are sent by a separate
+    /// thread that is spawned when `on_connect` returns — the same moment this
+    /// flag flips to `true`.  There is therefore a brief window where
+    /// `is_connected()` is `true` but the broker has not yet acknowledged those
+    /// subscriptions.  Retained messages on subscribed topics will be delivered
+    /// once the broker processes the SUBSCRIBE packets; no application action is
+    /// needed.
     ///
     /// Uses `Ordering::Acquire` to ensure visibility of any state written
     /// by the event loop thread before the flag was set.
