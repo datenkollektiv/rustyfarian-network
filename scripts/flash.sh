@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # flash.sh — build and flash a named example
-# Usage: scripts/flash.sh <example>
+# Usage: scripts/flash.sh <example> [hal_dir [idf_dir]]
 #   example: idf_{chip}_{feature} or hal_{chip}_{name}
 #   e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join
 #
@@ -12,6 +12,8 @@ set -euo pipefail
 # (32 KB MMU page mismatch) and produces the "efuse blk rev" boot failure.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib.sh
+. "$SCRIPT_DIR/lib.sh"
 
 # Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
 # usbmodem/usbserial (macOS) or ttyUSB/ttyACM (Linux) device — espflash's own
@@ -29,6 +31,8 @@ if [ $# -lt 1 ]; then
 fi
 
 example="$1"
+hal_dir="${2:-target/hal}"
+idf_dir="${3:-target/idf}"
 
 # Extract prefix to determine HAL type
 prefix=$(printf '%s' "$example" | cut -d_ -f1)
@@ -60,32 +64,18 @@ case "$prefix" in
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            MCU="$mcu" cargo +esp build --release --target "$target" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo +esp build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
         else
-            MCU="$mcu" cargo build --release --target "$target" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
         fi
 
-        # Use the IDF-built bootloader; espflash 4.x bundles v5.5.1 which is incompatible
-        # with v5.3.3 binaries.
-        bl_candidates=( "$PWD/target/$target/release/build"/esp-idf-sys-*/out/build/bootloader/bootloader.bin )
-        bl=""
-        if [ ${#bl_candidates[@]} -gt 0 ] && [ -e "${bl_candidates[0]}" ]; then
-            if [ ${#bl_candidates[@]} -gt 1 ]; then
-                printf 'Error: multiple IDF-built bootloaders found for target "%s".\n' "$target" >&2
-                printf 'Please clean old builds or remove unused esp-idf-sys-* build directories.\nCandidates:\n' >&2
-                for cand in "${bl_candidates[@]}"; do
-                    printf '  %s\n' "$cand" >&2
-                done
-                exit 1
-            fi
-            bl="${bl_candidates[0]}"
-        fi
+        bl=$(find_idf_bootloader "$target" "$idf_dir")
         if [ -n "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "target/$target/release/examples/$example"
+            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
         else
             printf 'Warning: IDF-built bootloader not found, using espflash default (may fail on boot).\n' >&2
-            espflash flash "${port_args[@]}" --ignore-app-descriptor "target/$target/release/examples/$example"
+            espflash flash "${port_args[@]}" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
         fi
         ;;
 
@@ -119,42 +109,27 @@ case "$prefix" in
         esac
 
         # Ensure IDF-built bootloader is cached
-        "$SCRIPT_DIR/ensure-bootloader.sh" "$chip"
+        "$SCRIPT_DIR/ensure-bootloader.sh" "$chip" "$hal_dir" "$idf_dir"
 
         printf 'Building %s for bare-metal %s (MCU=%s)...\n' "$example" "$hal_target" "$mcu"
 
         # Build command differs by chip: esp32 requires Xtensa toolchain
         if [ "$mcu" = "esp32" ] || [ "$mcu" = "esp32s3" ]; then
-            # Source xtensa toolchain for esp32
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            cargo +esp build --release -Zbuild-std=core,alloc --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo +esp build --release -Zbuild-std=core,alloc --target "$hal_target" --target-dir "$hal_dir" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         else
-            cargo build --release -Zbuild-std=core,alloc --target "$hal_target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo build --release -Zbuild-std=core,alloc --target "$hal_target" --target-dir "$hal_dir" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         fi
 
-        # Get bootloader from IDF target's release cache; HAL targets don't produce bootloaders
-        bl_candidates=( "$PWD/target/$idf_target/release/build"/esp-idf-sys-*/out/build/bootloader/bootloader.bin )
-        bl=""
-        if [ ${#bl_candidates[@]} -gt 0 ] && [ -e "${bl_candidates[0]}" ]; then
-            if [ ${#bl_candidates[@]} -gt 1 ]; then
-                printf 'Error: multiple IDF-built bootloaders found for target "%s".\n' "$idf_target" >&2
-                printf 'Please clean old builds or remove unused esp-idf-sys-* build directories.\nCandidates:\n' >&2
-                for cand in "${bl_candidates[@]}"; do
-                    printf '  %s\n' "$cand" >&2
-                done
-                exit 1
-            fi
-            bl="${bl_candidates[0]}"
-        fi
-
+        bl=$(find_idf_bootloader "$idf_target" "$idf_dir")
         if [ -n "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
+            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
         else
             printf 'Warning: no IDF-built bootloader cached for %s; using espflash default (may fail on boot for some chips).\n' "$chip" >&2
-            espflash flash "${port_args[@]}" --ignore-app-descriptor "target/$hal_target/release/examples/$example"
+            espflash flash "${port_args[@]}" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
         fi
         ;;
 

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# doctor.sh — check development prerequisites (RAM disk, sccache)
+# Usage: scripts/doctor.sh <ramdisk> <hal_dir> <idf_dir>
+
+ramdisk="$1"
+hal_dir="$2"
+idf_dir="$3"
+
+if [ -d "$ramdisk" ]; then
+    if [ -d "$ramdisk/targets/hal" ] && [ -d "$ramdisk/targets/idf" ]; then
+        printf "  ramdisk    ok       %s\n" "$ramdisk"
+        printf "  hal target ok       %s\n" "$hal_dir"
+        printf "  idf target ok       %s\n" "$idf_dir"
+    else
+        printf "  ramdisk    PARTIAL  %s (subdirs missing — run: just ramdisk attach)\n" "$ramdisk"
+        printf "  hal target fallback %s\n" "$hal_dir"
+        printf "  idf target fallback %s\n" "$idf_dir"
+    fi
+else
+    printf "  ramdisk    MISSING  run: just ramdisk attach\n"
+    printf "  hal target fallback %s\n" "$hal_dir"
+    printf "  idf target fallback %s\n" "$idf_dir"
+fi
+
+if command -v sccache >/dev/null 2>&1; then
+    if [ "${RUSTC_WRAPPER:-}" = "sccache" ]; then
+        printf "  sccache    ok       %s\n" "$(sccache --version 2>/dev/null)"
+    else
+        printf "  sccache    --       installed but RUSTC_WRAPPER not set\n"
+    fi
+else
+    printf "  sccache    MISSING  run: brew install sccache  (optional, speeds up cold builds)\n"
+fi

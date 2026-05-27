@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # build-example.sh — build a named example (no flash)
-# Usage: scripts/build-example.sh <example>
+# Usage: scripts/build-example.sh <example> [hal_dir [idf_dir]]
 #   example: idf_{chip}_{feature} or hal_{chip}_{name}
 #   e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join
 #
@@ -16,6 +16,8 @@ if [ $# -lt 1 ]; then
 fi
 
 example="$1"
+hal_dir="${2:-target/hal}"
+idf_dir="${3:-target/idf}"
 
 # Extract prefix to determine HAL type
 prefix=$(printf '%s' "$example" | cut -d_ -f1)
@@ -47,9 +49,9 @@ case "$prefix" in
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            MCU="$mcu" cargo +esp build --release --target "$target" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo +esp build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
         else
-            MCU="$mcu" cargo build --release --target "$target" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
         fi
         ;;
 
@@ -86,16 +88,15 @@ case "$prefix" in
 
         # Build commands differ by chip: esp32 requires Xtensa toolchain
         if [ "$mcu" = "esp32" ] || [ "$mcu" = "esp32s3" ]; then
-            # Source xtensa toolchain for esp32
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            cargo +esp build --release -Zbuild-std=core,alloc --target "$target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo +esp build --release -Zbuild-std=core,alloc --target "$target" --target-dir "$hal_dir" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         else
             # RISC-V bare-metal: override the workspace [unstable] build-std (which
             # defaults to "std") with core + alloc only.  alloc is needed by crates
             # like esp-radio that use alloc::string::String.
-            cargo build --release -Zbuild-std=core,alloc --target "$target" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
+            cargo build --release -Zbuild-std=core,alloc --target "$target" --target-dir "$hal_dir" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         fi
         ;;
 

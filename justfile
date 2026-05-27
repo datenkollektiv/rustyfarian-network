@@ -9,6 +9,28 @@
 _default:
     @just --list
 
+# host target, used to override the workspace ESP-IDF target for pure-logic tests
+host_target := `scripts/host-target.sh`
+
+# platform-independent crates that can be compiled and tested on the host
+pure_crates := "-p rustyfarian-network-pure -p wifi-pure -p espnow-pure"
+
+ramdisk := "/Volumes/RustBuilds"
+hal_dir  := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
+idf_dir  := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
+
+# ── Build Environment ─────────────────────────────────────────────────────
+
+# show RAM disk status, resolved target dirs, and sccache
+doctor:
+    @scripts/doctor.sh "{{ramdisk}}" "{{hal_dir}}" "{{idf_dir}}"
+
+# manage the RAM disk: just ramdisk attach | detach
+ramdisk action:
+    @scripts/ramdisk.sh "{{action}}"
+
+# ── Build & Check ─────────────────────────────────────────────────────────
+
 # build the entire workspace (release)
 build:
     cargo build --release
@@ -19,15 +41,15 @@ check:
 
 # check the wifi crate
 check-wifi:
-    cargo check -p rustyfarian-esp-idf-wifi
+    cargo check -p rustyfarian-esp-idf-wifi --target-dir {{ idf_dir }}
 
 # check the mqtt crate
 check-mqtt:
-    cargo check -p rustyfarian-esp-idf-mqtt
+    cargo check -p rustyfarian-esp-idf-mqtt --target-dir {{ idf_dir }}
 
 # check the esp-idf lora crate
 check-lora:
-    cargo check -p rustyfarian-esp-idf-lora
+    cargo check -p rustyfarian-esp-idf-lora --target-dir {{ idf_dir }}
 
 # check the pure lora crate (no ESP-IDF required)
 check-lora-pure:
@@ -47,16 +69,16 @@ check-ota-pure:
 
 # check the esp-idf ota crate
 check-ota-idf:
-    cargo check -p rustyfarian-esp-idf-ota
+    cargo check -p rustyfarian-esp-idf-ota --target-dir {{ idf_dir }}
 
 # check the esp-hal ota stub (no-default-features to avoid esp-hal target conflict)
 check-ota-hal:
-    cargo check -p rustyfarian-esp-hal-ota --no-default-features
+    cargo check -p rustyfarian-esp-hal-ota --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal ota crate with chip + embassy features (ESP32-C6 + ESP32-C3)
 check-ota-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
 # run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
 test-ota-hal:
@@ -64,21 +86,23 @@ test-ota-hal:
 
 # check the esp-idf espnow crate
 check-espnow:
-    cargo check -p rustyfarian-esp-idf-espnow
+    cargo check -p rustyfarian-esp-idf-espnow --target-dir {{ idf_dir }}
 
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
-    cargo check -p rustyfarian-esp-hal-lora --no-default-features
+    cargo check -p rustyfarian-esp-hal-lora --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal wifi stub (no-default-features to avoid esp-hal target conflict)
 check-wifi-hal:
-    cargo check -p rustyfarian-esp-hal-wifi --no-default-features
+    cargo check -p rustyfarian-esp-hal-wifi --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
 check-wifi-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
+
+# ── Test & Lint ───────────────────────────────────────────────────────────
 
 # run clippy on the entire workspace
 clippy:
@@ -108,16 +132,6 @@ deny:
 update *args:
     cargo update {{args}}
 
-# clean build artifacts
-clean:
-    cargo clean
-
-# host target, used to override the workspace ESP-IDF target for pure-logic tests
-host_target := `scripts/host-target.sh`
-
-# platform-independent crates that can be compiled and tested on the host
-pure_crates := "-p rustyfarian-network-pure -p wifi-pure -p espnow-pure"
-
 # run platform-independent backoff unit tests (host toolchain, no ESP-IDF needed)
 test-backoff:
     cargo test --target {{host_target}} -p rustyfarian-network-pure backoff
@@ -145,7 +159,7 @@ test-ota:
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
 test: test-backoff test-mqtt test-wifi test-lora test-espnow test-ota test-ota-hal
 
-# ── Examples ────────────────────────────────────────────────────────────────
+# ── Examples ──────────────────────────────────────────────────────────────
 
 # list all available hardware examples
 examples:
@@ -160,16 +174,20 @@ examples:
 
 # build a named example; chip and crate auto-detected from example name
 build-example example:
-    scripts/build-example.sh "{{example}}"
+    scripts/build-example.sh "{{example}}" "{{hal_dir}}" "{{idf_dir}}"
 
 # serial port for espflash; honoured verbatim if set, otherwise scripts/detect-port.sh
 # narrows espflash auto-detect to USB serial devices (usbmodem/usbserial on macOS,
 # ttyUSB/ttyACM on Linux) so paired Bluetooth ports do not get picked.
 export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
 
+# ensure the IDF-built v5.3.3 bootloader is in the build cache for the given chip
+ensure-bootloader chip:
+    scripts/ensure-bootloader.sh "{{chip}}" "{{hal_dir}}" "{{idf_dir}}"
+
 # build and flash a named example; chip and crate auto-detected from example name
 flash example:
-    scripts/flash.sh "{{example}}"
+    scripts/flash.sh "{{example}}" "{{hal_dir}}" "{{idf_dir}}"
 
 # build, flash, and open the serial monitor (run without args to list examples)
 run *example:
@@ -187,7 +205,7 @@ run *example:
 
 # erase flash (NVS + app), rebuild from clean, flash, and monitor
 fresh-run example:
-    cargo clean
+    just clean
     just erase-flash
     just run {{example}}
 
@@ -209,12 +227,22 @@ monitor:
     [ -n "$port" ] && port_args=(--port "$port")
     espflash monitor --non-interactive "${port_args[@]}"
 
+# ── Maintenance ───────────────────────────────────────────────────────────
+
+# clean build artifacts (target/ide, hal and idf target dirs)
+clean:
+    cargo clean --target-dir target/ide
+    cargo clean --target-dir {{ hal_dir }}
+    cargo clean --target-dir {{ idf_dir }}
+
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:
-    cargo clean -p rustyfarian-esp-idf-wifi
-    cargo clean -p rustyfarian-esp-idf-mqtt
-    rm -rf target/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
-    rm -rf target/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
+    cargo clean -p rustyfarian-esp-idf-wifi --target-dir {{ idf_dir }}
+    cargo clean -p rustyfarian-esp-idf-mqtt --target-dir {{ idf_dir }}
+    rm -rf {{ idf_dir }}/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
+    rm -rf {{ idf_dir }}/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
+
+# ── CI ────────────────────────────────────────────────────────────────────
 
 # full pre-commit verification: format, check, lint (local use only — modifies files)
 pre-commit: fmt check clippy
@@ -227,7 +255,7 @@ verify:
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy
 
-# ── Local CI via act ───────────────────────────────────────────────────────
+# ── Local CI via act ──────────────────────────────────────────────────────
 
 # run all CI workflows locally via act (requires Docker + act)
 act *job:
