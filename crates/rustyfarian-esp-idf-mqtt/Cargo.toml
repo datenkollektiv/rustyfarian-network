@@ -22,9 +22,17 @@ rgb.workspace = true
 
 [dev-dependencies]
 rustyfarian-esp-idf-wifi = { path = "../rustyfarian-esp-idf-wifi" }
+ssd1306.workspace = true
+embedded-graphics.workspace = true
 
 [[example]]
 name = "idf_c3_mqtt"
 
 [[example]]
 name = "idf_esp32_mqtt"
+
+[[example]]
+name = "idf_c3_mqtt_button_oled"
+
+[[example]]
+name = "idf_c3_mqtt_led_grid"

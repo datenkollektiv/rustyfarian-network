@@ -66,6 +66,10 @@ embedded-io-async = { version = "0.6" }
 # Bare-metal debugging
 esp-backtrace = { version = "=0.19.0", default-features = false, features = ["panic-handler", "println"] }
 
+# Display / graphics — used by OLED examples in rustyfarian-esp-idf-mqtt
+ssd1306 = "0.9"
+embedded-graphics = "0.8"
+
 # Cross-repo dependencies — rustyfarian-ws2812 v0.6.0 wave, resolves from crates.io.
 # `hal` feature pulls in `SimpleLed` (the `embedded-hal` `OutputPin` adapter for
 # simple on/off GPIO LEDs), re-exported by the Wi-Fi and MQTT crates.
