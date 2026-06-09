@@ -1,8 +1,14 @@
-//! ESP-NOW scout example for ESP32-C3 Super Mini.
+//! ESP-NOW scout — **SoftAP channel-lock variant** (ESP32-C3 Super Mini).
 //!
-//! Starts the Wi-Fi radio without connecting to an AP, then scans channels
-//! 1-13 to find the coordinator by MAC-layer ACK.  Once the channel is
-//! discovered, the scout sends a message every second.
+//! Starts the Wi-Fi radio in SoftAP mode (`init_with_radio`), scans channels
+//! 1-13 to find the coordinator by MAC-layer ACK, then sends a message every
+//! second.  SoftAP beacon scheduling prevents the Wi-Fi driver from
+//! autonomously hopping channels, so every send lands on the coordinator's
+//! channel without any per-send re-pinning.  This is the race-free, recommended
+//! approach for most deployments.
+//!
+//! See `idf_c3_espnow_scout_promisc` for the STA + promiscuous-bracket
+//! alternative when SoftAP conflicts with BLE or a user-facing access point.
 //!
 //! The onboard LED (GPIO 8, active low) shows connection status:
 //! - **off** — scanning / not connected

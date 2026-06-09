@@ -28,3 +28,9 @@ name = "idf_c3_espnow_coordinator"
 
 [[example]]
 name = "idf_c3_espnow_scout"
+
+[[example]]
+name = "idf_c3_espnow_sta_scout"
+
+[[example]]
+name = "idf_c3_espnow_scout_promisc"

@@ -1,11 +1,12 @@
 # Roadmap
 
-*Last updated: May 2026*
+*Last updated: June 2026*
 
 The bare-metal stack is aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
 The bare-metal Wi-Fi surface is async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
 TTN v3 LoRa validation remains blocked on hardware.
 A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Mid term: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
+June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 
 ```mermaid
 %%{init: {
@@ -32,6 +33,7 @@ timeline
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell
               : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
+              : ESP-NOW scan country-code awareness — query esp_wifi_get_country() at scan start and restrict probed channels to schan..schan+nchan-1 instead of hardcoded 1-13; eliminates ESP_ERR_WIFI_NOT_ALLOWED_CHANNEL warnings on US/FCC and other restricted-band regions
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
               : OTA security model doc — threat model, rollback policy, signed-manifest question
