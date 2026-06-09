@@ -652,7 +652,12 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 ///
 /// The underlying `EspMqttClient` reconnects automatically.
 /// [`on_connect`](MqttBuilder::on_connect) is called on every (re)connect;
-/// use it for subscriptions and retained-state publishes.
+/// use it for retained-state publishes or other setup that does *not* call the
+/// blocking `EspMqttClient::subscribe()` — invoking subscription from inside
+/// `on_connect` deadlocks because the event loop is the thread that must
+/// process the SUBACK.  Register subscriptions with
+/// [`MqttBuilder::subscribe`](MqttBuilder::subscribe) instead; they are sent
+/// from a dedicated subscriber thread spawned after `on_connect` returns.
 ///
 /// # Thread safety
 ///
@@ -1190,18 +1195,23 @@ impl MqttHandle {
     /// callback has completed.
     ///
     /// The flag is set only after `on_connect` releases the internal mutex,
-    /// so a caller that sees `true` and immediately calls `publish_with()`
-    /// is guaranteed to find the mutex free — no race with the event loop.
+    /// so the event loop itself never races with publish callers.
     ///
-    /// # Subscriptions may still be in flight
+    /// # Mutex contention during subscription handshake
     ///
     /// Topics registered via [`MqttBuilder::subscribe`] are sent by a separate
     /// thread that is spawned when `on_connect` returns — the same moment this
-    /// flag flips to `true`.  There is therefore a brief window where
-    /// `is_connected()` is `true` but the broker has not yet acknowledged those
-    /// subscriptions.  Retained messages on subscribed topics will be delivered
-    /// once the broker processes the SUBSCRIBE packets; no application action is
-    /// needed.
+    /// flag flips to `true`.  That thread holds the client mutex while it waits
+    /// for each SUBACK, so for the brief window between the flag flipping and
+    /// the broker acknowledging every subscription:
+    ///
+    /// - [`publish_with`](MqttHandle::publish_with) may block briefly waiting
+    ///   for the subscriber thread to release the mutex
+    /// - [`try_publish_with`](MqttHandle::try_publish_with) may return
+    ///   `WouldBlock`
+    ///
+    /// Retained messages on subscribed topics will be delivered once the broker
+    /// processes the SUBSCRIBE packets; no application action is needed.
     ///
     /// Uses `Ordering::Acquire` to ensure visibility of any state written
     /// by the event loop thread before the flag was set.

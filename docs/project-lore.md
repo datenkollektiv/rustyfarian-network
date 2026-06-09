@@ -275,3 +275,44 @@ Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS 
 Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
 The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
 See `crates/rustyfarian-esp-idf-ota/src/downloader.rs::url_for_log`.
+
+## ESP-NOW
+
+The detailed analysis, decision, and consequence trail for the channel-stability work
+lives in [ADR 012](adr/012-espnow-unassociated-sta-channel-stability.md).
+The entries below are pitfall reminders only — when behaviour drifts, update the ADR and
+the rustdoc on `EspIdfEspNow`, not this section.
+
+**Unassociated STA radio drifts off `esp_wifi_set_channel` within ms.**
+Symptom: coordinator (AP-locked) receives every scan probe but zero data frames; scout's
+send callback fires `FAIL` ~30 ms after each TX (7 × 802.11 short-retry).
+Fix: use `init_with_radio` (SoftAP) so the beacon schedule holds the channel. See ADR 012.
+
+**Promiscuous-bracket per-send re-pin is fundamentally racy.**
+`set_promiscuous(false)` is a FreeRTOS task-switch trigger; the Wi-Fi driver task can
+preempt before `esp_now_send` and return `ESP_ERR_ESPNOW_CHAN` (0x3069) on a meaningful
+fraction of sends.
+Fix: prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when
+SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
+
+**Roaming peers cause false-positive channel detection in `scan_for_peer`.**
+A peer's STA briefly visits every channel during an AP roam scan and hardware-ACKs unicast
+frames addressed to its MAC even while not associated, so a first-ACK-wins scan latches
+onto the wrong channel.
+Fix: leave `ScanConfig::probe_confirmations` ≥ 1 with `confirmation_gap` longer than a
+typical scan dwell (defaults: 1 / 150 ms). See `crates/espnow-pure/src/lib.rs`.
+
+**`scan_for_peer` failure cascade leaves the radio on the last-probed channel.**
+A failed re-scan removed the peer entry and left the radio on (e.g.) ch 11, so the next
+`send_and_wait` aborted before TX with "peer not found", adding an extra round-trip
+before recovery.
+Fix: the `Err` branch of `scan_for_peer` restores both the peer registration and the
+radio channel from `pinned_channel`. See `crates/rustyfarian-esp-idf-espnow/src/lib.rs`.
+
+**The promiscuous-bracket fallback protects TX but not ACK reception.**
+After `esp_now_send` returns, the background scanner is free to hop off the channel
+before the coordinator's 802.11 ACK arrives — frame is delivered but `send_and_wait`
+sees `FAIL`.
+Symptom in `init_with_radio_sta`: ~10–20 % `"scout-probe"` retries even though end-to-end
+delivery is ~99 %.
+Mitigation: prefer `init_with_radio` (SoftAP). See ADR 012.

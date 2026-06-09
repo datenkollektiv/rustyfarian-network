@@ -61,6 +61,36 @@ pub const DEFAULT_PROBE_TIMEOUT: core::time::Duration = core::time::Duration::fr
 /// Override with [`ScanConfig::with_burst_timeout`].
 pub const DEFAULT_BURST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(3);
 
+/// Default number of *additional* confirmation probes required after the first
+/// ACK on a channel before that channel is declared the peer's home channel.
+///
+/// One ACK alone is not a reliable signal: a peer whose Wi-Fi STA is in the
+/// middle of an AP roam will briefly visit each channel during its own scan
+/// sequence and its 802.11 hardware ACKs unicast frames addressed to its MAC
+/// even while not associated.  A scan that returns the first transient ACK
+/// captures a channel the peer is merely passing through, then every
+/// subsequent send goes to the wrong channel.
+///
+/// Requiring an additional probe spaced [`DEFAULT_CONFIRMATION_GAP`] apart
+/// after the first ACK forces the scan to verify the peer has actually
+/// settled — its radio cannot remain on the same channel for that long
+/// during a roam scan (observed active dwell is roughly 100 ms per channel
+/// on common ESP-IDF / vendor stacks).
+///
+/// Default `1` = one extra confirmation = two total ACKs required.
+/// Override with [`ScanConfig::with_probe_confirmations`].
+pub const DEFAULT_PROBE_CONFIRMATIONS: u8 = 1;
+
+/// Default gap between the first ACK and the next confirmation probe on the
+/// same channel.
+///
+/// Sized to exceed a typical 802.11 active-scan dwell (roughly 100 ms in
+/// observed deployments) so a roaming peer that briefly visits a channel
+/// cannot ACK both probes.  Lower values reduce scan latency but increase
+/// the risk of false-positive channel detection during roams.
+/// Override with [`ScanConfig::with_confirmation_gap`].
+pub const DEFAULT_CONFIRMATION_GAP: core::time::Duration = core::time::Duration::from_millis(150);
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A 6-byte IEEE 802.11 MAC address.
@@ -199,17 +229,34 @@ pub struct ScanConfig<'a> {
     /// early once this limit is reached.  Bounds the time the radio
     /// spends at boosted TX power during peer discovery.
     pub burst_timeout: core::time::Duration,
+    /// Number of additional ACK probes required to confirm a channel after
+    /// the first probe ACKs (default: [`DEFAULT_PROBE_CONFIRMATIONS`] = 1).
+    ///
+    /// Set to `0` to declare success on the first ACK (legacy behaviour, fast
+    /// but vulnerable to false positives when the peer is mid-roam).
+    /// Set to `1` or higher to require confirmation probes; the channel is
+    /// only declared found if all confirmations also ACK.
+    pub probe_confirmations: u8,
+    /// Gap between consecutive probes on the same channel during confirmation
+    /// (default: [`DEFAULT_CONFIRMATION_GAP`] = 150 ms).
+    ///
+    /// Must exceed a typical 802.11 active-scan dwell time (observed at
+    /// roughly 100 ms across common ESP-IDF / vendor stacks) for the
+    /// confirmation to reliably reject a roaming peer's transient ACK.
+    pub confirmation_gap: core::time::Duration,
 }
 
 impl<'a> ScanConfig<'a> {
     /// Create a scan config with default channels (1-13), the given probe
-    /// payload, the default probe timeout, and the default burst timeout.
+    /// payload, and the default timeouts and confirmation settings.
     pub fn new(probe_data: &'a [u8]) -> Self {
         Self {
             channels: &DEFAULT_SCAN_CHANNELS,
             probe_data,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             burst_timeout: DEFAULT_BURST_TIMEOUT,
+            probe_confirmations: DEFAULT_PROBE_CONFIRMATIONS,
+            confirmation_gap: DEFAULT_CONFIRMATION_GAP,
         }
     }
 
@@ -232,6 +279,26 @@ impl<'a> ScanConfig<'a> {
     /// runs at boosted TX power if discovery fails.
     pub fn with_burst_timeout(mut self, timeout: core::time::Duration) -> Self {
         self.burst_timeout = timeout;
+        self
+    }
+
+    /// Override the number of confirmation probes required after the first
+    /// ACK on a channel.  `0` disables confirmation (first-ACK-wins).
+    pub fn with_probe_confirmations(mut self, count: u8) -> Self {
+        self.probe_confirmations = count;
+        self
+    }
+
+    /// Override the gap between confirmation probes on the same channel.
+    ///
+    /// Values below the typical 802.11 active-scan dwell time may reintroduce
+    /// false-positive channel detection when the peer is mid-roam — see
+    /// [`DEFAULT_CONFIRMATION_GAP`] for the rationale behind the default.
+    /// Setting [`ScanConfig::probe_confirmations`] to a non-zero count while
+    /// keeping the gap very small (or zero) defeats the confirmation gating
+    /// and reduces it to a doubled-up first-ACK-wins scan.
+    pub fn with_confirmation_gap(mut self, gap: core::time::Duration) -> Self {
+        self.confirmation_gap = gap;
         self
     }
 }
@@ -404,6 +471,8 @@ mod tests {
         assert_eq!(config.probe_data, b"probe");
         assert_eq!(config.probe_timeout, DEFAULT_PROBE_TIMEOUT);
         assert_eq!(config.burst_timeout, DEFAULT_BURST_TIMEOUT);
+        assert_eq!(config.probe_confirmations, DEFAULT_PROBE_CONFIRMATIONS);
+        assert_eq!(config.confirmation_gap, DEFAULT_CONFIRMATION_GAP);
     }
 
     #[test]
@@ -411,6 +480,37 @@ mod tests {
         let channels = [1, 6, 11];
         let config = ScanConfig::new(b"ping").with_channels(&channels);
         assert_eq!(config.channels, &[1, 6, 11]);
+    }
+
+    #[test]
+    fn scan_config_custom_probe_confirmations() {
+        let config = ScanConfig::new(b"ping").with_probe_confirmations(3);
+        assert_eq!(config.probe_confirmations, 3);
+    }
+
+    #[test]
+    fn scan_config_zero_probe_confirmations_disables_confirmation() {
+        let config = ScanConfig::new(b"ping").with_probe_confirmations(0);
+        assert_eq!(config.probe_confirmations, 0);
+    }
+
+    #[test]
+    fn scan_config_custom_confirmation_gap() {
+        let gap = core::time::Duration::from_millis(200);
+        let config = ScanConfig::new(b"ping").with_confirmation_gap(gap);
+        assert_eq!(config.confirmation_gap, gap);
+    }
+
+    #[test]
+    fn default_probe_confirmations_is_one() {
+        assert_eq!(DEFAULT_PROBE_CONFIRMATIONS, 1);
+    }
+
+    #[test]
+    fn default_confirmation_gap_exceeds_typical_scan_dwell() {
+        // 802.11 active-scan dwell is ~120 ms; gap must be larger so a roaming
+        // peer cannot ACK both the first probe and the confirmation probe.
+        assert!(DEFAULT_CONFIRMATION_GAP >= core::time::Duration::from_millis(130));
     }
 
     #[test]

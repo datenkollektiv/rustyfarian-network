@@ -45,6 +45,7 @@
 //! No special `sdkconfig` needed on either chip — radio contention is
 //! eliminated by design.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -52,12 +53,56 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::wifi::EspWifi;
+use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, Configuration, EspWifi};
 pub use espnow_pure::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanResult, WifiInterface,
-    BROADCAST_MAC, DEFAULT_PROBE_TIMEOUT, DEFAULT_RX_CHANNEL_CAPACITY, DEFAULT_SCAN_CHANNELS,
-    MAX_DATA_LEN,
+    BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP, DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT,
+    DEFAULT_RX_CHANNEL_CAPACITY, DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
 };
+
+/// Radio-management mode the driver is operating in.
+///
+/// This is the single source of truth for branching between the three
+/// initialisation paths.  Every other method (`default_interface`,
+/// `scan_for_peer`, `send_and_wait`) derives its behaviour from this enum
+/// rather than inspecting the presence of `_wifi` and the value of
+/// `wifi_interface` independently — which previously coupled two fields
+/// to encode three states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioMode {
+    /// Caller owns the radio (must already be started).
+    ///
+    /// Constructor: [`EspIdfEspNow::init`] / [`EspIdfEspNow::init_with_capacity`].
+    /// Peer interface: [`WifiInterface::Sta`].
+    CallerManagedSta,
+    /// Driver owns the radio and started it in SoftAP mode.
+    ///
+    /// Constructor: [`EspIdfEspNow::init_with_radio`].
+    /// Peer interface: [`WifiInterface::Ap`].
+    /// AP beacon scheduling locks the channel deterministically; no per-send
+    /// re-pinning is required.  This is the recommended owned-radio mode.
+    OwnedSoftAp,
+    /// Driver owns the radio and started it in unassociated STA mode.
+    ///
+    /// Constructor: [`EspIdfEspNow::init_with_radio_sta`].
+    /// Peer interface: [`WifiInterface::Sta`].
+    /// The Wi-Fi driver's background scanner drifts the channel; every
+    /// `send_and_wait` brackets the send with promiscuous-on / set-channel /
+    /// promiscuous-off using the channel last stored by `scan_for_peer`.
+    /// Fundamentally racy — see ADR 012 — and offered only as a fallback
+    /// when SoftAP conflicts with another radio requirement on the same chip.
+    OwnedStaPromisc,
+}
+
+impl RadioMode {
+    /// Wi-Fi interface peers must be registered against for this mode.
+    fn wifi_interface(self) -> WifiInterface {
+        match self {
+            RadioMode::OwnedSoftAp => WifiInterface::Ap,
+            RadioMode::CallerManagedSta | RadioMode::OwnedStaPromisc => WifiInterface::Sta,
+        }
+    }
+}
 
 /// ESP-IDF implementation of [`EspNowDriver`].
 ///
@@ -66,11 +111,22 @@ pub use espnow_pure::{
 ///
 /// # Radio management
 ///
-/// - [`init()`](EspIdfEspNow::init) — caller owns the Wi-Fi radio;
-///   the radio must already be started before calling this.
-/// - [`init_with_radio()`](EspIdfEspNow::init_with_radio) — the driver
-///   starts and owns the radio internally. Use this for ESP-NOW-only devices
-///   that do not connect to a Wi-Fi AP.
+/// Three initialisation paths cover the three deployment patterns:
+///
+/// - [`init()`](EspIdfEspNow::init) — caller owns the Wi-Fi radio; the radio
+///   must already be started before calling this.  Best for devices that
+///   simultaneously connect to a Wi-Fi AP (both peers share the AP's channel
+///   automatically — no scanning needed).
+/// - [`init_with_radio()`](EspIdfEspNow::init_with_radio) — the driver starts
+///   and owns the radio internally in **SoftAP mode**.  Recommended for
+///   ESP-NOW-only devices: the AP beacon schedule locks the channel
+///   deterministically, eliminating channel-drift races without per-send
+///   workarounds.
+/// - [`init_with_radio_sta()`](EspIdfEspNow::init_with_radio_sta) — the driver
+///   starts and owns the radio in unassociated STA mode with a
+///   promiscuous-bracket channel re-pin before every send.  Offered only as a
+///   fallback when SoftAP conflicts with another radio requirement; see
+///   ADR 012 for the documented ~0–20 % send failure rate.
 pub struct EspIdfEspNow {
     esp_now: EspNow<'static>,
     rx: Receiver<EspNowEvent>,
@@ -81,6 +137,33 @@ pub struct EspIdfEspNow {
     /// of the call; without this guard, a concurrent caller would either
     /// have its callback replaced or steal another caller's ACKs.
     send_cb_guard: Mutex<()>,
+    /// Explicit state for the three radio-management modes the driver supports.
+    ///
+    /// See [`RadioMode`] for the per-variant semantics.  All branching for
+    /// `default_interface`, `scan_for_peer`, and `send_and_wait` is driven
+    /// off this single field.
+    mode: RadioMode,
+    /// Last channel reported by a successful [`scan_for_peer`] call,
+    /// reused by:
+    ///
+    /// - the `Err` branch of [`scan_for_peer`] itself, to restore the peer
+    ///   and radio channel after a failed re-scan so the next
+    ///   [`send_and_wait`] is not penalised by a stale channel + missing peer
+    ///   registration; and
+    /// - [`send_and_wait`] in [`RadioMode::OwnedStaPromisc`] mode, where the
+    ///   STA background scanner drifts the channel and the promiscuous
+    ///   bracket re-pins it before each frame.
+    ///
+    /// Lifecycle invariants:
+    ///
+    /// - Sentinel [`u8::MAX`] means "no channel ever discovered".
+    /// - Written only by [`scan_for_peer`] on a successful scan.
+    /// - Never cleared once set — a stale value will be overwritten on the
+    ///   next successful scan; if a failed scan ever needs to invalidate it
+    ///   explicitly, store [`u8::MAX`] here.
+    /// - Has no effect in [`RadioMode::CallerManagedSta`] or
+    ///   [`RadioMode::OwnedSoftAp`] beyond the failed-scan fallback path.
+    pinned_channel: AtomicU8,
 }
 
 impl EspIdfEspNow {
@@ -90,7 +173,11 @@ impl EspIdfEspNow {
     /// The Wi-Fi radio must already be started by the caller.
     /// For ESP-NOW-only devices, use [`init_with_radio()`](Self::init_with_radio) instead.
     pub fn init() -> anyhow::Result<Self> {
-        Self::init_inner(DEFAULT_RX_CHANNEL_CAPACITY, None)
+        Self::init_inner(
+            DEFAULT_RX_CHANNEL_CAPACITY,
+            None,
+            RadioMode::CallerManagedSta,
+        )
     }
 
     /// Initialise ESP-NOW with a custom receive-queue capacity.
@@ -98,15 +185,71 @@ impl EspIdfEspNow {
     /// The Wi-Fi radio must already be started by the caller.
     /// Frames received while the queue is full are dropped with a warning log.
     pub fn init_with_capacity(capacity: usize) -> anyhow::Result<Self> {
-        Self::init_inner(capacity, None)
+        Self::init_inner(capacity, None, RadioMode::CallerManagedSta)
     }
 
-    /// Initialise ESP-NOW and start the Wi-Fi radio internally.
+    /// Initialise ESP-NOW and start the Wi-Fi radio internally in
+    /// **SoftAP mode** on channel 1.
     ///
     /// Use this for devices that need ESP-NOW without connecting to a Wi-Fi AP.
     /// The radio is kept alive for the lifetime of the returned driver.
-    /// The radio starts in STA mode — use [`WifiInterface::Sta`] for peers.
+    /// AP beacon scheduling prevents the ESP-IDF Wi-Fi driver from autonomously
+    /// hopping channels in the background — the root cause of channel drift on
+    /// unassociated STA.  See ADR 012 for the analysis.
+    ///
+    /// # Breaking semantics change vs `0.2.x`
+    ///
+    /// Prior to this release, `init_with_radio` started the radio in
+    /// unassociated STA mode.  As of `0.2.2` it starts a **hidden SoftAP** on
+    /// channel 1, and [`default_interface`](Self::default_interface) now
+    /// returns [`WifiInterface::Ap`] instead of [`WifiInterface::Sta`].
+    /// Downstream code that hard-codes [`WifiInterface::Sta`] for peer
+    /// registration on a driver-owned radio must either call
+    /// [`default_interface`](Self::default_interface) or switch to
+    /// [`init_with_radio_sta`](Self::init_with_radio_sta) to keep the prior
+    /// behaviour.  Devices that simultaneously run BLE or a user-facing
+    /// SoftAP must use [`init_with_radio_sta`](Self::init_with_radio_sta).
     pub fn init_with_radio(
+        modem: Modem<'static>,
+        sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
+        nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
+    ) -> anyhow::Result<Self> {
+        let mut wifi = EspWifi::new(modem, sys_loop, nvs)
+            .context("failed to create EspWifi for ESP-NOW radio")?;
+        wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
+            ssid_hidden: true,
+            channel: 1,
+            auth_method: AuthMethod::None,
+            ..Default::default()
+        }))
+        .context("failed to configure SoftAP for ESP-NOW radio")?;
+        wifi.start()
+            .context("failed to start Wi-Fi SoftAP for ESP-NOW")?;
+        log::info!("Wi-Fi SoftAP started for ESP-NOW (channel-stable, no AP connection)");
+
+        Self::init_inner(
+            DEFAULT_RX_CHANNEL_CAPACITY,
+            Some(wifi),
+            RadioMode::OwnedSoftAp,
+        )
+    }
+
+    /// Initialise ESP-NOW and start the Wi-Fi radio internally in unassociated
+    /// STA mode, using a promiscuous-bracket channel re-pin before every send.
+    ///
+    /// Use this alternative to [`init_with_radio`](Self::init_with_radio) when
+    /// SoftAP mode conflicts with another radio requirement on the same device
+    /// (BLE coexistence, user-facing SoftAP, etc.).
+    ///
+    /// # Trade-off vs SoftAP mode
+    ///
+    /// The ESP-IDF Wi-Fi driver's background scan task (FreeRTOS priority 23)
+    /// can preempt the application task (priority 5) between the promiscuous
+    /// disable and `esp_now_send`, causing `ESP_ERR_ESPNOW_CHAN` (~0–20 % of
+    /// sends depending on scheduler load).  Sends that fail trigger a re-scan
+    /// and retry.  Use [`init_with_radio`](Self::init_with_radio) (SoftAP) for
+    /// deterministic, race-free delivery whenever possible.
+    pub fn init_with_radio_sta(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
         nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
@@ -115,18 +258,24 @@ impl EspIdfEspNow {
             .context("failed to create EspWifi for ESP-NOW radio")?;
         wifi.start()
             .context("failed to start Wi-Fi radio for ESP-NOW")?;
-        log::info!("Wi-Fi radio started for ESP-NOW (no AP connection)");
+        log::info!("Wi-Fi STA started for ESP-NOW (promiscuous-bracket channel re-pin)");
 
-        Self::init_inner(DEFAULT_RX_CHANNEL_CAPACITY, Some(wifi))
+        Self::init_inner(
+            DEFAULT_RX_CHANNEL_CAPACITY,
+            Some(wifi),
+            RadioMode::OwnedStaPromisc,
+        )
     }
 
-    /// Returns the recommended [`WifiInterface`] for peer configuration.
+    /// Returns the Wi-Fi interface that peers must be registered against.
     ///
-    /// Always returns [`WifiInterface::Sta`] because both [`init()`](Self::init)
-    /// and [`init_with_radio()`](Self::init_with_radio) start the radio in
-    /// STA mode.
+    /// - [`WifiInterface::Sta`] — drivers created via [`init()`](Self::init),
+    ///   [`init_with_capacity()`](Self::init_with_capacity), or
+    ///   [`init_with_radio_sta()`](Self::init_with_radio_sta) (STA modes).
+    /// - [`WifiInterface::Ap`] — drivers created via
+    ///   [`init_with_radio()`](Self::init_with_radio) (SoftAP mode).
     pub fn default_interface(&self) -> WifiInterface {
-        WifiInterface::Sta
+        self.mode.wifi_interface()
     }
 
     /// Scan Wi-Fi channels to find one where the given peer responds.
@@ -136,16 +285,33 @@ impl EspIdfEspNow {
     /// returns the first channel where the peer ACKs the frame.
     ///
     /// On success the peer is left registered with the discovered channel.
-    /// On failure any temporary peer registration is cleaned up.
+    /// On failure, if a channel was found in a previous successful scan, the
+    /// peer is re-registered on that channel and the radio is restored to it,
+    /// so the next [`send_and_wait`](Self::send_and_wait) can attempt delivery
+    /// without an extra failure round-trip.  If no prior channel is known, the
+    /// peer registration is removed.
+    ///
+    /// # Supported radio modes
+    ///
+    /// Both driver-owned modes support scanning:
+    ///
+    /// - [`init_with_radio()`](Self::init_with_radio) — SoftAP-owned radio.
+    ///   `esp_wifi_set_channel` triggers an immediate CSA with no associated
+    ///   stations, so the channel-hop scan works exactly as in STA mode.
+    /// - [`init_with_radio_sta()`](Self::init_with_radio_sta) — owned STA
+    ///   radio.  Scanning competes with the background scan task and can
+    ///   produce false positives on roaming peers; the
+    ///   [`ScanConfig::probe_confirmations`] gating defends against this.
+    ///
+    /// The caller-managed [`init()`](Self::init) path is **not** supported:
+    /// channel-hop scanning would break the AP association the caller is
+    /// relying on.  Devices that share an AP with the peer do not need to
+    /// scan in the first place — both radios are locked to the AP's channel.
     ///
     /// # Side effects
     ///
     /// - Scanning hops the radio across [`ScanConfig::channels`] via
-    ///   `esp_wifi_set_channel`.  Any active STA/AP connection on the device
-    ///   will be disrupted while scanning is in progress, which is why this
-    ///   method requires [`init_with_radio()`](Self::init_with_radio) (the
-    ///   driver owns the radio and there is no concurrent AP association to
-    ///   worry about).
+    ///   `esp_wifi_set_channel`.
     /// - Any prior peer registration for `mac` is removed before scanning so
     ///   that a stale entry does not abort the probe loop with
     ///   `ESP_ERR_ESPNOW_EXIST`.  The peer is left registered with the
@@ -154,26 +320,28 @@ impl EspIdfEspNow {
     /// # Errors
     ///
     /// Returns an error if the peer does not respond on any scanned channel,
-    /// or if the driver was not created via
-    /// [`init_with_radio()`](Self::init_with_radio).
+    /// or if the driver was created via [`init()`](Self::init) /
+    /// [`init_with_capacity()`](Self::init_with_capacity).
     pub fn scan_for_peer(
         &self,
         mac: &MacAddress,
         config: &ScanConfig<'_>,
     ) -> anyhow::Result<ScanResult> {
         anyhow::ensure!(
-            self._wifi.is_some(),
-            "scan_for_peer requires init_with_radio (driver must own the radio); \
-             scanning hops Wi-Fi channels and would break any active STA association"
+            matches!(
+                self.mode,
+                RadioMode::OwnedSoftAp | RadioMode::OwnedStaPromisc
+            ),
+            "scan_for_peer requires init_with_radio or init_with_radio_sta \
+             (driver must own the radio); scanning hops Wi-Fi channels and \
+             would break any active AP association the caller relies on"
         );
 
-        // Use STA interface for scanning: init_with_radio() starts the radio
-        // in STA mode, and esp_wifi_set_channel() operates on the STA interface.
         let temp_peer = PeerConfig {
             mac: *mac,
             channel: 0,
             encrypt: false,
-            interface: WifiInterface::Sta,
+            interface: self.default_interface(),
         };
 
         // A previous successful scan leaves the peer registered on its
@@ -197,11 +365,67 @@ impl EspIdfEspNow {
                 };
                 self.add_peer(&final_peer)
                     .context("failed to re-register peer on discovered channel")?;
+                self.pinned_channel
+                    .store(scan_result.channel, Ordering::Relaxed);
                 log::info!("Peer {:02X?} found on channel {}", mac, scan_result.channel);
             }
             Err(_) => {
                 let _ = self.remove_peer(mac);
                 log::warn!("Peer {:02X?} not found on any scanned channel", mac);
+
+                // If a channel was discovered in a previous successful scan,
+                // restore the peer registration and radio channel so the next
+                // send_and_wait can attempt delivery without failing immediately
+                // with "peer not found" or ESP_ERR_ESPNOW_CHAN.
+                //
+                // Without this, a failed re-scan removes the peer entry and
+                // leaves the radio on the last-probed channel (e.g. ch 11),
+                // causing the next send to fail before the frame is ever
+                // transmitted — adding an extra failure round-trip before the
+                // following re-scan can recover.
+                let ch = self.pinned_channel.load(Ordering::Relaxed);
+                if ch != u8::MAX {
+                    let fallback = PeerConfig {
+                        mac: *mac,
+                        channel: ch,
+                        encrypt: false,
+                        interface: self.default_interface(),
+                    };
+                    // Restore the radio channel first so the peer registration is
+                    // consistent with the physical channel.
+                    // SAFETY: scan_for_peer is gated to owned-radio modes, so the
+                    // radio is owned and running. ch is a valid 2.4 GHz channel
+                    // written by a previous successful scan.
+                    let set_ch_ret = unsafe {
+                        esp_idf_svc::sys::esp_wifi_set_channel(
+                            ch,
+                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                        )
+                    };
+                    if set_ch_ret != esp_idf_svc::sys::ESP_OK {
+                        log::warn!(
+                            "Failed to restore radio to last known channel {}: {:#x} \
+                             (next send may target an inconsistent channel)",
+                            ch,
+                            set_ch_ret
+                        );
+                    }
+                    if let Err(e) = self.add_peer(&fallback) {
+                        log::warn!(
+                            "Failed to fallback-register peer {:02X?} on channel {}: {:#} \
+                             (next send_and_wait will fail until the next successful scan)",
+                            mac,
+                            ch,
+                            e
+                        );
+                    } else {
+                        log::debug!(
+                            "Peer {:02X?} fallback-registered on last known channel {}",
+                            mac,
+                            ch
+                        );
+                    }
+                }
             }
         }
 
@@ -282,7 +506,8 @@ impl EspIdfEspNow {
 
                 // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
                 // Wi-Fi subsystem, which is initialised by init_with_radio().
-                // channel is a valid u8 (1-13).
+                // In SoftAP mode the channel change is a CSA with no connected
+                // stations, so it takes effect immediately. channel is 1-13.
                 let ret = unsafe {
                     esp_idf_svc::sys::esp_wifi_set_channel(
                         channel,
@@ -303,7 +528,54 @@ impl EspIdfEspNow {
                 probed += 1;
 
                 match ack_status.wait(config.probe_timeout) {
-                    Some(true) => return Ok(ScanResult { channel }),
+                    Some(true) => {
+                        // First probe ACKed.  One ACK alone may be a roaming
+                        // peer transiently visiting this channel — require
+                        // probe_confirmations additional ACKs spaced longer
+                        // than a typical 802.11 scan dwell (observed at
+                        // roughly 100 ms) to verify the peer has actually
+                        // settled here.
+                        let mut confirmed = true;
+                        for confirmation in 0..config.probe_confirmations {
+                            std::thread::sleep(config.confirmation_gap);
+                            ack_status.reset();
+                            if self.send(mac, config.probe_data).is_err() {
+                                confirmed = false;
+                                log::debug!(
+                                    "Channel {} confirmation probe {} send failed",
+                                    channel,
+                                    confirmation + 1
+                                );
+                                break;
+                            }
+                            match ack_status.wait(config.probe_timeout) {
+                                Some(true) => continue,
+                                Some(false) => {
+                                    log::debug!(
+                                        "Channel {} unconfirmed: probe {} not ACKed \
+                                         (likely roaming peer)",
+                                        channel,
+                                        confirmation + 1
+                                    );
+                                    confirmed = false;
+                                    break;
+                                }
+                                None => {
+                                    log::debug!(
+                                        "Channel {} unconfirmed: probe {} timed out",
+                                        channel,
+                                        confirmation + 1
+                                    );
+                                    confirmed = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if confirmed {
+                            return Ok(ScanResult { channel });
+                        }
+                        // Confirmation failed: continue to the next channel.
+                    }
                     Some(false) => log::debug!("No ACK on channel {}", channel),
                     None => log::debug!("Send timeout on channel {}", channel),
                 }
@@ -354,13 +626,97 @@ impl EspIdfEspNow {
         let _cb = self.register_ack_cb(&ack_status, "send_and_wait")?;
 
         ack_status.reset();
-        self.send(mac, data)?;
+
+        match self.mode {
+            RadioMode::OwnedStaPromisc => {
+                let ch = self.pinned_channel.load(Ordering::Relaxed);
+                if ch != u8::MAX {
+                    self.send_with_promisc_repin(mac, data, ch)?;
+                } else {
+                    // No prior scan — no channel to re-pin to; fall through to the
+                    // plain send path and let the caller's scan loop recover.
+                    self.send(mac, data)?;
+                }
+            }
+            RadioMode::OwnedSoftAp | RadioMode::CallerManagedSta => {
+                // SoftAP: beacon schedule holds the channel — no re-pin needed.
+                // Caller-managed: radio managed externally (typically AP-associated).
+                self.send(mac, data)?;
+            }
+        }
 
         match ack_status.wait(Duration::from_millis(timeout_ms)) {
             Some(true) => Ok(()),
             Some(false) => anyhow::bail!("peer did not ACK"),
             None => anyhow::bail!("send ACK timeout after {} ms", timeout_ms),
         }
+    }
+
+    /// Re-pin the radio to `channel` and dispatch `esp_now_send` in a single
+    /// `unsafe` block; used by [`send_and_wait`] in
+    /// [`RadioMode::OwnedStaPromisc`] mode.
+    ///
+    /// `set_promiscuous(false)` and `esp_now_send` must be consecutive
+    /// instructions to minimise the scheduler window in which the Wi-Fi
+    /// background scan task (priority 23) can preempt the app task (priority 5)
+    /// and drift the channel.  Even with the tightest possible bracket the race
+    /// is not fully eliminated — see ADR 012 for the ~0–20 % `ESP_ERR_ESPNOW_CHAN`
+    /// rate this path exhibits in production.
+    fn send_with_promisc_repin(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        channel: u8,
+    ) -> anyhow::Result<()> {
+        espnow_pure::validate_payload(data)
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("payload validation failed")?;
+
+        // SAFETY: this helper is only called from RadioMode::OwnedStaPromisc, so
+        // the radio is owned and running. `channel` was written by a successful
+        // scan_for_peer (the caller has already guarded against u8::MAX), so it
+        // is a valid 2.4 GHz channel.  `mac` and `data` outlive this call.
+        //
+        // The tight bracket captures every intermediate `esp_err_t` so that a
+        // channel-race or country-code failure surfaces as a specific log line
+        // rather than an opaque "peer did not ACK" downstream.
+        let (promisc_on_ret, set_ch_ret, promisc_off_ret, send_ret) = unsafe {
+            let on = esp_idf_svc::sys::esp_wifi_set_promiscuous(true);
+            let set = esp_idf_svc::sys::esp_wifi_set_channel(
+                channel,
+                esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+            );
+            let off = esp_idf_svc::sys::esp_wifi_set_promiscuous(false);
+            let send = esp_idf_svc::sys::esp_now_send(mac.as_ptr(), data.as_ptr(), data.len());
+            (on, set, off, send)
+        };
+
+        if promisc_on_ret != esp_idf_svc::sys::ESP_OK {
+            log::warn!(
+                "esp_wifi_set_promiscuous(true) failed: {:#x} \
+                 (channel re-pin skipped, send proceeded on previous channel)",
+                promisc_on_ret
+            );
+        }
+        if set_ch_ret != esp_idf_svc::sys::ESP_OK {
+            log::warn!(
+                "esp_wifi_set_channel({}) failed: {:#x} \
+                 (frame sent on whatever channel the radio was on)",
+                channel,
+                set_ch_ret
+            );
+        }
+        if promisc_off_ret != esp_idf_svc::sys::ESP_OK {
+            log::warn!(
+                "esp_wifi_set_promiscuous(false) failed: {:#x} \
+                 (radio left in promiscuous mode)",
+                promisc_off_ret
+            );
+        }
+        if send_ret != esp_idf_svc::sys::ESP_OK {
+            anyhow::bail!("esp_now_send failed: {:#x}", send_ret);
+        }
+        Ok(())
     }
 
     /// Take the send-callback guard, install an ACK-recording callback, and
@@ -395,7 +751,11 @@ impl EspIdfEspNow {
         })
     }
 
-    fn init_inner(capacity: usize, wifi: Option<EspWifi<'static>>) -> anyhow::Result<Self> {
+    fn init_inner(
+        capacity: usize,
+        wifi: Option<EspWifi<'static>>,
+        mode: RadioMode,
+    ) -> anyhow::Result<Self> {
         let esp_now = EspNow::take().context("failed to acquire EspNow singleton")?;
 
         let (tx, rx): (SyncSender<EspNowEvent>, Receiver<EspNowEvent>) = sync_channel(capacity);
@@ -418,6 +778,8 @@ impl EspIdfEspNow {
             rx,
             _wifi: wifi,
             send_cb_guard: Mutex::new(()),
+            mode,
+            pinned_channel: AtomicU8::new(u8::MAX),
         })
     }
 }
