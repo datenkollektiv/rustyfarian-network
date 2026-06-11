@@ -32,3 +32,17 @@ if command -v sccache >/dev/null 2>&1; then
 else
     printf "  sccache    MISSING  run: brew install sccache  (optional, speeds up cold builds)\n"
 fi
+
+# mermaid-cli prerequisites — needed for `just lint-docs` to validate diagrams in docs/.
+if command -v npx >/dev/null 2>&1; then
+    printf "  npx        ok       %s\n" "$(npx --version 2>/dev/null)"
+    puppeteer_cache="${PUPPETEER_CACHE_DIR:-$HOME/.cache/puppeteer}"
+    chrome_exe="$(find "$puppeteer_cache" -type f \( -name 'Google Chrome for Testing' -o -name 'chrome-headless-shell' \) 2>/dev/null | head -1)"
+    if [ -n "$chrome_exe" ]; then
+        printf "  mmdc chrome ok      %s\n" "$chrome_exe"
+    else
+        printf "  mmdc chrome MISSING run: npx puppeteer browsers install chrome  (needed for: just lint-docs)\n"
+    fi
+else
+    printf "  npx        MISSING  install Node.js  (needed for: just lint-docs)\n"
+fi

@@ -124,6 +124,10 @@ doc:
 doc-open:
     cargo doc --workspace --no-deps --open
 
+# validate Mermaid diagrams in markdown via mermaid-cli (requires Node.js/npx)
+lint-docs:
+    scripts/lint-docs.sh
+
 # check dependency licenses, advisories, and bans
 deny:
     cargo deny check
