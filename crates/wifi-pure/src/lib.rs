@@ -33,6 +33,23 @@ pub const SSID_MAX_LEN: usize = 32;
 /// Maximum password length permitted by the ESP-IDF Wi-Fi driver (bytes).
 pub const PASSWORD_MAX_LEN: usize = 64;
 
+/// Minimum password length for a WPA2-protected SoftAP (bytes).
+///
+/// WPA2-Personal requires a pre-shared key of at least 8 characters.
+pub const AP_PASSWORD_MIN_LEN: usize = 8;
+
+/// Lowest 2.4 GHz channel a SoftAP may be configured on.
+pub const AP_CHANNEL_MIN: u8 = 1;
+
+/// Highest 2.4 GHz channel a SoftAP may be configured on.
+///
+/// Channels above 13 are not permitted in most regulatory domains, so the
+/// validator caps the range at 13 to stay portable across regions.
+pub const AP_CHANNEL_MAX: u8 = 13;
+
+/// Default maximum number of stations that may associate with a SoftAP.
+pub const AP_MAX_CONNECTIONS_DEFAULT: u8 = 4;
+
 // ─── Validation ─────────────────────────────────────────────────────────────
 
 /// Returns `Ok(())` if `ssid` fits within the ESP-IDF limit, or an error
@@ -54,6 +71,30 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
     } else {
         Err("Password exceeds maximum length of 64 bytes")
     }
+}
+
+/// Returns `Ok(())` if `config` is a valid SoftAP configuration.
+///
+/// Validates the SSID via [`validate_ssid`], the channel against
+/// [`AP_CHANNEL_MIN`]`..=`[`AP_CHANNEL_MAX`], and `max_connections >= 1`.
+/// When a password is present, it must be at least [`AP_PASSWORD_MIN_LEN`]
+/// bytes (the WPA2-Personal minimum) and at most [`PASSWORD_MAX_LEN`] bytes —
+/// the upper bound is delegated to [`validate_password`].
+pub fn validate_ap_config(config: &ApConfig<'_>) -> Result<(), &'static str> {
+    validate_ssid(config.ssid)?;
+    if let Some(password) = config.password {
+        if password.len() < AP_PASSWORD_MIN_LEN {
+            return Err("AP password must be at least 8 bytes for WPA2");
+        }
+        validate_password(password)?;
+    }
+    if config.channel < AP_CHANNEL_MIN || config.channel > AP_CHANNEL_MAX {
+        return Err("AP channel must be in the range 1..=13");
+    }
+    if config.max_connections < 1 {
+        return Err("AP max_connections must be at least 1");
+    }
+    Ok(())
 }
 
 // ─── ConnectMode ────────────────────────────────────────────────────────────
@@ -239,6 +280,113 @@ impl<'a> WiFiConfig<'a> {
     ///
     /// Lower levels reduce power draw and heat; higher levels increase range.
     /// The exact dBm mapping depends on the chip — see [`TxPowerLevel`].
+    pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
+        self.tx_power = level;
+        self
+    }
+}
+
+// ─── ApConfig ───────────────────────────────────────────────────────────────
+
+/// SoftAP (access point) configuration.
+///
+/// Used by the ESP-IDF SoftAP lifecycle to bring up a captive-portal access
+/// point. Construct via [`ApConfig::open`] or [`ApConfig::wpa2`], then chain
+/// builder methods as needed:
+///
+/// ```ignore
+/// let config = ApConfig::wpa2("Rustyfarian-AB12", "provision-me")
+///     .with_channel(6)                   // optional: override the channel-1 default
+///     .with_max_connections(2)           // optional: cap associated stations
+///     .with_tx_power(TxPowerLevel::Low); // optional: reduce transmit power
+/// ```
+pub struct ApConfig<'a> {
+    /// Access-point SSID broadcast in beacons.
+    pub ssid: &'a str,
+    /// WPA2 pre-shared key, or `None` for an open network.
+    pub password: Option<&'a str>,
+    /// 2.4 GHz channel (1..=13).
+    pub channel: u8,
+    /// Maximum number of stations that may associate.
+    pub max_connections: u8,
+    /// Transmit power level applied after the AP starts.
+    pub tx_power: TxPowerLevel,
+}
+
+impl<'a> Clone for ApConfig<'a> {
+    fn clone(&self) -> Self {
+        Self {
+            ssid: self.ssid,
+            password: self.password,
+            channel: self.channel,
+            max_connections: self.max_connections,
+            tx_power: self.tx_power,
+        }
+    }
+}
+
+impl core::fmt::Debug for ApConfig<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ApConfig")
+            .field("ssid", &self.ssid)
+            .field("password", &self.password.map(|_| "<redacted>"))
+            .field("channel", &self.channel)
+            .field("max_connections", &self.max_connections)
+            .field("tx_power", &self.tx_power)
+            .finish()
+    }
+}
+
+impl<'a> ApConfig<'a> {
+    /// Creates an **open** (passwordless) SoftAP configuration.
+    ///
+    /// Defaults to channel 1, [`AP_MAX_CONNECTIONS_DEFAULT`] connections, and
+    /// [`TxPowerLevel::Medium`].
+    ///
+    /// # Warning
+    ///
+    /// An open AP exposes the captive portal's `/save` and `/factory-reset`
+    /// endpoints to anyone within radio range — no authentication gates the
+    /// provisioning or destructive-reset routes. Prefer [`ApConfig::wpa2`] for
+    /// any deployment where bystanders could be on the network.
+    pub fn open(ssid: &'a str) -> Self {
+        Self {
+            ssid,
+            password: None,
+            channel: AP_CHANNEL_MIN,
+            max_connections: AP_MAX_CONNECTIONS_DEFAULT,
+            tx_power: TxPowerLevel::default(),
+        }
+    }
+
+    /// Creates a WPA2-protected SoftAP configuration.
+    ///
+    /// Defaults to channel 1, [`AP_MAX_CONNECTIONS_DEFAULT`] connections, and
+    /// [`TxPowerLevel::Medium`]. The password must satisfy
+    /// [`AP_PASSWORD_MIN_LEN`] when later passed to [`validate_ap_config`].
+    pub fn wpa2(ssid: &'a str, password: &'a str) -> Self {
+        Self {
+            ssid,
+            password: Some(password),
+            channel: AP_CHANNEL_MIN,
+            max_connections: AP_MAX_CONNECTIONS_DEFAULT,
+            tx_power: TxPowerLevel::default(),
+        }
+    }
+
+    /// Sets the 2.4 GHz channel (validated to 1..=13 by [`validate_ap_config`]).
+    pub fn with_channel(mut self, channel: u8) -> Self {
+        self.channel = channel;
+        self
+    }
+
+    /// Sets the maximum number of associated stations.
+    pub fn with_max_connections(mut self, max: u8) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// Sets the transmit power level applied after the AP starts.
     pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
         self.tx_power = level;
         self
@@ -536,5 +684,94 @@ mod tests {
         driver.start().unwrap();
         assert!(driver.connect().is_err());
         assert!(!driver.is_connected().unwrap());
+    }
+
+    // ── ApConfig tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn ap_config_open_defaults() {
+        let config = ApConfig::open(TEST_SSID);
+        assert_eq!(config.ssid, TEST_SSID);
+        assert!(config.password.is_none());
+        assert_eq!(config.channel, AP_CHANNEL_MIN);
+        assert_eq!(config.max_connections, AP_MAX_CONNECTIONS_DEFAULT);
+        assert_eq!(config.tx_power, TxPowerLevel::Medium);
+    }
+
+    #[test]
+    fn ap_config_wpa2_defaults() {
+        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK);
+        assert_eq!(config.ssid, TEST_SSID);
+        assert_eq!(config.password, Some(TEST_PSK));
+        assert_eq!(config.channel, AP_CHANNEL_MIN);
+        assert_eq!(config.max_connections, AP_MAX_CONNECTIONS_DEFAULT);
+        assert_eq!(config.tx_power, TxPowerLevel::Medium);
+    }
+
+    #[test]
+    fn ap_config_chained_builders() {
+        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK)
+            .with_channel(6)
+            .with_max_connections(2)
+            .with_tx_power(TxPowerLevel::Low);
+        assert_eq!(config.channel, 6);
+        assert_eq!(config.max_connections, 2);
+        assert_eq!(config.tx_power, TxPowerLevel::Low);
+    }
+
+    #[test]
+    fn ap_config_valid_passes() {
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID)).is_ok());
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, TEST_PSK)).is_ok());
+    }
+
+    #[test]
+    fn ap_config_ssid_boundary() {
+        let ssid_ok = "a".repeat(SSID_MAX_LEN);
+        assert!(validate_ap_config(&ApConfig::open(&ssid_ok)).is_ok());
+        let ssid_too_long = "a".repeat(SSID_MAX_LEN + 1);
+        assert!(validate_ap_config(&ApConfig::open(&ssid_too_long)).is_err());
+    }
+
+    #[test]
+    fn ap_config_password_length_boundaries() {
+        let too_short = "x".repeat(AP_PASSWORD_MIN_LEN - 1);
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, &too_short)).is_err());
+        let min_ok = "x".repeat(AP_PASSWORD_MIN_LEN);
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, &min_ok)).is_ok());
+        let max_ok = "x".repeat(PASSWORD_MAX_LEN);
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, &max_ok)).is_ok());
+        let too_long = "x".repeat(PASSWORD_MAX_LEN + 1);
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, &too_long)).is_err());
+    }
+
+    #[test]
+    fn ap_config_channel_boundaries() {
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(0)).is_err());
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(1)).is_ok());
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(13)).is_ok());
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(14)).is_err());
+    }
+
+    #[test]
+    fn ap_config_max_connections_zero_rejected() {
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_max_connections(0)).is_err());
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_max_connections(1)).is_ok());
+    }
+
+    #[test]
+    fn ap_config_debug_redacts_password() {
+        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK);
+        let rendered = alloc::format!("{:?}", config);
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(TEST_PSK));
+    }
+
+    #[test]
+    fn ap_config_debug_open_shows_no_password() {
+        let config = ApConfig::open(TEST_SSID);
+        let rendered = alloc::format!("{:?}", config);
+        assert!(rendered.contains("None"));
+        assert!(!rendered.contains("<redacted>"));
     }
 }

@@ -8,7 +8,7 @@ TTN v3 LoRa validation remains blocked on hardware.
 A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Mid term: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
 June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 A June 2026 full-code deep dive (all 13 crates) confirmed the pure-first architecture is consistently executed and surfaced a set of hygiene items — LED/timeout logic dedup, a CI hardware-tier build job, a LoRa RF-config mapping guard, and README staleness fixes — tracked in Near term and in the findings table below.
-ADR 013 (2026-06-11) accepted SoftAP captive-portal provisioning as a workspace concern, deferred to Long term; driven by `rustyfarian-beekeeper` Milestone 5.
+ADR 013 (2026-06-11) accepted SoftAP captive-portal provisioning as a workspace concern, driven by `rustyfarian-beekeeper` Milestone 5; the same day delivered the implementation (the `provisioning-pure` + `rustyfarian-esp-idf-provisioning` triad, SoftAP support in the Wi-Fi crates, and the `idf_c3_provision` example), now in validation — host tests written, `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` and the on-hardware iOS/Android captive-portal smoke test pending.
 
 ```mermaid
 %%{init: {
@@ -50,7 +50,7 @@ timeline
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
               : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after async MQTT ADR)
-              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning) — SoftAP captive portal, NVS credentials, four-field schema (ADR 013)
+              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning) — SoftAP captive portal, NVS credentials, four-field schema (ADR 013) — implemented 2026-06-11, in validation
 ```
 
 ---

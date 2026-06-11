@@ -30,7 +30,8 @@ case "$prefix" in
             *connect*|*wifi*) pkg="rustyfarian-esp-idf-wifi" ;;
             *join*|*lora*) pkg="rustyfarian-esp-idf-lora" ;;
             *espnow*)  pkg="rustyfarian-esp-idf-espnow" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", or "espnow".\n' "$example" >&2; exit 1 ;;
+            *provision*) pkg="rustyfarian-esp-idf-provisioning" ;;
+            *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", "espnow", or "provision".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set MCU / Cargo target

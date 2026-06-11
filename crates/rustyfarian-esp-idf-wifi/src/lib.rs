@@ -60,15 +60,18 @@ use anyhow::Context as _;
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
+use esp_idf_svc::wifi::{
+    AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
+    EspWifi, WifiEvent,
+};
 use pennant::PulseEffect;
 use rgb::RGB8;
 
 // Re-export all pure types from wifi-pure
 pub use wifi_pure::{
-    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, TxPowerLevel,
-    WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
-    POLL_INTERVAL_MS, SSID_MAX_LEN,
+    validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig,
+    ConnectMode, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
+    AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -504,5 +507,171 @@ impl WiFiManager {
     /// Returns whether the WiFi is currently connected.
     pub fn is_connected(&self) -> anyhow::Result<bool> {
         Ok(self.wifi.is_connected()?)
+    }
+}
+
+/// Reads the SoftAP factory MAC address from efuse.
+///
+/// This reads the base MAC via `esp_read_mac` with the
+/// `ESP_MAC_WIFI_SOFTAP` type and works **without** initialising Wi-Fi,
+/// because the value is stored in efuse rather than the Wi-Fi driver state.
+/// Callers can therefore derive a MAC-suffixed SSID *before* starting the AP,
+/// avoiding an SSID change after the radio is already broadcasting.
+pub fn softap_mac() -> anyhow::Result<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    esp_idf_svc::sys::esp!(unsafe {
+        esp_idf_svc::sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_WIFI_SOFTAP,
+        )
+    })
+    .context("failed to read SoftAP MAC from efuse")?;
+    Ok(mac)
+}
+
+/// SoftAP (access-point) lifecycle manager.
+///
+/// Brings up a Wi-Fi access point from an [`ApConfig`] and exposes the AP
+/// netif IP, the AP MAC, and the associated-station count — the surface the
+/// captive-portal provisioning crate consumes.
+///
+/// # Mode
+///
+/// This is AP-only.
+/// v1 deliberately does not run mixed AP+STA mode; the provisioning flow
+/// commits credentials and the host reboots into normal STA boot
+/// (reboot-based handoff), sidestepping ESP-IDF mode-switch issues.
+///
+/// # TX power on ESP32-C3 Super Mini boards
+///
+/// The ESP32-C3 Super Mini PCB-antenna lore (full TX power reflecting off the
+/// antenna and corrupting frames) is a documented *bare-metal* STA finding.
+/// It may also affect AP beacons, so the default here is
+/// [`TxPowerLevel::Medium`].
+/// [`TxPowerLevel::Low`] is suggested as an optional tweak for C3 Super Mini
+/// boards if AP association proves unreliable — this is a plausible mitigation,
+/// not a verified fix for the AP path.
+pub struct SoftApManager {
+    wifi: EspWifi<'static>,
+}
+
+impl SoftApManager {
+    /// Starts a SoftAP from the given [`ApConfig`].
+    ///
+    /// Validates the configuration via [`validate_ap_config`], configures the
+    /// access point (WPA2-Personal when a password is present, open otherwise),
+    /// starts the radio, then applies the requested transmit power.
+    /// As with the STA path, a TX-power failure is logged at `warn` and the AP
+    /// continues at the radio default rather than hard-erroring.
+    /// The SSID is logged by length only, never by value.
+    pub fn start(
+        modem: Modem<'static>,
+        sys_loop: EspSystemEventLoop,
+        nvs: Option<EspDefaultNvsPartition>,
+        config: ApConfig<'_>,
+    ) -> anyhow::Result<Self> {
+        validate_ap_config(&config).map_err(|e| {
+            anyhow::anyhow!("AP config invalid (ssid len={}): {}", config.ssid.len(), e)
+        })?;
+
+        log::info!("Starting SoftAP (ssid len={})", config.ssid.len());
+
+        let mut wifi = EspWifi::new(modem, sys_loop, nvs)?;
+
+        let ssid = config.ssid.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "internal: SSID conversion failed after validation (len={}, limit={})",
+                config.ssid.len(),
+                SSID_MAX_LEN
+            )
+        })?;
+
+        let mut ap_config = AccessPointConfiguration {
+            ssid,
+            channel: config.channel,
+            max_connections: config.max_connections as u16,
+            ..Default::default()
+        };
+        match config.password {
+            Some(pw) => {
+                ap_config.password = pw.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "internal: password conversion failed after validation (len={}, limit={})",
+                        pw.len(),
+                        PASSWORD_MAX_LEN
+                    )
+                })?;
+                ap_config.auth_method = AuthMethod::WPA2Personal;
+            }
+            None => {
+                ap_config.auth_method = AuthMethod::None;
+            }
+        }
+
+        wifi.set_configuration(&Configuration::AccessPoint(ap_config))?;
+
+        wifi.start()?;
+
+        let tx_power = config.tx_power.to_quarter_dbm();
+        match esp_idf_svc::sys::esp!(unsafe {
+            esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power)
+        }) {
+            Ok(()) => log::info!(
+                "SoftAP TX power set to {:?} ({} quarter-dBm)",
+                config.tx_power,
+                tx_power
+            ),
+            Err(e) => log::warn!(
+                "Failed to set SoftAP TX power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
+                config.tx_power,
+                tx_power,
+                e
+            ),
+        }
+
+        Ok(Self { wifi })
+    }
+
+    /// Returns the IPv4 address of the AP netif.
+    ///
+    /// The default ESP-IDF AP address is `192.168.4.1`, but it is read from the
+    /// netif rather than assumed.
+    pub fn ap_ip(&self) -> anyhow::Result<Ipv4Addr> {
+        Ok(self.wifi.ap_netif().get_ip_info()?.ip)
+    }
+
+    /// Returns the AP interface MAC address.
+    ///
+    /// Wraps the unsafe `esp_wifi_get_mac(WIFI_IF_AP, ...)` IDF call; the AP
+    /// interface is up after [`start`](Self::start) succeeds.
+    pub fn ap_mac(&self) -> anyhow::Result<[u8; 6]> {
+        let mut mac = [0u8; 6];
+        esp_idf_svc::sys::esp!(unsafe {
+            esp_idf_svc::sys::esp_wifi_get_mac(
+                esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
+                mac.as_mut_ptr(),
+            )
+        })
+        .context("failed to read AP MAC")?;
+        Ok(mac)
+    }
+
+    /// Returns the number of stations currently associated with the AP.
+    ///
+    /// Wraps the unsafe `esp_wifi_ap_get_sta_list` IDF call.
+    pub fn station_count(&self) -> anyhow::Result<u16> {
+        // SAFETY: `wifi_sta_list_t` is a plain C struct of integers and a fixed
+        // array; an all-zero value is a valid empty list. `esp_wifi_ap_get_sta_list`
+        // fills it in place and the AP interface is up after `start`.
+        let mut sta_list: esp_idf_svc::sys::wifi_sta_list_t = unsafe { core::mem::zeroed() };
+        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_ap_get_sta_list(&mut sta_list) })
+            .context("failed to read AP station list")?;
+        Ok(sta_list.num as u16)
+    }
+
+    /// Stops the SoftAP and releases the radio.
+    pub fn stop(mut self) -> anyhow::Result<()> {
+        self.wifi.stop()?;
+        Ok(())
     }
 }
