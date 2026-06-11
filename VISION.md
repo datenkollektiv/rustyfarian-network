@@ -21,6 +21,8 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
   This generalises the earlier LoRa-only `esp-hal` goal into a workspace-wide pattern: separate crates per HAL tier with shared `*-pure` crates for platform-independent types and traits (see [ADR 005](docs/adr/005-crate-naming-for-dual-hal-drivers.md)).
   Active: `rustyfarian-esp-hal-lora` (LoRa radio driver) and `rustyfarian-esp-hal-wifi` (Wi-Fi via `esp-wifi 0.14.0`, in progress).
 - **OTA as firmware-update plumbing** — OTA support may live in this workspace when it reuses the same Wi-Fi, bootloader, partition-table, and dual-HAL foundations as the networking crates.
+- **SoftAP captive-portal provisioning** — provisioning support may live in this workspace when it reuses the same Wi-Fi lifecycle and NVS foundations as the networking crates.
+  The HTTP server backing the captive portal is a private transport, not a reusable workspace API (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
 
 ## Target Beneficiaries
 
@@ -31,7 +33,7 @@ but with an API clean enough that any ESP32-IDF project can adopt it with confid
 
 - **General-purpose application-layer clients** — HTTP, CoAP, WebSocket, and similar reusable clients are out of scope.
   Feature-specific private transports may exist behind crate APIs, such as OTA fetching, but are not exported as protocol libraries.
-- **Provisioning / SoftAP mode** — no captive portal, BLE provisioning, or Wi-Fi setup flows.
+- **BLE provisioning** — no BLE-based Wi-Fi setup flows; SoftAP captive-portal provisioning is in scope (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
 - **Full `no_std` / `esp-hal` MQTT** — MQTT over bare-metal Wi-Fi (`rustyfarian-esp-hal-mqtt`) is a long-term goal but not an active workstream; Wi-Fi association is the current `esp-hal` frontier.
 
 ## Success Signals
@@ -57,3 +59,6 @@ _(none at this time)_
   The `esp-hal` goal was generalised from LoRa-only to a workspace-wide dual-HAL pattern (ADR 005).
 - 2026-04-29 — OTA accepted as firmware-update plumbing in this workspace, with private transports only.
   General-purpose HTTP clients remain a non-goal (ADR 011).
+- 2026-06-11 — SoftAP captive-portal provisioning accepted as a workspace concern, deferred to Long-term.
+  The captive-portal HTTP server is a private transport, not a reusable workspace API.
+  BLE provisioning remains a non-goal (ADR 013).
