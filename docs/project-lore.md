@@ -316,3 +316,26 @@ sees `FAIL`.
 Symptom in `init_with_radio_sta`: ~10–20 % `"scout-probe"` retries even though end-to-end
 delivery is ~99 %.
 Mitigation: prefer `init_with_radio` (SoftAP). See ADR 012.
+
+---
+
+## Mermaid Diagrams in Markdown
+
+**Mermaid `timeline` event descriptions reserve `:`, `;`, `"`, and HTML entities as syntax tokens.**
+The parser separates a period from its events on `:` and treats `;` as a section terminator, so any of these characters mid-text get tokenised as `INVALID` with a misleading message like:
+```
+Parse error on line N:
+...ome event text ; rest of text
+-----------------------^
+Expecting 'EOF', 'SPACE', 'NEWLINE', 'title', 'acc_title', 'acc_descr',
+'acc_descr_multiline_value', 'section', 'period', 'event', got 'INVALID'
+```
+Concrete triggers observed in `docs/ROADMAP.md`:
+- `;` anywhere inside an event description (most common) — replace with `,` or `—`.
+- `::` from Rust paths (e.g. `MqttBuilder::build`) — replace with `.` or rephrase.
+- `: ` from Rust trait bounds (e.g. `<D: WifiDriver>`) — rephrase in prose.
+- `"..."` quoted words — drop the quotes; em-dashes already provide emphasis.
+- HTML entities like `&lt;` / `&gt;` — the embedded `;` re-triggers the same parser path; rephrase rather than escape.
+Em-dashes (`—`), `×`, `==`, `..`, `/`, and parentheses render fine.
+Fix: catch these locally via `just lint-docs`, which runs `scripts/lint-docs.sh` to parse every fenced ```mermaid block in every `*.md` file through `mermaid-cli` (`mmdc` via `npx`).
+The check is not folded into `just verify` or `just ci` because it pulls a Node toolchain on first run — invoke it explicitly when touching `docs/ROADMAP.md` or any other diagram-bearing markdown.
