@@ -2,10 +2,9 @@
 
 Feature doc for the SoftAP captive-portal provisioning triad accepted by
 [ADR 013](../adr/013-softap-provisioning-acceptance.md).
-Implementation work is **Long-term** and does not start until capacity opens
-or `rustyfarian-beekeeper` Milestone 5 forces the issue.
-The implementation plan below was drafted 2026-06-11.
-This doc is deliberately a hybrid artifact with three normative levels: the Decisions table records locked architecture, the open questions carry **Proposed** answers awaiting maintainer sign-off, and the Design section is an illustrative implementation sketch.
+The implementation plan below was drafted 2026-06-11 and implemented the same day (Phases 1–5).
+All open questions are resolved and signed off; the Decisions table records the locked architecture across three sub-tables (ADR 013, planning pass, and implementation).
+The Design section remains an illustrative sketch; where the code deviated, the Session Log records it.
 
 ## Decisions
 
@@ -20,7 +19,7 @@ This doc is deliberately a hybrid artifact with three normative levels: the Deci
 |        Four-field provisionable schema (Wi-Fi creds + LoRaWAN OTAA keys + OTA URL + device name) | Matches the requesting downstream's needs verbatim; also the union of NVS fields every Rustyfarian field device stores today                                                     | Wi-Fi credentials only (forces beekeeper to build half of what it asked for); generic host-defined schema (scatters validation rules across every downstream) |
 |                                                                BLE provisioning stays a non-goal | No downstream has asked for it; ESP-IDF BLE stack is a substantial new dependency; SoftAP solves the same problem on hardware every device already uses                          | Accept BLE provisioning alongside SoftAP                                                                                                                      |
 
-### Provisional (2026-06-11 planning pass, pending sign-off)
+### Locked at planning pass (signed off 2026-06-11)
 
 |                                                                                         Decision | Reason                                                                                                                                                                           | Rejected Alternative                                                                                      |
 |-------------------------------------------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------|
@@ -28,7 +27,22 @@ This doc is deliberately a hybrid artifact with three normative levels: the Deci
 |                OTAA credential validation delegates to `lora-pure::LoraConfig::from_hex_strings` | One authoritative hex/length/byte-order implementation; provisioning maps its failure to a typed field error                                                                     | Second hex parser in `provisioning-pure` (drift risk, double maintenance)                                 |
 |                          Concrete error enums in `provisioning-pure`, following `ota-pure` style | Validation errors must be structured and matchable by the HTTP layer and host tests; the exact enum shape is sketched in the Design section                                      | `&'static str` errors as in `wifi-pure` (loses structure, forces string comparison in tests)              |
 
-These provisional rows are not backed by ADR 013 and share the sign-off gate of the proposed answers below.
+These rows began as a planning-pass proposal and were signed off alongside the resolved open questions on 2026-06-11.
+
+### Locked at implementation (2026-06-11)
+
+These rows capture the durable outcomes promoted from the resolved open questions plus the implementation deviations.
+The amendments that produced them are itemised in the 2026-06-11 implementation Session Log entry.
+
+|                                                                                                          Decision | Reason                                                                                                                                                                                                       |
+|------------------------------------------------------------------------------------------------------------------:|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|                              SoftAP SSID is `{prefix}-XXXX` from `derive_softap_ssid(prefix, mac)` in `provisioning-pure` | Last-two-MAC-bytes hex suffix guarantees uniqueness for several unprovisioned devices on one table; lives in the pure crate so it is host-testable and reusable by a future `esp-hal` triad (Q1)             |
+|                            Single NVS namespace `rf_prov`, one key per field, hex-string LoRa values, `schema_ver` written last | One logical commit unit, single-namespace factory reset, zero re-encoding on load-then-join; `schema_ver` last means torn writes never look provisioned (Q2). An `extras_idx` key indexes `x_*` extras (deviation below) |
+|                                       Single-shot validate-all / commit-all NVS write; host-driven reboot, no in-process handoff | Incremental saves create ambiguous boot states; reboot-based handoff sidesteps ESP-IDF AP↔STA mode-switch bugs (Q3)                                                                                          |
+|                            `/status` is `{schema, state, provisioned}` required plus optional `device_name`/`firmware_version`/`uptime_s`/`extra` | Minimal static-plus-session schema, host-injected extras via `with_status_entry`, no live telemetry (no ADC / LoRa-stack access); session-scoped per ADR 013 §3 (Q4)                                          |
+|                                   Factory reset is `ProvisioningStore::erase_all()` plus `ProvisioningEvent::FactoryResetRequested` | Library signals reset intent only; host owns the destructive operation and the reboot (Q5)                                                                                                                   |
+|                                  Per-field error list: `Field` × `ValidationError`, `heapless::Vec<FieldError, 8>` | Portal HTML must highlight the offending input; at most one error per canonical field plus one form-level error makes `MAX_FIELD_ERRORS = 8` exact (Q6)                                                       |
+|                            `pub(crate)` UDP catch-all DNS responder bound to `0.0.0.0:53`, lifecycle-bound to the session | Without a wildcard responder the OS captive-portal sheet rarely appears; `std::net::UdpSocket` needs zero new dependencies; manual `192.168.4.1` stays documented as fallback (Q7)                            |
 
 ## Constraints
 
@@ -40,11 +54,17 @@ These provisional rows are not backed by ADR 013 and share the sign-off gate of 
 - Provisioning-mode entry (no NVS credentials, button hold, repeated Wi-Fi failure) is the host application's decision, not the library's.
 - The library never calls `esp_restart()`; rebooting after commit is the host's decision.
 - NVS values are stored in plaintext; flash/NVS encryption is a partition concern owned by the host firmware, not this crate.
-- Event callbacks run on the `httpd` task and must return quickly and never block (same rule as `MqttBuilder::on_connect`; see the SUBACK-deadlock lore).
+- Event callbacks run on the `httpd` task and must return quickly and never block (same rule as `MqttBuilder::on_connect`; the rule is cited from the MQTT crate rustdoc, where the SUBACK-deadlock lore lives).
+- Secrets are never echoed back into HTML: `GET /` pre-fills non-secret fields only, and `wifi_pass` and `app_key` must be re-entered on every submission.
+- Each session carries a per-session nonce (hidden `_nonce` field) checked on `POST /save` and `POST /factory-reset`; a mismatch is rejected `403`, defending the open AP against request forgery.
+- `ota_url` accepts `http://` only, matching the ADR 011 plain-HTTP OTA scope.
 
-## Open Questions — Proposed Answers (awaiting sign-off)
+## Open Questions — Resolved (signed off 2026-06-11)
 
-### 1. SoftAP SSID derivation — Proposed: configurable prefix and last-two-MAC-bytes hex suffix
+All seven questions were reviewed by the agent-team pass, signed off, and implemented; the durable outcomes are promoted into the "Locked at implementation" Decisions sub-table above.
+The original proposals are retained below as the rationale of record.
+
+### 1. SoftAP SSID derivation — Resolved: configurable prefix and last-two-MAC-bytes hex suffix
 
 - `derive_softap_ssid(prefix, mac)` produces `{prefix}-{XXXX}` where `XXXX` is the uppercase hex of the AP MAC's last two bytes, truncated so the SSID fits 32 bytes.
   Workspace default prefix is `Rustyfarian`; beekeeper passes `Beekeeper` to get its `Beekeeper-XXXX`.
@@ -52,7 +72,7 @@ These provisional rows are not backed by ADR 013 and share the sign-off gate of 
   The derivation lives in `provisioning-pure` so it is host-testable and reusable by a future `esp-hal` triad.
   Rejected: fixed `Beekeeper-` prefix (couples a workspace crate to one downstream user's branding).
 
-### 2. NVS namespace and key layout — Proposed: single namespace `rf_prov`, one key per field, hex-string LoRa values
+### 2. NVS namespace and key layout — Resolved: single namespace `rf_prov`, one key per field, hex-string LoRa values
 
 - Namespace `rf_prov` with keys `schema_ver` (u8, value 1), `wifi_ssid`, `wifi_pass`, `lora_dev_eui`, `lora_join_eui`, `lora_app_key`, `ota_url`, `dev_name`; opaque extras stored as `x_{name}` with `name` validated to ≤13 chars (NVS key limit is 15).
   A single namespace makes the commit one logical unit and factory reset a single-namespace erase.
@@ -60,13 +80,13 @@ These provisional rows are not backed by ADR 013 and share the sign-off gate of 
   `schema_ver` future-proofs layout migrations.
   Rejected: namespace per field category (more handles and erase complexity for zero isolation benefit, since fields commit together per question 3).
 
-### 3. Save semantics — Proposed: single-shot validate-all, commit-all, host-driven reboot
+### 3. Save semantics — Resolved: single-shot validate-all, commit-all, host-driven reboot
 
 - One form whose POST is validated as a complete set; only a fully valid submission is written to NVS, in one pass, after which the session enters `Committed` and the host is notified via the event callback.
   Incremental per-field saves create ambiguous boot states (Wi-Fi saved, LoRa keys missing) that every downstream would need recovery rules for.
   Single-shot also eliminates in-process AP-to-STA radio handoff: commit, host reboots, normal boot loads NVS — sidestepping ESP-IDF mode-switch bugs.
 
-### 4. `/status` JSON schema — Proposed: minimal static-plus-session schema, host-injected extras, no live telemetry
+### 4. `/status` JSON schema — Resolved: minimal static-plus-session schema, host-injected extras, no live telemetry
 
 - Schema: `{"schema":1,"device_name":"…","firmware_version":"…","state":"awaiting_submission","provisioned":false,"uptime_s":42,"extra":{…}}`.
   Required fields are `schema`, `state`, and `provisioned`; `device_name`, `firmware_version`, `uptime_s`, and `extra` are optional conveniences, and the exact payload above is illustrative, not a frozen external contract.
@@ -74,14 +94,14 @@ These provisional rows are not backed by ADR 013 and share the sign-off gate of 
   The builder accepts `with_status_entry(key, value)` string pairs rendered under `"extra"`, so beekeeper injects a battery reading it measured itself.
   This keeps `/status` session-scoped per ADR 013 §3.
 
-### 5. Factory-reset hook — Proposed: event callback enum plus explicit `erase_all()` on the store
+### 5. Factory-reset hook — Resolved: event callback enum plus explicit `erase_all()` on the store
 
 - Two surfaces: `ProvisioningStore::erase_all()` for host-triggered resets, and `ProvisioningEvent::FactoryResetRequested` delivered via the builder's `on_event` callback when the portal's reset button is pressed.
   Callback matches the `MqttBuilder` precedent; a host wanting channel semantics wraps the callback around its own sender in one line.
   The library only ever signals reset intent; the host application remains solely responsible for invoking destructive reset operations.
   Rejected: NVS-flag polling (flash wear, latency, and it inverts the constraint by letting the library make the reset decision).
 
-### 6. Form-validation error reporting — Proposed: per-field error list with concrete enums
+### 6. Form-validation error reporting — Resolved: per-field error list with concrete enums
 
 - `parse_form` returns `heapless::Vec<FieldError, 8>` pairing a `Field` enum (seven canonical fields plus `Form` for body-level problems) with a `ValidationError` enum (`Missing`, `Empty`, `Duplicate`, `TooLong`, `InvalidHex`, `InvalidUrl`, `MalformedBody`, `TooManyFields`).
   Per-field beats a single string because the portal HTML must highlight the offending input.
@@ -90,7 +110,7 @@ These provisional rows are not backed by ADR 013 and share the sign-off gate of 
   The parser therefore records at most one error per canonical field plus one form-level error, so the capacity of 8 is exact, not a guess.
   Both enums implement `core::fmt::Display` so the IDF crate renders messages without `alloc` in the pure crate.
 
-### 7. Captive-portal DNS (new question) — Proposed: ship a minimal `pub(crate)` UDP catch-all responder in v1
+### 7. Captive-portal DNS (new question) — Resolved: ship a minimal `pub(crate)` UDP catch-all responder in v1
 
 - Without a wildcard DNS responder answering every A query with the AP IP, the OS captive-portal sheet rarely appears automatically, undermining the "no toolchain in the field" premise.
   ESP-IDF `std` provides `std::net::UdpSocket`, so the responder is roughly 100 lines with zero new dependencies.
@@ -403,10 +423,11 @@ Gate: `just lint-docs`.
 
 - [x] Design approved (ADR 013)
 - [x] Implementation plan drafted (2026-06-11)
-- [ ] Open-question proposals signed off
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Open-question proposals signed off (2026-06-11)
+- [x] Core implementation (Phases 1–5, 2026-06-11)
+- [x] Host tests written (`provisioning-pure` + `wifi-pure` AP coverage)
+- [ ] Verification gates green — `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` pending on the maintainer machine (no Rust toolchain in the implementation sandbox)
+- [x] Documentation updated (2026-06-11)
 
 ## Session Log
 
@@ -433,3 +454,52 @@ Gate: `just lint-docs`.
   claim softened from absolute to probabilistic, and duplicate extra-key
   accounting clarified (folds into a single `Form`-level `Duplicate`,
   preserving the exact `MAX_FIELD_ERRORS = 8` bound).
+- 2026-06-11 — Review-and-implement pass: an agent-team review
+  (architecture / security / API-feasibility) adopted all seven proposals with
+  amendments, then Phases 1–5 were implemented in full (`wifi-pure` AP types,
+  `rustyfarian-esp-idf-wifi` SoftAP lifecycle, `provisioning-pure`,
+  `rustyfarian-esp-idf-provisioning`, and the `idf_c3_provision` example with
+  build-script routing).
+  Adopted amendments and implementation deviations (authoritative list):
+  - Security blocker fixed: `GET /` pre-fills non-secret fields only; `wifi_pass`
+    and `app_key` are never echoed into HTML and must be re-entered on every
+    submission.
+  - Per-session nonce (hidden `_nonce` field, checked on `POST /save` and
+    `POST /factory-reset`, `403` on mismatch) defends the open AP against request
+    forgery; form keys beginning with `_` are reserved and silently ignored by
+    `parse_form`.
+  - No-credential-logging rule adopted from the Wi-Fi crate (lengths only);
+    `"<redacted>"` Debug token; `parse_form` hardened (never panics on malformed
+    percent-escapes, all heapless pushes fallible, 2048-byte POST body cap → `413`).
+  - `lora-pure`'s `from_hex_strings` returns `Option` without field attribution,
+    so `provisioning-pure` does per-field hex length / charset validation itself
+    and uses `from_hex_strings` only as the final constructor in `to_lora_config`
+    (the `expect` is documented as unreachable-by-construction, guarded by a
+    round-trip test); the form's `join_eui` maps to the `app_eui` parameter.
+  - `AccessPointConfiguration.max_connections` is `u16` (cast from `ApConfig`'s
+    `u8`); `station_count` wraps the unsafe `esp_wifi_ap_get_sta_list` sys call;
+    the SSID-before-start chicken-and-egg is solved by a new `softap_mac()` efuse
+    helper (`esp_read_mac`), so derivation needs no started interface.
+  - `on_event` keeps `Send + Sync` (the callback is shared across httpd handlers
+    via `Arc`), a documented divergence from `MqttBuilder`'s `Send`-only
+    precedent; the "callbacks run on the httpd task" rule cites the MQTT crate
+    rustdoc (the SUBACK lore lives there, not in `project-lore.md`).
+  - `ApConfig` Debug is hand-written to redact the password; `Clone` hand-written
+    alongside.
+  - `Field::form_name` returns a `"_form"` sentinel for `Field::Form`
+    (collision-free via the reserved-underscore rule); `InvalidTransition` lives
+    in `state.rs`; over-cap extra keys / values fold into a single Form-level
+    `TooManyFields`, preserving the `MAX_FIELD_ERRORS = 8` proof; `wifi_pass` must
+    be present but may be empty (open STA networks); `ota_url` accepts `http://`
+    only (ADR 011 scope); Debug redacts `wifi_password` + `app_key` but not the
+    EUIs (device identifiers).
+  - NVS store adds an `extras_idx` index key (`EspNvs` 0.52 cannot enumerate keys)
+    so `load` / `erase_all` can find `x_*` extras — a deviation from pure
+    one-key-per-field; `schema_ver` is written last so torn writes never look
+    provisioned.
+  - Portal: `max_uri_handlers` set to 12 (10 handlers — 4 functional + 6 probe
+    routes); httpd stack 10240 via server `Configuration`; DNS catch-all thread
+    `prov-dns` with an 8 KB stack bound `0.0.0.0:53` and a 500 ms shutdown-poll
+    timeout; rejected POSTs do not round-trip entered values in v1.
+  - Toolchain unavailable in the implementation sandbox: all `just` gates deferred
+    to the maintainer; `Cargo.lock` will update on first build.

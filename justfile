@@ -67,9 +67,17 @@ check-espnow-pure:
 check-ota-pure:
     cargo check -p ota-pure
 
+# check the pure provisioning crate (no ESP-IDF required)
+check-provisioning-pure:
+    cargo check -p provisioning-pure
+
 # check the esp-idf ota crate
 check-ota-idf:
     cargo check -p rustyfarian-esp-idf-ota --target-dir {{ idf_dir }}
+
+# check the esp-idf provisioning crate
+check-provisioning:
+    cargo check -p rustyfarian-esp-idf-provisioning --target-dir {{ idf_dir }}
 
 # check the esp-hal ota stub (no-default-features to avoid esp-hal target conflict)
 check-ota-hal:
@@ -164,8 +172,12 @@ test-espnow:
 test-ota:
     cargo test --target {{host_target}} -p ota-pure
 
+# run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
+test-provisioning:
+    cargo test --target {{host_target}} -p provisioning-pure
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning
 
 # ── Examples ──────────────────────────────────────────────────────────────
 

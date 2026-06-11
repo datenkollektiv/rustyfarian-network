@@ -58,6 +58,8 @@ a pattern common in application development but rare in embedded Rust.
 | [`ota-pure`](crates/ota-pure)                                     | Platform-independent OTA primitives — `Version`, streaming SHA-256, sidecar metadata        |
 | [`rustyfarian-esp-idf-ota`](crates/rustyfarian-esp-idf-ota)       | ESP-IDF OTA driver — **blocking**; streaming download, SHA-256 verify, partition swap, rollback |
 | [`rustyfarian-esp-hal-ota`](crates/rustyfarian-esp-hal-ota)       | Bare-metal OTA driver — **async-only**; strict HTTP/1.1 over `embassy-net` + `OtaUpdater` (MVP) |
+| [`provisioning-pure`](crates/provisioning-pure)                   | Platform-independent provisioning primitives — form parsing, field validation, SSID derivation, state machine; `no_std`; unit-testable on host |
+| [`rustyfarian-esp-idf-provisioning`](crates/rustyfarian-esp-idf-provisioning) | ESP-IDF SoftAP captive-portal provisioning — AP lifecycle, wildcard DNS, embedded HTTP form, NVS credential store |
 
 ## Usage
 
