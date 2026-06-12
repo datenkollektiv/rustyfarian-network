@@ -25,7 +25,7 @@ Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA support libraries for ESP32 projects.
 
 **Out of scope:** General-purpose application-layer clients (HTTP, CoAP, WebSocket) and BLE provisioning flows.
 The OTA crates (`rustyfarian-esp-idf-ota`, `rustyfarian-esp-hal-ota`) carry their own internal HTTP/1.1 GET clients for firmware download, but these are implementation details and not published as reusable workspace HTTP APIs.
-SoftAP captive-portal provisioning is in scope as a Long-term goal; the captive-portal HTTP server will follow the same internal-transport pattern as the OTA clients (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
+SoftAP captive-portal provisioning ships with two `SchemaProfile`s — `LorawanFieldDevice` and `WifiMqttDevice` — under [ADR 013](docs/adr/013-softap-provisioning-acceptance.md) (acceptance, 2026-06-11) and [ADR 014](docs/adr/014-wifi-mqtt-provisioning-profile.md) (Wi-Fi + MQTT generalisation, 2026-06-12); the captive-portal HTTP server follows the same internal-transport pattern as the OTA clients.
 
 *Full vision, success signals, and open questions: [VISION.md](./VISION.md)*
 

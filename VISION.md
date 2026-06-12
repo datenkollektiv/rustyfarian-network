@@ -62,3 +62,5 @@ _(none at this time)_
 - 2026-06-11 — SoftAP captive-portal provisioning accepted as a workspace concern, deferred to Long-term.
   The captive-portal HTTP server is a private transport, not a reusable workspace API.
   BLE provisioning remains a non-goal (ADR 013).
+- 2026-06-12 — Wi-Fi + MQTT provisioning profile accepted, generalising the four-field v1 schema into a closed set of named `SchemaProfile`s (`LorawanFieldDevice`, `WifiMqttDevice`).
+  `rustyfarian-network-pure` gains a `no_std`-safe surface so `provisioning-pure` can delegate MQTT validation without dragging in `std` (ADR 014).

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; amended by [ADR 014](014-wifi-mqtt-provisioning-profile.md) (2026-06-12), which generalises the original four-field schema described below into a closed set of named `SchemaProfile`s.
+The four-field framing in this document is historical and reflects the v1 acceptance decision unchanged; the runtime contract is the two-profile schema documented in ADR 014.
 
 ## Context
 
