@@ -83,6 +83,15 @@ pub enum ValidationError {
         /// The maximum number of bytes the field accepts.
         max: usize,
     },
+    /// The value was shorter than the field's minimum length.
+    ///
+    /// Currently emitted for `wifi_pass` when a non-empty password is below
+    /// the WPA2-Personal floor (`wifi_pure::AP_PASSWORD_MIN_LEN`). An empty
+    /// password means "open network" and is not rejected.
+    TooShort {
+        /// The minimum number of bytes the field requires when non-empty.
+        min: usize,
+    },
     /// The value was not exactly `expected_len` hexadecimal characters.
     InvalidHex {
         /// The exact hex-character length the field requires.
@@ -105,8 +114,14 @@ impl fmt::Display for ValidationError {
             ValidationError::TooLong { max } => {
                 write!(f, "field exceeds maximum length of {max} bytes")
             }
+            ValidationError::TooShort { min } => {
+                write!(f, "field must be at least {min} bytes when not empty")
+            }
             ValidationError::InvalidHex { expected_len } => {
-                write!(f, "field must be exactly {expected_len} hexadecimal characters")
+                write!(
+                    f,
+                    "field must be exactly {expected_len} hexadecimal characters"
+                )
             }
             ValidationError::InvalidUrl => f.write_str("OTA URL is malformed"),
             ValidationError::MalformedBody => f.write_str("request body is malformed"),

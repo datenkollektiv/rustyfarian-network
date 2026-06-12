@@ -319,6 +319,59 @@ Mitigation: prefer `init_with_radio` (SoftAP). See ADR 012.
 
 ---
 
+## SoftAP Provisioning
+
+**The ESP-IDF AP netif silently retains a non-default subnet across firmware revisions — `softap.ap_ip()` may report `192.168.71.1` (or other) instead of the documented `192.168.4.1`.**
+No code in this workspace sets a custom AP IP, and the `esp-idf-svc` AP wrapper exposes no
+`set_ip_info()`. The netif state appears to be persisted by ESP-IDF (likely via the Wi-Fi NVS
+partition's netif/DHCPS records, which survive `CONFIG_ESP_WIFI_NVS_ENABLED=n` because that flag
+only disables Wi-Fi credential caching, not the netif config blob).
+Symptom: captive-portal browsers fail to reach the documented `http://192.168.4.1/`; the DHCP
+server lease log shows clients getting `192.168.71.2` (i.e. the AP self-assigned `192.168.71.1`).
+The library logs `Provisioning AP up at 192.168.71.1`, but any hardcoded `192.168.4.1` URL
+literal in example/log code is wrong.
+Fix: pin the AP netif explicitly before `wifi.start()` via the raw FFI sequence
+`esp_netif_dhcps_stop → esp_netif_set_ip_info → esp_netif_dhcps_start` on
+`wifi.ap_netif().handle()` (requires `use esp_idf_svc::handle::RawHandle;`). See
+`SoftApManager::start` / `pin_ap_netif_ip` in `rustyfarian-esp-idf-wifi`. A full `espflash
+erase-flash` also clears the stale netif state but does not prevent recurrence.
+
+**ESP-IDF httpd's default request-header buffer (`CONFIG_HTTPD_MAX_REQ_HDR_LEN = 512 B`) is too small for modern browsers and silently returns `HTTP 431 Request Header Fields Too Large` on form POSTs.**
+Symptom: a form submission from any iOS/Safari/Chrome captive portal probe produces in the device
+log:
+```
+W httpd_parse: parse_block: request URI/header too long
+W httpd_txrx: httpd_resp_send_err: 431 Request Header Fields Too Large
+```
+The body is never read because the request line plus headers (User-Agent + Accept-* + Cookie +
+Sec-* + Referer) overflow the 512 B parse block. Modern browsers regularly send 800–1500 B of
+headers.
+Fix: set `CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048` in `sdkconfig.defaults` at the workspace root, then
+clean `target/<target>/release/build/esp-idf-sys-*/` to force a CMake reconfigure (the same
+`sdkconfig.defaults` lore that applies to `CONFIG_ESP_MAIN_TASK_STACK_SIZE`). The setting is
+compile-time only; there is no runtime equivalent on `EspHttpServer::Configuration`.
+
+**`EspHttpServer` does not set `Cache-Control` by default — captive-portal browsers cache the form HTML aggressively across reflashes.**
+Symptom: HTML or behaviour changes in the portal handler are not reflected in the browser even
+after a fresh `just run`; reconnecting to the SoftAP shows the previous form. Common on iOS
+Safari and macOS captive-portal sheets, which treat `/hotspot-detect.html`-style probes as
+cacheable.
+Fix: explicitly set `Cache-Control: no-store` on the `GET /` response by using
+`request.into_response(200, Some("OK"), &headers)` with
+`("Cache-Control", "no-store")` and `("Content-Type", "text/html; charset=utf-8")` instead of
+`request.into_ok_response()`. Without this, reconnecting to the SoftAP is the only reliable way
+to invalidate the cached HTML.
+
+**Provisioning UI: `wifi_pure::validate_password` enforces only `<= PASSWORD_MAX_LEN` — empty is treated as "open network", but a 1–7-character non-empty password is silently accepted by the pure crate even though WPA2-Personal requires `>= 8`.**
+Symptom: a user typing a 4-char test password gets a "successfully provisioned" log
+(`Already provisioned: ... wifi_pass len=4 (secret)`), but the STA association will fail at boot
+because WPA2-Personal needs >= 8 bytes (`AP_PASSWORD_MIN_LEN`).
+Fix: `provisioning-pure::form::validate_wifi_password` adds a `TooShort { min: 8 }` error when
+the value is non-empty and below the floor; the form adds `minlength="8"` to the input (HTML5
+`minlength` is only enforced when the field is non-empty, so open networks still work).
+
+---
+
 ## Mermaid Diagrams in Markdown
 
 **Mermaid `timeline` event descriptions reserve `:`, `;`, `"`, and HTML entities as syntax tokens.**

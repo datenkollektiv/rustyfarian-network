@@ -223,7 +223,8 @@ impl<'a> ProvisioningBuilder<'a> {
     /// These values are served unauthenticated to anyone on the AP and must
     /// never contain secrets.
     pub fn with_status_entry(mut self, key: &'a str, value: &'a str) -> Self {
-        self.status_entries.push((key.to_string(), value.to_string()));
+        self.status_entries
+            .push((key.to_string(), value.to_string()));
         self
     }
 
@@ -318,6 +319,7 @@ impl<'a> ProvisioningBuilder<'a> {
             server: Some(server),
             dns: Some(dns),
             state,
+            ap_ip,
             _subscription: subscription,
         })
     }
@@ -356,6 +358,7 @@ pub struct ProvisioningSession {
     server: Option<esp_idf_svc::http::server::EspHttpServer<'static>>,
     dns: Option<DnsResponder>,
     state: SharedState,
+    ap_ip: std::net::Ipv4Addr,
     /// Stored so AP-association events keep firing (dropped subscriptions fire
     /// zero times — known lore).
     _subscription: EspSystemSubscription<'static>,
@@ -367,6 +370,16 @@ impl ProvisioningSession {
     /// The current provisioning state.
     pub fn state(&self) -> ProvisioningState {
         self.state.current()
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The IPv4 address of the SoftAP netif, read once at session start.
+    /// Use this for user-facing log lines (`"open http://{ip}/"`) instead of
+    /// hardcoding the ESP-IDF default — the netif may report a non-default
+    /// subnet if NVS retained an alternate config from prior firmware.
+    pub fn ap_ip(&self) -> std::net::Ipv4Addr {
+        self.ap_ip
     }
 
     /// Experimental: API may change before 1.0.

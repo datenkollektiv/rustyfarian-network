@@ -158,9 +158,6 @@ impl fmt::Debug for ProvisioningConfig {
 }
 
 #[cfg(test)]
-extern crate alloc;
-
-#[cfg(test)]
 mod tests {
     use crate::parse_form;
     use alloc::format;

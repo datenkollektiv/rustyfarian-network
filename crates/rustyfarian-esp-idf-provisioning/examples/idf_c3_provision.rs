@@ -24,9 +24,7 @@
 
 use std::time::Duration;
 
-use rustyfarian_esp_idf_provisioning::{
-    PortalConfig, ProvisioningBuilder, ProvisioningStore,
-};
+use rustyfarian_esp_idf_provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningStore};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -106,7 +104,10 @@ fn main() -> anyhow::Result<()> {
         .on_event(|event| log::info!("Provisioning event: {event:?}"))
         .start(peripherals.modem, sys_loop, nvs)?;
 
-    log::info!("Portal running — connect to the AP and open http://192.168.4.1/");
+    log::info!(
+        "Portal running — connect to the AP and open http://{}/",
+        session.ap_ip()
+    );
 
     match session.wait_committed(Some(Duration::from_secs(600))) {
         Some(cfg) => {

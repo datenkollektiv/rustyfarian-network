@@ -610,6 +610,8 @@ impl SoftApManager {
 
         wifi.set_configuration(&Configuration::AccessPoint(ap_config))?;
 
+        pin_ap_netif_ip(&wifi)?;
+
         wifi.start()?;
 
         let tx_power = config.tx_power.to_quarter_dbm();
@@ -634,8 +636,11 @@ impl SoftApManager {
 
     /// Returns the IPv4 address of the AP netif.
     ///
-    /// The default ESP-IDF AP address is `192.168.4.1`, but it is read from the
-    /// netif rather than assumed.
+    /// `SoftApManager::start` pins the AP netif to the documented ESP-IDF
+    /// default `192.168.4.1/24` via `pin_ap_netif_ip`, so the value returned
+    /// here is stable across reboots and is not affected by stale NVS netif
+    /// state. The address is still read live from the netif rather than
+    /// assumed.
     pub fn ap_ip(&self) -> anyhow::Result<Ipv4Addr> {
         Ok(self.wifi.ap_netif().get_ip_info()?.ip)
     }
@@ -664,8 +669,10 @@ impl SoftApManager {
         // array; an all-zero value is a valid empty list. `esp_wifi_ap_get_sta_list`
         // fills it in place and the AP interface is up after `start`.
         let mut sta_list: esp_idf_svc::sys::wifi_sta_list_t = unsafe { core::mem::zeroed() };
-        esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_ap_get_sta_list(&mut sta_list) })
-            .context("failed to read AP station list")?;
+        esp_idf_svc::sys::esp!(unsafe {
+            esp_idf_svc::sys::esp_wifi_ap_get_sta_list(&mut sta_list)
+        })
+        .context("failed to read AP station list")?;
         Ok(sta_list.num as u16)
     }
 
@@ -674,4 +681,40 @@ impl SoftApManager {
         self.wifi.stop()?;
         Ok(())
     }
+}
+
+/// Forces the AP netif onto the documented ESP-IDF default `192.168.4.1/24`.
+///
+/// `esp-idf-svc` does not expose `set_ip_info`, and `EspWifi::new` can read a
+/// stale netif configuration retained in NVS that lands the SoftAP on an
+/// unexpected subnet. Pinning the IP here gives `ap_ip()` callers — and any
+/// hard-coded captive-portal URL — a predictable address.
+fn pin_ap_netif_ip(wifi: &EspWifi<'_>) -> anyhow::Result<()> {
+    use esp_idf_svc::handle::RawHandle;
+    use esp_idf_svc::sys::{
+        esp, esp_ip4_addr_t, esp_netif_dhcps_start, esp_netif_dhcps_stop, esp_netif_ip_info_t,
+        esp_netif_set_ip_info,
+    };
+
+    let handle = wifi.ap_netif().handle();
+    let info = esp_netif_ip_info_t {
+        ip: esp_ip4_addr_t {
+            addr: u32::from_le_bytes([192, 168, 4, 1]),
+        },
+        netmask: esp_ip4_addr_t {
+            addr: u32::from_le_bytes([255, 255, 255, 0]),
+        },
+        gw: esp_ip4_addr_t {
+            addr: u32::from_le_bytes([192, 168, 4, 1]),
+        },
+    };
+
+    unsafe {
+        // DHCPS must be stopped before set_ip_info; ignored result handles the
+        // "already stopped" case (ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED).
+        let _ = esp_netif_dhcps_stop(handle);
+        esp!(esp_netif_set_ip_info(handle, &info)).context("failed to set AP netif IP")?;
+        esp!(esp_netif_dhcps_start(handle)).context("failed to (re)start AP DHCP server")?;
+    }
+    Ok(())
 }

@@ -8,3 +8,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 # Disable WiFi NVS caching — forces fresh credentials from firmware on every boot.
 # Prevents stale cached BSSID/PMK/channel from causing silent auth failures.
 CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# Provisioning portal: 2 KB request header buffer (default 512 B).
+# Modern browsers send User-Agent + Accept-* + Cookie + Sec-* headers that
+# overflow the default and trigger `parse_block: request URI/header too long`
+# → HTTP 431 on POST /save. 2 KB covers Safari/Chrome with cookies.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048

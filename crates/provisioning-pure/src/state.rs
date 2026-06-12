@@ -51,10 +51,7 @@ impl ProvisioningState {
     /// `Persisting` + `PersistFailed` → `AwaitingSubmission`. Every other pair
     /// is an [`InvalidTransition`]; in particular both `Committed` and
     /// `FactoryResetPending` are terminal and accept no input.
-    pub fn apply(
-        self,
-        input: ProvisioningInput,
-    ) -> Result<ProvisioningState, InvalidTransition> {
+    pub fn apply(self, input: ProvisioningInput) -> Result<ProvisioningState, InvalidTransition> {
         use ProvisioningInput::*;
         use ProvisioningState::*;
         match (self, input) {
@@ -188,7 +185,13 @@ mod tests {
     #[test]
     fn committed_is_terminal() {
         use ProvisioningInput::*;
-        for input in [ValidSubmission, InvalidSubmission, PersistOk, PersistFailed, FactoryReset] {
+        for input in [
+            ValidSubmission,
+            InvalidSubmission,
+            PersistOk,
+            PersistFailed,
+            FactoryReset,
+        ] {
             assert!(ProvisioningState::Committed.apply(input).is_err());
         }
     }
@@ -196,7 +199,13 @@ mod tests {
     #[test]
     fn factory_reset_pending_is_terminal() {
         use ProvisioningInput::*;
-        for input in [ValidSubmission, InvalidSubmission, PersistOk, PersistFailed, FactoryReset] {
+        for input in [
+            ValidSubmission,
+            InvalidSubmission,
+            PersistOk,
+            PersistFailed,
+            FactoryReset,
+        ] {
             assert!(ProvisioningState::FactoryResetPending.apply(input).is_err());
         }
     }
