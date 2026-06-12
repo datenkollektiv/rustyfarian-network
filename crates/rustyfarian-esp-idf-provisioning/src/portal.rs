@@ -17,9 +17,10 @@
 //! # Secrets
 //!
 //! Pre-fill substitutes only non-secret fields into the HTML. The Wi-Fi
-//! password and AppKey inputs are always rendered empty and must be re-entered
-//! on every submission (single-shot commit). No credential value is ever logged
-//! or echoed.
+//! password, the LoRaWAN AppKey, and the MQTT password inputs are always
+//! rendered empty and must be re-entered on every submission (single-shot
+//! commit) — no template carries an `{{MQTT_PASS}}` placeholder. No credential
+//! value is ever logged or echoed.
 
 use std::sync::Arc;
 
@@ -29,13 +30,24 @@ use embedded_svc::io::{Read, Write};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 
-use provisioning_pure::{parse_form, Field, FieldErrors, ProvisioningInput};
+use provisioning_pure::{parse_form, Field, FieldErrors, ProvisioningInput, SchemaProfile};
 
 use crate::store::ProvisioningStore;
 use crate::{ProvisioningEvent, SharedState};
 
-/// The embedded portal HTML template.
-const PORTAL_HTML: &str = include_str!("portal.html");
+/// The embedded LoRaWAN-profile portal HTML template.
+const PORTAL_HTML_LORAWAN: &str = include_str!("portal_lorawan.html");
+
+/// The embedded Wi-Fi + MQTT-profile portal HTML template.
+const PORTAL_HTML_WIFI_MQTT: &str = include_str!("portal_wifi_mqtt.html");
+
+/// Selects the embedded template for `profile`.
+fn template_for(profile: SchemaProfile) -> &'static str {
+    match profile {
+        SchemaProfile::LorawanFieldDevice => PORTAL_HTML_LORAWAN,
+        SchemaProfile::WifiMqttDevice => PORTAL_HTML_WIFI_MQTT,
+    }
+}
 
 /// HTTP port the portal listens on.
 const HTTP_PORT: u16 = 80;
@@ -82,6 +94,7 @@ pub(crate) fn start(
     device_name: Arc<String>,
     firmware_version: Arc<String>,
     status_entries: Arc<Vec<(String, String)>>,
+    profile: SchemaProfile,
 ) -> anyhow::Result<EspHttpServer<'static>> {
     let config = Configuration {
         http_port: HTTP_PORT,
@@ -97,8 +110,8 @@ pub(crate) fn start(
         let store_for_load = store.clone();
         let nonce = nonce.clone();
         server.fn_handler("/", Method::Get, move |request| {
-            let prefill = load_prefill(&store_for_load);
-            let html = render_form(&nonce, &prefill, &FieldErrors::new());
+            let prefill = load_prefill(&store_for_load, profile);
+            let html = render_form(profile, &nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
             let headers = [
@@ -121,6 +134,7 @@ pub(crate) fn start(
                 BodyRead::Ok(b) => b,
                 BodyRead::TooLarge => {
                     let html = render_form_with_banner(
+                        profile,
                         &nonce,
                         &Prefill::empty(),
                         "Request body too large — please try again.",
@@ -144,7 +158,7 @@ pub(crate) fn start(
                 return Ok(());
             }
 
-            match parse_form(&body) {
+            match parse_form(&body, profile) {
                 Ok(config) => {
                     state.apply(ProvisioningInput::ValidSubmission);
                     let persist = store
@@ -163,6 +177,7 @@ pub(crate) fn start(
                             log::error!("POST /save persist failed: {e:#}");
                             state.apply(ProvisioningInput::PersistFailed);
                             let html = render_form_with_banner(
+                                profile,
                                 &nonce,
                                 &Prefill::empty(),
                                 "Could not save credentials to flash. Please try again.",
@@ -176,7 +191,7 @@ pub(crate) fn start(
                     state.apply(ProvisioningInput::InvalidSubmission);
                     (on_event)(ProvisioningEvent::SubmissionRejected);
                     log::info!("POST /save rejected: {} field error(s)", errors.len());
-                    let html = render_form(&nonce, &Prefill::empty(), &errors);
+                    let html = render_form(profile, &nonce, &Prefill::empty(), &errors);
                     let mut response = request.into_status_response(400)?;
                     response.write_all(html.as_bytes())?;
                 }
@@ -200,6 +215,7 @@ pub(crate) fn start(
             let json = render_status(
                 state.current().as_str(),
                 provisioned,
+                profile,
                 &device_name,
                 &firmware_version,
                 state.uptime_secs(),
@@ -349,10 +365,19 @@ fn percent_decode_simple(input: &str) -> Option<String> {
 }
 
 /// Non-secret pre-fill values for the form.
+///
+/// Carries the union of both profiles' non-secret inputs; only the active
+/// profile's placeholders are substituted, so the unused fields stay empty.
+/// Secret inputs — `wifi_pass`, `app_key`, and `mqtt_pass` — are deliberately
+/// absent: they are never pre-filled and must be re-entered on every
+/// submission.
 struct Prefill {
     wifi_ssid: String,
     dev_eui: String,
     join_eui: String,
+    mqtt_uri: String,
+    mqtt_user: String,
+    mqtt_client: String,
     ota_url: String,
     dev_name: String,
 }
@@ -360,21 +385,32 @@ struct Prefill {
 impl Prefill {
     /// An all-empty pre-fill (used when re-rendering after a POST: secrets are
     /// never echoed and non-secret values came from the rejected submission,
-    /// which we deliberately do not round-trip in v1).
+    /// which we deliberately do not round-trip).
     fn empty() -> Self {
         Self {
             wifi_ssid: String::new(),
             dev_eui: String::new(),
             join_eui: String::new(),
+            mqtt_uri: String::new(),
+            mqtt_user: String::new(),
+            mqtt_client: String::new(),
             ota_url: String::new(),
             dev_name: String::new(),
         }
     }
 }
 
-/// Loads non-secret pre-fill values from NVS, falling back to empty on any
-/// error or when unprovisioned.
-fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
+/// Loads non-secret pre-fill values from NVS for `profile`, falling back to
+/// empty on any error or when unprovisioned.
+///
+/// For the `WifiMqttDevice` profile the `mqtt_uri` field is recomposed from the
+/// stored `mqtt_host` + `mqtt_port` (the inverse of the parse-time split). The
+/// `mqtt_pass` secret is never read into the prefill — it joins `wifi_pass` and
+/// `app_key` in the no-prefill set.
+fn load_prefill(
+    store: &Arc<std::sync::Mutex<ProvisioningStore>>,
+    profile: SchemaProfile,
+) -> Prefill {
     let guard = match store.lock() {
         Ok(g) => g,
         Err(_) => {
@@ -383,13 +419,25 @@ fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
         }
     };
     match guard.load() {
-        Ok(Some(cfg)) => Prefill {
-            wifi_ssid: cfg.wifi_ssid,
-            dev_eui: cfg.dev_eui_hex,
-            join_eui: cfg.join_eui_hex,
-            ota_url: cfg.ota_url,
-            dev_name: cfg.device_name,
-        },
+        Ok(Some(cfg)) if cfg.profile == profile => {
+            let mut prefill = Prefill {
+                wifi_ssid: cfg.wifi_ssid,
+                dev_eui: cfg.dev_eui_hex,
+                join_eui: cfg.join_eui_hex,
+                mqtt_uri: String::new(),
+                mqtt_user: cfg.mqtt_user.unwrap_or_default(),
+                mqtt_client: cfg.mqtt_client.unwrap_or_default(),
+                ota_url: cfg.ota_url,
+                dev_name: cfg.device_name,
+            };
+            if profile == SchemaProfile::WifiMqttDevice && !cfg.mqtt_host.is_empty() {
+                prefill.mqtt_uri = format!("mqtt://{}:{}", cfg.mqtt_host, cfg.mqtt_port);
+            }
+            prefill
+        }
+        // A stored record under the *other* profile must not pre-fill this
+        // form (its fields do not map); render empty.
+        Ok(Some(_)) => Prefill::empty(),
         Ok(None) => Prefill::empty(),
         Err(e) => {
             log::debug!("load_prefill: store.load() failed, rendering empty form: {e:#}");
@@ -398,29 +446,53 @@ fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
     }
 }
 
-/// Substitutes pre-fill values and rendered errors into the portal template.
+/// Substitutes pre-fill values and rendered errors into the active profile's
+/// template.
 ///
-/// Secret inputs (`wifi_pass`, `app_key`) carry no placeholder substitution and
-/// are always emitted empty.
-fn render_form(nonce: &str, prefill: &Prefill, errors: &FieldErrors) -> String {
-    render_template(nonce, prefill, &render_errors(errors))
+/// Secret inputs (`wifi_pass`, `app_key`, `mqtt_pass`) carry no placeholder
+/// substitution and are always emitted empty.
+fn render_form(
+    profile: SchemaProfile,
+    nonce: &str,
+    prefill: &Prefill,
+    errors: &FieldErrors,
+) -> String {
+    render_template(profile, nonce, prefill, &render_errors(errors))
 }
 
 /// Renders the form with a non-field-specific banner instead of per-field
 /// errors. Used for transport/persistence failures (413, 500) where the form
 /// data itself was never validated and the per-field error model would
 /// misrepresent the cause.
-fn render_form_with_banner(nonce: &str, prefill: &Prefill, message: &str) -> String {
-    render_template(nonce, prefill, &render_banner(message))
+fn render_form_with_banner(
+    profile: SchemaProfile,
+    nonce: &str,
+    prefill: &Prefill,
+    message: &str,
+) -> String {
+    render_template(profile, nonce, prefill, &render_banner(message))
 }
 
-fn render_template(nonce: &str, prefill: &Prefill, errors_html: &str) -> String {
-    PORTAL_HTML
+fn render_template(
+    profile: SchemaProfile,
+    nonce: &str,
+    prefill: &Prefill,
+    errors_html: &str,
+) -> String {
+    // Every profile shares the Core/OTA placeholders; the profile-specific
+    // ones (`{{DEV_EUI}}` / `{{JOIN_EUI}}` for LoRaWAN, `{{MQTT_*}}` for
+    // Wi-Fi+MQTT) simply do not appear in the other profile's template, so the
+    // corresponding `replace` calls are no-ops there. No `{{MQTT_PASS}}`
+    // placeholder exists in any template — the secret is never pre-filled.
+    template_for(profile)
         .replace("{{NONCE}}", &html_escape(nonce))
         .replace("{{ERRORS}}", errors_html)
         .replace("{{WIFI_SSID}}", &html_escape(&prefill.wifi_ssid))
         .replace("{{DEV_EUI}}", &html_escape(&prefill.dev_eui))
         .replace("{{JOIN_EUI}}", &html_escape(&prefill.join_eui))
+        .replace("{{MQTT_URI}}", &html_escape(&prefill.mqtt_uri))
+        .replace("{{MQTT_USER}}", &html_escape(&prefill.mqtt_user))
+        .replace("{{MQTT_CLIENT}}", &html_escape(&prefill.mqtt_client))
         .replace("{{OTA_URL}}", &html_escape(&prefill.ota_url))
         .replace("{{DEV_NAME}}", &html_escape(&prefill.dev_name))
 }
@@ -454,6 +526,11 @@ fn render_errors(errors: &FieldErrors) -> String {
 }
 
 /// Human-readable label for a form field.
+///
+/// [`Field::Form`] covers every body-level problem, including a
+/// [`ValidationError::UnexpectedForProfile`](provisioning_pure::ValidationError::UnexpectedForProfile)
+/// — the message text comes from the error's `Display`, this only labels the
+/// owning input as the whole submission.
 fn field_label(field: Field) -> &'static str {
     match field {
         Field::WifiSsid => "Wi-Fi network name",
@@ -461,6 +538,10 @@ fn field_label(field: Field) -> &'static str {
         Field::DevEui => "DevEUI",
         Field::JoinEui => "JoinEUI",
         Field::AppKey => "AppKey",
+        Field::MqttUri => "MQTT broker URI",
+        Field::MqttUser => "MQTT username",
+        Field::MqttPass => "MQTT password",
+        Field::MqttClient => "MQTT client ID",
         Field::OtaUrl => "OTA URL",
         Field::DeviceName => "Device name",
         Field::Form => "Submission",
@@ -469,24 +550,30 @@ fn field_label(field: Field) -> &'static str {
 
 /// Builds the `/status` JSON document with `core` formatting.
 ///
-/// Schema: `{"schema":1,"state":"…","provisioned":bool,"device_name":"…",
-/// "firmware_version":"…","uptime_s":N,"extra":{…}}`. The `extra` entries come
-/// from `with_status_entry` and are served unauthenticated to anyone on the AP;
-/// they must never contain secrets.
+/// Schema: `{"schema":2,"state":"…","provisioned":bool,"profile":"…",
+/// "device_name":"…","firmware_version":"…","uptime_s":N,"extra":{…}}`. The
+/// `profile` field is additive (`"lorawan"` / `"wifi_mqtt"`), consistent with
+/// the `/status` contract where everything beyond `schema` / `state` /
+/// `provisioned` is optional. The `extra` entries come from `with_status_entry`
+/// and are served unauthenticated to anyone on the AP; they must never contain
+/// secrets.
 fn render_status(
     state: &str,
     provisioned: bool,
+    profile: SchemaProfile,
     device_name: &str,
     firmware_version: &str,
     uptime_s: u64,
     extras: &[(String, String)],
 ) -> String {
-    let mut json = String::with_capacity(160);
-    json.push_str("{\"schema\":1,\"state\":\"");
+    let mut json = String::with_capacity(176);
+    json.push_str("{\"schema\":2,\"state\":\"");
     json.push_str(&json_escape(state));
     json.push_str("\",\"provisioned\":");
     json.push_str(if provisioned { "true" } else { "false" });
-    json.push_str(",\"device_name\":\"");
+    json.push_str(",\"profile\":\"");
+    json.push_str(profile.as_str());
+    json.push_str("\",\"device_name\":\"");
     json.push_str(&json_escape(device_name));
     json.push_str("\",\"firmware_version\":\"");
     json.push_str(&json_escape(firmware_version));
@@ -575,18 +662,49 @@ mod tests {
 
     #[test]
     fn status_json_has_required_fields() {
-        let json = render_status("awaiting_submission", false, "dev", "1.0", 42, &[]);
-        assert!(json.contains("\"schema\":1"));
+        let json = render_status(
+            "awaiting_submission",
+            false,
+            SchemaProfile::LorawanFieldDevice,
+            "dev",
+            "1.0",
+            42,
+            &[],
+        );
+        assert!(json.contains("\"schema\":2"));
         assert!(json.contains("\"state\":\"awaiting_submission\""));
         assert!(json.contains("\"provisioned\":false"));
+        assert!(json.contains("\"profile\":\"lorawan\""));
         assert!(json.contains("\"uptime_s\":42"));
         assert!(json.ends_with("\"extra\":{}}"));
     }
 
     #[test]
+    fn status_json_renders_wifi_mqtt_profile() {
+        let json = render_status(
+            "committed",
+            true,
+            SchemaProfile::WifiMqttDevice,
+            "d",
+            "v",
+            1,
+            &[],
+        );
+        assert!(json.contains("\"profile\":\"wifi_mqtt\""));
+    }
+
+    #[test]
     fn status_json_renders_extras() {
         let extras = vec![("battery".to_string(), "88".to_string())];
-        let json = render_status("committed", true, "d", "v", 1, &extras);
+        let json = render_status(
+            "committed",
+            true,
+            SchemaProfile::LorawanFieldDevice,
+            "d",
+            "v",
+            1,
+            &extras,
+        );
         assert!(json.contains("\"extra\":{\"battery\":\"88\"}"));
     }
 }

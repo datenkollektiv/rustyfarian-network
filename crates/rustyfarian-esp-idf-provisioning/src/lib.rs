@@ -1,11 +1,15 @@
 //! ESP-IDF SoftAP captive-portal provisioning driver.
 //!
 //! Brings up a Wi-Fi access point, a wildcard DNS responder, and an embedded
-//! HTTP captive portal so a field operator can enter Wi-Fi credentials,
-//! LoRaWAN OTAA keys, an OTA URL, and a device name with no toolchain present.
-//! A valid submission is persisted to NVS via [`ProvisioningStore`] and the
-//! host is notified through the [`on_event`](ProvisioningBuilder::on_event)
-//! callback; the host then reboots into normal STA boot.
+//! HTTP captive portal so a field operator can provision a device with no
+//! toolchain present. The [`PortalConfig::profile`] selects one of two schemas
+//! ([`SchemaProfile`]): `LorawanFieldDevice` collects Wi-Fi credentials,
+//! LoRaWAN OTAA keys, an OTA URL, and a device name; `WifiMqttDevice` collects
+//! Wi-Fi credentials, an MQTT broker URI with optional auth and client ID, an
+//! OTA URL, and a device name. A valid submission is persisted to NVS via
+//! [`ProvisioningStore`] and the host is notified through the
+//! [`on_event`](ProvisioningBuilder::on_event) callback; the host then reboots
+//! into normal STA boot.
 //!
 //! The host-testable form/state/SSID logic lives in [`provisioning_pure`]; this
 //! crate is the ESP-IDF binding around it, mirroring the
@@ -25,7 +29,7 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_idf_provisioning::{PortalConfig, ProvisioningBuilder};
+//! use rustyfarian_esp_idf_provisioning::{PortalConfig, ProvisioningBuilder, SchemaProfile};
 //!
 //! let config = PortalConfig {
 //!     ssid_prefix: "Rustyfarian",
@@ -33,6 +37,7 @@
 //!     channel: 1,
 //!     device_name: "hive-01",
 //!     firmware_version: env!("CARGO_PKG_VERSION"),
+//!     profile: SchemaProfile::LorawanFieldDevice,
 //! };
 //!
 //! let session = ProvisioningBuilder::new(config)
@@ -53,7 +58,8 @@ mod store;
 pub use store::{ProvisioningStore, StoredConfig};
 
 pub use provisioning_pure::{
-    derive_softap_ssid, Field, FieldError, ProvisioningConfig, ProvisioningState, ValidationError,
+    derive_softap_ssid, Field, FieldError, LoraFields, MqttFields, ProvisioningConfig,
+    ProvisioningState, SchemaProfile, ValidationError,
 };
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -87,6 +93,18 @@ pub struct PortalConfig<'a> {
     pub device_name: &'a str,
     /// Firmware version surfaced on `/status`.
     pub firmware_version: &'a str,
+    /// The provisioning schema profile this portal serves.
+    ///
+    /// Selects the form template, the canonical field set
+    /// [`parse_form`](provisioning_pure::parse_form) validates against, and the
+    /// `profile` discriminator the [`ProvisioningStore`] persists. Existing
+    /// devices provisioned before the second profile landed read as
+    /// [`SchemaProfile::LorawanFieldDevice`] (the NVS v1 → v2 migration in
+    /// [`store`](mod@store)), so a beekeeper device upgraded to v2 firmware is
+    /// never re-provisioned. The `mqtt_pass` secret follows the same rules as
+    /// `wifi_pass` and `app_key`: redacted, never pre-filled, re-entered on
+    /// every submission.
+    pub profile: SchemaProfile,
 }
 
 /// Experimental: API may change before 1.0.
@@ -305,6 +323,7 @@ impl<'a> ProvisioningBuilder<'a> {
         let device_name = Arc::new(self.config.device_name.to_string());
         let firmware_version = Arc::new(self.config.firmware_version.to_string());
         let status_entries = Arc::new(self.status_entries);
+        let profile = self.config.profile;
 
         let server = portal::start(
             ap_ip,
@@ -315,6 +334,7 @@ impl<'a> ProvisioningBuilder<'a> {
             device_name,
             firmware_version,
             status_entries,
+            profile,
         )?;
 
         let subscription = subscribe_ap_events(&sys_loop, on_event.clone())?;

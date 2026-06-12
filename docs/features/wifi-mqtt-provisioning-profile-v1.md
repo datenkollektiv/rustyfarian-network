@@ -3,24 +3,39 @@
 Feature doc for the second provisioning schema profile proposed by [ADR 014](../adr/014-wifi-mqtt-provisioning-profile.md).
 The profile adds a `WifiMqttDevice` schema (Wi-Fi credentials + MQTT broker + OTA URL + device name, no LoRaWAN) to the SoftAP provisioning triad already shipped on the `soft-ap` branch under [ADR 013](../adr/013-softap-provisioning-acceptance.md) / [feature doc](softap-provisioning-v1.md).
 
-This is a hybrid doc: it records decisions that **will** be locked by ADR 014 once accepted, and it carries the open questions and phased plan for the implementer.
-Nothing here is final until the maintainer signs off ADR 014 and the seven proposed answers below.
-The Design section is an illustrative sketch and a *delta* on the existing v1 implementation, not a fresh contract; where the code deviates, the Session Log will record it.
-All gates below are unrun and "awaiting sign-off".
+This is a hybrid doc: it records the decisions locked by ADR 014 (accepted 2026-06-12) and the open questions and phased plan that drove the implementation.
+ADR 014 and the seven proposed answers below were signed off on 2026-06-12 and implemented the same day; durable outcomes are promoted into the "Locked at implementation" Decisions sub-table.
+The Design section is an illustrative sketch and a *delta* on the existing v1 implementation, not a fresh contract; where the code deviated, the Session Log records it.
+The verification gates are deferred to the maintainer machine (no Rust toolchain in the implementation sandbox); see the State checklist.
 
 ## Decisions
 
 ### Locked by ADR 014 (once accepted)
 
-|                                                                                                 Decision | Reason                                                                                                                                                                                  | Rejected Alternative                                                                                                                                                                                         |
-|--------------------------------------------------------------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|                  A second provisioning profile is accepted: `WifiMqttDevice` = Core + MQTT + OTA            | `rustyfarian-rgb-clock` needs Wi-Fi + MQTT + OTA + device name and no LoRaWAN; ADR 013's Consequences already anticipated a "no LoRaWAN" host; closed named profiles keep validation centralised | Route MQTT creds through opaque extras (no redaction/validation); a third crate or per-downstream fork (duplicates the portal); ad-hoc optional LoRa fields (ambiguous boot states, no typed profile contract)  |
-|             Schema generalises to a closed set of named profiles built from field groups (Core/LoRaWAN/MQTT/OTA) | Exactly two profiles (`LorawanFieldDevice`, `WifiMqttDevice`) keep ADR 013's "validation is load-bearing" property while expressing both shapes from one type                            | Generic host-defined schema (reaffirmed rejection from ADR 013 §4 — scatters validation across downstreams)                                                                                                  |
-|       MQTT field group = broker host+port, optional username/password, optional client ID                  | Every field maps onto an existing `MqttConfig` method (`new(host, port, client_id)` / `with_auth(username, password)`); validation delegates per the wifi-pure/lora-pure precedent       | A bespoke MQTT field set not grounded in the consumer (collects values the MQTT crate cannot use)                                                                                                            |
-|                                       Plain `mqtt://` only; MQTT-over-TLS is out of scope                  | Matches `format_broker_url`'s single hard-coded scheme and the workspace plain-transport posture (same as ADR 011 plain-HTTP OTA)                                                        | Accept `mqtts://` (promises a transport the consumer cannot honour today)                                                                                                                                    |
-|                The profile mechanism lives in `provisioning-pure`; the same two crates serve both profiles | No new crate; `parse_form` becomes profile-parameterised and `ProvisioningConfig` carries optional field groups (honours ADR 013 §2/§3)                                                  | A parallel crate or surface for the new profile                                                                                                                                                             |
-|         NVS schema version bumps to 2 with an explicit `profile` discriminator; v1 records read as `lorawan` | A device must know its profile at boot; absent-`profile` v1 records read as `lorawan` so deployed beekeeper devices are not re-provisioned                                               | No discriminator (a v2 reader cannot tell the profiles apart); a full migration pass (unnecessary — default-by-absence is zero-cost)                                                                          |
-|                                              BLE provisioning and TLS remain non-goals                     | Carried forward from ADR 013 §5 and the plain-transport posture; no downstream has asked for either                                                                                      | Accept BLE provisioning or MQTT-over-TLS in v1                                                                                                                                                               |
+|                                                                                                         Decision | Reason                                                                                                                                                                                           | Rejected Alternative                                                                                                                                                                                           |
+|-----------------------------------------------------------------------------------------------------------------:|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|                                  A second provisioning profile is accepted: `WifiMqttDevice` = Core + MQTT + OTA | `rustyfarian-rgb-clock` needs Wi-Fi + MQTT + OTA + device name and no LoRaWAN; ADR 013's Consequences already anticipated a "no LoRaWAN" host; closed named profiles keep validation centralised | Route MQTT creds through opaque extras (no redaction/validation); a third crate or per-downstream fork (duplicates the portal); ad-hoc optional LoRa fields (ambiguous boot states, no typed profile contract) |
+|             Schema generalises to a closed set of named profiles built from field groups (Core/LoRaWAN/MQTT/OTA) | Exactly two profiles (`LorawanFieldDevice`, `WifiMqttDevice`) keep ADR 013's "validation is load-bearing" property while expressing both shapes from one type                                    | Generic host-defined schema (reaffirmed rejection from ADR 013 §4 — scatters validation across downstreams)                                                                                                    |
+|                              MQTT field group = broker host+port, optional username/password, optional client ID | Every field maps onto an existing `MqttConfig` method (`new(host, port, client_id)` / `with_auth(username, password)`); validation delegates per the wifi-pure/lora-pure precedent               | A bespoke MQTT field set not grounded in the consumer (collects values the MQTT crate cannot use)                                                                                                              |
+|                                                              Plain `mqtt://` only; MQTT-over-TLS is out of scope | Matches `format_broker_url`'s single hard-coded scheme and the workspace plain-transport posture (same as ADR 011 plain-HTTP OTA)                                                                | Accept `mqtts://` (promises a transport the consumer cannot honour today)                                                                                                                                      |
+|                      The profile mechanism lives in `provisioning-pure`; the same two crates serve both profiles | No new crate; `parse_form` becomes profile-parameterised and `ProvisioningConfig` carries optional field groups (honours ADR 013 §2/§3)                                                          | A parallel crate or surface for the new profile                                                                                                                                                                |
+|             NVS schema version bumps to 2 with an explicit `profile` discriminator; v1 records read as `lorawan` | A device must know its profile at boot; absent-`profile` v1 records read as `lorawan` so deployed beekeeper devices are not re-provisioned                                                       | No discriminator (a v2 reader cannot tell the profiles apart); a full migration pass (unnecessary — default-by-absence is zero-cost)                                                                           |
+|                                                                        BLE provisioning and TLS remain non-goals | Carried forward from ADR 013 §5 and the plain-transport posture; no downstream has asked for either                                                                                              | Accept BLE provisioning or MQTT-over-TLS in v1                                                                                                                                                                 |
+
+### Locked at implementation (2026-06-12)
+
+These rows promote the resolved Q1–Q7 outcomes plus the implementation deviations into durable decisions.
+The amendments that produced them are itemised in the 2026-06-12 implementation Session Log entry.
+
+|                                                                                                          Decision | Reason                                                                                                                                                                                |
+|-----------------------------------------------------------------------------------------------------------------:|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|              Q1 — single `mqtt_uri` input split into separate `mqtt_host` / `mqtt_port` NVS keys (`mqtt_port` string) | One form field, zero re-parsing on the boot critical section; port failures on both paths (`u16` parse and `!= 0` validator) map to the `mqtt_uri` field error as `InvalidUrl`        |
+|                         Q2 — optional `mqtt_client`; blank derives a host-side client ID truncated to 23 bytes on a char boundary | `MqttConfig::new` needs a client ID but the library does not invent identifiers; the example's `derive_client_id` helper truncates the device name on a UTF-8 boundary                |
+|                                Q3 — `mqtt_user` / `mqtt_pass` optional with an asymmetric guard: anonymous, user-only, and both-present accepted; password-without-user rejected | Maps onto `MqttConfig::with_auth`; username-only ACLs are legitimate; `mqtt_pass` is secret-class (redacting `Debug`, no prefill, re-entered each submission)                         |
+|             Q4 — `SchemaProfile` enum (with `as_str` / `from_str`) and grouped `Option<LoraFields>` / `Option<MqttFields>` | Closed two-profile set with profile-aware `parse_form`; cross-profile fields fold to one Form-level `UnexpectedForProfile`; `MAX_FIELD_ERRORS = 9`; group structs carry redacting `Debug` |
+|                                                  Q5 — two complete templates `portal_lorawan.html` / `portal_wifi_mqtt.html` | Flat `include_str!` + substitution, no template mini-language; the old combined `portal.html` was deleted                                                                            |
+|         Q6 — NVS schema v2 with a `profile` discriminator; absent-`profile` v1 records load as `lorawan`; `save` removes the inactive group | A device knows its profile at boot; deployed beekeeper devices are not re-provisioned; `save` writes only the active group so `load` round-trips `None` for the other; MQTT length caps set to 64 |
+|                  Q7 — `PortalConfig` gains `profile`; prefill / field-label / render paths profile-aware; `/status` adds `"profile"` | Prefill only fires when the stored profile matches the portal profile; the `/status` document schema bumped 1→2 on an axis independent of the NVS `schema_ver`                        |
 
 ## Constraints
 
@@ -65,7 +80,7 @@ That note belongs in the rustdoc of whatever accessor returns the client ID, so 
 Rejected: a required client-ID field — `MqttConfig::new` requires a client ID at build time, but the provisioning layer should not force a field author to invent one; the host can derive it.
 Rejected: auto-derivation *inside* the library — the library does not invent identifiers, by the same principle that keeps reboot and mode-entry host-owned.
 
-### Q3. Auth pair — Proposed: `mqtt_user` / `mqtt_pass`, both-or-neither with one asymmetry
+### Q3. Auth pair — Proposed: `mqtt_user` / `mqtt_pass`, optional with an asymmetric guard
 
 The portal collects `mqtt_user` and `mqtt_pass`.
 Anonymous connection = both absent or both empty.
@@ -277,13 +292,17 @@ Gate: `just lint-docs`.
 ## State
 
 - [x] Design drafted (ADR 014 proposed)
-- [ ] ADR 014 accepted
-- [ ] Open-question proposals signed off
-- [ ] Phase 1 — profile mechanism + MQTT validators + tests
-- [ ] Phase 2 — store schema v2 + templates + builder threading
-- [ ] Phase 3 — example + build routing
-- [ ] Phase 4 — docs / CHANGELOG / ROADMAP
-- [ ] Verification gates green
+- [x] ADR 014 accepted (2026-06-12)
+- [x] Open-question proposals signed off (2026-06-12)
+- [x] Phase 0 — `rustyfarian-network-pure` `no_std` extraction (ADR 014 §2)
+- [x] Phase 1 — profile mechanism + MQTT validators + tests
+- [x] Phase 2 — store schema v2 + templates + builder threading
+- [x] Phase 3 — example + build routing
+- [x] Core implementation (Phases 0–3, 2026-06-12)
+- [x] Host tests written (`provisioning-pure` profile + MQTT coverage)
+- [x] Phase 4 — docs / CHANGELOG / ROADMAP
+- [ ] Verification gates green — `just fmt` / `just verify` / `just test-provisioning` / `just build-example idf_c3_provision_mqtt` (and `idf_c3_provision`) plus the `cargo build -p rustyfarian-network-pure --no-default-features` `no_std` check pending on the maintainer machine (no Rust toolchain in the implementation sandbox)
+- [x] On-hardware smoke test of the `wifi_mqtt` load path (ESP32-C3, 2026-06-12)
 
 ## Session Log
 
@@ -292,3 +311,20 @@ Gate: `just lint-docs`.
   Awaiting maintainer sign-off of ADR 014 and the seven proposed answers above.
 - 2026-06-12 — Maintainer review pass; nine findings adopted: the no_std mechanism for `rustyfarian-network-pure` lifted to an ADR §2 sub-decision (`#![cfg_attr(not(feature = "std"), no_std)]`, default `std` feature, extraction before Phase 1); §2 delegation argument reframed to lead with the requirement before the mechanism; `ProvisioningConfig::profile()` accessor added; profile-mismatch handling made explicit rejection via a Form-level `ValidationError::UnexpectedForProfile` (replacing extras-folding); `mqtt_port` storage locked to string; the `profile` NVS key reserved alongside the `x_*` rule; the port boundary test split into the `0`-rejected-by-validator and `65536`-fails-u16-parse paths; `mqtt_pass` added to the no-prefill secret set; and a version-axes note distinguishing feature-doc `v1` from NVS `schema_ver = 2`.
   The tracking-issue suggestion was declined per the no-issue-tracker convention; the feature-doc State checklist is the sign-off anchor.
+- 2026-06-12 — ADR 014 accepted (maintainer signed off verbally; this counts as acceptance) and Phases 0–3 implemented the same day against the `soft-ap` branch.
+  Implementation deviations and locked choices (authoritative list):
+  - MQTT length caps set to 64 (`MQTT_HOST_MAX_LEN` / `MQTT_USER_MAX_LEN` / `MQTT_PASS_MAX_LEN`); the doc had left caps open, 64 was chosen.
+  - `SchemaProfile` gained `as_str` / `from_str` alongside `fields()`, so the NVS `profile` discriminator round-trips through one source of truth.
+  - `mqtt_uri` port failures map to `InvalidUrl` on **both** paths — the `0`-rejected-by-validator path and the `65536`-fails-`u16`-parse path.
+  - The `LoraFields` / `MqttFields` group structs carry manual redacting `Debug` impls (redacting `app_key_hex` and `mqtt_pass` respectively), matching the `LoraConfig` / `ProvisioningConfig` precedent.
+  - `QoS` and the `SubscribeClient` trait joined the `std` gate in `rustyfarian-network-pure` (the trait's `anyhow` dependency forced the pair), and `anyhow` was made optional behind the `std` feature; the `no_std` core keeps `validate_client_id`, `CLIENT_ID_MAX_LEN`, the topic validators, `backoff.rs`, and `status_colors.rs`.
+  - The `/status` document schema bumped 1→2 on an axis independent of the NVS `schema_ver`, with the additive `"profile"` field; the version-axes note in Q6 covers the asymmetry.
+  - `save()` writes only the active group's keys and removes the inactive group's keys, so `load` round-trips `None` for the absent group; v1 / absent-`profile` records load as `lorawan` with no re-provisioning.
+  - Prefill is profile-aware: it recomposes `mqtt://host:port` and pre-fills only when the stored profile matches the portal profile; `mqtt_pass` joined the no-prefill secret set.
+  - The `idf_c3_provision_mqtt` example constructs the downstream `MqttConfig` via a `rustyfarian-esp-idf-mqtt` dev-dependency (the established cross-crate example pattern) and uses a `derive_client_id` helper truncating the device name to 23 bytes on a char boundary when `mqtt_client` is blank; the existing `idf_c3_provision` example gained `profile: LorawanFieldDevice`.
+  - The old combined `portal.html` was deleted in favour of `portal_lorawan.html` + `portal_wifi_mqtt.html`.
+  - All gates deferred to the maintainer (no toolchain in the sandbox): `just fmt`, `just verify`, `just test-provisioning`, `just build-example idf_c3_provision_mqtt`, `just build-example idf_c3_provision`, and `cargo build -p rustyfarian-network-pure --no-default-features` to prove the `no_std` path (not covered by `just verify`).
+    Follow-up suggestion (not actioned here): add a `justfile` recipe wrapping the `--no-default-features` `no_std` build so CI and the maintainer can gate it like the other checks.
+- 2026-06-12 — On-hardware smoke test (ESP32-C3): `idf_c3_provision_mqtt` boots an already-provisioned `wifi_mqtt` device, confirming the schema-v2 `profile` discriminator round-trip from real NVS flash, absent optional MQTT keys loading as `None` (anonymous broker), the blank-`mqtt_client` device-name derivation (`client_id len=4` from name `Test`), lengths-only secret logging, and downstream `MqttConfig` construction.
+  The flash itself exercised the corrected `*provision*`-before-`*mqtt*` routing in `scripts/build-example.sh` / `scripts/flash.sh`.
+  Not yet exercised on hardware: the `portal_wifi_mqtt.html` submission path on a phone browser (same trailing manual validation as the v1 captive-portal smoke).

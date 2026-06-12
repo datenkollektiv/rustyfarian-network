@@ -8,6 +8,7 @@
 use core::fmt;
 
 use crate::form::ExtraField;
+use crate::profile::{LoraFields, MqttFields, SchemaProfile};
 
 /// Maximum length of the human-readable device name (bytes).
 pub const DEVICE_NAME_MAX_LEN: usize = 24;
@@ -29,8 +30,28 @@ pub const EXTRA_VALUE_MAX_LEN: usize = 64;
 
 /// Capacity of the [`FieldErrors`](crate::FieldErrors) accumulator.
 ///
-/// At most one error per canonical field (seven) plus one form-level error.
-pub const MAX_FIELD_ERRORS: usize = 8;
+/// At most one error per canonical field of the active profile (up to eight
+/// for `WifiMqttDevice`) plus one form-level error.
+pub const MAX_FIELD_ERRORS: usize = 9;
+
+/// Maximum length of the MQTT broker host (bytes).
+///
+/// The feature doc Q1 leaves this unspecified; 64 is chosen as a sane cap that
+/// comfortably holds a fully-qualified domain name and is recorded as a
+/// deviation in the Session Log.
+pub const MQTT_HOST_MAX_LEN: usize = 64;
+
+/// Maximum length of the MQTT username (bytes).
+///
+/// The feature doc Q3 leaves this unspecified; 64 is chosen as a sane cap and
+/// recorded as a deviation in the Session Log.
+pub const MQTT_USER_MAX_LEN: usize = 64;
+
+/// Maximum length of the MQTT password (bytes).
+///
+/// The feature doc Q3 leaves this unspecified; 64 is chosen as a sane cap and
+/// recorded as a deviation in the Session Log.
+pub const MQTT_PASS_MAX_LEN: usize = 64;
 
 /// Hex-character length of a LoRaWAN EUI (8 bytes, MSB-first).
 pub(crate) const EUI_HEX_LEN: usize = 16;
@@ -45,22 +66,28 @@ pub(crate) const APP_KEY_HEX_LEN: usize = 32;
 /// Construct it only via [`parse_form`](crate::parse_form); the field accessors
 /// then return values that are guaranteed to satisfy every validation rule.
 ///
+/// The Core and OTA fields (`wifi_ssid`, `wifi_password`, `ota_url`,
+/// `device_name`, `extras`) are always present. The profile-specific field
+/// groups are carried as [`Option`]s: exactly one of [`lora`](Self::lora) and
+/// [`mqtt`](Self::mqtt) is `Some`, matching the [`profile`](Self::profile) the
+/// submission was parsed under.
+///
 /// # Redaction
 ///
-/// The [`Debug`](fmt::Debug) impl redacts the Wi-Fi password and the AppKey as
+/// The [`Debug`](fmt::Debug) impl redacts the Wi-Fi password, the AppKey (when
+/// the LoRaWAN group is present), and the MQTT password (when present) as
 /// `"<redacted>"`, following the [`lora_pure::LoraConfig`] precedent. It
-/// deliberately redacts *fewer* fields than `LoraConfig`: the DevEUI and
-/// JoinEUI are device identifiers rather than secrets and are useful verbatim
-/// in field logs, so they are shown.
+/// deliberately redacts *fewer* fields than `LoraConfig`: the DevEUI, JoinEUI,
+/// and the MQTT username are device identifiers rather than secrets and are
+/// useful verbatim in field logs, so they are shown.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProvisioningConfig {
     pub(crate) wifi_ssid: heapless::String<{ wifi_pure::SSID_MAX_LEN }>,
     pub(crate) wifi_password: heapless::String<{ wifi_pure::PASSWORD_MAX_LEN }>,
-    pub(crate) dev_eui_hex: heapless::String<EUI_HEX_LEN>,
-    pub(crate) join_eui_hex: heapless::String<EUI_HEX_LEN>,
-    pub(crate) app_key_hex: heapless::String<APP_KEY_HEX_LEN>,
     pub(crate) ota_url: heapless::String<OTA_URL_MAX_LEN>,
     pub(crate) device_name: heapless::String<DEVICE_NAME_MAX_LEN>,
+    pub(crate) lora: Option<LoraFields>,
+    pub(crate) mqtt: Option<MqttFields>,
     pub(crate) extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>,
 }
 
@@ -81,27 +108,6 @@ impl ProvisioningConfig {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// The validated DevEUI as a 16-character MSB-first hex string.
-    pub fn dev_eui_hex(&self) -> &str {
-        &self.dev_eui_hex
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// The validated JoinEUI as a 16-character MSB-first hex string.
-    pub fn join_eui_hex(&self) -> &str {
-        &self.join_eui_hex
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// The validated AppKey as a 32-character hex string.
-    pub fn app_key_hex(&self) -> &str {
-        &self.app_key_hex
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
     /// The validated OTA update URL.
     pub fn ota_url(&self) -> &str {
         &self.ota_url
@@ -116,40 +122,51 @@ impl ProvisioningConfig {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// The opaque extra fields carried by the submission, in submission order.
-    pub fn extras(&self) -> &[ExtraField] {
-        &self.extras
+    /// The LoRaWAN field group, present iff the profile is
+    /// [`SchemaProfile::LorawanFieldDevice`].
+    pub fn lora(&self) -> Option<&LoraFields> {
+        self.lora.as_ref()
     }
 
     /// Experimental: API may change before 1.0.
     ///
-    /// Builds a [`lora_pure::LoraConfig`] from the validated OTAA credentials.
+    /// The MQTT field group, present iff the profile is
+    /// [`SchemaProfile::WifiMqttDevice`].
+    pub fn mqtt(&self) -> Option<&MqttFields> {
+        self.mqtt.as_ref()
+    }
+
+    /// Experimental: API may change before 1.0.
     ///
-    /// The DevEUI, JoinEUI, and AppKey were validated at parse time with the
-    /// exact length-and-hex rules [`lora_pure::LoraConfig::from_hex_strings`]
-    /// applies, so the `Option` it returns is `Some` by construction. The
-    /// `expect` below is therefore unreachable for any value this type can
-    /// hold; it would only fire if the parse-time and `from_hex_strings`
-    /// validation rules drifted apart, which the host tests guard against.
-    pub fn to_lora_config(&self, region: lora_pure::Region) -> lora_pure::LoraConfig {
-        lora_pure::LoraConfig::from_hex_strings(
-            region,
-            &self.dev_eui_hex,
-            &self.join_eui_hex,
-            &self.app_key_hex,
-        )
-        .expect("OTAA credentials validated at parse time")
+    /// The profile this config was parsed under.
+    ///
+    /// Exactly one field group is present; the returned profile is the
+    /// authoritative discriminator hosts match on, rather than probing which
+    /// group happens to be `Some`.
+    pub fn profile(&self) -> SchemaProfile {
+        if self.mqtt.is_some() {
+            SchemaProfile::WifiMqttDevice
+        } else {
+            SchemaProfile::LorawanFieldDevice
+        }
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The opaque extra fields carried by the submission, in submission order.
+    pub fn extras(&self) -> &[ExtraField] {
+        &self.extras
     }
 }
 
 impl fmt::Debug for ProvisioningConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProvisioningConfig")
+            .field("profile", &self.profile())
             .field("wifi_ssid", &self.wifi_ssid())
             .field("wifi_password", &"<redacted>")
-            .field("dev_eui_hex", &self.dev_eui_hex())
-            .field("join_eui_hex", &self.join_eui_hex())
-            .field("app_key_hex", &"<redacted>")
+            .field("lora", &self.lora)
+            .field("mqtt", &self.mqtt)
             .field("ota_url", &self.ota_url())
             .field("device_name", &self.device_name())
             .field("extras", &self.extras())
@@ -160,6 +177,7 @@ impl fmt::Debug for ProvisioningConfig {
 #[cfg(test)]
 mod tests {
     use crate::parse_form;
+    use crate::SchemaProfile;
     use alloc::format;
 
     // Fixture values named to avoid CodeQL's hardcoded-credential rule.
@@ -172,7 +190,7 @@ mod tests {
              &join_eui=70B3D57ED005ABCD&app_key={TEST_APP_KEY_HEX}\
              &ota_url=http://example.com/fw.bin&dev_name=hive"
         );
-        parse_form(&body).expect("valid fixture body")
+        parse_form(&body, SchemaProfile::LorawanFieldDevice).expect("valid fixture body")
     }
 
     #[test]
@@ -197,8 +215,19 @@ mod tests {
     #[test]
     fn to_lora_config_round_trips_validated_credentials() {
         let cfg = parsed_config();
-        let lora = cfg.to_lora_config(lora_pure::Region::EU868);
+        let lora = cfg
+            .lora()
+            .expect("lora group present")
+            .to_lora_config(lora_pure::Region::EU868);
         assert_eq!(lora.region, lora_pure::Region::EU868);
         assert_eq!(lora.dev_eui[7], 0x77);
+    }
+
+    #[test]
+    fn lorawan_profile_round_trips() {
+        let cfg = parsed_config();
+        assert_eq!(cfg.profile(), SchemaProfile::LorawanFieldDevice);
+        assert!(cfg.lora().is_some());
+        assert!(cfg.mqtt().is_none());
     }
 }

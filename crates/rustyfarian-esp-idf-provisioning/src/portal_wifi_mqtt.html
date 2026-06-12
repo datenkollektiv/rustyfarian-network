@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device Provisioning</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background: #f4f4f4; color: #222; }
+main { max-width: 30rem; margin: 0 auto; background: #fff; padding: 1.25rem; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+h1 { font-size: 1.3rem; margin-top: 0; }
+label { display: block; margin: .75rem 0 .2rem; font-weight: 600; font-size: .9rem; }
+input { width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid #bbb; border-radius: 4px; font-size: 1rem; }
+button { margin-top: 1rem; padding: .6rem 1rem; border: 0; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+.primary { background: #2563eb; color: #fff; width: 100%; }
+.danger { background: #dc2626; color: #fff; }
+.errors { background: #fee2e2; border: 1px solid #dc2626; color: #991b1b; padding: .5rem .75rem; border-radius: 4px; margin-bottom: 1rem; }
+.errors ul { margin: .25rem 0 0; padding-left: 1.2rem; }
+.hint { font-size: .8rem; color: #666; margin: .1rem 0 0; }
+hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
+</style>
+</head>
+<body>
+<main>
+<h1>Provision this device</h1>
+{{ERRORS}}
+<form method="POST" action="/save">
+<input type="hidden" name="_nonce" value="{{NONCE}}">
+
+<label for="wifi_ssid">Wi-Fi network name</label>
+<input id="wifi_ssid" name="wifi_ssid" value="{{WIFI_SSID}}" maxlength="32" required>
+
+<label for="wifi_pass">Wi-Fi password</label>
+<input id="wifi_pass" name="wifi_pass" type="password" placeholder="required (8–64 chars), leave blank for open networks" maxlength="64" minlength="8" title="Leave blank for an open network, otherwise 8–64 characters (WPA2-Personal minimum is 8).">
+<p class="hint">Leave blank for an open network, otherwise 8–64 characters.</p>
+
+<label for="mqtt_uri">MQTT broker URI</label>
+<input id="mqtt_uri" name="mqtt_uri" value="{{MQTT_URI}}" placeholder="mqtt://broker.local:1883" maxlength="96" title="Plain mqtt:// only, with host and port. Example: mqtt://broker.local:1883">
+<p class="hint">Plain mqtt:// only, host and port. Example: <code>mqtt://broker.local:1883</code>.</p>
+
+<label for="mqtt_user">MQTT username</label>
+<input id="mqtt_user" name="mqtt_user" value="{{MQTT_USER}}" maxlength="64" title="Optional. Leave blank for an anonymous connection.">
+<p class="hint">Optional. Leave blank for an anonymous connection.</p>
+
+<label for="mqtt_pass">MQTT password</label>
+<input id="mqtt_pass" name="mqtt_pass" type="password" placeholder="optional, re-enter each time" maxlength="64" title="Optional. Never pre-filled — re-enter on every submission.">
+<p class="hint">Optional. Never pre-filled — re-enter on every submission.</p>
+
+<label for="mqtt_client">MQTT client ID</label>
+<input id="mqtt_client" name="mqtt_client" value="{{MQTT_CLIENT}}" maxlength="23" title="Optional, at most 23 characters. Leave blank to let the firmware derive one.">
+<p class="hint">Optional, at most 23 characters. Blank lets the firmware derive one.</p>
+
+<label for="ota_url">OTA update URL</label>
+<input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128">
+<p class="hint">Plain http:// only.</p>
+
+<label for="dev_name">Device name</label>
+<input id="dev_name" name="dev_name" value="{{DEV_NAME}}" maxlength="24">
+
+<button class="primary" type="submit">Save and restart</button>
+</form>
+
+<hr>
+
+<form method="POST" action="/factory-reset" onsubmit="return confirm('Request a factory reset?');">
+<input type="hidden" name="_nonce" value="{{NONCE}}">
+<button class="danger" type="submit">Factory reset</button>
+</form>
+</main>
+</body>
+</html>

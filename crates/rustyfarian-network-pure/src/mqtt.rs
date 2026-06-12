@@ -15,6 +15,9 @@ pub fn connection_wait_iterations(timeout_ms: u64) -> u64 {
 ///
 /// This is the single place where the URL scheme is chosen; a future TLS
 /// variant would change the prefix here.
+///
+/// Requires the `std` feature (returns an owned [`String`]).
+#[cfg(feature = "std")]
 pub fn format_broker_url(host: &str, port: u16) -> String {
     format!("mqtt://{}:{}", host, port)
 }
@@ -229,6 +232,9 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
 /// Platform-neutral mirror of `esp_idf_svc::mqtt::client::QoS`.
 /// Used by [`SubscribeClient`] and [`spawn_subscriber_thread`] so that
 /// the subscriber thread machinery can be compiled and tested on any host.
+///
+/// Requires the `std` feature (part of the subscriber-thread machinery).
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QoS {
     AtMostOnce,
@@ -240,6 +246,10 @@ pub enum QoS {
 ///
 /// Implemented for `EspMqttClient<'static>` in `rustyfarian-esp-idf-mqtt`
 /// and for test doubles on the host.
+///
+/// Requires the `std` feature (part of the subscriber-thread machinery, and
+/// its method returns [`anyhow::Result`], which needs `std`).
+#[cfg(feature = "std")]
 pub trait SubscribeClient {
     fn subscribe_topic(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()>;
 }
@@ -262,6 +272,9 @@ pub trait SubscribeClient {
 ///
 /// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
 /// Pass the platform-specific constant (e.g. 8192) for embedded targets.
+///
+/// Requires the `std` feature (uses `std::thread` and `std::sync`).
+#[cfg(feature = "std")]
 pub fn spawn_subscriber_thread<C>(
     client: std::sync::Arc<std::sync::Mutex<C>>,
     topics: Vec<(String, QoS)>,
@@ -294,9 +307,11 @@ pub fn spawn_subscriber_thread<C>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "std")]
+    use super::format_broker_url;
     use super::{
-        connection_wait_iterations, format_broker_url, next_state, topic_matches_filter,
-        validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
+        connection_wait_iterations, next_state, topic_matches_filter, validate_broker_host,
+        validate_broker_port, validate_client_id, validate_publish_topic,
         validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent,
         CLIENT_ID_MAX_LEN, TOPIC_MAX_LEN,
     };
@@ -330,6 +345,7 @@ mod tests {
 
     // ── format_broker_url ───────────────────────────────────────────────────
 
+    #[cfg(feature = "std")]
     #[test]
     fn broker_url_ip_and_standard_port() {
         assert_eq!(
@@ -338,6 +354,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn broker_url_hostname_and_tls_port() {
         assert_eq!(
@@ -683,15 +700,20 @@ mod tests {
 
     // ── spawn_subscriber_thread ──────────────────────────────────────────────
 
+    #[cfg(feature = "std")]
     use super::{spawn_subscriber_thread, QoS, SubscribeClient};
+    #[cfg(feature = "std")]
     use std::sync::{Arc, Condvar, Mutex};
+    #[cfg(feature = "std")]
     use std::time::Duration;
 
+    #[cfg(feature = "std")]
     struct BlockingMockClient {
         gate: Arc<(Mutex<bool>, Condvar)>,
         subscribed: Arc<Mutex<Vec<String>>>,
     }
 
+    #[cfg(feature = "std")]
     impl SubscribeClient for BlockingMockClient {
         fn subscribe_topic(&mut self, topic: &str, _qos: QoS) -> anyhow::Result<()> {
             let (lock, cvar) = &*self.gate;
@@ -704,6 +726,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     fn wait_for_count(subscribed: &Arc<Mutex<Vec<String>>>, n: usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -729,6 +752,7 @@ mod tests {
     /// spawner returns in <100 ms even while the mock's `subscribe_topic` is still
     /// blocking — a regression that would reliably catch any revert to the old
     /// inline pattern.
+    #[cfg(feature = "std")]
     #[test]
     fn subscriber_thread_does_not_block_caller() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -761,6 +785,7 @@ mod tests {
     }
 
     /// All registered topics are subscribed in order when the mock is non-blocking.
+    #[cfg(feature = "std")]
     #[test]
     fn subscriber_thread_subscribes_all_topics() {
         let gate = Arc::new((Mutex::new(true), Condvar::new()));

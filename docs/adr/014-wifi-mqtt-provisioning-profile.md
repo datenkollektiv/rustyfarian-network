@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — awaiting maintainer sign-off.
+Accepted — maintainer signed off 2026-06-12; implemented the same day on the `soft-ap` branch.
 
 The canonical sign-off anchor is the State checklist in the feature doc ([wifi-mqtt-provisioning-profile-v1.md](../features/wifi-mqtt-provisioning-profile-v1.md)), which records acceptance; no issue tracker exists in this workspace by convention.
 
@@ -78,7 +78,7 @@ That feature gates only the two std-dependent items — `spawn_subscriber_thread
 The validators — `validate_client_id`, `CLIENT_ID_MAX_LEN`, and the topic validators — sit in the `no_std` core, as do `backoff.rs` and `status_colors.rs`, which have no std usage.
 `provisioning-pure` depends on `rustyfarian-network-pure` with `default-features = false`, picking up the validators without dragging in `std`.
 The MQTT consumers (`rustyfarian-esp-idf-mqtt`) keep the default `std` feature and are unaffected.
-This extraction lands **before Phase 1** of the feature plan, since Phase 1's MQTT validators delegate into it.
+This extraction landed **before Phase 1** of the feature plan (Phase 0, 2026-06-12), since Phase 1's MQTT validators delegate into it; the implementation also moved `QoS` and the `SubscribeClient` trait behind the `std` gate because the trait's `anyhow` dependency forced it, and made `anyhow` itself optional behind `std`.
 
 Rejected alternatives:
 
@@ -169,11 +169,11 @@ Bumping `schema_ver` to 2 while reading absent-`profile` v1 records as `lorawan`
 
 ### Implications
 
-These land **only if and when this ADR is accepted**, and are out of scope for the drafting pass:
+These landed with acceptance on 2026-06-12 and are recorded for the follow-through pass:
 
 - `docs/ROADMAP.md` gains an entry for the Wi-Fi + MQTT profile.
 - Any `VISION.md` / `README.md` / `CHANGELOG.md` wording that describes the schema as "four-field" is updated to reflect two profiles.
-  (The "four-field" phrasing currently appears in `docs/ROADMAP.md`, `CHANGELOG.md`, and ADR 013; it is not in `VISION.md` or the README, but both should be checked when the ADR lands.)
+  (The "four-field" phrasing appeared in `docs/ROADMAP.md`, `CHANGELOG.md`, and ADR 013; it was not in `VISION.md` or the README, both of which were checked when the ADR landed.)
 - The feature doc's seven open questions are signed off and Phases 1–4 are implemented.
 
 ## References
