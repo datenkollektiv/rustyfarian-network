@@ -31,8 +31,8 @@ use esp_idf_svc::http::Method;
 
 use provisioning_pure::{parse_form, Field, FieldErrors, ProvisioningInput};
 
-use crate::{ProvisioningEvent, SharedState};
 use crate::store::ProvisioningStore;
+use crate::{ProvisioningEvent, SharedState};
 
 /// The embedded portal HTML template.
 const PORTAL_HTML: &str = include_str!("portal.html");
@@ -101,7 +101,11 @@ pub(crate) fn start(
             let html = render_form(&nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
-            let mut response = request.into_ok_response()?;
+            let headers = [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+            ];
+            let mut response = request.into_response(200, Some("OK"), &headers)?;
             response.write_all(html.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
@@ -310,10 +314,7 @@ impl Prefill {
 /// Loads non-secret pre-fill values from NVS, falling back to empty on any
 /// error or when unprovisioned.
 fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
-    let loaded = store
-        .lock()
-        .ok()
-        .and_then(|s| s.load().ok().flatten());
+    let loaded = store.lock().ok().and_then(|s| s.load().ok().flatten());
     match loaded {
         Some(cfg) => Prefill {
             wifi_ssid: cfg.wifi_ssid,
@@ -484,7 +485,10 @@ mod tests {
 
     #[test]
     fn html_escape_covers_all_five() {
-        assert_eq!(html_escape("<a href=\"x\">&'"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
+        assert_eq!(
+            html_escape("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
+        );
     }
 
     #[test]

@@ -141,11 +141,7 @@ impl ProvisioningStore {
         if schema.is_none() {
             return Ok(false);
         }
-        let ssid_present = self
-            .nvs
-            .contains(KEY_WIFI_SSID)
-            .context("failed to probe wifi_ssid")?;
-        Ok(ssid_present)
+        Ok(self.read_str(KEY_WIFI_SSID)?.is_some())
     }
 
     /// Experimental: API may change before 1.0.
@@ -286,9 +282,7 @@ impl ProvisioningStore {
     /// Reads the comma-joined extras index into owned names.
     fn extra_names(&self) -> anyhow::Result<Vec<String>> {
         match self.read_str(KEY_EXTRAS_IDX)? {
-            Some(idx) if !idx.is_empty() => {
-                Ok(idx.split(',').map(|s| s.to_string()).collect())
-            }
+            Some(idx) if !idx.is_empty() => Ok(idx.split(',').map(|s| s.to_string()).collect()),
             _ => Ok(Vec::new()),
         }
     }

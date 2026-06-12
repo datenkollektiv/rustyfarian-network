@@ -15,6 +15,9 @@
 //!
 //! All public APIs are experimental.
 
+#[cfg(test)]
+extern crate alloc;
+
 pub mod config;
 pub mod error;
 pub mod form;

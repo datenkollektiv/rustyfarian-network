@@ -30,19 +30,20 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <input id="wifi_ssid" name="wifi_ssid" value="{{WIFI_SSID}}" maxlength="32" required>
 
 <label for="wifi_pass">Wi-Fi password</label>
-<input id="wifi_pass" name="wifi_pass" type="password" placeholder="required" maxlength="64">
+<input id="wifi_pass" name="wifi_pass" type="password" placeholder="required (8–64 chars), leave blank for open networks" maxlength="64" minlength="8" title="Leave blank for an open network, otherwise 8–64 characters (WPA2-Personal minimum is 8).">
+<p class="hint">Leave blank for an open network, otherwise 8–64 characters.</p>
 
 <label for="dev_eui">LoRaWAN DevEUI</label>
-<input id="dev_eui" name="dev_eui" value="{{DEV_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}">
-<p class="hint">16 hex characters, MSB-first.</p>
+<input id="dev_eui" name="dev_eui" value="{{DEV_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}" title="16 hex characters, MSB-first. Example: 0102030405060708">
+<p class="hint">16 hex characters, MSB-first. Example: <code>0102030405060708</code>.</p>
 
 <label for="join_eui">LoRaWAN JoinEUI</label>
-<input id="join_eui" name="join_eui" value="{{JOIN_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}">
-<p class="hint">16 hex characters, MSB-first.</p>
+<input id="join_eui" name="join_eui" value="{{JOIN_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}" title="16 hex characters, MSB-first. Example: 70B3D57ED0000000">
+<p class="hint">16 hex characters, MSB-first. Example: <code>70B3D57ED0000000</code>.</p>
 
 <label for="app_key">LoRaWAN AppKey</label>
-<input id="app_key" name="app_key" type="password" placeholder="required" maxlength="32" pattern="[0-9A-Fa-f]{32}">
-<p class="hint">32 hex characters.</p>
+<input id="app_key" name="app_key" type="password" placeholder="required" maxlength="32" pattern="[0-9A-Fa-f]{32}" title="32 hex characters. Example: 0102030405060708090A0B0C0D0E0F10">
+<p class="hint">32 hex characters. Example: <code>0102030405060708090A0B0C0D0E0F10</code>.</p>
 
 <label for="ota_url">OTA update URL</label>
 <input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128">

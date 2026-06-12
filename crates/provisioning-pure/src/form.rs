@@ -236,8 +236,18 @@ pub fn parse_form(body: &str) -> Result<ProvisioningConfig, FieldErrors> {
 
     validate_wifi_ssid(&slots[0], &mut config.wifi_ssid, &mut errors);
     validate_wifi_password(&slots[1], &mut config.wifi_password, &mut errors);
-    validate_eui(&slots[2], Field::DevEui, &mut config.dev_eui_hex, &mut errors);
-    validate_eui(&slots[3], Field::JoinEui, &mut config.join_eui_hex, &mut errors);
+    validate_eui(
+        &slots[2],
+        Field::DevEui,
+        &mut config.dev_eui_hex,
+        &mut errors,
+    );
+    validate_eui(
+        &slots[3],
+        Field::JoinEui,
+        &mut config.join_eui_hex,
+        &mut errors,
+    );
     validate_app_key(&slots[4], &mut config.app_key_hex, &mut errors);
     validate_ota_url(&slots[5], &mut config.ota_url, &mut errors);
     validate_device_name(&slots[6], &mut config.device_name, &mut errors);
@@ -359,6 +369,18 @@ fn validate_wifi_password(
         );
         return;
     }
+    // Empty is allowed (open network); a non-empty password must clear the
+    // WPA2-Personal minimum, otherwise the STA association will fail at runtime.
+    if !slot.value.is_empty() && slot.value.len() < wifi_pure::AP_PASSWORD_MIN_LEN {
+        push_field_error(
+            errors,
+            Field::WifiPassword,
+            ValidationError::TooShort {
+                min: wifi_pure::AP_PASSWORD_MIN_LEN,
+            },
+        );
+        return;
+    }
     if wifi_pure::validate_password(&slot.value).is_err() {
         push_field_error(
             errors,
@@ -462,9 +484,7 @@ fn is_valid_ota_url(url: &str) -> bool {
     const PREFIX: &str = "http://";
     match url.strip_prefix(PREFIX) {
         Some(rest) => {
-            let host_end = rest
-                .find(|c| c == '/' || c == '?' || c == '#')
-                .unwrap_or(rest.len());
+            let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
             !rest[..host_end].is_empty()
         }
         None => false,
@@ -500,9 +520,6 @@ fn validate_device_name(
     }
     let _ = out.push_str(&slot.value);
 }
-
-#[cfg(test)]
-extern crate alloc;
 
 #[cfg(test)]
 mod tests {
@@ -582,21 +599,33 @@ mod tests {
     fn invalid_escape_zz_is_malformed_body() {
         let body = "wifi_ssid=ab%zz&dev_name=x";
         let errors = parse_form(body).expect_err("malformed");
-        assert!(has_error(&errors, Field::Form, ValidationError::MalformedBody));
+        assert!(has_error(
+            &errors,
+            Field::Form,
+            ValidationError::MalformedBody
+        ));
     }
 
     #[test]
     fn truncated_escape_at_end_is_malformed_body() {
         let body = "wifi_ssid=ab%4&dev_name=x";
         let errors = parse_form(body).expect_err("malformed");
-        assert!(has_error(&errors, Field::Form, ValidationError::MalformedBody));
+        assert!(has_error(
+            &errors,
+            Field::Form,
+            ValidationError::MalformedBody
+        ));
     }
 
     #[test]
     fn escape_decoding_to_invalid_utf8_is_malformed_body() {
         let body = "wifi_ssid=%FF%FE&dev_name=x";
         let errors = parse_form(body).expect_err("malformed");
-        assert!(has_error(&errors, Field::Form, ValidationError::MalformedBody));
+        assert!(has_error(
+            &errors,
+            Field::Form,
+            ValidationError::MalformedBody
+        ));
     }
 
     #[test]
@@ -658,7 +687,11 @@ mod tests {
         let body = "wifi_pass=&dev_eui=0011223344556677&join_eui=0011223344556677\
                     &app_key=00112233445566778899AABBCCDDEEFF&ota_url=http://h/x&dev_name=ok";
         let errors = parse_form(body).expect_err("missing");
-        assert!(has_error(&errors, Field::WifiSsid, ValidationError::Missing));
+        assert!(has_error(
+            &errors,
+            Field::WifiSsid,
+            ValidationError::Missing
+        ));
     }
 
     // ── Password boundary (empty allowed; max 64) ───────────────────────
@@ -679,6 +712,21 @@ mod tests {
             Field::WifiPassword,
             ValidationError::Missing
         ));
+    }
+
+    #[test]
+    fn password_below_wpa2_minimum_is_rejected() {
+        // 7 chars is one below the WPA2-Personal floor (AP_PASSWORD_MIN_LEN=8).
+        let pw7 = "p".repeat(7);
+        let errors = parse_form(&body_with("wifi_pass", &pw7)).expect_err("too short");
+        assert!(has_error(
+            &errors,
+            Field::WifiPassword,
+            ValidationError::TooShort { min: 8 }
+        ));
+        // 8 chars is the lowest accepted value for a protected network.
+        let pw8 = "p".repeat(8);
+        assert!(parse_form(&body_with("wifi_pass", &pw8)).is_ok());
     }
 
     #[test]
@@ -738,8 +786,7 @@ mod tests {
 
     #[test]
     fn non_hex_char_rejected() {
-        let errors =
-            parse_form(&body_with("join_eui", "GGGG223344556677")).expect_err("non-hex");
+        let errors = parse_form(&body_with("join_eui", "GGGG223344556677")).expect_err("non-hex");
         assert!(has_error(
             &errors,
             Field::JoinEui,
@@ -752,20 +799,31 @@ mod tests {
     #[test]
     fn url_missing_scheme_rejected() {
         let errors = parse_form(&body_with("ota_url", "example.com/x")).expect_err("no scheme");
-        assert!(has_error(&errors, Field::OtaUrl, ValidationError::InvalidUrl));
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::InvalidUrl
+        ));
     }
 
     #[test]
     fn https_url_rejected_http_only() {
-        let errors =
-            parse_form(&body_with("ota_url", "https://example.com/x")).expect_err("https");
-        assert!(has_error(&errors, Field::OtaUrl, ValidationError::InvalidUrl));
+        let errors = parse_form(&body_with("ota_url", "https://example.com/x")).expect_err("https");
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::InvalidUrl
+        ));
     }
 
     #[test]
     fn bare_http_no_host_rejected() {
         let errors = parse_form(&body_with("ota_url", "http://")).expect_err("no host");
-        assert!(has_error(&errors, Field::OtaUrl, ValidationError::InvalidUrl));
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::InvalidUrl
+        ));
     }
 
     #[test]
@@ -818,7 +876,11 @@ mod tests {
             Field::AppKey,
             ValidationError::InvalidHex { expected_len: 32 }
         ));
-        assert!(has_error(&errors, Field::OtaUrl, ValidationError::InvalidUrl));
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::InvalidUrl
+        ));
     }
 
     // ── Extras ──────────────────────────────────────────────────────────
