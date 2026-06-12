@@ -12,6 +12,9 @@ categories = ["embedded", "network-programming"]
 [[example]]
 name = "idf_c3_provision"
 
+[[example]]
+name = "idf_c3_provision_mqtt"
+
 [build-dependencies]
 embuild.workspace = true
 
@@ -23,3 +26,10 @@ anyhow.workspace = true
 esp-idf-svc.workspace = true
 embedded-svc.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+# Used only by `idf_c3_provision_mqtt` to demonstrate constructing the
+# downstream `MqttConfig` from a committed `WifiMqttDevice` config. Cross-crate
+# path dev-dependencies are the established pattern in this workspace (see
+# rustyfarian-esp-idf-espnow / -mqtt / -wifi).
+rustyfarian-esp-idf-mqtt = { path = "../rustyfarian-esp-idf-mqtt" }

@@ -9,6 +9,7 @@ A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture
 June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 A June 2026 full-code deep dive (all 13 crates) confirmed the pure-first architecture is consistently executed and surfaced a set of hygiene items — LED/timeout logic dedup, a CI hardware-tier build job, a LoRa RF-config mapping guard, and README staleness fixes — tracked in Near term and in the findings table below.
 ADR 013 (2026-06-11) accepted SoftAP captive-portal provisioning as a workspace concern, driven by `rustyfarian-beekeeper` Milestone 5; the same day delivered the implementation (the `provisioning-pure` + `rustyfarian-esp-idf-provisioning` triad, SoftAP support in the Wi-Fi crates, and the `idf_c3_provision` example), now in validation — host tests written, `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` and the on-hardware iOS/Android captive-portal smoke test pending.
+ADR 014 (2026-06-12) accepted a Wi-Fi + MQTT provisioning profile, driven by the new `rustyfarian-rgb-clock` downstream; the same day delivered the implementation (a `SchemaProfile` generalisation in `provisioning-pure`, a `no_std`-safe surface for `rustyfarian-network-pure`, NVS schema v2 with a `profile` discriminator that loads v1 records as `lorawan`, and the `idf_c3_provision_mqtt` example), now in validation — host tests written, `just verify` / `just test-provisioning` / `just build-example idf_c3_provision_mqtt` and the `cargo build -p rustyfarian-network-pure --no-default-features` `no_std` check pending on the maintainer machine.
 
 ```mermaid
 %%{init: {
@@ -50,7 +51,7 @@ timeline
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
               : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after async MQTT ADR)
-              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning) — SoftAP captive portal, NVS credentials, four-field schema (ADR 013) — implemented 2026-06-11, in validation
+              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning) — SoftAP captive portal, NVS credentials, LoRaWAN + Wi-Fi/MQTT schema profiles (ADR 013, ADR 014) — implemented 2026-06-11 / 2026-06-12, in validation
 ```
 
 ---

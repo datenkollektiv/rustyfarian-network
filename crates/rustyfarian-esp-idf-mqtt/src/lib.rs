@@ -300,9 +300,27 @@ impl<'a> MqttConfig<'a> {
     }
 
     /// Sets MQTT broker authentication credentials.
+    ///
+    /// For brokers whose ACL keys off a username alone (no password), use
+    /// [`with_username_only`](Self::with_username_only) instead — it omits the
+    /// CONNECT packet's password field rather than transmitting an empty
+    /// string, matching what those brokers expect.
     pub fn with_auth(mut self, username: &'a str, password: &'a str) -> Self {
         self.username = Some(username);
         self.password = Some(password);
+        self
+    }
+
+    /// Sets a username with no password, for brokers that authorise by
+    /// username alone.
+    ///
+    /// The CONNECT packet carries the username and *omits* the password field
+    /// (rather than carrying an empty one). This is semantically distinct on
+    /// the wire from [`with_auth(user, "")`](Self::with_auth) and is what
+    /// broker-side username-only ACL implementations typically expect.
+    pub fn with_username_only(mut self, username: &'a str) -> Self {
+        self.username = Some(username);
+        self.password = None;
         self
     }
 

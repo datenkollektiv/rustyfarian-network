@@ -24,7 +24,9 @@
 
 use std::time::Duration;
 
-use rustyfarian_esp_idf_provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningStore};
+use rustyfarian_esp_idf_provisioning::{
+    PortalConfig, ProvisioningBuilder, ProvisioningStore, SchemaProfile,
+};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -97,6 +99,7 @@ fn main() -> anyhow::Result<()> {
         channel: 1,
         device_name: "c3-provision-demo",
         firmware_version: env!("CARGO_PKG_VERSION"),
+        profile: SchemaProfile::LorawanFieldDevice,
     };
 
     let session = ProvisioningBuilder::new(config)

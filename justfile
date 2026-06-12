@@ -110,6 +110,10 @@ check-wifi-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
 
+# check rustyfarian-network-pure compiles without the `std` feature (ADR 014 §2 no_std surface)
+check-network-pure-no-std:
+    cargo check -p rustyfarian-network-pure --no-default-features
+
 # ── Test & Lint ───────────────────────────────────────────────────────────
 
 # run clippy on the entire workspace

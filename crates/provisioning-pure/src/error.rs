@@ -12,10 +12,11 @@ use crate::config::MAX_FIELD_ERRORS;
 ///
 /// Identifies which provisioning form field an error refers to.
 ///
-/// The seven canonical variants correspond to the HTML inputs of the
-/// four-field provisionable schema (Wi-Fi credentials, LoRaWAN OTAA keys, OTA
-/// URL, device name). [`Field::Form`] carries body-level problems that are not
-/// attributable to a single input.
+/// The canonical variants correspond to the HTML inputs of the two provisioning
+/// profiles: the shared Core/OTA fields (Wi-Fi credentials, OTA URL, device
+/// name), the LoRaWAN OTAA keys (`LorawanFieldDevice`), and the MQTT broker
+/// fields (`WifiMqttDevice`). [`Field::Form`] carries body-level problems that
+/// are not attributable to a single input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     /// Wi-Fi SSID (`wifi_ssid`).
@@ -28,12 +29,21 @@ pub enum Field {
     JoinEui,
     /// LoRaWAN AppKey (`app_key`).
     AppKey,
+    /// MQTT broker URI (`mqtt_uri`), parsed as `mqtt://{host}:{port}`.
+    MqttUri,
+    /// MQTT username (`mqtt_user`).
+    MqttUser,
+    /// MQTT password (`mqtt_pass`).
+    MqttPass,
+    /// MQTT client ID (`mqtt_client`).
+    MqttClient,
     /// OTA update URL (`ota_url`).
     OtaUrl,
     /// Human-readable device name (`dev_name`).
     DeviceName,
     /// Body-level problem with no single owning input (malformed body,
-    /// duplicate extra key, too many extra fields).
+    /// duplicate extra key, too many extra fields, a field canonical only to
+    /// the other profile).
     Form,
 }
 
@@ -43,8 +53,8 @@ impl Field {
     /// Returns the HTML input `name` attribute for this field.
     ///
     /// This is the single source of truth shared by the portal HTML, the
-    /// [`parse_form`](crate::parse_form) parser, and the host tests. The seven
-    /// canonical fields return their real input name; [`Field::Form`] has no
+    /// [`parse_form`](crate::parse_form) parser, and the host tests. Every
+    /// canonical field returns its real input name; [`Field::Form`] has no
     /// real input and returns the sentinel `"_form"` (an underscore-prefixed
     /// name, which the parser reserves and never treats as a submitted value).
     pub fn form_name(self) -> &'static str {
@@ -54,6 +64,10 @@ impl Field {
             Field::DevEui => "dev_eui",
             Field::JoinEui => "join_eui",
             Field::AppKey => "app_key",
+            Field::MqttUri => "mqtt_uri",
+            Field::MqttUser => "mqtt_user",
+            Field::MqttPass => "mqtt_pass",
+            Field::MqttClient => "mqtt_client",
             Field::OtaUrl => "ota_url",
             Field::DeviceName => "dev_name",
             Field::Form => "_form",
@@ -97,12 +111,22 @@ pub enum ValidationError {
         /// The exact hex-character length the field requires.
         expected_len: usize,
     },
-    /// The OTA URL failed its shape check (scheme, host, or length).
+    /// A URL or URI failed its shape check (scheme, host, port, or length).
+    ///
+    /// Emitted for the OTA URL (`ota_url`) and the MQTT broker URI
+    /// (`mqtt_uri`); for the latter it also covers a missing, non-numeric,
+    /// out-of-`u16`-range, or zero port.
     InvalidUrl,
     /// The request body could not be percent-decoded into valid UTF-8.
     MalformedBody,
     /// More opaque extra fields were submitted than [`EXTRA_FIELDS_MAX`](crate::EXTRA_FIELDS_MAX).
     TooManyFields,
+    /// A submitted field is canonical only to the *other* profile.
+    ///
+    /// Recorded as a single body-level error on [`Field::Form`] (the first
+    /// such field wins); the field is neither folded into extras nor reported
+    /// per-field, because the active profile's form never renders it.
+    UnexpectedForProfile,
 }
 
 impl fmt::Display for ValidationError {
@@ -123,9 +147,12 @@ impl fmt::Display for ValidationError {
                     "field must be exactly {expected_len} hexadecimal characters"
                 )
             }
-            ValidationError::InvalidUrl => f.write_str("OTA URL is malformed"),
+            ValidationError::InvalidUrl => f.write_str("URL is malformed"),
             ValidationError::MalformedBody => f.write_str("request body is malformed"),
             ValidationError::TooManyFields => f.write_str("too many extra fields"),
+            ValidationError::UnexpectedForProfile => {
+                f.write_str("field does not belong to the selected profile")
+            }
         }
     }
 }
@@ -153,5 +180,6 @@ impl fmt::Display for FieldError {
 /// [`parse_form`](crate::parse_form).
 ///
 /// The capacity of [`MAX_FIELD_ERRORS`] is exact: at most one error per
-/// canonical field (seven) plus at most one [`Field::Form`]-level error.
+/// canonical field of the active profile (up to eight for `WifiMqttDevice`)
+/// plus at most one [`Field::Form`]-level error.
 pub type FieldErrors = heapless::Vec<FieldError, MAX_FIELD_ERRORS>;

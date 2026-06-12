@@ -9,7 +9,11 @@ description = "Platform-independent primitives for rustyfarian-network crates"
 keywords = ["wifi", "mqtt", "esp-idf", "rustyfarian", "embedded"]
 categories = ["embedded"]
 
+[features]
+default = ["std"]
+std = ["dep:anyhow"]
+
 [dependencies]
 wifi-pure.workspace = true
-anyhow.workspace = true
+anyhow = { workspace = true, optional = true }
 log.workspace = true

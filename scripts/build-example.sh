@@ -26,11 +26,11 @@ case "$prefix" in
     idf)
         # ESP-IDF HAL examples: detect package from feature name
         case "$example" in
+            *provision*) pkg="rustyfarian-esp-idf-provisioning" ;;
             *mqtt*)    pkg="rustyfarian-esp-idf-mqtt" ;;
             *connect*|*wifi*) pkg="rustyfarian-esp-idf-wifi" ;;
             *join*|*lora*) pkg="rustyfarian-esp-idf-lora" ;;
             *espnow*)  pkg="rustyfarian-esp-idf-espnow" ;;
-            *provision*) pkg="rustyfarian-esp-idf-provisioning" ;;
             *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", "espnow", or "provision".\n' "$example" >&2; exit 1 ;;
         esac
 

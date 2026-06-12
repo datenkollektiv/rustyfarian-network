@@ -9,9 +9,14 @@
 //! the ESP-IDF crate drives. It holds no platform dependencies so a future
 //! `rustyfarian-esp-hal-provisioning` can adopt it without an API break.
 //!
-//! OTAA credential validation delegates to [`lora_pure::LoraConfig::from_hex_strings`]
-//! and Wi-Fi validation to [`wifi_pure`], keeping one authoritative
-//! implementation of each rule.
+//! OTAA credential validation delegates to [`lora_pure::LoraConfig::from_hex_strings`],
+//! Wi-Fi validation to [`wifi_pure`], and MQTT client-ID validation to
+//! [`rustyfarian_network_pure`], keeping one authoritative implementation of
+//! each rule.
+//!
+//! The schema is expressed as one of two [`SchemaProfile`]s — `LorawanFieldDevice`
+//! (Core + LoRaWAN + OTA) and `WifiMqttDevice` (Core + MQTT + OTA) — selected by
+//! the caller of [`parse_form`].
 //!
 //! All public APIs are experimental.
 
@@ -21,14 +26,17 @@ extern crate alloc;
 pub mod config;
 pub mod error;
 pub mod form;
+pub mod profile;
 pub mod ssid;
 pub mod state;
 
 pub use config::{
     ProvisioningConfig, DEVICE_NAME_MAX_LEN, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN,
-    EXTRA_VALUE_MAX_LEN, MAX_FIELD_ERRORS, OTA_URL_MAX_LEN,
+    EXTRA_VALUE_MAX_LEN, MAX_FIELD_ERRORS, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN,
+    OTA_URL_MAX_LEN,
 };
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
+pub use profile::{LoraFields, MqttFields, SchemaProfile};
 pub use ssid::derive_softap_ssid;
 pub use state::{InvalidTransition, ProvisioningInput, ProvisioningState};

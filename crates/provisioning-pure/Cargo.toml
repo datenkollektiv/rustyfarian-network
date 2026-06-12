@@ -13,3 +13,4 @@ categories = ["embedded", "no-std"]
 heapless = { workspace = true }
 wifi-pure = { workspace = true }
 lora-pure = { workspace = true }
+rustyfarian-network-pure = { workspace = true, default-features = false }
