@@ -169,23 +169,30 @@ impl SharedState {
     }
 
     /// Blocks until the config is committed or the optional timeout elapses.
+    ///
+    /// A `Some(timeout)` is treated as a wall-clock deadline computed once at
+    /// entry; spurious wakeups consume the elapsed slice instead of restarting
+    /// the timer, so the total wait never exceeds the caller's requested
+    /// duration.
     fn wait_committed(&self, timeout: Option<Duration>) -> Option<ProvisioningConfig> {
         let (lock, cvar) = &*self.inner;
         let mut guard = lock.lock().ok()?;
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if let Some(config) = guard.committed.clone() {
                 return Some(config);
             }
-            match timeout {
+            match deadline {
                 None => {
                     guard = cvar.wait(guard).ok()?;
                 }
-                Some(t) => {
-                    let (g, result) = cvar.wait_timeout(guard, t).ok()?;
-                    guard = g;
-                    if result.timed_out() && guard.committed.is_none() {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return None;
                     }
+                    let (g, _result) = cvar.wait_timeout(guard, remaining).ok()?;
+                    guard = g;
                 }
             }
         }

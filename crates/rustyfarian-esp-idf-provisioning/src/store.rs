@@ -203,6 +203,13 @@ impl ProvisioningStore {
             config.extras().len(),
         );
 
+        // Read the previous extras index *before* we overwrite anything, so we
+        // can remove keys this commit no longer references. Without this,
+        // shrinking the extras set would leak stale `x_*` values into NVS —
+        // invisible to `load()` (which trusts the index) but still occupying
+        // flash and retaining whatever value was last written.
+        let previous_extras = self.extra_names().unwrap_or_default();
+
         self.set_str(KEY_WIFI_SSID, config.wifi_ssid())?;
         self.set_str(KEY_WIFI_PASS, config.wifi_password())?;
         self.set_str(KEY_DEV_EUI, config.dev_eui_hex())?;
@@ -226,6 +233,26 @@ impl ProvisioningStore {
                 EXTRAS_IDX_MAX
             );
         }
+
+        for name in &previous_extras {
+            let still_present = config
+                .extras()
+                .iter()
+                .any(|e| e.key.as_str() == name.as_str());
+            if !still_present {
+                let key = extra_key(name);
+                // Best-effort cleanup — we do not fail the commit on a removal
+                // error because the new state (canonical keys + new index) is
+                // already valid. But the whole point of this loop is to
+                // prevent stale retention, so a removal failure means we did
+                // not achieve that intent; surface it at `warn` so the
+                // operator can investigate (NVS exhaustion, hardware fault).
+                if let Err(e) = self.nvs.remove(&key) {
+                    log::warn!("failed to remove stale extra '{key}': {e:?}");
+                }
+            }
+        }
+
         self.set_str(KEY_EXTRAS_IDX, &index)?;
 
         self.nvs

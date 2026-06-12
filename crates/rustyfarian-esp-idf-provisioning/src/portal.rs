@@ -120,10 +120,19 @@ pub(crate) fn start(
             let body = match read_body(&mut request) {
                 BodyRead::Ok(b) => b,
                 BodyRead::TooLarge => {
-                    let errors = form_level_errors();
-                    let html = render_form(&nonce, &Prefill::empty(), &errors);
+                    let html = render_form_with_banner(
+                        &nonce,
+                        &Prefill::empty(),
+                        "Request body too large — please try again.",
+                    );
                     let mut response = request.into_status_response(413)?;
                     response.write_all(html.as_bytes())?;
+                    return Ok(());
+                }
+                BodyRead::ReadError => {
+                    log::warn!("POST /save aborted: transport read failure");
+                    let mut response = request.into_status_response(400)?;
+                    response.write_all(b"Bad request: could not read body.")?;
                     return Ok(());
                 }
             };
@@ -153,8 +162,11 @@ pub(crate) fn start(
                         Err(e) => {
                             log::error!("POST /save persist failed: {e:#}");
                             state.apply(ProvisioningInput::PersistFailed);
-                            let errors = form_level_errors();
-                            let html = render_form(&nonce, &Prefill::empty(), &errors);
+                            let html = render_form_with_banner(
+                                &nonce,
+                                &Prefill::empty(),
+                                "Could not save credentials to flash. Please try again.",
+                            );
                             let mut response = request.into_status_response(500)?;
                             response.write_all(html.as_bytes())?;
                         }
@@ -212,6 +224,12 @@ pub(crate) fn start(
                     response.write_all(b"Request body too large.")?;
                     return Ok(());
                 }
+                BodyRead::ReadError => {
+                    log::warn!("POST /factory-reset aborted: transport read failure");
+                    let mut response = request.into_status_response(400)?;
+                    response.write_all(b"Bad request: could not read body.")?;
+                    return Ok(());
+                }
             };
             if !nonce_matches(&body, &nonce) {
                 log::warn!("POST /factory-reset rejected: nonce mismatch");
@@ -241,17 +259,21 @@ pub(crate) fn start(
     Ok(server)
 }
 
-/// Body-read outcome: the decoded body, or a too-large signal.
+/// Body-read outcome: the decoded body, an oversized signal, or a transport
+/// read error.
 enum BodyRead {
     Ok(String),
     TooLarge,
+    ReadError,
 }
 
 /// Reads the full request body in chunks into a bounded buffer.
 ///
 /// Returns [`BodyRead::TooLarge`] once the accumulated length would exceed
-/// [`MAX_BODY_LEN`]. Bytes that are not valid UTF-8 are lossily replaced; the
-/// pure parser then reports any genuinely malformed pairs.
+/// [`MAX_BODY_LEN`], or [`BodyRead::ReadError`] on a transport read failure
+/// (previously these surfaced as silent truncation that then failed validation
+/// for the wrong reason). Bytes that are not valid UTF-8 are lossily replaced;
+/// the pure parser then reports any genuinely malformed pairs.
 fn read_body<R: Read>(request: &mut R) -> BodyRead {
     let mut body: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 512];
@@ -264,7 +286,7 @@ fn read_body<R: Read>(request: &mut R) -> BodyRead {
                 }
                 body.extend_from_slice(&chunk[..n]);
             }
-            Err(_) => break,
+            Err(_) => return BodyRead::ReadError,
         }
     }
     BodyRead::Ok(String::from_utf8_lossy(&body).into_owned())
@@ -280,11 +302,50 @@ fn read_body<R: Read>(request: &mut R) -> BodyRead {
 /// form.
 fn nonce_matches(body: &str, expected: &str) -> bool {
     for pair in body.split('&') {
-        if let Some(value) = pair.strip_prefix("_nonce=") {
-            return value == expected;
+        if let Some(raw) = pair.strip_prefix("_nonce=") {
+            // Today's nonces are 8 lowercase hex characters that need no
+            // decoding, but the rest of the form is percent-decoded — keeping
+            // this path consistent removes a foot-gun if the nonce alphabet
+            // ever changes (e.g. base64 with `+` or `/`). Bounded length: a
+            // legitimate _nonce never exceeds a few bytes; anything longer is
+            // a malformed body and won't match anyway.
+            let Some(decoded) = percent_decode_simple(raw) else {
+                return false;
+            };
+            return decoded == expected;
         }
     }
     false
+}
+
+/// Percent-decodes an `application/x-www-form-urlencoded` value (`+` → space,
+/// `%XX` → byte) into a `String`. Returns `None` if any `%` is not followed by
+/// two valid hex digits. Used only for the per-request nonce; the main form
+/// parser has its own buffered, bounded decoder.
+fn percent_decode_simple(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16)?;
+                let lo = (bytes[i + 2] as char).to_digit(16)?;
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+            }
+            b'%' => return None,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Non-secret pre-fill values for the form.
@@ -314,16 +375,26 @@ impl Prefill {
 /// Loads non-secret pre-fill values from NVS, falling back to empty on any
 /// error or when unprovisioned.
 fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
-    let loaded = store.lock().ok().and_then(|s| s.load().ok().flatten());
-    match loaded {
-        Some(cfg) => Prefill {
+    let guard = match store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            log::warn!("load_prefill: store mutex poisoned, rendering empty form");
+            return Prefill::empty();
+        }
+    };
+    match guard.load() {
+        Ok(Some(cfg)) => Prefill {
             wifi_ssid: cfg.wifi_ssid,
             dev_eui: cfg.dev_eui_hex,
             join_eui: cfg.join_eui_hex,
             ota_url: cfg.ota_url,
             dev_name: cfg.device_name,
         },
-        None => Prefill::empty(),
+        Ok(None) => Prefill::empty(),
+        Err(e) => {
+            log::debug!("load_prefill: store.load() failed, rendering empty form: {e:#}");
+            Prefill::empty()
+        }
     }
 }
 
@@ -332,14 +403,35 @@ fn load_prefill(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Prefill {
 /// Secret inputs (`wifi_pass`, `app_key`) carry no placeholder substitution and
 /// are always emitted empty.
 fn render_form(nonce: &str, prefill: &Prefill, errors: &FieldErrors) -> String {
+    render_template(nonce, prefill, &render_errors(errors))
+}
+
+/// Renders the form with a non-field-specific banner instead of per-field
+/// errors. Used for transport/persistence failures (413, 500) where the form
+/// data itself was never validated and the per-field error model would
+/// misrepresent the cause.
+fn render_form_with_banner(nonce: &str, prefill: &Prefill, message: &str) -> String {
+    render_template(nonce, prefill, &render_banner(message))
+}
+
+fn render_template(nonce: &str, prefill: &Prefill, errors_html: &str) -> String {
     PORTAL_HTML
         .replace("{{NONCE}}", &html_escape(nonce))
-        .replace("{{ERRORS}}", &render_errors(errors))
+        .replace("{{ERRORS}}", errors_html)
         .replace("{{WIFI_SSID}}", &html_escape(&prefill.wifi_ssid))
         .replace("{{DEV_EUI}}", &html_escape(&prefill.dev_eui))
         .replace("{{JOIN_EUI}}", &html_escape(&prefill.join_eui))
         .replace("{{OTA_URL}}", &html_escape(&prefill.ota_url))
         .replace("{{DEV_NAME}}", &html_escape(&prefill.dev_name))
+}
+
+/// Renders a freeform banner (`<div class="errors">…</div>`) used when the
+/// failure is not attributable to a specific form field.
+fn render_banner(message: &str) -> String {
+    let mut out = String::from("<div class=\"errors\">");
+    out.push_str(&html_escape(message));
+    out.push_str("</div>");
+    out
 }
 
 /// Renders the accumulated field errors as an HTML error block, or the empty
@@ -359,16 +451,6 @@ fn render_errors(errors: &FieldErrors) -> String {
     }
     out.push_str("</ul></div>");
     out
-}
-
-/// A single body-level error block (used for `413`/`500` re-renders).
-fn form_level_errors() -> FieldErrors {
-    let mut errors = FieldErrors::new();
-    let _ = errors.push(provisioning_pure::FieldError {
-        field: Field::Form,
-        error: provisioning_pure::ValidationError::MalformedBody,
-    });
-    errors
 }
 
 /// Human-readable label for a form field.
