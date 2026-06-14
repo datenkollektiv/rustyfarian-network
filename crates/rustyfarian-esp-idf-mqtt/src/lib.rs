@@ -13,6 +13,7 @@
 //!
 //! let handle = MqttBuilder::new(config)
 //!     .subscribe("commands/#", QoS::AtLeastOnce)
+//!     .with_startup_message()
 //!     .on_disconnect(|| log::warn!("MQTT disconnected"))
 //!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
 //!     .build()?;
@@ -556,7 +557,9 @@ where
     /// Sends a startup notification message.
     ///
     /// Publishes "1" to `iot/{client_id}/startup`.
-    #[deprecated(note = "use publish() or publish_with() for custom lifecycle messages")]
+    #[deprecated(
+        note = "use MqttBuilder::with_startup_message() for automatic startup notifications on every (re)connect, or publish() / publish_with() for custom lifecycle messages"
+    )]
     pub fn send_startup_message(&mut self) -> anyhow::Result<()> {
         let topic = format!("iot/{}/startup", self.client_id);
         self.publish(&topic, "1")
@@ -711,6 +714,7 @@ pub struct MqttBuilder<'a> {
     on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
     on_message: Option<OnMessageCallback>,
     subscribe_topics: Vec<(String, PureQoS)>,
+    with_startup_message: bool,
 }
 
 impl<'a> MqttBuilder<'a> {
@@ -722,6 +726,7 @@ impl<'a> MqttBuilder<'a> {
             on_disconnect: None,
             on_message: None,
             subscribe_topics: Vec::new(),
+            with_startup_message: false,
         }
     }
 
@@ -816,6 +821,34 @@ impl<'a> MqttBuilder<'a> {
         self
     }
 
+    /// Opts in to publishing a startup notification on every MQTT (re)connect.
+    ///
+    /// **Fires on every broker `Connected` transition — both the initial
+    /// connection and every automatic reconnection — not only at device boot.**
+    /// Despite the "startup" name, the publish repeats on each reconnect by
+    /// design, so a downstream broker (or its consumers) always sees a fresh
+    /// liveness ping after a network blip without the host needing to wire
+    /// reconnect bookkeeping itself.
+    ///
+    /// When enabled, the builder publishes `"1"` to `iot/{client_id}/startup`
+    /// with [`QoS::AtLeastOnce`] (not retained) immediately when the broker
+    /// transitions to `Connected`, before any [`on_connect`](Self::on_connect)
+    /// callback runs.
+    /// The publish uses `client.enqueue()` under the same internal mutex the
+    /// `on_connect` callback uses, so it is safe to call alongside any other
+    /// builder callback and never deadlocks against [`MqttHandle::publish`].
+    ///
+    /// Replaces the deprecated [`MqttHandle::send_startup_message`]: the
+    /// builder handles the (re)connect lifecycle automatically, so the host
+    /// no longer needs to call it manually.
+    ///
+    /// A failed startup publish is logged at `warn` and does not abort the
+    /// connection — the message is best-effort, not load-bearing.
+    pub fn with_startup_message(mut self) -> Self {
+        self.with_startup_message = true;
+        self
+    }
+
     /// Starts the background event loop and returns an [`MqttHandle`].
     ///
     /// Returns immediately — the initial broker connection happens in the
@@ -900,6 +933,9 @@ impl<'a> MqttBuilder<'a> {
         let on_disconnect = self.on_disconnect;
         let on_message = self.on_message;
         let subscribe_topics = self.subscribe_topics;
+        let startup_topic: Option<String> = self
+            .with_startup_message
+            .then(|| format!("iot/{}/startup", client_id));
 
         std::thread::Builder::new()
             .stack_size(BUILDER_EVENT_LOOP_STACK_SIZE)
@@ -929,10 +965,29 @@ impl<'a> MqttBuilder<'a> {
                             if let Some(next) = next_state(state, MqttEvent::Connected) {
                                 state = next;
                                 log::info!("[mqtt] connected (clean_session={})", is_clean);
-                                if let Some(ref f) = on_connect {
+                                if startup_topic.is_some() || on_connect.is_some() {
+                                    // One guard for both: startup publish MUST precede on_connect
+                                    // so the broker sees it first in the outgoing queue. Splitting
+                                    // the guard would break that ordering. Startup failure is
+                                    // best-effort by design and never aborts on_connect.
                                     let mut guard = client_for_thread.lock().unwrap();
-                                    if let Err(e) = f(&mut guard, is_clean) {
-                                        log::warn!("[mqtt] on_connect callback failed: {:#}", e);
+                                    if let Some(ref topic) = startup_topic {
+                                        if let Err(e) =
+                                            guard.enqueue(topic, QoS::AtLeastOnce, false, b"1")
+                                        {
+                                            log::warn!(
+                                                "[mqtt] startup-message publish to '{}' failed: {:?}",
+                                                topic, e
+                                            );
+                                        }
+                                    }
+                                    if let Some(ref f) = on_connect {
+                                        if let Err(e) = f(&mut guard, is_clean) {
+                                            log::warn!(
+                                                "[mqtt] on_connect callback failed: {:#}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                                 if !subscribe_topics.is_empty() {
