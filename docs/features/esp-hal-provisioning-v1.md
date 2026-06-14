@@ -1,11 +1,14 @@
 # Feature: Bare-Metal (esp-hal) Provisioning v1
 
+> **Status: design + planning only — no `rustyfarian-esp-hal-provisioning` code in this PR.**
+> The PR that introduces this doc lands ADR 015 and the planning content below; Phases 0–4 are follow-up PRs that begin only after ADR 015 is accepted and the open-question proposals are signed off.
+> The State checklist at the bottom is the authoritative progress record — at the time this doc landed, only "Design drafted (ADR 015 proposed)" is true.
+
 Feature doc for the bare-metal SoftAP captive-portal provisioning crate proposed by [ADR 015](../adr/015-esp-hal-provisioning.md).
 The crate, `rustyfarian-esp-hal-provisioning`, brings the `WifiMqttDevice` profile already shipped on the ESP-IDF tier ([ADR 014](../adr/014-wifi-mqtt-provisioning-profile.md) / [feature doc](wifi-mqtt-provisioning-profile-v1.md)) to the bare-metal esp-hal stack, for the `rustyfarian-rgb-clock` downstream moving onto that stack.
 
 This is a hybrid doc: it carries the decisions ADR 015 locks (once accepted), the open questions and proposed answers that will drive the implementation, a signature-only design sketch, and a phased plan.
 ADR 015 and the proposed answers below are **Proposed — awaiting maintainer sign-off**; the maintainer asked for both load-bearing technology choices (network substrate, flash store) to be evaluated at ADR level rather than picked by gut feel, so the ADR recommends and the maintainer decides.
-The verification gates are deferred to the maintainer machine (no Rust toolchain in the implementation sandbox); see the State checklist.
 One sentence per line throughout this doc.
 
 ## Decisions
@@ -296,7 +299,7 @@ The ESP-IDF portal (`crates/rustyfarian-esp-idf-provisioning`) is the reference 
 
 ## State
 
-- [ ] Design drafted (ADR 015 proposed)
+- [x] Design drafted (ADR 015 proposed) — 2026-06-12
 - [ ] ADR 015 accepted
 - [ ] Open-question proposals signed off
 - [ ] Phase 0 — SoftAP (AP-mode) in `rustyfarian-esp-hal-wifi` + AP example
@@ -304,7 +307,7 @@ The ESP-IDF portal (`crates/rustyfarian-esp-idf-provisioning`) is the reference 
 - [ ] Phase 2 — portal (edge-net wiring + templates)
 - [ ] Phase 3 — examples + build routing + justfile
 - [ ] Phase 4 — docs / CHANGELOG / ROADMAP + CLAUDE-lore correction note
-- [ ] Verification gates green — `just fmt` / `just verify` / `just check-provisioning-hal-embassy` / `just build-example hal_c3_provision_mqtt` on the maintainer machine (no Rust toolchain in the implementation sandbox)
+- [ ] Verification gates green — `just fmt` / `just verify` / `just check-provisioning-hal-embassy` / `just build-example hal_c3_provision_mqtt` (gated on Phase 0–3 landing)
 - [ ] On-hardware captive-portal smoke test (ESP32-C3, phone browser) — trailing manual validation
 
 ## Session Log

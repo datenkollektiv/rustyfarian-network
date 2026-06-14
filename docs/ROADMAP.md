@@ -32,7 +32,8 @@ timeline
     Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
               : MQTT startup message — `.with_startup_message()` opt-in on MqttBuilder (feature-doc)
 
-    Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
+    Near term : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning, ADR 013 + ADR 014) — SoftAP captive portal, NVS credentials, LoRaWAN + Wi-Fi/MQTT schema profiles (done 2026-06-14)
+              : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line
               : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule (including why it is the only non-no_std pure crate)
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
@@ -51,7 +52,6 @@ timeline
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
               : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after async MQTT ADR)
-              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning) — SoftAP captive portal, NVS credentials, LoRaWAN + Wi-Fi/MQTT schema profiles (ADR 013, ADR 014) — implemented 2026-06-11 / 2026-06-12, in validation
 ```
 
 ---

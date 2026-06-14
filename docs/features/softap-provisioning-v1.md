@@ -426,7 +426,7 @@ Gate: `just lint-docs`.
 - [x] Open-question proposals signed off (2026-06-11)
 - [x] Core implementation (Phases 1–5, 2026-06-11)
 - [x] Host tests written (`provisioning-pure` + `wifi-pure` AP coverage)
-- [ ] Verification gates green — `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` pending on the maintainer machine (no Rust toolchain in the implementation sandbox)
+- [x] Verification gates green — `just fmt` / `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` all clean on the maintainer machine (2026-06-14)
 - [x] Documentation updated (2026-06-11)
 
 ## Session Log
@@ -503,3 +503,5 @@ Gate: `just lint-docs`.
     timeout; rejected POSTs do not round-trip entered values in v1.
   - Toolchain unavailable in the implementation sandbox: all `just` gates deferred
     to the maintainer; `Cargo.lock` will update on first build.
+- 2026-06-14 — Verification gates run on the maintainer machine: `just fmt` clean (no Rust drift), `just verify` clean after the workspace-deps fix detailed in `wifi-mqtt-provisioning-profile-v1.md`'s session log, `just test-provisioning` 79 passed / 0 failed, `just build-example idf_c3_provision` 14.77s release for `riscv32imc-esp-espidf`.
+  The shared captive-portal substrate (HTTP server, DHCP, DNS catch-all, probe routes) was end-to-end smoke-tested on hardware via the sibling `idf_c3_provision_mqtt` run on 2026-06-13 — the LoRaWAN-profile portal differs only in template and field set, both covered by host tests, so a separate LoRaWAN-portal hardware flash was not run.
