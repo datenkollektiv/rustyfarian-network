@@ -301,7 +301,7 @@ Gate: `just lint-docs`.
 - [x] Core implementation (Phases 0–3, 2026-06-12)
 - [x] Host tests written (`provisioning-pure` profile + MQTT coverage)
 - [x] Phase 4 — docs / CHANGELOG / ROADMAP
-- [ ] Verification gates green — `just fmt` / `just verify` / `just test-provisioning` / `just build-example idf_c3_provision_mqtt` (and `idf_c3_provision`) plus the `cargo build -p rustyfarian-network-pure --no-default-features` `no_std` check pending on the maintainer machine (no Rust toolchain in the implementation sandbox)
+- [x] Verification gates green — `just fmt` / `just verify` / `just test-provisioning` / `just build-example idf_c3_provision_mqtt` (and `idf_c3_provision`) plus the `cargo build -p rustyfarian-network-pure --no-default-features` `no_std` check all clean on the maintainer machine (2026-06-14)
 - [x] On-hardware smoke test of the `wifi_mqtt` load path (ESP32-C3, 2026-06-12)
 
 ## Session Log
@@ -328,3 +328,12 @@ Gate: `just lint-docs`.
 - 2026-06-12 — On-hardware smoke test (ESP32-C3): `idf_c3_provision_mqtt` boots an already-provisioned `wifi_mqtt` device, confirming the schema-v2 `profile` discriminator round-trip from real NVS flash, absent optional MQTT keys loading as `None` (anonymous broker), the blank-`mqtt_client` device-name derivation (`client_id len=4` from name `Test`), lengths-only secret logging, and downstream `MqttConfig` construction.
   The flash itself exercised the corrected `*provision*`-before-`*mqtt*` routing in `scripts/build-example.sh` / `scripts/flash.sh`.
   Not yet exercised on hardware: the `portal_wifi_mqtt.html` submission path on a phone browser (same trailing manual validation as the v1 captive-portal smoke).
+- 2026-06-13 — On-hardware portal-submission smoke (ESP32-C3): `idf_c3_provision_mqtt` factory-reset, brought up the SoftAP at `192.168.4.1`, served `portal_wifi_mqtt.html`, accepted a fresh phone submission via `POST /save`, committed to NVS v2, and on reboot loaded straight as `wifi_mqtt` with the expected lengths-only field shape (`ssid len=7`, `mqtt_host len=13`, `mqtt_port=1883`, anonymous broker `mqtt_user=0` / `mqtt_pass len=0`, `name=test` driving `client_id len=4` via `derive_client_id`).
+  Closes the trailing portal-submission validation noted in the 2026-06-12 entry; all hardware contract items from ADR 014 §5 (no plaintext credentials, no secret prefill, asymmetric anonymous-broker guard, schema-v2 round-trip, clean NVS handle lifecycle) hold end-to-end.
+  Toolchain-side gates (`just fmt` / `just verify` / `just test-provisioning` / `cargo build -p rustyfarian-network-pure --no-default-features` / `just build-example idf_c3_provision_mqtt` / `just build-example idf_c3_provision`) remain pending and are independent of this smoke.
+- 2026-06-14 — Verification gates run on the maintainer machine — all six green: `just fmt` clean, `just verify` clean (after the workspace-deps fix recorded below), `just test-provisioning` 79 / 0, `cargo build -p rustyfarian-network-pure --no-default-features` clean (the standalone `no_std` proof), `just build-example idf_c3_provision_mqtt` 1.25s, `just build-example idf_c3_provision` 14.77s.
+  Gate 2 surfaced that the ADR §2 consumer-side `no_std` contract was silently broken at the workspace-deps layer: `provisioning-pure`'s crate-level `default-features = false` was being ignored, so it was inheriting the `std` core of `rustyfarian-network-pure` for two days (2026-06-12 → 2026-06-14).
+  Three-line fix landed in this same gate run: root `Cargo.toml` workspace declaration flipped to `default-features = false`; the two `std`-needing consumers (`rustyfarian-esp-idf-wifi`, `rustyfarian-esp-idf-mqtt`) opt back in with `features = ["std"]`.
+  After the fix, `provisioning-pure` compiles against the actual `no_std` core with no errors, so the contract holds in practice.
+  Full pitfall write-up — what Cargo's rule actually is and how to detect it in future — lives in `docs/project-lore.md` under "Toolchain & Build" as "A crate-level `default-features = false` on a workspace-inherited dependency is silently ignored".
+  Same pass also removed a stale `RUSTSEC-2024-0436` (`paste`) suppression in `deny.toml` flagged by `cargo deny` as `advisory-not-detected`.

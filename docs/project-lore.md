@@ -89,6 +89,17 @@ When an unpinned git dep adopts a new release wave that bumps the linked crate, 
 Fix: always pin cross-repo git deps with `tag = "vX.Y.Z"` (or `rev = "<sha>"`).
 Upstream release waves then cannot reach into this workspace without a deliberate, coordinated bump.
 
+**A crate-level `default-features = false` on a workspace-inherited dependency is silently ignored unless the workspace declaration also says `default-features = false`.**
+Cargo's workspace-deps inheritance rule: a crate inheriting a dep via `workspace = true` may override `features`, but a `default-features` override only takes effect when the workspace declaration **already** has `default-features = false`.
+If the workspace declaration omits `default-features` (the implicit `true`) or sets it to `true` explicitly, every consumer pulls default features even when they wrote `default-features = false`.
+Cargo emits `warning: 'default-features' is ignored for <crate>, since 'default-features' was [not specified | true] for 'workspace.dependencies.<crate>', this could become a hard error in the future` — easy to miss because `cargo check` / `cargo clippy` still exit 0.
+Symptom this caused in this workspace: `provisioning-pure` (a `no_std` crate) silently inherited the `std` feature of `rustyfarian-network-pure` for two days (2026-06-12 → 2026-06-14), so the ADR 014 §2 `no_std` consumer-side contract held only on paper, not at the build layer.
+Fix when introducing a `no_std` consumer of a workspace-inherited dep:
+1. Set the workspace declaration to `default-features = false`.
+2. Every `std`-needing consumer opts back in with `features = ["std"]`.
+3. Re-run `just verify`; the warning should be gone and the `no_std` consumer should compile against the actual `no_std` core (if it secretly used a `std`-gated item, this is where it surfaces as a compile error).
+Detection: any `cargo` invocation that emits the `default-features is ignored` warning means the workspace-deps relationship is broken — treat it like a `-D warnings` finding even though it does not fail the build.
+
 ---
 
 ## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)
