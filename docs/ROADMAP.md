@@ -8,8 +8,7 @@ TTN v3 LoRa validation remains blocked on hardware.
 A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Mid term: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
 June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 A June 2026 full-code deep dive (all 13 crates) confirmed the pure-first architecture is consistently executed and surfaced a set of hygiene items — LED/timeout logic dedup, a CI hardware-tier build job, a LoRa RF-config mapping guard, and README staleness fixes — tracked in Near term and in the findings table below.
-ADR 013 (2026-06-11) accepted SoftAP captive-portal provisioning as a workspace concern, driven by `rustyfarian-beekeeper` Milestone 5; the same day delivered the implementation (the `provisioning-pure` + `rustyfarian-esp-idf-provisioning` triad, SoftAP support in the Wi-Fi crates, and the `idf_c3_provision` example), now in validation — host tests written, `just verify` / `just test-provisioning` / `just build-example idf_c3_provision` and the on-hardware iOS/Android captive-portal smoke test pending.
-ADR 014 (2026-06-12) accepted a Wi-Fi + MQTT provisioning profile, driven by the new `rustyfarian-rgb-clock` downstream; the same day delivered the implementation (a `SchemaProfile` generalisation in `provisioning-pure`, a `no_std`-safe surface for `rustyfarian-network-pure`, NVS schema v2 with a `profile` discriminator that loads v1 records as `lorawan`, and the `idf_c3_provision_mqtt` example), now in validation — host tests written, `just verify` / `just test-provisioning` / `just build-example idf_c3_provision_mqtt` and the `cargo build -p rustyfarian-network-pure --no-default-features` `no_std` check pending on the maintainer machine.
+June 2026 shipped the provisioning triad — SoftAP captive-portal provisioning with two schema profiles (`LorawanFieldDevice` and `WifiMqttDevice`), NVS schema v2 with a `profile` discriminator, a `no_std`-safe surface on `rustyfarian-network-pure`, and the `idf_c3_provision` / `idf_c3_provision_mqtt` examples; per ADR 013 (acceptance) and ADR 014 (profile generalisation), end-to-end validated 2026-06-14, full detail in the CHANGELOG.
 
 ```mermaid
 %%{init: {
@@ -31,9 +30,7 @@ timeline
 
     Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
 
-    Near term : MQTT startup message — `.with_startup_message()` opt-in on MqttBuilder (done 2026-06-14)
-              : Provisioning triad (provisioning-pure + rustyfarian-esp-idf-provisioning, ADR 013 + ADR 014) — SoftAP captive portal, NVS credentials, LoRaWAN + Wi-Fi/MQTT schema profiles (done 2026-06-14)
-              : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
+    Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line
               : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule (including why it is the only non-no_std pure crate)
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
