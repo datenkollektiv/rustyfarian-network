@@ -91,11 +91,11 @@ The feature doc pins the exact spike-target versions of the family as a "Locked 
 
 Fallback rule: if the spike fails on executor fit, single-client ergonomics, or binary size, the documented runner-up (all-hand-rolled) proceeds WITHOUT a new ADR — because the architectural commitment is the private-substrate boundary, not the crate family.
 
-| Option | New deps | Covers | heapless | Code to own | Verdict |
-|:-------|:---------|:-------|:---------|:------------|:--------|
-| **edge-net family** (edge-http + edge-dhcp + edge-captive + edge-nal-embassy) | ~6 (`edge-http`, `edge-dhcp`, `edge-captive`, `edge-nal`, `edge-nal-embassy`, `domain`) | HTTP server + DHCP server + DNS catch-all — all three | 0.9 (already in lock via the workspace pin) | thin `pub(crate)` wiring | **Preferred first candidate** |
-| **picoserve** | `picoserve` + `serde` + `thiserror 2` + `pin-project` + `picoserve_derive` + `heapless 0.8` | HTTP **only** — DHCP server and DNS still needed elsewhere | 0.8 (coexists with workspace 0.9, already in lock via embassy-net) | DHCP server + DNS catch-all on top | Rejected — partial coverage |
-| **All hand-rolled** | 0 | nothing pulled in; three protocols hand-written | n/a | HTTP server + DHCP server + DNS (~3 protocols) | Documented runner-up — review surface |
+| Option                                                                        | New deps                                                                                    | Covers                                                     | heapless                                                           | Code to own                                    | Verdict                               |
+|:------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------|:-----------------------------------------------------------|:-------------------------------------------------------------------|:-----------------------------------------------|:--------------------------------------|
+| **edge-net family** (edge-http + edge-dhcp + edge-captive + edge-nal-embassy) | ~6 (`edge-http`, `edge-dhcp`, `edge-captive`, `edge-nal`, `edge-nal-embassy`, `domain`)     | HTTP server + DHCP server + DNS catch-all — all three      | 0.9 (already in lock via the workspace pin)                        | thin `pub(crate)` wiring                       | **Preferred first candidate**         |
+| **picoserve**                                                                 | `picoserve` + `serde` + `thiserror 2` + `pin-project` + `picoserve_derive` + `heapless 0.8` | HTTP **only** — DHCP server and DNS still needed elsewhere | 0.8 (coexists with workspace 0.9, already in lock via embassy-net) | DHCP server + DNS catch-all on top             | Rejected — partial coverage           |
+| **All hand-rolled**                                                           | 0                                                                                           | nothing pulled in; three protocols hand-written            | n/a                                                                | HTTP server + DHCP server + DNS (~3 protocols) | Documented runner-up — review surface |
 
 Key arguments for the recommendation:
 
@@ -123,12 +123,12 @@ The feature doc carries the full per-option rationale.
 This ADR locks the durable storage contract: a simple single-record store — not a general key-value database — of the torn-write-safe A/B double-buffered class, living in a DEDICATED non-NVS partition, with a minimum-size guarantee validated when the store is opened, and NO cross-tier NVS interop (a tier switch re-provisions the device).
 The record holds one TLV+CRC entry per sector, written A/B for torn-write safety, over the synchronous `embedded-storage 0.3` `NorFlash` trait that `esp-storage` implements directly.
 
-| Option | Trait fit | Wear-leveling | heapless | Verdict |
-|:-------|:----------|:--------------|:---------|:--------|
-| **Hand-rolled A/B record store** | sync `embedded-storage 0.3` — `esp-storage` implements it directly | not needed (single-digit writes per device lifetime) | n/a (pure byte layout) | **Recommended** |
-| **sequential-storage 7.2.0** | async `embedded-storage-async 0.4.1` — needs a `BlockingAsync` adapter over `esp-storage`'s sync `NorFlash` | yes (solves a non-problem here) | 0.8 + 0.9 | Rejected — async mismatch |
-| **ekv 1.0.0** | own `Flash` trait; `embassy-sync 0.6`, `heapless 0.8` | LSM-tree (overkill for one record) | 0.8 | Rejected — disproportionate |
-| **ESP-IDF NVS binary format from bare-metal** | no crate exists | n/a | n/a | Eliminated — no upstream support |
+| Option                                        | Trait fit                                                                                                   | Wear-leveling                                        | heapless               | Verdict                          |
+|:----------------------------------------------|:------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------|:-----------------------|:---------------------------------|
+| **Hand-rolled A/B record store**              | sync `embedded-storage 0.3` — `esp-storage` implements it directly                                          | not needed (single-digit writes per device lifetime) | n/a (pure byte layout) | **Recommended**                  |
+| **sequential-storage 7.2.0**                  | async `embedded-storage-async 0.4.1` — needs a `BlockingAsync` adapter over `esp-storage`'s sync `NorFlash` | yes (solves a non-problem here)                      | 0.8 + 0.9              | Rejected — async mismatch        |
+| **ekv 1.0.0**                                 | own `Flash` trait; `embassy-sync 0.6`, `heapless 0.8`                                                       | LSM-tree (overkill for one record)                   | 0.8                    | Rejected — disproportionate      |
+| **ESP-IDF NVS binary format from bare-metal** | no crate exists                                                                                             | n/a                                                  | n/a                    | Eliminated — no upstream support |
 
 Key arguments for the recommendation:
 

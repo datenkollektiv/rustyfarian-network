@@ -84,3 +84,7 @@ required-features = ["esp32c3", "rt", "embassy"]
 [[example]]
 name = "hal_c6_connect_async_led"
 required-features = ["esp32c6", "rt", "embassy", "rustyfarian-esp-hal-ws2812"]
+
+[[example]]
+name = "hal_c3_ap_smoke"
+required-features = ["esp32c3", "rt", "embassy"]

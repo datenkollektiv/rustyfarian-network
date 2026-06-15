@@ -122,6 +122,15 @@ Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 
 - `controller.wait_for_event(WifiEvent::StaDisconnected)` removed; replacement is `controller.wait_for_disconnect_async().await -> Result<DisconnectedStationInfo, WifiError>`
 - `esp_radio::wifi::new()` signature is now `(WIFI<'d>, ControllerConfig)` — the prior `radio_ref` parameter is gone; `esp_radio::init()` is now `pub(crate)` and not part of user code
 
+**`esp-radio 0.18` AP-mode surface map (companion to the STA rename map above) — Phase 0 of ADR 015 surfaced these names:**
+- `Interfaces.ap` → `Interfaces.access_point` (the AP-side field; mirror of `Interfaces.station`).
+- `WifiEvent::ApStaConnected` → `WifiEvent::AccessPointStationConnected`; `WifiEvent::ApStaDisconnected` → `WifiEvent::AccessPointStationDisconnected`.
+- `AccessPointConfig` lives at `esp_radio::wifi::ap::AccessPointConfig` (the `ap` submodule is `pub` but `AccessPointConfig` is not re-exported at `esp_radio::wifi` — same pattern as `StationConfig`).
+- `AccessPointConfig::with_password` takes `impl Into<String>` (so `password.into()` works; bare `&str` does NOT — opposite of `StationConfig::with_ssid` which takes `&str` directly). `AccessPointConfig::with_auth_method(AuthenticationMethod)` is the auth-method setter; pass `AuthenticationMethod::None` for open, `AuthenticationMethod::WPA2Personal` for WPA2.
+- **`WifiController::start_async()` does NOT exist** — the AP (and STA) radio is started by `set_config()` triggering `esp_wifi_start()` internally on a mode transition (already noted in the rename map for STA; the same is true for AP). Any code that spawns a `wifi_task` and calls `start_async()` is wrong on both sides; the wifi_task goes directly to the event-listening loop (`controller.wait_for_event(WifiEvent::AccessPointStationConnected).await` or similar) after `init_softap_async` returns.
+- The feature doc `docs/features/esp-hal-provisioning-v1.md` candidate-signatures section refers to `interfaces.ap` and `start_async()`; treat those as illustrative placeholders, not the real API.
+Source: `esp-radio-0.18.0/src/wifi/ap.rs` and `esp-radio-0.18.0/src/wifi/mod.rs` (`Interfaces` struct, `WifiEvent` enum).
+
 **`StationConfig::with_ssid` accepts `&str` directly via `Into<Ssid>` — calling `.into()` first triggers `E0283`.**
 The compiler can't pick between `&str → Ssid` and `&str → &str` when the `&str.into()` is bare.
 Pass the `&str` literal directly: `StationConfig::default().with_ssid(ssid).with_password(password.into())`.

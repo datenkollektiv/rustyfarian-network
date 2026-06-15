@@ -28,8 +28,8 @@
 #![no_std]
 
 pub use wifi_pure::{
-    validate_password, validate_ssid, wifi_disconnect_reason_name, ConnectMode, TxPowerLevel,
-    WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+    validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
+    TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
     POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
@@ -96,13 +96,22 @@ compile_error!(
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c6", feature = "esp32c3")))]
 mod driver {
-    use embassy_net::{Config as NetConfig, DhcpConfig, Runner, Stack, StackResources};
+    use embassy_net::{
+        Config as NetConfig, DhcpConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
+        StaticConfigV4,
+    };
     use esp_hal::interrupt::software::SoftwareInterruptControl;
     use esp_hal::timer::timg::TimerGroup;
+    use esp_radio::wifi::ap::AccessPointConfig;
     use esp_radio::wifi::sta::StationConfig;
-    use esp_radio::wifi::{Config, ControllerConfig, Interface, PowerSaveMode, WifiController};
+    use esp_radio::wifi::{
+        AuthenticationMethod, Config, ControllerConfig, Interface, PowerSaveMode, WifiController,
+    };
     use static_cell::StaticCell;
-    use wifi_pure::{validate_password, validate_ssid, TxPowerLevel, WiFiConfig, WifiPowerSave};
+    use wifi_pure::{
+        validate_ap_config, validate_password, validate_ssid, ApConfig, TxPowerLevel, WiFiConfig,
+        WifiPowerSave,
+    };
 
     /// Wi-Fi configuration bundled with the hardware peripherals needed for init.
     ///
@@ -305,9 +314,7 @@ mod driver {
             // esp-wifi-sys; no extra crate dependency is needed.
             //
             // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
-            extern "C" {
-                fn esp_wifi_set_max_tx_power(power: i8) -> i32;
-            }
+            //
             // Default to Low (8.5 dBm) if the caller left tx_power at Medium (the
             // wifi_pure default). Medium (~13 dBm) still causes auth failures on
             // PCB-antenna boards; Low is the safe baseline for bare-metal.
@@ -316,18 +323,7 @@ mod driver {
             } else {
                 config.tx_power.to_quarter_dbm()
             };
-            // SAFETY: `esp_wifi_set_max_tx_power` is provided by esp-wifi-sys (linked
-            // by every esp-radio build); it is only valid after esp_wifi_start(), which
-            // step 3's set_config() triggers.  `to_quarter_dbm()` returns values in
-            // [8, 78] — all within the SDK-documented valid range [8, 84].
-            let rc = unsafe { esp_wifi_set_max_tx_power(quarter_dbm) };
-            if rc != 0 {
-                log::warn!(
-                    "esp_wifi_set_max_tx_power({}) failed with code {:#010x} (non-fatal)",
-                    quarter_dbm,
-                    rc
-                );
-            }
+            set_tx_power_or_log(quarter_dbm);
 
             // 5. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);
@@ -396,10 +392,263 @@ mod driver {
                 .expect("stack reports config up but has no IPv4 config")
         }
     }
+
+    // ─── SoftAP (AP-mode) lifecycle ────────────────────────────────────────────
+
+    /// Fixed IP address of the SoftAP interface (`192.168.4.1`).
+    ///
+    /// Clients obtain addresses in the `192.168.4.0/24` subnet via DHCP (when a
+    /// DHCP server is running on top of the AP stack).  The provisioning crate
+    /// references this constant so the AP IP is never restated as a magic literal.
+    pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+
+    /// SoftAP configuration bundled with the hardware peripherals needed for init.
+    ///
+    /// Built from an [`ApConfig`] via
+    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals], then passed to
+    /// [`WiFiManager::init_softap_async`].
+    pub struct HalApConfig<'a> {
+        ap: ApConfig<'a>,
+        timg0: esp_hal::peripherals::TIMG0<'static>,
+        sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+        wifi: esp_hal::peripherals::WIFI<'static>,
+    }
+
+    /// Extension trait that adds
+    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals] to [`ApConfig`],
+    /// producing a [`HalApConfig`] ready for
+    /// [`WiFiManager::init_softap_async`].
+    pub trait ApConfigExt<'a> {
+        /// Bundles this AP configuration with the ESP32 peripherals required for
+        /// bare-metal Wi-Fi.
+        fn with_ap_peripherals(
+            self,
+            timg0: esp_hal::peripherals::TIMG0<'static>,
+            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalApConfig<'a>;
+    }
+
+    impl<'a> ApConfigExt<'a> for ApConfig<'a> {
+        fn with_ap_peripherals(
+            self,
+            timg0: esp_hal::peripherals::TIMG0<'static>,
+            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalApConfig<'a> {
+            HalApConfig {
+                ap: self,
+                timg0,
+                sw_interrupt,
+                wifi,
+            }
+        }
+    }
+
+    /// Handle returned by [`WiFiManager::init_softap_async`] carrying the
+    /// components needed to drive the SoftAP from async tasks.
+    ///
+    /// The caller must spawn two tasks:
+    ///
+    /// - A `net_task` that owns the [`Runner`] and calls `runner.run().await`.
+    /// - A `wifi_task` that owns the [`WifiController`] and calls
+    ///   `controller.start_async().await` once, then waits on station events via
+    ///   [`WifiController::wait_for_access_point_connected_event_async`].
+    ///
+    /// The [`Stack`] is `Copy` and can be shared with any number of socket tasks.
+    pub struct SoftApHandle {
+        /// Wi-Fi controller for the AP task.
+        pub controller: WifiController<'static>,
+        /// Network stack handle for opening sockets; `Copy`able.
+        pub stack: Stack<'static>,
+        /// Runner for the network task — `runner.run().await` must be polled
+        /// continuously in a dedicated task.
+        pub runner: Runner<'static, Interface<'static>>,
+    }
+
+    // Separate StaticCell for the AP stack so calling both `init_async` and
+    // `init_softap_async` in one boot does not panic on the second `.init()`.
+    static AP_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+
+    impl WiFiManager {
+        /// Initialises the scheduler and the Wi-Fi radio in SoftAP mode, applies
+        /// the AP configuration, clamps TX power, and builds the `embassy-net`
+        /// stack with a static IPv4 address (`192.168.4.1/24`).
+        ///
+        /// # AP configuration
+        ///
+        /// The access point is WPA2-protected when `config.ap.password` is
+        /// `Some(_)`, or open when it is `None`.  Open APs emit a log warning
+        /// at `warn` level because anyone in radio range can reach the portal
+        /// endpoints.
+        ///
+        /// # TX-power policy
+        ///
+        /// Unlike the STA path, the AP path applies the `tx_power` from
+        /// [`ApConfig`] directly, without overriding `Medium` to `Low`.  The
+        /// STA Medium-to-Low override defends against an auth-frame corruption
+        /// pathology (`AuthenticationExpired`, reason 2) that exists only for
+        /// clients connecting to a remote AP; the AP itself is unaffected by
+        /// that PCB-antenna reflection mode.  Callers that need lower power
+        /// (e.g. a captive-portal restricted to a small room) can pass an
+        /// explicit [`TxPowerLevel`] via
+        /// [`ApConfig::with_tx_power`][wifi_pure::ApConfig::with_tx_power].
+        ///
+        /// TX-power clamping must happen **after** `set_config()`, which is
+        /// what triggers `esp_wifi_start()`.  Failure is non-fatal and logged
+        /// at `warn`.
+        ///
+        /// # Static IP
+        ///
+        /// The AP stack is wired to `192.168.4.1/24` with the AP itself as
+        /// the default gateway.  No DNS servers are configured here; a
+        /// captive-portal DNS catch-all is the provisioning crate's concern.
+        /// The `AP_IP` const in this crate holds the same address for
+        /// callers that need to reference it without restating the literal.
+        ///
+        /// # One-shot per boot
+        ///
+        /// Call at most once per boot — a `static` `StackResources` is
+        /// initialised via [`StaticCell`] and a second call will panic.
+        /// If you need both STA and AP in the same firmware, call
+        /// [`WiFiManager::init_async`] first for STA, then
+        /// `init_softap_async` for AP; the scheduler is started by
+        /// `init_async`, so `init_softap_async` must be called afterwards.
+        /// Calling `init_softap_async` before `init_async` also works, but
+        /// calling either twice is not supported.
+        pub fn init_softap_async(config: HalApConfig<'_>) -> Result<SoftApHandle, WifiError> {
+            validate_ap_config(&config.ap).map_err(|_| WifiError::ConfigureFailed)?;
+
+            if config.ap.password.is_none() {
+                log::warn!(
+                    "SoftAP is open (no WPA2 password) — anyone in radio range can reach \
+                     the portal endpoints; set a password for any deployment outside a lab"
+                );
+            }
+
+            // 1. Start the scheduler.
+            let timg = TimerGroup::new(config.timg0);
+            let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
+            esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
+
+            // 2. Construct the Wi-Fi controller with default ControllerConfig.
+            //    `esp_radio::wifi::new` starts the radio driver; AP credentials
+            //    are applied via `set_config` immediately after (step 3).
+            let (mut controller, interfaces) =
+                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
+                    .map_err(WifiError::Driver)?;
+
+            // 3. Build the esp-radio AP config and apply it.
+            let mut ap_cfg = AccessPointConfig::default()
+                .with_ssid(config.ap.ssid)
+                .with_channel(config.ap.channel)
+                .with_max_connections(config.ap.max_connections as u16);
+
+            match config.ap.password {
+                Some(pw) => {
+                    ap_cfg = ap_cfg
+                        .with_auth_method(AuthenticationMethod::Wpa2Personal)
+                        .with_password(pw.into());
+                }
+                None => {
+                    ap_cfg = ap_cfg.with_auth_method(AuthenticationMethod::None);
+                }
+            }
+
+            controller
+                .set_config(&Config::AccessPoint(ap_cfg))
+                .map_err(WifiError::Driver)?;
+
+            // 4. Clamp TX power.
+            //
+            // AP mode is not affected by the STA-specific PCB-reflection pathology,
+            // so we apply the configured level directly rather than overriding it.
+            // Must be called after set_config() (which triggers esp_wifi_start()).
+            //
+            // SAFETY: identical to the STA path — `esp_wifi_set_max_tx_power` is
+            // provided by esp-wifi-sys, always linked by esp-radio, and only valid
+            // after `esp_wifi_start()`.  `to_quarter_dbm()` returns values in
+            // [8, 78], within the SDK-documented valid range [8, 84].
+            set_tx_power_or_log(config.ap.tx_power.to_quarter_dbm());
+
+            log::info!(
+                "SoftAP configured (ssid len={}, auth={}, channel={}, max_conn={})",
+                config.ap.ssid.len(),
+                if config.ap.password.is_some() {
+                    "WPA2"
+                } else {
+                    "open"
+                },
+                config.ap.channel,
+                config.ap.max_connections,
+            );
+
+            // 5. Build the embassy-net stack with a static AP IP.
+            //    `StackResources::<4>` — DHCP server (UDP) + DNS (UDP) + HTTP (TCP)
+            //    + one spare — covers the Phase 2 edge-net substrate without needing
+            //    the caller to rebuild the stack.
+            let resources = AP_RESOURCES.init(StackResources::<4>::new());
+
+            let seed = esp_hal::time::Instant::now()
+                .duration_since_epoch()
+                .as_micros();
+
+            let static_cfg = StaticConfigV4 {
+                address: Ipv4Cidr::new(AP_IP, 24),
+                gateway: Some(AP_IP),
+                dns_servers: Default::default(),
+            };
+
+            let (stack, runner) = embassy_net::new(
+                interfaces.access_point,
+                NetConfig::ipv4_static(static_cfg),
+                resources,
+                seed,
+            );
+
+            Ok(SoftApHandle {
+                controller,
+                stack,
+                runner,
+            })
+        }
+    }
+
+    /// Clamps the TX power to `quarter_dbm` (units of 0.25 dBm).
+    ///
+    /// Shared by the STA and AP init paths so the extern declaration and
+    /// SAFETY comment live in one place.
+    ///
+    /// # Safety invariant
+    ///
+    /// Must be called after `esp_wifi_start()`, which is triggered by the
+    /// `set_config()` call in both `init_async` and `init_softap_async`.
+    /// Calling it before start returns `ESP_ERR_WIFI_NOT_STARTED` (0x3002),
+    /// which this function logs at `warn` and ignores.
+    fn set_tx_power_or_log(quarter_dbm: i8) {
+        extern "C" {
+            fn esp_wifi_set_max_tx_power(power: i8) -> i32;
+        }
+        // SAFETY: `esp_wifi_set_max_tx_power` is provided by esp-wifi-sys,
+        // always linked by every esp-radio build.  It is only valid after
+        // `esp_wifi_start()`.  `to_quarter_dbm()` returns values in [8, 78],
+        // within the SDK-documented valid range [8, 84].
+        let rc = unsafe { esp_wifi_set_max_tx_power(quarter_dbm) };
+        if rc != 0 {
+            log::warn!(
+                "esp_wifi_set_max_tx_power({}) failed with code {:#010x} (non-fatal)",
+                quarter_dbm,
+                rc
+            );
+        }
+    }
 }
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c6", feature = "esp32c3")))]
-pub use driver::{AsyncWifiHandle, HalWifiConfig, WiFiConfigExt, WiFiManager, WifiError};
+pub use driver::{
+    ApConfigExt, AsyncWifiHandle, HalApConfig, HalWifiConfig, SoftApHandle, WiFiConfigExt,
+    WiFiManager, WifiError, AP_IP,
+};
 
 // ─── Stub fallback (no chip feature — host / doc / test builds) ─────────────
 //
