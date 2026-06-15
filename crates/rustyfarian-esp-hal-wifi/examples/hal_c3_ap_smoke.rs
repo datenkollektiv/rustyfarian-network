@@ -98,8 +98,12 @@ async fn main(spawner: Spawner) {
     let handle = match WiFiManager::init_softap_async(config) {
         Ok(h) => h,
         Err(e) => {
-            println!("FATAL: SoftAP init failed: {}", e);
-            loop {}
+            // Periodic-log loop instead of a silent spin — easier to diagnose
+            // on real hardware when logging is intermittent.
+            loop {
+                log::error!("FATAL: SoftAP init failed: {} — board needs to be reset", e);
+                Timer::after(Duration::from_secs(10)).await;
+            }
         }
     };
 

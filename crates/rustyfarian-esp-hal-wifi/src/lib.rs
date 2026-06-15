@@ -472,9 +472,14 @@ mod driver {
     /// The caller must spawn two tasks:
     ///
     /// - A `net_task` that owns the [`Runner`] and calls `runner.run().await`.
-    /// - A `wifi_task` that owns the [`WifiController`] and calls
-    ///   `controller.start_async().await` once, then waits on station events via
-    ///   [`WifiController::wait_for_access_point_connected_event_async`].
+    /// - A `wifi_task` that owns the [`WifiController`] and waits on station
+    ///   events directly via
+    ///   [`WifiController::wait_for_access_point_connected_event_async`] —
+    ///   **the AP radio is already started by the time `init_softap_async`
+    ///   returns** (`set_config(Config::AccessPoint(_))` triggers
+    ///   `esp_wifi_start()` internally in `esp-radio 0.18`).  There is no
+    ///   separate `controller.start_async()` call on either the STA or AP
+    ///   side; the `wifi_task` goes straight into the event loop.
     ///
     /// The [`Stack`] is `Copy` and can be shared with any number of socket tasks.
     pub struct SoftApHandle {
