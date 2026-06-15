@@ -40,16 +40,17 @@
 //! ## Routes
 //!
 //! - `GET <any path>` → 200 OK with the SoftAP spike HTML page
-//! - Non-`GET` method → 404 Not Found (plain text)
+//! - Non-`GET` method (e.g. `POST`) → **405 Method Not Allowed** (plain text)
 //!
 //! Returning the portal page for **every** GET is the key captive-portal
 //! trigger: the phone OS probes well-known sentinel URLs (`/generate_204`,
 //! `/hotspot-detect.html`, `/ncsi.txt`, etc.) and compares the response body
 //! to an expected value.  When the body does not match — our HTML portal page
 //! — the OS concludes it is behind a captive portal and pops the browser
-//! automatically.  POST will become 405 / redirect when provisioning form
-//! submission lands in Phase 2 proper; 404 is an acceptable placeholder for
-//! the spike.
+//! automatically.  Non-`GET` requests are rejected at the router (rather than
+//! parsed half-way) because the spike's [`parse_request`] does not extract
+//! request bodies — see the [`ParsedRequest`] docs for the rationale.  A real
+//! form-submission route lands in Phase 2 proper.
 
 // When building without the embassy + chip features the async `run` function
 // and its TcpSocket usage are compiled away.  Allow dead-code on the types
@@ -88,8 +89,8 @@ const INDEX_HTML: &str = "\
 </body>\
 </html>";
 
-/// Plain-text body for 404 responses.
-const NOT_FOUND_BODY: &str = "Not Found";
+/// Plain-text body for 405 responses to non-`GET` methods.
+const METHOD_NOT_ALLOWED_BODY: &str = "Method Not Allowed";
 
 // ── HTTP method ───────────────────────────────────────────────────────────────
 
@@ -165,7 +166,13 @@ pub struct ParsedHeaders {
 
 // ── Parsed request ─────────────────────────────────────────────────────────────
 
-/// A parsed HTTP/1.1 request (headers only; body slice is separate).
+/// A parsed HTTP/1.1 request (request line + headers).
+///
+/// **Body is not parsed in this spike.**  The parser stops at the end of the
+/// header block — the `\r\n\r\n` separator.  Reading and parsing the body
+/// belongs to whichever route consumes it; the spike's router rejects every
+/// non-`GET` method with `405 Method Not Allowed` before any body could be
+/// needed.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedRequest {
     /// Request method.
@@ -211,13 +218,20 @@ impl ParsedRequest {
 /// Configuration for the minimal HTTP server.
 ///
 /// All fields carry sensible defaults for a captive-portal SoftAP scenario.
+///
+/// # Why socket buffer sizes are not in this struct
+///
+/// The receive and transmit buffer sizes are compile-time constants
+/// ([`DEFAULT_RX_BUF`] and [`DEFAULT_TX_BUF`]) because they back
+/// `StaticCell<[u8; N]>` allocations and Rust requires `N` to be `const`.
+/// Exposing them as runtime fields would be misleading — the values would
+/// have no effect on actual memory use.  When the substrate migrates to
+/// `rustyfarian-esp-hal-provisioning`, the right answer is const generics on
+/// the server type itself.  See the lore entry under "esp-hal April 2026
+/// Stack" in `docs/project-lore.md`.
 pub struct HttpServerConfig {
     /// TCP port the server listens on (`80` by default).
     pub bind_port: u16,
-    /// Size of the embassy-net TCP socket receive buffer (`1024` by default).
-    pub rx_buf_size: usize,
-    /// Size of the embassy-net TCP socket transmit buffer (`2048` by default).
-    pub tx_buf_size: usize,
     /// Maximum total request size in bytes; requests larger than this are
     /// rejected with 413 Payload Too Large (`2048` by default).
     pub request_size_cap: usize,
@@ -227,8 +241,6 @@ impl Default for HttpServerConfig {
     fn default() -> Self {
         Self {
             bind_port: DEFAULT_PORT,
-            rx_buf_size: DEFAULT_RX_BUF,
-            tx_buf_size: DEFAULT_TX_BUF,
             request_size_cap: DEFAULT_REQUEST_SIZE_CAP,
         }
     }
@@ -429,18 +441,16 @@ impl Default for HeaderAccumulator {
     }
 }
 
-/// Parse an HTTP/1.1 request from a byte buffer.
+/// Parse an HTTP/1.1 request line + headers from a byte buffer.
 ///
-/// `buf` must contain the complete request (headers + optional body for POST).
-/// `request_size_cap` is used to bound `Content-Length` values.
+/// `buf` must contain at least the request line and header block terminated
+/// by `\r\n\r\n`.  Any bytes following that terminator are ignored — body
+/// parsing is intentionally out of scope for this spike (see the
+/// [`ParsedRequest`] docs).
 ///
-/// On success returns `(ParsedRequest, body_slice)` where `body_slice` is the
-/// slice of `buf` that contains the request body (empty for GET requests).
-pub fn parse_request<'b>(
-    buf: &'b [u8],
-    request_size_cap: usize,
-) -> Result<(ParsedRequest, &'b [u8]), ParseError> {
-    // Locate the blank-line separator "\r\n\r\n".
+/// `request_size_cap` bounds `Content-Length` values: a request advertising a
+/// body larger than the cap is rejected with [`ParseError::RequestTooLarge`].
+pub fn parse_request(buf: &[u8], request_size_cap: usize) -> Result<ParsedRequest, ParseError> {
     let header_end = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -448,9 +458,7 @@ pub fn parse_request<'b>(
 
     let header_section = &buf[..header_end];
 
-    // Split into lines on "\r\n".
     let mut lines = header_section.split(|&b| b == b'\n').map(|l| {
-        // Strip trailing CR that split leaves on each line.
         if l.last() == Some(&b'\r') {
             &l[..l.len() - 1]
         } else {
@@ -458,16 +466,13 @@ pub fn parse_request<'b>(
         }
     });
 
-    // First line is the request line.
     let request_line = lines.next().ok_or(ParseError::IncompleteRequest)?;
     let (method, target_bytes) = parse_request_line(request_line)?;
 
-    // Copy target into a fixed-size buffer.
     let mut target_buf = [0u8; MAX_TARGET_LEN];
     let target_len = target_bytes.len();
     target_buf[..target_len].copy_from_slice(target_bytes);
 
-    // Parse the remaining header lines.
     let mut accum = HeaderAccumulator::new();
     for line in lines {
         if line.is_empty() {
@@ -478,25 +483,11 @@ pub fn parse_request<'b>(
 
     let headers = accum.finish();
 
-    // For POST requests, locate the body that follows the blank line.
-    let body_start = header_end + 4; // skip "\r\n\r\n"
-    let body = if method == Method::Post {
-        let expected_len = headers.content_length.unwrap_or(0) as usize;
-        let available = buf.len().saturating_sub(body_start);
-        let body_len = expected_len.min(available);
-        &buf[body_start..body_start + body_len]
-    } else {
-        &[]
-    };
-
-    Ok((
-        ParsedRequest {
-            method,
-            target: (target_buf, target_len),
-            headers,
-        },
-        body,
-    ))
+    Ok(ParsedRequest {
+        method,
+        target: (target_buf, target_len),
+        headers,
+    })
 }
 
 // ── Response writer ────────────────────────────────────────────────────────────
@@ -508,6 +499,7 @@ fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         411 => "Length Required",
         413 => "Payload Too Large",
         414 => "URI Too Long",
@@ -624,9 +616,11 @@ pub fn build_response(
 /// — our HTML portal page — the OS knows it is behind a captive portal and
 /// opens the browser automatically.
 ///
-/// A non-`GET` method still returns 404.  POST will become 405 / redirect
-/// when provisioning form submission lands in Phase 2 proper, but for this
-/// spike 404 is an acceptable placeholder — no form submission is in scope.
+/// Any non-`GET` method (e.g. `POST`) returns **405 Method Not Allowed**.
+/// The spike intentionally does not read request bodies (see
+/// [`parse_request`] / [`ParsedRequest`]), so any method that would normally
+/// carry a body is rejected at the router rather than handled half-way.
+/// Phase 2 proper will replace this with a real form-submission route.
 pub fn route(req: &ParsedRequest, resp_buf: &mut [u8]) -> Result<usize, ()> {
     match req.method {
         Method::Get => build_response(
@@ -637,9 +631,9 @@ pub fn route(req: &ParsedRequest, resp_buf: &mut [u8]) -> Result<usize, ()> {
         ),
         _ => build_response(
             resp_buf,
-            404,
+            405,
             "text/plain; charset=utf-8",
-            NOT_FOUND_BODY.as_bytes(),
+            METHOD_NOT_ALLOWED_BODY.as_bytes(),
         ),
     }
 }
@@ -746,7 +740,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
         // Parse and dispatch.
         let resp_len = match filled {
             Ok(n) => match parse_request(&req_buf[..n], size_cap) {
-                Ok((req, _body)) => {
+                Ok(req) => {
                     log::info!(
                         "HTTP {} {}",
                         if req.method == Method::Get {
@@ -912,16 +906,16 @@ mod tests {
     #[test]
     fn parse_get_root_with_host() {
         let raw = b"GET / HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, body) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.method, Method::Get);
         assert_eq!(req.target_str(), "/");
         assert_eq!(req.host_str(), Some("192.168.4.1"));
-        assert!(body.is_empty());
     }
 
-    /// POST /save with all three interesting headers and a body round-trips.
+    /// POST /save parses the request line and headers; the body is intentionally
+    /// not extracted (see [`ParsedRequest`] — body is out of scope for the spike).
     #[test]
-    fn parse_post_save_with_body() {
+    fn parse_post_save_request_line_and_headers() {
         let raw = b"POST /save HTTP/1.1\r\n\
             Host: 192.168.4.1\r\n\
             Content-Length: 11\r\n\
@@ -929,7 +923,7 @@ mod tests {
             \r\n\
             foo=1&bar=2";
 
-        let (req, body) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.method, Method::Post);
         assert_eq!(req.target_str(), "/save");
         assert_eq!(req.host_str(), Some("192.168.4.1"));
@@ -938,7 +932,6 @@ mod tests {
             Some("application/x-www-form-urlencoded")
         );
         assert_eq!(req.headers.content_length, Some(11));
-        assert_eq!(body, b"foo=1&bar=2");
     }
 
     /// Duplicate Content-Length is rejected.
@@ -986,7 +979,7 @@ mod tests {
     #[test]
     fn host_header_case_insensitive_upper() {
         let raw = b"GET / HTTP/1.1\r\nHOST: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.host_str(), Some("192.168.4.1"));
     }
 
@@ -994,7 +987,7 @@ mod tests {
     #[test]
     fn host_header_case_insensitive_lower() {
         let raw = b"GET / HTTP/1.1\r\nhost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.host_str(), Some("192.168.4.1"));
     }
 
@@ -1005,9 +998,8 @@ mod tests {
             content-length: 5\r\n\
             \r\n\
             hello";
-        let (req, body) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.headers.content_length, Some(5));
-        assert_eq!(body, b"hello");
     }
 
     /// Unknown headers are skipped without failing the parser.
@@ -1018,7 +1010,7 @@ mod tests {
             X-Custom-Header: some-value\r\n\
             Accept: */*\r\n\
             \r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         assert_eq!(req.target_str(), "/");
         assert_eq!(req.host_str(), Some("192.168.4.1"));
     }
@@ -1085,7 +1077,7 @@ mod tests {
     #[test]
     fn route_get_root_returns_200() {
         let raw = b"GET / HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
@@ -1101,7 +1093,7 @@ mod tests {
     #[test]
     fn route_captive_portal_probe_generate_204_returns_200() {
         let raw = b"GET /generate_204 HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
@@ -1113,7 +1105,7 @@ mod tests {
     #[test]
     fn route_captive_portal_probe_hotspot_detect_returns_200() {
         let raw = b"GET /hotspot-detect.html HTTP/1.1\r\nHost: captive.apple.com\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
@@ -1125,7 +1117,7 @@ mod tests {
     #[test]
     fn route_captive_portal_probe_ncsi_returns_200() {
         let raw = b"GET /ncsi.txt HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
@@ -1137,7 +1129,7 @@ mod tests {
     #[test]
     fn route_get_favicon_returns_200() {
         let raw = b"GET /favicon.ico HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
@@ -1149,28 +1141,29 @@ mod tests {
     #[test]
     fn route_any_get_path_returns_200() {
         let raw = b"GET /some/deep/path?q=1 HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
     }
 
-    /// POST /save returns 404 — POST is not in scope for the spike.
+    /// POST /save returns 405 Method Not Allowed — the spike is GET-only.
     ///
-    /// Will become 405 / redirect when provisioning form submission lands in
+    /// Will become a real form-submission route when provisioning lands in
     /// Phase 2 proper.
     #[test]
-    fn route_post_save_returns_404() {
+    fn route_post_save_returns_405() {
         let raw = b"POST /save HTTP/1.1\r\nHost: 192.168.4.1\r\nContent-Length: 0\r\n\r\n";
-        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 256];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(
-            resp.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
             "resp: {}",
             resp
         );
+        assert!(resp.contains("Method Not Allowed"));
     }
 }

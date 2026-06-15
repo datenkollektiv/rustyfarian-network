@@ -554,27 +554,43 @@ pub struct Lease {
 /// Fixed-size DHCP lease table for the default 11-address pool.
 pub struct LeaseTable {
     entries: [Option<Lease>; POOL_SIZE],
+    /// First address in the pool — bound at construction; per-call sites cannot
+    /// override it.  See `docs/project-lore.md` "esp-hal April 2026 Stack" for
+    /// the rationale (the original API passed this per-call and caused the
+    /// 2026-06-15 hardware-only-surfacing offer-the-server's-own-IP bug).
+    pool_start: Ipv4Addr,
+    /// Lease duration in seconds — bound at construction for the same reason.
+    lease_secs: u32,
 }
 
 impl LeaseTable {
-    /// Constructs an empty lease table.
-    pub const fn new() -> Self {
+    /// Constructs an empty lease table bound to a specific pool start address
+    /// and lease duration.
+    ///
+    /// `pool_start` is the first IP address handed out by this table; the
+    /// table itself is `[Option<Lease>; POOL_SIZE]`, so the inclusive last
+    /// address is `pool_start + POOL_SIZE - 1`.  `lease_secs` is the lifetime
+    /// applied to each issued lease (used by [`Self::allocate`] for the
+    /// expired-slot reuse policy).
+    pub const fn new(pool_start: Ipv4Addr, lease_secs: u32) -> Self {
         Self {
             entries: [None; POOL_SIZE],
+            pool_start,
+            lease_secs,
         }
     }
 
     /// Returns the pool index for an IP address, or `None` if out of range.
     ///
     /// The pool is within one /24 subnet — only the last octet varies.
-    fn index_of(addr: Ipv4Addr, pool_start: Ipv4Addr) -> Option<usize> {
-        if addr.0[0] != pool_start.0[0]
-            || addr.0[1] != pool_start.0[1]
-            || addr.0[2] != pool_start.0[2]
+    fn index_of(&self, addr: Ipv4Addr) -> Option<usize> {
+        if addr.0[0] != self.pool_start.0[0]
+            || addr.0[1] != self.pool_start.0[1]
+            || addr.0[2] != self.pool_start.0[2]
         {
             return None;
         }
-        let offset = addr.0[3].checked_sub(pool_start.0[3])? as usize;
+        let offset = addr.0[3].checked_sub(self.pool_start.0[3])? as usize;
         if offset < POOL_SIZE {
             Some(offset)
         } else {
@@ -583,19 +599,19 @@ impl LeaseTable {
     }
 
     /// Returns the `Ipv4Addr` for pool slot `index`.
-    fn addr_of(index: usize, pool_start: Ipv4Addr) -> Ipv4Addr {
+    fn addr_of(&self, index: usize) -> Ipv4Addr {
         Ipv4Addr([
-            pool_start.0[0],
-            pool_start.0[1],
-            pool_start.0[2],
-            pool_start.0[3].wrapping_add(index as u8),
+            self.pool_start.0[0],
+            self.pool_start.0[1],
+            self.pool_start.0[2],
+            self.pool_start.0[3].wrapping_add(index as u8),
         ])
     }
 
     /// Returns `true` if the lease has expired given `now_secs` and the
-    /// configured lease duration.
-    fn is_expired(lease: &Lease, now_secs: u64, lease_secs: u32) -> bool {
-        now_secs.saturating_sub(lease.offered_at_secs) >= u64::from(lease_secs)
+    /// table's configured lease duration.
+    fn is_expired(&self, lease: &Lease, now_secs: u64) -> bool {
+        now_secs.saturating_sub(lease.offered_at_secs) >= u64::from(self.lease_secs)
     }
 
     /// Looks up an existing lease entry for `mac` and returns its pool index.
@@ -614,16 +630,16 @@ impl LeaseTable {
     /// 3. Allocate the first free or expired slot.
     /// 4. If all slots hold valid leases, evict the oldest one.
     ///
-    /// Returns the allocated `Ipv4Addr`, or `None` if `pool_start` is outside
-    /// the addressable range (defensive — should not happen with well-formed
-    /// config).
+    /// Returns the allocated `Ipv4Addr`, or `None` only in the pathological
+    /// case where the table holds no `Some` entries — i.e. the for-loop in
+    /// step 3 finds every slot free but the early-return doesn't fire, which
+    /// can't happen with the current code; the `Option` is preserved as a
+    /// safety hatch.
     pub fn allocate(
         &mut self,
         mac: &[u8; 6],
         requested: Option<Ipv4Addr>,
-        pool_start: Ipv4Addr,
         now_secs: u64,
-        lease_secs: u32,
     ) -> Option<Ipv4Addr> {
         // 1. Existing lease for this MAC — reuse and refresh.
         if let Some(idx) = self.find_by_mac(mac) {
@@ -631,14 +647,13 @@ impl LeaseTable {
                 mac: *mac,
                 offered_at_secs: now_secs,
             });
-            return Some(Self::addr_of(idx, pool_start));
+            return Some(self.addr_of(idx));
         }
 
         // 2. Honour the requested IP if it is in pool and available.
         if let Some(req) = requested {
-            if let Some(idx) = Self::index_of(req, pool_start) {
-                let available =
-                    self.entries[idx].map_or(true, |l| Self::is_expired(&l, now_secs, lease_secs));
+            if let Some(idx) = self.index_of(req) {
+                let available = self.entries[idx].map_or(true, |l| self.is_expired(&l, now_secs));
                 if available {
                     self.entries[idx] = Some(Lease {
                         mac: *mac,
@@ -651,10 +666,9 @@ impl LeaseTable {
 
         // 3. First free or expired slot.
         for idx in 0..POOL_SIZE {
-            let available =
-                self.entries[idx].map_or(true, |l| Self::is_expired(&l, now_secs, lease_secs));
+            let available = self.entries[idx].map_or(true, |l| self.is_expired(&l, now_secs));
             if available {
-                let addr = Self::addr_of(idx, pool_start);
+                let addr = self.addr_of(idx);
                 self.entries[idx] = Some(Lease {
                     mac: *mac,
                     offered_at_secs: now_secs,
@@ -677,7 +691,7 @@ impl LeaseTable {
             oldest_idx
         );
 
-        let addr = Self::addr_of(oldest_idx, pool_start);
+        let addr = self.addr_of(oldest_idx);
         self.entries[oldest_idx] = Some(Lease {
             mac: *mac,
             offered_at_secs: now_secs,
@@ -686,8 +700,8 @@ impl LeaseTable {
     }
 
     /// Records or extends a confirmed lease for REQUEST→ACK.
-    pub fn confirm(&mut self, mac: &[u8; 6], addr: Ipv4Addr, pool_start: Ipv4Addr, now_secs: u64) {
-        if let Some(idx) = Self::index_of(addr, pool_start) {
+    pub fn confirm(&mut self, mac: &[u8; 6], addr: Ipv4Addr, now_secs: u64) {
+        if let Some(idx) = self.index_of(addr) {
             self.entries[idx] = Some(Lease {
                 mac: *mac,
                 offered_at_secs: now_secs,
@@ -724,6 +738,27 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
     use embassy_net::udp::{PacketMetadata, UdpSocket};
     use static_cell::StaticCell;
 
+    // Validate the configured pool range against the hard-coded `LeaseTable`
+    // capacity.  `LeaseTable` is a `[Option<Lease>; POOL_SIZE]` and cannot
+    // grow at runtime, so a config that exposes more (or fewer) addresses
+    // than the table can hold would silently allocate the wrong IPs.  Refuse
+    // to start rather than serve subtly wrong leases.
+    let start_u32 = u32::from_be_bytes(config.pool_start.0);
+    let end_u32 = u32::from_be_bytes(config.pool_end.0);
+    let configured_size = end_u32.saturating_sub(start_u32).saturating_add(1) as usize;
+    if configured_size != POOL_SIZE {
+        log::error!(
+            "DHCP config invalid: pool_start={} pool_end={} implies {} slots, but LeaseTable is fixed at {} — refusing to start (Phase 2 will lift this constraint via const generics)",
+            config.pool_start,
+            config.pool_end,
+            configured_size,
+            POOL_SIZE
+        );
+        loop {
+            embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
+        }
+    }
+
     // Static socket buffers — required because `UdpSocket::new` in
     // `embassy-net 0.8` internally transmutes the buffer slices to `'static`
     // (see `embassy_net::udp::UdpSocket::new` safety contract).
@@ -756,7 +791,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
 
     let mut rx_pkt = [0u8; PACKET_BUF];
     let mut tx_pkt = [0u8; PACKET_BUF];
-    let mut leases = LeaseTable::new();
+    let mut leases = LeaseTable::new(config.pool_start, config.lease_secs);
 
     let server_ip = config.server_ip;
 
@@ -804,19 +839,14 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
 
         match msg_type {
             MSG_DISCOVER => {
-                let offered_ip = match leases.allocate(
-                    &msg.chaddr,
-                    msg.options.requested_ip,
-                    config.pool_start,
-                    now_secs,
-                    config.lease_secs,
-                ) {
-                    Some(ip) => ip,
-                    None => {
-                        log::warn!("DHCP: pool exhausted — cannot send OFFER");
-                        continue;
-                    }
-                };
+                let offered_ip =
+                    match leases.allocate(&msg.chaddr, msg.options.requested_ip, now_secs) {
+                        Some(ip) => ip,
+                        None => {
+                            log::warn!("DHCP: pool exhausted — cannot send OFFER");
+                            continue;
+                        }
+                    };
 
                 let reply = DhcpMessage {
                     op: OP_REPLY,
@@ -872,13 +902,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
                     }
                 });
 
-                let offered_ip = match leases.allocate(
-                    &msg.chaddr,
-                    requested,
-                    config.pool_start,
-                    now_secs,
-                    config.lease_secs,
-                ) {
+                let offered_ip = match leases.allocate(&msg.chaddr, requested, now_secs) {
                     Some(ip) => ip,
                     None => {
                         log::warn!("DHCP REQUEST: pool exhausted — sending NAK");
@@ -902,7 +926,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
                     }
                 }
 
-                leases.confirm(&msg.chaddr, offered_ip, config.pool_start, now_secs);
+                leases.confirm(&msg.chaddr, offered_ip, now_secs);
 
                 let reply = DhcpMessage {
                     op: OP_REPLY,
@@ -953,10 +977,21 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
     }
 }
 
-/// Returns the broadcast [`IpEndpoint`] used for all DHCP replies.
+/// Returns the broadcast [`IpEndpoint`] used for all DHCP replies in this spike.
 ///
-/// RFC 2131 §4.1: the server sends OFFER and ACK to `255.255.255.255:68`
-/// when the broadcast flag is set (i.e. ciaddr is `0.0.0.0`).
+/// RFC 2131 §4.1 specifies the broadcast address for OFFER and ACK when the
+/// client's broadcast flag is set (i.e. `ciaddr` is `0.0.0.0`).
+///
+/// # Intentional simplification: every reply is broadcast
+///
+/// This spike sends **every** OFFER / ACK / NAK to `255.255.255.255:68`,
+/// even when the spec would allow unicast (a renewing client with a valid
+/// `ciaddr` should receive replies at that address per RFC 2131 §4.3.2).
+/// For a single-client captive-portal scenario this is acceptable — there
+/// is exactly one phone associating at a time, no DHCP relay, and the AP
+/// netif is the only adjacent broadcast domain.  Phase 2 proper, which
+/// migrates this module into `rustyfarian-esp-hal-provisioning`, should
+/// add a unicast path for renew/rebind transitions.
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 fn dhcp_broadcast_endpoint() -> embassy_net::IpEndpoint {
     use embassy_net::{IpAddress, IpEndpoint, Ipv4Address};
@@ -1195,10 +1230,10 @@ mod tests {
     /// First allocation from an empty table returns pool_start.
     #[test]
     fn first_allocation_returns_pool_start() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01];
         let addr = table
-            .allocate(&mac, None, POOL_START, 0, LEASE_SECS)
+            .allocate(&mac, None, 0)
             .expect("allocation should succeed");
         assert_eq!(addr, Ipv4Addr::new(192, 168, 4, 10));
     }
@@ -1206,13 +1241,13 @@ mod tests {
     /// Same MAC gets the same IP on a second allocation (lease renewal).
     #[test]
     fn same_mac_reuses_lease() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02];
         let first = table
-            .allocate(&mac, None, POOL_START, 0, LEASE_SECS)
+            .allocate(&mac, None, 0)
             .expect("first alloc should succeed");
         let second = table
-            .allocate(&mac, None, POOL_START, 100, LEASE_SECS)
+            .allocate(&mac, None, 100)
             .expect("second alloc should succeed");
         assert_eq!(first, second, "same MAC must get the same IP");
     }
@@ -1220,11 +1255,11 @@ mod tests {
     /// Requested IP that is in pool and free is honoured.
     #[test]
     fn requested_ip_in_pool_is_honoured() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x03];
         let want = Ipv4Addr::new(192, 168, 4, 15);
         let got = table
-            .allocate(&mac, Some(want), POOL_START, 0, LEASE_SECS)
+            .allocate(&mac, Some(want), 0)
             .expect("allocation should succeed");
         assert_eq!(got, want);
     }
@@ -1232,12 +1267,12 @@ mod tests {
     /// Requested IP outside the pool falls through to first-free.
     #[test]
     fn requested_ip_out_of_pool_falls_through_to_first_free() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x04];
         // 192.168.4.200 is well outside the .10–.20 pool.
         let out_of_pool = Some(Ipv4Addr::new(192, 168, 4, 200));
         let got = table
-            .allocate(&mac, out_of_pool, POOL_START, 0, LEASE_SECS)
+            .allocate(&mac, out_of_pool, 0)
             .expect("allocation should succeed");
         // Falls back to first free = pool_start = .10.
         assert_eq!(got, Ipv4Addr::new(192, 168, 4, 10));
@@ -1246,16 +1281,16 @@ mod tests {
     /// An expired lease slot is reused by a new client.
     #[test]
     fn expired_lease_slot_is_reused() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac1 = [0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
         let mac2 = [0x02, 0x02, 0x02, 0x02, 0x02, 0x02];
         // Allocate at t=0 with 300 s lease.
         let addr1 = table
-            .allocate(&mac1, None, POOL_START, 0, LEASE_SECS)
+            .allocate(&mac1, None, 0)
             .expect("first alloc should succeed");
         // At t=400 the lease has expired; mac2 requests the same IP.
         let addr2 = table
-            .allocate(&mac2, Some(addr1), POOL_START, 400, LEASE_SECS)
+            .allocate(&mac2, Some(addr1), 400)
             .expect("second alloc should succeed");
         assert_eq!(addr2, addr1, "expired slot should be reused");
     }
@@ -1263,34 +1298,30 @@ mod tests {
     /// Two different MACs get different IP addresses.
     #[test]
     fn two_clients_get_different_ips() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         let mac1 = [0x11, 0x11, 0x11, 0x11, 0x11, 0x11];
         let mac2 = [0x22, 0x22, 0x22, 0x22, 0x22, 0x22];
-        let a1 = table
-            .allocate(&mac1, None, POOL_START, 0, LEASE_SECS)
-            .unwrap();
-        let a2 = table
-            .allocate(&mac2, None, POOL_START, 0, LEASE_SECS)
-            .unwrap();
+        let a1 = table.allocate(&mac1, None, 0).unwrap();
+        let a2 = table.allocate(&mac2, None, 0).unwrap();
         assert_ne!(a1, a2, "different MACs must get different IPs");
     }
 
     /// Full pool with all slots valid — oldest lease is evicted.
     #[test]
     fn full_pool_evicts_oldest_lease() {
-        let mut table = LeaseTable::new();
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
         // Fill all 11 slots with distinct offered_at_secs values.
         for i in 0..POOL_SIZE {
             let mac = [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, i as u8];
             // t = i so slot 0 is the oldest (t=0).
             table
-                .allocate(&mac, None, POOL_START, i as u64, LEASE_SECS)
+                .allocate(&mac, None, i as u64)
                 .expect("alloc should succeed");
         }
         // A new MAC needs a slot — the oldest (slot 0, t=0) must be evicted.
         let newcomer = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let addr = table
-            .allocate(&newcomer, None, POOL_START, 1000, LEASE_SECS)
+            .allocate(&newcomer, None, 1000)
             .expect("eviction alloc should succeed");
         // Slot 0 → pool_start = 192.168.4.10.
         assert_eq!(addr, Ipv4Addr::new(192, 168, 4, 10));
