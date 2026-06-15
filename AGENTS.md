@@ -14,13 +14,14 @@ Both tiers share platform-independent `*-pure` crates that compile and unit-test
 The workspace separates pure logic (host-testable) from hardware-specific implementations.
 ADRs in `docs/adr/` document each architectural split.
 
-| Pure (no_std, host-testable) | ESP-IDF (std)                | esp-hal (no_std bare-metal) |
-|:-----------------------------|:-----------------------------|:----------------------------|
-| `wifi-pure`                  | `rustyfarian-esp-idf-wifi`   | `rustyfarian-esp-hal-wifi`  |
-| `lora-pure`                  | `rustyfarian-esp-idf-lora`   | `rustyfarian-esp-hal-lora`  |
-| `espnow-pure`                | `rustyfarian-esp-idf-espnow` | (not yet)                   |
-| `ota-pure`                   | `rustyfarian-esp-idf-ota`    | `rustyfarian-esp-hal-ota`   |
-| `rustyfarian-network-pure`   | `rustyfarian-esp-idf-mqtt`   | (planned)                   |
+| Pure (no_std, host-testable) | ESP-IDF (std)                      | esp-hal (no_std bare-metal)        |
+|:-----------------------------|:-----------------------------------|:-----------------------------------|
+| `wifi-pure`                  | `rustyfarian-esp-idf-wifi`         | `rustyfarian-esp-hal-wifi`         |
+| `lora-pure`                  | `rustyfarian-esp-idf-lora`         | `rustyfarian-esp-hal-lora`         |
+| `espnow-pure`                | `rustyfarian-esp-idf-espnow`       | (not yet)                          |
+| `ota-pure`                   | `rustyfarian-esp-idf-ota`          | `rustyfarian-esp-hal-ota`          |
+| `provisioning-pure`          | `rustyfarian-esp-idf-provisioning` | `rustyfarian-esp-hal-provisioning` |
+| `rustyfarian-network-pure`   | `rustyfarian-esp-idf-mqtt`         | (planned)                          |
 
 Pure crates contain validation, types, traits, state machines, and timing math.
 Hardware crates implement the traits using ESP-IDF or `esp-hal` and handle the hardware lifecycle.

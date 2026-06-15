@@ -322,20 +322,14 @@ fn parse_options(buf: &[u8]) -> Result<ParsedOptions, DhcpError> {
         i += len;
 
         match tag {
-            OPT_MSG_TYPE => {
-                if len >= 1 {
-                    opts.message_type = Some(val[0]);
-                }
+            OPT_MSG_TYPE if len >= 1 => {
+                opts.message_type = Some(val[0]);
             }
-            OPT_REQUESTED_IP => {
-                if len == 4 {
-                    opts.requested_ip = Some(Ipv4Addr([val[0], val[1], val[2], val[3]]));
-                }
+            OPT_REQUESTED_IP if len == 4 => {
+                opts.requested_ip = Some(Ipv4Addr([val[0], val[1], val[2], val[3]]));
             }
-            OPT_SERVER_ID => {
-                if len == 4 {
-                    opts.server_id = Some(Ipv4Addr([val[0], val[1], val[2], val[3]]));
-                }
+            OPT_SERVER_ID if len == 4 => {
+                opts.server_id = Some(Ipv4Addr([val[0], val[1], val[2], val[3]]));
             }
             OPT_CLIENT_ID => {
                 let copy_len = len.min(16);
@@ -618,7 +612,7 @@ impl LeaseTable {
     pub(crate) fn find_by_mac(&self, mac: &[u8; 6]) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| e.map_or(false, |l| &l.mac == mac))
+            .position(|e| e.is_some_and(|l| &l.mac == mac))
     }
 
     /// Allocates or reuses a pool slot for a client.
@@ -653,7 +647,7 @@ impl LeaseTable {
         // 2. Honour the requested IP if it is in pool and available.
         if let Some(req) = requested {
             if let Some(idx) = self.index_of(req) {
-                let available = self.entries[idx].map_or(true, |l| self.is_expired(&l, now_secs));
+                let available = self.entries[idx].is_none_or(|l| self.is_expired(&l, now_secs));
                 if available {
                     self.entries[idx] = Some(Lease {
                         mac: *mac,
@@ -666,7 +660,7 @@ impl LeaseTable {
 
         // 3. First free or expired slot.
         for idx in 0..POOL_SIZE {
-            let available = self.entries[idx].map_or(true, |l| self.is_expired(&l, now_secs));
+            let available = self.entries[idx].is_none_or(|l| self.is_expired(&l, now_secs));
             if available {
                 let addr = self.addr_of(idx);
                 self.entries[idx] = Some(Lease {
@@ -733,26 +727,74 @@ impl LeaseTable {
 ///
 /// Bind failure, send errors, and malformed packets are all logged at `warn`
 /// and do not abort the server loop.
+/// Reasons a configured DHCP pool fails `LeaseTable`'s shape constraints.
+///
+/// `LeaseTable` is a `[Option<Lease>; POOL_SIZE]` where `addr_of` derives
+/// each pool slot by `wrapping_add`-ing the index onto `pool_start`'s last
+/// octet and leaving the first three octets unchanged. The pool must
+/// therefore lie wholly within a single /24 and span exactly `pool_size`
+/// slots. A `pool_start[3] + pool_size - 1 > 255` overflow is structurally
+/// unreachable under this contract — if it would happen, then by definition
+/// `pool_end` either lands in the next /24 (caught by `CrossesSubnet`) or
+/// the implied `end - start + 1` no longer equals `pool_size` (caught by
+/// `SizeMismatch`), so no separate `LastOctetOverflow` variant is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolGeometryError {
+    SizeMismatch { configured: usize, required: usize },
+    CrossesSubnet,
+}
+
+impl PoolGeometryError {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PoolGeometryError::SizeMismatch { .. } => "configured pool size != POOL_SIZE",
+            PoolGeometryError::CrossesSubnet => "pool crosses a /24 boundary",
+        }
+    }
+}
+
+/// Validate that the pool range fits `LeaseTable`'s within-/24 layout.
+///
+/// Pure helper extracted so the boundary cases can be locked by host tests
+/// rather than only discovered at server startup. Returns `Ok(())` for the
+/// well-formed default config and `Err` for every shape `LeaseTable` cannot
+/// faithfully address.
+pub(crate) fn validate_pool_geometry(
+    pool_start: Ipv4Addr,
+    pool_end: Ipv4Addr,
+    pool_size: usize,
+) -> Result<(), PoolGeometryError> {
+    let start_u32 = u32::from_be_bytes(pool_start.0);
+    let end_u32 = u32::from_be_bytes(pool_end.0);
+    let configured = end_u32.saturating_sub(start_u32).saturating_add(1) as usize;
+    if configured != pool_size {
+        return Err(PoolGeometryError::SizeMismatch {
+            configured,
+            required: pool_size,
+        });
+    }
+    if pool_start.0[0..3] != pool_end.0[0..3] {
+        return Err(PoolGeometryError::CrossesSubnet);
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -> ! {
     use embassy_net::udp::{PacketMetadata, UdpSocket};
     use static_cell::StaticCell;
 
-    // Validate the configured pool range against the hard-coded `LeaseTable`
-    // capacity.  `LeaseTable` is a `[Option<Lease>; POOL_SIZE]` and cannot
-    // grow at runtime, so a config that exposes more (or fewer) addresses
-    // than the table can hold would silently allocate the wrong IPs.  Refuse
-    // to start rather than serve subtly wrong leases.
-    let start_u32 = u32::from_be_bytes(config.pool_start.0);
-    let end_u32 = u32::from_be_bytes(config.pool_end.0);
-    let configured_size = end_u32.saturating_sub(start_u32).saturating_add(1) as usize;
-    if configured_size != POOL_SIZE {
+    // Validate the configured pool range against `LeaseTable`'s shape — the
+    // table is a `[Option<Lease>; POOL_SIZE]` and `addr_of` only varies the
+    // last octet via `wrapping_add`, so a misconfigured pool would silently
+    // allocate the wrong IPs.  Refuse to start instead.
+    if let Err(reason) = validate_pool_geometry(config.pool_start, config.pool_end, POOL_SIZE) {
         log::error!(
-            "DHCP config invalid: pool_start={} pool_end={} implies {} slots, but LeaseTable is fixed at {} — refusing to start (Phase 2 will lift this constraint via const generics)",
+            "DHCP config invalid: pool_start={} pool_end={} — {} (LeaseTable is fixed at POOL_SIZE={}, lives within a single /24, and must not cross the last-octet 255 wraparound; Phase 2 will lift these constraints via const generics)",
             config.pool_start,
             config.pool_end,
-            configured_size,
-            POOL_SIZE
+            reason.as_str(),
+            POOL_SIZE,
         );
         loop {
             embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
@@ -1360,5 +1402,59 @@ mod tests {
             decoded.yiaddr.is_unspecified(),
             "NAK yiaddr must be 0.0.0.0"
         );
+    }
+
+    // ── Pool-geometry validation tests ────────────────────────────────────────
+
+    #[test]
+    fn pool_geometry_accepts_default_within_24_pool() {
+        // 192.168.4.10..=192.168.4.20 (POOL_SIZE = 11) — the shipping default.
+        let start = Ipv4Addr([192, 168, 4, 10]);
+        let end = Ipv4Addr([192, 168, 4, 20]);
+        assert_eq!(validate_pool_geometry(start, end, POOL_SIZE), Ok(()));
+    }
+
+    #[test]
+    fn pool_geometry_rejects_size_mismatch() {
+        let start = Ipv4Addr([192, 168, 4, 10]);
+        let end = Ipv4Addr([192, 168, 4, 24]); // 15 slots, not 11
+        assert_eq!(
+            validate_pool_geometry(start, end, POOL_SIZE),
+            Err(PoolGeometryError::SizeMismatch {
+                configured: 15,
+                required: POOL_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn pool_geometry_rejects_crosses_24_boundary() {
+        // 192.168.4.250..=192.168.5.4 — 11 slots numerically, but `addr_of(6)`
+        // would wrap last-octet to .0 instead of advancing to .5.0. The
+        // size check would pass; the cross-subnet check must catch it.
+        let start = Ipv4Addr([192, 168, 4, 250]);
+        let end = Ipv4Addr([192, 168, 5, 4]);
+        assert_eq!(
+            validate_pool_geometry(start, end, POOL_SIZE),
+            Err(PoolGeometryError::CrossesSubnet)
+        );
+    }
+
+    #[test]
+    fn pool_geometry_accepts_boundary_at_255() {
+        // The boundary case the dropped `LastOctetOverflow` variant claimed to
+        // catch — pool_start.0[3] = 250, pool_size = 6 → last slot lands on
+        // .255 exactly. The remaining two checks (size match, same subnet)
+        // accept it as valid, which is correct: nothing wraps.
+        let start = Ipv4Addr([10, 0, 0, 250]);
+        let end = Ipv4Addr([10, 0, 0, 255]);
+        assert_eq!(validate_pool_geometry(start, end, 6), Ok(()));
+        // Claiming one more slot than the addressable range trips the size
+        // check — which is the correct error surface; there is no separate
+        // overflow variant to reach.
+        assert!(matches!(
+            validate_pool_geometry(start, end, 7),
+            Err(PoolGeometryError::SizeMismatch { .. })
+        ));
     }
 }

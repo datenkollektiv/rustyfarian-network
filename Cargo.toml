@@ -16,7 +16,7 @@ lora-pure = { path = "crates/lora-pure" }
 wifi-pure = { path = "crates/wifi-pure" }
 espnow-pure = { path = "crates/espnow-pure" }
 ota-pure = { path = "crates/ota-pure" }
-provisioning-pure = { path = "crates/provisioning-pure" }
+provisioning-pure = { path = "crates/provisioning-pure", default-features = false }
 rustyfarian-esp-idf-provisioning = { path = "crates/rustyfarian-esp-idf-provisioning" }
 
 # External dependencies

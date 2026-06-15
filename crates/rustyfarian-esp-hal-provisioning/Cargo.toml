@@ -1,0 +1,12 @@
+[package]
+name = "rustyfarian-esp-hal-provisioning"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+provisioning-pure = { workspace = true, default-features = false }
+rustyfarian-network-pure = { workspace = true, default-features = false }
+wifi-pure = { workspace = true }
+embedded-storage = { workspace = true }
+heapless = { workspace = true }

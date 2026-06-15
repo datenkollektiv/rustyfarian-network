@@ -83,14 +83,28 @@ check-provisioning:
 check-ota-hal:
     cargo check -p rustyfarian-esp-hal-ota --no-default-features --target-dir {{ hal_dir }}
 
+# check the esp-hal provisioning stub (no-default-features to avoid esp-hal target conflict)
+check-provisioning-hal:
+    cargo check -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
+
 # check the esp-hal ota crate with chip + embassy features (ESP32-C6 + ESP32-C3)
 check-ota-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
+# check the esp-hal provisioning crate cross-compiles cleanly to both bare-metal targets
+# Phase 1 has no chip features yet — this recipe proves the no_std purity of the store module.
+check-provisioning-hal-embassy:
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
+
 # run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
 test-ota-hal:
     cargo test --target {{host_target}} -p rustyfarian-esp-hal-ota --no-default-features
+
+# run platform-independent provisioning unit tests for the bare-metal crate (host toolchain, no ESP toolchain needed)
+test-provisioning-hal:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-provisioning --no-default-features
 
 # check the esp-idf espnow crate
 check-espnow:
@@ -204,7 +218,7 @@ test-dns:
     cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-dhcp test-http test-dns
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-hal test-dhcp test-http test-dns
 
 # ── Examples ──────────────────────────────────────────────────────────────
 

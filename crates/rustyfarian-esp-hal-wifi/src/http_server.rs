@@ -99,9 +99,9 @@ const METHOD_NOT_ALLOWED_BODY: &str = "Method Not Allowed";
 pub enum Method {
     /// `GET` — used for the captive portal page.
     Get,
-    /// `POST` — forward-compatible placeholder for `/save`; the spike only
-    /// responds with 404 for unrecognised routes, but the parser already
-    /// accepts POST bodies so the routing layer has something to dispatch.
+    /// `POST` — forward-compatible placeholder for `/save`. The spike's
+    /// router returns 405 for every POST today; the parser already accepts
+    /// POST bodies so Phase 2's `/save` route has somewhere to dispatch.
     Post,
 }
 
@@ -566,6 +566,11 @@ fn write_u32_decimal(buf: &mut [u8], pos: &mut usize, n: u32) -> Result<(), ()> 
 /// The status code and content type are per-call parameters because they
 /// genuinely vary per response.  The `Connection: close` policy is a server
 /// invariant and is therefore baked in, not passed as a parameter.
+// Returning `Result<_, ()>` is intentional: the only failure mode is "ran out
+// of bytes in the response buffer", and the caller (`route`) has no recovery
+// path beyond "log and skip the write". Phase 2 will replace this with a
+// real error enum once the response set grows past 200/405.
+#[allow(clippy::result_unit_err)]
 pub fn build_response(
     buf: &mut [u8],
     status: u16,
@@ -621,6 +626,7 @@ pub fn build_response(
 /// [`parse_request`] / [`ParsedRequest`]), so any method that would normally
 /// carry a body is rejected at the router rather than handled half-way.
 /// Phase 2 proper will replace this with a real form-submission route.
+#[allow(clippy::result_unit_err)] // see `build_response` for rationale
 pub fn route(req: &ParsedRequest, resp_buf: &mut [u8]) -> Result<usize, ()> {
     match req.method {
         Method::Get => build_response(
@@ -751,7 +757,16 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
                         req.target_str()
                     );
                     route(&req, &mut resp_buf).unwrap_or_else(|()| {
-                        log::warn!("HTTP: response buffer too small — sending empty 500");
+                        // `route` returned `Err(())` because `resp_buf` was
+                        // too small to hold even the minimal response we
+                        // would have built. We fall through with resp_len=0,
+                        // and the `if resp_len > 0` guard below skips the
+                        // write — no body, no status line — leaving the
+                        // client to time out. Phase 2 should reserve a
+                        // minimal 500 in a separate fixed-size buffer.
+                        log::warn!(
+                            "HTTP: response buffer too small — closing without sending any response"
+                        );
                         0
                     })
                 }
@@ -884,7 +899,7 @@ mod tests {
     fn request_line_target_at_max_len() {
         let mut line = b"GET /".to_vec();
         // Fill target with 'a' to exactly reach MAX_TARGET_LEN including the '/'.
-        line.extend(core::iter::repeat(b'a').take(MAX_TARGET_LEN - 1));
+        line.extend(core::iter::repeat_n(b'a', MAX_TARGET_LEN - 1));
         line.extend_from_slice(b" HTTP/1.1");
         let (method, target) = parse_request_line(&line).unwrap();
         assert_eq!(method, Method::Get);
@@ -895,7 +910,7 @@ mod tests {
     #[test]
     fn request_line_target_too_long() {
         let mut line = b"GET /".to_vec();
-        line.extend(core::iter::repeat(b'a').take(MAX_TARGET_LEN));
+        line.extend(core::iter::repeat_n(b'a', MAX_TARGET_LEN));
         line.extend_from_slice(b" HTTP/1.1");
         assert_eq!(parse_request_line(&line), Err(ParseError::UriTooLong));
     }
