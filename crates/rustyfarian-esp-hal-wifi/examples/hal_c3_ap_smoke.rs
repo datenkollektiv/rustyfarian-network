@@ -4,7 +4,7 @@
 //! using `esp-radio` on top of an `embassy-net` stack with a static IP
 //! (`192.168.4.1/24`).
 //!
-//! Four tasks run alongside the idle main loop:
+//! Five tasks run alongside the idle main loop:
 //!
 //! * `net_task` — drives the `embassy-net` stack by calling `runner.run().await`.
 //! * `wifi_task` — owns the [`WifiController`], starts the AP, then waits for
@@ -16,10 +16,24 @@
 //!   failure" because no DHCP server was present; after it is spawned the
 //!   phone obtains a valid lease and the captive-portal UX becomes available.
 //! * `http_task` — runs the minimal hand-rolled HTTP/1.1 server (Phase 2
-//!   spike, ADR 015 §3 fallback).  After joining the AP and obtaining a DHCP
-//!   lease, a phone can browse to `http://192.168.4.1/` and see the SoftAP
-//!   spike page, confirming the full substrate (Wi-Fi → DHCP → TCP → HTTP)
-//!   is wired end-to-end.  Any other path returns 404.
+//!   spike, ADR 015 §3 fallback).  Every `GET` request — regardless of path —
+//!   returns 200 OK with the SoftAP portal page.  This is the captive-portal
+//!   trigger: when the phone's probe URL returns unexpected content the OS pops
+//!   the captive browser automatically.
+//! * `dns_task` — runs the DNS catch-all server (Phase 2 spike, ADR 015 §3
+//!   fallback).  Every DNS query — regardless of name or type — receives an A
+//!   record pointing to `192.168.4.1`.  This ensures the phone OS can resolve
+//!   its captive-portal probe hostname to the AP, completing the full
+//!   AP + DHCP + DNS + HTTP substrate needed for the OS to auto-pop the browser.
+//!
+//! ## Expected boot log
+//!
+//! ```text
+//! INFO - SoftAP running — SSID="Rustyfarian-Smoke" — waiting for station events
+//! INFO - DHCP server bound on port 67
+//! INFO - HTTP server listening on port 80
+//! INFO - DNS catch-all bound on port 53
+//! ```
 //!
 //! The AP comes up **open** (no password), matching the captive-portal UX of
 //! the ESP-IDF `idf_c3_provision` / `idf_c3_provision_mqtt` examples — a
@@ -51,6 +65,7 @@ use esp_println::println;
 use esp_radio::wifi::{AccessPointStationEventInfo, Interface, WifiController};
 use rustyfarian_esp_hal_wifi::{
     dhcp::{self, DhcpServerConfig},
+    dns_catchall::{self, DnsCatchallConfig},
     http_server::{self, HttpServerConfig},
     ApConfig, ApConfigExt, SoftApHandle, WiFiManager, AP_IP,
 };
@@ -98,11 +113,13 @@ async fn main(spawner: Spawner) {
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(dhcp_task(stack).unwrap());
     spawner.spawn(http_task(stack).unwrap());
+    spawner.spawn(dns_task(stack).unwrap());
 
     // Log the AP IP so the console confirms the AP is up.
     println!("SoftAP IP: {}", AP_IP);
     println!("DHCP pool: 192.168.4.10 – 192.168.4.20 (lease 300 s)");
-    println!("HTTP server: http://192.168.4.1/");
+    println!("HTTP server: http://192.168.4.1/ (all GET paths → portal page)");
+    println!("DNS catch-all: port 53 → every name resolves to 192.168.4.1");
 
     // Idle loop.
     loop {
@@ -177,11 +194,22 @@ async fn dhcp_task(stack: embassy_net::Stack<'static>) -> ! {
 
 /// Runs the hand-rolled HTTP/1.1 server (Phase 2 spike, ADR 015 §3 fallback).
 ///
-/// Listens on port 80.  Phones that browse to `http://192.168.4.1/` after
-/// obtaining a DHCP lease see the SoftAP spike page.  Any other path returns
-/// 404.  The server handles one connection at a time — sufficient for a
+/// Listens on port 80.  Every `GET` request — regardless of path — returns
+/// the SoftAP portal page, triggering the phone OS's captive-portal detection.
+/// The server handles one connection at a time — sufficient for a
 /// single-client captive-portal scenario.
 #[embassy_executor::task]
 async fn http_task(stack: embassy_net::Stack<'static>) -> ! {
     http_server::run(stack, HttpServerConfig::default()).await
+}
+
+/// Runs the DNS catch-all server (Phase 2 spike, ADR 015 §3 fallback).
+///
+/// Listens on UDP port 53.  Every DNS query — regardless of name or type —
+/// receives an A record pointing to `192.168.4.1` (the AP IP).  This ensures
+/// the phone OS can resolve its captive-portal probe hostname before it
+/// attempts the HTTP probe that triggers the browser pop-up.
+#[embassy_executor::task]
+async fn dns_task(stack: embassy_net::Stack<'static>) -> ! {
+    dns_catchall::run(stack, DnsCatchallConfig::default()).await
 }

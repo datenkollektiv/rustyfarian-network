@@ -196,8 +196,15 @@ test-dhcp:
 test-http:
     cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
 
+# run platform-independent DNS catch-all codec unit tests (host toolchain)
+# Uses the `provisioning-spike` feature which enables the dns_catchall module; no chip
+# feature is selected so the async `run()` function is compiled away and no ESP toolchain
+# is needed.
+test-dns:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-dhcp test-http
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-dhcp test-http test-dns
 
 # ── Examples ──────────────────────────────────────────────────────────────
 

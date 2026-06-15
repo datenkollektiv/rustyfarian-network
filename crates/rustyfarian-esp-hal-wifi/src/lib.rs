@@ -34,6 +34,13 @@
 #[cfg(feature = "provisioning-spike")]
 pub mod dhcp;
 
+/// DNS catch-all server — Phase 2 spike code (ADR 015 §3 fallback).
+///
+/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
+/// the module-level documentation for the migration path.
+#[cfg(feature = "provisioning-spike")]
+pub mod dns_catchall;
+
 /// Minimal HTTP/1.1 server — Phase 2 spike code (ADR 015 §3 fallback).
 ///
 /// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
