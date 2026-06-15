@@ -4,17 +4,30 @@
 //! using `esp-radio` on top of an `embassy-net` stack with a static IP
 //! (`192.168.4.1/24`).
 //!
-//! Three tasks run alongside the idle main loop:
+//! Four tasks run alongside the idle main loop:
 //!
 //! * `net_task` — drives the `embassy-net` stack by calling `runner.run().await`.
 //! * `wifi_task` — owns the [`WifiController`], starts the AP, then waits for
 //!   station connect/disconnect events and logs them with a running count.
+//! * `dhcp_task` — runs the minimal hand-rolled DHCP server (Phase 2 spike,
+//!   ADR 015 §3 fallback).  Clients that join the AP are now offered addresses
+//!   in the `192.168.4.10`–`192.168.4.20` range with a 5-minute lease.
+//!   Before this task was added the phone would join but see "IP config
+//!   failure" because no DHCP server was present; after it is spawned the
+//!   phone obtains a valid lease and the captive-portal UX becomes available.
+//! * `http_task` — runs the minimal hand-rolled HTTP/1.1 server (Phase 2
+//!   spike, ADR 015 §3 fallback).  After joining the AP and obtaining a DHCP
+//!   lease, a phone can browse to `http://192.168.4.1/` and see the SoftAP
+//!   spike page, confirming the full substrate (Wi-Fi → DHCP → TCP → HTTP)
+//!   is wired end-to-end.  Any other path returns 404.
 //!
-//! The AP comes up **open** (no password), matching the captive-portal UX of the
-//! ESP-IDF `idf_c3_provision` / `idf_c3_provision_mqtt` examples — a field
-//! operator joins from a phone without ever knowing a password, and the captive
-//! portal (not the Wi-Fi layer) is the access control. `AP_SSID` can be set as
-//! an environment variable at build time; the default is `"Rustyfarian-Smoke"`.
+//! The AP comes up **open** (no password), matching the captive-portal UX of
+//! the ESP-IDF `idf_c3_provision` / `idf_c3_provision_mqtt` examples — a
+//! field operator joins from a phone without ever knowing a password, and the
+//! captive portal (not the Wi-Fi layer) is the access control.
+//!
+//! `AP_SSID` can be set as an environment variable at build time; the default
+//! is `"Rustyfarian-Smoke"`.
 //!
 //! # Build and flash
 //!
@@ -36,7 +49,11 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
 use esp_radio::wifi::{AccessPointStationEventInfo, Interface, WifiController};
-use rustyfarian_esp_hal_wifi::{ApConfig, ApConfigExt, SoftApHandle, WiFiManager, AP_IP};
+use rustyfarian_esp_hal_wifi::{
+    dhcp::{self, DhcpServerConfig},
+    http_server::{self, HttpServerConfig},
+    ApConfig, ApConfigExt, SoftApHandle, WiFiManager, AP_IP,
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -73,17 +90,21 @@ async fn main(spawner: Spawner) {
 
     let SoftApHandle {
         controller,
-        stack: _stack,
+        stack,
         runner,
     } = handle;
 
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(dhcp_task(stack).unwrap());
+    spawner.spawn(http_task(stack).unwrap());
 
-    // Log the AP IP and MAC so the console confirms the AP is up.
+    // Log the AP IP so the console confirms the AP is up.
     println!("SoftAP IP: {}", AP_IP);
+    println!("DHCP pool: 192.168.4.10 – 192.168.4.20 (lease 300 s)");
+    println!("HTTP server: http://192.168.4.1/");
 
-    // Idle loop — real applications would open TCP sockets here.
+    // Idle loop.
     loop {
         Timer::after(Duration::from_secs(10)).await;
         println!("SoftAP idle — AP_IP={}", AP_IP);
@@ -142,4 +163,25 @@ async fn wifi_task(controller: WifiController<'static>) {
             }
         }
     }
+}
+
+/// Runs the hand-rolled DHCP server (Phase 2 spike, ADR 015 §3 fallback).
+///
+/// Serves `192.168.4.10` – `192.168.4.20` with a 300 s lease.
+/// Phones that join the open AP now obtain a valid IP address instead of
+/// showing "IP configuration failure".
+#[embassy_executor::task]
+async fn dhcp_task(stack: embassy_net::Stack<'static>) -> ! {
+    dhcp::run(stack, DhcpServerConfig::default()).await
+}
+
+/// Runs the hand-rolled HTTP/1.1 server (Phase 2 spike, ADR 015 §3 fallback).
+///
+/// Listens on port 80.  Phones that browse to `http://192.168.4.1/` after
+/// obtaining a DHCP lease see the SoftAP spike page.  Any other path returns
+/// 404.  The server handles one connection at a time — sufficient for a
+/// single-client captive-portal scenario.
+#[embassy_executor::task]
+async fn http_task(stack: embassy_net::Stack<'static>) -> ! {
+    http_server::run(stack, HttpServerConfig::default()).await
 }

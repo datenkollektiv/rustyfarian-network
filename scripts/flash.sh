@@ -112,7 +112,7 @@ case "$prefix" in
             *_async*) hal_features="${hal_features},embassy" ;;
         esac
         case "$example" in
-            *ap*) hal_features="${hal_features},embassy" ;;
+            *ap*) hal_features="${hal_features},provisioning-spike" ;;
         esac
 
         # Ensure IDF-built bootloader is cached
