@@ -27,6 +27,20 @@
 
 #![no_std]
 
+/// Minimal DHCP server — Phase 2 spike code (ADR 015 §3 fallback).
+///
+/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
+/// the module-level documentation for the migration path.
+#[cfg(feature = "provisioning-spike")]
+pub mod dhcp;
+
+/// Minimal HTTP/1.1 server — Phase 2 spike code (ADR 015 §3 fallback).
+///
+/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
+/// the module-level documentation for the migration path.
+#[cfg(feature = "provisioning-spike")]
+pub mod http_server;
+
 pub use wifi_pure::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
     TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,

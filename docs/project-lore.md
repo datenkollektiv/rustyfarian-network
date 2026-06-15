@@ -131,6 +131,31 @@ Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 
 - The feature doc `docs/features/esp-hal-provisioning-v1.md` candidate-signatures section refers to `interfaces.ap` and `start_async()`; treat those as illustrative placeholders, not the real API.
 Source: `esp-radio-0.18.0/src/wifi/ap.rs` and `esp-radio-0.18.0/src/wifi/mod.rs` (`Interfaces` struct, `WifiEvent` enum).
 
+**`embassy-sync = =0.8.0` is a workspace-wide lock set by `esp-rtos 0.3.0`; many published async networking crates (incl. the `edge-net 0.7.x` family) still target `embassy-sync 0.7.2` and cannot coexist.**
+Cargo only allows one version of `embassy-sync` in the graph because the trait surface (`Mutex`, `Signal`, `CriticalSection`) is API-incompatible across the 0.7 → 0.8 boundary, and downgrading the workspace pin would break every other embassy-using crate.
+A crate evaluation that checks only license + transitive surface will miss this and fail at the resolver, not at the compiler.
+Fix: before adding any async networking crate to the bare-metal estate, run `cargo tree -i embassy-sync` or read the candidate's `Cargo.toml` and confirm it binds `embassy-sync 0.8.x`. Discovered during the ADR 015 Phase 2 substrate evaluation of `edge-dhcp 0.7.0` / `edge-nal-embassy 0.8.1` — both blocked, hand-rolled fallback proceeded per ADR 015 §3.
+
+**`embassy-net` feature flags `udp`, `tcp`, `proto-ipv4`, and `medium-ethernet` are independently gated; the workspace's `embassy` feature in `rustyfarian-esp-hal-wifi` enables none of them.**
+Pulling `embassy-net` into the dep graph does not provide `UdpSocket` or `TcpSocket` — those types live in `embassy_net::udp` and `embassy_net::tcp` modules behind their own feature flags, each adding a `smoltcp` module pair internally.
+Symptom when missing: `E0432: unresolved import 'embassy_net::udp'` (or `tcp`) even with `embassy-net` in the dep graph, OR a `smoltcp` `compile_error!` deep in the dep graph if `proto-ipv4`/`medium-ethernet` are also missing (the OTA-side entry below covers that variant).
+Fix: forward every required feature on the consuming crate's `embassy-net` dep — see `provisioning-spike = ["embassy", "embassy-net/udp", "embassy-net/tcp"]` in `crates/rustyfarian-esp-hal-wifi/Cargo.toml`. Discovered during Phase 2 spike DHCP-half then HTTP-half.
+
+**`embassy-net::TcpSocket` server-side accept-loop: `accept(port)` is the listen-set AND the wait-point; `close()` is FIN-only; `flush()` must follow before reusing the socket.**
+There is no separate `listen()` + `wait_for_accept()` split — one `accept(port).await?` call puts the socket into listen mode on the given port and suspends until a connection arrives.
+After serving a request, `close()` only shuts the **write** half (sends FIN); `flush()` must be awaited next so smoltcp actually emits the FIN before the next `accept()` reuses the socket — without it, the previous connection lingers in FIN-WAIT and the next accept races against teardown.
+`abort()` is the same story (sends RST instead of FIN, still needs `flush()` to push the packet out). Pattern: `loop { socket.accept(port).await?; serve(socket); socket.close(); socket.flush().await; }`. Lives in `crates/rustyfarian-esp-hal-wifi/src/http_server.rs::run`.
+
+**Pass workspace invariants by binding-at-construction, not by per-call argument — host tests miss the call-site indirection.**
+The Phase 2 DHCP server's `LeaseTable::allocate(mac, requested, pool_start, ...)` took `pool_start` as a runtime arg; three call sites in `run` had to pass it, one passed `server_ip` (192.168.4.1) instead. Host tests called `LeaseTable::allocate` directly with the correct constant and never exercised the call-site indirection — the bug only surfaced on hardware when the phone got `192.168.4.1` for its DHCP lease and stalled on "IP configuration failure".
+Fix: when designing a `pub(crate)` state machine helper, bind workspace-invariant constants at construction (`LeaseTable::new(pool_start, lease_secs)` followed by `.allocate(mac, requested, now_secs)`) so the call site cannot get them wrong.
+The HTTP server applied this prospectively: `build_response` does NOT take `Connection: close` as a parameter — it's a server-wide invariant. Same principle for other private helpers in the spike.
+
+**`StaticCell<[u8; N]>` requires `N` to be a compile-time constant — runtime `config.buf_size: usize` fields cannot back the allocation.**
+The bare-metal substrate (DHCP / HTTP servers in `rustyfarian-esp-hal-wifi`) needs `'static`-lifetime socket buffers via `StaticCell`, but the buffer size lives in the type signature, so a `HttpServerConfig.rx_buf_size` field cannot drive a `StaticCell<[u8; rx_buf_size]>` allocation.
+The const-generic workaround (`HttpServer<const RX: usize, const TX: usize>`) propagates the generics through every consumer, which bloats the surface.
+Fix for spike-quality code: use `const` defaults for the `StaticCell` backing buffers and keep the `config.buf_size` fields as forward-compat documentation markers; for production code, lift the sizes to const generics on the server type.
+
 **`StationConfig::with_ssid` accepts `&str` directly via `Into<Ssid>` — calling `.into()` first triggers `E0283`.**
 The compiler can't pick between `&str → Ssid` and `&str → &str` when the `&str.into()` is bare.
 Pass the `&str` literal directly: `StationConfig::default().with_ssid(ssid).with_password(password.into())`.

@@ -48,6 +48,14 @@ embassy = [
     "dep:embedded-io-async",
     "esp-rtos?/embassy",
 ]
+# Phase 2 spike: hand-rolled DHCP server for the SoftAP captive-portal.
+# Gated here so the codec and server module are only compiled in when explicitly
+# requested.  Expected to migrate to `rustyfarian-esp-hal-provisioning::dhcp`
+# when Phase 2 proper begins; do not depend on the API stability of code behind
+# this flag.  Requires `embassy` — the server runs on the embassy-net UDP stack.
+# The `embassy-net/udp` feature enables `embassy_net::udp::UdpSocket`; it is
+# not required by the `embassy` feature alone (which only uses TCP for TLS).
+provisioning-spike = ["embassy", "embassy-net/udp", "embassy-net/tcp"]
 
 [dependencies]
 wifi-pure.workspace = true
@@ -87,4 +95,4 @@ required-features = ["esp32c6", "rt", "embassy", "rustyfarian-esp-hal-ws2812"]
 
 [[example]]
 name = "hal_c3_ap_smoke"
-required-features = ["esp32c3", "rt", "embassy"]
+required-features = ["esp32c3", "rt", "provisioning-spike"]

@@ -88,7 +88,10 @@ case "$prefix" in
             *_async*) hal_features="${hal_features},embassy" ;;
         esac
         case "$example" in
-            *ap*) hal_features="${hal_features},embassy" ;;
+            # AP-mode smoke includes the Phase 2 DHCP spike (provisioning-spike
+            # implies embassy, so the separate embassy append above is redundant
+            # but harmless — Cargo deduplicates features).
+            *ap*) hal_features="${hal_features},provisioning-spike" ;;
         esac
 
         printf 'Building %s for bare-metal %s (MCU=%s)...\n' "$example" "$target" "$mcu"

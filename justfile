@@ -106,9 +106,12 @@ check-wifi-hal:
 
 # check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
+# Also checks the `provisioning-spike` feature (hand-rolled DHCP server) on both chips.
 check-wifi-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,provisioning-spike --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,provisioning-spike --target-dir {{ hal_dir }}
 
 # check rustyfarian-network-pure compiles without the `std` feature (ADR 014 §2 no_std surface)
 check-network-pure-no-std:
@@ -180,8 +183,21 @@ test-ota:
 test-provisioning:
     cargo test --target {{host_target}} -p provisioning-pure
 
+# run platform-independent DHCP codec and allocation-policy unit tests (host toolchain)
+# Uses the `provisioning-spike` feature which enables the dhcp module; no chip feature
+# is selected so the async `run()` function is compiled away and no ESP toolchain is needed.
+test-dhcp:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
+
+# run platform-independent HTTP parser and routing unit tests (host toolchain)
+# Uses the `provisioning-spike` feature which enables the http_server module; no chip
+# feature is selected so the async `run()` function is compiled away and no ESP toolchain
+# is needed.
+test-http:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
+
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-dhcp test-http
 
 # ── Examples ──────────────────────────────────────────────────────────────
 
