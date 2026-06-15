@@ -28,7 +28,8 @@ June 2026 shipped the provisioning triad — SoftAP captive-portal provisioning 
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
+    Ready     : rustyfarian-esp-hal-provisioning — bare-metal SoftAP captive-portal provisioning for the WifiMqttDevice profile, Phases 0–3 (ADR 015, feature-doc)
+              : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line
