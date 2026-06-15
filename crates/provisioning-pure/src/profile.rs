@@ -223,6 +223,31 @@ impl MqttFields {
     pub fn client_id(&self) -> Option<&str> {
         self.client_id.as_deref()
     }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Construct `MqttFields` directly from validated values.
+    ///
+    /// Intended for storage adapters that have just decoded a previously-stored
+    /// record and CRC-verified its integrity. The constructor itself performs
+    /// no validation; the values must have originated from a previous
+    /// `parse_form` and been round-tripped through a checked encode / decode
+    /// pair.
+    pub fn from_storage_parts(
+        host: heapless::String<MQTT_HOST_MAX_LEN>,
+        port: u16,
+        username: Option<heapless::String<MQTT_USER_MAX_LEN>>,
+        password: Option<heapless::String<MQTT_PASS_MAX_LEN>>,
+        client_id: Option<heapless::String<{ rustyfarian_network_pure::mqtt::CLIENT_ID_MAX_LEN }>>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            username,
+            password,
+            client_id,
+        }
+    }
 }
 
 impl fmt::Debug for MqttFields {

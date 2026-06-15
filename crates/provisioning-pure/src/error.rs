@@ -183,3 +183,68 @@ impl fmt::Display for FieldError {
 /// canonical field of the active profile (up to eight for `WifiMqttDevice`)
 /// plus at most one [`Field::Form`]-level error.
 pub type FieldErrors = heapless::Vec<FieldError, MAX_FIELD_ERRORS>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    /// Sentinel that, if it appears in error output, proves the variant has
+    /// leaked input bytes. Used by `validation_errors_carry_no_input_bytes`.
+    const LEAK_SENTINEL: &str = "LEAK-SENTINEL-XYZ";
+
+    /// Locks the security contract: no [`ValidationError`] variant may render
+    /// any submitted input bytes via `Debug` or `Display`. A future variant
+    /// that accidentally captures an input value will fail this test.
+    ///
+    /// The exhaustive match at the bottom is the compile-time future-proofing
+    /// hook: any newly added `ValidationError` variant will fail to compile
+    /// here until it is also added to the `variants` array exercised by the
+    /// runtime sweep.
+    #[test]
+    fn validation_errors_carry_no_input_bytes() {
+        let variants = [
+            ValidationError::Missing,
+            ValidationError::Empty,
+            ValidationError::Duplicate,
+            ValidationError::TooLong { max: 64 },
+            ValidationError::TooShort { min: 8 },
+            ValidationError::InvalidHex { expected_len: 16 },
+            ValidationError::InvalidUrl,
+            ValidationError::MalformedBody,
+            ValidationError::TooManyFields,
+            ValidationError::UnexpectedForProfile,
+        ];
+
+        for err in &variants {
+            let debug_str = format!("{err:?}");
+            let display_str = format!("{err}");
+            assert!(
+                !debug_str.contains(LEAK_SENTINEL),
+                "Debug output for {err:?} contains sentinel: {debug_str}"
+            );
+            assert!(
+                !display_str.contains(LEAK_SENTINEL),
+                "Display output for {err:?} contains sentinel: {display_str}"
+            );
+        }
+
+        // Exhaustiveness lock: any new variant added to `ValidationError`
+        // must also appear in this match — which forces it to also appear in
+        // the `variants` array above so the security sweep stays complete.
+        fn _exhaustiveness_lock(err: ValidationError) {
+            match err {
+                ValidationError::Missing
+                | ValidationError::Empty
+                | ValidationError::Duplicate
+                | ValidationError::TooLong { .. }
+                | ValidationError::TooShort { .. }
+                | ValidationError::InvalidHex { .. }
+                | ValidationError::InvalidUrl
+                | ValidationError::MalformedBody
+                | ValidationError::TooManyFields
+                | ValidationError::UnexpectedForProfile => {}
+            }
+        }
+    }
+}

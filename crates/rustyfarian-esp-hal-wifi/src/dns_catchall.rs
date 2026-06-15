@@ -339,8 +339,9 @@ pub fn encode_response(
 
     // Flags:
     //   QR=1 (response)
-    //   Opcode=0 (standard query — copied from request via mask, always 0 for
-    //             queries we accept, but masking is the correct form)
+    //   Opcode=0 (standard query — hard-set, not copied from request: the
+    //             decoder only accepts QUERY/opcode=0, so anything else has
+    //             already been NOTIMP'd before we get here)
     //   AA=1 (authoritative)
     //   TC=0, RD=copied from request, RA=0, Z=0, RCODE=0
     //
@@ -782,7 +783,11 @@ mod tests {
                 pos += 1;
             }
         }
-        buf[pos] = 0; // root terminator — this pushes wire_len over 255
+        // 12 × 21-byte labels = 252 bytes of label data + 13 length bytes →
+        // wire_len 265 when the decoder reads the 13th label header at offset
+        // 252, before this root terminator is ever seen. The rejection fires
+        // on that 13th label-body bounds check, not on the root terminator.
+        buf[pos] = 0; // root terminator
         pos += 1;
         // qtype + qclass
         buf[pos] = 0x00;

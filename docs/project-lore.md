@@ -431,9 +431,12 @@ Expecting 'EOF', 'SPACE', 'NEWLINE', 'title', 'acc_title', 'acc_descr',
 Concrete triggers observed in `docs/ROADMAP.md`:
 - `;` anywhere inside an event description (most common) — replace with `,` or `—`.
 - `::` from Rust paths (e.g. `MqttBuilder::build`) — replace with `.` or rephrase.
+- **bare `:`** in file-line references (e.g. `store.rs:141`) or URLs (e.g. `mqtt://host:1883`) — rewrite as `store.rs line 141` / `mqtt //host 1883`, or move the reference out of the event text entirely. **`:` is reserved everywhere in event text, not just when followed by a space.**
 - `: ` from Rust trait bounds (e.g. `<D: WifiDriver>`) — rephrase in prose.
 - `"..."` quoted words — drop the quotes; em-dashes already provide emphasis.
 - HTML entities like `&lt;` / `&gt;` — the embedded `;` re-triggers the same parser path; rephrase rather than escape.
 Em-dashes (`—`), `×`, `==`, `..`, `/`, and parentheses render fine.
 Fix: catch these locally via `just lint-docs`, which runs `scripts/lint-docs.sh` to parse every fenced ```mermaid block in every `*.md` file through `mermaid-cli` (`mmdc` via `npx`).
 The check is not folded into `just verify` or `just ci` because it pulls a Node toolchain on first run — invoke it explicitly when touching `docs/ROADMAP.md` or any other diagram-bearing markdown.
+
+**`mmdc`-vs-IDE renderer divergence.** `mmdc` (the `mermaid-cli` `just lint-docs` invokes) has been observed accepting bare `:` strings (e.g. `store.rs:141`) that the IDE's Mermaid preview renderer rejects with the same `'INVALID'` parse error documented above. The IDE typically ships a newer Mermaid runtime than `npx mermaid-cli` resolves, and its parser is stricter on the colon rule. Treat a clean `just lint-docs` as a necessary but not sufficient signal — always visually verify the rendered diagram in the IDE after editing any `timeline` / `gantt` event text. The `technical-writer` agent in `.claude/agents/technical-writer.md` encodes this divergence and is the mandated delegate for any non-trivial `docs/ROADMAP.md` edit.

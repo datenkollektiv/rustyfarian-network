@@ -157,6 +157,34 @@ impl ProvisioningConfig {
     pub fn extras(&self) -> &[ExtraField] {
         &self.extras
     }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Construct a `ProvisioningConfig` directly from validated field values.
+    ///
+    /// Intended for storage adapters that have just decoded a previously-stored
+    /// record and CRC-verified its integrity: every field originated from a
+    /// previous `parse_form` and was round-tripped through a checked encode /
+    /// decode pair, so the validation invariants `parse_form` enforces still
+    /// hold by construction. The constructor itself performs no validation.
+    pub fn from_storage_parts(
+        wifi_ssid: heapless::String<{ wifi_pure::SSID_MAX_LEN }>,
+        wifi_password: heapless::String<{ wifi_pure::PASSWORD_MAX_LEN }>,
+        ota_url: heapless::String<OTA_URL_MAX_LEN>,
+        device_name: heapless::String<DEVICE_NAME_MAX_LEN>,
+        lora: Option<LoraFields>,
+        mqtt: Option<MqttFields>,
+    ) -> Self {
+        Self {
+            wifi_ssid,
+            wifi_password,
+            ota_url,
+            device_name,
+            lora,
+            mqtt,
+            extras: heapless::Vec::new(),
+        }
+    }
 }
 
 impl fmt::Debug for ProvisioningConfig {
