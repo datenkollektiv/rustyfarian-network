@@ -39,11 +39,17 @@
 //!
 //! ## Routes
 //!
-//! - `GET /` → 200 OK with the SoftAP spike HTML page
-//! - Anything else → 404 Not Found (plain text)
+//! - `GET <any path>` → 200 OK with the SoftAP spike HTML page
+//! - Non-`GET` method → 404 Not Found (plain text)
 //!
-//! Captive-portal-aware routes (`/generate_204`, etc.) are out of scope for
-//! this spike; they will land when DNS catch-all and portal flow are wired up.
+//! Returning the portal page for **every** GET is the key captive-portal
+//! trigger: the phone OS probes well-known sentinel URLs (`/generate_204`,
+//! `/hotspot-detect.html`, `/ncsi.txt`, etc.) and compares the response body
+//! to an expected value.  When the body does not match — our HTML portal page
+//! — the OS concludes it is behind a captive portal and pops the browser
+//! automatically.  POST will become 405 / redirect when provisioning form
+//! submission lands in Phase 2 proper; 404 is an acceptable placeholder for
+//! the spike.
 
 // When building without the embassy + chip features the async `run` function
 // and its TcpSocket usage are compiled away.  Allow dead-code on the types
@@ -608,13 +614,22 @@ pub fn build_response(
 /// Returns the number of bytes written, or `Err(())` if the response buffer
 /// is too small.
 ///
-/// Routes:
-/// - `GET /` → 200 OK with the SoftAP spike HTML page
-/// - Anything else → 404 Not Found (plain text)
+/// ## Captive-portal-aware routing
+///
+/// **Every `GET` request returns 200 OK with the portal HTML page**, regardless
+/// of path.  This is the key behaviour that triggers the phone OS's
+/// captive-portal pop-up: the phone probes well-known detection URLs
+/// (`/generate_204`, `/hotspot-detect.html`, `/ncsi.txt`, etc.) and compares
+/// the response to the expected sentinel.  When the body is _not_ the sentinel
+/// — our HTML portal page — the OS knows it is behind a captive portal and
+/// opens the browser automatically.
+///
+/// A non-`GET` method still returns 404.  POST will become 405 / redirect
+/// when provisioning form submission lands in Phase 2 proper, but for this
+/// spike 404 is an acceptable placeholder — no form submission is in scope.
 pub fn route(req: &ParsedRequest, resp_buf: &mut [u8]) -> Result<usize, ()> {
-    let target = req.target_str();
-    match (req.method, target) {
-        (Method::Get, "/") => build_response(
+    match req.method {
+        Method::Get => build_response(
             resp_buf,
             200,
             "text/html; charset=utf-8",
@@ -1079,25 +1094,83 @@ mod tests {
         assert!(resp.contains("Rustyfarian SoftAP"));
     }
 
-    /// GET /generate_204 routes to 404.
+    /// GET /generate_204 (Android captive-portal probe) returns 200 + portal page.
+    ///
+    /// This is the key captive-portal trigger: the OS expects a 204 response
+    /// body but receives our HTML page, so it knows to pop the captive browser.
     #[test]
-    fn route_captive_portal_probe_returns_404() {
+    fn route_captive_portal_probe_generate_204_returns_200() {
         let raw = b"GET /generate_204 HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
         let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
-        let mut resp_buf = [0u8; 256];
+        let mut resp_buf = [0u8; 4096];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+        assert!(resp.contains("Rustyfarian SoftAP"));
     }
 
-    /// GET /unknown routes to 404.
+    /// GET /hotspot-detect.html (iOS captive-portal probe) returns 200 + portal page.
     #[test]
-    fn route_unknown_path_returns_404() {
-        let raw = b"GET /unknown HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
+    fn route_captive_portal_probe_hotspot_detect_returns_200() {
+        let raw = b"GET /hotspot-detect.html HTTP/1.1\r\nHost: captive.apple.com\r\n\r\n";
+        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let mut resp_buf = [0u8; 4096];
+        let n = route(&req, &mut resp_buf).unwrap();
+        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+        assert!(resp.contains("Rustyfarian SoftAP"));
+    }
+
+    /// GET /ncsi.txt (Windows captive-portal probe) returns 200 + portal page.
+    #[test]
+    fn route_captive_portal_probe_ncsi_returns_200() {
+        let raw = b"GET /ncsi.txt HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
+        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let mut resp_buf = [0u8; 4096];
+        let n = route(&req, &mut resp_buf).unwrap();
+        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+        assert!(resp.contains("Rustyfarian SoftAP"));
+    }
+
+    /// GET /favicon.ico returns 200 + portal HTML (browser ignores invalid favicon).
+    #[test]
+    fn route_get_favicon_returns_200() {
+        let raw = b"GET /favicon.ico HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
+        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let mut resp_buf = [0u8; 4096];
+        let n = route(&req, &mut resp_buf).unwrap();
+        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+        assert!(resp.contains("Rustyfarian SoftAP"));
+    }
+
+    /// GET /any/arbitrary/path returns 200 — catch-all GET behaviour.
+    #[test]
+    fn route_any_get_path_returns_200() {
+        let raw = b"GET /some/deep/path?q=1 HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
+        let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        let mut resp_buf = [0u8; 4096];
+        let n = route(&req, &mut resp_buf).unwrap();
+        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+    }
+
+    /// POST /save returns 404 — POST is not in scope for the spike.
+    ///
+    /// Will become 405 / redirect when provisioning form submission lands in
+    /// Phase 2 proper.
+    #[test]
+    fn route_post_save_returns_404() {
+        let raw = b"POST /save HTTP/1.1\r\nHost: 192.168.4.1\r\nContent-Length: 0\r\n\r\n";
         let (req, _) = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
         let mut resp_buf = [0u8; 256];
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(
+            resp.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "resp: {}",
+            resp
+        );
     }
 }
