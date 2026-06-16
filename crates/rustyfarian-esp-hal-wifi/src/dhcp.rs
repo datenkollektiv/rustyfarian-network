@@ -692,16 +692,96 @@ impl LeaseTable {
         });
         Some(addr)
     }
+}
 
-    /// Records or extends a confirmed lease for REQUEST→ACK.
-    pub fn confirm(&mut self, mac: &[u8; 6], addr: Ipv4Addr, now_secs: u64) {
-        if let Some(idx) = self.index_of(addr) {
-            self.entries[idx] = Some(Lease {
-                mac: *mac,
-                offered_at_secs: now_secs,
-            });
+// ── REQUEST decision (pure, host-testable) ───────────────────────────────────
+
+/// Outcome of evaluating a DHCP REQUEST under RFC 2131 §4.3.2.
+///
+/// The decision is derived from the parsed request, the current lease table,
+/// and the server's identity.  The async loop in [`run`] interprets each
+/// variant into a network action; the same enum is host-tested without an
+/// `embassy-net` stack.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RequestOutcome {
+    /// Reply with ACK and this address.
+    Ack(Ipv4Addr),
+    /// Reply with NAK — the requested IP cannot be granted.
+    Nak,
+    /// Silently drop the packet — bindingless REQUEST with no prior record
+    /// (RFC 2131 §4.3.2 "If the DHCP server has no record of this client,
+    /// then it MUST remain silent").
+    Drop,
+    /// Silently drop — Option 54 (Server Identifier) names a different server.
+    Ignore,
+}
+
+/// Pure REQUEST decision.
+///
+/// Decision tree:
+/// 1. Option 54 present and not equal to `server_ip` → [`RequestOutcome::Ignore`]
+///    (the REQUEST is targeted at another DHCP server).
+/// 2. Locate the address the client wants:
+///    - Option 50 (Requested IP Address) present → use it
+///      (SELECTING / INIT-REBOOT path after a prior OFFER).
+///    - Option 50 absent but `ciaddr` non-zero → use `ciaddr`
+///      (RENEWING / REBINDING path).
+///    - Neither present → bindingless REQUEST.
+/// 3. Bindingless REQUEST:
+///    - If `chaddr` has an existing lease → fall through to allocate, which
+///      refreshes it (lenient — a real phone may re-REQUEST after losing
+///      address state but keeping the MAC).
+///    - Otherwise → [`RequestOutcome::Drop`] (§4.3.2 silent-server rule).
+/// 4. Allocate (or refresh) via [`LeaseTable::allocate`]:
+///    - If the allocated IP equals the explicitly requested one (or no
+///      specific IP was requested) → [`RequestOutcome::Ack`].
+///    - If the client insisted on a specific IP but the table allocated a
+///      different one → [`RequestOutcome::Nak`].
+///    - On pool exhaustion → [`RequestOutcome::Nak`].
+///
+/// # Mutation note
+///
+/// This function takes `&mut LeaseTable` because [`LeaseTable::allocate`]
+/// mutates the table (claims a slot) even on the [`RequestOutcome::Nak`]
+/// path.  This preserves the prior spike behaviour where a NAK'd REQUEST
+/// still records the offered slot under the client's MAC, so the next
+/// DISCOVER from the same MAC resolves to the same address.  Decoupling
+/// candidate-lookup from commit is a Phase 2B follow-up.
+pub(crate) fn decide_request(
+    msg: &DhcpMessage,
+    leases: &mut LeaseTable,
+    server_ip: Ipv4Addr,
+    now_secs: u64,
+) -> RequestOutcome {
+    if let Some(sid) = msg.options.server_id {
+        if sid != server_ip {
+            return RequestOutcome::Ignore;
         }
     }
+
+    let explicit = msg.options.requested_ip.or_else(|| {
+        if !msg.ciaddr.is_unspecified() {
+            Some(msg.ciaddr)
+        } else {
+            None
+        }
+    });
+
+    if explicit.is_none() && leases.find_by_mac(&msg.chaddr).is_none() {
+        return RequestOutcome::Drop;
+    }
+
+    let Some(offered_ip) = leases.allocate(&msg.chaddr, explicit, now_secs) else {
+        return RequestOutcome::Nak;
+    };
+
+    if let Some(req) = explicit {
+        if req != offered_ip && !req.is_unspecified() {
+            return RequestOutcome::Nak;
+        }
+    }
+
+    RequestOutcome::Ack(offered_ip)
 }
 
 // ── Async server loop (bare-metal only) ──────────────────────────────────────
@@ -831,7 +911,19 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
         }
     }
 
-    let mut rx_pkt = [0u8; PACKET_BUF];
+    // `rx_pkt` matches the underlying UDP socket RX buffer (1024 B), not the
+    // 548-byte BOOTP minimum — option-heavy DHCP REQUESTs (DDNS, vendor-class
+    // identifiers, PXE options) can exceed 548 B in the wild.  `embassy-net`
+    // `recv_from` copies `min(datagram, buf)` and reports the actual `n`, so
+    // a too-small `rx_pkt` would silently truncate a >548-byte datagram
+    // before the decoder ever saw it.  Cost: ~500 B additional task stack;
+    // acceptable given the ~4 KiB headroom on the dhcp_task stack.
+    //
+    // `tx_pkt` stays at the BOOTP cap — the server only emits OFFER, ACK, and
+    // NAK with the fixed option set encoded by `encode_offer_or_ack` /
+    // `encode_nak`, all well under 548 B.
+    const DHCP_RX_BUF: usize = 1024;
+    let mut rx_pkt = [0u8; DHCP_RX_BUF];
     let mut tx_pkt = [0u8; PACKET_BUF];
     let mut leases = LeaseTable::new(config.pool_start, config.lease_secs);
 
@@ -924,85 +1016,61 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
                 }
             }
 
-            MSG_REQUEST => {
-                // If Option 54 is present and does not name us, ignore the
-                // REQUEST — it is targeted at a different server (RFC 2131
-                // §4.3.2, selecting state).
-                if let Some(sid) = msg.options.server_id {
-                    if sid != server_ip {
-                        log::trace!("DHCP REQUEST for server {} — ignoring (not us)", sid);
-                        continue;
-                    }
+            MSG_REQUEST => match decide_request(&msg, &mut leases, server_ip, now_secs) {
+                RequestOutcome::Ignore => {
+                    log::trace!(
+                        "DHCP REQUEST for different server — ignoring (chaddr={:02x?})",
+                        msg.chaddr
+                    );
                 }
-
-                // Determine the requested address: Option 50, then ciaddr.
-                let requested = msg.options.requested_ip.or_else(|| {
-                    if !msg.ciaddr.is_unspecified() {
-                        Some(msg.ciaddr)
-                    } else {
-                        None
-                    }
-                });
-
-                let offered_ip = match leases.allocate(&msg.chaddr, requested, now_secs) {
-                    Some(ip) => ip,
-                    None => {
-                        log::warn!("DHCP REQUEST: pool exhausted — sending NAK");
-                        do_send_nak(&sock, &msg, server_ip, &mut tx_pkt).await;
-                        continue;
-                    }
-                };
-
-                // If the client insisted on a specific IP but we could not give
-                // it that exact address, send NAK (defensive — should not happen
-                // with normal single-client provisioning use).
-                if let Some(req) = requested {
-                    if req != offered_ip && !req.is_unspecified() {
-                        log::warn!(
-                            "DHCP REQUEST: wanted {} but allocated {} — sending NAK",
-                            req,
-                            offered_ip
+                RequestOutcome::Drop => {
+                    log::trace!(
+                            "DHCP REQUEST without binding (chaddr={:02x?}) — silent per RFC 2131 §4.3.2",
+                            msg.chaddr
                         );
-                        do_send_nak(&sock, &msg, server_ip, &mut tx_pkt).await;
-                        continue;
-                    }
                 }
+                RequestOutcome::Nak => {
+                    log::warn!(
+                        "DHCP REQUEST cannot be satisfied — sending NAK (chaddr={:02x?})",
+                        msg.chaddr
+                    );
+                    do_send_nak(&sock, &msg, server_ip, &mut tx_pkt).await;
+                }
+                RequestOutcome::Ack(offered_ip) => {
+                    let reply = DhcpMessage {
+                        op: OP_REPLY,
+                        htype: HTYPE_ETHERNET,
+                        hlen: HLEN_ETHERNET,
+                        xid: msg.xid,
+                        ciaddr: Ipv4Addr::new(0, 0, 0, 0),
+                        yiaddr: offered_ip,
+                        siaddr: server_ip,
+                        chaddr: msg.chaddr,
+                        options: ParsedOptions {
+                            message_type: Some(MSG_ACK),
+                            ..Default::default()
+                        },
+                    };
 
-                leases.confirm(&msg.chaddr, offered_ip, now_secs);
-
-                let reply = DhcpMessage {
-                    op: OP_REPLY,
-                    htype: HTYPE_ETHERNET,
-                    hlen: HLEN_ETHERNET,
-                    xid: msg.xid,
-                    ciaddr: Ipv4Addr::new(0, 0, 0, 0),
-                    yiaddr: offered_ip,
-                    siaddr: server_ip,
-                    chaddr: msg.chaddr,
-                    options: ParsedOptions {
-                        message_type: Some(MSG_ACK),
-                        ..Default::default()
-                    },
-                };
-
-                match encode_offer_or_ack(
-                    &reply,
-                    &mut tx_pkt,
-                    server_ip,
-                    config.subnet_mask,
-                    config.lease_secs,
-                ) {
-                    Ok(len) => {
-                        let dest = dhcp_broadcast_endpoint();
-                        if let Err(e) = sock.send_to(&tx_pkt[..len], dest).await {
-                            log::warn!("DHCP ACK send failed: {:?}", e);
-                        } else {
-                            log::info!("DHCP ACK: {} → chaddr={:02x?}", offered_ip, msg.chaddr);
+                    match encode_offer_or_ack(
+                        &reply,
+                        &mut tx_pkt,
+                        server_ip,
+                        config.subnet_mask,
+                        config.lease_secs,
+                    ) {
+                        Ok(len) => {
+                            let dest = dhcp_broadcast_endpoint();
+                            if let Err(e) = sock.send_to(&tx_pkt[..len], dest).await {
+                                log::warn!("DHCP ACK send failed: {:?}", e);
+                            } else {
+                                log::info!("DHCP ACK: {} → chaddr={:02x?}", offered_ip, msg.chaddr);
+                            }
                         }
+                        Err(e) => log::warn!("DHCP ACK encode failed: {:?}", e),
                     }
-                    Err(e) => log::warn!("DHCP ACK encode failed: {:?}", e),
                 }
-            }
+            },
 
             MSG_DECLINE => {
                 // Client says the offered IP is already in use — free the lease.
@@ -1437,6 +1505,151 @@ mod tests {
         assert_eq!(
             validate_pool_geometry(start, end, POOL_SIZE),
             Err(PoolGeometryError::CrossesSubnet)
+        );
+    }
+
+    // ── decide_request — RFC 2131 §4.3.2 decision-tree tests ─────────────────
+
+    /// Build a minimal REQUEST `DhcpMessage` for the decision tests.
+    fn make_request(
+        mac: [u8; 6],
+        ciaddr: Ipv4Addr,
+        requested_ip: Option<Ipv4Addr>,
+        server_id: Option<Ipv4Addr>,
+    ) -> DhcpMessage {
+        DhcpMessage {
+            op: OP_REQUEST,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            xid: 0x1234_5678,
+            ciaddr,
+            yiaddr: Ipv4Addr::new(0, 0, 0, 0),
+            siaddr: Ipv4Addr::new(0, 0, 0, 0),
+            chaddr: mac,
+            options: ParsedOptions {
+                message_type: Some(MSG_REQUEST),
+                requested_ip,
+                server_id,
+                ..Default::default()
+            },
+        }
+    }
+
+    const SERVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
+
+    /// SELECTING path: REQUEST carries Option 50 naming the prior OFFER's IP
+    /// and the server's Option 54.  Allocation returns the same IP → Ack.
+    #[test]
+    fn decide_request_selecting_with_option_50_acks() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6];
+        // Pre-load the slot the OFFER would have claimed.
+        table
+            .allocate(&mac, None, 0)
+            .expect("preallocate OFFER slot");
+
+        let msg = make_request(
+            mac,
+            Ipv4Addr::new(0, 0, 0, 0),
+            Some(Ipv4Addr::new(192, 168, 4, 10)),
+            Some(SERVER_IP),
+        );
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 10),
+            RequestOutcome::Ack(Ipv4Addr::new(192, 168, 4, 10))
+        );
+    }
+
+    /// RENEWING path: client already has a binding, sends REQUEST with
+    /// non-zero ciaddr and no Option 50.  Allocation refreshes the slot → Ack.
+    #[test]
+    fn decide_request_renewing_with_ciaddr_acks() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6];
+        let addr = table.allocate(&mac, None, 0).expect("preallocate slot");
+
+        let msg = make_request(mac, addr, None, None);
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 100),
+            RequestOutcome::Ack(addr)
+        );
+    }
+
+    /// Bindingless REQUEST (no Option 50, ciaddr=0, no prior lease) →
+    /// silent Drop per RFC 2131 §4.3.2.
+    #[test]
+    fn decide_request_bindingless_with_no_record_is_dropped() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6];
+
+        let msg = make_request(mac, Ipv4Addr::new(0, 0, 0, 0), None, None);
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 0),
+            RequestOutcome::Drop
+        );
+        // Drop must not commit a lease slot.
+        assert!(
+            table.find_by_mac(&mac).is_none(),
+            "Drop path must not write a lease entry"
+        );
+    }
+
+    /// Bindingless REQUEST when the MAC already has a binding → lenient Ack
+    /// with refresh (matches real-world phones that re-REQUEST after losing
+    /// address-knowledge but keeping the MAC).
+    #[test]
+    fn decide_request_bindingless_with_existing_binding_acks() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6];
+        let addr = table.allocate(&mac, None, 0).expect("preallocate slot");
+
+        let msg = make_request(mac, Ipv4Addr::new(0, 0, 0, 0), None, None);
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 5),
+            RequestOutcome::Ack(addr)
+        );
+    }
+
+    /// Option 54 names a different server → Ignore; the table is untouched.
+    #[test]
+    fn decide_request_different_server_id_is_ignored() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6];
+        let other_server = Ipv4Addr::new(10, 0, 0, 1);
+
+        let msg = make_request(
+            mac,
+            Ipv4Addr::new(0, 0, 0, 0),
+            Some(Ipv4Addr::new(192, 168, 4, 10)),
+            Some(other_server),
+        );
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 0),
+            RequestOutcome::Ignore
+        );
+        assert!(
+            table.find_by_mac(&mac).is_none(),
+            "Ignore path must not write a lease entry"
+        );
+    }
+
+    /// Client insists on an IP outside the pool — the allocator falls back to
+    /// the first free slot, which differs from the requested IP → Nak.
+    #[test]
+    fn decide_request_unrequestable_specific_ip_naks() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6];
+        let out_of_pool = Ipv4Addr::new(192, 168, 4, 99);
+
+        let msg = make_request(
+            mac,
+            Ipv4Addr::new(0, 0, 0, 0),
+            Some(out_of_pool),
+            Some(SERVER_IP),
+        );
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 0),
+            RequestOutcome::Nak
         );
     }
 

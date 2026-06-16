@@ -197,28 +197,25 @@ test-ota:
 test-provisioning:
     cargo test --target {{host_target}} -p provisioning-pure
 
-# run platform-independent DHCP codec and allocation-policy unit tests (host toolchain)
-# Uses the `provisioning-spike` feature which enables the dhcp module; no chip feature
-# is selected so the async `run()` function is compiled away and no ESP toolchain is needed.
-test-dhcp:
+# run all `provisioning-spike` unit tests (DHCP codec + allocation policy, DNS
+# catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
+# toolchain.  Uses the `provisioning-spike` Cargo feature which enables the
+# three spike modules; no chip feature is selected so each module's async
+# `run()` is compiled away and no ESP toolchain is needed.
+test-provisioning-spike:
     cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
 
-# run platform-independent HTTP parser and routing unit tests (host toolchain)
-# Uses the `provisioning-spike` feature which enables the http_server module; no chip
-# feature is selected so the async `run()` function is compiled away and no ESP toolchain
-# is needed.
-test-http:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
-
-# run platform-independent DNS catch-all codec unit tests (host toolchain)
-# Uses the `provisioning-spike` feature which enables the dns_catchall module; no chip
-# feature is selected so the async `run()` function is compiled away and no ESP toolchain
-# is needed.
-test-dns:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
+# Back-compat aliases — `test-dhcp` / `test-http` / `test-dns` all delegate to
+# the same `test-provisioning-spike` command because cargo cannot run a single
+# crate's tests with per-module isolation without a per-test filter.  Keep
+# these for the muscle-memory of callers who type the area they care about;
+# remove once Phase 2B promotion splits the spike into per-module crates.
+test-dhcp: test-provisioning-spike
+test-http: test-provisioning-spike
+test-dns: test-provisioning-spike
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-hal test-dhcp test-http test-dns
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-hal test-provisioning-spike
 
 # ── Examples ──────────────────────────────────────────────────────────────
 

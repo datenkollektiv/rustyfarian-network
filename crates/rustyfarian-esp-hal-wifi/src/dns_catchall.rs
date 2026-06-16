@@ -490,6 +490,12 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DnsCatchallConfig) 
             }
         };
 
+        // Defensive clamp — `embassy-net` `recv_from` already returns
+        // `min(datagram, buf)`, but the clamp here documents the invariant
+        // and protects against any future stack change that might report a
+        // count exceeding the destination buffer.
+        let n = n.min(rx_pkt.len());
+
         let query = match decode_query(&rx_pkt[..n]) {
             Ok(q) => q,
             Err(e) => {
