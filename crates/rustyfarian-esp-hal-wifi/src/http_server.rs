@@ -666,6 +666,36 @@ fn error_response(buf: &mut [u8], err: &ParseError) -> usize {
     build_response(buf, status, "text/plain; charset=utf-8", body.as_bytes()).unwrap_or(0)
 }
 
+// ── Minimal fallback responses ────────────────────────────────────────────────
+
+/// Hard-coded minimal `500 Internal Server Error` response.
+///
+/// Used when [`route`] reports the response buffer is too small to hold the
+/// real response (today this is structurally unreachable — the spike's HTML
+/// page + headers fits in well under 2 KiB — but the branch must still
+/// produce a deterministic non-empty reply rather than silently emitting
+/// zero bytes and letting the client time out).
+///
+/// The body is empty (`Content-Length: 0`); the status line tells the client
+/// the server failed.  Length is well under any `resp_buf` size the server
+/// will ever be constructed with, so writing it never fails.
+const MINIMAL_500: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Write [`MINIMAL_500`] into `buf` and return the byte count.
+///
+/// Panics only if `buf.len() < MINIMAL_500.len()`, which would be a build-time
+/// misconfiguration; the live `resp_buf` is `DEFAULT_TX_BUF = 2048` bytes.
+fn write_minimal_500(buf: &mut [u8]) -> usize {
+    let len = MINIMAL_500.len();
+    debug_assert!(
+        buf.len() >= len,
+        "MINIMAL_500 must fit in any resp_buf the server uses"
+    );
+    buf[..len].copy_from_slice(MINIMAL_500);
+    len
+}
+
 // ── Async server loop (bare-metal only) ──────────────────────────────────────
 
 /// Runs the HTTP server on the given `embassy-net` stack.
@@ -700,6 +730,21 @@ fn error_response(buf: &mut [u8], err: &ParseError) -> usize {
 /// and do not abort the server loop.  The only panics in this module are
 /// the `StaticCell::init` calls, which are one-shot by construction and
 /// identical to the pattern used throughout the crate.
+///
+/// # Stack usage
+///
+/// The task running `run` peaks at roughly 4 KiB of stack: a `req_buf` of
+/// `DEFAULT_REQUEST_SIZE_CAP` (2048 B) plus a `resp_buf` of `DEFAULT_TX_BUF`
+/// (2048 B), both held as on-stack arrays for the lifetime of the loop.
+/// The static socket buffers ([`DEFAULT_RX_BUF`] + [`DEFAULT_TX_BUF`]) live
+/// in `.bss` and do not count.  Other modules in this crate that share the
+/// same task budget: the DHCP server's `rx_pkt` + `tx_pkt` (~1.5 KiB on the
+/// `dhcp_task` stack), the DNS server's `rx_pkt` + `tx_pkt` (1 KiB total on
+/// the `dns_task` stack), and `ProvisioningStore::save` which transiently
+/// peaks at ~4–5 KiB on whatever task drives it.  Integrators sizing the
+/// spawned-task stacks should budget at least 6 KiB on top of their own
+/// requirements until the Phase 2B promotion lands the targeted-read store
+/// optimisation.
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -> ! {
     use embassy_net::tcp::TcpSocket;
@@ -743,6 +788,16 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
         // or fill the buffer.
         let filled = read_request(&mut socket, &mut req_buf, size_cap).await;
 
+        // Track how much of the request body has already been received into
+        // `req_buf` past the header terminator, so the post-response drain
+        // (RST-avoidance) does not double-count.
+        let mut body_drain_target: Option<(usize, usize)> = None;
+
+        // SECURITY: never log request bodies — POST bodies will carry
+        // `wifi_pass` / `mqtt_pass` credentials when the `/save` route
+        // lands in Phase 2B promotion.  Log lines below are limited to
+        // method, target, and parser-error variants; bytes from `req_buf`
+        // past the header terminator MUST NOT appear in any log call.
         // Parse and dispatch.
         let resp_len = match filled {
             Ok(n) => match parse_request(&req_buf[..n], size_cap) {
@@ -756,18 +811,30 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
                         },
                         req.target_str()
                     );
+
+                    // Compute how many body bytes were already pulled into
+                    // `req_buf` alongside the headers (clients that pipeline
+                    // headers + body in a single TCP send).  The remainder
+                    // (Content-Length minus what we already have) is what
+                    // needs draining from the socket before close.
+                    if let Some(cl) = req.headers.content_length {
+                        if let Some(hdr_end) =
+                            req_buf[..n].windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let already = n.saturating_sub(hdr_end + 4);
+                            body_drain_target = Some((cl as usize, already));
+                        }
+                    }
+
                     route(&req, &mut resp_buf).unwrap_or_else(|()| {
-                        // `route` returned `Err(())` because `resp_buf` was
-                        // too small to hold even the minimal response we
-                        // would have built. We fall through with resp_len=0,
-                        // and the `if resp_len > 0` guard below skips the
-                        // write — no body, no status line — leaving the
-                        // client to time out. Phase 2 should reserve a
-                        // minimal 500 in a separate fixed-size buffer.
+                        // `route` could not fit the real response into
+                        // `resp_buf`.  Emit a deterministic minimal 500
+                        // instead of zero bytes — never let the client
+                        // time out on an empty reply.
                         log::warn!(
-                            "HTTP: response buffer too small — closing without sending any response"
+                            "HTTP: route response too large for resp_buf — emitting minimal 500"
                         );
-                        0
+                        write_minimal_500(&mut resp_buf)
                     })
                 }
                 Err(e) => {
@@ -795,6 +862,26 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
         // Flush ensures the FIN is enqueued before close() teardown.
         let _ = socket.flush().await;
 
+        // Drain any remaining request body before close — without this, a
+        // client still uploading a POST body (e.g. the 405 path) sees RST
+        // instead of FIN once `socket.close()` fires.  Browsers can
+        // surface RST as "connection reset" rather than the response we
+        // just wrote, so the drain is what makes 405 (and the future
+        // /save route) deliver visibly to the client.  The drain runs
+        // with a 500 ms total deadline so a slow or stuck client cannot
+        // pin the single TCP socket indefinitely.
+        if let Some((content_length, already_in_buf)) = body_drain_target {
+            if content_length > already_in_buf {
+                let remaining = content_length - already_in_buf;
+                drain_body_with_deadline(
+                    &mut socket,
+                    remaining,
+                    embassy_time::Duration::from_millis(500),
+                )
+                .await;
+            }
+        }
+
         // Close the write half; the connection will fully teardown after
         // the remote ACKs our FIN.
         socket.close();
@@ -804,6 +891,34 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
         // yield once and move on — the TCP stack handles the cleanup).
         let _ = socket.flush().await;
     }
+}
+
+/// Read and discard up to `remaining` bytes from `socket`, honouring `deadline`.
+///
+/// Used between the response write and `socket.close()` so an in-flight POST
+/// body does not race the FIN we send and trigger an RST.  The discard buffer
+/// is small (256 B); body content is intentionally never inspected so a
+/// `// SECURITY` rule about not handling credential bytes here is implicit.
+///
+/// Returns silently — partial drains, deadlines, and EOFs are all benign:
+/// the close() that follows is best-effort either way.
+#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+async fn drain_body_with_deadline(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    mut remaining: usize,
+    deadline: embassy_time::Duration,
+) {
+    let mut scratch = [0u8; 256];
+    let drain = async {
+        while remaining > 0 {
+            let take = remaining.min(scratch.len());
+            match socket.read(&mut scratch[..take]).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => remaining -= n,
+            }
+        }
+    };
+    let _ = embassy_time::with_timeout(deadline, drain).await;
 }
 
 /// Read from `socket` until the request headers are complete (`\r\n\r\n`)
@@ -1161,6 +1276,26 @@ mod tests {
         let n = route(&req, &mut resp_buf).unwrap();
         let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+    }
+
+    // ── Minimal 500 fallback ──────────────────────────────────────────────────
+
+    /// `write_minimal_500` emits a syntactically complete `Content-Length: 0`
+    /// response that any client can parse — never zero bytes.
+    #[test]
+    fn minimal_500_is_a_valid_complete_response() {
+        let mut buf = [0u8; 2048];
+        let n = write_minimal_500(&mut buf);
+        assert!(n > 0, "minimal 500 must never be empty");
+        let resp = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "status line: {}",
+            resp
+        );
+        assert!(resp.contains("Content-Length: 0\r\n"));
+        assert!(resp.contains("Connection: close\r\n"));
+        assert!(resp.ends_with("\r\n\r\n"));
     }
 
     /// POST /save returns 405 Method Not Allowed — the spike is GET-only.

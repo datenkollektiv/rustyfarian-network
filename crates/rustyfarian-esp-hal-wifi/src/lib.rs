@@ -611,8 +611,17 @@ mod driver {
 
             // 5. Build the embassy-net stack with a static AP IP.
             //    `StackResources::<4>` — DHCP server (UDP) + DNS (UDP) + HTTP (TCP)
-            //    + one spare — covers the Phase 2 edge-net substrate without needing
+            //    + one spare — covers the Phase 2 spike substrate without needing
             //    the caller to rebuild the stack.
+            //
+            //    INVARIANT: this `<4>` is coupled to the three sockets opened by
+            //    the spike modules (`dhcp::run`, `dns_catchall::run`,
+            //    `http_server::run`).  Spawning a fourth substrate task that opens
+            //    a socket will exhaust the table silently — `embassy-net` returns
+            //    `SocketAlreadyOpen` / `OutOfResources` rather than blocking.
+            //    Bump this number in lockstep with any new long-lived socket the
+            //    AP scaffold owns (and update the matching comment at the spawn
+            //    site in `examples/hal_c3_ap_smoke.rs`).
             let resources = AP_RESOURCES.init(StackResources::<4>::new());
 
             let seed = esp_hal::time::Instant::now()
