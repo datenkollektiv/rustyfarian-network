@@ -9,6 +9,7 @@ A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture
 June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 A June 2026 full-code deep dive (all 13 crates) confirmed the pure-first architecture is consistently executed and surfaced a set of hygiene items — LED/timeout logic dedup, a CI hardware-tier build job, a LoRa RF-config mapping guard, and README staleness fixes — tracked in Near term and in the findings table below.
 June 2026 shipped the provisioning triad — SoftAP captive-portal provisioning with two schema profiles (`LorawanFieldDevice` and `WifiMqttDevice`), NVS schema v2 with a `profile` discriminator, a `no_std`-safe surface on `rustyfarian-network-pure`, and the `idf_c3_provision` / `idf_c3_provision_mqtt` examples; per ADR 013 (acceptance) and ADR 014 (profile generalisation), end-to-end validated 2026-06-14, full detail in the CHANGELOG.
+June 2026 also landed the bare-metal `rustyfarian-esp-hal-provisioning` crate with the complete v1 feature set — end-to-end portal substrate, A.B torn-write-safe flash store, per-session nonce, and all 10 security-checklist items locked by host tests; per ADR 015 § 3 hand-rolled substrate; on-hardware smoke test remains a trailing validation step for the integrator.
 
 ```mermaid
 %%{init: {
@@ -28,8 +29,7 @@ June 2026 shipped the provisioning triad — SoftAP captive-portal provisioning 
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : rustyfarian-esp-hal-provisioning — bare-metal SoftAP captive-portal provisioning for the WifiMqttDevice profile, Phases 0–3 (ADR 015, feature-doc)
-              : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
+    Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line

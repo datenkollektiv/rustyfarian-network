@@ -1,19 +1,5 @@
-//! DNS catch-all server — Phase 2 spike code (ADR 015 §3 fallback).
-//!
-//! **Stability notice:** this module is internal spike code gated behind the
-//! `provisioning-spike` Cargo feature.  It is expected to migrate to
-//! `rustyfarian-esp-hal-provisioning::dns` when Phase 2 proper begins.
-//! Do not depend on the API stability of this module or the
-//! `provisioning-spike` feature flag across releases.
-//!
-//! ## Why it exists
-//!
-//! The `edge-net` family (`edge-dhcp`, `edge-http`, `edge-captive`) was the
-//! preferred Phase 2 substrate (ADR 015 §3), but its `embassy-sync 0.7`
-//! dependency conflicts with the workspace-pinned `embassy-sync 0.8`.
-//! ADR 015 §3 explicitly permits the hand-rolled fallback to proceed without a
-//! new ADR — the architectural commitment is the private-substrate boundary,
-//! not the crate family.
+//! DNS catch-all server substrate for the SoftAP captive-portal (ADR 015 §3
+//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-wifi` in Phase 2B).
 //!
 //! ## What it covers
 //!
@@ -431,7 +417,7 @@ pub fn encode_response(
 /// # Spawn this as a dedicated embassy task
 ///
 /// ```ignore
-/// use rustyfarian_esp_hal_wifi::dns_catchall::{self, DnsCatchallConfig};
+/// use rustyfarian_esp_hal_provisioning::dns_catchall::{self, DnsCatchallConfig};
 ///
 /// #[embassy_executor::task]
 /// async fn dns_task(stack: embassy_net::Stack<'static>) -> ! {
@@ -451,15 +437,17 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DnsCatchallConfig) 
     // Static socket buffers — required because `UdpSocket::new` in
     // `embassy-net 0.8` internally transmutes the buffer slices to `'static`
     // (see `embassy_net::udp::UdpSocket::new` safety contract).
+    // Buffer size matches `crate::dhcp::SOCKET_BUF_LEN` so both servers use
+    // the same tuned constant; raise both together if the MTU floor changes.
     static RX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
-    static RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; crate::dhcp::SOCKET_BUF_LEN]> = StaticCell::new();
     static TX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
-    static TX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    static TX_BUF: StaticCell<[u8; crate::dhcp::SOCKET_BUF_LEN]> = StaticCell::new();
 
     let rx_meta = RX_META.init([PacketMetadata::EMPTY; 4]);
-    let rx_buf = RX_BUF.init([0u8; 1024]);
+    let rx_buf = RX_BUF.init([0u8; crate::dhcp::SOCKET_BUF_LEN]);
     let tx_meta = TX_META.init([PacketMetadata::EMPTY; 4]);
-    let tx_buf = TX_BUF.init([0u8; 1024]);
+    let tx_buf = TX_BUF.init([0u8; crate::dhcp::SOCKET_BUF_LEN]);
 
     let mut sock = UdpSocket::new(stack, rx_meta, rx_buf, tx_meta, tx_buf);
 

@@ -30,22 +30,18 @@ use embedded_svc::io::{Read, Write};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 
+use provisioning_pure::html_json_escape::{html_escape_to, json_escape_to};
+use provisioning_pure::templates::{LORAWAN_PORTAL_HTML, WIFI_MQTT_PORTAL_HTML};
 use provisioning_pure::{parse_form, Field, FieldErrors, ProvisioningInput, SchemaProfile};
 
 use crate::store::ProvisioningStore;
 use crate::{ProvisioningEvent, SharedState};
 
-/// The embedded LoRaWAN-profile portal HTML template.
-const PORTAL_HTML_LORAWAN: &str = include_str!("portal_lorawan.html");
-
-/// The embedded Wi-Fi + MQTT-profile portal HTML template.
-const PORTAL_HTML_WIFI_MQTT: &str = include_str!("portal_wifi_mqtt.html");
-
-/// Selects the embedded template for `profile`.
+/// Selects the shared template for `profile`.
 fn template_for(profile: SchemaProfile) -> &'static str {
     match profile {
-        SchemaProfile::LorawanFieldDevice => PORTAL_HTML_LORAWAN,
-        SchemaProfile::WifiMqttDevice => PORTAL_HTML_WIFI_MQTT,
+        SchemaProfile::LorawanFieldDevice => LORAWAN_PORTAL_HTML,
+        SchemaProfile::WifiMqttDevice => WIFI_MQTT_PORTAL_HTML,
     }
 }
 
@@ -595,35 +591,22 @@ fn render_status(
 }
 
 /// HTML-escapes the five significant characters.
+///
+/// Delegates to [`provisioning_pure::html_json_escape::html_escape_to`],
+/// accumulating the result into an owned `String`.
 fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            other => out.push(other),
-        }
-    }
+    html_escape_to(input, |s| out.push_str(s));
     out
 }
 
 /// Escapes a string for inclusion in a JSON string literal.
+///
+/// Delegates to [`provisioning_pure::html_json_escape::json_escape_to`],
+/// accumulating the result into an owned `String`.
 fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            other => out.push(other),
-        }
-    }
+    json_escape_to(input, |s| out.push_str(s));
     out
 }
 

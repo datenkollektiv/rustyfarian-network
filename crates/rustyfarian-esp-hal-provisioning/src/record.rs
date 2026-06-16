@@ -67,10 +67,10 @@ pub(crate) const TAG_DEVICE_NAME: u8 = 0x09;
 
 /// Bytes consumed by the fixed header before the profile string:
 /// magic(4) + layout_ver(1) + seq(4) + record_len(2) + profile_len(1) = 12.
-const HEADER_FIXED: usize = 12;
+pub(crate) const HEADER_FIXED: usize = 12;
 
 /// Byte offset of the `record_len` field in the fixed header.
-const RECORD_LEN_OFFSET: usize = 9;
+pub(crate) const RECORD_LEN_OFFSET: usize = 9;
 
 /// Byte offset of the `profile_len` field in the fixed header.
 const PROFILE_LEN_OFFSET: usize = 11;
@@ -1412,5 +1412,158 @@ mod tests {
             debug_str.contains("<redacted>"),
             "debug output should contain '<redacted>': {debug_str}"
         );
+    }
+
+    // ── Security-checklist item 8: CRC commit-guard locking tests ────────────
+
+    /// Security-checklist item 8 lock: the CRC word must be the LAST 4 bytes
+    /// of every encoded record, covering all preceding bytes from magic through
+    /// the last TLV.
+    ///
+    /// For 50 distinct configurations (varying SSID, password, MQTT host, port,
+    /// and optional fields) this test verifies:
+    ///
+    /// 1. `bytes[record_len - 4 .. record_len]` equals the CRC computed over
+    ///    `bytes[..record_len - 4]`.
+    /// 2. Flipping any single byte in the payload produces a `BadCrc` decode
+    ///    error (the existing `crc_byte_flipped_returns_bad_crc` test covers
+    ///    this; this test only checks the position invariant).
+    #[test]
+    fn crc_is_the_final_word_of_every_encoded_record() {
+        // Simple deterministic pseudo-random generator — xorshift32 — so the
+        // test is reproducible without a hardware RNG and without pulling in
+        // an external rand crate.
+        let mut rng_state: u32 = 0xDEAD_CAFE;
+        let next_u32 = |s: &mut u32| -> u32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        };
+
+        let next_short_str =
+            |s: &mut u32, prefix: &str, max_extra: usize| -> alloc::string::String {
+                let n = (next_u32(s) as usize % max_extra) + 1;
+                let mut out = alloc::string::String::from(prefix);
+                for _ in 0..n {
+                    let c = (b'a' + (next_u32(s) % 26) as u8) as char;
+                    out.push(c);
+                }
+                out
+            };
+
+        for i in 0u32..50 {
+            let ssid = next_short_str(&mut rng_state, "net", 8);
+            let pass = next_short_str(&mut rng_state, "pw", 12);
+            let host = next_short_str(&mut rng_state, "broker", 10);
+            let port = (next_u32(&mut rng_state) % 60000 + 1024) as u16;
+            let user = if i % 2 == 0 {
+                Some(next_short_str(&mut rng_state, "user", 6))
+            } else {
+                let _ = next_short_str(&mut rng_state, "", 6); // advance RNG
+                None
+            };
+            let mqtt_pass = if i % 3 == 0 {
+                Some(next_short_str(&mut rng_state, "pass", 8))
+            } else {
+                let _ = next_short_str(&mut rng_state, "", 8);
+                None
+            };
+
+            let config = make_wifi_mqtt_config(
+                &ssid,
+                &pass,
+                &host,
+                port,
+                user.as_deref(),
+                mqtt_pass.as_deref(),
+                None,
+            );
+
+            let mut buf = [0u8; SECTOR_SIZE];
+            let record_len = encode_record(&config, i, &mut buf)
+                .unwrap_or_else(|e| panic!("encode failed for iteration {i}: {e:?}"));
+
+            // Compute the expected CRC over [0..record_len-4].
+            let expected_crc = crc32(&buf[..record_len - 4]);
+
+            // Read the stored CRC from [record_len-4..record_len].
+            let stored_crc = u32::from_le_bytes([
+                buf[record_len - 4],
+                buf[record_len - 3],
+                buf[record_len - 2],
+                buf[record_len - 1],
+            ]);
+
+            assert_eq!(
+                stored_crc, expected_crc,
+                "iteration {i}: CRC at [record_len-4..record_len] ({stored_crc:#010x}) \
+                 must equal CRC over [0..record_len-4] ({expected_crc:#010x})"
+            );
+
+            // Also verify the record round-trips correctly.
+            let decoded = decode_record(&buf[..record_len])
+                .unwrap_or_else(|e| panic!("decode failed for iteration {i}: {e:?}"));
+            assert_eq!(decoded.seq, i, "iteration {i}: seq mismatch");
+        }
+    }
+
+    /// Security-checklist item 8 lock: a record whose CRC word is not fully
+    /// written (torn write — truncated one byte before the CRC starts) must
+    /// NOT decode successfully.
+    ///
+    /// A truncation at `record_len - 5` means the CRC bytes are absent; the
+    /// decoder must return `Err(ShortRecord { .. })` or `Err(BadCrc)` — never
+    /// a successfully-typed `DecodedRecord`.
+    #[test]
+    fn torn_write_with_valid_header_but_no_crc_decodes_as_none() {
+        let config = make_wifi_mqtt_config(
+            "myssid",
+            "mypass",
+            "broker.example.com",
+            1883,
+            None,
+            None,
+            None,
+        );
+        let mut buf = [0u8; SECTOR_SIZE];
+        let record_len = encode_record(&config, 1, &mut buf).unwrap();
+
+        // Truncate one byte before the CRC starts — the CRC 4-byte word at
+        // [record_len-4..record_len] is entirely missing from the slice.
+        // `record_len - 5` is inside the last TLV payload region.
+        let torn_len = record_len - 5;
+        assert!(
+            torn_len >= 1,
+            "record_len ({record_len}) must be > 5 for this test to make sense"
+        );
+
+        let result = decode_record(&buf[..torn_len]);
+
+        assert!(
+            result.is_err(),
+            "a torn record (missing CRC) must NOT decode as Ok; got: {result:?}"
+        );
+
+        // The error must be ShortRecord (the record_len field in the header
+        // claims more bytes than the slice has) or BadCrc (if the decode
+        // managed to read past the header but the CRC check fires first).
+        // Either is acceptable — both are "fail closed" on a torn write.
+        match result {
+            Err(
+                crate::store::StoreError::ShortRecord { .. } | crate::store::StoreError::BadCrc,
+            ) => {
+                // Correct: torn write detected.
+            }
+            Err(other) => {
+                panic!(
+                    "torn write returned unexpected error {other:?}; \
+                     expected ShortRecord or BadCrc"
+                );
+            }
+            Ok(_) => {
+                panic!("torn write must not produce Ok(DecodedRecord)");
+            }
+        }
     }
 }

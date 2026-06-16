@@ -15,8 +15,27 @@ use provisioning_pure::ProvisioningConfig;
 
 use crate::record::{
     decode_record, encode_record, pad_to_write_granularity, pick_active, DecodedRecord,
-    SECTOR_SIZE, STORE_SIZE,
+    HEADER_FIXED, RECORD_LEN_OFFSET, SECTOR_SIZE, STORE_SIZE,
 };
+
+/// Maximum byte length of a single encoded record across all profiles.
+///
+/// Worst-case is `WifiMqttDevice` with all fields filled to their cap:
+/// - Fixed header:     12 B
+/// - Profile string:    9 B ("wifi_mqtt")
+/// - TLV wifi_ssid:    34 B (2+32)
+/// - TLV wifi_pass:    66 B (2+64)
+/// - TLV ota_url:     130 B (2+128)
+/// - TLV device_name:  26 B (2+24)
+/// - TLV mqtt_host:    66 B (2+64)
+/// - TLV mqtt_port:     4 B (2+2)
+/// - TLV mqtt_user:    66 B (2+64)
+/// - TLV mqtt_pass:    66 B (2+64)
+/// - TLV mqtt_client:  25 B (2+23)
+/// - CRC32:             4 B
+///
+/// Sum: 508 B. `512` is the next power-of-two ceiling.
+const MAX_RECORD_LEN: usize = 512;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -244,12 +263,47 @@ impl<F: NorFlash> ProvisioningStore<F> {
     /// magic / version mismatch, CRC mismatch, unknown profile) so the active
     /// sector arbitration can fall back to the standby. Flash read errors are
     /// surfaced as `Err(StoreError::Flash)`.
+    ///
+    /// # Two-step bounded read
+    ///
+    /// Instead of reading the full 4 KiB sector, this method performs two
+    /// targeted reads:
+    ///
+    /// 1. Read the 12-byte fixed header to extract `record_len`.
+    /// 2. Read exactly `record_len` bytes (≤ `MAX_RECORD_LEN`) into a
+    ///    [`MAX_RECORD_LEN`]-byte stack buffer and hand that slice to
+    ///    `decode_record`.
+    ///
+    /// This cuts the transient stack contribution of each `try_read_sector`
+    /// call from 4 KiB to ≤ 512 B (`MAX_RECORD_LEN`).
     fn try_read_sector(&mut self, sector_index: u32) -> Result<Option<DecodedRecord>, StoreError> {
-        let mut buf = [0u8; SECTOR_SIZE];
+        let base = self.sector_offset(sector_index);
+
+        // Step 1 — read the fixed header (12 bytes) to learn `record_len`.
+        let mut header = [0u8; HEADER_FIXED];
         self.flash
-            .read(self.sector_offset(sector_index), &mut buf)
+            .read(base, &mut header)
             .map_err(|_| StoreError::Flash)?;
-        Ok(decode_record(&buf).ok())
+
+        // Extract `record_len` from the header.  `decode_record` will re-check
+        // magic / version / bounds, so we do not need to validate here — if the
+        // header is corrupt `record_len` may be nonsense and the subsequent
+        // bounded read will cover a partial / wrong slice, but `decode_record`
+        // will return `Err` on any structural violation.
+        let record_len =
+            u16::from_le_bytes([header[RECORD_LEN_OFFSET], header[RECORD_LEN_OFFSET + 1]]) as usize;
+
+        // Clamp to a sensible maximum so a corrupt `record_len` field cannot
+        // request a read larger than our stack buffer.
+        let read_len = record_len.min(MAX_RECORD_LEN);
+
+        // Step 2 — read exactly `read_len` bytes from the sector head.
+        let mut buf = [0u8; MAX_RECORD_LEN];
+        self.flash
+            .read(base, &mut buf[..read_len])
+            .map_err(|_| StoreError::Flash)?;
+
+        Ok(decode_record(&buf[..read_len]).ok())
     }
 
     /// Returns `true` if either sector contains a valid record.
@@ -277,18 +331,33 @@ impl<F: NorFlash> ProvisioningStore<F> {
     ///
     /// # Stack usage
     ///
-    /// `save` allocates a 4 KiB encode buffer; `try_read_sector` (called by
-    /// `plan_save`) allocates another 4 KiB read buffer that is live across
-    /// most of `save`. Peak stack on the hot path is therefore ~4–5 KiB
-    /// before any task overhead. This matches `SECTOR_SIZE` and is acceptable
-    /// for the spike but is on the Phase 2 entry-conditions list — the
-    /// planned optimisation is to read only a 12-byte header prefix first to
-    /// learn `record_len`, then read just `record_len` bytes into a smaller
-    /// buffer. Sizing notes for `embassy::executor` tasks that own a
-    /// `ProvisioningStore` should budget at least 6 KiB on top of their own
-    /// requirements until that change lands. See
-    /// `docs/features/esp-hal-provisioning-v1.md` Session Log (2026-06-15
-    /// Phase 2 entry conditions) for the full plan.
+    /// `save` allocates a 4 KiB `heapless::Vec` encode buffer on this
+    /// function's frame.
+    /// `try_read_sector` (called twice by `plan_save`) uses a two-step
+    /// bounded read — a 12-byte header read followed by a read of exactly
+    /// `record_len` bytes (≤ `MAX_RECORD_LEN` = 512 B) — so the transient
+    /// read-buffer contribution is ~512 B, not the 4 KiB it was before the
+    /// Phase 2B optimisation.
+    ///
+    /// The total transient stack contribution of `save` (encode buffer + read
+    /// buffer + locals) is approximately **4.6 KiB**.
+    ///
+    /// Combined with the HTTP task's steady-state frame (~8.3 KiB: `req_buf`
+    /// 2048 + `resp_buf` 6144 + executor overhead), the worst-case stack peak
+    /// during a `POST /save` request is approximately **13 KiB**.
+    /// The recommended integrator HTTP-task stack is **14 KiB minimum**,
+    /// leaving headroom for ISR frames and stack canary.
+    ///
+    /// The steady-state HTTP frame is ~8 KiB (`req_buf` 2048 + `resp_buf`
+    /// 6144 + executor overhead); `POST /save` transiently adds another
+    /// ~4.6 KiB for `ProvisioningStore::save`'s encode + read buffers,
+    /// raising the worst-case peak to ~13 KiB.
+    /// Integrators should size the spawned HTTP task with at least 14 KiB of
+    /// stack to leave headroom for ISR frames and stack canary.
+    ///
+    /// See `docs/features/esp-hal-provisioning-v1.md` Decisions
+    /// "Locked at Phase 2B implementation" for the `DEFAULT_TX_BUF = 6144`
+    /// rationale.
     ///
     /// # Hardware caller pre-condition
     ///
@@ -392,6 +461,91 @@ struct SaveTarget {
 }
 
 // ── Mock NorFlash + tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod test_flash_instrumented {
+    use embedded_storage::nor_flash::{
+        ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+    };
+
+    /// Wrapper around a byte slice that records each `read` call's `(offset,
+    /// length)`.  Used to assert `try_read_sector`'s two-step bounded-read
+    /// behaviour without touching real flash.
+    pub(super) struct InstrumentedFlash {
+        pub(super) data: [u8; 8192],
+        pub(super) read_log: alloc::vec::Vec<(u32, usize)>,
+    }
+
+    impl InstrumentedFlash {
+        pub(super) fn from_data(data: [u8; 8192]) -> Self {
+            Self {
+                data,
+                read_log: alloc::vec::Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct IError;
+
+    impl NorFlashError for IError {
+        fn kind(&self) -> NorFlashErrorKind {
+            NorFlashErrorKind::Other
+        }
+    }
+
+    impl ErrorType for InstrumentedFlash {
+        type Error = IError;
+    }
+
+    impl ReadNorFlash for InstrumentedFlash {
+        const READ_SIZE: usize = 1;
+
+        fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+            self.read_log.push((offset, bytes.len()));
+            let start = offset as usize;
+            let end = start + bytes.len();
+            if end > self.data.len() {
+                return Err(IError);
+            }
+            bytes.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+
+        fn capacity(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    impl NorFlash for InstrumentedFlash {
+        const WRITE_SIZE: usize = 4;
+        const ERASE_SIZE: usize = 4096;
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            let start = from as usize;
+            let end = to as usize;
+            if end > self.data.len() {
+                return Err(IError);
+            }
+            for byte in &mut self.data[start..end] {
+                *byte = 0xFF;
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+            let start = offset as usize;
+            let end = start + bytes.len();
+            if end > self.data.len() {
+                return Err(IError);
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                self.data[start + i] &= b;
+            }
+            Ok(())
+        }
+    }
+}
 
 #[cfg(test)]
 mod test_flash {
@@ -559,6 +713,7 @@ mod test_flash {
 #[cfg(test)]
 mod tests {
     use super::test_flash::{MockFlash, MockFlash8KiB};
+    use super::test_flash_instrumented::InstrumentedFlash;
     use super::*;
     use heapless::String as HS;
     use provisioning_pure::{
@@ -719,5 +874,90 @@ mod tests {
         let flash_after_second = store.into_flash();
 
         assert_eq!(&flash_after_second.data[..4096], &snapshot[..]);
+    }
+
+    /// Verifies the two-step bounded-read contract of `try_read_sector`:
+    ///
+    /// For each sector the method must:
+    /// 1. Issue one read of exactly [`HEADER_FIXED`] (12) bytes at the sector
+    ///    base to extract `record_len`.
+    /// 2. Issue one read of exactly `record_len` bytes (≤ [`MAX_RECORD_LEN`])
+    ///    at the same sector base.
+    ///
+    /// Together `plan_save` (which calls `try_read_sector` on both sectors)
+    /// must produce exactly four reads: two pairs of (12-byte header,
+    /// record-body) — one pair per sector — rather than the old two reads of
+    /// 4096 bytes each.
+    ///
+    /// This test also asserts that the record decoded through the bounded read
+    /// equals the one obtained by writing via the store API, confirming that
+    /// `decode_record` receives the right slice.
+    #[test]
+    fn try_read_sector_reads_only_record_len_bytes() {
+        use crate::record::encode_record;
+
+        let cfg = sample_config();
+
+        // Encode the config into a SECTOR_SIZE staging buffer so we can
+        // compute the exact `record_len` the decoder will see.
+        let mut staging = [0u8; SECTOR_SIZE];
+        let record_len = encode_record(&cfg, 1, &mut staging).unwrap();
+
+        // Build a flash image: sector 0 contains the encoded record, sector 1
+        // is blank (0xFF — blank sector so `try_read_sector(1)` returns None).
+        let mut flash_data = [0xFFu8; 8192];
+        flash_data[..record_len].copy_from_slice(&staging[..record_len]);
+
+        // The instrumented flash records every (offset, length) read call.
+        let flash = InstrumentedFlash::from_data(flash_data);
+
+        // Open a store; save() calls plan_save() which calls try_read_sector()
+        // on both sectors.  We want to observe the reads without going through
+        // save(), so we call load() instead — it also calls try_read_sector()
+        // on both sectors internally.
+        let mut store = ProvisioningStore::open(flash, 0, 8192).unwrap();
+        let loaded = store.load().unwrap().expect("record present in sector 0");
+        assert_eq!(loaded.wifi_ssid(), "my-net");
+
+        // Retrieve the log.
+        let log = store.into_flash().read_log;
+
+        // load() calls try_read_sector(0) then try_read_sector(1).
+        // Each call issues:
+        //   read #1: (sector_base,     HEADER_FIXED)  = (offset, 12)
+        //   read #2: (sector_base,     record_len)    = (offset, record_len)
+        //
+        // Sector 0 base = 0; sector 1 base = 4096.
+        // Blank sector 1: header read returns 0xFF bytes → record_len decodes
+        // to 0xFFFF (65535), clamped to MAX_RECORD_LEN (512).
+        assert_eq!(log.len(), 4, "expected exactly 4 flash reads, got {log:?}");
+
+        // Sector 0, read 1: 12-byte header.
+        assert_eq!(log[0], (0, HEADER_FIXED), "sector 0 header read mismatch");
+
+        // Sector 0, read 2: exactly `record_len` bytes (not SECTOR_SIZE).
+        assert_eq!(
+            log[1],
+            (0, record_len),
+            "sector 0 body read should be record_len={record_len}, not 4096"
+        );
+        assert!(
+            record_len <= MAX_RECORD_LEN,
+            "encoded record ({record_len} B) exceeds MAX_RECORD_LEN ({MAX_RECORD_LEN} B)"
+        );
+
+        // Sector 1, read 1: 12-byte header (returns 0xFF bytes).
+        assert_eq!(
+            log[2],
+            (4096, HEADER_FIXED),
+            "sector 1 header read mismatch"
+        );
+
+        // Sector 1, read 2: clamped to MAX_RECORD_LEN (0xFFFF → 512).
+        assert_eq!(
+            log[3],
+            (4096, MAX_RECORD_LEN),
+            "sector 1 body read should be clamped to MAX_RECORD_LEN"
+        );
     }
 }
