@@ -82,13 +82,11 @@ case "$prefix" in
 
     hal)
         # Bare-metal HAL examples: detect package from feature name
-        # NOTE: *ap* must appear before *connect*|*wifi* because hal_c3_ap_smoke
-        # contains no "connect" or "wifi" substring.
         case "$example" in
-            *ap*)   pkg="rustyfarian-esp-hal-wifi" ;;
+            *provision*) pkg="rustyfarian-esp-hal-provisioning" ;;
             *join*) pkg="rustyfarian-esp-hal-lora" ;;
             *connect*|*wifi*) pkg="rustyfarian-esp-hal-wifi" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "ap", "join", "connect", or "wifi".\n' "$example" >&2; exit 1 ;;
+            *) printf 'Cannot detect crate for example "%s".\nName must contain "join", "connect", "wifi", or "provision".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set targets
@@ -112,7 +110,7 @@ case "$prefix" in
             *_async*) hal_features="${hal_features},embassy" ;;
         esac
         case "$example" in
-            *ap*) hal_features="${hal_features},provisioning-spike" ;;
+            *provision*) hal_features="${hal_features},embassy" ;;
         esac
 
         # Ensure IDF-built bootloader is cached

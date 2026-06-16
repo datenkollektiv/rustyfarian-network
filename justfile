@@ -87,16 +87,16 @@ check-ota-hal:
 check-provisioning-hal:
     cargo check -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
 
+# check the esp-hal provisioning crate cross-compiles cleanly to both bare-metal targets
+check-provisioning-hal-embassy:
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+
 # check the esp-hal ota crate with chip + embassy features (ESP32-C6 + ESP32-C3)
 check-ota-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
-# check the esp-hal provisioning crate cross-compiles cleanly to both bare-metal targets
-# Phase 1 has no chip features yet — this recipe proves the no_std purity of the store module.
-check-provisioning-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
 
 # run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
 test-ota-hal:
@@ -120,12 +120,9 @@ check-wifi-hal:
 
 # check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
-# Also checks the `provisioning-spike` feature (hand-rolled DHCP server) on both chips.
 check-wifi-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,provisioning-spike --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,provisioning-spike --target-dir {{ hal_dir }}
 
 # check rustyfarian-network-pure compiles without the `std` feature (ADR 014 §2 no_std surface)
 check-network-pure-no-std:
@@ -197,25 +194,24 @@ test-ota:
 test-provisioning:
     cargo test --target {{host_target}} -p provisioning-pure
 
-# run all `provisioning-spike` unit tests (DHCP codec + allocation policy, DNS
+# run all substrate unit tests (DHCP codec + allocation policy, DNS
 # catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
-# toolchain.  Uses the `provisioning-spike` Cargo feature which enables the
-# three spike modules; no chip feature is selected so each module's async
-# `run()` is compiled away and no ESP toolchain is needed.
-test-provisioning-spike:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-wifi --no-default-features --features provisioning-spike
+# toolchain.  The substrate modules live in `rustyfarian-esp-hal-provisioning`
+# after Phase 2B promotion; no chip feature is needed for host tests since
+# each module's async `run()` is compiled away without a chip feature.
+test-provisioning-substrate:
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-provisioning --no-default-features
 
 # Back-compat aliases — `test-dhcp` / `test-http` / `test-dns` all delegate to
-# the same `test-provisioning-spike` command because cargo cannot run a single
-# crate's tests with per-module isolation without a per-test filter.  Keep
-# these for the muscle-memory of callers who type the area they care about;
-# remove once Phase 2B promotion splits the spike into per-module crates.
-test-dhcp: test-provisioning-spike
-test-http: test-provisioning-spike
-test-dns: test-provisioning-spike
+# the same recipe because cargo cannot run a single crate's tests with
+# per-module isolation without a per-test filter.  Keep these for the
+# muscle-memory of callers who type the area they care about.
+test-dhcp: test-provisioning-substrate
+test-http: test-provisioning-substrate
+test-dns: test-provisioning-substrate
 
 # run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
-test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-hal test-provisioning-spike
+test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-substrate test-provisioning-hal
 
 # ── Examples ──────────────────────────────────────────────────────────────
 
@@ -300,6 +296,41 @@ clean-idf:
     rm -rf {{ idf_dir }}/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
     rm -rf {{ idf_dir }}/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
 
+# check that provisioning library logs never interpolate credential field names
+check-no-credential-logging:
+    #!/usr/bin/env bash
+    # Grep for log macro calls where credential names appear as actual macro arguments
+    # (not in comments or test assertions about containing these names).
+    # We exclude lines that are comments or assertions about NOT containing.
+    exit_code=0
+    grep -rn 'log::\(debug\|info\|warn\|error\)!' \
+      crates/rustyfarian-esp-hal-provisioning/src/ \
+      | grep -E '\(wifi_pass\|mqtt_pass\|body_str\|body_in_buf\)' \
+      | grep -v '//' \
+      | grep -v '!.*".*"' && exit_code=1 || true
+    exit $exit_code
+
+# check that provisioning library never calls reset/reboot or erase_all
+check-library-never-reboots:
+    #!/usr/bin/env bash
+    exit_code=0
+    if find crates/rustyfarian-esp-hal-provisioning/src/ -name '*.rs' -exec \
+      grep -Hn 'esp_hal::reset\|software_reset\|esp_hal_reset' {} \; > /tmp/resets.txt 2>&1; then
+      if [ -s /tmp/resets.txt ]; then
+        cat /tmp/resets.txt
+        echo "ERROR: Found reset/reboot calls in library source"
+        exit_code=1
+      fi
+    fi
+    if grep -Hn 'erase_all' crates/rustyfarian-esp-hal-provisioning/src/portal.rs > /tmp/erase.txt 2>&1; then
+      if [ -s /tmp/erase.txt ]; then
+        cat /tmp/erase.txt
+        echo "ERROR: Found erase_all call in portal.rs"
+        exit_code=1
+      fi
+    fi
+    exit $exit_code
+
 # ── CI ────────────────────────────────────────────────────────────────────
 
 # full pre-commit verification: format, check, lint (local use only — modifies files)
@@ -309,6 +340,9 @@ pre-commit: fmt check clippy
 verify:
     just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
     just ci
+    just check-provisioning-hal-embassy
+    just check-no-credential-logging
+    just check-library-never-reboots
 
 # CI-equivalent verification (non-modifying): format check, deny, check, lint
 ci: fmt-check deny check clippy

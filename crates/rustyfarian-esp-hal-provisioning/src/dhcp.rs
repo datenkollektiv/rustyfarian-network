@@ -1,10 +1,5 @@
-//! Minimal DHCP server — Phase 2 spike code (ADR 015 §3 fallback).
-//!
-//! **Stability notice:** this module is internal spike code gated behind the
-//! `provisioning-spike` Cargo feature.  It is expected to migrate to
-//! `rustyfarian-esp-hal-provisioning::dhcp` when Phase 2 proper begins.
-//! Do not depend on the API stability of this module or the
-//! `provisioning-spike` feature flag across releases.
+//! Minimal DHCP server substrate for the SoftAP captive-portal (ADR 015 §3
+//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-wifi` in Phase 2B).
 //!
 //! ## Why it exists
 //!
@@ -389,7 +384,10 @@ fn write_option(buf: &mut [u8], offset: usize, tag: u8, val: &[u8]) -> Result<us
 /// The `sname` and `file` fields are zeroed.  The `chaddr` is placed in the
 /// first 6 bytes of the 16-byte BOOTP chaddr field; the remaining 10 bytes
 /// are zero-padded.
-pub fn encode(msg: &DhcpMessage, buf: &mut [u8]) -> Result<usize, DhcpError> {
+// Only used by the round-trip unit test; gated to avoid a dead-code warning
+// in release builds where the async server uses encode_offer_or_ack directly.
+#[cfg(test)]
+pub(crate) fn encode(msg: &DhcpMessage, buf: &mut [u8]) -> Result<usize, DhcpError> {
     let min_len = BOOTP_FIXED_LEN + 4; // BOOTP header + magic cookie
     if buf.len() < min_len {
         return Err(DhcpError::BufferTooSmall);
@@ -823,7 +821,7 @@ pub(crate) fn decide_request(
 /// # Spawn this as a dedicated embassy task
 ///
 /// ```ignore
-/// use rustyfarian_esp_hal_wifi::dhcp::{self, DhcpServerConfig};
+/// use rustyfarian_esp_hal_provisioning::dhcp::{self, DhcpServerConfig};
 ///
 /// #[embassy_executor::task]
 /// async fn dhcp_task(stack: embassy_net::Stack<'static>) -> ! {

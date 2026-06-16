@@ -26,9 +26,11 @@ extern crate alloc;
 pub mod config;
 pub mod error;
 pub mod form;
+pub mod html_json_escape;
 pub mod profile;
 pub mod ssid;
 pub mod state;
+pub mod templates;
 
 pub use config::{
     ProvisioningConfig, DEVICE_NAME_MAX_LEN, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN,

@@ -41,21 +41,10 @@ rt = ["esp-hal/rt"]
 # Opt-in async support via the embassy ecosystem. As of esp-radio 0.18 this
 # feature is required alongside any chip feature for a working Wi-Fi build.
 embassy = [
-    "dep:embassy-executor",
     "dep:embassy-net",
-    "dep:embassy-time",
     "dep:static_cell",
-    "dep:embedded-io-async",
     "esp-rtos?/embassy",
 ]
-# Phase 2 spike: hand-rolled DHCP server for the SoftAP captive-portal.
-# Gated here so the codec and server module are only compiled in when explicitly
-# requested.  Expected to migrate to `rustyfarian-esp-hal-provisioning::dhcp`
-# when Phase 2 proper begins; do not depend on the API stability of code behind
-# this flag.  Requires `embassy` — the server runs on the embassy-net UDP stack.
-# The `embassy-net/udp` feature enables `embassy_net::udp::UdpSocket`; it is
-# not required by the `embassy` feature alone (which only uses TCP for TLS).
-provisioning-spike = ["embassy", "embassy-net/udp", "embassy-net/tcp"]
 
 [dependencies]
 wifi-pure.workspace = true
@@ -73,13 +62,8 @@ esp-println = { workspace = true, optional = true }
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 
 # Embassy (optional — activated by the `embassy` feature)
-embassy-executor = { workspace = true, optional = true }
 embassy-net = { workspace = true, optional = true, features = ["dhcpv4", "proto-ipv4", "medium-ethernet"] }
-embassy-time = { workspace = true, optional = true }
 static_cell = { workspace = true, optional = true }
-# Re-exported via the `embassy` feature for downstream socket code that needs
-# `AsyncRead` / `AsyncWrite`. Not used inside this crate yet.
-embedded-io-async = { workspace = true, optional = true }
 
 [[example]]
 name = "hal_c3_connect_async"
@@ -92,7 +76,3 @@ required-features = ["esp32c3", "rt", "embassy"]
 [[example]]
 name = "hal_c6_connect_async_led"
 required-features = ["esp32c6", "rt", "embassy", "rustyfarian-esp-hal-ws2812"]
-
-[[example]]
-name = "hal_c3_ap_smoke"
-required-features = ["esp32c3", "rt", "provisioning-spike"]

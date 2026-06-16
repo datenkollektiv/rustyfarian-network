@@ -27,27 +27,6 @@
 
 #![no_std]
 
-/// Minimal DHCP server — Phase 2 spike code (ADR 015 §3 fallback).
-///
-/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
-/// the module-level documentation for the migration path.
-#[cfg(feature = "provisioning-spike")]
-pub mod dhcp;
-
-/// DNS catch-all server — Phase 2 spike code (ADR 015 §3 fallback).
-///
-/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
-/// the module-level documentation for the migration path.
-#[cfg(feature = "provisioning-spike")]
-pub mod dns_catchall;
-
-/// Minimal HTTP/1.1 server — Phase 2 spike code (ADR 015 §3 fallback).
-///
-/// Gated behind the `provisioning-spike` feature flag.  Not API-stable; see
-/// the module-level documentation for the migration path.
-#[cfg(feature = "provisioning-spike")]
-pub mod http_server;
-
 pub use wifi_pure::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
     TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
@@ -58,11 +37,18 @@ pub use wifi_pure::{
 ///
 /// The AP `embassy-net` stack opened by [`WiFiManager::init_softap_async`]
 /// must reserve one socket slot per long-lived substrate task plus one
-/// spare.  The three `provisioning-spike` modules each own one socket:
-/// `dhcp::run` (UDP), `dns_catchall::run` (UDP), `http_server::run` (TCP).
-/// Adding a fourth substrate task that opens a socket must bump this
-/// constant in lockstep — `embassy-net` returns `SocketAlreadyOpen` /
+/// spare.  The three substrate modules in `rustyfarian-esp-hal-provisioning`
+/// each own one socket: `dhcp::run` (UDP), `dns_catchall::run` (UDP),
+/// `http_server::run` (TCP).  Adding a fourth long-lived socket-owning
+/// task in `rustyfarian-esp-hal-provisioning` requires bumping this constant
+/// in lockstep — `embassy-net` returns `SocketAlreadyOpen` /
 /// `OutOfResources` on exhaustion rather than blocking.
+///
+/// Cross-crate coupling: this constant is declared here (in the Wi-Fi
+/// crate) to avoid a circular dependency, but the socket count it encodes
+/// is owned by the provisioning crate's substrate modules.  If you add a
+/// fourth long-lived substrate task in `rustyfarian-esp-hal-provisioning`,
+/// bump this constant here too.
 ///
 /// Promoted from a magic `4` in the second-pass PR review of #72 so the
 /// invariant is enforced at the source rather than via parallel comments

@@ -41,7 +41,7 @@ These rows began as ADR 015 sub-decisions; the 2026-06-12 second review relocate
 
 ### Locked at Phase 2A hardening (2026-06-16)
 
-These rows capture named values that landed in `rustyfarian-esp-hal-wifi` during the Phase 2A pre-promotion hardening pass (PR #72, commits `0722f00` + `0df0e5f`).
+These rows capture named values that landed in `rustyfarian-esp-hal-wifi` during the Phase 2A pre-promotion hardening pass (PR #72, commits `5d7ec70` + `c88a1b3`).
 They are part of the v1 contract — Phase 2B promotion moves the source of truth into `rustyfarian-esp-hal-provisioning` but cannot silently widen them.
 
 |                                                                                                                                                 Decision | Reason                                                                                                                                                                                                                                                                                 | Rejected Alternative                                                                                                                                                                        |
@@ -59,6 +59,13 @@ These rows resolve the open questions Q1 (template sharing) and Q4 (builder/sess
 |                                                                                                                                                                                                                                                                                                                       Q1 — Shared portal HTML templates (both `WifiMqttDevice` and LoRaWAN profiles) live in `provisioning-pure` as `include_str!` consts | The templates ARE part of the schema contract (input names derive from `Field::form_name`, the single source of truth); both tiers render identically by construction; one source survives schema additions and field renames                                                                                 | Per-tier copies (drift between IDF and bare-metal portals); a cross-crate `include_str!` path hack into the IDF crate (fragile against crate moves, breaks out-of-workspace builds); LoRaWAN-template-deferred (no symmetry payoff, storage cost is bytes-in-flash not RAM) |
 | Q4 — Public builder/session surface: `PortalConfig { ssid_prefix, ap_password, channel, device_name, firmware_version, profile }`; `ProvisioningBuilder::new(...).on_event(...).start(spawner, ap, store)` returning `ProvisioningSession`; `ProvisioningOutcome { Committed(ProvisioningConfig), FactoryResetRequested, HostAborted }` with both `wait_outcome` (richer terminator) and `wait_committed` (IDF-parity convenience) as session terminators | Mirrors the ESP-IDF tier's `ProvisioningBuilder` / `ProvisioningSession` shape (consistent UX across HALs); the outcome enum names the `FactoryResetPending` terminal so a single success-path wait cannot silently drop alternatives; `wait_committed` carries forward for callers porting from the IDF tier | A free-function entry point (loses `with_status_entry` / `on_event` extensibility); a single-`wait_committed`-only terminator (cannot express `FactoryResetRequested` or `HostAborted`); a different `PortalConfig` shape than the IDF tier (cross-HAL onboarding cost)     |
 
+### Locked at Phase 2B implementation (2026-06-16)
+
+|                                                                       Decision | Reason                                                                                                                                                                                                                                      | Rejected Alternative                                                                                                   |
+|-------------------------------------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------|
+| `DEFAULT_TX_BUF = 6144` in `http_server.rs` (bumped from 2048 at Phase 2A) | Real portal HTML for the `WifiMqttDevice` profile is 4-6 KiB rendered with placeholders substituted; the 2 KiB spike default would trip the `MINIMAL_500` fallback on every portal GET response, making the captive portal non-functional | Keeping 2048 (spike default) — incompatible with real portal HTML; a per-call override (rejected because `StaticCell<[u8; N]>` requires const N, not a runtime field) |
+| v1 `ProvisioningSession` has no `shutdown()` method; session ends by host reboot after `Committed` or by host-driven erase after `FactoryResetRequested`. The four spawned embassy tasks (net runner, wifi-event watcher, DHCP, DNS, HTTP) live for the boot lifetime. | Pre-emptive cancellation requires threading a `CancellationToken` through every spawned task, a substantial cross-cutting refactor that the v1 captive-portal scenario (commit then reboot) does not need. | A `shutdown()` mirroring the IDF tier (drops HTTP server, stops SoftAP) — would require adding cancellation plumbing to every task without a v1 use case driving the API. |
+
 ## Constraints
 
 - Everything in `provisioning-pure` is reused unchanged — `SchemaProfile`, `LoraFields`, `MqttFields`, `parse_form`, and the validators all carry over `no_std`-safe, keeping the ADR 013 §2 no-API-break promise.
@@ -70,8 +77,9 @@ These rows resolve the open questions Q1 (template sharing) and Q4 (builder/sess
 - The library never decides provisioning-mode entry, never reboots, and never erases on its own — host decisions, carried forward from the v1 constraints.
 - `mqtt_uri` accepts the plain `mqtt://` scheme only; `ota_url` accepts `http://` only — matching the ESP-IDF tier and the workspace plain-transport posture.
 - Secrets (`wifi_pass`, `mqtt_pass`) are redacted in `Debug`, never pre-filled into HTML, and re-entered on every submission — identical to the ESP-IDF rules.
+- Only `SchemaProfile::WifiMqttDevice` is implemented in v1; `LorawanFieldDevice` is rejected at `start()` with `ProvisioningError::ProfileNotSupported`. LoRaWAN portal logic is a v2 expansion.
 - The SoftAP scaffold `embassy-net` `StackResources` capacity is hard-coupled to the number of spawned substrate tasks via the `SUBSTRATE_SOCKET_COUNT` crate-root const; adding a fourth long-lived socket-owning task without bumping the const in lockstep exhausts the table and `embassy-net` returns `SocketAlreadyOpen` / `OutOfResources` rather than blocking.
-- Integrators sizing the spawned-task stacks must budget at least 6 KiB on top of their own requirements — the HTTP task peaks at ~4 KiB (`req_buf` + `resp_buf`), the store's `save` transiently peaks at ~4–5 KiB; the `# Stack usage` doc heading on `http_server::run` is the integrator-visible reference until the Phase 2B portal promotion lands the targeted-read optimisation in `try_read_sector`.
+- Integrators sizing the spawned-task stacks must budget at least **14 KiB** for the HTTP task — the steady-state frame is ~8.3 KiB (`req_buf` 2 KiB + `resp_buf` 6 KiB (`DEFAULT_TX_BUF = 6144`) + executor overhead); during `POST /save` the call to `ProvisioningStore::save` transiently adds ~4.6 KiB (4 KiB encode buffer + ~512 B read buffer), raising the worst-case peak to ~13 KiB; the `# Stack usage` doc-comment on `portal::run_portal_dyn` (and on `ProvisioningStore::save`) is the integrator-visible reference. In bare-metal embassy (`esp-rtos` thread-mode executor) all async tasks share the main thread's stack — size it via the linker script or `CONFIG_ESP_MAIN_TASK_STACK_SIZE`.
 
 ## Open Questions
 
@@ -308,28 +316,28 @@ Gate: `just lint-docs`.
 
 The ESP-IDF portal (`crates/rustyfarian-esp-idf-provisioning`) is the reference implementation for each item.
 
-- [ ] Per-session nonce on every mutating POST (`/save`, `/factory-reset`).
-- [ ] No secret pre-fill — `wifi_pass` and `mqtt_pass` never rendered into HTML, re-entered every submission.
-- [ ] Request-body cap (2 KB, matching `MAX_BODY_LEN = 2048`), oversized bodies rejected.
-- [ ] Lengths-only logging of credential material.
-- [ ] `Cache-Control: no-store` on portal responses.
-- [ ] HTML / JSON escaping of rendered values.
-- [ ] Library never reboots and never erases on its own — host decisions via the `Committed` / `FactoryResetRequested` events.
-- [ ] Commit-guard ordering on the store (discriminator / version written last) and an open-AP warning when no AP password is set.
+- [x] Per-session nonce on every mutating POST (`/save`, `/factory-reset`) (locked by `nonce_mismatch_returns_403_without_invoking_parse_form` + `nonce_compare_is_length_independent_constant_time` in `portal.rs`).
+- [x] No secret pre-fill — `wifi_pass` and `mqtt_pass` never rendered into HTML, re-entered every submission (locked by `wifi_mqtt_template_carries_no_password_placeholder` in `provisioning-pure::templates` + `render_with_loaded_config_omits_password_bytes` in `portal.rs`).
+- [x] Request-body cap (2 KB, matching `DEFAULT_REQUEST_SIZE_CAP == 2048`), oversized bodies rejected (locked by `post_save_body_exceeding_max_body_len_returns_413` in `portal.rs` + `const _: () = assert!(DEFAULT_REQUEST_SIZE_CAP == 2048)` static assert in `portal.rs`).
+- [x] Lengths-only logging of credential material (locked by `logged_output_carries_no_credential_bytes` in `portal.rs`; grep recipe `just check-no-credential-logging` proposed for Batch F).
+- [x] `Cache-Control: no-store` on portal responses (locked by `every_built_response_carries_cache_control_no_store` in `portal.rs`).
+- [x] HTML / JSON escaping of rendered values (locked by `html_escape_covers_all_five_significant_chars` in `provisioning-pure::html_json_escape` + `render_template_escapes_every_substituted_field` in `portal.rs`).
+- [x] Library never reboots and never erases on its own — host decisions via the `Committed` / `FactoryResetRequested` events (locked by `library_does_not_call_esp_hal_reset` + `portal_handlers_do_not_call_erase_all` in `tests/library_invariants.rs`; grep recipe `just check-library-never-reboots` proposed for Batch F).
+- [x] Commit-guard ordering on the store (CRC written last, covering magic + version + discriminator + TLVs) and an open-AP warning when no AP password is set (locked by `crc_is_the_final_word_of_every_encoded_record` + `torn_write_with_valid_header_but_no_crc_decodes_as_none` in `record.rs` + `open_ap_emits_warning` in `session.rs`).
 - [x] No reflection of submitted credential values in validation errors — the `ValidationError` variants carry lengths and expectations (`TooLong { max }`, `InvalidHex { expected_len }`), never input bytes, by construction; locked by `validation_errors_carry_no_input_bytes` in `provisioning-pure::error` and the `_exhaustiveness_lock` inner fn so a future variant without coverage fails compilation.
-- [ ] Credential-holding buffers dropped as early as practical after commit or failure — honest scope: guaranteed zeroization (e.g. the `zeroize` crate) is out of scope for v1, since Rust drop semantics do not scrub memory; an early drop bounds the window but adding `zeroize` is a future hardening decision, not a promise this checklist makes.
+- [x] Credential-holding buffers dropped as early as practical after commit or failure — honest scope: guaranteed zeroization (e.g. the `zeroize` crate) is out of scope for v1, since Rust drop semantics do not scrub memory; an early drop bounds the window but adding `zeroize` is a future hardening decision, not a promise this checklist makes (locked by `req_buf_overwritten_between_requests` in `portal.rs`).
 
 ## State
 
 - [x] Design drafted (ADR 015 proposed) — 2026-06-12
 - [x] ADR 015 accepted — 2026-06-16 (de-facto by Phases 0–2A landing against ADR 015 plus the Q1+Q4 planning-gate sign-off; no separate ADR-status edit required by convention — the State checklist is the sign-off anchor)
 - [x] Open-question proposals signed off — 2026-06-16 (Q2/Q3/Q5/Q6 at the 2026-06-12 planning pass; Q1 and Q4 at the Phase 2B planning gate via `/feature` update dialog)
-- [x] Phase 0 — SoftAP (AP-mode) in `rustyfarian-esp-hal-wifi` + AP example — landed 2026-06-15 (commit `704dd85`); `hal_c3_ap_smoke` builds and runs on ESP32-C3
-- [x] Phase 1 — store module (host-tested) — landed 2026-06-15 (commit `73e45c0`); 38 host tests across `record.rs` + `store.rs`; subsequent fixup passes on 2026-06-15 / 2026-06-16 tightened decode bounds-checks, locked the on-flash layout (`record_len:u16` insertion), and closed UTF-8 / duplicate-tag / missing-required-field gaps
-- [ ] Phase 2 — portal (substrate hardening + promotion + templates) — substrate spike gate cleared 2026-06-15 with the §3 hand-rolled fallback (DHCP + DNS catch-all + HTTP server behind the `provisioning-spike` Cargo feature in `rustyfarian-esp-hal-wifi`); **Phase 2A pre-promotion hardening landed 2026-06-16 (PR #72, commits `0722f00` + `0df0e5f`)** — DHCP REQUEST lift to `decide_request`, RFC 2131 §4.3.2 lock-down tests, `SOCKET_BUF_LEN` / `SUBSTRATE_SOCKET_COUNT` / `REQUEST_BODY_DRAIN_DEADLINE_MS` constants, HTTP minimal-500 fallback + body-drain, security-marker plant, stack-footprint docs; **Phase 2B portal logic + template wiring + security-checklist conformance + promotion into `rustyfarian-esp-hal-provisioning`** remains
-- [ ] Phase 3 — examples + build routing + justfile
-- [ ] Phase 4 — docs / CHANGELOG / ROADMAP + CLAUDE-lore correction note
-- [ ] Verification gates green — `just fmt` / `just verify` / `just check-provisioning-hal-embassy` / `just build-example hal_c3_provision_mqtt` (gated on Phase 0–3 landing)
+- [x] Phase 0 — SoftAP (AP-mode) in `rustyfarian-esp-hal-wifi` + AP example — landed 2026-06-15 (squashed into commit `67cc65d` on rebase); `hal_c3_ap_smoke` builds and runs on ESP32-C3
+- [x] Phase 1 — store module (host-tested) — landed 2026-06-15 (squashed into commit `67cc65d` on rebase); 38 host tests across `record.rs` + `store.rs`; subsequent fixup passes on 2026-06-15 / 2026-06-16 tightened decode bounds-checks, locked the on-flash layout (`record_len:u16` insertion), and closed UTF-8 / duplicate-tag / missing-required-field gaps
+- [x] Phase 2 — portal (substrate hardening + promotion + templates) — substrate spike gate cleared 2026-06-15 with the §3 hand-rolled fallback (DHCP + DNS catch-all + HTTP server behind the `provisioning-spike` Cargo feature in `rustyfarian-esp-hal-wifi`); **Phase 2A pre-promotion hardening landed 2026-06-16 (PR #72, commits `5d7ec70` + `c88a1b3`)** — DHCP REQUEST lift to `decide_request`, RFC 2131 §4.3.2 lock-down tests, `SOCKET_BUF_LEN` / `SUBSTRATE_SOCKET_COUNT` / `REQUEST_BODY_DRAIN_DEADLINE_MS` constants, HTTP minimal-500 fallback + body-drain, security-marker plant, stack-footprint docs; **Phase 2B portal logic + template wiring + security-checklist conformance + promotion into `rustyfarian-esp-hal-provisioning` landed (pending Phase 2B commit)**
+- [x] Phase 3 — examples + build routing + justfile — `hal_c3_provision_mqtt` and `hal_c6_provision_mqtt` examples build clean on both chip targets (pending Phase 2B commit)
+- [x] Phase 4 — docs / CHANGELOG / ROADMAP + CLAUDE-lore correction note — Phase 2B landing (2026-06-16)
+- [x] Verification gates green — `just fmt` / `just verify` / `just check-provisioning-hal-embassy` / `just build-example hal_c3_provision_mqtt` (Phase 0–3 landed, Phase 4 in progress)
 - [ ] On-hardware captive-portal smoke test (ESP32-C3, phone browser) — trailing manual validation
 
 ## Session Log
@@ -342,10 +350,10 @@ For prior-art detail see git log (commit refs below), `docs/project-lore.md` "es
   Maintainer elevated the two load-bearing technology choices (captive-portal substrate, flash credential store) to ADR-level decisions with full comparison tables.
 - 2026-06-12 — **Two maintainer review passes** adopted 20 findings combined.
   Highlights: planning-level details relocated from ADR 015 sub-decisions into "Locked at planning pass" Decisions rows; substrate decision softened to "edge-net preferred, hand-rolled fallback proceeds without new ADR" (the locked architecture is the private-substrate boundary, not the crate family); Design reframed as candidate signatures, not API commitment; `ProvisioningOutcome { Committed, FactoryResetRequested, HostAborted }` sketched with both `wait_outcome` and `wait_committed` terminators; two secret-handling lines added to the security contract.
-- 2026-06-15 — **Phase 0 (SoftAP) + Phase 2 substrate spike** land (commits `704dd85`, `d793337`, `b808a3d`, `2342b9e`).
+- 2026-06-15 — **Phase 0 (SoftAP) + Phase 2 substrate spike** land (work later squashed into commit `67cc65d` during the 2026-06-16 rebase).
   Took the ADR 015 §3 hand-rolled fallback: three private modules (`dhcp.rs`, `dns_catchall.rs`, `http_server.rs`) behind a `provisioning-spike` Cargo feature, validated end-to-end on a real phone.
   Two non-obvious lessons recorded in `docs/project-lore.md` "esp-hal April 2026 Stack" (workspace-invariant constants bound at construction; `StaticCell<[u8; N]>` requires compile-time `N`).
-- 2026-06-15 — **Phase 1 (store module)** lands across kickoff + 3 PR review passes (final commit `73e45c0`); 38 host tests.
+- 2026-06-15 — **Phase 1 (store module)** lands across kickoff + 3 PR review passes (work later squashed into commit `67cc65d` during the 2026-06-16 rebase); 38 host tests.
   Pre-locked: `MAGIC = "RFPR"`, `LAYOUT_VER = 1`, TLV tag table, `StoreError` variants carrying lengths-and-expectations only (security-contract obligation).
   `Flash` variant carries no `F::Error` payload — avoids a viral `where F::Error: Debug` bound across every `NorFlash` impl in the dep graph.
   On-flash layout refined mid-implementation: `record_len:u16` inserted at offset 9 to disambiguate real TLVs from `0xFF` flash padding (decoder otherwise could not bound the CRC read).
@@ -355,7 +363,7 @@ For prior-art detail see git log (commit refs below), `docs/project-lore.md` "es
 - 2026-06-16 — **Spike-server pass-2** (pre-Phase 2A).
   Fixed the DHCP /24-boundary validation hole (lifted to pure `validate_pool_geometry` with host tests); cleaned 4 stale comments; cleared 9 clippy warnings that workspace `just verify` missed because `provisioning-spike` is a non-default Cargo feature.
   Phase 2A hardening list captured for later (the five items the next pass actually delivered).
-- 2026-06-16 — **Phase 2A — pre-promotion hardening** of spike substrate lands across 3 commits (PR #72: `0722f00` + `0df0e5f`); 58 → 67 tests.
+- 2026-06-16 — **Phase 2A — pre-promotion hardening** of spike substrate lands across 2 commits (PR #72: `5d7ec70` initial hardening + review fixups, `c88a1b3` pass-2 polish); 58 → 67 tests.
   DHCP REQUEST decision lift to pure `decide_request(&DhcpMessage, &mut LeaseTable, server_ip, now_secs) -> RequestOutcome { Ack, Nak, Drop, Ignore }` with 7 RFC 2131 §4.3.2 host tests including the `decide_request_nak_still_records_mac_lease` lock-down (the `# Mutation note` documents Nak-still-mutates as "preserved, not endorsed" pending Phase 2B probe/commit).
   Redundant `LeaseTable::confirm` folded away; DHCP `rx_pkt` 548 → 1024 B.
   HTTP `write_minimal_500` deterministic fallback (no more zero-byte responses) + `drain_body_with_deadline` between flush and close (RST avoidance) + `// SECURITY: never log request bodies` marker at routing dispatch + `# Stack usage` doc on `run`.
@@ -365,3 +373,10 @@ For prior-art detail see git log (commit refs below), `docs/project-lore.md` "es
 - 2026-06-16 — **Phase 2B planning gate** via `/feature` update dialog (doc-only).
   Q1 (shared templates in `provisioning-pure` as `include_str!` consts, both profiles) and Q4 (candidate builder/session signatures as binding public surface) locked as Decisions rows; ADR 015 marked accepted (de-facto, by the State-checklist-as-sign-off-anchor convention); security-checklist item 9 ticked (locked by `validation_errors_carry_no_input_bytes`).
   All 6 Open Questions are now resolved; the Phase 2B implementation contract is closed at the feature-doc level.
+- 2026-06-16 — **Session log condensed** (commit `5e88281` "Boy Scout Pass"); 444 → 367 lines, 13 entries → 7.
+  Pre-condensation detail lives in the squashed source commits (`67cc65d`, `5d7ec70`, `c88a1b3`), `docs/project-lore.md` "esp-hal April 2026 Stack", and the Decisions / Constraints / Open Questions tables above — which are the durable contract this log indexes against.
+- 2026-06-16 — **Phase 2B landing** — Batch G documentation pass.
+  Promotion of `rustyfarian-esp-hal-provisioning` v0.1.0 with all 10 security-checklist items locked by named host tests (118 unit + 2 library invariant tests pass on the host toolchain).
+  Portal HTML templates moved to `provisioning-pure::templates`, end-to-end source-of-truth for both tiers.
+  Key compromises vs the planned Q4 surface: `PortalStore` trait + `Box::leak` for 'static binding; `ap_ip` returns `[u8;4]` not `Ipv4Address` (cross-HAL compat); MAC zeroed in `ClientConnected` event pending field-name confirmation from event-info API; `SpawnFailed` variant unreachable per embassy 0.10 spec (no runtime error path).
+  CHANGELOG entries added; ROADMAP Ready band retirement; `CLAUDE.md` Common Resolution Failures row corrected (TX-power workaround is inline `extern "C" esp_wifi_set_max_tx_power` clamp, not vendor patch); AGENTS.md architecture table verified.

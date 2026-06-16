@@ -33,17 +33,21 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <input id="wifi_pass" name="wifi_pass" type="password" placeholder="required (8–64 chars), leave blank for open networks" maxlength="64" minlength="8" title="Leave blank for an open network, otherwise 8–64 characters (WPA2-Personal minimum is 8).">
 <p class="hint">Leave blank for an open network, otherwise 8–64 characters.</p>
 
-<label for="dev_eui">LoRaWAN DevEUI</label>
-<input id="dev_eui" name="dev_eui" value="{{DEV_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}" title="16 hex characters, MSB-first. Example: 0102030405060708">
-<p class="hint">16 hex characters, MSB-first. Example: <code>0102030405060708</code>.</p>
+<label for="mqtt_uri">MQTT broker URI</label>
+<input id="mqtt_uri" name="mqtt_uri" value="{{MQTT_URI}}" placeholder="mqtt://broker.local:1883" maxlength="96" title="Plain mqtt:// only, with host and port. Example: mqtt://broker.local:1883">
+<p class="hint">Plain mqtt:// only, host and port. Example: <code>mqtt://broker.local:1883</code>.</p>
 
-<label for="join_eui">LoRaWAN JoinEUI</label>
-<input id="join_eui" name="join_eui" value="{{JOIN_EUI}}" maxlength="16" pattern="[0-9A-Fa-f]{16}" title="16 hex characters, MSB-first. Example: 70B3D57ED0000000">
-<p class="hint">16 hex characters, MSB-first. Example: <code>70B3D57ED0000000</code>.</p>
+<label for="mqtt_user">MQTT username</label>
+<input id="mqtt_user" name="mqtt_user" value="{{MQTT_USER}}" maxlength="64" title="Optional. Leave blank for an anonymous connection.">
+<p class="hint">Optional. Leave blank for an anonymous connection.</p>
 
-<label for="app_key">LoRaWAN AppKey</label>
-<input id="app_key" name="app_key" type="password" placeholder="required" maxlength="32" pattern="[0-9A-Fa-f]{32}" title="32 hex characters. Example: 0102030405060708090A0B0C0D0E0F10">
-<p class="hint">32 hex characters. Example: <code>0102030405060708090A0B0C0D0E0F10</code>.</p>
+<label for="mqtt_pass">MQTT password</label>
+<input id="mqtt_pass" name="mqtt_pass" type="password" placeholder="optional, re-enter each time" maxlength="64" title="Optional. Never pre-filled — re-enter on every submission.">
+<p class="hint">Optional. Never pre-filled — re-enter on every submission.</p>
+
+<label for="mqtt_client">MQTT client ID</label>
+<input id="mqtt_client" name="mqtt_client" value="{{MQTT_CLIENT}}" maxlength="23" title="Optional, at most 23 characters. Leave blank to let the firmware derive one.">
+<p class="hint">Optional, at most 23 characters. Blank lets the firmware derive one.</p>
 
 <label for="ota_url">OTA update URL</label>
 <input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128">
@@ -53,6 +57,7 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <input id="dev_name" name="dev_name" value="{{DEV_NAME}}" maxlength="24">
 
 <button class="primary" type="submit">Save and restart</button>
+<p class="hint">Firmware version: {{FW_VER}}</p>
 </form>
 
 <hr>
