@@ -114,9 +114,10 @@ async fn main(spawner: Spawner) {
     } = handle;
 
     // Three socket-owning tasks (dhcp/http/dns) plus the net runner.  This
-    // matches the `StackResources::<4>` capacity in `init_softap_async` — three
-    // sockets + one spare.  A fourth substrate task that opens a socket would
-    // exhaust the table; bump the `<N>` in lockstep with any addition here.
+    // matches the `SUBSTRATE_SOCKET_COUNT` invariant in the parent crate
+    // (3 sockets + 1 spare).  A fourth substrate task that opens a socket
+    // would exhaust the `StackResources` — bump the constant at its
+    // single source of truth, not here.
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(wifi_task(controller).unwrap());
     spawner.spawn(dhcp_task(stack).unwrap());
