@@ -54,6 +54,21 @@ pub use wifi_pure::{
     POLL_INTERVAL_MS, SSID_MAX_LEN,
 };
 
+/// `embassy-net` `StackResources<N>` size for the SoftAP scaffold.
+///
+/// The AP `embassy-net` stack opened by [`WiFiManager::init_softap_async`]
+/// must reserve one socket slot per long-lived substrate task plus one
+/// spare.  The three `provisioning-spike` modules each own one socket:
+/// `dhcp::run` (UDP), `dns_catchall::run` (UDP), `http_server::run` (TCP).
+/// Adding a fourth substrate task that opens a socket must bump this
+/// constant in lockstep — `embassy-net` returns `SocketAlreadyOpen` /
+/// `OutOfResources` on exhaustion rather than blocking.
+///
+/// Promoted from a magic `4` in the second-pass PR review of #72 so the
+/// invariant is enforced at the source rather than via parallel comments
+/// in the example and the driver.
+pub const SUBSTRATE_SOCKET_COUNT: usize = 4;
+
 pub use pennant::{NoLed, SimpleLed, StatusLed};
 
 // ─── ActiveLowLed ──────────────────────────────────────────────────────────
@@ -494,7 +509,8 @@ mod driver {
 
     // Separate StaticCell for the AP stack so calling both `init_async` and
     // `init_softap_async` in one boot does not panic on the second `.init()`.
-    static AP_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    static AP_RESOURCES: StaticCell<StackResources<{ crate::SUBSTRATE_SOCKET_COUNT }>> =
+        StaticCell::new();
 
     impl WiFiManager {
         /// Initialises the scheduler and the Wi-Fi radio in SoftAP mode, applies
@@ -610,19 +626,12 @@ mod driver {
             );
 
             // 5. Build the embassy-net stack with a static AP IP.
-            //    `StackResources::<4>` — DHCP server (UDP) + DNS (UDP) + HTTP (TCP)
-            //    + one spare — covers the Phase 2 spike substrate without needing
-            //    the caller to rebuild the stack.
-            //
-            //    INVARIANT: this `<4>` is coupled to the three sockets opened by
-            //    the spike modules (`dhcp::run`, `dns_catchall::run`,
-            //    `http_server::run`).  Spawning a fourth substrate task that opens
-            //    a socket will exhaust the table silently — `embassy-net` returns
-            //    `SocketAlreadyOpen` / `OutOfResources` rather than blocking.
-            //    Bump this number in lockstep with any new long-lived socket the
-            //    AP scaffold owns (and update the matching comment at the spawn
-            //    site in `examples/hal_c3_ap_smoke.rs`).
-            let resources = AP_RESOURCES.init(StackResources::<4>::new());
+            //    The capacity is `SUBSTRATE_SOCKET_COUNT` (DHCP UDP + DNS UDP +
+            //    HTTP TCP + one spare); see the crate-root constant for the full
+            //    coupling rationale.  A future fourth substrate task that opens
+            //    a socket must bump the constant in lockstep.
+            let resources =
+                AP_RESOURCES.init(StackResources::<{ crate::SUBSTRATE_SOCKET_COUNT }>::new());
 
             let seed = esp_hal::time::Instant::now()
                 .duration_since_epoch()

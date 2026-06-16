@@ -59,7 +59,22 @@ const BOOTP_FIXED_LEN: usize = 236;
 /// DHCP magic cookie appended immediately after the BOOTP header.
 const MAGIC_COOKIE: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
 /// Packet buffer size — 548 bytes (BOOTP 236 + magic 4 + options 308).
+///
+/// Used by the encode helpers and the on-stack `tx_pkt`; the server only
+/// emits OFFER, ACK, and NAK with a fixed option set well under this cap.
 pub(crate) const PACKET_BUF: usize = 548;
+
+/// Per-direction UDP socket buffer length (bytes), shared by the
+/// `StaticCell` RX/TX buffers passed to `UdpSocket::new` and by the
+/// on-stack `rx_pkt` array the loop reads into.
+///
+/// Keeping the two coupled at the source — rather than via comments — means
+/// a future tuning pass cannot raise one without raising the other and
+/// silently reintroducing the 548-vs-1024 truncation hazard the Phase 2A
+/// hardening closed.  Option-heavy DHCP REQUESTs (DDNS, vendor-class
+/// identifiers, PXE) routinely exceed the BOOTP 548-byte minimum, so the
+/// receive buffer must match the socket buffer exactly.
+pub(crate) const SOCKET_BUF_LEN: usize = 1024;
 
 /// BOOTP op-codes.
 pub(crate) const OP_REQUEST: u8 = 1;
@@ -739,14 +754,27 @@ pub(crate) enum RequestOutcome {
 ///      different one → [`RequestOutcome::Nak`].
 ///    - On pool exhaustion → [`RequestOutcome::Nak`].
 ///
-/// # Mutation note
+/// # Mutation note — NAK-still-mutates is **preserved, not endorsed**
 ///
 /// This function takes `&mut LeaseTable` because [`LeaseTable::allocate`]
-/// mutates the table (claims a slot) even on the [`RequestOutcome::Nak`]
-/// path.  This preserves the prior spike behaviour where a NAK'd REQUEST
-/// still records the offered slot under the client's MAC, so the next
-/// DISCOVER from the same MAC resolves to the same address.  Decoupling
-/// candidate-lookup from commit is a Phase 2B follow-up.
+/// mutates the table (claims a slot) even when this function returns
+/// [`RequestOutcome::Nak`].
+///
+/// **This is temporary, not the long-term design.**  The current shape
+/// preserves the prior spike behaviour where a NAK'd REQUEST still
+/// records the offered slot under the client's MAC, so the next DISCOVER
+/// from that MAC resolves to the same address (a happy-accident recovery
+/// for malformed clients).  The behaviour is locked by the
+/// `decide_request_nak_still_records_mac_lease` host test so any change
+/// fails CI loudly rather than drifting silently.
+///
+/// Phase 2B portal promotion will decouple candidate-lookup from commit
+/// (introduce `LeaseTable::probe` + `LeaseTable::commit_lease`); at that
+/// point this function becomes side-effect-free on Nak/Drop/Ignore and
+/// the lock-down test will be updated to assert the absence of the
+/// mutation.  Until then: do not rely on this side effect outside the
+/// happy-accident recovery, and do not extend the spike with new logic
+/// that would compound the surprise.
 pub(crate) fn decide_request(
     msg: &DhcpMessage,
     leases: &mut LeaseTable,
@@ -885,14 +913,14 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
     // `embassy-net 0.8` internally transmutes the buffer slices to `'static`
     // (see `embassy_net::udp::UdpSocket::new` safety contract).
     static RX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
-    static RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; SOCKET_BUF_LEN]> = StaticCell::new();
     static TX_META: StaticCell<[PacketMetadata; 4]> = StaticCell::new();
-    static TX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    static TX_BUF: StaticCell<[u8; SOCKET_BUF_LEN]> = StaticCell::new();
 
     let rx_meta = RX_META.init([PacketMetadata::EMPTY; 4]);
-    let rx_buf = RX_BUF.init([0u8; 1024]);
+    let rx_buf = RX_BUF.init([0u8; SOCKET_BUF_LEN]);
     let tx_meta = TX_META.init([PacketMetadata::EMPTY; 4]);
-    let tx_buf = TX_BUF.init([0u8; 1024]);
+    let tx_buf = TX_BUF.init([0u8; SOCKET_BUF_LEN]);
 
     let mut sock = UdpSocket::new(stack, rx_meta, rx_buf, tx_meta, tx_buf);
 
@@ -911,19 +939,17 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
         }
     }
 
-    // `rx_pkt` matches the underlying UDP socket RX buffer (1024 B), not the
-    // 548-byte BOOTP minimum — option-heavy DHCP REQUESTs (DDNS, vendor-class
-    // identifiers, PXE options) can exceed 548 B in the wild.  `embassy-net`
-    // `recv_from` copies `min(datagram, buf)` and reports the actual `n`, so
-    // a too-small `rx_pkt` would silently truncate a >548-byte datagram
-    // before the decoder ever saw it.  Cost: ~500 B additional task stack;
-    // acceptable given the ~4 KiB headroom on the dhcp_task stack.
+    // `rx_pkt` is sized to `SOCKET_BUF_LEN` — the same constant that backs
+    // the static UDP socket buffer above — so a future tuning pass cannot
+    // raise the socket buffer without also raising the on-stack `rx_pkt`
+    // and silently reintroducing the 548-vs-1024 truncation hazard.
+    // `embassy-net` `recv_from` copies `min(datagram, rx_pkt)` and reports
+    // the actual `n`, so the two must stay equal.
     //
     // `tx_pkt` stays at the BOOTP cap — the server only emits OFFER, ACK, and
     // NAK with the fixed option set encoded by `encode_offer_or_ack` /
     // `encode_nak`, all well under 548 B.
-    const DHCP_RX_BUF: usize = 1024;
-    let mut rx_pkt = [0u8; DHCP_RX_BUF];
+    let mut rx_pkt = [0u8; SOCKET_BUF_LEN];
     let mut tx_pkt = [0u8; PACKET_BUF];
     let mut leases = LeaseTable::new(config.pool_start, config.lease_secs);
 
@@ -1018,9 +1044,18 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
 
             MSG_REQUEST => match decide_request(&msg, &mut leases, server_ip, now_secs) {
                 RequestOutcome::Ignore => {
+                    // `decide_request` returns `Ignore` only when Option 54
+                    // was present and did not match `server_ip`, so the
+                    // `unwrap_or` arm of the format below is unreachable;
+                    // it exists so the log call never panics if the
+                    // decision tree gains a new path that maps to Ignore.
                     log::trace!(
-                        "DHCP REQUEST for different server — ignoring (chaddr={:02x?})",
-                        msg.chaddr
+                        "DHCP REQUEST for different server (client_server_id={}, local_server_ip={}) — ignoring (chaddr={:02x?})",
+                        msg.options
+                            .server_id
+                            .unwrap_or(Ipv4Addr::new(0, 0, 0, 0)),
+                        server_ip,
+                        msg.chaddr,
                     );
                 }
                 RequestOutcome::Drop => {
@@ -1650,6 +1685,40 @@ mod tests {
         assert_eq!(
             decide_request(&msg, &mut table, SERVER_IP, 0),
             RequestOutcome::Nak
+        );
+    }
+
+    /// Lock the temporary "Nak-still-mutates-leases" side effect.
+    ///
+    /// See `decide_request` # Mutation note: `allocate` writes a slot
+    /// under the client's MAC even when the response is Nak, because the
+    /// spike preserves prior behaviour where a malformed REQUEST gets
+    /// happy-accident recovery from the next DISCOVER.  Phase 2B will
+    /// introduce probe/commit; until then this test pins the current
+    /// behaviour so any silent drift fails CI loudly.
+    #[test]
+    fn decide_request_nak_still_records_mac_lease() {
+        let mut table = LeaseTable::new(POOL_START, LEASE_SECS);
+        let mac = [0xAB, 0xAD, 0xCA, 0xFE, 0x00, 0x01];
+        let out_of_pool = Ipv4Addr::new(192, 168, 4, 99);
+
+        let msg = make_request(
+            mac,
+            Ipv4Addr::new(0, 0, 0, 0),
+            Some(out_of_pool),
+            Some(SERVER_IP),
+        );
+        assert_eq!(
+            decide_request(&msg, &mut table, SERVER_IP, 0),
+            RequestOutcome::Nak
+        );
+        // Side effect we are pinning here: even though the response is
+        // Nak, `allocate` claimed a pool slot under the client's MAC.
+        // Phase 2B probe/commit will replace this assertion with
+        // `assert!(table.find_by_mac(&mac).is_none())`.
+        assert!(
+            table.find_by_mac(&mac).is_some(),
+            "spike preserves Nak-still-mutates-leases (see `decide_request` # Mutation note); Phase 2B will introduce probe/commit"
         );
     }
 

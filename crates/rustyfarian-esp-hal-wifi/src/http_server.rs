@@ -73,6 +73,19 @@ const DEFAULT_RX_BUF: usize = 1024;
 /// Default socket transmit buffer size.
 const DEFAULT_TX_BUF: usize = 2048;
 
+/// Deadline for draining an unread request body after the response is
+/// written and before [`embassy_net::tcp::TcpSocket::close`] is called.
+///
+/// Trade-off: a longer deadline gives a slow client more chance to deliver
+/// its full body so the client-visible teardown is FIN (clean) rather than
+/// RST (which some browsers surface as "connection reset" instead of the
+/// response we just wrote).  The cost is that the single TCP socket
+/// remains pinned for up to this duration before the loop accepts the
+/// next connection.  500 ms picked so a phone on the captive portal
+/// almost never stalls long enough to be noticeable while still bounding
+/// the worst-case wedge from a stuck client.
+const REQUEST_BODY_DRAIN_DEADLINE_MS: u64 = 500;
+
 // ── SoftAP spike HTML page ────────────────────────────────────────────────────
 
 /// HTML body served at `GET /`.
@@ -876,7 +889,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: HttpServerConfig) -
                 drain_body_with_deadline(
                     &mut socket,
                     remaining,
-                    embassy_time::Duration::from_millis(500),
+                    embassy_time::Duration::from_millis(REQUEST_BODY_DRAIN_DEADLINE_MS),
                 )
                 .await;
             }
@@ -1295,6 +1308,29 @@ mod tests {
         );
         assert!(resp.contains("Content-Length: 0\r\n"));
         assert!(resp.contains("Connection: close\r\n"));
+        assert!(resp.ends_with("\r\n\r\n"));
+    }
+
+    /// Integration: when `route` cannot fit the real response into the caller's
+    /// buffer, the production fallback writes `MINIMAL_500` instead of leaving
+    /// the buffer at length 0 and silently closing.  Locks the
+    /// `route(...).unwrap_or_else(|()| write_minimal_500(...))` path in
+    /// `run` end-to-end without touching the network stack.
+    #[test]
+    fn route_response_too_large_falls_back_to_minimal_500() {
+        let raw = b"GET / HTTP/1.1\r\nHost: 192.168.4.1\r\n\r\n";
+        let req = parse_request(raw, DEFAULT_REQUEST_SIZE_CAP).unwrap();
+        // resp_buf is too small to hold the real portal HTML response
+        // (INDEX_HTML alone is ~250 bytes; full response is ~400+) but is
+        // still larger than MINIMAL_500 (~80 bytes), so the fallback fits.
+        let mut resp_buf = [0u8; 128];
+        let n = route(&req, &mut resp_buf).unwrap_or_else(|()| write_minimal_500(&mut resp_buf));
+        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "expected minimal 500 fallback, got: {}",
+            resp
+        );
         assert!(resp.ends_with("\r\n\r\n"));
     }
 
