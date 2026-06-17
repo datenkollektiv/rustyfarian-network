@@ -485,3 +485,30 @@ The SX1262 datasheet (§13.3.6, Rev 2.2) documents that when `SetDIO3AsTCXOCtrl`
 **Also: TCXO startup delay was increased from 5 ms to 10 ms** as a conservative cold-start margin. The Heltec V3 TCXO is rated ≤2 ms, but 10 ms gives 5× headroom against oscillator startup jitter; the field is internal to the chip and does not extend the BUSY-wait — it tells the SX1262 how long to wait internally before driving any XOSC-dependent operation after the TCXO power rail is enabled.
 
 Fix is in: `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`, functions `init_sx1262` and `wait_busy_spi`.
+
+---
+
+## LoRaWAN OTAA Join (TTN EU868) — RX path & driver loop
+
+First successful OTAA join on hardware: Heltec WiFi LoRa 32 V3, `sx126x 0.3`, `lorawan-device 0.12.2`, ESP-IDF v5.3.3, TTN EU868. These five facts each cost multiple flash cycles to find; the radio bring-up being correct is not enough — RX delivery and timing dominate.
+
+**`esp-idf-hal` `PinDriver` GPIO interrupts are ONE-SHOT — poll the SX1262 IRQ register instead of relying on the DIO1 edge.**
+The driver auto-disables the interrupt on every firing (to avoid IWDT loops) and requires `enable_interrupt()` to be re-armed from a *non-ISR* context after each notification.
+Symptom: DIO1 delivered exactly one edge per boot (the TxDone), and every subsequent RxDone was missed — the radio had `rx_done=true` latched in its IRQ register (visible only via a polled read at window teardown) but the firmware's DIO1-driven loop never saw it, so the join-accept was received-but-undelivered.
+Because the DIO1 `PinDriver` is moved into the `SX126x` driver and cannot be re-armed from the event loop, the fix is to **poll `get_irq_status()` over SPI each loop tick** and deliver `RadioEvent(Phy)` when RxDone/TxDone/Timeout/CrcErr is set — see `EspIdfLoraRadio::irq_pending` / `LoraRadioAdapter::irq_pending` and the loop in `examples/idf_esp32s3_join.rs`. Polling GetIrqStatus is safe to issue while the radio is in RX.
+This was the final blocker; it masked every earlier "no DIO1 during RX" symptom. Refs: esp-rs `PinDriver` docs, esp-idf-hal issue #349.
+
+**`lorawan-device 0.12` `Response::TimeoutRequest(ms)` is an ABSOLUTE timestamp (`TimestampMs`), not a relative delay.**
+The driver loop must assign `next_timeout = ms`, never `elapsed + ms`. Adding `elapsed` opens RX1/RX2 roughly twice as late and the join-accept is missed.
+Confirmed in `nb_device/mod.rs:125` (`TimeoutRequest(TimestampMs)`) and the crate's own tests asserting `TimeoutRequest(5000/5100/6000/6100)` — absolute RX1 open/close, RX2 open/close stamps in the device timeline (epoch ≈ TX start).
+
+**An SF12 join-accept cannot be received in RX1 — join at a faster data rate.**
+`lorawan-device` hard-caps the RX1 window close at the inter-window gap: `min(get_rx_window_duration_ms, t_rx2 − t_rx1)` = 1000 ms for EU868 OTAA (`nb_device::state::WaitingForRx`). It issues `CancelRx` at that close, aborting reception mid-packet. An SF12 accept (with TTN's CFList, ~1.8 s airtime) can never complete in 1000 ms — the radio detects the preamble (`preamble=true`) and is then torn down.
+Fix: `device.set_datarate(region::DR::_5)` (SF7/BW125) **before** `device.join(...)`. At SF7 the accept is ~70 ms and fits RX1 comfortably; RX2 stays SF12/869.525 and only it benefits from a large `RX_WINDOW_DURATION_MS` (set to 3000) — RX1 is auto-capped, so the long duration extends only RX2 (no overlap). TTN alternates RX1/RX2 by gateway duty-cycle (868.x is the 1 % band, 869.525 the 10 % band), so both windows must work.
+
+**LoRaWAN downlinks carry no PHY-layer CRC — RX packet params must use `LoRaCrcType::CrcOff`.**
+TX (uplink) keeps `CrcOn`. With CRC on for RX, the SX1262 mis-handles the absent CRC bytes. Set `CrcOff` only in `prepare_rx`. (Downlinks also use inverted IQ — `LoRaInvertIq::Inverted` — which matches the gateway's `invert_polarization=true`; that part was already correct.)
+
+**Compile-time credentials via `option_env!` need explicit `.env` wiring or the device silently transmits all-zero EUIs.**
+Three independent gaps caused a join-request with `dev_eui=0000000000000000` (TTN ignores it, no accept): (1) the justfile must `set dotenv-load`; (2) the `.env` keys must be named `LORAWAN_DEV_EUI` / `LORAWAN_APP_EUI` / `LORAWAN_APP_KEY` — the old template used `LORA_*` (no "WAN"), so `option_env!("LORAWAN_*")` resolved to `None`; (3) `build.rs` must declare `cargo:rerun-if-env-changed=LORAWAN_*` because Cargo does not track env vars used by `option_env!`/`env!`, so changing a credential otherwise reuses a stale binary.
+EUIs are entered MSB-first (TTN display order); the example `.reverse()`s DevEUI and AppEUI before `DevEui::from`/`AppEui::from`; AppKey is unchanged. JoinEUI/AppEUI all-zeros is valid in TTN. A `build.rs` `cargo:warning` now flags empty/all-zero credentials at build time. `.env` is gitignored (public repo) and must stay so.
