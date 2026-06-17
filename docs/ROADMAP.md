@@ -40,6 +40,7 @@ timeline
               : LED/timeout dedup — extract the shared status-LED pulse + timeout-poll loop duplicated between rustyfarian-esp-idf-wifi (blocking vs LED paths) and MqttBuilder.build_and_wait into one helper
               : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
               : CI hardware-tier build job — compile one example per tier (Xtensa IDF + bare-metal) in CI to close the just-verify blind spot
+              : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
               : rustyfarian-esp-idf-provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)

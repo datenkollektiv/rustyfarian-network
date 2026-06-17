@@ -54,6 +54,7 @@ Pure crates iterate fast without the ESP toolchain — see `just check-wifi-pure
 - **Feature documents** in `docs/features/` track in-progress work across sessions; start from `docs/features/000-template.md`.
 - **Project lore** in `docs/project-lore.md` records non-obvious technical discoveries (failures that took >15 min to diagnose, or root causes not obvious from the error message). Read it before debugging anything ESP-IDF / `esp-hal` / LoRaWAN.
 - **Cross-repo git deps** must be pinned with `tag` or `rev` — the workspace pulls in `links = "..."` crates that fail to resolve if upstream bumps without coordination.
+- **Never commit real credentials — not even in example doc comments.** This is a public repo. Real LoRaWAN keys (`AppKey`), Wi-Fi PSKs, and tokens must live only in the git-ignored `.env`, never in `.rs` / `.md` source. Setup examples must use obvious placeholders (`0123456789ABCDEF`, `00112233445566778899AABBCCDDEEFF`, all-zeros) — a realistic-looking key in a doc comment reads as real and gets indexed by secret scanners. A DevEUI/JoinEUI is a device identifier (not secret) but should also be a placeholder so docs do not point at a live device. If a real secret is ever committed, treat it as compromised: rotate it at the source (TTN, AP) first; scrubbing the file does not un-publish pushed history.
 - **License:** dual MIT / Apache-2.0 (see `LICENSE`).
 
 ## Coding Principles

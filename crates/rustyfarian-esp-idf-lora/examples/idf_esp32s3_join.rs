@@ -15,9 +15,9 @@
 //! 2. Fill in the `.env` file at the workspace root:
 //!
 //! ```sh
-//! LORAWAN_DEV_EUI=70B3D57ED00762C6
-//! LORAWAN_APP_EUI=0000000000000002
-//! LORAWAN_APP_KEY=A14D11AAA39713873E07E5CBC990832F
+//! LORAWAN_DEV_EUI=0123456789ABCDEF
+//! LORAWAN_APP_EUI=0000000000000000
+//! LORAWAN_APP_KEY=00112233445566778899AABBCCDDEEFF
 //! ```
 //!
 //! 3. Build and flash:
@@ -77,6 +77,19 @@ use rustyfarian_esp_idf_lora::{
 
 /// DIO1 rising-edge flag — set by ISR, cleared by main loop after delivery.
 static DIO1_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Data rate used for the OTAA join.
+///
+/// `DR5` (SF7/BW125) is chosen for **local-gateway validation**: an SF12 (`DR0`,
+/// the EU868 default) join-accept is ~1.8 s of airtime, but lorawan-device hard-caps
+/// the RX1 window at the RX1→RX2 gap (`min(duration, 1000 ms)` for EU868 OTAA), so an
+/// SF12 accept can never complete inside RX1. At SF7 the accept is ~70 ms and fits RX1
+/// with margin. RX2 stays SF12/869.525 and is covered by `RX_WINDOW_DURATION_MS`.
+///
+/// This bakes in a short-range assumption (a strong local link). For **range testing**,
+/// prefer `DR0` (SF12) and ensure the gateway schedules the accept on RX2, or accept that
+/// RX1 will not complete at long range.
+const JOIN_DR: region::DR = region::DR::_5;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -179,17 +192,10 @@ fn main() -> anyhow::Result<()> {
         appkey: AppKey::from(lora_config.app_key),
     };
 
-    // Join at DR5 (SF7/BW125) instead of the EU868 default DR0 (SF12).
-    //
-    // Why: an SF12 join-accept is ~1.8 s of airtime, but lorawan-device hard-caps
-    // the RX1 window at the RX1->RX2 gap (min(duration, 1000 ms) for EU868 OTAA),
-    // so an SF12 accept can never complete inside RX1 — when TTN schedules the
-    // accept on RX1 (868.x, +5 s) the device only ever sees `preamble=true` then
-    // the window is torn down. At SF7 the accept is ~70 ms and fits RX1 with
-    // margin. RX2 is always SF12/869.525 and is covered by RX_WINDOW_DURATION_MS.
-    // The test link is very strong (RSSI ~-32 dBm, SNR +13), so SF7 is ample.
-    device.set_datarate(region::DR::_5);
-    log::info!(target: tag, "Join data rate set to DR5 (SF7/BW125)");
+    // See `JOIN_DR` for why DR5 (SF7/BW125) is used for local-gateway validation
+    // and when DR0 (SF12) is preferable for range testing.
+    device.set_datarate(JOIN_DR);
+    log::info!(target: tag, "Join data rate set to {:?} (DR5 = SF7/BW125)", JOIN_DR);
 
     let mut response = device
         .join(join_mode)
@@ -204,7 +210,7 @@ fn main() -> anyhow::Result<()> {
         // makes RX1/RX2 open on time; adding `elapsed` opens them ~2x too late
         // and the join-accept is missed. See lorawan-device nb_device::Response.
         next_timeout_ms = ms;
-        log::info!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
+        log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
         response = Response::NoUpdate;
     }
 
@@ -223,7 +229,7 @@ fn main() -> anyhow::Result<()> {
         // delivered edge is not left pending.
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
         if dio1_edge || device.get_radio().irq_pending() {
-            log::info!(target: tag, "radio IRQ at {}ms", elapsed_ms);
+            log::debug!(target: tag, "radio IRQ at {}ms", elapsed_ms);
             response = device
                 .handle_event(Event::RadioEvent(LdRadioEvent::Phy(())))
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -232,7 +238,7 @@ fn main() -> anyhow::Result<()> {
         // Timing tick — deliver timeout when the deadline has elapsed.
         if elapsed_ms >= next_timeout_ms && next_timeout_ms > 0 {
             let late_ms = elapsed_ms.saturating_sub(next_timeout_ms);
-            log::info!(
+            log::debug!(
                 target: tag,
                 "Timeout fired at {}ms (deadline {}ms, {}ms late)",
                 elapsed_ms, next_timeout_ms, late_ms
@@ -255,7 +261,7 @@ fn main() -> anyhow::Result<()> {
             Response::TimeoutRequest(ms) => {
                 // Absolute timestamp in the device timeline — assign, don't add.
                 next_timeout_ms = *ms;
-                log::info!(target: tag, "RX window scheduled at {}ms (absolute)", *ms);
+                log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", *ms);
                 response = Response::NoUpdate;
             }
             Response::JoinRequestSending => {
@@ -264,7 +270,7 @@ fn main() -> anyhow::Result<()> {
             }
             Response::NoUpdate => {}
             other => {
-                log::info!(target: tag, "response: {:?}", other);
+                log::debug!(target: tag, "response: {:?}", other);
                 response = Response::NoUpdate;
             }
         }
