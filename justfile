@@ -5,6 +5,9 @@
 # test on any host without the ESP toolchain.
 # Run `just setup-cargo-config` to create the local cargo config.
 
+# load .env file (LoRaWAN and WiFi credentials, MQTT config)
+set dotenv-load := true
+
 # list available recipes (default)
 _default:
     @just --list

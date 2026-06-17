@@ -294,6 +294,6 @@ mod tests {
     fn timing_defaults() {
         let radio = MockLoraRadio::new();
         assert_eq!(radio.rx_window_offset_ms(), -500);
-        assert_eq!(radio.rx_window_duration_ms(), 800);
+        assert_eq!(radio.rx_window_duration_ms(), 3000);
     }
 }
