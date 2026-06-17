@@ -51,16 +51,19 @@
 //! `prepare_rx` sets the inverted flag before each RX window.
 //! `prepare_tx` restores standard IQ before each uplink.
 
-use embedded_hal::digital::OutputPin;
+use embedded_hal::{
+    digital::OutputPin,
+    spi::{ErrorType, Operation, SpiDevice},
+};
 use esp_idf_hal::{
+    delay::FreeRtos,
     gpio::{GpioError, Input, Output, PinDriver},
     spi::{SpiDeviceDriver, SpiDriver},
 };
 use sx126x::{
     calc_rf_freq,
-    conf::Config,
     op::{
-        calib::CalibParam,
+        calib::{CalibImageFreq, CalibParam},
         irq::{IrqMask, IrqMaskBit},
         modulation::{LoRaBandWidth, LoRaSpreadFactor, LoraCodingRate, LoraModParams},
         packet::{LoRaCrcType, LoRaHeaderType, LoRaInvertIq, LoRaPacketParams, PacketType},
@@ -76,7 +79,105 @@ use lora_pure::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
 };
 
-// ─── Error type ───────────────────────────────────────────────────────────────
+// ─── FullDuplexDevice SPI wrapper ─────────────────────────────────────────────
+
+/// Adapts an `SpiDevice` for the ESP-IDF full-duplex constraint.
+///
+/// The ESP-IDF SPI master driver (`spi_master.c:check_trans_valid`) rejects any
+/// transaction where `rxlength > txlength` in full-duplex mode.  When esp-idf-hal
+/// translates an embedded-hal `Operation::Read(buf)` into an `spi_transaction_t`,
+/// it sets `rx_buffer = buf` and `tx_buffer = NULL` while `length = rxlength =
+/// buf.len() * 8`.  Logically `rxlength == length`, so the check should pass —
+/// but in practice the ESP32-S3 SPI peripheral rejects the transaction with
+/// `rx length > tx length in full duplex mode` (observed during `sx126x::init()`
+/// at around t=404 ms from boot on Heltec WiFi LoRa 32 V3).
+///
+/// Root cause: the ESP-IDF C driver does not fully support `tx_buffer = NULL` with
+/// `length > 0` in full-duplex mode on ESP32-S3.  A null TX buffer collapses the
+/// effective TX length to zero, which then violates `rxlength <= txlength`.
+///
+/// Fix: translate every `Operation::Read(buf)` into
+/// `Operation::Transfer(buf, &[0u8; buf.len()])`.  This provides a real (zeroed)
+/// TX buffer of equal length to the RX buffer, satisfying the full-duplex
+/// constraint.  The SX1262 ignores MOSI during read phases, so sending 0x00 bytes
+/// on MOSI has no effect on correctness.
+///
+/// `TransferInPlace` (used by `sx126x` for `get_status`, `get_device_errors`, etc.)
+/// already provides a real TX buffer and is not affected.
+pub(crate) struct FullDuplexDevice<SPI> {
+    inner: SPI,
+}
+
+impl<SPI> FullDuplexDevice<SPI> {
+    pub(crate) fn new(inner: SPI) -> Self {
+        Self { inner }
+    }
+}
+
+impl<SPI: ErrorType> ErrorType for FullDuplexDevice<SPI> {
+    type Error = SPI::Error;
+}
+
+impl<SPI: SpiDevice> SpiDevice for FullDuplexDevice<SPI> {
+    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        // Fast path: if no Operation::Read is present, forward the original slice
+        // directly without any heap allocation.
+        //
+        // This path is critical for correctness: sx126x::reset() calls
+        // spi.transaction(&mut [Operation::DelayNs(200_000)]) inside
+        // critical_section::with (interrupts disabled, FreeRTOS scheduler
+        // suspended).  Heap allocation (Vec) inside an ESP-IDF critical section
+        // deadlocks the main task — the heap lock is held by the allocator, and
+        // no other task can release it while the scheduler is suspended.
+        //
+        // All Write, TransferInPlace, and DelayNs operations take this path and
+        // pay zero allocation cost.
+        if !operations.iter().any(|op| matches!(op, Operation::Read(_))) {
+            return self.inner.transaction(operations);
+        }
+
+        // Slow path: at least one Read is present.  All Read call sites in
+        // sx126x 0.3 (read_register, read_buffer, get_irq_status,
+        // get_packet_status, get_rx_buffer_status, get_device_errors) are NOT
+        // wrapped in critical_section::with, so Vec allocation here is safe.
+        //
+        // Allocate a single zeroed scratch buffer sized to the largest Read in
+        // this transaction.  Every Read borrows this buffer immutably (it is
+        // only ever written from the SX1262 side), so one allocation covers all
+        // Reads.  Do NOT cap at a small constant — read_buffer() can fetch a
+        // full 255-byte LoRaWAN downlink, and a TX slice shorter than the RX
+        // buffer would re-trigger the `rx length > tx length` error this wrapper
+        // exists to prevent.
+        let max_read_len = operations
+            .iter()
+            .filter_map(|op| {
+                if let Operation::Read(buf) = op {
+                    Some(buf.len())
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let zeroes = vec![0u8; max_read_len];
+
+        // Build a rewritten operation list.  Translate every Read → Transfer
+        // with a zeroed TX slice to satisfy the ESP-IDF full-duplex constraint
+        // (rxlength must not exceed txlength).  All other variants pass through.
+        let mut rewritten: Vec<Operation<'_, u8>> = Vec::with_capacity(operations.len());
+        for op in operations.iter_mut() {
+            rewritten.push(match op {
+                Operation::Read(buf) => Operation::Transfer(buf, &zeroes[..buf.len()]),
+                Operation::Write(buf) => Operation::Write(buf),
+                Operation::Transfer(r, w) => Operation::Transfer(r, w),
+                Operation::TransferInPlace(buf) => Operation::TransferInPlace(buf),
+                Operation::DelayNs(ns) => Operation::DelayNs(*ns),
+            });
+        }
+
+        self.inner.transaction(&mut rewritten)
+    }
+}
 
 /// Error type for [`EspIdfLoraRadio`] operations.
 #[derive(Debug)]
@@ -116,7 +217,8 @@ impl core::fmt::Display for LoraError {
 
 // ─── Type aliases ─────────────────────────────────────────────────────────────
 
-type SpiBus<'d> = SpiDeviceDriver<'d, SpiDriver<'d>>;
+type SpiBusInner<'d> = SpiDeviceDriver<'d, SpiDriver<'d>>;
+type SpiBus<'d> = FullDuplexDevice<SpiBusInner<'d>>;
 type RstPin<'d> = PinDriver<'d, Output>;
 type BusyPin<'d> = PinDriver<'d, Input>;
 type Dio1Pin<'d> = PinDriver<'d, Input>;
@@ -149,6 +251,41 @@ where
 {
     /// Initialise the SX1262 and return a ready-to-use radio driver.
     ///
+    /// Uses a step-by-step instrumented init sequence instead of the monolithic
+    /// `sx126x::init()` so that:
+    ///
+    /// 1. Every command is logged before it is issued — the **last log line printed
+    ///    before a watchdog fire identifies the stalling command**.
+    /// 2. BUSY waits are bounded and yield to the FreeRTOS scheduler, preventing
+    ///    `IDLE0` starvation and the 5-second task-watchdog fires.
+    /// 3. The TCXO is brought up in the order mandated by the SX1262 datasheet
+    ///    (§9.6 + §13.3.6): `SetDIO3AsTCXOCtrl` → `ClearDeviceErrors` → `Calibrate`.
+    ///
+    /// # Why the order matters
+    ///
+    /// At power-on the SX1262 runs its auto-calibration with the RC oscillator.
+    /// When TCXO mode is later selected via `SetDIO3AsTCXOCtrl`, the chip sets the
+    /// `XOSC_START_ERR` flag in the DeviceErrors register (bit 5) because the
+    /// crystal has not yet had time to stabilise — this is **expected behaviour**
+    /// (datasheet §13.3.6, Rev. 2.2).  Calling `Calibrate` while `XOSC_START_ERR`
+    /// is set causes the calibration FSM to abort immediately, which in turn leaves
+    /// BUSY asserted indefinitely.
+    ///
+    /// The fix is: after `SetDIO3AsTCXOCtrl`, call `ClearDeviceErrors` to acknowledge
+    /// the expected `XOSC_START_ERR`, then call `Calibrate` so the FSM uses the now-
+    /// powered TCXO.  This sequence is confirmed by the official Semtech reference
+    /// driver (SX126x HAL) and by community reports (RadioLib issue #89).
+    ///
+    /// # Bounded BUSY wait
+    ///
+    /// The sx126x crate's `wait_on_busy()` spins forever.  This driver replaces every
+    /// busy-wait with `wait_busy_spi()`, which:
+    ///   - Polls `get_status()` over SPI (returns `0x_2_` in STDBY_RC / active modes,
+    ///     and the cmd_status field indicates whether a command completed).
+    ///   - Calls `FreeRtos::delay_ms(1)` between polls so the scheduler runs.
+    ///   - Caps at `BUSY_POLL_MAX_ITER` iterations (500 ms total) and, on timeout,
+    ///     reads `get_device_errors()` and returns `LoraError::BusyTimeout`.
+    ///
     /// # Parameters
     ///
     /// - `spi` — SPI device driver configured for SPI mode 0 at 8 MHz with GPIO 8 as CS.
@@ -159,17 +296,21 @@ where
     ///   rising edge, which the main loop delivers as a `Phy(())` event.
     /// - `_config` — LoRaWAN credentials (used by the LoRaWAN layer, not the radio driver).
     pub fn new(
-        spi: SpiBus<'d>,
+        spi: SpiDeviceDriver<'d, SpiDriver<'d>>,
         rst: RstPin<'d>,
         busy: BusyPin<'d>,
         ant: ANT,
         dio1: Dio1Pin<'d>,
         _config: &LoraConfig,
     ) -> Result<Self, LoraError> {
+        // Wrap the SPI device in the full-duplex compatibility shim before handing it
+        // to sx126x.  See `FullDuplexDevice` for a detailed explanation of why this
+        // is required.
+        let spi = FullDuplexDevice::new(spi);
         let mut radio = SX126x::new(spi, (rst, busy, ant, dio1));
-        radio
-            .init(heltec_v3_eu868_config())
-            .map_err(|_| LoraError::RadioInitFailed)?;
+
+        init_sx1262(&mut radio)?;
+
         log::info!("SX1262 initialized");
         Ok(Self {
             radio,
@@ -184,49 +325,333 @@ where
     /// Best-effort: errors are ignored since this is called during cancellation paths
     /// where we want to reset state regardless.
     pub fn cancel_rx(&mut self) {
+        // Diagnostic: capture what the radio saw in the RX window being torn down,
+        // BEFORE returning to standby (which aborts any in-progress reception).
+        // This is the only point that observes the final (RX2) window, since the
+        // software timer closes it before any hardware Timeout IRQ reaches DIO1.
+        if let Ok(irq) = self.radio.get_irq_status() {
+            log::info!(
+                "cancel_rx: RX teardown IRQ — preamble={} syncword={} header_valid={} \
+                 header_err={} rx_done={} crc_err={} timeout={}",
+                irq.preamble_detected(),
+                irq.syncword_valid(),
+                irq.header_valid(),
+                irq.header_error(),
+                irq.rx_done(),
+                irq.crc_err(),
+                irq.timeout(),
+            );
+        }
         let _ = self.radio.set_standby(StandbyConfig::StbyRc);
         let _ = self.radio.clear_irq_status(IrqMask::all());
         self.tx_start = None;
     }
+
+    /// Return `true` if a DIO1-relevant IRQ (RxDone, TxDone, Timeout, CrcErr) is
+    /// latched in the radio's IRQ register, WITHOUT clearing it.
+    ///
+    /// The event loop polls this over SPI instead of relying on the DIO1 GPIO
+    /// edge interrupt. `esp-idf-hal` `PinDriver` interrupts are one-shot — they
+    /// auto-disable on each firing and must be re-armed from a non-ISR context —
+    /// and the DIO1 pin is owned by the inner `SX126x`, so it cannot be re-armed
+    /// from the loop. The result: only the first edge (TxDone) is ever delivered
+    /// by interrupt, and RxDone is missed. Polling `GetIrqStatus` is immune to
+    /// this and is safe to issue while the radio is in RX.
+    pub fn irq_pending(&mut self) -> bool {
+        self.radio
+            .get_irq_status()
+            .map(|irq| irq.rx_done() || irq.tx_done() || irq.timeout() || irq.crc_err())
+            .unwrap_or(false)
+    }
 }
 
-/// Build the EU868 `Config` for the Heltec WiFi LoRa 32 V3.
+// ─── Bounded busy-wait ───────────────────────────────────────────────────────
+
+/// Maximum number of 1 ms polls before declaring a busy-wait timeout.
 ///
-/// Initialises at DR0 (SF12/BW125/CR4-5) with TCXO enabled.
-/// Callers may re-issue `set_mod_params` to switch data rate before each frame.
-fn heltec_v3_eu868_config() -> Config {
-    let irq_mask = IrqMask::none()
-        .combine(IrqMaskBit::TxDone)
-        .combine(IrqMaskBit::RxDone)
-        .combine(IrqMaskBit::CrcErr)
-        .combine(IrqMaskBit::Timeout);
+/// 500 iterations × 1 ms/iteration = 500 ms maximum wait per command.
+/// The longest legitimate busy interval is `Calibrate` with a TCXO startup
+/// delay (10 ms TCXO + calibration FSM ~3.5 ms) — well under 100 ms on a
+/// healthy chip.  500 ms gives 5× safety margin while still being far shorter
+/// than the 5-second task-watchdog period.
+const BUSY_POLL_MAX_ITER: u32 = 500;
 
-    Config {
-        packet_type: PacketType::LoRa,
+/// Poll `get_status()` over SPI until the chip reports a non-busy state, with
+/// a 1 ms yield between each poll so the FreeRTOS scheduler can run.
+///
+/// Returns `Ok(())` when the chip is ready, or `Err(LoraError::BusyTimeout)`
+/// after `BUSY_POLL_MAX_ITER` ms.  On timeout, device errors are read and
+/// logged before returning.
+///
+/// # Why get_status() instead of the BUSY pin
+///
+/// The sx126x crate moves the BUSY `PinDriver` into `SX126x` and does not
+/// expose it again.  `get_status()` is an SPI command (`0xC0 NOP`) that
+/// returns the chip status byte; when the chip is busy it returns `0x00`
+/// (no valid status) or leaves the data bus in a known state.  Concretely,
+/// the status byte encodes `chip_mode` in bits [6:4]:
+///   - `0x2` = STDBY_RC  — ready
+///   - `0x3` = STDBY_XOSC — ready (XOSC / TCXO active)
+///   - `0x4` = FS — ready
+///   - `0x0` = chip is still busy / command in progress
+///
+/// Polling until `chip_mode != 0` is equivalent to polling BUSY low.
+fn wait_busy_spi<ANT>(
+    label: &str,
+    radio: &mut SX126x<SpiBus<'_>, RstPin<'_>, BusyPin<'_>, ANT, Dio1Pin<'_>>,
+) -> Result<(), LoraError>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    for i in 0..BUSY_POLL_MAX_ITER {
+        // Yield to FreeRTOS — feeds the task watchdog and lets other tasks run.
+        FreeRtos::delay_ms(1);
 
-        // LoRaWAN public network sync word for SX1262.
-        // 0x3444 for SX1262 — NOT 0x34 as used by SX1276.
-        sync_word: 0x3444,
+        match radio.get_status() {
+            Ok(status) => {
+                // chip_mode() returns Some(_) for any valid non-busy state:
+                // STDBY_RC (0x2), STDBY_XOSC (0x3), FS (0x4), RX (0x5), TX (0x6).
+                // Returns None when the chip is busy (chip_mode bits = 0x0 or 0x1).
+                if status.chip_mode().is_some() {
+                    log::debug!(
+                        "wait_busy_spi({}): ready after {} ms, status={:?}",
+                        label,
+                        i + 1,
+                        status
+                    );
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                // SPI error during poll — log and keep trying; may self-clear.
+                log::warn!("wait_busy_spi({}): SPI error at iter {}", label, i);
+            }
+        }
+    }
 
-        calib_param: CalibParam::all(),
+    // Timeout — read device errors to help diagnose the cause.
+    log::error!(
+        "wait_busy_spi({}): BUSY did not clear after {} ms — reading device errors",
+        label,
+        BUSY_POLL_MAX_ITER
+    );
+    match radio.get_device_errors() {
+        Ok(errs) => log::error!("wait_busy_spi: device errors = {:?}", errs),
+        Err(_) => log::error!("wait_busy_spi: could not read device errors (SPI error)"),
+    }
+    Err(LoraError::BusyTimeout)
+}
 
-        // EU868 DR0: SF12, BW125, CR4/5.
-        // LDRO is mandatory at SF12/BW125 — symbol duration is ~524 ms (> 16 ms threshold).
-        mod_params: LoraModParams::default()
-            .set_spread_factor(LoRaSpreadFactor::SF12)
-            .set_bandwidth(LoRaBandWidth::BW125)
-            .set_coding_rate(LoraCodingRate::CR4_5)
-            .set_low_dr_opt(true)
-            .into(),
+// ─── Step-by-step instrumented init ──────────────────────────────────────────
 
-        pa_config: PaConfig::default()
-            .set_pa_duty_cycle(0x04)
-            .set_hp_max(0x07)
-            .set_device_sel(DeviceSel::SX1262),
+/// Perform the Heltec V3 / EU868 SX1262 bring-up sequence with per-command
+/// logging and bounded busy-waits.
+///
+/// Every `log::info!` call is issued **before** the corresponding SPI command
+/// so the last line printed before a watchdog fire names the stalling command.
+///
+/// # TCXO bring-up order (SX1262 datasheet §9.6 + §13.3.6)
+///
+/// At POR the chip auto-calibrates using the internal RC oscillator.  When
+/// `SetDIO3AsTCXOCtrl` is later issued, the chip immediately asserts
+/// `XOSC_START_ERR` (DeviceErrors bit 5) because the crystal has not had
+/// time to stabilise — **this is expected and documented behaviour**.
+///
+/// Calling `Calibrate` while `XOSC_START_ERR` is set causes the calibration
+/// FSM to abort, which leaves BUSY high indefinitely.  The mandatory fix:
+///
+/// ```text
+/// SetDIO3AsTCXOCtrl(1.8 V, 10 ms)   // power the TCXO; XOSC_START_ERR is set
+/// wait_busy                           // chip acknowledges the command
+/// ClearDeviceErrors()                 // ← mandatory: clear XOSC_START_ERR
+/// wait_busy
+/// Calibrate(0x7F)                     // ← re-calibrate all blocks with the TCXO
+/// wait_busy
+/// ```
+///
+/// The `sx126x 0.3` crate's `init()` calls `set_dio3_as_tcxo_ctrl` then
+/// immediately calls `calibrate` **without** the intervening `ClearDeviceErrors`.
+/// That is the root cause of the BUSY-stuck-forever hang on this board.
+fn init_sx1262<ANT>(
+    radio: &mut SX126x<SpiBus<'_>, RstPin<'_>, BusyPin<'_>, ANT, Dio1Pin<'_>>,
+) -> Result<(), LoraError>
+where
+    ANT: OutputPin<Error = GpioError>,
+{
+    // ── Step 1: hardware reset ────────────────────────────────────────────────
+    log::info!("sx1262_init: step 1 — hardware reset");
+    radio.reset().map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after reset");
+    wait_busy_spi("reset", radio)?;
 
-        // Initial packet params for uplinks (IQ=Standard).
-        // Re-issue set_packet_params() with IQ=Inverted before each RX window.
-        packet_params: Some(
+    // ── Step 2: enter STDBY_RC ────────────────────────────────────────────────
+    log::info!("sx1262_init: step 2 — SetStandby(STDBY_RC)");
+    radio
+        .set_standby(StandbyConfig::StbyRc)
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetStandby");
+    wait_busy_spi("SetStandby", radio)?;
+
+    // ── Step 3: set packet type ───────────────────────────────────────────────
+    log::info!("sx1262_init: step 3 — SetPacketType(LoRa)");
+    radio
+        .set_packet_type(PacketType::LoRa)
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetPacketType");
+    wait_busy_spi("SetPacketType", radio)?;
+
+    // ── Step 4: set RF frequency ──────────────────────────────────────────────
+    // At this point no TCXO yet — this uses the RC oscillator frequency reference.
+    // The frequency will be re-confirmed accurate after calibration.
+    log::info!("sx1262_init: step 4 — SetRfFrequency(868.1 MHz)");
+    radio
+        .set_rf_frequency(calc_rf_freq(868_100_000.0, 32_000_000.0))
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetRfFrequency");
+    wait_busy_spi("SetRfFrequency", radio)?;
+
+    // ── Step 5: enable TCXO via DIO3 ─────────────────────────────────────────
+    //
+    // After this command the SX1262 SETS DeviceErrors.XOSC_START_ERR (bit 5).
+    // This is EXPECTED (datasheet §13.3.6 Rev 2.2): the chip flags that the
+    // oscillator has not yet started because the startup delay has not elapsed.
+    //
+    // Using 10 ms (not 5 ms) as a conservative startup margin.  The TCXO on the
+    // Heltec V3 is rated for ≤2 ms startup, but the SX1262 startup-delay field
+    // sets how long the chip waits before driving any subsequent oscillator-
+    // dependent operation.  10 ms gives 5× headroom against a cold-start jitter.
+    log::info!(
+        "sx1262_init: step 5 — SetDIO3AsTCXOCtrl(1.8 V, 10 ms) \
+         [XOSC_START_ERR will be set — this is expected]"
+    );
+    radio
+        .set_dio3_as_tcxo_ctrl(TcxoVoltage::Volt1_8, TcxoDelay::from_ms(10))
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetDIO3AsTCXOCtrl");
+    wait_busy_spi("SetDIO3AsTCXOCtrl", radio)?;
+
+    // Read and log device errors — expect XOSC_START_ERR (bit 5) here.
+    match radio.get_device_errors() {
+        Ok(errs) => log::info!(
+            "sx1262_init: device errors after SetDIO3AsTCXOCtrl = {:?} \
+             [XOSC_START_ERR=true is normal here]",
+            errs
+        ),
+        Err(_) => log::warn!("sx1262_init: could not read device errors after SetDIO3AsTCXOCtrl"),
+    }
+
+    // ── Step 6: clear XOSC_START_ERR ─────────────────────────────────────────
+    //
+    // MANDATORY before Calibrate.  If XOSC_START_ERR remains set when Calibrate
+    // is issued, the calibration FSM interprets it as "oscillator not ready" and
+    // aborts immediately, leaving BUSY asserted indefinitely.
+    log::info!("sx1262_init: step 6 — ClearDeviceErrors (mandatory before Calibrate)");
+    radio
+        .clear_device_errors()
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after ClearDeviceErrors");
+    wait_busy_spi("ClearDeviceErrors", radio)?;
+
+    // ── Step 7: calibrate all blocks ──────────────────────────────────────────
+    //
+    // Now that XOSC_START_ERR is cleared and the TCXO startup delay has elapsed
+    // (the 10 ms delay was encoded in the SetDIO3AsTCXOCtrl delay field — the chip
+    // waits internally), Calibrate will use the TCXO as the reference oscillator.
+    log::info!("sx1262_init: step 7 — Calibrate(all blocks, 0x7F)");
+    radio
+        .calibrate(CalibParam::all())
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after Calibrate (may take up to ~10 ms)");
+    wait_busy_spi("Calibrate (may take up to ~10 ms)", radio)?;
+
+    // Read device errors after calibration — all flags should be clear.
+    match radio.get_device_errors() {
+        Ok(errs) => {
+            // DeviceErrors has no Into<u16>; check each flag individually.
+            let any_err = errs.rc64k_calib_err()
+                || errs.rc13m_calib_err()
+                || errs.pll_calib_err()
+                || errs.adc_calib_err()
+                || errs.img_calib_err()
+                || errs.xosc_start_err()
+                || errs.pll_lock_err()
+                || errs.pa_ramp_err();
+            if any_err {
+                log::error!(
+                    "sx1262_init: device errors after Calibrate = {:?} — \
+                     non-zero means calibration failed",
+                    errs
+                );
+                return Err(LoraError::RadioInitFailed);
+            }
+            log::info!(
+                "sx1262_init: device errors after Calibrate = {:?} (clean)",
+                errs
+            );
+        }
+        Err(_) => log::warn!("sx1262_init: could not read device errors after Calibrate"),
+    }
+
+    // ── Step 8: calibrate image (frequency-band-specific) ────────────────────
+    log::info!("sx1262_init: step 8 — CalibrateImage(EU868 band: 0xD7..0xD8)");
+    radio
+        .calibrate_image(CalibImageFreq::from_rf_frequency(868_100_000))
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after CalibrateImage");
+    wait_busy_spi("CalibrateImage", radio)?;
+
+    // ── Step 9: PA config ─────────────────────────────────────────────────────
+    log::info!("sx1262_init: step 9 — SetPaConfig(duty=0x04, hp_max=0x07, SX1262)");
+    radio
+        .set_pa_config(
+            PaConfig::default()
+                .set_pa_duty_cycle(0x04)
+                .set_hp_max(0x07)
+                .set_device_sel(DeviceSel::SX1262),
+        )
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetPaConfig");
+    wait_busy_spi("SetPaConfig", radio)?;
+
+    // ── Step 10: TX params ────────────────────────────────────────────────────
+    log::info!("sx1262_init: step 10 — SetTxParams(14 dBm, ramp=200 µs)");
+    radio
+        .set_tx_params(
+            TxParams::default()
+                .set_power_dbm(14)
+                .set_ramp_time(RampTime::Ramp200u),
+        )
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetTxParams");
+    wait_busy_spi("SetTxParams", radio)?;
+
+    // ── Step 11: buffer base addresses ───────────────────────────────────────
+    log::info!("sx1262_init: step 11 — SetBufferBaseAddress(tx=0x00, rx=0x00)");
+    radio
+        .set_buffer_base_address(0x00, 0x00)
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetBufferBaseAddress");
+    wait_busy_spi("SetBufferBaseAddress", radio)?;
+
+    // ── Step 12: modulation params (DR0: SF12/BW125/CR4-5, LDRO on) ──────────
+    log::info!("sx1262_init: step 12 — SetModulationParams(SF12/BW125/CR4-5/LDRO)");
+    radio
+        .set_mod_params(
+            LoraModParams::default()
+                .set_spread_factor(LoRaSpreadFactor::SF12)
+                .set_bandwidth(LoRaBandWidth::BW125)
+                .set_coding_rate(LoraCodingRate::CR4_5)
+                .set_low_dr_opt(true)
+                .into(),
+        )
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetModulationParams");
+    wait_busy_spi("SetModulationParams", radio)?;
+
+    // ── Step 13: packet params ────────────────────────────────────────────────
+    log::info!("sx1262_init: step 13 — SetPacketParams(preamble=8, VarLen, CRCon, IQ=Std)");
+    radio
+        .set_packet_params(
             LoRaPacketParams::default()
                 .set_preamble_len(8)
                 .set_header_type(LoRaHeaderType::VarLen)
@@ -234,23 +659,64 @@ fn heltec_v3_eu868_config() -> Config {
                 .set_crc_type(LoRaCrcType::CrcOn)
                 .set_invert_iq(LoRaInvertIq::Standard)
                 .into(),
-        ),
+        )
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetPacketParams");
+    wait_busy_spi("SetPacketParams", radio)?;
 
-        tx_params: TxParams::default()
-            .set_power_dbm(14)
-            .set_ramp_time(RampTime::Ramp200u),
+    // ── Step 14: DIO IRQ params ───────────────────────────────────────────────
+    // Bits routed to DIO1 — these drive the join state machine.
+    let dio1_mask = IrqMask::none()
+        .combine(IrqMaskBit::TxDone)
+        .combine(IrqMaskBit::RxDone)
+        .combine(IrqMaskBit::CrcErr)
+        .combine(IrqMaskBit::Timeout);
+    // Global IRQ-record mask is wider so `get_irq_status()` can report whether the
+    // radio saw a preamble / sync word / header during an RX window, even though
+    // those bits are NOT routed to DIO1 (they would otherwise fire early and
+    // disrupt the state machine). Used by the RX diagnostics in cancel_rx/receive.
+    let record_mask = dio1_mask
+        .combine(IrqMaskBit::PreambleDetected)
+        .combine(IrqMaskBit::SyncwordValid)
+        .combine(IrqMaskBit::HeaderValid)
+        .combine(IrqMaskBit::HeaderError);
+    log::info!(
+        "sx1262_init: step 14 — SetDioIrqParams(record=rx-diag, DIO1=TxDone|RxDone|CrcErr|Timeout)"
+    );
+    radio
+        .set_dio_irq_params(record_mask, dio1_mask, IrqMask::none(), IrqMask::none())
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetDioIrqParams");
+    wait_busy_spi("SetDioIrqParams", radio)?;
 
-        dio1_irq_mask: irq_mask,
-        dio2_irq_mask: IrqMask::none(),
-        dio3_irq_mask: IrqMask::none(),
+    // ── Step 15: DIO2 as RF switch ────────────────────────────────────────────
+    log::info!("sx1262_init: step 15 — SetDio2AsRfSwitchCtrl(enable)");
+    radio
+        .set_dio2_as_rf_switch_ctrl(true)
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetDio2AsRfSwitchCtrl");
+    wait_busy_spi("SetDio2AsRfSwitchCtrl", radio)?;
 
-        // set_rf_frequency() takes a PLL register value — use calc_rf_freq(), never raw Hz.
-        rf_freq: calc_rf_freq(868_100_000.0, 32_000_000.0),
-        rf_frequency: 868_100_000,
+    // ── Step 16: LoRaWAN public network sync word ─────────────────────────────
+    // 0x3444 for SX1262/SX1261 on public networks (TTN).
+    // NOT 0x34 as used by SX1276/SX1278 — the SX126x uses a 16-bit sync word.
+    log::info!("sx1262_init: step 16 — SetSyncWord(0x3444, LoRaWAN public)");
+    radio
+        .set_sync_word(0x3444)
+        .map_err(|_| LoraError::RadioInitFailed)?;
+    log::info!("sx1262_init: waiting busy after SetSyncWord");
+    wait_busy_spi("SetSyncWord", radio)?;
 
-        // CRITICAL: without tcxo_opts, init() succeeds but produces no RF output.
-        tcxo_opts: Some((TcxoVoltage::Volt1_8, TcxoDelay::from_ms(5))),
+    // ── Final status check ────────────────────────────────────────────────────
+    match radio.get_status() {
+        Ok(status) => {
+            // Status has no Into<u8>; use Debug which prints chip_mode + command_status.
+            log::info!("sx1262_init: complete — GetStatus = {:?}", status);
+        }
+        Err(_) => log::warn!("sx1262_init: could not read final status"),
     }
+
+    Ok(())
 }
 
 // ─── LoraRadio impl ───────────────────────────────────────────────────────────
@@ -346,12 +812,13 @@ where
         // `window` is informational only here: lorawan-device already encodes the correct
         // frequency and data rate for RX1 vs RX2 in `config`, so no further dispatch is needed.
         // The adapter passes it through for logging.
-        log::debug!(
-            "prepare_rx: window={:?} freq={}Hz sf={:?} bw={:?}",
+        log::info!(
+            "prepare_rx: window={:?} freq={}Hz sf={:?} bw={:?} cr={:?}",
             window,
             config.freq_hz,
             config.sf,
-            config.bw
+            config.bw,
+            config.cr
         );
         let mod_params = LoraModParams::default()
             .set_spread_factor(sf_to_sx126x(config.sf))
@@ -368,7 +835,10 @@ where
             .set_preamble_len(8)
             .set_header_type(LoRaHeaderType::VarLen)
             .set_payload_len(255)
-            .set_crc_type(LoRaCrcType::CrcOn)
+            // LoRaWAN downlinks carry NO PHY-layer CRC. With CRC on, the SX1262
+            // either treats the missing CRC bytes as payload or flags crc_err and
+            // drops the frame, so RX must use CrcOff (TX keeps CrcOn).
+            .set_crc_type(LoRaCrcType::CrcOff)
             .set_invert_iq(LoRaInvertIq::Inverted)
             .into();
         self.radio
@@ -385,6 +855,10 @@ where
         self.radio
             .set_rx(RxTxTimeout::from_ms(lora_pure::RX_WINDOW_DURATION_MS))
             .map_err(|_| LoraError::ReceiveFailed)?;
+        log::info!(
+            "prepare_rx: set_rx issued — RX window open for {}ms",
+            lora_pure::RX_WINDOW_DURATION_MS
+        );
 
         Ok(())
     }
@@ -399,6 +873,17 @@ where
             .radio
             .get_irq_status()
             .map_err(|_| nb::Error::Other(LoraError::IrqStatusReadFailed))?;
+        log::info!(
+            "receive: IRQ before clear — preamble={} syncword={} header_valid={} \
+             header_err={} rx_done={} crc_err={} timeout={}",
+            irq.preamble_detected(),
+            irq.syncword_valid(),
+            irq.header_valid(),
+            irq.header_error(),
+            irq.rx_done(),
+            irq.crc_err(),
+            irq.timeout()
+        );
         self.radio
             .clear_irq_status(IrqMask::all())
             .map_err(|_| nb::Error::Other(LoraError::ReceiveFailed))?;
@@ -446,6 +931,13 @@ where
             .unwrap_or((0, 0));
         self.last_rssi = rssi;
         self.last_snr = snr;
+        log::info!(
+            "receive: RxDone len={} offset={} rssi={} snr={}",
+            len,
+            offset,
+            rssi,
+            snr
+        );
 
         Ok((len, RxQuality { rssi, snr }))
     }
@@ -556,6 +1048,13 @@ where
             op: RadioOp::Idle,
         }
     }
+
+    /// Poll the radio for a pending DIO1-relevant IRQ — see
+    /// [`EspIdfLoraRadio::irq_pending`]. The event loop calls this each tick so
+    /// it does not depend on the one-shot DIO1 GPIO interrupt.
+    pub fn irq_pending(&mut self) -> bool {
+        self.radio.irq_pending()
+    }
 }
 
 impl<'d, ANT> core::fmt::Debug for LoraRadioAdapter<'d, ANT>
@@ -661,6 +1160,7 @@ where
 
             LdRadioEvent::CancelRx => {
                 // Stop any in-progress RX and clear stale packet data.
+                log::info!("adapter: CancelRx — closing RX window");
                 self.radio.cancel_rx();
                 self.rx_len = 0;
                 self.op = RadioOp::Idle;

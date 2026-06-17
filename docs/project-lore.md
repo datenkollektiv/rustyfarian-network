@@ -273,6 +273,27 @@ Rust infers `TPINERR = GpioError` from the concrete `PinDriver` types.
 Any generic `ANT` parameter must therefore also declare `OutputPin<Error = GpioError>` — a bare `OutputPin` bound causes a type mismatch error.
 Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = GpioError>`.
 
+**`sx126x::init()` aborts with `spi_master: check_trans_valid(1052): rx length > tx length in full duplex mode` on ESP32-S3.**
+`sx126x` issues register and buffer reads as `Operation::Write` + `Operation::Read` pairs; `esp-idf-hal 0.46` translates `Operation::Read(buf)` into an `spi_transaction_t` with `tx_buffer = NULL` and `length = rxlength = buf.len() * 8`.
+On ESP32-S3 (ESP-IDF v5.3.3) a null TX buffer collapses the effective TX length to zero at the hardware level, so the C driver's `rxlength <= txlength` full-duplex check fails — even though at the Rust level `rxlength == length`.
+Half-duplex mode is NOT a fix: `SOC_SPI_HD_BOTH_INOUT_SUPPORTED` is undefined on ESP32-S3, so half-duplex rejects the simultaneous-TX+RX `TransferInPlace` calls `sx126x` uses for `get_status` and friends.
+Fix: wrap the `SpiDeviceDriver` in a `FullDuplexDevice` adapter that rewrites each `Operation::Read(buf)` into `Operation::Transfer(buf, &zeroes[..buf.len()])` (the SX1262 ignores MOSI during read phases, so zeroed TX is harmless) — see `FullDuplexDevice` in `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`.
+The zero scratch buffer must be sized to the actual read length (allocated per transaction), not a fixed cap: `read_buffer` can read a full 255-byte downlink payload, and a short TX slice re-triggers the same error.
+The bare-metal `hal_esp32s3_join` example never hit this because it hand-issues `Operation::Transfer(&mut rx, &tx)` with equal-length buffers.
+
+**`FullDuplexDevice::transaction` must not allocate unconditionally — `sx126x::reset()` calls it inside `critical_section::with`.**
+`sx126x 0.3`'s `reset()` wraps `spi.transaction(&mut [Operation::DelayNs(200_000)])` in `critical_section::with`, which on ESP-IDF disables interrupts and suspends the FreeRTOS scheduler.
+Any heap allocation (including `Vec::with_capacity`) inside a critical section deadlocks the main task: the allocator tries to acquire a mutex that is held by a task the suspended scheduler can never reschedule — the task watchdog fires every 5 s with the backtrace ending at `memcpy`.
+Symptom: `init()` hangs at the first `reset()` call; TWDT backtrace ends at `memcpy | <-CORRUPTED`; no SPI error log (unlike the `check_trans_valid` error above).
+Fix: add a no-allocation fast path at the top of `transaction`:
+```rust
+if !operations.iter().any(|op| matches!(op, Operation::Read(_))) {
+    return self.inner.transaction(operations);
+}
+```
+This forwards `DelayNs`, `Write`, and `TransferInPlace` operations directly, with zero allocation.
+The slow path (Vec-based rewrite for `Read` operations) is safe because all six `Read` call sites in `sx126x 0.3` (`read_register`, `read_buffer`, `get_irq_status`, `get_packet_status`, `get_rx_buffer_status`, `get_device_errors`) are NOT inside `critical_section::with` — only `reset()` is, and it uses only `DelayNs`.
+
 ---
 
 ## CodeQL / GitHub Advanced Security
@@ -440,3 +461,27 @@ Fix: catch these locally via `just lint-docs`, which runs `scripts/lint-docs.sh`
 The check is not folded into `just verify` or `just ci` because it pulls a Node toolchain on first run — invoke it explicitly when touching `docs/ROADMAP.md` or any other diagram-bearing markdown.
 
 **`mmdc`-vs-IDE renderer divergence.** `mmdc` (the `mermaid-cli` `just lint-docs` invokes) has been observed accepting bare `:` strings (e.g. `store.rs:141`) that the IDE's Mermaid preview renderer rejects with the same `'INVALID'` parse error documented above. The IDE typically ships a newer Mermaid runtime than `npx mermaid-cli` resolves, and its parser is stricter on the colon rule. Treat a clean `just lint-docs` as a necessary but not sufficient signal — always visually verify the rendered diagram in the IDE after editing any `timeline` / `gantt` event text. The `technical-writer` agent in `.claude/agents/technical-writer.md` encodes this divergence and is the mandated delegate for any non-trivial `docs/ROADMAP.md` edit.
+
+---
+
+## SX1262 TCXO Init — `sx126x 0.3` Missing `ClearDeviceErrors` Bug
+
+**`sx126x 0.3`'s `init()` hangs forever on BUSY when a TCXO is used — missing `ClearDeviceErrors` before `Calibrate`.**
+
+The SX1262 datasheet (§13.3.6, Rev 2.2) documents that when `SetDIO3AsTCXOCtrl` is issued, the chip **immediately sets `XOSC_START_ERR` (DeviceErrors bit 5)** because the crystal has not yet had time to stabilise. This is expected behaviour. However, if `Calibrate` is issued while `XOSC_START_ERR` is set, the calibration FSM interprets the flag as "oscillator not ready" and aborts immediately, leaving BUSY asserted indefinitely — i.e. the chip hangs.
+
+`sx126x 0.3`'s monolithic `init()` calls `set_dio3_as_tcxo_ctrl`, waits on BUSY (once, correctly), then immediately calls `calibrate` **without** issuing `ClearDeviceErrors` first. On a board where no TCXO is fitted (or where `tcxo_opts` is None), this does not matter — there is no `XOSC_START_ERR` to clear. On the Heltec WiFi LoRa 32 V3 (TCXO mandatory), the bug causes a permanent BUSY-stuck hang. The symptom is: the example prints `DevEUI loaded` then nothing more — the main task spins at `sx126x::wait_on_busy` (line 548 in the 0.3.0 source) and the ESP-IDF task watchdog fires every 5 s.
+
+**The mandatory init sequence for any SX1262 board with a TCXO (datasheet §9.6 + §13.3.6):**
+1. `SetDIO3AsTCXOCtrl(voltage, delay)` — powers the TCXO; `XOSC_START_ERR` is set immediately (expected)
+2. wait BUSY
+3. `ClearDeviceErrors()` — mandatory acknowledgement; clears `XOSC_START_ERR`
+4. wait BUSY
+5. `Calibrate(0x7F)` — all blocks; the FSM now uses the TCXO reference
+6. wait BUSY
+
+**Secondary issue: `sx126x::wait_on_busy` is unbounded.** The crate spins with `while let Ok(true) = self.busy_pin.is_high() {}` — no timeout, no yield. This starves the FreeRTOS IDLE task, causes task-watchdog fires every 5 s, and hides which command stalled. The fix (implemented in `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`) replaces the opaque `init()` call with a step-by-step instrumented sequence where every command is logged before issuance, and busy-waits poll `get_status()` over SPI with a 1 ms `FreeRtos::delay_ms` yield and a 500-iteration (500 ms) hard cap. On timeout, `get_device_errors()` is read and logged before returning `LoraError::BusyTimeout`.
+
+**Also: TCXO startup delay was increased from 5 ms to 10 ms** as a conservative cold-start margin. The Heltec V3 TCXO is rated ≤2 ms, but 10 ms gives 5× headroom against oscillator startup jitter; the field is internal to the chip and does not extend the BUSY-wait — it tells the SX1262 how long to wait internally before driving any XOSC-dependent operation after the TCXO power rail is enabled.
+
+Fix is in: `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`, functions `init_sx1262` and `wait_busy_spi`.

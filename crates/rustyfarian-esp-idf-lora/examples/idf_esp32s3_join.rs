@@ -2,17 +2,40 @@
 //!
 //! # Credentials
 //!
-//! Set at build time via environment variables:
+//! LoRaWAN credentials are loaded at build time from environment variables:
+//! `LORAWAN_DEV_EUI`, `LORAWAN_APP_EUI`, and `LORAWAN_APP_KEY`.
+//!
+//! ## Setup (recommended: .env workflow)
+//!
+//! 1. Copy TTN Console credentials (MSB-first as shown there):
+//!    - DevEUI: 16 hex chars (8 bytes)
+//!    - AppEUI (JoinEUI): 16 hex chars (8 bytes)
+//!    - AppKey: 32 hex chars (16 bytes)
+//!
+//! 2. Fill in the `.env` file at the workspace root:
+//!
+//! ```sh
+//! LORAWAN_DEV_EUI=70B3D57ED00762C6
+//! LORAWAN_APP_EUI=0000000000000002
+//! LORAWAN_APP_KEY=A14D11AAA39713873E07E5CBC990832F
+//! ```
+//!
+//! 3. Build and flash:
+//!
+//! ```sh
+//! just run idf_esp32s3_join
+//! ```
+//!
+//! ## Alternative: inline environment variables
+//!
+//! Override `.env` by passing credentials inline (takes precedence):
 //!
 //! ```sh
 //! LORAWAN_DEV_EUI=0000000000000001 \
 //! LORAWAN_APP_EUI=0000000000000002 \
 //! LORAWAN_APP_KEY=00000000000000000000000000000003 \
-//! just build-example idf_esp32s3_join
+//! just run idf_esp32s3_join
 //! ```
-//!
-//! EUIs are 16 hex chars (8 bytes) MSB-first as shown in TTN Console.
-//! AppKey is 32 hex chars (16 bytes).
 //!
 //! # Expected output
 //!
@@ -156,6 +179,18 @@ fn main() -> anyhow::Result<()> {
         appkey: AppKey::from(lora_config.app_key),
     };
 
+    // Join at DR5 (SF7/BW125) instead of the EU868 default DR0 (SF12).
+    //
+    // Why: an SF12 join-accept is ~1.8 s of airtime, but lorawan-device hard-caps
+    // the RX1 window at the RX1->RX2 gap (min(duration, 1000 ms) for EU868 OTAA),
+    // so an SF12 accept can never complete inside RX1 — when TTN schedules the
+    // accept on RX1 (868.x, +5 s) the device only ever sees `preamble=true` then
+    // the window is torn down. At SF7 the accept is ~70 ms and fits RX1 with
+    // margin. RX2 is always SF12/869.525 and is covered by RX_WINDOW_DURATION_MS.
+    // The test link is very strong (RSSI ~-32 dBm, SNR +13), so SF7 is ample.
+    device.set_datarate(region::DR::_5);
+    log::info!(target: tag, "Join data rate set to DR5 (SF7/BW125)");
+
     let mut response = device
         .join(join_mode)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -163,16 +198,32 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut next_timeout_ms: u32 = 0;
     if let Response::TimeoutRequest(ms) = response {
-        next_timeout_ms = start.elapsed().as_millis() as u32 + ms;
+        // `TimeoutRequest(ms)` carries an ABSOLUTE timestamp in the device's
+        // millisecond timeline (epoch ≈ TX start ≈ `start`), NOT a relative
+        // delay. Assigning it directly (rather than `elapsed + ms`) is what
+        // makes RX1/RX2 open on time; adding `elapsed` opens them ~2x too late
+        // and the join-accept is missed. See lorawan-device nb_device::Response.
+        next_timeout_ms = ms;
+        log::info!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
         response = Response::NoUpdate;
     }
 
     loop {
         let elapsed_ms = start.elapsed().as_millis() as u32;
 
-        // DIO1 fired — deliver radio event to the lorawan-device state machine.
-        if DIO1_FLAG.swap(false, Ordering::AcqRel) {
-            log::info!(target: tag, "DIO1 at {}ms", elapsed_ms);
+        // Deliver a radio event when the SX1262 has a pending IRQ.
+        //
+        // We do NOT rely on the DIO1 GPIO interrupt alone: esp-idf-hal PinDriver
+        // interrupts are one-shot (auto-disabled on each firing, must be re-armed
+        // from a non-ISR context), and the DIO1 pin is owned by the radio driver
+        // so it cannot be re-armed here. The interrupt therefore only ever
+        // delivers the first edge (TxDone); RxDone was being missed entirely.
+        // Polling the radio's IRQ register over SPI each tick is robust and
+        // catches every RxDone/Timeout. The DIO1 flag is still consumed so a
+        // delivered edge is not left pending.
+        let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
+        if dio1_edge || device.get_radio().irq_pending() {
+            log::info!(target: tag, "radio IRQ at {}ms", elapsed_ms);
             response = device
                 .handle_event(Event::RadioEvent(LdRadioEvent::Phy(())))
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -202,7 +253,9 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             Response::TimeoutRequest(ms) => {
-                next_timeout_ms = elapsed_ms + ms;
+                // Absolute timestamp in the device timeline — assign, don't add.
+                next_timeout_ms = *ms;
+                log::info!(target: tag, "RX window scheduled at {}ms (absolute)", *ms);
                 response = Response::NoUpdate;
             }
             Response::JoinRequestSending => {

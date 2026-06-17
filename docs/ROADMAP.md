@@ -99,6 +99,7 @@ All steps use TTN v3 EU868.
 **Step 1 — Gateway & RF sanity**
 
 - Confirm a TTN-connected EU868 gateway is online (TTN Console → Gateways → "connected recently").
+  For the current Pi 4 + RAK5146 SPI EU868/GPS gateway setup, see the [operational runbook](https://devops.datenkollektiv.de/pages/lorawan-gateway-rak5146-trixie.html) and the shorter [Trixie gateway write-up](https://devops.datenkollektiv.de/lorawan-gateway-rak5146-trixie.html).
 - Place the device within metres for initial tests; use a correct EU868 antenna.
 
 **Step 2 — SX1262 bring-up (before LoRaWAN)**

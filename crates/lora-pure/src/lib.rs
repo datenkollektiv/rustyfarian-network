@@ -41,22 +41,27 @@ pub const RX_WINDOW_OFFSET_MS: i32 = -500;
 
 /// Default RX window duration in milliseconds.
 ///
-/// At SF12/BW125 the preamble is 8 × 32.8 ms = 262 ms.
-/// With `RX_WINDOW_OFFSET_MS = -500` the radio opens 500 ms early, giving
-/// ≈ 800 ms of combined coverage around the nominal LoRaWAN window time.
-/// Once a preamble is detected the SX1262 continues receiving the full packet
-/// regardless of this timeout — so 800 ms is sufficient to latch any packet
-/// that starts arriving within the window without risking overlap with the
-/// next scheduled window.
+/// `lorawan-device` uses this as the software window-close timeout: it keeps the
+/// window open for this long and then issues `CancelRx`, which aborts reception
+/// **even if the radio is mid-packet**. It must therefore exceed the worst-case
+/// time from window-open to `RxDone` for the slowest data rate — it is NOT merely
+/// a preamble-detection margin.
 ///
-/// # RX1/RX2 overlap check (EU868 Class A)
+/// At SF12/BW125 a TTN join-accept with CFList is ≈ 1.8 s of airtime. With the
+/// −500 ms early open plus the ≈ 500 ms until the downlink actually starts,
+/// `RxDone` lands ≈ 2.3–2.8 s after the window opens. 3000 ms covers this with
+/// margin. (An 800 ms window detects the preamble but is torn down long before
+/// `RxDone`, so the join-accept is never delivered — observed on hardware.)
 ///
-/// With these defaults, RX1 occupies the interval `[t_rx1 − 500ms, t_rx1 + 300ms]`.
-/// RX2 opens at `t_rx1 + 1 000ms`, leaving a 700 ms gap — safely clear of RX1.
+/// # No RX1/RX2 overlap despite the long duration
 ///
-/// HAL implementations may override [`LoraRadio::rx_window_duration_ms`] to reduce
-/// power usage on lower-latency platforms where a smaller opening margin is sufficient.
-pub const RX_WINDOW_DURATION_MS: u32 = 800;
+/// `lorawan-device` caps the RX1 close at the inter-window gap — `RxWindow1` uses
+/// `min(duration, t_rx2 − t_rx1)` (= 1000 ms for EU868 OTAA join), so RX1 always
+/// closes before RX2 opens. Only RX2, which has no following window, uses the full
+/// duration. See `nb_device::state::WaitingForRx::handle_event`.
+///
+/// HAL implementations may override [`LoraRadio::rx_window_duration_ms`].
+pub const RX_WINDOW_DURATION_MS: u32 = 3000;
 
 // ─── Core radio types ─────────────────────────────────────────────────────────
 
