@@ -106,12 +106,24 @@ async fn main(spawner: Spawner) {
 // `connect_async` directly reuses those settings without resetting driver state.
 #[embassy_executor::task]
 async fn wifi_task(mut controller: WifiController<'static>) {
+    // Connection cycle counter — tags the link-up / disconnect log pair so heap
+    // readings can be correlated across reconnects during long manual test runs.
+    let mut cycle: u32 = 0;
     loop {
         match controller.connect_async().await {
             Ok(_) => {
-                // Connected — block until the link drops.
+                // Connected — log free heap so reconnect cycles can be compared
+                // for leaks, then block until the link drops.
+                cycle += 1;
+                println!(
+                    "Wi-Fi link up #{cycle} (free heap: {} B)",
+                    esp_alloc::HEAP.free()
+                );
                 let _ = controller.wait_for_disconnect_async().await;
-                println!("Wi-Fi disconnected — reconnecting...");
+                println!(
+                    "Wi-Fi disconnected #{cycle} — reconnecting... (free heap: {} B)",
+                    esp_alloc::HEAP.free()
+                );
                 // Short delay: we know the AP exists, reconnect promptly.
                 Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
             }

@@ -65,6 +65,14 @@ rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 embassy-net = { workspace = true, optional = true, features = ["dhcpv4", "proto-ipv4", "medium-ethernet"] }
 static_cell = { workspace = true, optional = true }
 
+# The async examples drive the embassy executor and timers directly; the
+# library itself does not, so these are dev-only rather than feature-gated
+# optional deps. Without them the `#[embassy_executor::task]` attribute on the
+# examples' tasks is unresolved and every async example fails to compile.
+[dev-dependencies]
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+
 [[example]]
 name = "hal_c3_connect_async"
 required-features = ["esp32c3", "rt", "embassy"]
