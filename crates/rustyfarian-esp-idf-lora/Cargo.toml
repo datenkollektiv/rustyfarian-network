@@ -27,3 +27,6 @@ embuild.workspace = true
 
 [[example]]
 name = "idf_esp32s3_join"
+
+[[example]]
+name = "idf_esp32s3_lora_uplink"
