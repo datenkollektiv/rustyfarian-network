@@ -62,14 +62,14 @@ pub enum StoreError {
     },
     /// `base_offset` is not aligned to the flash erase granularity.
     NotAligned,
-    /// `base_offset + 8192` would extend past `total_bytes` or the flash
-    /// device's reported capacity. Catches misconfigured partitions on a cold
-    /// path so the first `save` does not fail late with a generic flash error.
+    /// The declared region `[base_offset, base_offset + total_bytes)` extends
+    /// past the flash device's reported capacity. Catches misconfigured
+    /// partitions on a cold path so the first `save` does not fail late with a
+    /// generic flash error.
     OffsetOutOfBounds {
-        /// The byte beyond the last byte the store would touch.
+        /// The end of the declared region (`base_offset + total_bytes`).
         end: u32,
-        /// The upper bound the store must not cross (the smaller of
-        /// `total_bytes` and `flash.capacity()`).
+        /// The upper bound the region must not cross (`flash.capacity()`).
         limit: u32,
     },
     /// The `NorFlash` impl reports a non-4096 `ERASE_SIZE` — unsupported in v1.
@@ -219,12 +219,19 @@ pub struct ProvisioningStore<F: NorFlash> {
 }
 
 impl<F: NorFlash> ProvisioningStore<F> {
-    /// Open a store over `total_bytes` of flash starting at `base_offset`.
+    /// Open a store over a `total_bytes` region of flash starting at
+    /// `base_offset`.
+    ///
+    /// `total_bytes` is the size of the partition region the store occupies,
+    /// measured from `base_offset` — it is *not* an absolute extent from flash
+    /// offset 0. A caller hands the store the size of the dedicated partition
+    /// (e.g. `8192` for a two-sector store at a 3 MiB offset on a 4 MiB
+    /// device).
     ///
     /// Fails if `total_bytes < 8192`, if `base_offset` is not a multiple of
-    /// `F::ERASE_SIZE`, if `F::ERASE_SIZE` is not 4096, or if
-    /// `base_offset + 8192` would extend past `total_bytes` or the flash
-    /// device's reported capacity. The last check catches a misconfigured
+    /// `F::ERASE_SIZE`, if `F::ERASE_SIZE` is not 4096, or if the declared
+    /// region `[base_offset, base_offset + total_bytes)` would extend past the
+    /// flash device's reported capacity. The last check catches a misconfigured
     /// partition table on a cold path so the first `save` does not fail late
     /// with a generic flash error from beyond the partition bound.
     pub fn open(flash: F, base_offset: u32, total_bytes: u32) -> Result<Self, StoreError> {
@@ -241,14 +248,22 @@ impl<F: NorFlash> ProvisioningStore<F> {
         if !base_offset.is_multiple_of(erase_size) {
             return Err(StoreError::NotAligned);
         }
-        // Upper bound: the store must fit within both `total_bytes` and the
-        // flash device's own capacity. `saturating_add` keeps the check sound
-        // even if the caller hands us a near-`u32::MAX` `base_offset`.
-        let end = base_offset.saturating_add(STORE_SIZE);
+        // Upper bound: the declared partition region `[base_offset,
+        // base_offset + total_bytes)` must fit within the flash device's own
+        // capacity. `total_bytes` is the size of the region the store lives in
+        // (measured from `base_offset`), not an absolute extent from offset 0,
+        // so the region end is `base_offset + total_bytes`. `saturating_add`
+        // keeps the check sound even if the caller hands us a near-`u32::MAX`
+        // `base_offset`. The minimum-size guarantee (`total_bytes >=
+        // STORE_SIZE`) is enforced above, so a region that fits also leaves
+        // room for the two sectors the store actually touches.
+        let end = base_offset.saturating_add(total_bytes);
         let capacity = u32::try_from(flash.capacity()).unwrap_or(u32::MAX);
-        let limit = total_bytes.min(capacity);
-        if end > limit {
-            return Err(StoreError::OffsetOutOfBounds { end, limit });
+        if end > capacity {
+            return Err(StoreError::OffsetOutOfBounds {
+                end,
+                limit: capacity,
+            });
         }
         Ok(Self { flash, base_offset })
     }
@@ -561,6 +576,11 @@ mod test_flash {
         /// `false` = contains at least one write and must be erased again
         /// before any further write to this sector.
         pub(super) erased: [bool; 2],
+        /// Capacity the mock reports from `capacity()`. Defaults to the backing
+        /// `data` length; `with_reported_capacity` raises it so `open`'s
+        /// region-vs-capacity check can be exercised at a high `base_offset`
+        /// without a multi-MiB backing buffer (`open` never reads flash).
+        reported_capacity: usize,
     }
 
     impl MockFlash {
@@ -568,6 +588,18 @@ mod test_flash {
             Self {
                 data: [0xFF; 8192],
                 erased: [true; 2],
+                reported_capacity: 8192,
+            }
+        }
+
+        /// A mock that reports `cap` bytes of capacity while keeping the small
+        /// backing buffer. Only valid for `open`-bound tests, which do not read
+        /// or write flash.
+        pub(super) fn with_reported_capacity(cap: usize) -> Self {
+            Self {
+                data: [0xFF; 8192],
+                erased: [true; 2],
+                reported_capacity: cap,
             }
         }
     }
@@ -599,7 +631,7 @@ mod test_flash {
         }
 
         fn capacity(&self) -> usize {
-            self.data.len()
+            self.reported_capacity
         }
     }
 
@@ -779,33 +811,34 @@ mod tests {
     }
 
     #[test]
-    fn store_open_rejects_offset_past_total_bytes() {
-        // base_offset(4096) + STORE_SIZE(8192) = 12288, but caller only
-        // declared total_bytes = 8192 — sector 1 would land outside the
-        // declared partition. Must surface on the cold path, not on first save.
-        let flash = MockFlash::new();
-        let result = ProvisioningStore::open(flash, 4096, 8192);
-        assert_eq!(
-            result.err(),
-            Some(StoreError::OffsetOutOfBounds {
-                end: 12288,
-                limit: 8192,
-            })
+    fn store_open_accepts_region_at_high_offset_within_capacity() {
+        // Regression (hardware, 2026-06-18): the C3 example opens the store at a
+        // 3 MiB partition offset on a 4 MiB device with total_bytes = 8192 (the
+        // partition size). `total_bytes` is the region size measured from
+        // base_offset, NOT an absolute extent from offset 0, so the bound is
+        // `base_offset + total_bytes <= capacity` (3145728 + 8192 = 3153920 <=
+        // 4 MiB), which must succeed. The prior `base_offset + STORE_SIZE >
+        // min(total_bytes, capacity)` check rejected this at boot.
+        let flash = MockFlash::with_reported_capacity(4 * 1024 * 1024);
+        let result = ProvisioningStore::open(flash, 0x0030_0000, 8192);
+        assert!(
+            result.is_ok(),
+            "high-offset open within capacity must succeed, got {:?}",
+            result.err()
         );
     }
 
     #[test]
-    fn store_open_rejects_offset_past_flash_capacity() {
-        // total_bytes claims 16 KiB, but the mock's capacity is only 8 KiB.
-        // The min(total_bytes, capacity) check must catch that the store
-        // would extend beyond the device itself even though `total_bytes`
-        // alone would have allowed it.
+    fn store_open_rejects_region_past_flash_capacity() {
+        // The declared region [4096, 4096 + 16384) = [4096, 20480) extends past
+        // the mock's 8 KiB capacity. The region-vs-capacity check must reject it
+        // on the cold path rather than failing late on the first save.
         let flash = MockFlash::new(); // capacity == 8192
         let result = ProvisioningStore::open(flash, 4096, 16384);
         assert_eq!(
             result.err(),
             Some(StoreError::OffsetOutOfBounds {
-                end: 12288,
+                end: 20480,
                 limit: 8192,
             })
         );

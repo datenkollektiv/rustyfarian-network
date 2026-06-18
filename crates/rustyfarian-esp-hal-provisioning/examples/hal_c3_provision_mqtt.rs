@@ -198,10 +198,18 @@ async fn main(spawner: Spawner) {
             }
         }
         // A real application reboots into its normal STA + MQTT boot here.
-        // This example idles to preserve the log output.
-        println!("Already provisioned — idling (real app would reboot into normal mode)");
+        // That normal path brings up Wi-Fi via `WiFiManager::init_async`, which
+        // calls `esp_rtos::start` and installs the scheduler's time driver.
+        // This provisioned branch performs no Wi-Fi bring-up, so the scheduler
+        // is never started — and the esp-rtos async executor panics the moment
+        // any task `.await`s and it tries to park on the absent time driver
+        // (`Timer::after` and even `core::future::pending().await` both trip it).
+        // We therefore halt with a non-async spin loop rather than awaiting.
+        println!(
+            "Already provisioned — halting (real app would reboot into normal STA + MQTT mode)"
+        );
         loop {
-            Timer::after(Duration::from_secs(60)).await;
+            core::hint::spin_loop();
         }
     }
 

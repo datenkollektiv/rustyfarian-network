@@ -178,6 +178,12 @@ Old: `spawner.must_spawn(my_task(arg));`
 New: `spawner.spawn(my_task(arg).unwrap());` — the `.unwrap()` goes on the **task call** (which returns `Result`), not on `spawner.spawn` (which returns `()`).
 The compiler hint `consider using Result::expect to unwrap the Result<SpawnToken, SpawnError>` is correct in spirit but its suggested edit is wrong (it places `.expect("REASON")` after the closing paren of `spawn`, where it would be applied to `()`).
 
+**The `esp-rtos 0.3.0` async executor panics `unwrap of self.time_driver.as_mut() failed: NoneError` on the *first* `.await` park if `esp_rtos::start` was never called — and `start` is the call that installs the time driver.**
+The executor reads the time driver every time a task parks, so this trips on *any* await, not just `Timer::after` — `core::future::pending().await` panics identically.
+In this workspace `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-wifi/src/lib.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
+Surfaced on hardware 2026-06-18: `hal_c3_provision_mqtt` logged the loaded config then panicked in the idle loop.
+Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `SW_INTERRUPT`.
+
 ---
 
 ## Flashing & Serial (espflash 4.x)
@@ -435,6 +441,18 @@ because WPA2-Personal needs >= 8 bytes (`AP_PASSWORD_MIN_LEN`).
 Fix: `provisioning-pure::form::validate_wifi_password` adds a `TooShort { min: 8 }` error when
 the value is non-empty and below the floor; the form adds `minlength="8"` to the input (HTML5
 `minlength` is only enforced when the field is non-empty, so open networks still work).
+
+**`ProvisioningStore::open(flash, base_offset, total_bytes)` takes `total_bytes` as the size of the partition region at `base_offset` — NOT an absolute extent from flash offset 0.**
+The original bounds check compared `base_offset + STORE_SIZE` against `min(total_bytes, capacity)`,
+which conflated the region size with an absolute ceiling and rejected any store opened at a real
+offset: the examples' `0x300000` (3 MiB) offset panicked at boot with
+`OffsetOutOfBounds { end: 3153920, limit: 8192 }`.
+The 128 host tests never caught it because they only used `base_offset` 0 / 4096, where the two
+interpretations numerically coincide — it surfaced on the first on-hardware run (ESP32-C3,
+2026-06-18). This is the same class as the DHCP `LeaseTable::allocate` lore: host tests can
+enshrine a wrong invariant when they never exercise a realistic parameter.
+Fix: check that the declared region `[base_offset, base_offset + total_bytes)` fits
+`flash.capacity()`; regression-guarded by `store_open_accepts_region_at_high_offset_within_capacity`.
 
 ---
 
