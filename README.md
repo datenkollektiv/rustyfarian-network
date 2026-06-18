@@ -171,6 +171,26 @@ configures linker settings and target-specific flags for ESP32, ESP32-S3, and ba
 Xtensa targets.
 Without this step, builds for those targets will fail with linker or toolchain errors.
 
+### Build target isolation (optional RAM disk)
+
+Bare-metal (`esp-hal`) and ESP-IDF (`std`) builds use separate target directories —
+`target/hal` and `target/idf` — because their artefacts are incompatible and a shared
+`target/` forces a full rebuild on every switch between the two.
+Host and IDE builds use `target/ide`.
+This isolation is always active and needs no setup.
+
+On macOS you can optionally back the embedded target directories with a RAM disk for
+faster, SSD-sparing builds:
+
+```sh
+just doctor           # show RAM disk status, resolved target dirs, and sccache
+just ramdisk attach   # create and mount the RAM disk (idempotent, 6 GB default)
+just ramdisk detach   # eject the RAM disk
+```
+
+When the RAM disk is detached, builds fall back to `target/hal` / `target/idf` on disk —
+isolation is preserved, builds are just slower.
+
 ## License
 
 MIT or Apache-2.0
