@@ -184,6 +184,11 @@ In this workspace `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` is
 Surfaced on hardware 2026-06-18: `hal_c3_provision_mqtt` logged the loaded config then panicked in the idle loop.
 Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `SW_INTERRUPT`.
 
+**A missing `embassy-executor` dependency makes `#[embassy_executor::task]` silently no-op and surfaces as misleading `no method named 'unwrap' found for ... impl Future<Output = ()>` errors, not a clear "macro not found".**
+When `embassy_executor` is unresolved, the `#[embassy_executor::task]` attribute cannot expand, so the annotated fn stays a plain `async fn` returning `impl Future` instead of the spawnable token the macro would produce; the real cause (`error[E0432]: unresolved import embassy_executor`) is buried above a cascade of `.unwrap()`-on-Future errors at every `spawner.spawn(task().unwrap())` call site.
+Hit 2026-06-18 when resuming `hal_c3_connect_async` validation: `rustyfarian-esp-hal-wifi` declared `embassy-net` + `static_cell` but never `embassy-executor` / `embassy-time`, so all three async examples failed to compile.
+Fix: the library doesn't use these crates — only the examples do — so add `embassy-executor` + `embassy-time` as `[dev-dependencies]` (workspace-pinned), not as `embassy`-feature optional deps. Read the *first* error (the unresolved import), not the cascade.
+
 ---
 
 ## Flashing & Serial (espflash 4.x)
