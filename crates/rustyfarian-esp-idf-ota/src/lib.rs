@@ -16,14 +16,14 @@
 mod downloader;
 mod flasher;
 
-pub use ota_pure::OtaError;
+pub use juggler::ota::OtaError;
 
 use std::io::Write;
 use std::time::Duration;
 
 use downloader::FirmwareDownloader;
 use flasher::{FirmwareFlasher, OtaWriter};
-use ota_pure::StreamingVerifier;
+use juggler::ota::StreamingVerifier;
 
 use esp_idf_svc::ota::EspOta;
 

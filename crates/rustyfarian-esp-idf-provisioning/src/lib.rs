@@ -11,7 +11,7 @@
 //! [`on_event`](ProvisioningBuilder::on_event) callback; the host then reboots
 //! into normal STA boot.
 //!
-//! The host-testable form/state/SSID logic lives in [`provisioning_pure`]; this
+//! The host-testable form/state/SSID logic lives in [`juggler::provisioning`]; this
 //! crate is the ESP-IDF binding around it, mirroring the
 //! `rustyfarian-esp-idf-ota` facade shape.
 //!
@@ -57,7 +57,7 @@ mod store;
 
 pub use store::{ProvisioningStore, StoredConfig};
 
-pub use provisioning_pure::{
+pub use juggler::provisioning::{
     derive_softap_ssid, Field, FieldError, LoraFields, MqttFields, ProvisioningConfig,
     ProvisioningState, SchemaProfile, ValidationError,
 };
@@ -72,7 +72,7 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
-use provisioning_pure::ProvisioningInput;
+use juggler::provisioning::ProvisioningInput;
 use rustyfarian_esp_idf_wifi::{softap_mac, ApConfig, SoftApManager};
 
 use dns::DnsResponder;
@@ -96,7 +96,7 @@ pub struct PortalConfig<'a> {
     /// The provisioning schema profile this portal serves.
     ///
     /// Selects the form template, the canonical field set
-    /// [`parse_form`](provisioning_pure::parse_form) validates against, and the
+    /// [`parse_form`](juggler::provisioning::parse_form) validates against, and the
     /// `profile` discriminator the [`ProvisioningStore`] persists. Existing
     /// devices provisioned before the second profile landed read as
     /// [`SchemaProfile::LorawanFieldDevice`] (the NVS v1 → v2 migration in
@@ -217,8 +217,8 @@ impl SharedState {
     }
 }
 
-/// Default maximum AP connections (mirrors `wifi_pure::AP_MAX_CONNECTIONS_DEFAULT`).
-const DEFAULT_MAX_CONNECTIONS: u8 = wifi_pure::AP_MAX_CONNECTIONS_DEFAULT;
+/// Default maximum AP connections (mirrors `juggler::wifi::AP_MAX_CONNECTIONS_DEFAULT`).
+const DEFAULT_MAX_CONNECTIONS: u8 = juggler::wifi::AP_MAX_CONNECTIONS_DEFAULT;
 
 /// Experimental: API may change before 1.0.
 ///
@@ -293,11 +293,11 @@ impl<'a> ProvisioningBuilder<'a> {
 
         let ap_config = match self.config.ap_password {
             Some(pw) => {
-                if pw.len() < wifi_pure::AP_PASSWORD_MIN_LEN {
+                if pw.len() < juggler::wifi::AP_PASSWORD_MIN_LEN {
                     anyhow::bail!(
                         "AP password too short (len={}, min {})",
                         pw.len(),
-                        wifi_pure::AP_PASSWORD_MIN_LEN
+                        juggler::wifi::AP_PASSWORD_MIN_LEN
                     );
                 }
                 ApConfig::wpa2(ssid.as_str(), pw)

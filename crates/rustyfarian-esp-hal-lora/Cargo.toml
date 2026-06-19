@@ -21,7 +21,7 @@ unstable = ["esp-hal/unstable"]
 rt = ["esp-hal/rt"]
 
 [dependencies]
-lora-pure.workspace = true
+juggler = { workspace = true, features = ["lora"] }
 log.workspace = true
 nb.workspace = true
 pennant.workspace = true

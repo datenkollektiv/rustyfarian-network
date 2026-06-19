@@ -4,8 +4,8 @@
 //! is verified on a Heltec V3 board. All methods currently return stub errors
 //! matching the operation attempted (e.g. [`LoraError::TransmitFailed`] from TX methods).
 
-use lora_pure::config::LoraConfig;
-use lora_pure::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
+use juggler::lora::config::LoraConfig;
+use juggler::lora::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
 use pennant::StatusLed;
 
 /// Error type for [`EspHalLoraRadio`] operations.
@@ -110,10 +110,10 @@ impl<S: StatusLed> LoraRadio for EspHalLoraRadio<S> {
     }
 
     fn rx_window_offset_ms(&self) -> i32 {
-        lora_pure::RX_WINDOW_OFFSET_MS
+        juggler::lora::RX_WINDOW_OFFSET_MS
     }
 
     fn rx_window_duration_ms(&self) -> u32 {
-        lora_pure::RX_WINDOW_DURATION_MS
+        juggler::lora::RX_WINDOW_DURATION_MS
     }
 }

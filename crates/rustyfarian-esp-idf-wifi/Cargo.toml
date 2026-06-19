@@ -22,8 +22,7 @@ name = "idf_c6_connect_nonblocking_rgb"
 embuild.workspace = true
 
 [dependencies]
-wifi-pure.workspace = true
-rustyfarian-network-pure = { workspace = true, features = ["std"] }
+juggler = { workspace = true, features = ["wifi", "std"] }
 anyhow.workspace = true
 esp-idf-svc.workspace = true
 pennant.workspace = true

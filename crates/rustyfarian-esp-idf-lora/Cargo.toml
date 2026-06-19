@@ -11,7 +11,7 @@ categories = ["embedded"]
 
 [dependencies]
 anyhow.workspace = true
-lora-pure.workspace = true
+juggler = { workspace = true, features = ["lora"] }
 log.workspace = true
 nb.workspace = true
 embedded-hal.workspace = true

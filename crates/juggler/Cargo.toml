@@ -1,0 +1,45 @@
+[package]
+name = "juggler"
+version = "0.4.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-agnostic types, validation, and state machines for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and provisioning on ESP32"
+keywords = ["esp32", "wifi", "mqtt", "lora", "embedded"]
+categories = ["embedded", "no-std"]
+
+[features]
+default = []
+
+# Domain features — each gates exactly one src/ subdirectory
+wifi = []
+mqtt = []
+lora = ["dep:heapless", "dep:nb", "dep:lorawan-device"]
+espnow = []
+ota = ["dep:heapless", "dep:sha2"]
+provisioning = ["wifi", "mqtt", "lora", "dep:heapless"]
+
+# Mock feature — test doubles for radio and ESP-NOW drivers
+# A single shared mock feature is used because only two domains have mocks with
+# non-trivial test dependencies: wifi and lora. MockEspNowDriver requires alloc
+# (uses std::collections::VecDeque); host-test environments always have alloc.
+mock = ["wifi", "lora", "espnow"]
+
+# std feature — enables the subscriber-thread helpers inside the mqtt module.
+# These require std::thread and std::sync and anyhow::Result.
+# The merged crate is no_std by default; std is opt-in for platform crates that
+# need spawn_subscriber_thread, format_broker_url, SubscribeClient, and QoS.
+std = ["mqtt", "dep:anyhow"]
+
+[dependencies]
+# Always-present: used by backoff, status_colors (zero-dep, always-on modules)
+# and by domain modules that reference log macros.
+log = { workspace = true }
+
+# Domain-optional deps (dep: prefix prevents feature auto-naming)
+heapless = { workspace = true, optional = true }
+nb = { workspace = true, optional = true }
+lorawan-device = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }

@@ -13,7 +13,7 @@ categories = ["embedded"]
 embuild.workspace = true
 
 [dependencies]
-ota-pure.workspace = true
+juggler = { workspace = true, features = ["ota"] }
 esp-idf-svc.workspace = true
 embedded-svc.workspace = true
 log.workspace = true

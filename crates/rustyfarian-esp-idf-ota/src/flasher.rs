@@ -5,7 +5,7 @@
 
 use esp_idf_svc::ota::{EspOta, EspOtaUpdate};
 
-use ota_pure::OtaError;
+use juggler::ota::OtaError;
 
 /// Manages the OTA flash partition handle.
 pub struct FirmwareFlasher {

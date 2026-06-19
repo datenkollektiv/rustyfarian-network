@@ -11,7 +11,7 @@ use core::fmt;
 
 use embedded_storage::nor_flash::NorFlash;
 use heapless::Vec as HVec;
-use provisioning_pure::ProvisioningConfig;
+use juggler::provisioning::ProvisioningConfig;
 
 use crate::record::{
     decode_record, encode_record, pad_to_write_granularity, pick_active, DecodedRecord,
@@ -748,7 +748,7 @@ mod tests {
     use super::test_flash_instrumented::InstrumentedFlash;
     use super::*;
     use heapless::String as HS;
-    use provisioning_pure::{
+    use juggler::provisioning::{
         config::{DEVICE_NAME_MAX_LEN, MQTT_HOST_MAX_LEN, OTA_URL_MAX_LEN},
         profile::MqttFields,
     };
@@ -768,8 +768,8 @@ mod tests {
             None,
         );
         ProvisioningConfig::from_storage_parts(
-            hs::<{ wifi_pure::SSID_MAX_LEN }>("my-net"),
-            hs::<{ wifi_pure::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
+            hs::<{ juggler::wifi::SSID_MAX_LEN }>("my-net"),
+            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,

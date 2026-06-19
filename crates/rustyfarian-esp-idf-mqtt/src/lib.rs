@@ -63,7 +63,7 @@ use std::time::Duration;
 // Re-export StatusLed and SimpleLed from pennant for convenience
 pub use pennant::{SimpleLed, StatusLed};
 
-use rustyfarian_network_pure::mqtt::{
+use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, next_state, spawn_subscriber_thread,
     validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
     validate_subscribe_filter, MqttConnectionState, MqttEvent, QoS as PureQoS, SubscribeClient,
@@ -105,19 +105,18 @@ const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
 
 /// Cyan LED colour for the MQTT connecting state.
 ///
-/// Re-exported from [`rustyfarian_network_pure::status_colors::MQTT_CONNECTING`].
-pub const MQTT_CONNECTING_COLOR: (u8, u8, u8) =
-    rustyfarian_network_pure::status_colors::MQTT_CONNECTING;
+/// Re-exported from [`juggler::status_colors::MQTT_CONNECTING`].
+pub const MQTT_CONNECTING_COLOR: (u8, u8, u8) = juggler::status_colors::MQTT_CONNECTING;
 
 /// Red LED colour for connection timeout/failure.
 ///
-/// Re-exported from [`rustyfarian_network_pure::status_colors::ERROR`].
-pub const MQTT_ERROR_COLOR: (u8, u8, u8) = rustyfarian_network_pure::status_colors::ERROR;
+/// Re-exported from [`juggler::status_colors::ERROR`].
+pub const MQTT_ERROR_COLOR: (u8, u8, u8) = juggler::status_colors::ERROR;
 
 /// Green channel brightness for the "connected" LED state.
 ///
-/// Derived from [`rustyfarian_network_pure::status_colors::CONNECTED`].
-pub const CONNECTED_LED_BRIGHTNESS: u8 = rustyfarian_network_pure::status_colors::CONNECTED.1;
+/// Derived from [`juggler::status_colors::CONNECTED`].
+pub const CONNECTED_LED_BRIGHTNESS: u8 = juggler::status_colors::CONNECTED.1;
 
 /// LED update interval during the connection wait loop (milliseconds).
 ///

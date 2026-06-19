@@ -22,7 +22,8 @@
 
 use core::fmt;
 
-use provisioning_pure::{
+use juggler::mqtt::CLIENT_ID_MAX_LEN;
+use juggler::provisioning::{
     config::{
         DEVICE_NAME_MAX_LEN, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN,
         OTA_URL_MAX_LEN,
@@ -30,7 +31,6 @@ use provisioning_pure::{
     profile::{MqttFields, SchemaProfile},
     ProvisioningConfig,
 };
-use rustyfarian_network_pure::mqtt::CLIENT_ID_MAX_LEN;
 
 use crate::store::StoreError;
 
@@ -538,9 +538,9 @@ fn build_config(
         b.map(|v| bytes_to_hstring::<N>(v, tag)).transpose()
     }
 
-    let wifi_ssid: HString<{ wifi_pure::SSID_MAX_LEN }> =
+    let wifi_ssid: HString<{ juggler::wifi::SSID_MAX_LEN }> =
         bytes_to_hstring(wifi_ssid_bytes, TAG_WIFI_SSID)?;
-    let wifi_password: HString<{ wifi_pure::PASSWORD_MAX_LEN }> =
+    let wifi_password: HString<{ juggler::wifi::PASSWORD_MAX_LEN }> =
         bytes_to_hstring(wifi_pass_bytes, TAG_WIFI_PASS)?;
     let ota_url: HString<OTA_URL_MAX_LEN> = bytes_to_hstring(ota_url_bytes, TAG_OTA_URL)?;
     let device_name: HString<DEVICE_NAME_MAX_LEN> =
@@ -621,8 +621,8 @@ pub(crate) fn pick_active(
 mod tests {
     use super::*;
     use alloc::format;
-    use provisioning_pure::profile::MqttFields;
-    use provisioning_pure::ProvisioningConfig;
+    use juggler::provisioning::profile::MqttFields;
+    use juggler::provisioning::ProvisioningConfig;
 
     /// Build a minimal `WifiMqttDevice` config for testing.
     fn make_wifi_mqtt_config(
@@ -655,8 +655,8 @@ mod tests {
         );
 
         ProvisioningConfig::from_storage_parts(
-            hs::<{ wifi_pure::SSID_MAX_LEN }>(ssid),
-            hs::<{ wifi_pure::PASSWORD_MAX_LEN }>(pass),
+            hs::<{ juggler::wifi::SSID_MAX_LEN }>(ssid),
+            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>(pass),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
@@ -1366,7 +1366,7 @@ mod tests {
     fn extras_rejected_at_encode() {
         // Build a config carrying one opaque extra via `parse_form`, then
         // assert the encoder rejects it rather than silently dropping it.
-        use provisioning_pure::parse_form;
+        use juggler::provisioning::parse_form;
         let body = "wifi_ssid=open-sesame&wifi_pass=secret-pass\
                     &mqtt_uri=mqtt://broker.example.com:1883\
                     &ota_url=http://example.com/fw.bin&dev_name=hive\

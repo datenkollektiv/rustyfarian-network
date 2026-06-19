@@ -20,7 +20,7 @@
 
 use heapless::String as HS;
 
-use provisioning_pure::{ProvisioningConfig, SchemaProfile};
+use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 use crate::store::ProvisioningStore;
@@ -36,11 +36,11 @@ use crate::store::ProvisioningStore;
 #[derive(Clone, Copy)]
 pub struct PortalConfig<'a> {
     /// SoftAP SSID prefix.  The last two bytes of the AP MAC are appended by
-    /// [`provisioning_pure::derive_softap_ssid`] to form the full SSID.
+    /// [`juggler::provisioning::derive_softap_ssid`] to form the full SSID.
     pub ssid_prefix: &'a str,
     /// Optional WPA2 password for the AP.  `None` opens an unprotected AP and
     /// emits a `warn!` log; `Some(pw)` where `pw.len() <
-    /// wifi_pure::AP_PASSWORD_MIN_LEN` causes `start` to return
+    /// juggler::wifi::AP_PASSWORD_MIN_LEN` causes `start` to return
     /// [`ProvisioningError::PasswordTooShort`].
     pub ap_password: Option<&'a str>,
     /// 2.4 GHz channel (1–13).
@@ -222,7 +222,7 @@ pub(crate) struct SharedState {
     /// HTTP task and the caller can read/write it concurrently without an async
     /// executor.
     pub state: embassy_sync::blocking_mutex::CriticalSectionMutex<
-        core::cell::Cell<provisioning_pure::ProvisioningState>,
+        core::cell::Cell<juggler::provisioning::ProvisioningState>,
     >,
     /// Signals the session outcome once, then clears.  Consumed by
     /// [`ProvisioningSession::wait_outcome`].
@@ -256,7 +256,7 @@ impl ProvisioningSession {
     /// The current provisioning state.
     ///
     /// Reads from the critical-section mutex without blocking.
-    pub fn state(&self) -> provisioning_pure::ProvisioningState {
+    pub fn state(&self) -> juggler::provisioning::ProvisioningState {
         self.shared.state.lock(|cell| cell.get())
     }
 
@@ -407,9 +407,9 @@ impl<'a> ProvisioningBuilder<'a> {
 
         // ── Step 1: validate AP password ───────────────────────────────────
         if let Some(pw) = self.config.ap_password {
-            if pw.len() < wifi_pure::AP_PASSWORD_MIN_LEN {
+            if pw.len() < juggler::wifi::AP_PASSWORD_MIN_LEN {
                 return Err(ProvisioningError::PasswordTooShort {
-                    min: wifi_pure::AP_PASSWORD_MIN_LEN,
+                    min: juggler::wifi::AP_PASSWORD_MIN_LEN,
                 });
             }
         } else {
@@ -424,7 +424,9 @@ impl<'a> ProvisioningBuilder<'a> {
         let shared: &'static SharedState = SHARED
             .try_init(SharedState {
                 state: embassy_sync::blocking_mutex::CriticalSectionMutex::new(
-                    core::cell::Cell::new(provisioning_pure::ProvisioningState::AwaitingSubmission),
+                    core::cell::Cell::new(
+                        juggler::provisioning::ProvisioningState::AwaitingSubmission,
+                    ),
                 ),
                 outcome: embassy_sync::signal::Signal::new(),
                 nonce,
@@ -606,7 +608,7 @@ where
 ))]
 pub(crate) mod portal {
     use heapless::String as HS;
-    use provisioning_pure::SchemaProfile;
+    use juggler::provisioning::SchemaProfile;
 
     /// Maximum length for `firmware_version` in the render config.
     pub(crate) const RENDER_FW_VERSION_MAX: usize = 32;
@@ -633,12 +635,12 @@ pub(crate) trait PortalStore: Send + Sync {
     /// Save `config` to flash.
     fn save(
         &self,
-        config: &provisioning_pure::ProvisioningConfig,
+        config: &juggler::provisioning::ProvisioningConfig,
     ) -> Result<(), crate::store::StoreError>;
     /// Load the stored config, if any.
     fn load(
         &self,
-    ) -> Result<Option<provisioning_pure::ProvisioningConfig>, crate::store::StoreError>;
+    ) -> Result<Option<juggler::provisioning::ProvisioningConfig>, crate::store::StoreError>;
 }
 
 /// Blanket impl of [`PortalStore`] for a `Mutex<RefCell<ProvisioningStore<F>>>`.
@@ -652,14 +654,14 @@ where
 {
     fn save(
         &self,
-        config: &provisioning_pure::ProvisioningConfig,
+        config: &juggler::provisioning::ProvisioningConfig,
     ) -> Result<(), crate::store::StoreError> {
         self.lock(|cell| cell.borrow_mut().save(config))
     }
 
     fn load(
         &self,
-    ) -> Result<Option<provisioning_pure::ProvisioningConfig>, crate::store::StoreError> {
+    ) -> Result<Option<juggler::provisioning::ProvisioningConfig>, crate::store::StoreError> {
         self.lock(|cell| cell.borrow_mut().load())
     }
 }

@@ -10,7 +10,7 @@
 // Module is private; no item in this module is part of the public API.
 mod http;
 
-pub use ota_pure::OtaError;
+pub use juggler::ota::OtaError;
 
 #[cfg(all(
     feature = "embassy",

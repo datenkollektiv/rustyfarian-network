@@ -1,6 +1,6 @@
 //! SX1262 radio driver for the Heltec WiFi LoRa 32 V3.
 //!
-//! [`EspIdfLoraRadio`] implements [`lora_pure::LoraRadio`] using `sx126x 0.3` and
+//! [`EspIdfLoraRadio`] implements [`juggler::lora::LoraRadio`] using `sx126x 0.3` and
 //! ESP-IDF SPI.
 //!
 //! # SPI2 pin assignments (Heltec WiFi LoRa 32 V3)
@@ -74,8 +74,8 @@ use sx126x::{
     SX126x,
 };
 
-use lora_pure::config::LoraConfig;
-use lora_pure::{
+use juggler::lora::config::LoraConfig;
+use juggler::lora::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
 };
 
@@ -866,11 +866,11 @@ where
         // Open the RX window immediately.  DIO1 fires when a packet arrives or the
         // window times out (SX1262 hardware timeout after RX_WINDOW_DURATION_MS).
         self.radio
-            .set_rx(RxTxTimeout::from_ms(lora_pure::RX_WINDOW_DURATION_MS))
+            .set_rx(RxTxTimeout::from_ms(juggler::lora::RX_WINDOW_DURATION_MS))
             .map_err(|_| LoraError::ReceiveFailed)?;
         log::debug!(
             "prepare_rx: set_rx issued — RX window open for {}ms",
-            lora_pure::RX_WINDOW_DURATION_MS
+            juggler::lora::RX_WINDOW_DURATION_MS
         );
 
         Ok(())
@@ -970,11 +970,11 @@ where
     }
 
     fn rx_window_offset_ms(&self) -> i32 {
-        lora_pure::RX_WINDOW_OFFSET_MS
+        juggler::lora::RX_WINDOW_OFFSET_MS
     }
 
     fn rx_window_duration_ms(&self) -> u32 {
-        lora_pure::RX_WINDOW_DURATION_MS
+        juggler::lora::RX_WINDOW_DURATION_MS
     }
 }
 

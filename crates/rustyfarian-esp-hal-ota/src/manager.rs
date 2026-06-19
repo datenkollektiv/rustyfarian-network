@@ -12,7 +12,7 @@ use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
 use esp_storage::FlashStorage;
-use ota_pure::{OtaError, StreamingVerifier};
+use juggler::ota::{OtaError, StreamingVerifier};
 
 use crate::http::async_client::fetch_get;
 use crate::http::parse_url;

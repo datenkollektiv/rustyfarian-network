@@ -4,7 +4,7 @@
 //!
 //! ```rust,no_run
 //! use rustyfarian_esp_idf_espnow::EspIdfEspNow;
-//! use espnow_pure::{EspNowDriver, PeerConfig};
+//! use juggler::espnow::{EspNowDriver, PeerConfig};
 //!
 //! let driver = EspIdfEspNow::init().unwrap();
 //! let config = PeerConfig::new([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
@@ -54,7 +54,7 @@ use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, Configuration, EspWifi};
-pub use espnow_pure::{
+pub use juggler::espnow::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanResult, WifiInterface,
     BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP, DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT,
     DEFAULT_RX_CHANNEL_CAPACITY, DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
@@ -477,7 +477,7 @@ impl EspIdfEspNow {
             unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power) }
                 == esp_idf_svc::sys::ESP_OK;
 
-        let burst_power = wifi_pure::TxPowerLevel::Max.to_quarter_dbm();
+        let burst_power = juggler::wifi::TxPowerLevel::Max.to_quarter_dbm();
         // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
         // Wi-Fi subsystem, which is initialised by init_with_radio().
         // burst_power comes from TxPowerLevel::Max which is within the
@@ -668,7 +668,7 @@ impl EspIdfEspNow {
         data: &[u8],
         channel: u8,
     ) -> anyhow::Result<()> {
-        espnow_pure::validate_payload(data)
+        juggler::espnow::validate_payload(data)
             .map_err(|e| anyhow::anyhow!(e))
             .context("payload validation failed")?;
 
@@ -844,8 +844,10 @@ impl EspNowDriver for EspIdfEspNow {
             channel: config.channel,
             encrypt: config.encrypt,
             ifidx: match config.interface {
-                espnow_pure::WifiInterface::Sta => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA,
-                espnow_pure::WifiInterface::Ap => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
+                juggler::espnow::WifiInterface::Sta => {
+                    esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA
+                }
+                juggler::espnow::WifiInterface::Ap => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
             },
             ..Default::default()
         };
@@ -861,7 +863,7 @@ impl EspNowDriver for EspIdfEspNow {
     }
 
     fn send(&self, mac: &MacAddress, data: &[u8]) -> anyhow::Result<()> {
-        espnow_pure::validate_payload(data)
+        juggler::espnow::validate_payload(data)
             .map_err(|e| anyhow::anyhow!(e))
             .context("payload validation failed")?;
         self.esp_now
