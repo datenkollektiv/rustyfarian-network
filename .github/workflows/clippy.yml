@@ -39,5 +39,8 @@ jobs:
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
+      - name: Setup just
+        uses: extractions/setup-just@v2
+
       - name: Run clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        run: just clippy

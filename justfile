@@ -165,6 +165,10 @@ lint-docs:
 deny:
     cargo deny check
 
+# audit dependencies for known security advisories (RUSTSEC)
+audit:
+    cargo audit
+
 # update dependencies (pass package flags to update specific crates, e.g. just update -p led-effects)
 update *args:
     cargo update {{args}}
