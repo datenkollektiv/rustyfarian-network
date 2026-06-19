@@ -38,8 +38,11 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup just
+        uses: extractions/setup-just@v2
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        run: just audit

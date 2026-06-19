@@ -39,24 +39,17 @@ jobs:
       - name: Setup cargo config
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
+      - name: Setup just
+        uses: extractions/setup-just@v2
+
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
 
       - name: Deny (licenses, advisories, bans)
-        run: cargo deny check
+        run: just deny
 
       - name: Check workspace
-        run: cargo check --workspace --release
+        run: just check
 
-      - name: Test pure crates
-        shell: bash
-        run: |
-          host_target="$(rustc -vV | awk '/^host:/ {print $2}')"
-          cargo test -p rustyfarian-network-pure --target "${host_target}"
-          cargo test -p wifi-pure --features mock --target "${host_target}"
-          cargo test -p lora-pure --features mock --target "${host_target}"
-          cargo test -p espnow-pure --features mock --target "${host_target}"
-          cargo test -p ota-pure --target "${host_target}"
-          cargo test -p provisioning-pure --target "${host_target}"
-          cargo test -p rustyfarian-esp-hal-ota --no-default-features --target "${host_target}"
-          cargo test -p rustyfarian-esp-hal-provisioning --no-default-features --target "${host_target}"
+      - name: Test (all platform-independent unit tests)
+        run: just test
