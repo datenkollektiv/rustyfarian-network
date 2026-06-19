@@ -7,24 +7,19 @@
 
 `rustyfarian-network` is a Rust workspace providing Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA networking libraries for ESP32 firmware.
 Two implementation tiers coexist: an ESP-IDF tier (`rustyfarian-esp-idf-*`, std-based) and a bare-metal `esp-hal` tier (`rustyfarian-esp-hal-*`, no_std).
-Both tiers share platform-independent `*-pure` crates that compile and unit-test on any host without the ESP toolchain.
+Both tiers consume platform-independent `juggler` — a consolidated `no_std`-by-default crate with optional `std` feature — that compiles and unit-tests on any host without the ESP toolchain (per ADR 016).
 
 ## Architecture
 
 The workspace separates pure logic (host-testable) from hardware-specific implementations.
 ADRs in `docs/adr/` document each architectural split.
 
-| Pure (no_std, host-testable) | ESP-IDF (std)                      | esp-hal (no_std bare-metal)        |
-|:-----------------------------|:-----------------------------------|:-----------------------------------|
-| `wifi-pure`                  | `rustyfarian-esp-idf-wifi`         | `rustyfarian-esp-hal-wifi`         |
-| `lora-pure`                  | `rustyfarian-esp-idf-lora`         | `rustyfarian-esp-hal-lora`         |
-| `espnow-pure`                | `rustyfarian-esp-idf-espnow`       | (not yet)                          |
-| `ota-pure`                   | `rustyfarian-esp-idf-ota`          | `rustyfarian-esp-hal-ota`          |
-| `provisioning-pure`          | `rustyfarian-esp-idf-provisioning` | `rustyfarian-esp-hal-provisioning` |
-| `rustyfarian-network-pure`   | `rustyfarian-esp-idf-mqtt`         | (planned)                          |
+| Pure (no_std + optional `std`)                                                                                                                                                        | ESP-IDF (std)                                                                                                                                                                                   | esp-hal (no_std bare-metal)                                                                                                             |
+|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------------------------------------|
+| **`juggler`** (Phase 1 ✓ merged) — consolidated platform-independent crate with feature-gated domains: `wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`, plus `mock` and `std` | `rustyfarian-esp-idf-wifi` `rustyfarian-esp-idf-mqtt` `rustyfarian-esp-idf-lora` `rustyfarian-esp-idf-espnow` `rustyfarian-esp-idf-ota` `rustyfarian-esp-idf-provisioning` (Phases 2–3 pending) | `rustyfarian-esp-hal-wifi` `rustyfarian-esp-hal-lora` `rustyfarian-esp-hal-ota` `rustyfarian-esp-hal-provisioning` (Phases 2–3 pending) |
 
-Pure crates contain validation, types, traits, state machines, and timing math.
-Hardware crates implement the traits using ESP-IDF or `esp-hal` and handle the hardware lifecycle.
+The pure tier (`juggler`) contains validation, types, traits, state machines, and timing math — all host-testable, no hardware dependencies.
+The ESP-IDF and esp-hal tiers implement the traits and hardware lifecycle; they remain separate per ADR 005 (HAL tiering is mutually exclusive).
 
 ## Development Workflow
 
@@ -43,7 +38,7 @@ just run <name>            # flash + serial monitor
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.
 `just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
-Pure crates iterate fast without the ESP toolchain — see `just check-wifi-pure`, `just test-wifi`, `just test-ota`, etc.
+The pure tier (`juggler`) iterates fast without the ESP toolchain — see `just test` (all tests), or target specific domains via `-p juggler --features wifi,mock` etc.
 Bare-metal and ESP-IDF builds are isolated into `target/hal` and `target/idf` (host/IDE builds use `target/ide`); this routing is automatic.
 On macOS, `just ramdisk attach` optionally backs those directories with a RAM disk for faster builds, and `just doctor` reports the resolved target dirs and RAM disk status.
 

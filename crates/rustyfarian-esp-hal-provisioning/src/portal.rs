@@ -73,19 +73,19 @@ extern crate alloc;
     test,
     all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
 ))]
-use provisioning_pure::html_json_escape::html_escape_to;
+use juggler::provisioning::html_json_escape::html_escape_to;
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
-use provisioning_pure::parse_form;
+use juggler::provisioning::parse_form;
 #[cfg(any(
     test,
     all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
 ))]
-use provisioning_pure::templates::WIFI_MQTT_PORTAL_HTML;
+use juggler::provisioning::templates::WIFI_MQTT_PORTAL_HTML;
 #[cfg(any(
     test,
     all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
 ))]
-use provisioning_pure::SchemaProfile;
+use juggler::provisioning::SchemaProfile;
 
 #[cfg(any(
     test,
@@ -1028,7 +1028,7 @@ pub(crate) fn dispatch_request(
     ap_ip_str: &str,
     resp_buf: &mut [u8],
 ) -> Result<usize, ()> {
-    use provisioning_pure::ProvisioningInput;
+    use juggler::provisioning::ProvisioningInput;
 
     let target = req.target_str();
 
@@ -2197,8 +2197,8 @@ mod tests {
     /// by which a stored password reaches the rendered HTML.
     #[test]
     fn render_with_loaded_config_omits_password_bytes() {
-        use provisioning_pure::html_json_escape::html_escape_to;
-        use provisioning_pure::templates::WIFI_MQTT_PORTAL_HTML;
+        use juggler::provisioning::html_json_escape::html_escape_to;
+        use juggler::provisioning::templates::WIFI_MQTT_PORTAL_HTML;
 
         // Sentinel passwords that must never appear in any rendered output.
         let sentinel_wifi = "SENTINEL-WIFI-PASS-1234";
@@ -2394,7 +2394,7 @@ mod tests {
     /// and asserts the five HTML-significant characters are escaped.
     #[test]
     fn render_template_escapes_every_substituted_field() {
-        use provisioning_pure::html_json_escape::html_escape_to;
+        use juggler::provisioning::html_json_escape::html_escape_to;
 
         // XSS payload with all five HTML-significant characters.
         let xss_payload = "<script>alert('xss\"&test')</script>";
@@ -2461,7 +2461,7 @@ mod tests {
     /// the expected firmware version string.
     #[test]
     fn render_template_substitutes_firmware_version() {
-        use provisioning_pure::templates::WIFI_MQTT_PORTAL_HTML;
+        use juggler::provisioning::templates::WIFI_MQTT_PORTAL_HTML;
 
         // Confirm the template actually contains the placeholder.
         assert!(
@@ -2566,7 +2566,7 @@ mod tests {
         use crate::session::portal::{
             PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
         };
-        use provisioning_pure::SchemaProfile;
+        use juggler::provisioning::SchemaProfile;
 
         // Build a PortalRenderConfig with a short firmware version + device name.
         let mut fw_ver = heapless::String::<RENDER_FW_VERSION_MAX>::new();

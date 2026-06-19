@@ -1,7 +1,7 @@
 //! LoRa radio driver for ESP-HAL projects (bare-metal, no_std).
 //!
 //! This crate provides [`EspHalLoraRadio`], an implementation of the
-//! [`lora_pure::LoraRadio`] trait using `esp-hal` SPI and GPIO peripherals.
+//! [`juggler::lora::LoraRadio`] trait using `esp-hal` SPI and GPIO peripherals.
 //!
 //! # Status
 //!
@@ -20,7 +20,7 @@
 
 #![no_std]
 
-pub use lora_pure::{
+pub use juggler::lora::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
     RX_WINDOW_DURATION_MS, RX_WINDOW_OFFSET_MS,
 };

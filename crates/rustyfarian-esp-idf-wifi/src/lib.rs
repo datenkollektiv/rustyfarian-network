@@ -67,8 +67,8 @@ use esp_idf_svc::wifi::{
 use pennant::PulseEffect;
 use rgb::RGB8;
 
-// Re-export all pure types from wifi-pure
-pub use wifi_pure::{
+// Re-export all pure types from juggler::wifi
+pub use juggler::wifi::{
     validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig,
     ConnectMode, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
     AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
@@ -77,7 +77,7 @@ pub use wifi_pure::{
 // Re-export StatusLed and SimpleLed from pennant for convenience
 pub use pennant::{SimpleLed, StatusLed};
 
-use rustyfarian_network_pure::status_colors;
+use juggler::status_colors;
 
 /// ESP-IDF Wi-Fi configuration bundled with the hardware peripherals needed for init.
 ///

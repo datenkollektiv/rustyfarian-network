@@ -10,7 +10,7 @@ use embedded_svc::http::Headers;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 
-use ota_pure::OtaError;
+use juggler::ota::OtaError;
 
 /// Buffer size for downloading firmware chunks.
 const DOWNLOAD_BUFFER_SIZE: usize = 4096;

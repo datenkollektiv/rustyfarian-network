@@ -20,7 +20,7 @@ Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA support libraries for ESP32 projects.
 
 **Long-term goals:**
 - Reliable, thin hardware wrappers that stay focused on connectivity — nothing more
-- A growing platform-independent layer (`rustyfarian-network-pure`) that can be unit-tested on the host
+- A platform-independent layer (`juggler`) with per-domain features, unit-tested on the host (Phase 1 complete, Phases 2–3 pending)
 - Minimal friction: a few lines of `Cargo.toml` and no surprises
 
 **Out of scope:** General-purpose application-layer clients (HTTP, CoAP, WebSocket) and BLE provisioning flows.
@@ -34,32 +34,31 @@ SoftAP captive-portal provisioning ships with two `SchemaProfile`s — `LorawanF
 This library embodies the principle of **extracting testable pure logic from hardware-specific code** —
 a pattern common in application development but rare in embedded Rust.
 
-- Pure functions belong in `rustyfarian-network-pure` — a platform-independent crate with no ESP-IDF dependency
-- Examples: SSID and password validation, connection timeout arithmetic, backoff calculations
-- If you can unit-test it without hardware, it should be in `rustyfarian-network-pure`
-- The ESP-IDF wrappers (`rustyfarian-esp-idf-wifi`, `rustyfarian-esp-idf-mqtt`) are thin layers that delegate logic downward and handle the hardware lifecycle
+- Pure logic belongs in `juggler` — a consolidated, feature-gated, platform-independent crate with no ESP-IDF or hardware dependency
+- Examples: SSID and password validation, connection timeout arithmetic, backoff calculations, MQTT state machines
+- If you can unit-test it without hardware, it should be in `juggler` (feature-gated by domain: `wifi`, `mqtt`, `lora`, etc.)
+- The ESP-IDF and esp-hal wrappers are thin layers that delegate logic downward and handle the hardware lifecycle
 
-`rustyfarian-network-pure` can be fully unit-tested on your laptop without an ESP32 or ESP toolchain.
+`juggler` can be fully unit-tested on your laptop without an ESP32 or ESP toolchain (via `just test`).
 
 ## Crates
 
-| Crate                                                             | Description                                                                                 |
-|:------------------------------------------------------------------|:--------------------------------------------------------------------------------------------|
-| [`rustyfarian-network-pure`](crates/rustyfarian-network-pure)     | Platform-independent primitives — validation, timing math; unit-testable on the host        |
-| [`wifi-pure`](crates/wifi-pure)                                   | Platform-independent Wi-Fi types, traits, and validation; `no_std`; unit-testable on host   |
-| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi)     | Wi-Fi connection manager with LED status feedback                                           |
-| [`rustyfarian-esp-hal-wifi`](crates/rustyfarian-esp-hal-wifi)     | Wi-Fi driver stub for bare-metal `esp-hal` targets; full implementation in progress         |
-| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt)     | MQTT client with automatic reconnection and graceful shutdown                               |
-| [`lora-pure`](crates/lora-pure)                                   | Platform-independent LoRa/LoRaWAN types and traits; `no_std`; unit-testable on host         |
-| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora)     | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                          |
-| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora)     | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress               |
-| [`espnow-pure`](crates/espnow-pure)                               | Platform-independent ESP-NOW types, traits, and validation; `no_std`; unit-testable on host |
-| [`rustyfarian-esp-idf-espnow`](crates/rustyfarian-esp-idf-espnow) | ESP-NOW driver for ESP-IDF projects, implementing the `EspNowDriver` trait                  |
-| [`ota-pure`](crates/ota-pure)                                     | Platform-independent OTA primitives — `Version`, streaming SHA-256, sidecar metadata        |
-| [`rustyfarian-esp-idf-ota`](crates/rustyfarian-esp-idf-ota)       | ESP-IDF OTA driver — **blocking**; streaming download, SHA-256 verify, partition swap, rollback |
-| [`rustyfarian-esp-hal-ota`](crates/rustyfarian-esp-hal-ota)       | Bare-metal OTA driver — **async-only**; strict HTTP/1.1 over `embassy-net` + `OtaUpdater` (MVP) |
-| [`provisioning-pure`](crates/provisioning-pure)                   | Platform-independent provisioning primitives — profile-aware form parsing, field validation, SSID derivation, state machine; LoRaWAN and Wi-Fi+MQTT schema profiles; `no_std`; unit-testable on host |
-| [`rustyfarian-esp-idf-provisioning`](crates/rustyfarian-esp-idf-provisioning) | ESP-IDF SoftAP captive-portal provisioning — AP lifecycle, wildcard DNS, embedded HTTP form, NVS credential store; LoRaWAN and Wi-Fi+MQTT device profiles |
+| Crate                                                                         | Description                                                                                                                                                                                             |
+|:------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Pure Tier (Phase 1 ✓)**                                                     |                                                                                                                                                                                                         |
+| [`juggler`](crates/juggler)                                                   | Consolidated platform-independent crate — `no_std` by default + optional `std` feature; features: `wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`, `mock`, `std`; all unit-testable on the host |
+| **ESP-IDF Tier (6 crates, Phases 2–3 pending)**                               |                                                                                                                                                                                                         |
+| [`rustyfarian-esp-idf-wifi`](crates/rustyfarian-esp-idf-wifi)                 | Wi-Fi connection manager with LED status feedback                                                                                                                                                       |
+| [`rustyfarian-esp-idf-mqtt`](crates/rustyfarian-esp-idf-mqtt)                 | MQTT client with automatic reconnection and graceful shutdown                                                                                                                                           |
+| [`rustyfarian-esp-idf-lora`](crates/rustyfarian-esp-idf-lora)                 | LoRa radio driver (SX1262) and LoRaWAN adapter for ESP-IDF targets                                                                                                                                      |
+| [`rustyfarian-esp-idf-espnow`](crates/rustyfarian-esp-idf-espnow)             | ESP-NOW driver for ESP-IDF projects, implementing the `EspNowDriver` trait                                                                                                                              |
+| [`rustyfarian-esp-idf-ota`](crates/rustyfarian-esp-idf-ota)                   | ESP-IDF OTA driver — **blocking**; streaming download, SHA-256 verify, partition swap, rollback                                                                                                         |
+| [`rustyfarian-esp-idf-provisioning`](crates/rustyfarian-esp-idf-provisioning) | ESP-IDF SoftAP captive-portal provisioning — AP lifecycle, wildcard DNS, embedded HTTP form, NVS credential store; LoRaWAN and Wi-Fi+MQTT device profiles                                               |
+| **Bare-Metal Tier (4 crates, Phases 2–3 pending)**                            |                                                                                                                                                                                                         |
+| [`rustyfarian-esp-hal-wifi`](crates/rustyfarian-esp-hal-wifi)                 | Async Wi-Fi driver for bare-metal `esp-hal` targets; STA and AP modes                                                                                                                                   |
+| [`rustyfarian-esp-hal-lora`](crates/rustyfarian-esp-hal-lora)                 | LoRa radio stub for bare-metal `esp-hal` targets; hardware driver in progress                                                                                                                           |
+| [`rustyfarian-esp-hal-ota`](crates/rustyfarian-esp-hal-ota)                   | Bare-metal OTA driver — **async-only**; strict HTTP/1.1 over `embassy-net` + `OtaUpdater` (MVP)                                                                                                         |
+| [`rustyfarian-esp-hal-provisioning`](crates/rustyfarian-esp-hal-provisioning) | Bare-metal SoftAP captive-portal provisioning (v1) — async, A/B torn-write flash store, edge-net HTTP/DHCP/DNS                                                                                          |
 
 ## Usage
 

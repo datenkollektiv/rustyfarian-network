@@ -27,7 +27,7 @@
 
 #![no_std]
 
-pub use wifi_pure::{
+pub use juggler::wifi::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
     TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
     POLL_INTERVAL_MS, SSID_MAX_LEN,
@@ -129,11 +129,11 @@ mod driver {
     use esp_radio::wifi::{
         AuthenticationMethod, Config, ControllerConfig, Interface, PowerSaveMode, WifiController,
     };
-    use static_cell::StaticCell;
-    use wifi_pure::{
+    use juggler::wifi::{
         validate_ap_config, validate_password, validate_ssid, ApConfig, TxPowerLevel, WiFiConfig,
         WifiPowerSave,
     };
+    use static_cell::StaticCell;
 
     /// Wi-Fi configuration bundled with the hardware peripherals needed for init.
     ///
@@ -289,7 +289,7 @@ mod driver {
         /// corrupting WPA2 auth frames.  8.5 dBm is a safe baseline for all
         /// bare-metal builds; callers with external antennas can raise it by
         /// passing an explicit [`TxPowerLevel`] via
-        /// [`WiFiConfig::with_tx_power`][wifi_pure::WiFiConfig::with_tx_power].
+        /// [`WiFiConfig::with_tx_power`][juggler::wifi::WiFiConfig::with_tx_power].
         ///
         /// # One-shot
         ///
@@ -520,7 +520,7 @@ mod driver {
         /// that PCB-antenna reflection mode.  Callers that need lower power
         /// (e.g. a captive-portal restricted to a small room) can pass an
         /// explicit [`TxPowerLevel`] via
-        /// [`ApConfig::with_tx_power`][wifi_pure::ApConfig::with_tx_power].
+        /// [`ApConfig::with_tx_power`][juggler::wifi::ApConfig::with_tx_power].
         ///
         /// TX-power clamping must happen **after** `set_config()`, which is
         /// what triggers `esp_wifi_start()`.  Failure is non-fatal and logged

@@ -50,7 +50,7 @@ pub use session::{
 
 // ── Re-exports from provisioning-pure ─────────────────────────────────────────
 
-pub use provisioning_pure::{
+pub use juggler::provisioning::{
     derive_softap_ssid, Field, FieldError, LoraFields, MqttFields, ProvisioningConfig,
     ProvisioningState, SchemaProfile, ValidationError,
 };

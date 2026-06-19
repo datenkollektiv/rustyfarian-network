@@ -20,7 +20,7 @@
     allow(dead_code)
 )]
 
-use ota_pure::OtaError;
+use juggler::ota::OtaError;
 
 // ── Internal error type ─────────────────────────────────────────────────────
 

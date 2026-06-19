@@ -42,9 +42,7 @@ embassy = [
 ]
 
 [dependencies]
-provisioning-pure = { workspace = true, default-features = false }
-rustyfarian-network-pure = { workspace = true, default-features = false }
-wifi-pure = { workspace = true }
+juggler = { workspace = true, features = ["provisioning"] }
 embedded-storage = { workspace = true }
 heapless = { workspace = true }
 log.workspace = true

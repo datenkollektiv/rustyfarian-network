@@ -30,9 +30,9 @@ use embedded_svc::io::{Read, Write};
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 
-use provisioning_pure::html_json_escape::{html_escape_to, json_escape_to};
-use provisioning_pure::templates::{LORAWAN_PORTAL_HTML, WIFI_MQTT_PORTAL_HTML};
-use provisioning_pure::{parse_form, Field, FieldErrors, ProvisioningInput, SchemaProfile};
+use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
+use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, WIFI_MQTT_PORTAL_HTML};
+use juggler::provisioning::{parse_form, Field, FieldErrors, ProvisioningInput, SchemaProfile};
 
 use crate::store::ProvisioningStore;
 use crate::{ProvisioningEvent, SharedState};
@@ -524,7 +524,7 @@ fn render_errors(errors: &FieldErrors) -> String {
 /// Human-readable label for a form field.
 ///
 /// [`Field::Form`] covers every body-level problem, including a
-/// [`ValidationError::UnexpectedForProfile`](provisioning_pure::ValidationError::UnexpectedForProfile)
+/// [`ValidationError::UnexpectedForProfile`](juggler::provisioning::ValidationError::UnexpectedForProfile)
 /// — the message text comes from the error's `Display`, this only labels the
 /// owning input as the whole submission.
 fn field_label(field: Field) -> &'static str {
@@ -592,7 +592,7 @@ fn render_status(
 
 /// HTML-escapes the five significant characters.
 ///
-/// Delegates to [`provisioning_pure::html_json_escape::html_escape_to`],
+/// Delegates to [`juggler::provisioning::html_json_escape::html_escape_to`],
 /// accumulating the result into an owned `String`.
 fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -602,7 +602,7 @@ fn html_escape(input: &str) -> String {
 
 /// Escapes a string for inclusion in a JSON string literal.
 ///
-/// Delegates to [`provisioning_pure::html_json_escape::json_escape_to`],
+/// Delegates to [`juggler::provisioning::html_json_escape::json_escape_to`],
 /// accumulating the result into an owned `String`.
 fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());

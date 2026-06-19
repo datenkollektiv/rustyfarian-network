@@ -38,7 +38,7 @@ embassy = [
 ]
 
 [dependencies]
-ota-pure.workspace = true
+juggler = { workspace = true, features = ["ota"] }
 log.workspace = true
 sha2 = { workspace = true, default-features = false }
 

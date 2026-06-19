@@ -19,8 +19,7 @@ name = "idf_c3_provision_mqtt"
 embuild.workspace = true
 
 [dependencies]
-provisioning-pure.workspace = true
-wifi-pure.workspace = true
+juggler = { workspace = true, features = ["provisioning"] }
 rustyfarian-esp-idf-wifi = { path = "../rustyfarian-esp-idf-wifi" }
 anyhow.workspace = true
 esp-idf-svc.workspace = true

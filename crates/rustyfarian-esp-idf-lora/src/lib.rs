@@ -2,19 +2,19 @@
 //!
 //! This crate provides the ESP-IDF-specific [`sx1262_driver::EspIdfLoraRadio`] implementation.
 //! Platform-independent types (traits, config, LoRaWAN protocol) are in the
-//! [`lora_pure`] crate, re-exported here for convenience.
+//! [`juggler::lora`] module, re-exported here for convenience.
 
 // Re-export all pure types for backward compatibility.
-pub use lora_pure::commands;
-pub use lora_pure::config;
-pub use lora_pure::lorawan;
-pub use lora_pure::{
+pub use juggler::lora::commands;
+pub use juggler::lora::config;
+pub use juggler::lora::lorawan;
+pub use juggler::lora::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
     RX_WINDOW_DURATION_MS, RX_WINDOW_OFFSET_MS,
 };
-pub use lora_pure::{
+pub use juggler::lora::{
     Downlink, LorawanDevice, LorawanError, LorawanResponse, LorawanSessionData, LorawanState,
 };
-pub use lora_pure::{HeltecV3Pins, LoraConfig, Region};
+pub use juggler::lora::{HeltecV3Pins, LoraConfig, Region};
 
 pub mod sx1262_driver;

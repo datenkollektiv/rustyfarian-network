@@ -11,12 +11,7 @@ repository = "https://github.com/datenkollektiv/rustyfarian-network"
 
 [workspace.dependencies]
 # Workspace-internal
-rustyfarian-network-pure = { path = "crates/rustyfarian-network-pure", default-features = false }
-lora-pure = { path = "crates/lora-pure" }
-wifi-pure = { path = "crates/wifi-pure" }
-espnow-pure = { path = "crates/espnow-pure" }
-ota-pure = { path = "crates/ota-pure" }
-provisioning-pure = { path = "crates/provisioning-pure", default-features = false }
+juggler = { path = "crates/juggler", default-features = false }
 rustyfarian-esp-idf-provisioning = { path = "crates/rustyfarian-esp-idf-provisioning" }
 rustyfarian-esp-hal-wifi = { path = "crates/rustyfarian-esp-hal-wifi", default-features = false }
 

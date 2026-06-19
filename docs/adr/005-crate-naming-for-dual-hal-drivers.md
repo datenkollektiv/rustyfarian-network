@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted — superseded in part by [ADR 016](016-crate-consolidation-for-publishing.md).
+ADR 016 walks back only the *per-domain granularity* (the six per-peripheral crates within each tier are consolidated into one crate per tier).
+The core decision of this ADR — that the three HAL tiers (`pure` / `esp-idf` / `esp-hal`) remain separate crates because mutually-exclusive backends cannot be feature-toggled — stands unchanged.
 
 ## Context
 

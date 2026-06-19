@@ -1,8 +1,8 @@
 # Rustyfarian Network — development tasks
 #
 # ESP-IDF crates require the ESP-IDF toolchain (`just setup-toolchain`).
-# Pure crates (rustyfarian-network-pure, wifi-pure, lora-pure) compile and
-# test on any host without the ESP toolchain.
+# The consolidated pure crate (`juggler`) compiles and tests on any
+# host without the ESP toolchain.
 # Run `just setup-cargo-config` to create the local cargo config.
 
 # load .env file (LoRaWAN and WiFi credentials, MQTT config)
@@ -16,7 +16,7 @@ _default:
 host_target := `scripts/host-target.sh`
 
 # platform-independent crates that can be compiled and tested on the host
-pure_crates := "-p rustyfarian-network-pure -p wifi-pure -p espnow-pure"
+pure_crates := "-p juggler"
 
 ramdisk := "/Volumes/RustBuilds"
 hal_dir  := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
@@ -54,25 +54,29 @@ check-mqtt:
 check-lora:
     cargo check -p rustyfarian-esp-idf-lora --target-dir {{ idf_dir }}
 
-# check the pure lora crate (no ESP-IDF required)
+# check the consolidated pure crate with all features (no ESP-IDF required)
+check-pure:
+    cargo check -p juggler --all-features
+
+# check the pure lora feature (no ESP-IDF required)
 check-lora-pure:
-    cargo check -p lora-pure
+    cargo check -p juggler --features lora
 
-# check the pure wifi crate (no ESP-IDF required)
+# check the pure wifi feature (no ESP-IDF required)
 check-wifi-pure:
-    cargo check -p wifi-pure
+    cargo check -p juggler --features wifi
 
-# check the pure espnow crate (no ESP-IDF required)
+# check the pure espnow feature (no ESP-IDF required)
 check-espnow-pure:
-    cargo check -p espnow-pure
+    cargo check -p juggler --features espnow
 
-# check the pure ota crate (no ESP-IDF required)
+# check the pure ota feature (no ESP-IDF required)
 check-ota-pure:
-    cargo check -p ota-pure
+    cargo check -p juggler --features ota
 
-# check the pure provisioning crate (no ESP-IDF required)
+# check the pure provisioning feature (no ESP-IDF required)
 check-provisioning-pure:
-    cargo check -p provisioning-pure
+    cargo check -p juggler --features provisioning
 
 # check the esp-idf ota crate
 check-ota-idf:
@@ -127,9 +131,9 @@ check-wifi-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
 
-# check rustyfarian-network-pure compiles without the `std` feature (ADR 014 §2 no_std surface)
+# check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
 check-network-pure-no-std:
-    cargo check -p rustyfarian-network-pure --no-default-features
+    cargo check -p juggler --no-default-features
 
 # ── Test & Lint ───────────────────────────────────────────────────────────
 
@@ -167,35 +171,35 @@ update *args:
 
 # run platform-independent backoff unit tests (host toolchain, no ESP-IDF needed)
 test-backoff:
-    cargo test --target {{host_target}} -p rustyfarian-network-pure backoff
+    cargo test --target {{host_target}} -p juggler backoff
 
 # run platform-independent MQTT unit tests (host toolchain, no ESP-IDF needed)
 test-mqtt:
-    cargo test --target {{host_target}} {{pure_crates}} mqtt
+    cargo test --target {{host_target}} -p juggler --features std mqtt
 
 # run subscriber-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
 test-subscriber-thread:
-    cargo test --target {{host_target}} -p rustyfarian-network-pure subscriber_thread
+    cargo test --target {{host_target}} -p juggler --features std subscriber_thread
 
 # run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
 test-wifi:
-    cargo test --target {{host_target}} -p wifi-pure --features mock
+    cargo test --target {{host_target}} -p juggler --features mock
 
 # run platform-independent LoRa unit tests (host toolchain, no ESP-IDF needed)
 test-lora:
-    cargo test --target {{host_target}} -p lora-pure --features mock
+    cargo test --target {{host_target}} -p juggler --features lora,mock
 
 # run platform-independent ESP-NOW unit tests (host toolchain, no ESP-IDF needed)
 test-espnow:
-    cargo test --target {{host_target}} -p espnow-pure --features mock
+    cargo test --target {{host_target}} -p juggler --features mock
 
 # run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
 test-ota:
-    cargo test --target {{host_target}} -p ota-pure
+    cargo test --target {{host_target}} -p juggler --features ota
 
 # run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
 test-provisioning:
-    cargo test --target {{host_target}} -p provisioning-pure
+    cargo test --target {{host_target}} -p juggler --features provisioning
 
 # run all substrate unit tests (DHCP codec + allocation policy, DNS
 # catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
@@ -213,7 +217,7 @@ test-dhcp: test-provisioning-substrate
 test-http: test-provisioning-substrate
 test-dns: test-provisioning-substrate
 
-# run all platform-independent unit tests using {{pure_crates}} (host toolchain, no ESP-IDF needed)
+# run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
 test: test-backoff test-mqtt test-subscriber-thread test-wifi test-lora test-espnow test-ota test-ota-hal test-provisioning test-provisioning-substrate test-provisioning-hal
 
 # ── Examples ──────────────────────────────────────────────────────────────

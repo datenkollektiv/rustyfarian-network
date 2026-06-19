@@ -35,7 +35,7 @@
 //! # Profiles and the v1 → v2 migration
 //!
 //! [`SCHEMA_VERSION`] is `2`. Two profiles share this namespace
-//! ([`provisioning_pure::SchemaProfile`]): `LorawanFieldDevice` writes the
+//! ([`juggler::provisioning::SchemaProfile`]): `LorawanFieldDevice` writes the
 //! LoRaWAN keys (`lora_dev_eui` / `lora_join_eui` / `lora_app_key`),
 //! `WifiMqttDevice` writes the MQTT keys (`mqtt_host` / `mqtt_port` /
 //! `mqtt_user` / `mqtt_pass` / `mqtt_client`); each writes only its active
@@ -43,14 +43,14 @@
 //! (`ota_url`) keys are common to both. [`load`](ProvisioningStore::load) reads
 //! the `profile` key first; a `schema_ver == 1` record (or any record with the
 //! `profile` key absent) is read as
-//! [`SchemaProfile::LorawanFieldDevice`](provisioning_pure::SchemaProfile::LorawanFieldDevice),
+//! [`SchemaProfile::LorawanFieldDevice`](juggler::provisioning::SchemaProfile::LorawanFieldDevice),
 //! so beekeeper-class devices provisioned under v1 are never re-provisioned.
 
 use anyhow::Context as _;
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
-use provisioning_pure::{ProvisioningConfig, SchemaProfile};
+use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
 /// NVS namespace holding every provisioning value.
 const NAMESPACE: &str = "rf_prov";
@@ -128,7 +128,7 @@ const EXTRAS_IDX_MAX: usize = 256;
 ///
 /// A fully loaded provisioning configuration as owned `std` strings.
 ///
-/// Unlike [`provisioning_pure::ProvisioningConfig`] (the parse-time, `no_std`
+/// Unlike [`juggler::provisioning::ProvisioningConfig`] (the parse-time, `no_std`
 /// type), this is the *read-back* view the host boot path consumes.
 ///
 /// The [`profile`](Self::profile) discriminator says which group is populated.
@@ -137,7 +137,7 @@ const EXTRAS_IDX_MAX: usize = 256;
 /// credentials and the MQTT fields are empty / `None`; for
 /// [`SchemaProfile::WifiMqttDevice`] the inverse holds. Hosts match on
 /// `profile` rather than probing which group happens to be populated, mirroring
-/// [`ProvisioningConfig::profile`](provisioning_pure::ProvisioningConfig::profile).
+/// [`ProvisioningConfig::profile`](juggler::provisioning::ProvisioningConfig::profile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredConfig {
     /// The profile this record was provisioned under.

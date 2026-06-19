@@ -47,7 +47,7 @@ embassy = [
 ]
 
 [dependencies]
-wifi-pure.workspace = true
+juggler = { workspace = true, features = ["wifi"] }
 embedded-hal.workspace = true
 pennant.workspace = true
 rgb.workspace = true
