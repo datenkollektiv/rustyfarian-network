@@ -22,7 +22,7 @@
 
 - [ ] What is the crates.io publication order, and are all three tiers published in a single release cycle, or is the pure tier promoted first with a gap?
 - [ ] What is the minimum set of "critical path" feature combinations for CI validation (e.g., `wifi+mqtt`, `lora+esp32s3`, `provisioning+esp32c6`)?
-- [ ] Does `rustyfarian-esp-idf` need a `[package.metadata.docs.rs]` section to control docs.rs builds, or does the default `riscv32imac-esp-espidf` target suffice?
+- [ ] Does `rustyfarian-esp-idf-network` need a `[package.metadata.docs.rs]` section to control docs.rs builds, or does the default `riscv32imac-esp-espidf` target suffice?
 - [ ] Should the pure tier be re-exported by the HAL tiers, or do consumers import both crates (one for pure types, one for implementations)?
 - [ ] Are the six per-domain crates (`wifi-pure`, `lora-pure`, etc.) deleted from the workspace after consolidation, or retained as internal-only path dependencies?
 
@@ -51,16 +51,16 @@
 
 ---
 
-### rustyfarian-esp-idf (std, ESP-IDF HAL, 6 domains)
+### rustyfarian-esp-idf-network (std, ESP-IDF HAL, 6 domains)
 
-| Feature        | What it gates                                            | Default  | Optional deps (proposed)                                                                     | Notes                                                          |
-|:---------------|:---------------------------------------------------------|:---------|:---------------------------------------------------------------------------------------------|:---------------------------------------------------------------|
-| `wifi`         | `rustyfarian-esp-idf-wifi` Wi-Fi manager + SoftAP        | No       | `esp-idf-svc 0.52`, `esp-idf-hal 0.46`, `embedded-svc 0.29`                                  | Always includes LED status feedback.                           |
-| `mqtt`         | `rustyfarian-esp-idf-mqtt` MQTT client + builder         | No       | `dep:esp-idf-svc`, `esp-idf-hal`, `embedded-svc`                                             | Requires `wifi` for bootstrap (checked at build time or docs). |
-| `lora`         | `rustyfarian-esp-idf-lora` SX1262 driver                 | No       | `dep:sx126x 0.3`, `dep:lorawan-device 0.12`, `dep:sha2 0.10`, `esp-idf-hal/critical-section` | Requires `wifi` (or can init standalone).                      |
-| `espnow`       | `rustyfarian-esp-idf-espnow` ESP-NOW peer-to-peer        | No       | `esp-idf-svc`, `esp-idf-hal`                                                                 | Broadcast mode, no Wi-Fi required.                             |
-| `ota`          | `rustyfarian-esp-idf-ota` OTA firmware update            | No       | `esp-idf-svc`, `esp-idf-hal`, `dep:esp-bootloader-esp-idf 0.5`                               | HTTP/HTTPS firmware download.                                  |
-| `provisioning` | `rustyfarian-esp-idf-provisioning` SoftAP captive portal | No       | `dep:esp-idf-svc`, `esp-idf-hal`, depends on `wifi` feature                                  | Credential persistence via NVS; requires `wifi`.               |
+| Feature        | What it gates                                                    | Default  | Optional deps (proposed)                                                                     | Notes                                                          |
+|:---------------|:-----------------------------------------------------------------|:---------|:---------------------------------------------------------------------------------------------|:---------------------------------------------------------------|
+| `wifi`         | `rustyfarian-esp-idf-network-wifi` Wi-Fi manager + SoftAP        | No       | `esp-idf-svc 0.52`, `esp-idf-hal 0.46`, `embedded-svc 0.29`                                  | Always includes LED status feedback.                           |
+| `mqtt`         | `rustyfarian-esp-idf-network-mqtt` MQTT client + builder         | No       | `dep:esp-idf-svc`, `esp-idf-hal`, `embedded-svc`                                             | Requires `wifi` for bootstrap (checked at build time or docs). |
+| `lora`         | `rustyfarian-esp-idf-network-lora` SX1262 driver                 | No       | `dep:sx126x 0.3`, `dep:lorawan-device 0.12`, `dep:sha2 0.10`, `esp-idf-hal/critical-section` | Requires `wifi` (or can init standalone).                      |
+| `espnow`       | `rustyfarian-esp-idf-network-espnow` ESP-NOW peer-to-peer        | No       | `esp-idf-svc`, `esp-idf-hal`                                                                 | Broadcast mode, no Wi-Fi required.                             |
+| `ota`          | `rustyfarian-esp-idf-network-ota` OTA firmware update            | No       | `esp-idf-svc`, `esp-idf-hal`, `dep:esp-bootloader-esp-idf 0.5`                               | HTTP/HTTPS firmware download.                                  |
+| `provisioning` | `rustyfarian-esp-idf-network-provisioning` SoftAP captive portal | No       | `dep:esp-idf-svc`, `esp-idf-hal`, depends on `wifi` feature                                  | Credential persistence via NVS; requires `wifi`.               |
 
 **Key dependencies (always present):**
 - `anyhow 1.0` (error handling)
@@ -79,12 +79,12 @@
 
 **Example usage:**
 ```toml
-rustyfarian-esp-idf = { version = "0.4", features = ["wifi", "mqtt", "ota"] }
+rustyfarian-esp-idf-network = { version = "0.4", features = ["wifi", "mqtt", "ota"] }
 ```
 
 ---
 
-### rustyfarian-esp-hal (no_std bare-metal, 4 domains × 4 chips)
+### rustyfarian-esp-hal-network (no_std bare-metal, 4 domains × 4 chips)
 
 | Feature            | What it gates                                           | Default  | Optional deps (proposed)                                                                                        | Notes                                                   |
 |:-------------------|:--------------------------------------------------------|:---------|:----------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------|
@@ -117,10 +117,10 @@ rustyfarian-esp-idf = { version = "0.4", features = ["wifi", "mqtt", "ota"] }
 **Example usage:**
 ```toml
 # Wi-Fi + OTA, targeting ESP32-C6
-rustyfarian-esp-hal = { version = "0.4", features = ["wifi", "ota", "esp32c6", "embassy"] }
+rustyfarian-esp-hal-network = { version = "0.4", features = ["wifi", "ota", "esp32c6", "embassy"] }
 
 # LoRa only, targeting ESP32-S3
-rustyfarian-esp-hal = { version = "0.4", features = ["lora", "esp32s3"] }
+rustyfarian-esp-hal-network = { version = "0.4", features = ["lora", "esp32s3"] }
 ```
 
 ---
@@ -146,27 +146,27 @@ The mapping is representative and covers all principal public entry points; it w
 
 **Naming and feature notes:**
 - The consolidated pure crate is named `juggler` (a fair-themed name mirroring `rustyfarian-ws2812`'s shared crate `pennant`); the crate name reflects that it juggles many concurrent wireless protocols.
-- The two HAL crates retain literal names (`rustyfarian-esp-idf`, `rustyfarian-esp-hal`) to preserve target-HAL transparency per ADR 005.
+- The two HAL crates take the project-domain postfix `-network` to form `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`, exactly mirroring `rustyfarian-ws2812`'s naming pattern; this scopes the namespace and future-proofs for sibling projects.
 - The `std` feature on `juggler` gates MQTT helpers (`spawn_subscriber_thread`, `SubscribeClient`, `QoS` enum, `format_broker_url`) that require `std::thread` and `anyhow`; it is host-tested and does not depend on any HAL.
 
-| Old crate path                                                             | New path                                                                    | Notes                                                  |
-|:---------------------------------------------------------------------------|:----------------------------------------------------------------------------|:-------------------------------------------------------|
-| `rustyfarian_esp_idf_wifi::WiFiManager`                                    | `rustyfarian_esp_idf::wifi::WiFiManager`                                    | Feature: `wifi`                                        |
-| `rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttHandle, MqttConnectionState}` | `rustyfarian_esp_idf::mqtt::{MqttBuilder, MqttHandle, MqttConnectionState}` | Feature: `mqtt`                                        |
-| `rustyfarian_esp_idf_lora::EspIdfLoraRadio`                                | `rustyfarian_esp_idf::lora::EspIdfLoraRadio`                                | Feature: `lora`                                        |
-| `rustyfarian_esp_idf_espnow::EspNowManager`                                | `rustyfarian_esp_idf::espnow::EspNowManager`                                | Feature: `espnow`                                      |
-| `rustyfarian_esp_idf_ota::OtaUpdate`                                       | `rustyfarian_esp_idf::ota::OtaUpdate`                                       | Feature: `ota`                                         |
-| `rustyfarian_esp_idf_provisioning::{ProvisioningPortal, SchemaProfile}`    | `rustyfarian_esp_idf::provisioning::{ProvisioningPortal, SchemaProfile}`    | Features: `provisioning`, `wifi`                       |
-| `rustyfarian_esp_hal_wifi::WiFiManager`                                    | `rustyfarian_esp_hal::wifi::WiFiManager`                                    | Features: `wifi`, `embassy`, `esp32c3` (or other chip) |
-| `rustyfarian_esp_hal_lora::EspHalLoraRadio`                                | `rustyfarian_esp_hal::lora::EspHalLoraRadio`                                | Feature: `lora`                                        |
-| `rustyfarian_esp_hal_ota::OtaUpdate`                                       | `rustyfarian_esp_hal::ota::OtaUpdate`                                       | Features: `ota`, `embassy`                             |
-| `rustyfarian_esp_hal_provisioning::ProvisioningPortal`                     | `rustyfarian_esp_hal::provisioning::ProvisioningPortal`                     | Features: `provisioning`, `wifi`, `embassy`            |
-| `wifi_pure::{WiFiConfig, ApConfig}`                                        | `juggler::wifi::{WiFiConfig, ApConfig}`                                     | Feature: `wifi`                                        |
-| `lora_pure::{LoraConfig, SpreadingFactor}`                                 | `juggler::lora::{LoraConfig, SpreadingFactor}`                              | Feature: `lora`                                        |
-| `espnow_pure::EspNowFrame`                                                 | `juggler::espnow::EspNowFrame`                                              | Feature: `espnow`                                      |
-| `ota_pure::UpdateManifest`                                                 | `juggler::ota::UpdateManifest`                                              | Feature: `ota`                                         |
-| `provisioning_pure::{SchemaProfile, LoraFields, MqttFields}`               | `juggler::provisioning::{SchemaProfile, LoraFields, MqttFields}`            | Feature: `provisioning`                                |
-| `rustyfarian_network_pure::mqtt::*`                                        | `juggler::mqtt::*`                                                          | Feature: `mqtt`                                        |
+| Old crate path                                                             | New path                                                                            | Notes                                                  |
+|:---------------------------------------------------------------------------|:------------------------------------------------------------------------------------|:-------------------------------------------------------|
+| `rustyfarian_esp_idf_wifi::WiFiManager`                                    | `rustyfarian_esp_idf_network::wifi::WiFiManager`                                    | Feature: `wifi`                                        |
+| `rustyfarian_esp_idf_mqtt::{MqttBuilder, MqttHandle, MqttConnectionState}` | `rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttHandle, MqttConnectionState}` | Feature: `mqtt`                                        |
+| `rustyfarian_esp_idf_lora::EspIdfLoraRadio`                                | `rustyfarian_esp_idf_network::lora::EspIdfLoraRadio`                                | Feature: `lora`                                        |
+| `rustyfarian_esp_idf_espnow::EspNowManager`                                | `rustyfarian_esp_idf_network::espnow::EspNowManager`                                | Feature: `espnow`                                      |
+| `rustyfarian_esp_idf_ota::OtaUpdate`                                       | `rustyfarian_esp_idf_network::ota::OtaUpdate`                                       | Feature: `ota`                                         |
+| `rustyfarian_esp_idf_provisioning::{ProvisioningPortal, SchemaProfile}`    | `rustyfarian_esp_idf_network::provisioning::{ProvisioningPortal, SchemaProfile}`    | Features: `provisioning`, `wifi`                       |
+| `rustyfarian_esp_hal_wifi::WiFiManager`                                    | `rustyfarian_esp_hal_network::wifi::WiFiManager`                                    | Features: `wifi`, `embassy`, `esp32c3` (or other chip) |
+| `rustyfarian_esp_hal_lora::EspHalLoraRadio`                                | `rustyfarian_esp_hal_network::lora::EspHalLoraRadio`                                | Feature: `lora`                                        |
+| `rustyfarian_esp_hal_ota::OtaUpdate`                                       | `rustyfarian_esp_hal_network::ota::OtaUpdate`                                       | Features: `ota`, `embassy`                             |
+| `rustyfarian_esp_hal_provisioning::ProvisioningPortal`                     | `rustyfarian_esp_hal_network::provisioning::ProvisioningPortal`                     | Features: `provisioning`, `wifi`, `embassy`            |
+| `wifi_pure::{WiFiConfig, ApConfig}`                                        | `juggler::wifi::{WiFiConfig, ApConfig}`                                             | Feature: `wifi`                                        |
+| `lora_pure::{LoraConfig, SpreadingFactor}`                                 | `juggler::lora::{LoraConfig, SpreadingFactor}`                                      | Feature: `lora`                                        |
+| `espnow_pure::EspNowFrame`                                                 | `juggler::espnow::EspNowFrame`                                                      | Feature: `espnow`                                      |
+| `ota_pure::UpdateManifest`                                                 | `juggler::ota::UpdateManifest`                                                      | Feature: `ota`                                         |
+| `provisioning_pure::{SchemaProfile, LoraFields, MqttFields}`               | `juggler::provisioning::{SchemaProfile, LoraFields, MqttFields}`                    | Feature: `provisioning`                                |
+| `rustyfarian_network_pure::mqtt::*`                                        | `juggler::mqtt::*`                                                                  | Feature: `mqtt`                                        |
 
 **Implementation note:** The exact type names and module structure will be finalized during Phase 1–3 as the crates are consolidated; this table is representative and will be completed as a comprehensive checklist in the PR description.
 
@@ -181,14 +181,14 @@ To validate that features are independent and do not leak dependencies, the CI p
 - [ ] `--features wifi` (and similarly for each domain: `mqtt`, `lora`, `espnow`, `ota`, `provisioning`)
 - [ ] `--all-features` (all domains + `mock`)
 
-**rustyfarian-esp-idf (riscv32imac-esp-espidf via `just verify`):**
+**rustyfarian-esp-idf-network (riscv32imac-esp-espidf via `just verify`):**
 - [ ] `--no-default-features` (zero features)
 - [ ] `--features wifi`
 - [ ] `--features lora`
 - [ ] `--features wifi,mqtt` (multimodal dependency check)
 - [ ] `--all-features` (all 6 domains)
 
-**rustyfarian-esp-hal (per-chip build via `just build-example`):**
+**rustyfarian-esp-hal-network (per-chip build via `just build-example`):**
 For each of `esp32c3`, `esp32c6`, `esp32s3`:
 - [ ] `--features embassy,wifi,<chip>` (Wi-Fi-only path)
 - [ ] `--features embassy,lora,<chip>` (LoRa-only path)
@@ -231,31 +231,31 @@ Any optional dependency that needs to be always-present (e.g., `heapless` in `ju
 
 ### Per-new-crate smoke tests
 
-For each newly consolidated crate (`juggler`, `rustyfarian-esp-idf`, `rustyfarian-esp-hal`), create a minimal example that exercises the crate the way an external consumer would:
+For each newly consolidated crate (`juggler`, `rustyfarian-esp-idf-network`, `rustyfarian-esp-hal-network`), create a minimal example that exercises the crate the way an external consumer would:
 
 **juggler:**
 - A simple `#[cfg(test)]` unit test (e.g., in `tests/`) that imports all domain modules and instantiates a few key types.
 - Example: `use juggler::wifi::*; let cfg = WiFiConfig::default();`
 
-**rustyfarian-esp-idf:**
+**rustyfarian-esp-idf-network:**
 - A minimal binary (not an example, but a simple `fn main() {}` in a Rust test) that depends on the crate with feature flags and successfully imports key types.
 - Validates that the consolidated crate is correctly re-exporting the old interfaces.
 
-**rustyfarian-esp-hal:**
+**rustyfarian-esp-hal-network:**
 - Per-chip compilation check: build the library with a single feature (`wifi` + `esp32c3`, `lora` + `esp32s3`, etc.) to verify no feature-interaction breakage.
 
 ### Workspace-external integration check
 
 After all three tiers are consolidated and before declaring readiness for publication:
 
-1. Run `cargo publish --dry-run` for each of the 3 crates in order (`juggler`, `rustyfarian-esp-idf`, `rustyfarian-esp-hal`).
+1. Run `cargo publish --dry-run` for each of the 3 crates in order (`juggler`, `rustyfarian-esp-idf-network`, `rustyfarian-esp-hal-network`).
    - Verify no missing `version =` on internal dependencies.
    - Check that the packaged tarball includes all intended source files.
    - Confirm `Cargo.toml.orig` and `.crates2.json` are generated correctly.
 
 2. Create a scratch consumer crate outside the workspace:
    - Add `juggler = { path = "../crate-consolidation-spike/crates/juggler" }` (simulate local publish).
-   - Add `rustyfarian-esp-idf = { path = "../crate-consolidation-spike/crates/rustyfarian-esp-idf", features = ["wifi", "mqtt"] }` (simulate local publish).
+   - Add `rustyfarian-esp-idf-network = { path = "../crate-consolidation-spike/crates/rustyfarian-esp-idf-network", features = ["wifi", "mqtt"] }` (simulate local publish).
    - Verify it compiles and can instantiate types from the consolidated crates.
    - This catches missing `pub use` re-exports and accidental private-item exposure before publication.
 
@@ -298,7 +298,7 @@ just release-publish VERSION=0.4.0
 # 1. Verify all 3 crates have [package] version = "0.4.0"
 # 2. Run `cargo publish --dry-run` for juggler
 # 3. On success, `cargo publish` juggler
-# 4. Repeat for rustyfarian-esp-idf and rustyfarian-esp-hal in order
+# 4. Repeat for rustyfarian-esp-idf-network and rustyfarian-esp-hal-network in order
 # 5. Create a git tag `v0.4.0` and push
 ```
 
@@ -329,8 +329,8 @@ just release-publish VERSION=0.4.0
 - [x] Updated `AGENTS.md` crate-list table to show `juggler` with 7 domain features + 1 support feature instead of 6 rows
 
 ### Phase 2 — ESP-IDF tier consolidation
-- [ ] Consolidate 6 ESP-IDF crates → 1 `rustyfarian-esp-idf` crate in `crates/rustyfarian-esp-idf/`
-  - Move source from `crates/rustyfarian-esp-idf-{wifi,mqtt,lora,espnow,ota,provisioning}/src/` into `src/wifi/`, `src/mqtt/`, etc.
+- [ ] Consolidate 6 ESP-IDF crates → 1 `rustyfarian-esp-idf-network` crate in `crates/rustyfarian-esp-idf-network/`
+  - Move source from `crates/rustyfarian-esp-idf-network-{wifi,mqtt,lora,espnow,ota,provisioning}/src/` into `src/wifi/`, `src/mqtt/`, etc.
   - Create `lib.rs` with re-export pattern
   - Update Cargo.toml: list domain features, all gated `#[cfg(feature = "...")]`
   - Add `default-features = false` to dependency on `juggler = { path = "../juggler" }`
@@ -342,8 +342,8 @@ just release-publish VERSION=0.4.0
 - [ ] Update `AGENTS.md` and `README.md` references from 6 ESP-IDF crates to 1 with feature table
 
 ### Phase 3 — Bare-metal tier consolidation
-- [ ] Consolidate 4 HAL crates → 1 `rustyfarian-esp-hal` crate in `crates/rustyfarian-esp-hal/`
-  - Move source from `crates/rustyfarian-esp-hal-{wifi,lora,ota,provisioning}/src/` into `src/wifi/`, `src/lora/`, etc.
+- [ ] Consolidate 4 HAL crates → 1 `rustyfarian-esp-hal-network` crate in `crates/rustyfarian-esp-hal-network/`
+  - Move source from `crates/rustyfarian-esp-hal-network-{wifi,lora,ota,provisioning}/src/` into `src/wifi/`, `src/lora/`, etc.
   - Create `lib.rs` with re-export pattern
   - Update Cargo.toml: list domain + chip features, all gated `#[cfg(feature = "...")]`
   - Add `default = []`
@@ -357,10 +357,10 @@ just release-publish VERSION=0.4.0
 ### Phase 4 — Prepare for publication
 - [ ] Add per-crate README sections:
   - `crates/juggler/README.md` — features, shared types, host-test coverage
-  - `crates/rustyfarian-esp-idf/README.md` — ESP-IDF-specific setup, Wi-Fi + MQTT + LoRa examples
-  - `crates/rustyfarian-esp-hal/README.md` — bare-metal setup, chip feature matrix, async ecosystem notes
+  - `crates/rustyfarian-esp-idf-network/README.md` — ESP-IDF-specific setup, Wi-Fi + MQTT + LoRa examples
+  - `crates/rustyfarian-esp-hal-network/README.md` — bare-metal setup, chip feature matrix, async ecosystem notes
 - [ ] Add `description`, `keywords`, `categories` to each crate's `Cargo.toml` (LOCKED at planning pass; examples provided below)
-- [ ] Fix `crates/rustyfarian-esp-hal-provisioning/Cargo.toml` metadata (if it still exists post-consolidation, which it will not; skip if already consolidated)
+- [ ] Fix `crates/rustyfarian-esp-hal-network-provisioning/Cargo.toml` metadata (if it still exists post-consolidation, which it will not; skip if already consolidated)
 - [ ] Add `[package.metadata.docs.rs]` to both HAL crates, or verify the default build works
 - [ ] Run `cargo publish --dry-run` for all three crates — no errors, output validates package contents
 - [ ] Update `docs/ROADMAP.md` to reference the 3 consolidated crates instead of 16
@@ -371,7 +371,7 @@ just release-publish VERSION=0.4.0
   - Rollback procedure
 
 ### Phase 5 — First publication
-- [ ] Publish to crates.io (in order: `juggler`, then `rustyfarian-esp-idf`, then `rustyfarian-esp-hal`)
+- [ ] Publish to crates.io (in order: `juggler`, then `rustyfarian-esp-idf-network`, then `rustyfarian-esp-hal-network`)
 - [ ] Verify on crates.io: all three appear, metadata is correct, docs build (or note build failures for HAL targets as expected)
 - [ ] Create a GitHub release tag `v0.4.0` with release notes covering the 16→3 consolidation and any breaking API changes
 - [ ] Update root `README.md` to reference the published crates (version 0.4.0) and feature tables
@@ -391,7 +391,7 @@ After consolidation, the following files must be updated to reflect the 16→3 c
 
 ### Documentation
 - [ ] `README.md`: update crate inventory table and usage examples to show 3 crates + feature flags instead of 16
-- [ ] `docs/ROADMAP.md`: update crate references and timeline events (e.g., "Phase 5 LoRa" → "Phase 5 rustyfarian-esp-hal LoRa")
+- [ ] `docs/ROADMAP.md`: update crate references and timeline events (e.g., "Phase 5 LoRa" → "Phase 5 rustyfarian-esp-hal-network LoRa")
 - [ ] `AGENTS.md` § Architecture: replace the 16-row table with the 3-tier structure + domain/chip feature matrix
 - [ ] `VISION.md`: update capability summary if it currently lists per-crate scope
 
@@ -400,7 +400,7 @@ After consolidation, the following files must be updated to reflect the 16→3 c
 - [ ] `deny.toml`: no changes required (dependency graph is unchanged, only the crate boundaries move)
 
 ### CI / publishing
-- [ ] Add or update CI job to test feature combinations: `cargo build -p rustyfarian-esp-idf --features wifi,mqtt`, `cargo build -p rustyfarian-esp-hal --features lora,esp32s3`, etc.
+- [ ] Add or update CI job to test feature combinations: `cargo build -p rustyfarian-esp-idf-network --features wifi,mqtt`, `cargo build -p rustyfarian-esp-hal-network --features lora,esp32s3`, etc.
 - [ ] Create `docs/release-plan.md` with publication checklist
 
 ---
@@ -417,7 +417,7 @@ keywords = ["esp32", "wifi", "mqtt", "lora", "embedded"]
 categories = ["embedded", "no-std"]
 ```
 
-### rustyfarian-esp-idf
+### rustyfarian-esp-idf-network
 
 ```toml
 description = "ESP-IDF (std) drivers for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and provisioning on ESP32"
@@ -425,7 +425,7 @@ keywords = ["esp32", "esp-idf", "wifi", "mqtt", "lora"]
 categories = ["embedded", "hardware-support"]
 ```
 
-### rustyfarian-esp-hal
+### rustyfarian-esp-hal-network
 
 ```toml
 description = "Bare-metal (esp-hal) async drivers for Wi-Fi, LoRa, OTA, and provisioning on ESP32-C3, ESP32-C6, ESP32-S3, and ESP32"
@@ -479,4 +479,4 @@ categories = ["embedded", "hardware-support", "no-std"]
 
 - 2026-06-18 — Feature doc created; ADR 016 LOCKED for signature; Phase 1–5 tasks defined; critical-path testing matrix TBD in Phase 2.
 - 2026-06-18 — External review feedback incorporated: added migration table (old → new crate paths), feature-combo CI matrix, build/size guardrails, dependency hygiene checklist, testing strategy (per-crate smokes + workspace-external integration), merge-readiness definition-of-done, and publish automation (`just release-publish` recipe pseudo-spec). ADR 016 sections: crate boundary contract (prohibited-dependency rules), semver impact statement, facade-crate rejection rationale.
-- 2026-06-19 — Final naming and feature decisions locked: (1) Pure crate renamed `rustyfarian-pure` → `juggler` (fair-themed, mirrors `pennant`; juggles many protocols); HAL crates stay literal (`rustyfarian-esp-idf`, `rustyfarian-esp-hal`). (2) Naming scope documented as working assumption in ADR 016. (3) `juggler` is `no_std` by default with optional `std` feature gating MQTT helpers (`spawn_subscriber_thread`, `SubscribeClient`, `QoS`, `format_broker_url`) + `anyhow`; host-tested, no HAL deps; does not break boundary contract. (4) Phase 1 COMPLETE: `crates/juggler` created, 10 consumers rewired, 6 old dirs deleted, all tests green, `AGENTS.md` updated. Phases 2–5 remain open.
+- 2026-06-19 — Final naming and feature decisions locked: (1) Pure crate renamed `rustyfarian-pure` → `juggler` (fair-themed, mirrors `pennant`; juggles many protocols); HAL crates stay literal (`rustyfarian-esp-idf-network`, `rustyfarian-esp-hal-network`). (2) Naming scope documented as working assumption in ADR 016. (3) `juggler` is `no_std` by default with optional `std` feature gating MQTT helpers (`spawn_subscriber_thread`, `SubscribeClient`, `QoS`, `format_broker_url`) + `anyhow`; host-tested, no HAL deps; does not break boundary contract. (4) Phase 1 COMPLETE: `crates/juggler` created, 10 consumers rewired, 6 old dirs deleted, all tests green, `AGENTS.md` updated. Phases 2–5 remain open.

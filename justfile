@@ -42,17 +42,17 @@ build:
 check:
     cargo check
 
-# check the wifi crate
+# check the wifi domain of the consolidated ESP-IDF network crate
 check-wifi:
-    cargo check -p rustyfarian-esp-idf-wifi --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features wifi --target-dir {{ idf_dir }}
 
-# check the mqtt crate
+# check the mqtt domain of the consolidated ESP-IDF network crate
 check-mqtt:
-    cargo check -p rustyfarian-esp-idf-mqtt --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt --target-dir {{ idf_dir }}
 
-# check the esp-idf lora crate
+# check the esp-idf lora domain of the consolidated ESP-IDF network crate
 check-lora:
-    cargo check -p rustyfarian-esp-idf-lora --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features lora --target-dir {{ idf_dir }}
 
 # check the consolidated pure crate with all features (no ESP-IDF required)
 check-pure:
@@ -78,13 +78,21 @@ check-ota-pure:
 check-provisioning-pure:
     cargo check -p juggler --features provisioning
 
-# check the esp-idf ota crate
+# check the esp-idf ota domain of the consolidated ESP-IDF network crate
 check-ota-idf:
-    cargo check -p rustyfarian-esp-idf-ota --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features ota --target-dir {{ idf_dir }}
 
-# check the esp-idf provisioning crate
+# check the esp-idf provisioning domain of the consolidated ESP-IDF network crate
 check-provisioning:
-    cargo check -p rustyfarian-esp-idf-provisioning --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features provisioning --target-dir {{ idf_dir }}
+
+# check the esp-idf espnow domain of the consolidated ESP-IDF network crate
+check-espnow:
+    cargo check -p rustyfarian-esp-idf-network --features espnow --target-dir {{ idf_dir }}
+
+# check all ESP-IDF domains of the consolidated network crate (all-features)
+check-idf:
+    cargo check -p rustyfarian-esp-idf-network --all-features --target-dir {{ idf_dir }}
 
 # check the esp-hal ota stub (no-default-features to avoid esp-hal target conflict)
 check-ota-hal:
@@ -112,10 +120,6 @@ test-ota-hal:
 # run platform-independent provisioning unit tests for the bare-metal crate (host toolchain, no ESP toolchain needed)
 test-provisioning-hal:
     cargo test --target {{host_target}} -p rustyfarian-esp-hal-provisioning --no-default-features
-
-# check the esp-idf espnow crate
-check-espnow:
-    cargo check -p rustyfarian-esp-idf-espnow --target-dir {{ idf_dir }}
 
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
@@ -302,8 +306,7 @@ clean:
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 clean-idf:
-    cargo clean -p rustyfarian-esp-idf-wifi --target-dir {{ idf_dir }}
-    cargo clean -p rustyfarian-esp-idf-mqtt --target-dir {{ idf_dir }}
+    cargo clean -p rustyfarian-esp-idf-network --target-dir {{ idf_dir }}
     rm -rf {{ idf_dir }}/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
     rm -rf {{ idf_dir }}/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
 
@@ -351,6 +354,7 @@ pre-commit: fmt check clippy
 verify:
     just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
     just ci
+    just check-idf
     just check-provisioning-hal-embassy
     just check-no-credential-logging
     just check-library-never-reboots

@@ -1,0 +1,134 @@
+[package]
+name = "rustyfarian-esp-idf-network"
+version = "0.4.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ESP-IDF (std) drivers for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and provisioning on ESP32"
+keywords = ["esp32", "esp-idf", "wifi", "mqtt", "lora"]
+categories = ["embedded", "hardware-support"]
+
+[lib]
+name = "rustyfarian_esp_idf_network"
+
+[build-dependencies]
+embuild.workspace = true
+
+[dependencies]
+# ── Always-on ────────────────────────────────────────────────────────────────
+juggler           = { workspace = true, default-features = false }
+anyhow            = { workspace = true }
+log               = { workspace = true }
+esp-idf-svc       = { workspace = true }
+esp-idf-hal       = { workspace = true }
+
+# ── Optional — wifi + mqtt ───────────────────────────────────────────────────
+pennant           = { workspace = true, optional = true }
+rgb               = { workspace = true, optional = true }
+
+# ── Optional — lora only ─────────────────────────────────────────────────────
+sx126x            = { workspace = true, optional = true }
+lorawan-device    = { workspace = true, optional = true }
+lora-modulation   = { workspace = true, optional = true }
+nb                = { workspace = true, optional = true }
+embedded-hal      = { workspace = true, optional = true }
+rand_core         = { version = "0.6", default-features = false, optional = true }
+
+# ── Optional — ota + provisioning ────────────────────────────────────────────
+embedded-svc      = { workspace = true, optional = true }
+
+[features]
+default = []
+
+# wifi: Wi-Fi STA connection manager + SoftAP lifecycle manager.
+wifi = ["juggler/wifi", "dep:pennant", "dep:rgb"]
+
+# mqtt: MQTT builder + handle, MqttManager (deprecated), background event loop.
+mqtt = ["juggler/mqtt", "juggler/std", "dep:pennant", "dep:rgb"]
+
+# lora: SX1262 radio driver + LoRaWAN adapter for lorawan-device 0.12.
+lora = [
+    "juggler/lora",
+    "dep:sx126x",
+    "dep:lorawan-device",
+    "dep:lora-modulation",
+    "dep:rand_core",
+    "dep:nb",
+    "dep:embedded-hal",
+    "esp-idf-hal/critical-section",
+]
+
+# espnow: ESP-NOW peer-to-peer driver.
+espnow = ["juggler/wifi", "juggler/espnow"]
+
+# ota: Streaming download + SHA-256 verify + partition swap.
+ota = ["juggler/ota", "dep:embedded-svc"]
+
+# provisioning: SoftAP captive portal.
+provisioning = ["wifi", "juggler/provisioning", "dep:embedded-svc"]
+
+[dev-dependencies]
+rustyfarian-esp-idf-ws2812 = { workspace = true }
+ssd1306                    = { workspace = true }
+embedded-graphics          = { workspace = true }
+
+[[example]]
+name = "idf_c3_connect"
+required-features = ["wifi"]
+
+[[example]]
+name = "idf_c3_connect_nonblocking"
+required-features = ["wifi"]
+
+[[example]]
+name = "idf_c6_connect_nonblocking_rgb"
+required-features = ["wifi"]
+
+[[example]]
+name = "idf_c3_mqtt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_esp32_mqtt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c3_mqtt_button_oled"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c3_mqtt_led_grid"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_esp32s3_join"
+required-features = ["lora"]
+
+[[example]]
+name = "idf_esp32s3_lora_uplink"
+required-features = ["lora"]
+
+[[example]]
+name = "idf_c3_espnow_coordinator"
+required-features = ["espnow", "wifi"]
+
+[[example]]
+name = "idf_c3_espnow_scout"
+required-features = ["espnow"]
+
+[[example]]
+name = "idf_c3_espnow_scout_promisc"
+required-features = ["espnow"]
+
+[[example]]
+name = "idf_c3_espnow_sta_scout"
+required-features = ["espnow", "wifi"]
+
+[[example]]
+name = "idf_c3_provision"
+required-features = ["provisioning"]
+
+[[example]]
+name = "idf_c3_provision_mqtt"
+required-features = ["provisioning", "mqtt"]

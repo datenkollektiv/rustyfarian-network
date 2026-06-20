@@ -2,7 +2,7 @@
 //!
 //! [`LorawanDevice`] is generic over any [`super::LoraRadio`] implementation,
 //! so it can be driven by a [`super::mock::MockLoraRadio`] in host-side tests
-//! or by `rustyfarian_esp_idf_lora::sx1262_driver::EspIdfLoraRadio` on the Heltec V3.
+//! or by `rustyfarian_esp_idf_network::lora::sx1262_driver::EspIdfLoraRadio` on the Heltec V3.
 //!
 //! # Implementation status
 //!

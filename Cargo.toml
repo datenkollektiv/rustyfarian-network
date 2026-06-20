@@ -11,14 +11,15 @@ repository = "https://github.com/datenkollektiv/rustyfarian-network"
 
 [workspace.dependencies]
 # Workspace-internal
-juggler = { path = "crates/juggler", default-features = false }
-rustyfarian-esp-idf-provisioning = { path = "crates/rustyfarian-esp-idf-provisioning" }
+juggler = { path = "crates/juggler", default-features = false, version = "0.4" }
+rustyfarian-esp-idf-network = { path = "crates/rustyfarian-esp-idf-network" }
 rustyfarian-esp-hal-wifi = { path = "crates/rustyfarian-esp-hal-wifi", default-features = false }
 
 # External dependencies
 anyhow = "1.0"
 log = "0.4"
 nb = "1"
+rand_core = { version = "0.6", default-features = false }
 rgb = "0.8"
 
 # ESP-IDF dependencies
@@ -64,7 +65,7 @@ embedded-io-async = { version = "0.6" }
 # Bare-metal debugging
 esp-backtrace = { version = "=0.19.0", default-features = false, features = ["panic-handler", "println"] }
 
-# Display / graphics — used by OLED examples in rustyfarian-esp-idf-mqtt
+# Display / graphics — used by OLED examples in rustyfarian-esp-idf-network
 ssd1306 = "0.9"
 embedded-graphics = "0.8"
 

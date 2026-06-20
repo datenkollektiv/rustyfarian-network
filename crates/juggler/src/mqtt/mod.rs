@@ -244,7 +244,7 @@ pub enum QoS {
 
 /// Minimal MQTT subscribe surface used by [`spawn_subscriber_thread`].
 ///
-/// Implemented for `EspMqttClient<'static>` in `rustyfarian-esp-idf-mqtt`
+/// Implemented for `EspMqttClient<'static>` in `rustyfarian-esp-idf-network` (mqtt feature)
 /// and for test doubles on the host.
 ///
 /// Requires the `std` feature (part of the subscriber-thread machinery, and
