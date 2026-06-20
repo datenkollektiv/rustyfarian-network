@@ -29,30 +29,30 @@ This ADR proposes a narrower consolidation: merging the six per-domain crates *w
 
 Collapse the 16 crates into three:
 
-| New crate             | Replaces                                                                                             | Mode                  | Domain features                                                                |
-|:----------------------|:-----------------------------------------------------------------------------------------------------|:----------------------|:-------------------------------------------------------------------------------|
-| `juggler`             | `rustyfarian-network-pure`, `wifi-pure`, `lora-pure`, `espnow-pure`, `ota-pure`, `provisioning-pure` | `no_std` + `std` opt  | `wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`, `mock`, `std`         |
-| `rustyfarian-esp-idf` | `rustyfarian-esp-idf-{wifi,mqtt,lora,espnow,ota,provisioning}`                                       | `std`                 | same domains; heavy deps gated optional                                        |
-| `rustyfarian-esp-hal` | `rustyfarian-esp-hal-{wifi,lora,ota,provisioning}`                                                   | `no_std`              | domains × chip features (`esp32`, `esp32c3`, `esp32c6`, `esp32s3`) + `embassy` |
+| New crate                      | Replaces                                                                                             | Mode                  | Domain features                                                                |
+|:-------------------------------|:-----------------------------------------------------------------------------------------------------|:----------------------|:-------------------------------------------------------------------------------|
+| `juggler`                      | `rustyfarian-network-pure`, `wifi-pure`, `lora-pure`, `espnow-pure`, `ota-pure`, `provisioning-pure` | `no_std` + `std` opt  | `wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`, `mock`, `std`         |
+| `rustyfarian-esp-idf-network`  | `rustyfarian-esp-idf-{wifi,mqtt,lora,espnow,ota,provisioning}`                                       | `std`                 | same domains; heavy deps gated optional                                        |
+| `rustyfarian-esp-hal-network`  | `rustyfarian-esp-hal-{wifi,lora,ota,provisioning}`                                                   | `no_std`              | domains × chip features (`esp32`, `esp32c3`, `esp32c6`, `esp32s3`) + `embassy` |
 
 Each crate is published to crates.io under the `datenkollektiv` (organizational) account and uses feature-gating to allow consumers to select only the domains they use.
 
-**Naming (working assumption):** the shared/pure crate is named `juggler` — a fair-themed name mirroring the sister project `rustyfarian-ws2812`'s shared crate `pennant`.
+**Naming:** the shared/pure crate is named `juggler` — a fair-themed name, exactly like the sister project `rustyfarian-ws2812`'s shared crate `pennant`.
 `juggler` was chosen because the crate juggles many concurrent wireless protocols (Wi-Fi, MQTT, LoRa, ESP-NOW) simultaneously — many items kept in flight at once.
-The two HAL crates retain literal names (`rustyfarian-esp-idf`, `rustyfarian-esp-hal`) to preserve target-HAL transparency and crates.io discoverability per ADR 005.
-This naming scope (fair-themed shared crate, literal HAL crates) mirrors the `rustyfarian-ws2812` precedent (`pennant` themed, `rustyfarian-esp-{idf,hal}-ws2812` literal) and is the current working assumption, revisitable if Phases 2–3 uncover a need to revise.
+The two HAL crates take the project-domain postfix `-network` to form `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`, exactly mirroring `rustyfarian-ws2812`'s `rustyfarian-esp-{idf,hal}-ws2812`.
+This naming scopes the namespace, future-proofs for sibling projects (e.g., `rustyfarian-esp-idf-power`), and is more consistent with ADR 005's "crate name is a semantic contract" principle than bare names would be (each name now clearly identifies the HAL tier AND the project domain).
 
 **Default features:** `default = []` — consumers explicitly declare the domains they depend on; this avoids pulling in heavyweight dependencies (like `sx126x` for LoRa, or `embassy-net` for bare-metal Wi-Fi) unless the feature is requested.
 
 ### 2. The pure tier is published first; HAL tiers depend on it as a published crate
 
 - `juggler 0.4.0` is published to crates.io with version `0.4.0` (the breaking consolidation layered on top of the released `0.3.0` from 2026-06-16).
-- `rustyfarian-esp-idf 0.4.0` adds a workspace dependency on `juggler = "0.4"` (semver-compatible).
-- `rustyfarian-esp-hal 0.4.0` adds a workspace dependency on `juggler = "0.4"`.
+- `rustyfarian-esp-idf-network 0.4.0` adds a workspace dependency on `juggler = "0.4"` (semver-compatible).
+- `rustyfarian-esp-hal-network 0.4.0` adds a workspace dependency on `juggler = "0.4"`.
 
 This ensures the two HAL crates always pull the same version of shared types and validation logic, avoiding the pre-publication constraint that internal paths must use `path = "crates/..."`.
 
-After publication, downstream consumers (outside the workspace) depend on `rustyfarian-esp-idf` or `rustyfarian-esp-hal` directly; they do not directly depend on `juggler` (though it remains a transitive dependency and is publicly re-exported by the HAL crates for consumers who need the shared types).
+After publication, downstream consumers (outside the workspace) depend on `rustyfarian-esp-idf-network` or `rustyfarian-esp-hal-network` directly; they do not directly depend on `juggler` (though it remains a transitive dependency and is publicly re-exported by the HAL crates for consumers who need the shared types).
 
 ### 3. Domain features are additive and independent within each tier
 
@@ -62,13 +62,13 @@ Example Cargo.toml declarations post-consolidation:
 
 ```toml
 # ESP-IDF consumer: Wi-Fi + MQTT
-rustyfarian-esp-idf = { version = "0.4", features = ["wifi", "mqtt"] }
+rustyfarian-esp-idf-network = { version = "0.4", features = ["wifi", "mqtt"] }
 
 # Bare-metal consumer: LoRa only
-rustyfarian-esp-hal = { version = "0.4", features = ["lora", "esp32s3"] }
+rustyfarian-esp-hal-network = { version = "0.4", features = ["lora", "esp32s3"] }
 
 # Bare-metal consumer: Wi-Fi + OTA + provisioning, targeting ESP32-C6
-rustyfarian-esp-hal = { version = "0.4", features = ["wifi", "ota", "provisioning", "esp32c6", "embassy"] }
+rustyfarian-esp-hal-network = { version = "0.4", features = ["wifi", "ota", "provisioning", "esp32c6", "embassy"] }
 ```
 
 ### 4. Pure-tier exports the consolidated pure crates; HAL crates re-export the domains they support
@@ -115,20 +115,20 @@ Each consolidated crate commits to a strict boundary contract and prohibited-dep
 - All logic must be host-testable (compilable on `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, etc.).
 - The `std` feature refines (not breaks) this contract: it pulls only the standard library and `anyhow`, both platform-independent.
 
-**`rustyfarian-esp-idf`:**
+**`rustyfarian-esp-idf-network`:**
 - `std`, ESP-IDF only.
 - Depends on `juggler` (selected features) plus `esp-idf-svc`, `esp-idf-hal`, and related ecosystem crates.
-- MUST NOT depend on `rustyfarian-esp-hal`, `esp-hal`, `esp-radio`, or any bare-metal crate.
+- MUST NOT depend on `rustyfarian-esp-hal-network`, `esp-hal`, `esp-radio`, or any bare-metal crate.
 - All target code must compile for `riscv32imac-esp-espidf` or Xtensa ESP-IDF targets only.
 
-**`rustyfarian-esp-hal`:**
+**`rustyfarian-esp-hal-network`:**
 - `no_std` bare-metal.
 - Depends on `juggler` (selected features) plus `esp-hal` (with `unstable` feature as needed), `esp-radio`, and bare-metal ecosystem crates.
-- MUST NOT depend on `rustyfarian-esp-idf`, `esp-idf-svc`, `esp-idf-hal`, or any ESP-IDF-specific crate.
+- MUST NOT depend on `rustyfarian-esp-idf-network`, `esp-idf-svc`, `esp-idf-hal`, or any ESP-IDF-specific crate.
 - All target code must compile for bare-metal RISC-V (`riscv32imac-esp-espidf`, `riscv32imafc-esp-espidf`) or Xtensa bare-metal targets.
 
 **Dependency direction:**
-- One-way: both `rustyfarian-esp-idf` and `rustyfarian-esp-hal` depend on `juggler`, never the reverse.
+- One-way: both `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network` depend on `juggler`, never the reverse.
 - No cycles within the workspace.
 - The two HAL crates never reference each other (not even indirectly via a shared internal crate).
 
@@ -205,7 +205,7 @@ This trade is acceptable because:
 
 - **The alternatives are worse:** 16 crates with similar names are *more* confusing to sort through than 3 well-named crates with documented feature tables.
 - **Documentation is the real discovery tool:** downstream projects will find the workspace via the GitHub repository (e.g. "rustyfarian esp32 mqtt rust"), not by scrolling crates.io, and the README will list the three crates with links to their feature tables.
-- **The crate names are unambiguous:** `juggler` (fair-themed shared crate), `rustyfarian-esp-idf` (literal ESP-IDF), and `rustyfarian-esp-hal` (literal bare-metal) are self-documenting; there is no naming conflict or ambiguity about which tier or paradigm to use.
+- **The crate names are unambiguous:** `juggler` (fair-themed shared crate), `rustyfarian-esp-idf-network` (ESP-IDF + network domain), and `rustyfarian-esp-hal-network` (bare-metal + network domain) are self-documenting; each name clearly identifies the HAL tier AND the project scope, with no ambiguity about which to use.
 
 ### On ADR 005 and this ADR's relationship
 
@@ -222,12 +222,12 @@ ADR 005 should be updated (separately, after this ADR is accepted) to note that 
 - **Simpler dependency graph:** downstream consumers declare one or three crates, not a subset of sixteen.
 - **Coordinated releases:** all domains within a tier share a version number, reducing downstream version-resolution friction and eliminating "which versions are compatible?" confusion.
 - **Reduced publication ceremony:** publishing `rustyfarian-esp-idf 0.4.0` publishes all six domains at once with a single `cargo publish` and a single CHANGELOG entry, instead of staggering six separate publishes and coordinating pre-release ordering.
-- **Cleaner crates.io namespace:** `juggler`, `rustyfarian-esp-idf`, and `rustyfarian-esp-hal` are the three user-facing crates; the six per-domain crates become internal implementation details not visible on crates.io.
+- **Cleaner crates.io namespace:** `juggler`, `rustyfarian-esp-idf-network`, and `rustyfarian-esp-hal-network` are the three user-facing crates; the six per-domain crates become internal implementation details not visible on crates.io.
 - **Feature clarity:** domain selection is explicit in the feature table, making it obvious which optional dependencies come with each choice.
 
 ### Negative
 
-- **Breaking rename for downstream:** any external crate already depending on (e.g.) `rustyfarian-esp-idf-wifi`, `wifi-pure`, or `lora-pure` will need to migrate imports and feature declarations to the consolidated crates (`rustyfarian-esp-idf` with `wifi` feature, `juggler` with `lora` feature, etc.).
+- **Breaking rename for downstream:** any external crate already depending on (e.g.) `rustyfarian-esp-idf-wifi`, `wifi-pure`, or `lora-pure` will need to migrate imports and feature declarations to the consolidated crates (`rustyfarian-esp-idf-network` with `wifi` feature, `juggler` with `lora` feature, etc.).
   This is acceptable as a one-time cost at the 0.4.0 breaking release (following the 0.3.0 publication on 2026-06-16), but it should be called out in the release notes and the migration guide.
 - **Feature-matrix combinatorics on CI:** the two HAL crates have a domain × chip feature matrix (6 domains × 4 chips for `rustyfarian-esp-hal`, 6 domains for `rustyfarian-esp-idf`).
   CI must validate enough combinations to catch feature-interaction bugs without testing an exponential explosion of permutations.
@@ -241,7 +241,7 @@ ADR 005 should be updated (separately, after this ADR is accepted) to note that 
 
 Follow-through items (not decided in this ADR, but implied):
 
-- A per-crate README section for `juggler`, `rustyfarian-esp-idf`, and `rustyfarian-esp-hal` covering the feature tables, chip support, and usage examples.
+- A per-crate README section for `juggler`, `rustyfarian-esp-idf-network`, and `rustyfarian-esp-hal-network` covering the feature tables, chip support, and usage examples.
 - A feature-discovery table in the root `README.md` showing which features are available on which tier and which optional dependencies they pull.
 - `cargo publish --dry-run` validation for all three crates before the first real publication.
 - An `[unstable]` features section in `.cargo/config.toml` if `rustyfarian-esp-hal` uses the bare-metal `unstable` features from `esp-hal` or `esp-radio` (e.g., GPIO, SPI raw access for radio drivers).

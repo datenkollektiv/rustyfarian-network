@@ -39,14 +39,17 @@ prefix=$(printf '%s' "$example" | cut -d_ -f1)
 
 case "$prefix" in
     idf)
-        # ESP-IDF HAL examples: detect package from feature name
+        # All ESP-IDF examples live in the consolidated rustyfarian-esp-idf-network crate.
+        # Derive the required Cargo feature(s) from the example name.
+        pkg="rustyfarian-esp-idf-network"
         case "$example" in
-            *provision*) pkg="rustyfarian-esp-idf-provisioning" ;;
-            *mqtt*)    pkg="rustyfarian-esp-idf-mqtt" ;;
-            *connect*|*wifi*) pkg="rustyfarian-esp-idf-wifi" ;;
-            *join*|*lora*) pkg="rustyfarian-esp-idf-lora" ;;
-            *espnow*)  pkg="rustyfarian-esp-idf-espnow" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", "espnow", or "provision".\n' "$example" >&2; exit 1 ;;
+            *provision*mqtt*|*mqtt*provision*) idf_features="provisioning,mqtt" ;;
+            *provision*) idf_features="provisioning" ;;
+            *mqtt*)      idf_features="wifi,mqtt" ;;
+            *join*|*lora*) idf_features="lora" ;;
+            *espnow*)    idf_features="espnow,wifi" ;;
+            *connect*|*wifi*) idf_features="wifi" ;;
+            *) printf 'Cannot detect feature for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", "espnow", or "provision".\n' "$example" >&2; exit 1 ;;
         esac
 
         # Detect chip and set MCU / Cargo target
@@ -59,15 +62,15 @@ case "$prefix" in
             *) printf 'Unknown chip "%s" in example "%s". Name must follow idf_{c3|c6|esp32|esp32s3}_{feature}.\n' "$chip" "$example" >&2; exit 1 ;;
         esac
 
-        printf 'Building %s for %s (MCU=%s)...\n' "$example" "$target" "$mcu"
+        printf 'Building %s for %s (MCU=%s, features=%s)...\n' "$example" "$target" "$mcu" "$idf_features"
 
         if [ "$mcu" = "esp32" ] || [ "$mcu" = "esp32s3" ]; then
             # shellcheck source=/dev/null
             source "$SCRIPT_DIR/xtensa-toolchain.sh"
             setup_xtensa_toolchain
-            MCU="$mcu" cargo +esp build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo +esp build --release --target "$target" --target-dir "$idf_dir" --features "$idf_features" --example "$example" -p "$pkg"
         else
-            MCU="$mcu" cargo build --release --target "$target" --target-dir "$idf_dir" --example "$example" -p "$pkg"
+            MCU="$mcu" cargo build --release --target "$target" --target-dir "$idf_dir" --features "$idf_features" --example "$example" -p "$pkg"
         fi
 
         bl=$(find_idf_bootloader "$target" "$idf_dir")

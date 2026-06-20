@@ -319,7 +319,7 @@ pub struct ScanResult {
 ///
 /// # Implementors
 ///
-/// - `rustyfarian_esp_idf_espnow::EspIdfEspNow` — ESP-IDF driver
+/// - `rustyfarian_esp_idf_network::espnow::EspIdfEspNow` — ESP-IDF driver
 /// - [`mock::MockEspNowDriver`] — test double (behind `mock` feature / `#[cfg(test)]`)
 pub trait EspNowDriver {
     /// Driver-specific error type.
