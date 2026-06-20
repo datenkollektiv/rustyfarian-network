@@ -6,7 +6,7 @@
 //! the `application/x-www-form-urlencoded` parser, the structured per-field
 //! error model the HTTP layer renders, and the provisioning state machine that
 //! the ESP-IDF crate drives. It holds no platform dependencies so a future
-//! `rustyfarian-esp-hal-provisioning` can adopt it without an API break.
+//! `rustyfarian-esp-hal-network` can adopt it without an API break.
 //!
 //! OTAA credential validation delegates to [`crate::lora::LoraConfig::from_hex_strings`],
 //! Wi-Fi validation to [`crate::wifi`], and MQTT client-ID validation to

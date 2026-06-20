@@ -60,13 +60,8 @@ case "$prefix" in
         ;;
 
     hal)
-        # Bare-metal HAL examples: detect package from feature name
-        case "$example" in
-            *provision*) pkg="rustyfarian-esp-hal-provisioning" ;;
-            *join*) pkg="rustyfarian-esp-hal-lora" ;;
-            *connect*|*wifi*) pkg="rustyfarian-esp-hal-wifi" ;;
-            *) printf 'Cannot detect crate for example "%s".\nName must contain "join", "connect", "wifi", or "provision".\n' "$example" >&2; exit 1 ;;
-        esac
+        # All bare-metal HAL examples live in the consolidated rustyfarian-esp-hal-network crate.
+        pkg="rustyfarian-esp-hal-network"
 
         # Detect chip and set Cargo target
         chip=$(printf '%s' "$example" | cut -d_ -f2)
@@ -78,18 +73,20 @@ case "$prefix" in
             *) printf 'Unknown chip "%s" in example "%s". Name must follow hal_{c3|c6|esp32|esp32s3}_{name}.\n' "$chip" "$example" >&2; exit 1 ;;
         esac
 
-        # Base features
+        # Base features: chip, unstable, rt
         hal_features="${mcu},unstable,rt"
 
-        # Append optional features based on example name
+        # Inject domain feature based on example name
         case "$example" in
-            *_rgb*|hal_c6_*_led*) hal_features="${hal_features},rustyfarian-esp-hal-ws2812" ;;
+            *provision*) hal_features="${hal_features},provisioning,embassy" ;;
+            *join*|*lora*) hal_features="${hal_features},lora" ;;
+            *connect*|*wifi*) hal_features="${hal_features},wifi,embassy" ;;
+            *) printf 'Cannot detect domain for example "%s".\nName must contain "join", "lora", "connect", "wifi", or "provision".\n' "$example" >&2; exit 1 ;;
         esac
+
+        # Append WS2812 feature for LED examples
         case "$example" in
-            *_async*) hal_features="${hal_features},embassy" ;;
-        esac
-        case "$example" in
-            *provision*) hal_features="${hal_features},embassy" ;;
+            *_rgb*|hal_c6_*_led*) hal_features="${hal_features},ws2812" ;;
         esac
 
         printf 'Building %s for bare-metal %s (MCU=%s)...\n' "$example" "$target" "$mcu"

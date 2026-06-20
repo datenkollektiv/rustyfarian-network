@@ -13,7 +13,7 @@ repository = "https://github.com/datenkollektiv/rustyfarian-network"
 # Workspace-internal
 juggler = { path = "crates/juggler", default-features = false, version = "0.4" }
 rustyfarian-esp-idf-network = { path = "crates/rustyfarian-esp-idf-network" }
-rustyfarian-esp-hal-wifi = { path = "crates/rustyfarian-esp-hal-wifi", default-features = false }
+rustyfarian-esp-hal-network = { path = "crates/rustyfarian-esp-hal-network", default-features = false }
 
 # External dependencies
 anyhow = "1.0"
@@ -47,6 +47,7 @@ esp-alloc = { version = "=0.10.0" }
 esp-bootloader-esp-idf = { version = "=0.5.0", default-features = false }
 esp-storage = { version = "=0.9.0", default-features = false }
 embedded-storage = { version = "0.3" }
+embedded-hal-bus = { version = "0.3", default-features = false }
 esp-println = { version = "=0.17.0", default-features = false }
 # `smoltcp` was dropped from the workspace dependency table when `esp-radio 0.18`
 # removed its `smoltcp` feature in favour of `embassy-net-driver`; no member crate

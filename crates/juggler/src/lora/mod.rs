@@ -150,7 +150,7 @@ pub struct RxQuality {
 /// # Implementors
 ///
 /// - `rustyfarian_esp_idf_network::lora::sx1262_driver::EspIdfLoraRadio` — hardware driver (ESP-IDF)
-/// - `rustyfarian_esp_hal_lora::EspHalLoraRadio` — hardware driver (esp-hal, bare-metal)
+/// - `rustyfarian_esp_hal_network::lora::EspHalLoraRadio` — hardware driver (esp-hal, bare-metal)
 /// - [`mock::MockLoraRadio`] — test double (behind `mock` feature / `#[cfg(test)]`)
 pub trait LoraRadio {
     /// Radio-specific error type.
