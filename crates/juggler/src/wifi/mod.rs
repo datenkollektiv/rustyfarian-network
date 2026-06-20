@@ -422,7 +422,7 @@ pub fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
 /// # Implementors
 ///
 /// - `rustyfarian_esp_idf_network::wifi::WiFiManager` — ESP-IDF driver
-/// - `rustyfarian_esp_hal_wifi::EspHalWifiDriver` — bare-metal driver (future)
+/// - `rustyfarian_esp_hal_network::wifi::EspHalWifiDriver` — bare-metal driver (future)
 /// - [`mock::MockWifiDriver`] — test double (behind `mock` feature / `#[cfg(test)]`)
 pub trait WifiDriver {
     /// Driver-specific error type.

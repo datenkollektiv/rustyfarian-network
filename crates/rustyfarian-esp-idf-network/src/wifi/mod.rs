@@ -456,7 +456,7 @@ impl WiFiManager {
     /// assigned via DHCP.
     ///
     /// Returns the assigned IPv4 address, or `Err` if the timeout elapses.
-    /// The bare-metal counterpart in `rustyfarian-esp-hal-wifi` is
+    /// The bare-metal counterpart in `rustyfarian-esp-hal-network` is
     /// `AsyncWifiHandle::wait_for_ip().await` (`esp-radio 0.18` made the
     /// HAL Wi-Fi surface async-only).
     pub fn wait_connected(&self, timeout_ms: u64) -> anyhow::Result<Ipv4Addr> {

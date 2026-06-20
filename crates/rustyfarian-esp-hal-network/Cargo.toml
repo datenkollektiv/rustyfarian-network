@@ -1,0 +1,224 @@
+[package]
+name        = "rustyfarian-esp-hal-network"
+version     = "0.4.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bare-metal (esp-hal) async drivers for Wi-Fi, LoRa, OTA, and provisioning on ESP32-C3, ESP32-C6, ESP32-S3, and ESP32"
+keywords    = ["esp32", "esp-hal", "embedded", "no-std", "async"]
+categories  = ["embedded", "hardware-support", "no-std"]
+
+[features]
+default = []
+
+# ── Domain features ──────────────────────────────────────────────────────────
+
+# wifi: async STA + SoftAP via esp-radio 0.18.
+# The compile_error! guard remains in wifi/mod.rs: enabling any chip feature
+# without `embassy` triggers a compile error in the wifi module.
+# `embassy` is implied by `wifi` (esp-radio 0.18 is async-only).
+wifi = [
+    "juggler/wifi",
+    "dep:esp-hal",
+    "dep:esp-radio", "esp-radio?/wifi", "esp-radio?/esp-alloc", "esp-radio?/unstable", "esp-radio?/log-04",
+    "dep:esp-rtos", "esp-rtos?/esp-radio", "esp-rtos?/esp-alloc",
+    "dep:esp-alloc",
+    "dep:esp-backtrace",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-println",
+    "embassy",
+]
+
+# lora: synchronous LoRa stub using embedded-hal SPI + GPIO.
+# No embassy requirement; lora is nb-based and blocking.
+lora = [
+    "juggler/lora",
+    "dep:esp-hal",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-println",
+    "dep:embedded-hal-bus",
+]
+
+# ota: async bare-metal OTA manager.
+# esp32s3 is deliberately NOT supported (no esp-storage support for esp32s3).
+ota = [
+    "juggler/ota",
+    "dep:esp-hal",
+    "dep:esp-bootloader-esp-idf",
+    "dep:esp-storage",
+    "embassy",
+]
+
+# provisioning: SoftAP captive-portal (always requires wifi + embassy).
+# `esp-storage` is required for the flash credential store on RISC-V targets.
+provisioning = [
+    "wifi",
+    "juggler/provisioning",
+    "dep:esp-storage",
+    "embassy",
+]
+# `wifi` is included because provisioning/session.rs imports crate::wifi::SoftApHandle.
+# `embassy` is transitively implied via `wifi` but listed here for explicitness.
+
+# Belt-and-braces compile-time guard: provisioning without wifi must fail.
+# (provisioning already enables wifi above; this catches any future mis-wiring.)
+
+# ── Cross-cutting support feature ────────────────────────────────────────────
+
+# embassy: async executor + network stack + time.
+# Enabled automatically by `wifi`, `ota`, and `provisioning`.
+embassy = [
+    "dep:embassy-executor",
+    "dep:embassy-net",
+    "embassy-net?/dhcpv4",
+    "embassy-net?/proto-ipv4",
+    "embassy-net?/udp",
+    "embassy-net?/tcp",
+    "embassy-net?/medium-ethernet",
+    "dep:embassy-time",
+    "dep:static_cell",
+    "dep:embedded-io-async",
+    "esp-rtos?/embassy",
+]
+
+# ── Cross-cutting optional features ──────────────────────────────────────────
+
+unstable = ["esp-hal?/unstable"]
+rt = ["esp-hal?/rt"]
+
+# ── Optional LED dependency for the hal_c6_connect_async_led example ─────────
+ws2812 = [
+    "dep:rustyfarian-esp-hal-ws2812",
+]
+
+# ── Chip features ─────────────────────────────────────────────────────────────
+#
+# Each chip feature selects the chip on all optional deps that are present.
+# The `dep?/feature` syntax is a no-op when the optional dep is not yet activated
+# by any domain feature — no-op when dep absent.
+
+# ESP32-C3: RISC-V, riscv32imc-unknown-none-elf
+# Supports: wifi, lora, ota, provisioning
+esp32c3 = [
+    "esp-hal?/esp32c3",
+    "esp-radio?/esp32c3",
+    "esp-rtos?/esp32c3",
+    "esp-alloc?/esp32c3",
+    "esp-bootloader-esp-idf?/esp32c3",
+    "esp-storage?/esp32c3",
+    "esp-backtrace?/esp32c3",
+    "esp-println?/esp32c3", "esp-println?/uart", "esp-println?/log-04",
+    "rustyfarian-esp-hal-ws2812?/esp32c3",
+]
+
+# ESP32-C6: RISC-V, riscv32imac-unknown-none-elf
+# Supports: wifi, lora, ota, provisioning
+esp32c6 = [
+    "esp-hal?/esp32c6",
+    "esp-radio?/esp32c6",
+    "esp-rtos?/esp32c6",
+    "esp-alloc?/esp32c6",
+    "esp-bootloader-esp-idf?/esp32c6",
+    "esp-storage?/esp32c6",
+    "esp-backtrace?/esp32c6",
+    "esp-println?/esp32c6", "esp-println?/jtag-serial", "esp-println?/log-04",
+    "rustyfarian-esp-hal-ws2812?/esp32c6",
+]
+
+# ESP32: Xtensa LX6, xtensa-esp32-none-elf
+# Supports: lora, ota ONLY (no esp-radio support for esp32)
+# wifi and provisioning with esp32 FAIL TO COMPILE BY DESIGN.
+esp32 = [
+    "esp-hal?/esp32",
+    "esp-bootloader-esp-idf?/esp32",
+    "esp-storage?/esp32",
+    "esp-println?/esp32", "esp-println?/uart", "esp-println?/log-04",
+]
+# esp-radio, esp-rtos, esp-alloc, esp-backtrace intentionally NOT listed for esp32.
+
+# ESP32-S3: Xtensa LX7, xtensa-esp32s3-none-elf
+# Supports: lora ONLY (no esp-radio, no ota storage support for esp32s3)
+# wifi, ota, provisioning with esp32s3 FAIL TO COMPILE BY DESIGN.
+esp32s3 = [
+    "esp-hal?/esp32s3",
+    "esp-bootloader-esp-idf?/esp32s3",
+    "esp-println?/esp32s3", "esp-println?/uart", "esp-println?/log-04",
+]
+# esp-radio, esp-rtos, esp-alloc, esp-backtrace, esp-storage intentionally
+# NOT listed for esp32s3.
+
+[dependencies]
+# ── Always-on ────────────────────────────────────────────────────────────────
+juggler          = { workspace = true, default-features = false }
+log              = { workspace = true }
+embedded-hal     = { workspace = true }
+pennant          = { workspace = true }
+rgb              = { workspace = true }
+# TODO post-1.0: gate embassy-sync and heapless on the `provisioning` feature.
+# Currently always-on because session.rs references these types unconditionally
+# (SharedState fields) and the host tests in session.rs must compile with
+# --no-default-features.
+embassy-sync     = { workspace = true }
+heapless         = { workspace = true }
+# `embedded_storage` and `nb` are always-on so the provisioning/store.rs and
+# lora/driver.rs source files (and their embedded unit tests) can compile with
+# --no-default-features on the host toolchain without the chip-specific optional
+# deps (esp-hal, esp-radio, etc.) being activated.  Both crates are pure Rust
+# and compile on any target.
+embedded-storage = { workspace = true }
+nb               = { workspace = true }
+
+# ── Optional — activated by domain or chip features ──────────────────────────
+esp-hal                 = { workspace = true, features = ["unstable"], optional = true }
+esp-radio               = { workspace = true, optional = true }
+esp-rtos                = { workspace = true, optional = true }
+esp-alloc               = { workspace = true, optional = true }
+esp-backtrace           = { workspace = true, optional = true }
+esp-bootloader-esp-idf  = { workspace = true, optional = true }
+esp-storage             = { workspace = true, optional = true, features = ["critical-section"] }
+esp-println             = { workspace = true, optional = true }
+
+embedded-hal-bus        = { workspace = true, optional = true }
+
+embassy-executor        = { workspace = true, optional = true }
+embassy-net             = { workspace = true, optional = true }
+embassy-time            = { workspace = true, optional = true }
+static_cell             = { workspace = true, optional = true }
+embedded-io-async       = { workspace = true, optional = true }
+
+rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
+
+[dev-dependencies]
+embassy-executor = { workspace = true }
+embassy-time     = { workspace = true }
+# Activate juggler sub-features needed by the host-side unit tests embedded in
+# the ota, provisioning, and session module files.  These are unified with the
+# [dependencies] entry so that `cfg(test)` compilation with --no-default-features
+# can reach juggler::ota, juggler::provisioning, juggler::wifi, and juggler::mqtt
+# without pulling in any chip-specific hardware crate.
+juggler = { workspace = true, default-features = false, features = ["ota", "provisioning", "wifi", "mqtt"] }
+
+[[example]]
+name = "hal_c3_connect_async"
+required-features = ["wifi", "esp32c3", "rt", "embassy"]
+
+[[example]]
+name = "hal_c3_connect_async_led"
+required-features = ["wifi", "esp32c3", "rt", "embassy"]
+
+[[example]]
+name = "hal_c6_connect_async_led"
+required-features = ["wifi", "esp32c6", "rt", "embassy", "ws2812"]
+
+[[example]]
+name = "hal_c3_provision_mqtt"
+required-features = ["provisioning", "esp32c3", "rt", "embassy"]
+
+[[example]]
+name = "hal_c6_provision_mqtt"
+required-features = ["provisioning", "esp32c6", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32s3_join"
+required-features = ["lora", "esp32s3", "rt"]

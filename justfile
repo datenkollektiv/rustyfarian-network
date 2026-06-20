@@ -94,46 +94,52 @@ check-espnow:
 check-idf:
     cargo check -p rustyfarian-esp-idf-network --all-features --target-dir {{ idf_dir }}
 
+# check the consolidated HAL network crate stub (no-default-features, host)
+check-hal-stub:
+    cargo check -p rustyfarian-esp-hal-network --no-default-features --target-dir {{ hal_dir }}
+
 # check the esp-hal ota stub (no-default-features to avoid esp-hal target conflict)
 check-ota-hal:
-    cargo check -p rustyfarian-esp-hal-ota --no-default-features --target-dir {{ hal_dir }}
+    cargo check -p rustyfarian-esp-hal-network --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal provisioning stub (no-default-features to avoid esp-hal target conflict)
 check-provisioning-hal:
-    cargo check -p rustyfarian-esp-hal-provisioning --no-default-features --target-dir {{ hal_dir }}
+    cargo check -p rustyfarian-esp-hal-network --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal provisioning crate cross-compiles cleanly to both bare-metal targets
 check-provisioning-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-provisioning --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
 # check the esp-hal ota crate with chip + embassy features (ESP32-C6 + ESP32-C3)
 check-ota-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-ota --no-default-features --features esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
-
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
 # run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
 test-ota-hal:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-ota --no-default-features
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
 
 # run platform-independent provisioning unit tests for the bare-metal crate (host toolchain, no ESP toolchain needed)
 test-provisioning-hal:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-provisioning --no-default-features
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
 
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
-    cargo check -p rustyfarian-esp-hal-lora --no-default-features --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features lora,esp32c6,rt --target-dir {{ hal_dir }}
 
 # check the esp-hal wifi stub (no-default-features to avoid esp-hal target conflict)
 check-wifi-hal:
-    cargo check -p rustyfarian-esp-hal-wifi --no-default-features --target-dir {{ hal_dir }}
+    cargo check -p rustyfarian-esp-hal-network --no-default-features --target-dir {{ hal_dir }}
 
 # check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
 check-wifi-hal-embassy:
-    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c6,rt,embassy --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-wifi --no-default-features --features esp32c3,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c6,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c3,rt,embassy --target-dir {{ hal_dir }}
+
+# check all HAL domains of the consolidated network crate
+check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy
 
 # check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
 check-network-pure-no-std:
@@ -211,11 +217,11 @@ test-provisioning:
 
 # run all substrate unit tests (DHCP codec + allocation policy, DNS
 # catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
-# toolchain.  The substrate modules live in `rustyfarian-esp-hal-provisioning`
-# after Phase 2B promotion; no chip feature is needed for host tests since
+# toolchain.  The substrate modules live in `rustyfarian-esp-hal-network/src/provisioning/`
+# after Phase 3 consolidation; no chip feature is needed for host tests since
 # each module's async `run()` is compiled away without a chip feature.
 test-provisioning-substrate:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-provisioning --no-default-features
+    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
 
 # Back-compat aliases — `test-dhcp` / `test-http` / `test-dns` all delegate to
 # the same recipe because cargo cannot run a single crate's tests with
@@ -318,7 +324,7 @@ check-no-credential-logging:
     # We exclude lines that are comments or assertions about NOT containing.
     exit_code=0
     grep -rn 'log::\(debug\|info\|warn\|error\)!' \
-      crates/rustyfarian-esp-hal-provisioning/src/ \
+      crates/rustyfarian-esp-hal-network/src/provisioning/ \
       | grep -E '\(wifi_pass\|mqtt_pass\|body_str\|body_in_buf\)' \
       | grep -v '//' \
       | grep -v '!.*".*"' && exit_code=1 || true
@@ -328,7 +334,7 @@ check-no-credential-logging:
 check-library-never-reboots:
     #!/usr/bin/env bash
     exit_code=0
-    if find crates/rustyfarian-esp-hal-provisioning/src/ -name '*.rs' -exec \
+    if find crates/rustyfarian-esp-hal-network/src/provisioning/ -name '*.rs' -exec \
       grep -Hn 'esp_hal::reset\|software_reset\|esp_hal_reset' {} \; > /tmp/resets.txt 2>&1; then
       if [ -s /tmp/resets.txt ]; then
         cat /tmp/resets.txt
@@ -336,7 +342,7 @@ check-library-never-reboots:
         exit_code=1
       fi
     fi
-    if grep -Hn 'erase_all' crates/rustyfarian-esp-hal-provisioning/src/portal.rs > /tmp/erase.txt 2>&1; then
+    if grep -Hn 'erase_all' crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs > /tmp/erase.txt 2>&1; then
       if [ -s /tmp/erase.txt ]; then
         cat /tmp/erase.txt
         echo "ERROR: Found erase_all call in portal.rs"
@@ -355,7 +361,7 @@ verify:
     just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
     just ci
     just check-idf
-    just check-provisioning-hal-embassy
+    just check-hal
     just check-no-credential-logging
     just check-library-never-reboots
 
