@@ -1,6 +1,6 @@
 [package]
 name        = "rustyfarian-esp-hal-network"
-version     = "0.4.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -8,6 +8,14 @@ repository.workspace = true
 description = "Bare-metal (esp-hal) async drivers for Wi-Fi, LoRa, OTA, and provisioning on ESP32-C3, ESP32-C6, ESP32-S3, and ESP32"
 keywords    = ["esp32", "esp-hal", "embedded", "no-std", "async"]
 categories  = ["embedded", "hardware-support", "no-std"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+default-target = "riscv32imc-unknown-none-elf"
+features = ["wifi", "esp32c3", "rt", "embassy"]
+# docs.rs for bare-metal crates requires a no_std target and selection of exactly
+# one chip feature. We document the ESP32-C3 (RISC-V, broadest support) with the
+# mandatory `rt` and `embassy` features needed for async Wi-Fi examples.
 
 [features]
 default = []
@@ -78,7 +86,6 @@ embassy = [
     "embassy-net?/medium-ethernet",
     "dep:embassy-time",
     "dep:static_cell",
-    "dep:embedded-io-async",
     "esp-rtos?/embassy",
 ]
 
@@ -185,7 +192,6 @@ embassy-executor        = { workspace = true, optional = true }
 embassy-net             = { workspace = true, optional = true }
 embassy-time            = { workspace = true, optional = true }
 static_cell             = { workspace = true, optional = true }
-embedded-io-async       = { workspace = true, optional = true }
 
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 

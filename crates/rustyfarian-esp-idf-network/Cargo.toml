@@ -1,6 +1,6 @@
 [package]
 name = "rustyfarian-esp-idf-network"
-version = "0.4.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -8,6 +8,13 @@ repository.workspace = true
 description = "ESP-IDF (std) drivers for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and provisioning on ESP32"
 keywords = ["esp32", "esp-idf", "wifi", "mqtt", "lora"]
 categories = ["embedded", "hardware-support"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+default-target = "riscv32imc-esp-espidf"
+features = ["wifi", "mqtt", "lora", "espnow", "ota", "provisioning"]
+# Note: docs.rs will use its own esp-idf build environment; the esp-idf-sys
+# crate is pre-built by docs.rs when the target is recognized.
 
 [lib]
 name = "rustyfarian_esp_idf_network"

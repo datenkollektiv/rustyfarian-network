@@ -6,10 +6,10 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
 
 ## Long-Term Goals
 
-- **Reliable, thin hardware wrappers** — `rustyfarian-esp-idf-wifi` and `rustyfarian-esp-idf-mqtt`
+- **Reliable, thin hardware wrappers** — the `wifi` and `mqtt` features of `rustyfarian-esp-idf-network`
   remain focused connective tissue: starting connections, managing subscriptions, and surfacing
   errors — nothing more.
-- **A growing platform-independent layer** — `rustyfarian-network-pure` accumulates the logic that
+- **A growing platform-independent layer** — `juggler` accumulates the logic that
   can be verified without hardware: validation, timing math, backoff calculations, and similar pure
   functions; all unit-tested on the host.
 - **Minimal friction for adopters** — adding networking to a new ESP32-IDF firmware project should
@@ -17,9 +17,8 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
   error messages make that possible.
 - **Driven by real firmware, not speculation** — new features are added when a concrete downstream
   project surfaces a gap; the library stays lean and avoids untested abstractions.
-- **An `esp-hal` bare-metal tier** — dedicated `rustyfarian-esp-hal-*` crates provide bare-metal alternatives alongside the existing ESP-IDF path.
-  This generalises the earlier LoRa-only `esp-hal` goal into a workspace-wide pattern: separate crates per HAL tier with shared `*-pure` crates for platform-independent types and traits (see [ADR 005](docs/adr/005-crate-naming-for-dual-hal-drivers.md)).
-  Active: `rustyfarian-esp-hal-lora` (LoRa radio driver) and `rustyfarian-esp-hal-wifi` (Wi-Fi via `esp-wifi 0.14.0`, in progress).
+- **An `esp-hal` bare-metal tier** — `rustyfarian-esp-hal-network` provides bare-metal (`no_std`) drivers alongside the ESP-IDF path, feature-gated by domain (`wifi`, `lora`, `ota`, `provisioning`) and chip.
+  The three HAL tiers stay separate crates because mutually-exclusive backends cannot be feature-toggled, while platform-independent types and traits are shared via `juggler` (see [ADR 005](docs/adr/005-crate-naming-for-dual-hal-drivers.md)); the per-domain crates within each tier were later consolidated into one crate per tier (see [ADR 016](docs/adr/016-crate-consolidation-for-publishing.md)).
 - **OTA as firmware-update plumbing** — OTA support may live in this workspace when it reuses the same Wi-Fi, bootloader, partition-table, and dual-HAL foundations as the networking crates.
 - **SoftAP captive-portal provisioning** — provisioning support may live in this workspace when it reuses the same Wi-Fi lifecycle and NVS foundations as the networking crates.
   The HTTP server backing the captive portal is a private transport, not a reusable workspace API (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
@@ -34,12 +33,12 @@ but with an API clean enough that any ESP32-IDF project can adopt it with confid
 - **General-purpose application-layer clients** — HTTP, CoAP, WebSocket, and similar reusable clients are out of scope.
   Feature-specific private transports may exist behind crate APIs, such as OTA fetching, but are not exported as protocol libraries.
 - **BLE provisioning** — no BLE-based Wi-Fi setup flows; SoftAP captive-portal provisioning is in scope (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
-- **Full `no_std` / `esp-hal` MQTT** — MQTT over bare-metal Wi-Fi (`rustyfarian-esp-hal-mqtt`) is a long-term goal but not an active workstream; Wi-Fi association is the current `esp-hal` frontier.
+- **Full `no_std` / `esp-hal` MQTT** — MQTT over bare-metal Wi-Fi (a future `mqtt` feature on `rustyfarian-esp-hal-network`) is a long-term goal but not an active workstream.
 
 ## Success Signals
 
 - A new firmware project can integrate Wi-Fi + MQTT in under 30 minutes with no surprises.
-- `rustyfarian-network-pure` has enough coverage that most connection-logic bugs surface in
+- `juggler` has enough coverage that most connection-logic bugs surface in
   host tests before touching hardware.
 - The CI pipeline is green on every push; `just verify` passes locally without friction.
 - Downstream firmware projects never need to fork or patch this library to meet a new requirement.
@@ -64,3 +63,5 @@ _(none at this time)_
   BLE provisioning remains a non-goal (ADR 013).
 - 2026-06-12 — Wi-Fi + MQTT provisioning profile accepted, generalising the four-field v1 schema into a closed set of named `SchemaProfile`s (`LorawanFieldDevice`, `WifiMqttDevice`).
   `rustyfarian-network-pure` gains a `no_std`-safe surface so `provisioning-pure` can delegate MQTT validation without dragging in `std` (ADR 014).
+- 2026-06-20 — The 16 per-domain crates consolidated into three publishable crates — `juggler` (pure), `rustyfarian-esp-idf-network` (ESP-IDF), and `rustyfarian-esp-hal-network` (bare-metal `esp-hal`) — each feature-gated by domain, in preparation for the first crates.io release (0.4.0).
+  Supersedes the per-domain granularity of ADR 005, keeping its HAL-split core (ADR 016).

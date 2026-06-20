@@ -1,6 +1,6 @@
 [package]
 name = "juggler"
-version = "0.4.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -8,6 +8,10 @@ repository.workspace = true
 description = "Platform-agnostic types, validation, and state machines for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and provisioning on ESP32"
 keywords = ["esp32", "wifi", "mqtt", "lora", "embedded"]
 categories = ["embedded", "no-std"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []

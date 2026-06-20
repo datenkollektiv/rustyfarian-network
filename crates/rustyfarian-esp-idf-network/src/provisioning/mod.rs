@@ -100,7 +100,7 @@ pub struct PortalConfig<'a> {
     /// `profile` discriminator the [`ProvisioningStore`] persists. Existing
     /// devices provisioned before the second profile landed read as
     /// [`SchemaProfile::LorawanFieldDevice`] (the NVS v1 → v2 migration in
-    /// [`store`](mod@store)), so a beekeeper device upgraded to v2 firmware is
+    /// the [`store`] module), so a beekeeper device upgraded to v2 firmware is
     /// never re-provisioned. The `mqtt_pass` secret follows the same rules as
     /// `wifi_pass` and `app_key`: redacted, never pre-filled, re-entered on
     /// every submission.

@@ -6,7 +6,7 @@
 # Run `just setup-cargo-config` to create the local cargo config.
 
 # load .env file (LoRaWAN and WiFi credentials, MQTT config)
-set dotenv-load := true
+set dotenv-load
 
 # list available recipes (default)
 _default:
@@ -15,22 +15,25 @@ _default:
 # host target, used to override the workspace ESP-IDF target for pure-logic tests
 host_target := `scripts/host-target.sh`
 
-# platform-independent crates that can be compiled and tested on the host
-pure_crates := "-p juggler"
+# bare-metal target for HAL crates (publish / dry-run)
+hal_target := "riscv32imac-unknown-none-elf"
+
+# ESP-IDF target (publish / dry-run)
+idf_target := "riscv32imac-esp-espidf"
 
 ramdisk := "/Volumes/RustBuilds"
-hal_dir  := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
-idf_dir  := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
+hal_dir := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
+idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
 
 # ── Build Environment ─────────────────────────────────────────────────────
 
 # show RAM disk status, resolved target dirs, and sccache
 doctor:
-    @scripts/doctor.sh "{{ramdisk}}" "{{hal_dir}}" "{{idf_dir}}"
+    @scripts/doctor.sh "{{ ramdisk }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
 # manage the RAM disk: just ramdisk attach | detach
 ramdisk action:
-    @scripts/ramdisk.sh "{{action}}"
+    @scripts/ramdisk.sh "{{ action }}"
 
 # ── Build & Check ─────────────────────────────────────────────────────────
 
@@ -122,11 +125,11 @@ check-ota-hal-embassy:
 
 # run platform-independent HTTP parser unit tests (host toolchain, no ESP toolchain needed)
 test-ota-hal:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
+    cargo test --target {{ host_target }} -p rustyfarian-esp-hal-network --no-default-features
 
 # run platform-independent provisioning unit tests for the bare-metal crate (host toolchain, no ESP toolchain needed)
 test-provisioning-hal:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
+    cargo test --target {{ host_target }} -p rustyfarian-esp-hal-network --no-default-features
 
 # check the esp-hal lora stub (no-default-features to avoid esp-hal target conflict)
 check-lora-hal:
@@ -185,39 +188,39 @@ audit:
 
 # update dependencies (pass package flags to update specific crates, e.g. just update -p led-effects)
 update *args:
-    cargo update {{args}}
+    cargo update {{ args }}
 
 # run platform-independent backoff unit tests (host toolchain, no ESP-IDF needed)
 test-backoff:
-    cargo test --target {{host_target}} -p juggler backoff
+    cargo test --target {{ host_target }} -p juggler backoff
 
 # run platform-independent MQTT unit tests (host toolchain, no ESP-IDF needed)
 test-mqtt:
-    cargo test --target {{host_target}} -p juggler --features std mqtt
+    cargo test --target {{ host_target }} -p juggler --features std mqtt
 
 # run subscriber-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
 test-subscriber-thread:
-    cargo test --target {{host_target}} -p juggler --features std subscriber_thread
+    cargo test --target {{ host_target }} -p juggler --features std subscriber_thread
 
 # run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
 test-wifi:
-    cargo test --target {{host_target}} -p juggler --features mock
+    cargo test --target {{ host_target }} -p juggler --features mock
 
 # run platform-independent LoRa unit tests (host toolchain, no ESP-IDF needed)
 test-lora:
-    cargo test --target {{host_target}} -p juggler --features lora,mock
+    cargo test --target {{ host_target }} -p juggler --features lora,mock
 
 # run platform-independent ESP-NOW unit tests (host toolchain, no ESP-IDF needed)
 test-espnow:
-    cargo test --target {{host_target}} -p juggler --features mock
+    cargo test --target {{ host_target }} -p juggler --features mock
 
 # run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
 test-ota:
-    cargo test --target {{host_target}} -p juggler --features ota
+    cargo test --target {{ host_target }} -p juggler --features ota
 
 # run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
 test-provisioning:
-    cargo test --target {{host_target}} -p juggler --features provisioning
+    cargo test --target {{ host_target }} -p juggler --features provisioning
 
 # run all substrate unit tests (DHCP codec + allocation policy, DNS
 # catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
@@ -225,14 +228,17 @@ test-provisioning:
 # after Phase 3 consolidation; no chip feature is needed for host tests since
 # each module's async `run()` is compiled away without a chip feature.
 test-provisioning-substrate:
-    cargo test --target {{host_target}} -p rustyfarian-esp-hal-network --no-default-features
+    cargo test --target {{ host_target }} -p rustyfarian-esp-hal-network --no-default-features
 
-# Back-compat aliases — `test-dhcp` / `test-http` / `test-dns` all delegate to
-# the same recipe because cargo cannot run a single crate's tests with
-# per-module isolation without a per-test filter.  Keep these for the
-# muscle-memory of callers who type the area they care about.
+# Back-compat aliases for muscle-memory: test-dhcp / test-http / test-dns all run
+# test-provisioning-substrate (cargo cannot isolate a crate's per-module tests
+# without a per-test filter, so the whole substrate suite runs in each case).
+
+# run DHCP substrate unit tests (alias for test-provisioning-substrate)
 test-dhcp: test-provisioning-substrate
+# run HTTP substrate unit tests (alias for test-provisioning-substrate)
 test-http: test-provisioning-substrate
+# run DNS substrate unit tests (alias for test-provisioning-substrate)
 test-dns: test-provisioning-substrate
 
 # run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
@@ -253,7 +259,7 @@ examples:
 
 # build a named example; chip and crate auto-detected from example name
 build-example example:
-    scripts/build-example.sh "{{example}}" "{{hal_dir}}" "{{idf_dir}}"
+    scripts/build-example.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
 # serial port for espflash; honoured verbatim if set, otherwise scripts/detect-port.sh
 # narrows espflash auto-detect to USB serial devices (usbmodem/usbserial on macOS,
@@ -262,49 +268,37 @@ export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
 
 # ensure the IDF-built v5.3.3 bootloader is in the build cache for the given chip
 ensure-bootloader chip:
-    scripts/ensure-bootloader.sh "{{chip}}" "{{hal_dir}}" "{{idf_dir}}"
+    scripts/ensure-bootloader.sh "{{ chip }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
 # build and flash a named example; chip and crate auto-detected from example name
 flash example:
-    scripts/flash.sh "{{example}}" "{{hal_dir}}" "{{idf_dir}}"
+    scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
 # build, flash, and open the serial monitor (run without args to list examples)
 run *example:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "{{example}}" ]; then
+    if [ -z "{{ example }}" ]; then
         just examples
     else
-        just flash "{{example}}"
-        port="$(scripts/detect-port.sh)"
-        port_args=()
-        [ -n "$port" ] && port_args=(--port "$port")
-        espflash monitor --non-interactive "${port_args[@]}"
+        just flash "{{ example }}"
+        scripts/espflash.sh monitor --non-interactive
     fi
 
 # erase flash (NVS + app), rebuild from clean, flash, and monitor
 fresh-run example:
     just clean
     just erase-flash
-    just run {{example}}
+    just run {{ example }}
 
 # erase entire flash (NVS, app, bootloader) — fixes stale WiFi credentials and corrupt state
+[confirm("Erase the ENTIRE flash (NVS, app, bootloader) on the connected device? [y/N]")]
 erase-flash:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    port="$(scripts/detect-port.sh)"
-    port_args=()
-    [ -n "$port" ] && port_args=(--port "$port")
-    espflash erase-flash "${port_args[@]}"
+    scripts/espflash.sh erase-flash
 
 # open the serial monitor for an already-flashed device
 monitor:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    port="$(scripts/detect-port.sh)"
-    port_args=()
-    [ -n "$port" ] && port_args=(--port "$port")
-    espflash monitor --non-interactive "${port_args[@]}"
+    scripts/espflash.sh monitor --non-interactive
 
 # ── Maintenance ───────────────────────────────────────────────────────────
 
@@ -377,11 +371,61 @@ ci: fmt-check deny check clippy
 # run all CI workflows locally via act (requires Docker + act)
 act *job:
     #!/usr/bin/env bash
-    if [ -z "{{job}}" ]; then
+    if [ -z "{{ job }}" ]; then
         just act fmt && just act clippy && just act ci && just act audit
     else
-        act -j "{{job}}"
+        act -j "{{ job }}"
     fi
+
+# ── Publishing ────────────────────────────────────────────────────────────
+
+# pre-flight release validation: version lockstep, verify, package contents, and
+# `cargo publish --dry-run` for all three crates (no actual publish)
+# See release-plan.md for the full publication sequence and post-publication steps
+[group('Release')]
+release-publish-validate:
+    scripts/release-validate.sh
+
+# pre-publish packaging validation (needs a clean tree): juggler gets a full
+# `cargo publish --dry-run` (host-buildable); the two -network crates get
+# `cargo package --list` because their `cargo publish --dry-run` resolves
+# `juggler ^0.4` against the crates.io index, which only succeeds AFTER juggler is
+# published — their real dry-run therefore happens as the ordered publish proceeds.
+[group('Release')]
+release-dry-run:
+    cargo publish --dry-run -p juggler --target {{ host_target }} --all-features
+    cargo package --list -p rustyfarian-esp-idf-network > /dev/null
+    cargo package --list -p rustyfarian-esp-hal-network > /dev/null
+
+# verify IDF network crate packages cleanly against IDF target (no upload; requires espup)
+# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.4 from index)
+[group('Release')]
+release-dry-run-idf:
+    cargo +esp publish --dry-run -p rustyfarian-esp-idf-network --target {{ idf_target }} --target-dir {{ idf_dir }}
+
+# verify HAL network crate packages cleanly against bare-metal target (no upload)
+# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.4 from index)
+[group('Release')]
+release-dry-run-hal:
+    cargo publish --dry-run -p rustyfarian-esp-hal-network -Zbuild-std=core,alloc --target {{ hal_target }} --target-dir {{ hal_dir }}
+
+# publish pure crate (juggler) to crates.io
+[group('Release')]
+[confirm]
+release-publish crate:
+    cargo publish -p {{ crate }} --target {{ host_target }}
+
+# publish IDF network crate to crates.io (requires espup)
+[group('Release')]
+[confirm]
+release-publish-idf:
+    cargo +esp publish -p rustyfarian-esp-idf-network --target {{ idf_target }} --target-dir {{ idf_dir }}
+
+# publish HAL network crate to crates.io
+[group('Release')]
+[confirm]
+release-publish-hal:
+    cargo publish -p rustyfarian-esp-hal-network -Zbuild-std=core,alloc --target {{ hal_target }} --target-dir {{ hal_dir }}
 
 # ── Setup ─────────────────────────────────────────────────────────────────
 

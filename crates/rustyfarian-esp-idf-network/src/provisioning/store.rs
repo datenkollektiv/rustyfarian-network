@@ -34,7 +34,7 @@
 //!
 //! # Profiles and the v1 → v2 migration
 //!
-//! [`SCHEMA_VERSION`] is `2`. Two profiles share this namespace
+//! The on-flash schema version is `2`. Two profiles share this namespace
 //! ([`juggler::provisioning::SchemaProfile`]): `LorawanFieldDevice` writes the
 //! LoRaWAN keys (`lora_dev_eui` / `lora_join_eui` / `lora_app_key`),
 //! `WifiMqttDevice` writes the MQTT keys (`mqtt_host` / `mqtt_port` /
@@ -121,7 +121,7 @@ const READ_BUF_LEN: usize = 256;
 /// Maximum bytes the `extras_idx` value may occupy.
 ///
 /// Eight extras of at most 13 name bytes plus seven separators is 111 bytes;
-/// 256 leaves comfortable headroom and matches [`READ_BUF_LEN`].
+/// 256 leaves comfortable headroom and matches the per-key read buffer size.
 const EXTRAS_IDX_MAX: usize = 256;
 
 /// Experimental: API may change before 1.0.

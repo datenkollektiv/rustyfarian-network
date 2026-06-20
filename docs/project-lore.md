@@ -543,3 +543,20 @@ Fix: treat `DownlinkReceived` as success (`break true`) alongside `RxComplete`. 
 
 **TTN Live Data shows only the raw `frm_payload` unless an Uplink payload formatter is configured — the decoder is not applied by default.**
 The Application > Payload formatters > Uplink **Formatter type** defaults to "None"; the JavaScript decoder must be selected explicitly (**Custom JavaScript formatter**) and saved before `temperature_c` (or any decoded field) appears in Live Data or is forwarded to integrations. Decoder and step-by-step are in the `idf_esp32s3_lora_uplink` example doc comment.
+
+---
+
+## crates.io Publishing
+
+**Publish ESP cross-compiled crates against their real target — never `--no-verify`.**
+`cargo publish` verify-builds against the **host target** by default, which fails for an ESP-IDF crate (`esp-idf-svc`/`esp-idf-hal`/`esp-idf-sys` + `build.rs` reject `aarch64-apple-darwin`/CI x86). The tempting workaround is `--no-verify`, but that skips verification entirely. The sibling `rustyfarian-ws2812` workspace established the correct convention: publish each crate against its real cross-target so the verify-build actually runs where the code compiles.
+Fix (the `just release-publish*` recipes): IDF crate → `cargo +esp publish --target riscv32imac-esp-espidf --target-dir {{ idf_dir }}`; bare-metal HAL crate → `cargo publish --target riscv32imac-unknown-none-elf -Zbuild-std=core,alloc`; pure crate → `--target {{ host_target }}`.
+
+**The HAL-crate publish/dry-run needs `-Zbuild-std=core,alloc` because the workspace default `build-std` is `["std", "panic_abort"]`.**
+`.cargo/config.toml` sets `[build] target = "riscv32imac-esp-espidf"` and `[unstable] build-std = ["std", "panic_abort"]` — correct for the IDF default target, but it cannot build `std` for a bare-metal `riscv32imac-unknown-none-elf` target. (This differs from `rustyfarian-ws2812`, whose default target *is* bare-metal, so its HAL publish needs no override.) Same override the `check-hal*` recipes use.
+
+**The two `-network` crates cannot be `cargo publish --dry-run`'d until `juggler` is live on crates.io.**
+Their packaged manifest drops the local `path` and resolves `juggler ^0.4` against the crates.io index, so a dry-run fails with `no matching package named 'juggler' found` until juggler is published. This is inherent (the same staging `ws2812` documents). Workflow: Stage 1 `just release-publish juggler` → wait for indexing → Stage 2 `just release-dry-run-idf` / `release-dry-run-hal` (now resolve) → Stage 3 `just release-publish-idf` / `-hal`. Pre-juggler, `just release-dry-run` validates the dependents via `cargo package --list` only.
+
+**crates.io publish authenticates via the `CARGO_REGISTRY_TOKEN` env var (from `.envrc`/direnv) — no `cargo login` needed.**
+`cargo publish` reads `CARGO_REGISTRY_TOKEN` from the environment automatically. A first publish of a *new* crate name also requires the token to carry the "publish new crates" scope and not be allowlisted to other crate names — scopes are visible only in the crates.io web UI (`/settings/tokens`), never via the API; the `/me` endpoint confirms validity but not scope.
