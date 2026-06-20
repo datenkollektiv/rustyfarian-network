@@ -90,9 +90,13 @@ check-provisioning:
 check-espnow:
     cargo check -p rustyfarian-esp-idf-network --features espnow --target-dir {{ idf_dir }}
 
-# check all ESP-IDF domains of the consolidated network crate (all-features)
-check-idf:
+# check the ESP-IDF network crate with all features enabled together
+check-idf-all:
     cargo check -p rustyfarian-esp-idf-network --all-features --target-dir {{ idf_dir }}
+
+# check all ESP-IDF domains: representative per-domain feature combos (catches
+# per-domain isolation gaps that --all-features masks) plus the all-features build
+check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-provisioning check-idf-all
 
 # check the consolidated HAL network crate stub (no-default-features, host)
 check-hal-stub:

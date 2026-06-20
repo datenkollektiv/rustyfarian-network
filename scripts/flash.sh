@@ -7,6 +7,7 @@ set -euo pipefail
 #
 # Chip and crate are auto-detected from the example name.
 # MCU and Cargo target are set per chip so the image matches the physical hardware.
+# Required features are read from the example's required-features in Cargo.toml.
 # The IDF-built v5.3.3 bootloader is used instead of the espflash-bundled one:
 # espflash 4.x bundles ESP-IDF v5.5.1, which is incompatible with v5.3.3 binaries
 # (32 KB MMU page mismatch) and produces the "efuse blk rev" boot failure.
@@ -14,6 +15,67 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
+
+# Get required-features for an example from its Cargo.toml
+# Arguments: example_name crate_dir
+# Output: comma-separated features (e.g., "wifi,mqtt")
+# Exit: 1 if not found
+get_example_features_from_toml() {
+    local example_name="$1"
+    local crate_dir="$2"
+
+    if [ ! -f "$crate_dir/Cargo.toml" ]; then
+        printf 'ERROR: %s/Cargo.toml not found\n' "$crate_dir" >&2
+        return 1
+    fi
+
+    local in_example=0 found_example=0 features=""
+
+    while IFS= read -r line; do
+        # Check if entering an [[example]] block
+        if [[ "$line" == "[[example]]" ]]; then
+            in_example=1
+            found_example=0
+            features=""
+            continue
+        fi
+
+        if [ $in_example -eq 1 ]; then
+            # Check if this is the example we want
+            if [[ "$line" =~ ^name\ =\ \"([^\"]+)\" ]]; then
+                if [ "${BASH_REMATCH[1]}" = "$example_name" ]; then
+                    found_example=1
+                else
+                    in_example=0
+                fi
+            fi
+
+            # Extract required-features if we found the right example
+            if [ $found_example -eq 1 ]; then
+                if [[ "$line" =~ ^required-features\ =\ \[(.*)\] ]]; then
+                    features="${BASH_REMATCH[1]}"
+                    break
+                fi
+            fi
+
+            # Stop if we hit another [[...]] that's not [[example]]
+            if [[ "$line" =~ ^\[\[ && ! "$line" =~ ^\[\[example\]\] ]]; then
+                in_example=0
+            fi
+        fi
+    done < "$crate_dir/Cargo.toml"
+
+    if [ -z "$features" ]; then
+        printf 'ERROR: Example "%s" not found or has no required-features in %s/Cargo.toml\n' \
+            "$example_name" "$crate_dir" >&2
+        return 1
+    fi
+
+    # Convert TOML array format to comma-separated
+    # Input: "wifi", "mqtt"  →  Output: wifi,mqtt
+    features=$(printf '%s' "$features" | tr -d '"' | tr -d ' ')
+    printf '%s' "$features"
+}
 
 # Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
 # usbmodem/usbserial (macOS) or ttyUSB/ttyACM (Linux) device — espflash's own
@@ -40,17 +102,11 @@ prefix=$(printf '%s' "$example" | cut -d_ -f1)
 case "$prefix" in
     idf)
         # All ESP-IDF examples live in the consolidated rustyfarian-esp-idf-network crate.
-        # Derive the required Cargo feature(s) from the example name.
+        # Read required-features from Cargo.toml [[example]] block.
         pkg="rustyfarian-esp-idf-network"
-        case "$example" in
-            *provision*mqtt*|*mqtt*provision*) idf_features="provisioning,mqtt" ;;
-            *provision*) idf_features="provisioning" ;;
-            *mqtt*)      idf_features="wifi,mqtt" ;;
-            *join*|*lora*) idf_features="lora" ;;
-            *espnow*)    idf_features="espnow,wifi" ;;
-            *connect*|*wifi*) idf_features="wifi" ;;
-            *) printf 'Cannot detect feature for example "%s".\nName must contain "mqtt", "connect", "wifi", "join", "lora", "espnow", or "provision".\n' "$example" >&2; exit 1 ;;
-        esac
+        pkg_dir="crates/$pkg"
+
+        idf_features=$(get_example_features_from_toml "$example" "$pkg_dir") || exit 1
 
         # Detect chip and set MCU / Cargo target
         chip=$(printf '%s' "$example" | cut -d_ -f2)
@@ -85,7 +141,11 @@ case "$prefix" in
 
     hal)
         # All bare-metal HAL examples live in the consolidated rustyfarian-esp-hal-network crate.
+        # Read required-features from Cargo.toml [[example]] block.
         pkg="rustyfarian-esp-hal-network"
+        pkg_dir="crates/$pkg"
+
+        hal_features=$(get_example_features_from_toml "$example" "$pkg_dir") || exit 1
 
         # Detect chip and set targets
         chip=$(printf '%s' "$example" | cut -d_ -f2)
@@ -95,22 +155,6 @@ case "$prefix" in
             esp32)   hal_target="xtensa-esp32-none-elf";        idf_target="xtensa-esp32-espidf";    mcu="esp32"    ;;
             esp32s3) hal_target="xtensa-esp32s3-none-elf";      idf_target="xtensa-esp32s3-espidf";  mcu="esp32s3"  ;;
             *) printf 'Unknown chip "%s" in example "%s". Name must follow hal_{c3|c6|esp32|esp32s3}_{name}.\n' "$chip" "$example" >&2; exit 1 ;;
-        esac
-
-        # Base features: chip, unstable, rt
-        hal_features="${mcu},unstable,rt"
-
-        # Inject domain feature based on example name
-        case "$example" in
-            *provision*) hal_features="${hal_features},provisioning,embassy" ;;
-            *join*|*lora*) hal_features="${hal_features},lora" ;;
-            *connect*|*wifi*) hal_features="${hal_features},wifi,embassy" ;;
-            *) printf 'Cannot detect domain for example "%s".\nName must contain "join", "lora", "connect", "wifi", or "provision".\n' "$example" >&2; exit 1 ;;
-        esac
-
-        # Append WS2812 feature for LED examples
-        case "$example" in
-            *_rgb*|hal_c6_*_led*) hal_features="${hal_features},ws2812" ;;
         esac
 
         # Ensure IDF-built bootloader is cached
