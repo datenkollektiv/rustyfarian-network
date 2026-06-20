@@ -14,6 +14,47 @@
 //!
 //! Enable only the features you need; `default = []` so no domain code is
 //! compiled unless explicitly opted in.
+//!
+//! ## Cargo features
+//!
+//! ### Domain features (opt-in)
+//!
+//! - **`wifi`** — Wi-Fi connection manager and SoftAP lifecycle handler via `esp-idf-svc`.
+//!   Provides [`wifi::WiFiManager`] for STA mode and [`wifi::SoftApManager`] for AP mode.
+//!
+//! - **`mqtt`** — Auto-reconnecting MQTT client with builder API and background event loop.
+//!   Provides [`mqtt::MqttBuilder`] and [`mqtt::MqttHandle`]. **This feature compiles
+//!   without `wifi`** — the MQTT client is transport-agnostic at the type level.
+//!   (Note: bundled examples additionally depend on `wifi` because they must bring up
+//!   Wi-Fi before connecting to MQTT; see [`[[example]]` `required-features`](https://docs.rs/cargo/1.0.0/cargo/reference/manifest.html#example)
+//!   entries in `Cargo.toml`). You may depend on `features = ["mqtt"]` alone if you
+//!   provide your own transport layer.
+//!
+//! - **`lora`** — SX1262 radio driver and LoRaWAN Class A adapter. Implements
+//!   [`lora::sx1262_driver::EspIdfLoraRadio`] for use with `lorawan-device 0.12`.
+//!   Provides full initialization, RX/TX, and LoRaWAN protocol bindings.
+//!
+//! - **`espnow`** — ESP-NOW peer driver with automatic channel scanning. Provides
+//!   [`espnow::EspIdfEspNow`] for point-to-point frame exchange.
+//!
+//! - **`ota`** — OTA firmware update via streaming HTTP download with SHA-256
+//!   verification. Provides [`ota::OtaSession`] for fetch-and-apply operations.
+//!
+//! - **`provisioning`** — SoftAP captive-portal provisioning for Wi-Fi and
+//!   LoRaWAN credentials. Requires `wifi` feature (SoftAP setup). Provides
+//!   [`provisioning::ProvisioningBuilder`] and [`provisioning::ProvisioningSession`].
+//!
+//! ## Re-export patterns
+//!
+//! Each domain module in this crate re-exports the corresponding types from
+//! [`juggler`] (the platform-agnostic core) for consumer convenience:
+//!
+//! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::WiFiDriver`], etc. from `juggler::wifi`
+//! - `mqtt::*` exports [`mqtt::MqttConnectionState`], validation functions, etc. from `juggler::mqtt`
+//! - `lora::*` exports [`lora::LoraRadio`], [`lora::LorawanDevice`], [`lora::Region`], etc. from `juggler::lora`
+//! - `espnow::*` exports [`espnow::EspNowDriver`], [`espnow::PeerTracker`], etc. from `juggler::espnow`
+//! - `ota::*` exports [`ota::OtaError`], [`ota::StreamingVerifier`], etc. from `juggler::ota`
+//! - `provisioning::*` exports [`provisioning::ProvisioningState`], [`provisioning::SchemaProfile`], etc. from `juggler::provisioning`
 
 /// Wi-Fi STA connection manager and SoftAP lifecycle manager.
 #[cfg(feature = "wifi")]
