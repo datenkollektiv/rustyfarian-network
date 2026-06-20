@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-20
+
 ### Changed
 
 - **Crate consolidation — pure tier ([ADR 016](docs/adr/016-crate-consolidation-for-publishing.md)):** the six platform-independent `no_std` crates (`wifi-pure`, `lora-pure`, `espnow-pure`, `ota-pure`, `provisioning-pure`, `rustyfarian-network-pure`) are merged into a single fair-themed crate **`juggler`** with per-domain features (`wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`), plus a `mock` feature and a non-default `std` feature. `default = []`, so consumers compile only the domains they select. **Breaking:** every pure-crate import path changes — `wifi_pure::X` → `juggler::wifi::X`, `rustyfarian_network_pure::mqtt::X` → `juggler::mqtt::X`, etc. (full migration table in `docs/features/crate-consolidation-3-crates-v1.md`). The `std`-only MQTT helpers (`spawn_subscriber_thread`, `SubscribeClient`, `QoS`, `format_broker_url`) remain available behind `juggler`'s `std` feature. The ESP-IDF and `esp-hal` tiers are unchanged in this phase; Phases 2–3 will consolidate them into `rustyfarian-esp-idf-network` / `rustyfarian-esp-hal-network`. All 325 pure unit tests and host coverage are preserved.

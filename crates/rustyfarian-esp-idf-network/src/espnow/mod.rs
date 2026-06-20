@@ -139,7 +139,8 @@ pub struct EspIdfEspNow {
     send_cb_guard: Mutex<()>,
     /// Explicit state for the three radio-management modes the driver supports.
     ///
-    /// See [`RadioMode`] for the per-variant semantics.  All branching for
+    /// The driver internally tracks which of the three init paths was taken.
+    /// All branching for
     /// `default_interface`, `scan_for_peer`, and `send_and_wait` is driven
     /// off this single field.
     mode: RadioMode,
@@ -150,7 +151,7 @@ pub struct EspIdfEspNow {
     ///   and radio channel after a failed re-scan so the next
     ///   [`send_and_wait`] is not penalised by a stale channel + missing peer
     ///   registration; and
-    /// - [`send_and_wait`] in [`RadioMode::OwnedStaPromisc`] mode, where the
+    /// - when using the unassociated STA radio mode, where the
     ///   STA background scanner drifts the channel and the promiscuous
     ///   bracket re-pins it before each frame.
     ///
@@ -161,8 +162,7 @@ pub struct EspIdfEspNow {
     /// - Never cleared once set — a stale value will be overwritten on the
     ///   next successful scan; if a failed scan ever needs to invalidate it
     ///   explicitly, store [`u8::MAX`] here.
-    /// - Has no effect in [`RadioMode::CallerManagedSta`] or
-    ///   [`RadioMode::OwnedSoftAp`] beyond the failed-scan fallback path.
+    /// - Has no effect in STA or SoftAP modes beyond the failed-scan fallback path.
     pinned_channel: AtomicU8,
 }
 
@@ -654,7 +654,7 @@ impl EspIdfEspNow {
 
     /// Re-pin the radio to `channel` and dispatch `esp_now_send` in a single
     /// `unsafe` block; used by [`send_and_wait`] in
-    /// [`RadioMode::OwnedStaPromisc`] mode.
+    /// unassociated STA radio mode.
     ///
     /// `set_promiscuous(false)` and `esp_now_send` must be consecutive
     /// instructions to minimise the scheduler window in which the Wi-Fi

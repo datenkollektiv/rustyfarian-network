@@ -282,7 +282,7 @@ enum BodyRead {
 /// Reads the full request body in chunks into a bounded buffer.
 ///
 /// Returns [`BodyRead::TooLarge`] once the accumulated length would exceed
-/// [`MAX_BODY_LEN`], or [`BodyRead::ReadError`] on a transport read failure
+/// the internal buffer limit, or [`BodyRead::ReadError`] on a transport read failure
 /// (previously these surfaced as silent truncation that then failed validation
 /// for the wrong reason). Bytes that are not valid UTF-8 are lossily replaced;
 /// the pure parser then reports any genuinely malformed pairs.
