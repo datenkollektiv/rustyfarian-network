@@ -16,6 +16,11 @@ features = ["wifi", "mqtt", "lora", "espnow", "ota", "provisioning"]
 # Note: docs.rs will use its own esp-idf build environment; the esp-idf-sys
 # crate is pre-built by docs.rs when the target is recognized.
 
+[package.metadata.cargo-machete]
+# False positive: `embuild` is a build-dependency used in build.rs
+# (embuild::espidf::sysenv::output()); cargo-machete does not scan build.rs.
+ignored = ["embuild"]
+
 [lib]
 name = "rustyfarian_esp_idf_network"
 

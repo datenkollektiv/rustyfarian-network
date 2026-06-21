@@ -46,3 +46,23 @@ if command -v npx >/dev/null 2>&1; then
 else
     printf "  npx        MISSING  install Node.js  (needed for: just lint-docs)\n"
 fi
+
+# --- Cargo tooling (verify, dependency hygiene, flashing) ---
+# Tiers: required = needed for `just verify`; recommended = release/maintenance;
+#        optional = hardware flashing or on-demand checks.
+check_cmd() {
+    # $1 binary  $2 label  $3 tier(required|recommended|optional)  $4 hint
+    if command -v "$1" >/dev/null 2>&1; then
+        printf "  %-14s ok       %s\n" "$2" "$("$1" --version 2>/dev/null | head -1)"
+    elif [ "$3" = "required" ]; then
+        printf "  %-14s MISSING  %s\n" "$2" "$4"
+    else
+        printf "  %-14s --       %s\n" "$2" "$4"
+    fi
+}
+
+check_cmd cargo-deny     cargo-deny     required    "cargo install cargo-deny      (needed for: just verify, just deny)"
+check_cmd cargo-audit    cargo-audit    recommended "cargo install cargo-audit     (needed for: just audit, release validation)"
+check_cmd cargo-machete  cargo-machete  optional    "cargo install cargo-machete   (needed for: just machete)"
+check_cmd cargo-outdated cargo-outdated optional    "cargo install cargo-outdated  (needed for: monthly dependency review)"
+check_cmd espflash       espflash       optional    "cargo install espflash        (needed for: just flash, just run)"

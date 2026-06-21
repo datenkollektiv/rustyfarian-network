@@ -13,6 +13,12 @@ readme = "README.md"
 [package.metadata.docs.rs]
 all-features = true
 
+[package.metadata.cargo-machete]
+# `lorawan-device` is declared for the `lora` feature but its nb_device/PhyRxTx
+# bridge is not yet wired (LorawanDevice::process() returns NoUpdate); reserved
+# intentionally, tracked in the LoRa post-adoption backlog (ROADMAP). Do not remove.
+ignored = ["lorawan-device"]
+
 [features]
 default = []
 
