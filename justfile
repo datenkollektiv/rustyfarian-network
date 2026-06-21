@@ -27,7 +27,7 @@ idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targ
 
 # ── Build Environment ─────────────────────────────────────────────────────
 
-# show RAM disk status, resolved target dirs, and sccache
+# show RAM disk status, resolved target dirs, sccache, and required/optional tooling
 doctor:
     @scripts/doctor.sh "{{ ramdisk }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
@@ -185,6 +185,13 @@ deny:
 # audit dependencies for known security advisories (RUSTSEC)
 audit:
     cargo audit
+
+# find unused declared dependencies across the workspace (needs `cargo install cargo-machete`).
+# Known exceptions (build-only `embuild`, the reserved `lorawan-device`) are suppressed via
+# `[package.metadata.cargo-machete] ignored` in the respective Cargo.toml, each with a
+# justification comment — a clean run reports no unused dependencies.
+machete:
+    cargo machete --with-metadata
 
 # update dependencies (pass package flags to update specific crates, e.g. just update -p led-effects)
 update *args:

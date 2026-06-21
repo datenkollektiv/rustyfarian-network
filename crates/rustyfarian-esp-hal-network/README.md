@@ -139,7 +139,7 @@ Documentation is available in the [workspace repository](https://github.com/date
 
 - [Workspace repository](https://github.com/datenkollektiv/rustyfarian-network)
 - [ADR 016: Crate Consolidation for Publishing](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/adr/016-crate-consolidation-for-publishing.md)
-- [Feature doc: 3-Crate Consolidation v1](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/features/crate-consolidation-3-crates-v1.md)
+- [Feature doc: 3-Crate Consolidation v1](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/features/archive/crate-consolidation-3-crates-v1.md)
 
 ## License
 

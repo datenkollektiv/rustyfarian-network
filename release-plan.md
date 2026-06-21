@@ -161,21 +161,23 @@ Create a release page at `https://github.com/datenkollektiv/rustyfarian-network/
 
 - **Tag:** `v0.4.0`
 - **Title:** `v0.4.0 — First Publication to Crates.io`
-- **Body:** Paste the entire `## [0.4.0]` section from `CHANGELOG.md`, followed by a summary of breaking changes:
+- **Body:** Keep it short — a one-line summary, the three crates, the breaking change with a migration link, and condensed fixes. Do **not** paste the full `## [0.4.0]` CHANGELOG section. Template:
 
 ```markdown
-## Breaking Changes
+First publication to crates.io. Consolidates 16 workspace crates into 3 publishable crates, one per HAL tier ([ADR 016](docs/adr/016-crate-consolidation-for-publishing.md)).
 
-This release consolidates 16 workspace crates into 3 publishable crates — one per HAL tier:
+## Crates
+- **`juggler`** — pure/`no_std` shared types (Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, provisioning), per-domain features, `default = []`
+- **`rustyfarian-esp-idf-network`** — ESP-IDF/`std` drivers
+- **`rustyfarian-esp-hal-network`** — bare-metal/`no_std` async drivers (ESP32-C3/C6/S3/ESP32)
 
-- `juggler` (pure/no_std + optional std)
-- `rustyfarian-esp-idf-network` (ESP-IDF/std)
-- `rustyfarian-esp-hal-network` (bare-metal/no_std)
+## Breaking
+Every import path changes (`wifi_pure::X` → `juggler::wifi::X`, `rustyfarian_esp_idf_wifi::X` → `rustyfarian_esp_idf_network::wifi::X`, etc.). No in-place upgrade — see the [migration guide](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/features/archive/crate-consolidation-3-crates-v1.md#migration-guide--old-paths-to-new-paths).
 
-**For downstream projects:** Update your `Cargo.toml` to depend on the consolidated crate that matches your tier.
-See [Migration Guide — Old Paths to New Paths](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/features/crate-consolidation-3-crates-v1.md#migration-guide--old-paths-to-new-paths) for import path changes.
-
-All 0.3.x projects must migrate to 0.4.0; there is no in-place upgrade path.
+## Fixed
+- Provisioning store rejected valid stores at non-zero flash offsets (`OffsetOutOfBounds`).
+- HAL provisioning examples panicked (`time_driver NoneError`) on the already-provisioned boot path.
+- HAL async examples failed to compile (missing `embassy-executor`/`embassy-time` dev-deps).
 ```
 
 - **Pre-release:** Uncheck (this is a stable release)
@@ -292,6 +294,6 @@ Wait 2–5 minutes between publishes to allow crates.io to index the new crate.
 ## Resources
 
 - [ADR 016: Crate Consolidation for Publishing](docs/adr/016-crate-consolidation-for-publishing.md)
-- [Feature doc: 3-Crate Consolidation v1](docs/features/crate-consolidation-3-crates-v1.md) — includes migration table and feature descriptions
+- [Feature doc: 3-Crate Consolidation v1](docs/features/archive/crate-consolidation-3-crates-v1.md) — includes migration table and feature descriptions
 - [Cargo Book — Publishing](https://doc.rust-lang.org/cargo/reference/publishing.html)
 - [crates.io — Publishing Crates](https://doc.rust-lang.org/cargo/reference/publishing.html#publishing-to-cratesio)

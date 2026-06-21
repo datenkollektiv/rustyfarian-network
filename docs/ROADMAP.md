@@ -2,14 +2,18 @@
 
 *Last updated: June 2026*
 
+## Context & recent milestones
+
 The bare-metal stack is aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
 The bare-metal Wi-Fi surface is async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
-TTN v3 LoRa validation remains blocked on hardware.
-A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Mid term: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
+TTN v3 EU868 OTAA join and the first uplink were validated on hardware (2026-06-17, Heltec V3); the remaining Phase 5 work is the first downlink (FPort 10) and session persistence.
+A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Midterm: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.
 June 2026 delivered the ESP-NOW Variant 1 (STA↔STA) and Variant 2 (SoftAP scout ↔ AP-connected coordinator) milestones, including ADR 012 documenting the background-scanner channel-drift root cause and the SoftAP fix.
 A June 2026 full-code deep dive (all 13 crates) confirmed the pure-first architecture is consistently executed and surfaced a set of hygiene items — LED/timeout logic dedup, a CI hardware-tier build job, a LoRa RF-config mapping guard, and README staleness fixes — tracked in Near term and in the findings table below.
 June 2026 shipped the provisioning triad — SoftAP captive-portal provisioning with two schema profiles (`LorawanFieldDevice` and `WifiMqttDevice`), NVS schema v2 with a `profile` discriminator, a `no_std`-safe surface on `rustyfarian-network-pure`, and the `idf_c3_provision` / `idf_c3_provision_mqtt` examples; per ADR 013 (acceptance) and ADR 014 (profile generalisation), end-to-end validated 2026-06-14, full detail in the CHANGELOG.
 June 2026 also landed the bare-metal `rustyfarian-esp-hal-provisioning` crate with the complete v1 feature set — end-to-end portal substrate, A.B torn-write-safe flash store, per-session nonce, and all 10 security-checklist items locked by host tests; per ADR 015 § 3 hand-rolled substrate; on-hardware smoke test remains a trailing validation step for the integrator.
+
+## Forward plan
 
 ```mermaid
 %%{init: {
@@ -43,7 +47,7 @@ timeline
               : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
               : rustyfarian-esp-idf-provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
 
-    Mid term  : Phase 5 — TTN v3 EU868 OTAA validation (blocked on hardware)
+    Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
               : OTA security model doc — threat model, rollback policy, signed-manifest question
               : WifiDriver async/sync trait ADR — document trait duality + first paragraph of wifi-pure rustdoc
               : Contract tests in wifi-pure — generic run_contract_tests() over any WifiDriver implementation, conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
@@ -79,7 +83,7 @@ Positive findings worth keeping in mind (no action): `rustyfarian-esp-hal-ota`'s
 
 ---
 
-## Mid term detail
+## Midterm detail
 
 ### Phase 5 — TTN v3 EU868 OTAA validation
 

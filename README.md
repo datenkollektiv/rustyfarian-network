@@ -45,14 +45,17 @@ a pattern common in application development but rare in embedded Rust.
 
 **Three publishable crates — one per HAL tier, all with feature-gated domain selection:**
 
-| Crate                                                               | Tier               | Domains                                                             | Description                                                                  |
-|:--------------------------------------------------------------------|:-------------------|:--------------------------------------------------------------------|:-----------------------------------------------------------------------------|
-| [`juggler`](crates/juggler)                                         | Pure (no_std)      | wifi, mqtt, lora, espnow, ota, provisioning, mock, std              | Platform-independent types, validation, state machines — fully host-testable |
-| [`rustyfarian-esp-idf-network`](crates/rustyfarian-esp-idf-network) | ESP-IDF (std)      | wifi, mqtt, lora, espnow, ota, provisioning                         | ESP-IDF drivers with blocking APIs and LED status feedback                   |
-| [`rustyfarian-esp-hal-network`](crates/rustyfarian-esp-hal-network) | Bare-metal (async) | wifi, lora, ota, provisioning + chip features (esp32c3/c6/s3/esp32) | Bare-metal `esp-hal` drivers with async/await via `embassy`                  |
+| Crate                                                               | Tier               | Description                                                                  | crates.io                                                                                                                             | Docs                                                                                                               |
+|:--------------------------------------------------------------------|:-------------------|:-----------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------------------|
+| [`juggler`](crates/juggler)                                         | Pure (no_std)      | Platform-independent types, validation, state machines — fully host-testable | [![crates.io](https://img.shields.io/crates/v/juggler.svg)](https://crates.io/crates/juggler)                                         | [![docs.rs](https://img.shields.io/docsrs/juggler)](https://docs.rs/juggler)                                          |
+| [`rustyfarian-esp-idf-network`](crates/rustyfarian-esp-idf-network) | ESP-IDF (std)      | ESP-IDF drivers with blocking APIs and LED status feedback                   | [![crates.io](https://img.shields.io/crates/v/rustyfarian-esp-idf-network.svg)](https://crates.io/crates/rustyfarian-esp-idf-network) | [![readme](https://img.shields.io/badge/docs-readme-blue)](crates/rustyfarian-esp-idf-network/README.md)              |
+| [`rustyfarian-esp-hal-network`](crates/rustyfarian-esp-hal-network) | Bare-metal (async) | Bare-metal `esp-hal` drivers with async/await via `embassy`                  | [![crates.io](https://img.shields.io/crates/v/rustyfarian-esp-hal-network.svg)](https://crates.io/crates/rustyfarian-esp-hal-network) | [![docs.rs](https://img.shields.io/docsrs/rustyfarian-esp-hal-network)](https://docs.rs/rustyfarian-esp-hal-network)  |
+
+> Domain features (`wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`) and chip features (`esp32c3`/`c6`/`s3`/`esp32`) are selected per dependency; `default = []`.
+> `rustyfarian-esp-idf-network` links to its crate README rather than docs.rs — `esp-idf-sys` cannot build in the docs.rs sandbox.
 
 **See each crate's README for complete feature tables and usage examples.**
-**For migration from the old per-domain crates, see the [Migration Guide](docs/features/crate-consolidation-3-crates-v1.md#migration-guide--old-paths-to-new-paths).**
+**For migration from the old per-domain crates, see the [Migration Guide](docs/features/archive/crate-consolidation-3-crates-v1.md#migration-guide--old-paths-to-new-paths).**
 
 ## Usage
 
