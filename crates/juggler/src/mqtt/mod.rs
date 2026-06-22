@@ -151,6 +151,67 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
     }
 }
 
+/// Resolves the MQTT client ID to use for a device, applying the standard
+/// 23-byte cap and empty-fallback policy.
+///
+/// # Resolution order
+///
+/// 1. If `operator_id` is `Some(id)` and non-empty, it is validated against
+///    [`validate_client_id`] and returned as-is. An over-length or otherwise
+///    invalid operator ID is rejected with an error — the operator supplied it
+///    and truncating it silently would change its semantics.
+/// 2. If `operator_id` is `None` or empty, a derived ID is taken from
+///    `device_name` truncated to [`CLIENT_ID_MAX_LEN`] bytes on a UTF-8 char
+///    boundary (so a naive byte-slice never splits a multi-byte codepoint).
+/// 3. If the derived slice is empty (i.e. `device_name` itself is empty),
+///    `fallback` is used instead.
+/// 4. The chosen derived/fallback slice is then validated via
+///    [`validate_client_id`] and returned.
+///
+/// Returns a `&str` borrowed from whichever of the three inputs was selected —
+/// no allocation, no `String`.
+///
+/// # Errors
+///
+/// Returns `Err(&'static str)` when the operator-supplied ID is invalid, or
+/// when the final derived/fallback value fails [`validate_client_id`]
+/// (e.g. the fallback itself is empty or over-length).
+pub fn resolve_client_id<'a>(
+    operator_id: Option<&'a str>,
+    device_name: &'a str,
+    fallback: &'a str,
+) -> Result<&'a str, &'static str> {
+    // ── 1. Operator-supplied override ────────────────────────────────────────
+    if let Some(id) = operator_id {
+        if !id.is_empty() {
+            validate_client_id(id)?;
+            return Ok(id);
+        }
+    }
+
+    // ── 2. Derive from device_name, truncated on a UTF-8 char boundary ───────
+    let mut byte_len = 0usize;
+    for ch in device_name.chars() {
+        let next = byte_len + ch.len_utf8();
+        if next > CLIENT_ID_MAX_LEN {
+            break;
+        }
+        byte_len = next;
+    }
+    let derived = &device_name[..byte_len];
+
+    // ── 3. Fall back if derived is empty ─────────────────────────────────────
+    let chosen = if derived.is_empty() {
+        fallback
+    } else {
+        derived
+    };
+
+    // ── 4. Validate and return ───────────────────────────────────────────────
+    validate_client_id(chosen)?;
+    Ok(chosen)
+}
+
 /// Returns `Ok(())` if `host` is a non-empty broker hostname or IP address.
 pub fn validate_broker_host(host: &str) -> Result<(), &'static str> {
     if host.is_empty() {
@@ -310,8 +371,8 @@ mod tests {
     #[cfg(feature = "std")]
     use super::format_broker_url;
     use super::{
-        connection_wait_iterations, next_state, topic_matches_filter, validate_broker_host,
-        validate_broker_port, validate_client_id, validate_publish_topic,
+        connection_wait_iterations, next_state, resolve_client_id, topic_matches_filter,
+        validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
         validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent,
         CLIENT_ID_MAX_LEN, TOPIC_MAX_LEN,
     };
@@ -696,6 +757,95 @@ mod tests {
     fn match_trailing_hash_zero_levels() {
         // "sport/tennis/#" should match "sport/tennis" (zero additional levels)
         assert!(topic_matches_filter("sport/tennis", "sport/tennis/#"));
+    }
+
+    // ── resolve_client_id ────────────────────────────────────────────────────
+
+    #[test]
+    fn operator_id_valid_is_returned_as_is() {
+        let result = resolve_client_id(Some("my-device-01"), "device", "fallback");
+        assert_eq!(result, Ok("my-device-01"));
+    }
+
+    #[test]
+    fn operator_id_at_max_len_is_accepted() {
+        let id = "x".repeat(CLIENT_ID_MAX_LEN);
+        let result = resolve_client_id(Some(id.as_str()), "device", "fallback");
+        assert_eq!(result, Ok(id.as_str()));
+    }
+
+    #[test]
+    fn operator_id_over_max_len_is_rejected() {
+        let id = "x".repeat(CLIENT_ID_MAX_LEN + 1);
+        let result = resolve_client_id(Some(id.as_str()), "device", "fallback");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_operator_id_falls_through_to_device_name() {
+        let result = resolve_client_id(Some(""), "my-device", "fallback");
+        assert_eq!(result, Ok("my-device"));
+    }
+
+    #[test]
+    fn none_operator_id_falls_through_to_device_name() {
+        let result = resolve_client_id(None, "my-device", "fallback");
+        assert_eq!(result, Ok("my-device"));
+    }
+
+    /// A device_name longer than 23 bytes must be truncated on a UTF-8 char
+    /// boundary. Using an emoji (4 bytes each) to prove a naive byte-slice
+    /// would panic while the boundary-aware code yields a valid prefix.
+    #[test]
+    fn derived_truncation_lands_on_utf8_char_boundary() {
+        // Each emoji is 4 bytes. Seven emojis = 28 bytes > CLIENT_ID_MAX_LEN=23.
+        // Floor: 5 emojis = 20 bytes. The 6th would push to 24 bytes, so 5 is the
+        // largest multiple of 4 that still fits in 23.
+        let emoji = "🔥"; // U+1F525, 4 UTF-8 bytes
+        let name: alloc::string::String = emoji.repeat(7); // 28 bytes
+        let result = resolve_client_id(None, &name, "fallback");
+        let chosen = result.expect("truncated id should be valid");
+        assert_eq!(chosen, emoji.repeat(5), "expected 5 emojis (20 bytes)");
+        assert!(chosen.len() <= CLIENT_ID_MAX_LEN);
+    }
+
+    /// Accented characters (2 bytes each) verify the same boundary logic with a
+    /// different byte width: 12 × 'é' = 24 bytes → truncated to 11 × 'é' = 22 bytes.
+    #[test]
+    fn derived_truncation_with_two_byte_chars() {
+        let ch = "é"; // U+00E9, 2 UTF-8 bytes
+        let name: alloc::string::String = ch.repeat(12); // 24 bytes
+        let result = resolve_client_id(None, &name, "fallback");
+        let chosen = result.expect("truncated id should be valid");
+        assert_eq!(chosen, ch.repeat(11), "expected 11 × 'é' (22 bytes)");
+        assert!(chosen.len() <= CLIENT_ID_MAX_LEN);
+    }
+
+    #[test]
+    fn empty_device_name_uses_fallback() {
+        let result = resolve_client_id(None, "", "rustyfarian");
+        assert_eq!(result, Ok("rustyfarian"));
+    }
+
+    #[test]
+    fn fallback_itself_is_validated() {
+        // A fallback that is empty should be rejected.
+        let result = resolve_client_id(None, "", "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fallback_over_max_len_is_rejected() {
+        let long_fallback = "x".repeat(CLIENT_ID_MAX_LEN + 1);
+        let result = resolve_client_id(None, "", long_fallback.as_str());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_name_exactly_max_len_bytes_is_returned_whole() {
+        let name = "a".repeat(CLIENT_ID_MAX_LEN);
+        let result = resolve_client_id(None, &name, "fallback");
+        assert_eq!(result, Ok(name.as_str()));
     }
 
     // ── spawn_subscriber_thread ──────────────────────────────────────────────

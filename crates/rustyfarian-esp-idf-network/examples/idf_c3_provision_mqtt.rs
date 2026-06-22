@@ -1,31 +1,27 @@
 //! SoftAP captive-portal provisioning example for ESP32-C3 using the
 //! Wi-Fi + MQTT profile.
 //!
-//! Demonstrates the [`SchemaProfile::WifiMqttDevice`] host contract:
+//! Demonstrates the [`SchemaProfile::WifiMqttDevice`] host contract using the
+//! `WifiMqttBoot` helper:
 //!
-//! 1. Open the [`ProvisioningStore`] and check [`ProvisioningStore::is_provisioned`].
-//! 2. If already provisioned, load the stored config (logging secrets by length
-//!    only) — a real application would proceed to its normal STA + MQTT boot
-//!    here, constructing an `MqttConfig` from the stored MQTT group.
-//! 3. Otherwise, run the provisioning portal under the `WifiMqttDevice` profile.
-//! 4. After the portal commits, log the MQTT target (host length + port only,
-//!    never credential values) and restart so the device boots into normal
-//!    mode.
+//! 1. [`WifiMqttBoot::load`] opens the NVS store and returns a ready-to-borrow
+//!    config bundle when the device is already provisioned under the
+//!    `WifiMqttDevice` profile.
+//! 2. If not provisioned, an indicator thread is spawned (placeholder for a
+//!    WS2812/LED animation), then [`run_wifi_mqtt_portal`] starts the SoftAP
+//!    captive portal and blocks until a submission is committed, the factory-reset
+//!    button is pressed, or the portal times out.
+//! 3. On every portal exit the indicator thread is cancelled and joined BEFORE
+//!    calling `restart()` — this guarantees no WS2812 SPI/RMT transfer is
+//!    left mid-frame when the device reboots.
+//!    On `FactoryResetRequested` the NVS provisioning namespace is erased (via
+//!    [`ProvisioningStore::erase_all`]) after the join, then the device restarts
+//!    so it re-enters the portal on the next boot.
 //!
-//! The library never reboots or erases on its own; the
-//! `esp_idf_svc::hal::reset::restart()` call below lives in this **example**,
+//! The library never reboots or erases on its own; every
+//! `esp_idf_svc::hal::reset::restart()` call and the
+//! `ProvisioningStore::erase_all()` call below live in this **example**,
 //! not the crate.
-//!
-//! # Constructing the downstream `MqttConfig`
-//!
-//! The committed [`MqttFields`](rustyfarian_esp_idf_network::provisioning::MqttFields)
-//! group maps one-to-one onto `rustyfarian_esp_idf_network::mqtt::MqttConfig`:
-//! `MqttConfig::new(host, port, client_id)` plus optional
-//! `with_auth(username, password)`. `MqttConfig` borrows its `&str` arguments,
-//! so the owned strings backing them must outlive it; `client_id()` is `None`
-//! when the firmware should derive one (here, from the device name truncated to
-//! the 23-byte MQTT 3.1.1 cap). The construction is shown in
-//! [`mqtt_config_from_stored`] below.
 //!
 //! # Build and flash
 //!
@@ -37,19 +33,18 @@
 //! just flash idf_c3_provision_mqtt
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use rustyfarian_esp_idf_network::mqtt::MqttConfig;
 use rustyfarian_esp_idf_network::provisioning::{
-    PortalConfig, ProvisioningBuilder, ProvisioningStore, SchemaProfile, StoredConfig,
+    run_wifi_mqtt_portal, BootConfig, PortalConfig, PortalOutcome, ProvisioningEvent,
+    ProvisioningStore, SchemaProfile, WifiMqttBoot, WifiMqttLoadOutcome,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-
-/// The MQTT 3.1.1 client-ID byte cap; a derived ID must not exceed it.
-const CLIENT_ID_MAX_LEN: usize = 23;
 
 /// Optional WPA2 password for the provisioning AP. Without it the AP is open.
 const AP_PSK: Option<&str> = option_env!("PROVISION_AP_PSK");
@@ -62,141 +57,156 @@ fn main() -> anyhow::Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let store = ProvisioningStore::open(nvs.clone())?;
-    if store.is_provisioned()? {
-        if let Some(cfg) = store.load()? {
-            // The stored profile may be lorawan if this device was provisioned
-            // under the other profile; only build an MqttConfig when it matches.
-            if cfg.profile == SchemaProfile::WifiMqttDevice {
-                log::info!(
-                    "Already provisioned (wifi_mqtt): ssid len={}, mqtt_host len={}, \
-                     mqtt_port={}, mqtt_user={}, ota_url len={}, name={}, \
-                     mqtt_pass len={} (secret), wifi_pass len={} (secret)",
-                    cfg.wifi_ssid.len(),
-                    cfg.mqtt_host.len(),
-                    cfg.mqtt_port,
-                    cfg.mqtt_user.as_deref().map(str::len).unwrap_or(0),
-                    cfg.ota_url.len(),
-                    cfg.device_name,
-                    cfg.mqtt_pass.as_deref().map(str::len).unwrap_or(0),
-                    cfg.wifi_password.len(),
-                );
-                // A real application would build the client and proceed to its
-                // normal STA + MQTT boot here.
-                let client_id = derive_client_id(&cfg);
-                let mqtt_config = mqtt_config_from_stored(&cfg, &client_id);
-                log::info!(
-                    "Constructed MqttConfig (host len={}, port={}, client_id len={}).",
-                    mqtt_config.host.len(),
-                    mqtt_config.port,
-                    mqtt_config.client_id.len(),
-                );
-                log::info!("A real application would now proceed to normal STA + MQTT boot.");
-            } else {
-                log::warn!(
-                    "Already provisioned under the lorawan profile; this example only \
-                     boots the wifi_mqtt profile. Factory-reset to re-provision."
-                );
+    // ── Step 1: try to load a provisioned WifiMqttDevice config ─────────────
+    let boot = match WifiMqttBoot::load(nvs.clone())? {
+        WifiMqttLoadOutcome::Ready(b) => b,
+
+        WifiMqttLoadOutcome::NotProvisioned => {
+            // ── Step 2: spawn indicator thread before the portal ─────────────
+            //
+            // The cancel flag is shared between this thread and the outcome
+            // handler below.  A real consumer drives its WS2812 / LED here,
+            // e.g. reacting to `on_event` pulses; here we use a placeholder
+            // log loop so the pattern compiles on any target without a
+            // hardware LED dep.
+            let indicator_cancel = Arc::new(AtomicBool::new(false));
+            let indicator_cancel_clone = Arc::clone(&indicator_cancel);
+            let indicator = std::thread::Builder::new()
+                .name("indicator".into())
+                .stack_size(2048)
+                .spawn(move || {
+                    // A real consumer drives its WS2812/LED here, e.g. off on_event.
+                    while !indicator_cancel_clone.load(Ordering::Relaxed) {
+                        log::debug!("indicator: portal running…");
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    log::debug!("indicator: cancelled, exiting");
+                })
+                .expect("failed to spawn indicator thread");
+
+            // ── Step 3: run the captive portal ───────────────────────────────
+            let ap_password = match AP_PSK {
+                Some(psk) => Some(psk),
+                None => {
+                    log::warn!(
+                        "PROVISION_AP_PSK not set — running an OPEN provisioning AP. \
+                         Set PROVISION_AP_PSK at build time for a WPA2-protected portal."
+                    );
+                    None
+                }
+            };
+
+            // Retain a clone of `nvs` before moving it into `run_wifi_mqtt_portal`
+            // so the factory-reset arm can open the store for erasure.
+            let nvs_for_erase = nvs.clone();
+
+            let boot_config = BootConfig {
+                portal: PortalConfig {
+                    ssid_prefix: "Rustyfarian",
+                    ap_password,
+                    channel: 1,
+                    device_name: "c3-mqtt-demo",
+                    firmware_version: env!("CARGO_PKG_VERSION"),
+                    profile: SchemaProfile::WifiMqttDevice,
+                },
+                portal_timeout: Some(Duration::from_secs(600)),
+                on_event: Some(Arc::new(|event: ProvisioningEvent| {
+                    // A real consumer would nudge the indicator here, e.g. change
+                    // colour on ClientConnected, solid green on Committed, etc.
+                    log::info!("Provisioning event: {event:?}");
+                })),
+            };
+
+            // Capture the Result WITHOUT `?` so the cleanup below runs even on
+            // an operational error — an early return here would orphan the
+            // indicator thread, leaving it running indefinitely.
+            let result = run_wifi_mqtt_portal(peripherals.modem, sys_loop, nvs, boot_config);
+
+            // ── Step 4: cancel + join before restart (and before propagating) ─
+            //
+            // Set the cancel flag and join the indicator thread on EVERY path —
+            // success, any PortalOutcome, OR an operational error — BEFORE
+            // calling restart() or returning Err. We must never reboot
+            // mid-LED-transfer (a WS2812 latches its last colour until the
+            // next full frame, so an interrupted RMT/SPI burst leaves the
+            // strip in an undefined state across the reset), and the indicator
+            // thread must never outlive this scope.
+            indicator_cancel.store(true, Ordering::Relaxed);
+            // join() only errors if the thread panicked; log and continue so
+            // the device still restarts rather than getting stuck here.
+            if let Err(e) = indicator.join() {
+                log::warn!("indicator thread panicked: {e:?}");
             }
-        }
-        return Ok(());
-    }
 
-    let ap_password = match AP_PSK {
-        Some(psk) => Some(psk),
-        None => {
-            log::warn!(
-                "PROVISION_AP_PSK not set — running an OPEN provisioning AP. \
-                 Set PROVISION_AP_PSK at build time for a WPA2-protected portal."
-            );
-            None
-        }
-    };
+            // The indicator is now stopped; propagate any operational error.
+            let outcome = result?;
 
-    let config = PortalConfig {
-        ssid_prefix: "Rustyfarian",
-        ap_password,
-        channel: 1,
-        device_name: "c3-mqtt-demo",
-        firmware_version: env!("CARGO_PKG_VERSION"),
-        profile: SchemaProfile::WifiMqttDevice,
-    };
-
-    let session = ProvisioningBuilder::new(config)
-        .with_status_entry("role", "mqtt-provision-demo")
-        .on_event(|event| log::info!("Provisioning event: {event:?}"))
-        .start(peripherals.modem, sys_loop, nvs)?;
-
-    log::info!(
-        "Portal running — connect to the AP and open http://{}/",
-        session.ap_ip()
-    );
-
-    match session.wait_committed(Some(Duration::from_secs(600))) {
-        Some(cfg) => {
-            // Log the MQTT target by host length and port only — never the
-            // username or password values, only their presence by length.
-            match cfg.mqtt() {
-                Some(mqtt) => log::info!(
-                    "Provisioning committed (ssid len={}, mqtt_host len={}, mqtt_port={}, \
-                     mqtt_user present={}, mqtt_pass present={}, mqtt_client present={}) — \
-                     restarting into normal boot.",
-                    cfg.wifi_ssid().len(),
-                    mqtt.host().len(),
-                    mqtt.port(),
-                    mqtt.username().is_some(),
-                    mqtt.password().is_some(),
-                    mqtt.client_id().is_some(),
-                ),
-                None => log::warn!(
-                    "Committed config unexpectedly missing its MQTT group; restarting anyway."
-                ),
+            match outcome {
+                PortalOutcome::JustProvisioned => {
+                    log::info!("Provisioning committed — restarting into normal boot.");
+                }
+                PortalOutcome::FactoryResetRequested => {
+                    // Erase the NVS provisioning namespace so the next boot
+                    // re-enters the portal.  Best-effort: log and restart even
+                    // if the erase fails — stranding the device here is worse
+                    // than a second erase attempt on the following boot.
+                    match ProvisioningStore::open(nvs_for_erase).and_then(|mut s| s.erase_all()) {
+                        Ok(()) => log::info!("Factory reset: NVS provisioning namespace erased."),
+                        Err(e) => log::warn!(
+                            "Factory reset: erase_all failed (will retry on next boot): {e:#}"
+                        ),
+                    }
+                    log::info!("Factory reset — restarting.");
+                }
+                PortalOutcome::PortalExitedWithoutCommit => {
+                    log::warn!("Portal timed out with no commit — restarting.");
+                }
+                // `#[non_exhaustive]` requires a wildcard arm.
+                _ => {
+                    log::warn!("Unknown portal outcome — restarting.");
+                }
             }
-            session.shutdown()?;
+
+            // Restart on all portal outcomes.  The library never restarts itself.
             esp_idf_svc::hal::reset::restart();
         }
-        None => {
-            log::warn!("Provisioning timed out with no commit; shutting the portal down.");
-            session.shutdown()?;
+
+        WifiMqttLoadOutcome::OtherProfile(profile) => {
+            // Provisioned under a different profile (e.g. LorawanFieldDevice).
+            // A real application might erase and re-provision; here we restart.
+            log::warn!(
+                "Device is provisioned under the '{:?}' profile, not WifiMqttDevice. \
+                 Factory-reset to re-provision.",
+                profile,
+            );
+            esp_idf_svc::hal::reset::restart();
         }
-    }
+
+        // `#[non_exhaustive]` requires a wildcard arm.
+        _ => {
+            log::warn!("Unexpected load outcome — restarting.");
+            esp_idf_svc::hal::reset::restart();
+        }
+    };
+
+    // ── Normal boot: hand borrowed configs to WiFiManager / MqttBuilder ─────
+    let wifi_cfg = boot.wifi_config();
+    let mqtt_cfg = boot.mqtt_config();
+
+    log::info!(
+        "Loaded provisioned config: wifi_ssid len={}, mqtt_host len={}, mqtt_port={}, \
+         mqtt_client_id len={}, wifi_pass len={} (secret)",
+        wifi_cfg.ssid.len(),
+        mqtt_cfg.host.len(),
+        mqtt_cfg.port,
+        mqtt_cfg.client_id.len(),
+        // Log secrets by length only — never the values themselves.
+        wifi_cfg.password.len(),
+    );
+
+    log::info!("A real application would now proceed to normal STA + MQTT boot.");
+    // WiFiManager::new_without_led(modem, sys_loop, Some(nvs), wifi_cfg)?;
+    // MqttBuilder::new(mqtt_cfg).build()?;
 
     Ok(())
-}
-
-/// Derives the MQTT client ID for a stored `WifiMqttDevice` config.
-///
-/// When the operator supplied one (`mqtt_client`), it is used verbatim — it was
-/// validated against the 23-byte cap at parse time. When blank, the firmware
-/// derives one from the device name, truncated to [`CLIENT_ID_MAX_LEN`] on a
-/// UTF-8 char boundary so a 24-byte device name still yields a valid ID.
-fn derive_client_id(cfg: &StoredConfig) -> String {
-    if let Some(client) = &cfg.mqtt_client {
-        return client.clone();
-    }
-    let mut id = String::new();
-    for ch in cfg.device_name.chars() {
-        if id.len() + ch.len_utf8() > CLIENT_ID_MAX_LEN {
-            break;
-        }
-        id.push(ch);
-    }
-    id
-}
-
-/// Builds an `MqttConfig` from a stored `WifiMqttDevice` config and a
-/// pre-derived client ID.
-///
-/// `MqttConfig` borrows its arguments, so `cfg` and `client_id` must outlive the
-/// returned value. The optional auth pair maps onto `with_auth` when both are
-/// present, onto `with_username_only` when only the username is — the latter
-/// omits the CONNECT password field entirely, matching broker-side username-
-/// only ACLs — and leaves the auth unset for an anonymous connection.
-fn mqtt_config_from_stored<'a>(cfg: &'a StoredConfig, client_id: &'a str) -> MqttConfig<'a> {
-    let config = MqttConfig::new(&cfg.mqtt_host, cfg.mqtt_port, client_id);
-    match (cfg.mqtt_user.as_deref(), cfg.mqtt_pass.as_deref()) {
-        (Some(user), Some(pass)) => config.with_auth(user, pass),
-        (Some(user), None) => config.with_username_only(user),
-        _ => config,
-    }
 }

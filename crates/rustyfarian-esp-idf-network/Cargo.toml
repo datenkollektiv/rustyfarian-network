@@ -143,4 +143,4 @@ required-features = ["provisioning"]
 
 [[example]]
 name = "idf_c3_provision_mqtt"
-required-features = ["provisioning", "mqtt"]
+required-features = ["wifi", "mqtt", "provisioning"]
