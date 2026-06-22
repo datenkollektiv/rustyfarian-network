@@ -249,7 +249,7 @@ pub(crate) fn start(
                 response.write_all(b"Forbidden: session token mismatch.")?;
                 return Ok(());
             }
-            state.apply(ProvisioningInput::FactoryReset);
+            state.apply_and_notify(ProvisioningInput::FactoryReset);
             (on_event)(ProvisioningEvent::FactoryResetRequested);
             log::info!("Factory reset requested via portal");
             let mut response = request.into_ok_response()?;

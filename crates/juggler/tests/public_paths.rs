@@ -106,8 +106,8 @@ fn wifi_mock_public_paths() {
 #[test]
 fn mqtt_public_paths() {
     use juggler::mqtt::{
-        connection_wait_iterations, next_state, topic_matches_filter, validate_broker_host,
-        validate_broker_port, validate_client_id, validate_publish_topic,
+        connection_wait_iterations, next_state, resolve_client_id, topic_matches_filter,
+        validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
         validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent,
         CLIENT_ID_MAX_LEN, TOPIC_MAX_LEN,
     };
@@ -145,6 +145,21 @@ fn mqtt_public_paths() {
     assert_eq!(
         next_state(MqttConnectionState::Connected, MqttEvent::Connected),
         None
+    );
+
+    // resolve_client_id: operator passthrough, derived truncation, fallback.
+    assert_eq!(
+        resolve_client_id(Some("my-device-01"), "name", "fallback"),
+        Ok("my-device-01")
+    );
+    assert!(resolve_client_id(Some("x".repeat(CLIENT_ID_MAX_LEN + 1).as_str()), "n", "f").is_err());
+    assert_eq!(
+        resolve_client_id(None, "device", "rustyfarian"),
+        Ok("device")
+    );
+    assert_eq!(
+        resolve_client_id(None, "", "rustyfarian"),
+        Ok("rustyfarian")
     );
 }
 

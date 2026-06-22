@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`WifiMqttBoot` boot helper** (Experimental — API may change before 1.0): `rustyfarian-esp-idf-network` provisioning + mqtt features now expose `WifiMqttBoot::load` / `WifiMqttBoot::load_with` (modem-free NVS load, returns a ready-to-borrow `WiFiConfig` + `MqttConfig` bundle) and `run_wifi_mqtt_portal` (portal lifecycle with three-way outcome: `JustProvisioned`, `FactoryResetRequested`, `PortalExitedWithoutCommit`). Gated `#[cfg(all(feature = "provisioning", feature = "mqtt"))]`. Re-exported via `rustyfarian_esp_idf_network::provisioning::{WifiMqttBoot, WifiMqttLoadOutcome, PortalOutcome, BootConfig, run_wifi_mqtt_portal}`.
+- **`juggler::mqtt::resolve_client_id`**: pure `no_std` helper that selects between an operator-supplied MQTT client ID, a `device_name`-derived ID truncated on a UTF-8 char boundary to the 23-byte MQTT 3.1.1 cap, and a last-resort fallback. Host-tested.
+- `ProvisioningSession::wait_outcome` (crate-internal): three-way condvar wait used by `run_wifi_mqtt_portal`; the factory-reset handler now calls `apply_and_notify` so an indefinite `portal_timeout: None` wait correctly wakes on factory-reset.
+- `idf_c3_provision_mqtt` example rewritten on the `WifiMqttBoot` + `run_wifi_mqtt_portal` API, eliminating the copy-paste `derive_client_id` / `mqtt_config_from_stored` helpers.
+
 ## [0.4.0] - 2026-06-20
 
 ### Changed
