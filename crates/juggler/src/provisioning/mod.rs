@@ -35,7 +35,7 @@ pub use config::{
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};
-pub use ssid::derive_softap_ssid;
+pub use ssid::{derive_softap_ssid, resolve_softap_ssid};
 pub use state::{
     resolve_wait, InvalidTransition, ProvisioningInput, ProvisioningState, WaitResolution,
 };

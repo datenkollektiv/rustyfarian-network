@@ -33,6 +33,7 @@
 //!
 //! let config = PortalConfig {
 //!     ssid_prefix: "Rustyfarian",
+//!     ssid_override: None,
 //!     ap_password: Some("provision-me"),
 //!     channel: 1,
 //!     device_name: "hive-01",
@@ -64,8 +65,8 @@ pub use boot::{
 };
 
 pub use juggler::provisioning::{
-    derive_softap_ssid, Field, FieldError, LoraFields, MqttFields, ProvisioningConfig,
-    ProvisioningState, SchemaProfile, ValidationError,
+    derive_softap_ssid, resolve_softap_ssid, Field, FieldError, LoraFields, MqttFields,
+    ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
 };
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -90,7 +91,15 @@ use dns::DnsResponder;
 pub struct PortalConfig<'a> {
     /// SoftAP SSID prefix; the AP MAC's last two bytes are appended as
     /// `{prefix}-XXXX` (see [`derive_softap_ssid`]).
+    ///
+    /// Ignored when [`ssid_override`](Self::ssid_override) is `Some`.
     pub ssid_prefix: &'a str,
+    /// When `Some`, used verbatim as the complete SoftAP SSID; `ssid_prefix` and the
+    /// MAC-derived suffix are ignored. Must be 1..=32 UTF-8 bytes and not
+    /// whitespace-only, or `start()` fails. Using an override disables the default
+    /// per-device MAC uniqueness, so distinct devices given the same override share
+    /// an SSID.
+    pub ssid_override: Option<&'a str>,
     /// Optional WPA2 password for the AP. `None` runs an open AP.
     pub ap_password: Option<&'a str>,
     /// 2.4 GHz channel (1–13).
@@ -424,8 +433,9 @@ impl<'a> ProvisioningBuilder<'a> {
             self.on_event.unwrap_or_else(|| Arc::new(|_| {}));
 
         let mac = softap_mac().context("failed to read SoftAP MAC")?;
-        let ssid = derive_softap_ssid(self.config.ssid_prefix, &mac);
-        log::info!("Provisioning SSID derived (len={})", ssid.len());
+        let ssid = resolve_softap_ssid(self.config.ssid_override, self.config.ssid_prefix, &mac)
+            .map_err(|e| anyhow::anyhow!("invalid SoftAP SSID override: {e}"))?;
+        log::info!("Provisioning SSID resolved (len={})", ssid.len());
 
         let ap_config = match self.config.ap_password {
             Some(pw) => {
