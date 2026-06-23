@@ -564,14 +564,22 @@ impl ProvisioningSession {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// Shuts the session down in dependency order: the HTTP server first (so
-    /// nothing answers on a netif about to disappear), then the DNS thread, then
-    /// the SoftAP. The AP-event subscription is dropped with `self`.
+    /// Shuts the session down in dependency order: the DNS catch-all first (so
+    /// OS captive-portal probe domains stop resolving to us, cutting the probe
+    /// burst that hits the httpd during teardown), then the HTTP server (still
+    /// before the netif disappears), then the SoftAP. The AP-event subscription
+    /// is dropped with `self`.
     pub fn shutdown(mut self) -> anyhow::Result<()> {
-        drop(self.server.take());
+        // DNS first: stop resolving probe domains to us before the httpd tears
+        // down, to cut the `httpd_txrx: setsockopt: 22` + probe-404 teardown
+        // noise seen on hardware. The server is still dropped before the SoftAP
+        // so nothing answers on a netif about to disappear (the original
+        // ordering invariant — a client already holding the cached AP IP may
+        // still poll directly, so this reduces rather than eliminates the noise).
         if let Some(dns) = self.dns.take() {
             dns.stop();
         }
+        drop(self.server.take());
         if let Some(softap) = self.softap.take() {
             softap.stop().context("failed to stop SoftAP")?;
         }
