@@ -9,7 +9,7 @@ if [ "$(uname)" != "Darwin" ]; then
 fi
 
 RAMDISK_NAME="RustBuilds"
-RAMDISK_SIZE_GB="${RAMDISK_SIZE_GB:-6}"
+RAMDISK_SIZE_GB="${RUSTBUILDS_RAMDISK_SIZE_GB:-${RAMDISK_SIZE_GB:-6}}"
 
 case "${1:-}" in
     attach)

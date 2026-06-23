@@ -12,6 +12,18 @@ ignore = [
     # separate transitive dep on heapless 0.7, which is why both versions coexist.
     # Resolves when lorawan-device upgrades to heapless 0.8 (not yet in 0.12).
     "RUSTSEC-2023-0089",
+    # anyhow 1.0.102 unsoundness in `Error::downcast_mut()` (RUSTSEC-2026-0190).
+    # Host-toolchain build dep only (not reachable in shipped firmware):
+    #   embuild → manyhow 0.11.4 → anyhow 1.0.102
+    # A patch fix exists (anyhow >= 1.0.103); deferred to a dependency-hygiene
+    # pass to keep this PR scoped. Remove after `cargo update -p anyhow`.
+    "RUSTSEC-2026-0190",
+    # crossbeam-epoch 0.9.18 invalid pointer deref in `fmt::Pointer` for
+    # `Atomic`/`Shared` (RUSTSEC-2026-0204). Host-toolchain build dep only:
+    #   embuild → globwalk → ignore → crossbeam-deque → crossbeam-epoch 0.9.18
+    # A patch fix exists (crossbeam-epoch >= 0.9.20); deferred to a
+    # dependency-hygiene pass. Remove after `cargo update -p crossbeam-epoch`.
+    "RUSTSEC-2026-0204",
 ]
 
 [licenses]
