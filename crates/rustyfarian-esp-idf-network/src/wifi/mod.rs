@@ -683,37 +683,89 @@ impl SoftApManager {
     }
 }
 
-/// Forces the AP netif onto the documented ESP-IDF default `192.168.4.1/24`.
+/// Forces the AP netif onto the documented ESP-IDF default `192.168.4.1/24`
+/// and configures the IDF DHCP server to advertise the AP as the DNS server
+/// (DHCP Option 6).
 ///
 /// `esp-idf-svc` does not expose `set_ip_info`, and `EspWifi::new` can read a
 /// stale netif configuration retained in NVS that lands the SoftAP on an
 /// unexpected subnet. Pinning the IP here gives `ap_ip()` callers — and any
 /// hard-coded captive-portal URL — a predictable address.
+///
+/// Without Option 6, captive-portal clients get an IP and gateway but no DNS
+/// resolver.  They cannot resolve probe domains such as
+/// `connectivitycheck.gstatic.com` or `captive.apple.com`, so the OS-level
+/// captive-portal detection never fires and the sign-in sheet never appears —
+/// even though our DNS catch-all on port 53 is already running.  Setting the
+/// AP netif's main DNS to the AP IP and enabling the DHCP-server DNS offer
+/// mirrors what the esp-hal DHCP path does in Option 6 of its hand-rolled
+/// OFFER/ACK messages.
 fn pin_ap_netif_ip(wifi: &EspWifi<'_>) -> anyhow::Result<()> {
+    use core::ffi::c_void;
+
     use esp_idf_svc::handle::RawHandle;
     use esp_idf_svc::sys::{
-        esp, esp_ip4_addr_t, esp_netif_dhcps_start, esp_netif_dhcps_stop, esp_netif_ip_info_t,
-        esp_netif_set_ip_info,
+        esp, esp_ip4_addr_t, esp_ip_addr_t,
+        esp_netif_dhcp_option_id_t_ESP_NETIF_DOMAIN_NAME_SERVER,
+        esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET, esp_netif_dhcps_option,
+        esp_netif_dhcps_start, esp_netif_dhcps_stop, esp_netif_dns_info_t,
+        esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN, esp_netif_ip_info_t, esp_netif_set_dns_info,
+        esp_netif_set_ip_info, ESP_IPADDR_TYPE_V4,
     };
 
     let handle = wifi.ap_netif().handle();
+    let ap_addr = u32::from_le_bytes([192, 168, 4, 1]);
     let info = esp_netif_ip_info_t {
-        ip: esp_ip4_addr_t {
-            addr: u32::from_le_bytes([192, 168, 4, 1]),
-        },
+        ip: esp_ip4_addr_t { addr: ap_addr },
         netmask: esp_ip4_addr_t {
             addr: u32::from_le_bytes([255, 255, 255, 0]),
         },
-        gw: esp_ip4_addr_t {
-            addr: u32::from_le_bytes([192, 168, 4, 1]),
-        },
+        gw: esp_ip4_addr_t { addr: ap_addr },
     };
 
+    // OFFER_DNS bit (0x02) from lwIP dhcpserver.h — the DHCP server
+    // respects bit 1 of this byte to include Option 6 in OFFER/ACK.
+    let mut dns_offer: u8 = 0x02;
+
     unsafe {
-        // DHCPS must be stopped before set_ip_info; ignored result handles the
-        // "already stopped" case (ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED).
+        // DHCPS must be stopped before set_ip_info and set_dns_info; the
+        // ignored result handles the "already stopped" case
+        // (ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED).
         let _ = esp_netif_dhcps_stop(handle);
+
         esp!(esp_netif_set_ip_info(handle, &info)).context("failed to set AP netif IP")?;
+
+        // Tell the AP netif's DNS slot (MAIN) to point at the AP itself so
+        // that the IDF DHCP server can advertise it via Option 6.
+        // SAFETY: esp_netif_set_dns_info takes a *mut but only reads the
+        // struct; the local `dns_info` outlives the call.
+        let mut dns_info = esp_netif_dns_info_t {
+            ip: esp_ip_addr_t {
+                u_addr: esp_idf_svc::sys::_ip_addr__bindgen_ty_1 {
+                    ip4: esp_ip4_addr_t { addr: ap_addr },
+                },
+                type_: ESP_IPADDR_TYPE_V4 as u8,
+            },
+        };
+        esp!(esp_netif_set_dns_info(
+            handle,
+            esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+            &mut dns_info,
+        ))
+        .context("failed to set AP netif DNS")?;
+
+        // Enable DHCP Option 6 (DNS server) in the IDF DHCP server.
+        // The opt_val is the OFFER_DNS bitmask byte from lwIP dhcpserver.h.
+        // SAFETY: opt_val pointer is valid for the duration of the call.
+        esp!(esp_netif_dhcps_option(
+            handle,
+            esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
+            esp_netif_dhcp_option_id_t_ESP_NETIF_DOMAIN_NAME_SERVER,
+            &mut dns_offer as *mut u8 as *mut c_void,
+            core::mem::size_of::<u8>() as u32,
+        ))
+        .context("failed to enable DHCP DNS offer")?;
+
         esp!(esp_netif_dhcps_start(handle)).context("failed to (re)start AP DHCP server")?;
     }
     Ok(())

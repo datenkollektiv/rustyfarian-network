@@ -26,6 +26,21 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 - `mqtt` and `provisioning` implicitly depend on `wifi` for bootstrap (compile error if `wifi` is omitted).
 - Dual SPI support via `esp-idf-hal` abstractions; no board-specific SPI routing code needed.
 
+## ⚠️ Required `sdkconfig.defaults` for SoftAP provisioning
+
+**If you enable the `provisioning` feature, you must raise the ESP-IDF httpd header limit**, or the captive portal will not work.
+
+OS captive-portal browsers send request headers larger than the ESP-IDF httpd default (512 B).
+Without this setting, the provisioning portal's `GET /` is rejected with `431 Request Header Fields Too Large` and the sign-in page never renders (the device connects but no portal appears).
+Add to your **workspace-root** `sdkconfig.defaults`:
+
+```text
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+```
+
+`2048` matches this workspace's default and the esp-hal portal's request-size cap.
+After editing `sdkconfig.defaults`, clean the `esp-idf-sys-*` build directory (or run `cargo clean`) so CMake reconfigures.
+
 ## Cargo.toml
 
 Add to your `Cargo.toml`:

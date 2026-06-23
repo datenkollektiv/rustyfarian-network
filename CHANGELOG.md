@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProvisioningSession::wait_outcome` (crate-internal): three-way condvar wait used by `run_wifi_mqtt_portal`; the factory-reset handler now calls `apply_and_notify` so an indefinite `portal_timeout: None` wait correctly wakes on factory-reset.
 - `idf_c3_provision_mqtt` example rewritten on the `WifiMqttBoot` + `run_wifi_mqtt_portal` API, eliminating the copy-paste `derive_client_id` / `mqtt_config_from_stored` helpers.
 
+### Fixed
+
+- **SoftAP captive portal now advertises the AP plus a DNS server via DHCP Option 6** so the OS sign-in sheet appears on connecting devices. Previously clients received an IP address and gateway but no DNS server; without a resolver they could not reach the OS-level captive-portal probe domains (`connectivitycheck.gstatic.com`, `captive.apple.com`, etc.) and the portal never popped — even though the DNS catch-all on port 53 was running. `pin_ap_netif_ip` now calls `esp_netif_set_dns_info` (DNS MAIN = AP IP) and `esp_netif_dhcps_option(OP_SET, DOMAIN_NAME_SERVER, 0x02)` between the DHCPS stop and start, mirroring the esp-hal DHCP Option 6 behaviour that already passed on-hardware validation.
+
 ## [0.4.0] - 2026-06-20
 
 ### Changed
