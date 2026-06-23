@@ -237,6 +237,7 @@ async fn main(spawner: Spawner) {
 
     let portal_config = PortalConfig {
         ssid_prefix: PORTAL_SSID_PREFIX,
+        ssid_override: None,
         ap_password: None,
         channel: 1,
         device_name: DEVICE_NAME,

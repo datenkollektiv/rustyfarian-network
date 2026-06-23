@@ -23,6 +23,9 @@ use heapless::String as HS;
 use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+use juggler::provisioning::resolve_softap_ssid;
+
+#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 use super::store::ProvisioningStore;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -37,7 +40,15 @@ use super::store::ProvisioningStore;
 pub struct PortalConfig<'a> {
     /// SoftAP SSID prefix.  The last two bytes of the AP MAC are appended by
     /// [`juggler::provisioning::derive_softap_ssid`] to form the full SSID.
+    ///
+    /// Ignored when [`ssid_override`](Self::ssid_override) is `Some`.
     pub ssid_prefix: &'a str,
+    /// When `Some`, used verbatim as the complete SoftAP SSID; `ssid_prefix` and the
+    /// MAC-derived suffix are ignored. Must be 1..=32 UTF-8 bytes and not
+    /// whitespace-only, or `start()` fails. Using an override disables the default
+    /// per-device MAC uniqueness, so distinct devices given the same override share
+    /// an SSID.
+    pub ssid_override: Option<&'a str>,
     /// Optional WPA2 password for the AP.  `None` opens an unprotected AP and
     /// emits a `warn!` log; `Some(pw)` where `pw.len() <
     /// juggler::wifi::AP_PASSWORD_MIN_LEN` causes `start` to return
@@ -128,6 +139,12 @@ pub enum ProvisioningError {
         /// The minimum acceptable password length.
         min: usize,
     },
+    /// The `ssid_override` value is invalid (empty, whitespace-only, or exceeds
+    /// the 32-byte UTF-8 SSID limit).
+    InvalidSsid {
+        /// The reason the SSID was rejected, as a `&'static str` message.
+        reason: &'static str,
+    },
     /// Reserved for future embassy versions where `spawner.spawn()` may become
     /// fallible again (precedent: embassy 0.7's `SpawnError`).  Currently
     /// unreachable — embassy 0.10 panics on pool exhaustion rather than
@@ -160,6 +177,9 @@ impl core::fmt::Display for ProvisioningError {
         match self {
             ProvisioningError::PasswordTooShort { min } => {
                 write!(f, "AP password too short (minimum {} characters)", min)
+            }
+            ProvisioningError::InvalidSsid { reason } => {
+                write!(f, "invalid SoftAP SSID override: {reason}")
             }
             ProvisioningError::SpawnFailed => write!(f, "embassy task spawn failed"),
             ProvisioningError::AlreadyStarted => {
@@ -323,6 +343,7 @@ impl ProvisioningSession {
 /// ```ignore
 /// let session = ProvisioningBuilder::new(PortalConfig {
 ///     ssid_prefix: "Rustyfarian",
+///     ssid_override: None,
 ///     ap_password: Some("provision-me"),
 ///     channel: 1,
 ///     device_name: "hive-01",
@@ -404,6 +425,22 @@ impl<'a> ProvisioningBuilder<'a> {
         // that a caller selecting an unsupported profile gets a clean error
         // without any side effects.
         validate_profile(self.config.profile)?;
+
+        // ── Step 0b: validate ssid_override if present ─────────────────────
+        // The bare-metal SoftAP is brought up externally (via
+        // `WiFiManager::init_softap_async`) before `start()` is called, so
+        // `start()` does not set the radio SSID.  However, `ssid_override`
+        // must still be validated early so callers receive a clean error
+        // rather than silently running a portal with an invalid SSID name.
+        // A zero MAC is used here because the MAC suffix is only appended on
+        // the `None` path (infallible, derives a harmless string we discard),
+        // and the `Some` path only inspects the override string itself.
+        resolve_softap_ssid(
+            self.config.ssid_override,
+            self.config.ssid_prefix,
+            &[0u8; 6],
+        )
+        .map_err(|reason| ProvisioningError::InvalidSsid { reason })?;
 
         // ── Step 1: validate AP password ───────────────────────────────────
         if let Some(pw) = self.config.ap_password {
