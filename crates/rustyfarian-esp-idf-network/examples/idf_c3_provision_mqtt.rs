@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+
 use rustyfarian_esp_idf_network::provisioning::{
     run_wifi_mqtt_portal, BootConfig, PortalConfig, PortalOutcome, ProvisioningEvent,
     ProvisioningStore, SchemaProfile, WifiMqttBoot, WifiMqttLoadOutcome,
@@ -97,7 +99,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     log::debug!("indicator: cancelled, exiting");
                 })
-                .expect("failed to spawn indicator thread");
+                .context("failed to spawn indicator thread")?;
 
             // ── Step 3: run the captive portal ───────────────────────────────
             let ap_password = match AP_PSK {

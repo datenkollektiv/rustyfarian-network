@@ -79,7 +79,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
 use crate::wifi::{softap_mac, ApConfig, SoftApManager};
-use juggler::provisioning::ProvisioningInput;
+use juggler::provisioning::{resolve_wait, ProvisioningInput, WaitResolution};
 
 use dns::DnsResponder;
 
@@ -137,7 +137,7 @@ pub enum ProvisioningEvent {
 /// [`PortalOutcome`](boot::PortalOutcome).
 ///
 /// Only consumed by the `mqtt`-gated `boot` module; gated accordingly.
-#[cfg(feature = "mqtt")]
+#[cfg(all(feature = "provisioning", feature = "mqtt"))]
 #[derive(Debug)]
 pub(crate) enum SessionWait {
     /// A valid submission was committed; carries the parsed config.
@@ -291,7 +291,7 @@ impl SharedState {
     /// on the factory-reset path, provided the factory-reset handler calls
     /// [`apply_and_notify`](Self::apply_and_notify) rather than bare
     /// [`apply`](Self::apply).
-    #[cfg(feature = "mqtt")]
+    #[cfg(all(feature = "provisioning", feature = "mqtt"))]
     pub(crate) fn wait_outcome(&self, timeout: Option<Duration>) -> SessionWait {
         let (lock, cvar) = &*self.inner;
         let mut guard = match lock.lock() {
@@ -306,12 +306,20 @@ impl SharedState {
         };
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            // Check terminal states before any wait.
-            if let Some(config) = guard.committed.clone() {
-                return SessionWait::Committed(config);
-            }
-            if guard.state == ProvisioningState::FactoryResetPending {
-                return SessionWait::FactoryResetRequested;
+            // Delegate the per-iteration terminal-state decision to the pure,
+            // host-tested juggler function so the "factory-reset unblocks an
+            // indefinite wait" contract is locked by juggler unit tests.
+            match resolve_wait(guard.committed.is_some(), guard.state) {
+                WaitResolution::Committed => {
+                    return SessionWait::Committed(
+                        guard
+                            .committed
+                            .clone()
+                            .expect("committed flag set implies Some"),
+                    );
+                }
+                WaitResolution::FactoryReset => return SessionWait::FactoryResetRequested,
+                WaitResolution::Pending => {}
             }
             match deadline {
                 None => match cvar.wait(guard) {
@@ -557,7 +565,7 @@ impl ProvisioningSession {
     /// (`timeout = None`) wait does not hang when the user presses the
     /// factory-reset button. Used internally by
     /// [`run_wifi_mqtt_portal`](crate::provisioning::run_wifi_mqtt_portal).
-    #[cfg(feature = "mqtt")]
+    #[cfg(all(feature = "provisioning", feature = "mqtt"))]
     pub(crate) fn wait_outcome(&self, timeout: Option<Duration>) -> SessionWait {
         self.state.wait_outcome(timeout)
     }

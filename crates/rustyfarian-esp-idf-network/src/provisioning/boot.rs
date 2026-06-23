@@ -133,7 +133,7 @@ mod inner {
         ///
         /// ```ignore
         /// WifiMqttBoot::load_with(nvs, |cfg| {
-        ///     Ok(format!("my-{}", &cfg.device_name[..8.min(cfg.device_name.len())]))
+        ///     Ok(format!("my-{}", cfg.device_name.chars().take(8).collect::<String>()))
         /// })?;
         /// ```
         pub fn load_with(
@@ -184,10 +184,27 @@ mod inner {
         /// - neither → anonymous
         pub fn mqtt_config(&self) -> MqttConfig<'_> {
             let config = MqttConfig::new(&self.mqtt_host, self.mqtt_port, &self.mqtt_client_id);
+            // Every auth shape is matched explicitly — nothing is folded into a
+            // catch-all — so a malformed `(None, Some(pass))` cannot silently become
+            // anonymous. That shape is in fact unreachable: a password without a
+            // username is rejected at the form/parse boundary by
+            // `juggler::provisioning::parse_form` (test
+            // `auth_password_without_user_rejected_on_mqtt_pass`), and MQTT 3.1.1
+            // forbids a password field without a username.
             match (self.mqtt_user.as_deref(), self.mqtt_pass.as_deref()) {
                 (Some(user), Some(pass)) => config.with_auth(user, pass),
                 (Some(user), None) => config.with_username_only(user),
-                _ => config,
+                (None, None) => config,
+                (None, Some(_)) => {
+                    // Unreachable per the invariant above. Do not emit a malformed
+                    // CONNECT (password without username); fall back to anonymous and
+                    // trip in debug so a parser regression is caught by tests.
+                    debug_assert!(
+                        false,
+                        "mqtt_pass without mqtt_user reached mqtt_config — parse_form should reject this"
+                    );
+                    config
+                }
             }
         }
     }
