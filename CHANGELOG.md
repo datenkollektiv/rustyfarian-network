@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProvisioningSession::wait_outcome` (crate-internal): three-way condvar wait used by `run_wifi_mqtt_portal`; the factory-reset handler now calls `apply_and_notify` so an indefinite `portal_timeout: None` wait correctly wakes on factory-reset.
 - `idf_c3_provision_mqtt` example rewritten on the `WifiMqttBoot` + `run_wifi_mqtt_portal` API, eliminating the copy-paste `derive_client_id` / `mqtt_config_from_stored` helpers.
 
+### Changed
+
+- **MQTT event-loop logging is quieter and more readable.** The per-event trace dropped from `info!` to `debug!`, so steady-state operation no longer spams the default INFO log; a `Received` event now logs its topic and byte length instead of dumping the raw payload as a decimal byte array. Connection-lifecycle events (connected / disconnected / subscribe) still log at INFO.
+- **Provisioning portal shutdown stops the DNS catch-all first** (before the HTTP server, then the SoftAP) so OS captive-portal probe domains stop resolving to the device as the httpd tears down — reducing the `httpd_txrx: setsockopt: 22` and probe-404 teardown noise observed on hardware. The server is still dropped before the SoftAP, preserving the netif-teardown ordering.
+
 ### Fixed
 
 - **SoftAP captive portal now advertises the AP plus a DNS server via DHCP Option 6** so the OS sign-in sheet appears on connecting devices. Previously clients received an IP address and gateway but no DNS server; without a resolver they could not reach the OS-level captive-portal probe domains (`connectivitycheck.gstatic.com`, `captive.apple.com`, etc.) and the portal never popped — even though the DNS catch-all on port 53 was running. `pin_ap_netif_ip` now calls `esp_netif_set_dns_info` (DNS MAIN = AP IP) and `esp_netif_dhcps_option(OP_SET, DOMAIN_NAME_SERVER, 0x02)` between the DHCPS stop and start, mirroring the esp-hal DHCP Option 6 behaviour that already passed on-hardware validation.

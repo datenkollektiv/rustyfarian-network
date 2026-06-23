@@ -957,7 +957,20 @@ impl<'a> MqttBuilder<'a> {
                             break;
                         }
                     };
-                    log::info!("[mqtt] event loop: received event: {:?}", event.payload());
+                    // Per-event trace at DEBUG so steady-state operation stays quiet
+                    // at the default INFO level (lifecycle events below log at INFO).
+                    // Never dump a `Received` payload's bytes — that spams a decimal
+                    // byte array on every message; log the topic and length instead.
+                    match event.payload() {
+                        EventPayload::Received { topic, data, .. } => log::debug!(
+                            "[mqtt] event loop: received message (topic={:?}, {} bytes)",
+                            topic,
+                            data.len()
+                        ),
+                        payload => {
+                            log::debug!("[mqtt] event loop: received event: {payload:?}")
+                        }
+                    }
 
                     match event.payload() {
                         EventPayload::Connected(is_clean) => {
