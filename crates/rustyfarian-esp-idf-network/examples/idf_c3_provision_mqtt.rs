@@ -32,6 +32,21 @@
 //! ```sh
 //! just flash idf_c3_provision_mqtt
 //! ```
+//!
+//! # Required `sdkconfig.defaults`
+//!
+//! OS captive-portal browsers send request headers larger than the ESP-IDF
+//! httpd default (512 B), so a standalone consumer MUST raise the limit in its
+//! workspace-root `sdkconfig.defaults` — otherwise the portal GET is rejected
+//! with `431 Request Header Fields Too Large` and the page never renders:
+//!
+//! ```text
+//! CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+//! ```
+//!
+//! This workspace already sets it; the `2048` mirrors the esp-hal portal's
+//! request-size cap. After changing `sdkconfig.defaults`, clean the
+//! `esp-idf-sys-*` build dir (or `cargo clean`) so CMake reconfigures.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
