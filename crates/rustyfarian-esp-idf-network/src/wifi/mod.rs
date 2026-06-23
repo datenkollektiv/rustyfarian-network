@@ -723,9 +723,12 @@ fn pin_ap_netif_ip(wifi: &EspWifi<'_>) -> anyhow::Result<()> {
         gw: esp_ip4_addr_t { addr: ap_addr },
     };
 
-    // OFFER_DNS bit (0x02) from lwIP dhcpserver.h — the DHCP server
-    // respects bit 1 of this byte to include Option 6 in OFFER/ACK.
-    let mut dns_offer: u8 = 0x02;
+    // Source of truth: lwIP `dhcpserver.h` defines `OFFER_DNS = 0x02`; the DHCP
+    // server includes Option 6 (DNS) in its OFFER/ACK when this bit is set in the
+    // `DOMAIN_NAME_SERVER` option byte. Hardware-validated (rgb-clock captive-portal
+    // bring-up, 2026-06-23) — there is no host/CI test for this IDF behavior.
+    const DHCPS_OFFER_DNS_BIT: u8 = 0x02;
+    let mut dns_offer: u8 = DHCPS_OFFER_DNS_BIT;
 
     unsafe {
         // DHCPS must be stopped before set_ip_info and set_dns_info; the

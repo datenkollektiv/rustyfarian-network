@@ -79,6 +79,39 @@ impl ProvisioningState {
 
 /// Experimental: API may change before 1.0.
 ///
+/// What a provisioning-session waiter should do, given the observable signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitResolution {
+    /// A config has been committed — return success.
+    Committed,
+    /// Factory-reset was requested (state reached `FactoryResetPending`) — return reset.
+    FactoryReset,
+    /// Neither yet — keep waiting.
+    Pending,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Decide a waiter's resolution from the two observable session signals.
+///
+/// `committed` is whether a config has been persisted; `state` is the current
+/// provisioning state-machine state. `Committed` takes precedence over a
+/// factory-reset (a committed config is the success path even if a reset was
+/// also signalled). `FactoryResetPending` resolves the waiter so an indefinite
+/// (no-timeout) wait cannot hang after the portal's factory-reset button — the
+/// bug this guards against.
+pub fn resolve_wait(committed: bool, state: ProvisioningState) -> WaitResolution {
+    if committed {
+        WaitResolution::Committed
+    } else if matches!(state, ProvisioningState::FactoryResetPending) {
+        WaitResolution::FactoryReset
+    } else {
+        WaitResolution::Pending
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
 /// A rejected [`ProvisioningState::apply`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidTransition {
@@ -221,6 +254,62 @@ mod tests {
         assert_eq!(
             ProvisioningState::FactoryResetPending.as_str(),
             "factory_reset_pending"
+        );
+    }
+
+    // --- resolve_wait tests ---
+
+    #[test]
+    fn resolve_wait_pending_when_not_committed_and_awaiting_submission() {
+        assert_eq!(
+            resolve_wait(false, ProvisioningState::AwaitingSubmission),
+            WaitResolution::Pending,
+        );
+    }
+
+    #[test]
+    fn resolve_wait_pending_when_not_committed_and_persisting() {
+        assert_eq!(
+            resolve_wait(false, ProvisioningState::Persisting),
+            WaitResolution::Pending,
+        );
+    }
+
+    #[test]
+    fn resolve_wait_factory_reset_when_not_committed_and_factory_reset_pending() {
+        // Regression: an indefinite wait must NOT hang when the portal's
+        // factory-reset button is pressed.
+        assert_eq!(
+            resolve_wait(false, ProvisioningState::FactoryResetPending),
+            WaitResolution::FactoryReset,
+        );
+    }
+
+    #[test]
+    fn resolve_wait_pending_when_not_committed_flag_despite_state_committed() {
+        // The `committed` flag (set_committed called) gates WaitResolution::Committed,
+        // NOT the ProvisioningState::Committed variant — the state can be Committed
+        // before the flag is set (edge case during a race); the flag is authoritative.
+        assert_eq!(
+            resolve_wait(false, ProvisioningState::Committed),
+            WaitResolution::Pending,
+        );
+    }
+
+    #[test]
+    fn resolve_wait_committed_when_committed_flag_set_and_awaiting_submission() {
+        assert_eq!(
+            resolve_wait(true, ProvisioningState::AwaitingSubmission),
+            WaitResolution::Committed,
+        );
+    }
+
+    #[test]
+    fn resolve_wait_committed_takes_precedence_over_factory_reset() {
+        // Committed flag beats FactoryResetPending state — success path wins.
+        assert_eq!(
+            resolve_wait(true, ProvisioningState::FactoryResetPending),
+            WaitResolution::Committed,
         );
     }
 
