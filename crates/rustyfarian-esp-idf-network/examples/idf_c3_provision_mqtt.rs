@@ -120,6 +120,7 @@ fn main() -> anyhow::Result<()> {
             let boot_config = BootConfig {
                 portal: PortalConfig {
                     ssid_prefix: "Rustyfarian",
+                    ssid_override: None,
                     ap_password,
                     channel: 1,
                     device_name: "c3-mqtt-demo",

@@ -23,6 +23,9 @@ use heapless::String as HS;
 use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+use juggler::provisioning::resolve_softap_ssid;
+
+#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 use super::store::ProvisioningStore;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -35,9 +38,37 @@ use super::store::ProvisioningStore;
 /// afterwards.
 #[derive(Clone, Copy)]
 pub struct PortalConfig<'a> {
-    /// SoftAP SSID prefix.  The last two bytes of the AP MAC are appended by
-    /// [`juggler::provisioning::derive_softap_ssid`] to form the full SSID.
+    /// SoftAP SSID prefix.  In the unified SSID resolution logic
+    /// ([`juggler::provisioning::resolve_softap_ssid`]) the last two bytes of the
+    /// AP MAC are appended to this prefix by
+    /// [`juggler::provisioning::derive_softap_ssid`] to form the full
+    /// `{prefix}-{MAC}` SSID.  Ignored when
+    /// [`ssid_override`](Self::ssid_override) is `Some`.
+    ///
+    /// **esp-hal interim limitation (current release):** this is the intended
+    /// prefix consumed by the shared resolution logic — it does **not** yet drive
+    /// the radio SSID on the bare-metal path.  `start()` only *validates* the
+    /// resolved name; the actual AP name still comes from the `ApConfig` you pass
+    /// to `WiFiManager::init_softap_async(..)` before `start()`.  Driving the
+    /// radio SSID from this prefix (and the MAC-derived suffix) lands with the AP
+    /// bring-up ownership redesign — see
+    /// `docs/features/hal-provisioning-ap-ownership-v1.md`.
     pub ssid_prefix: &'a str,
+    /// When `Some`, used verbatim as the complete SoftAP SSID; `ssid_prefix` and the
+    /// MAC-derived suffix are ignored. Must be 1..=32 UTF-8 bytes and not
+    /// whitespace-only, or `start()` fails. Using an override disables the default
+    /// per-device MAC uniqueness, so distinct devices given the same override share
+    /// an SSID.
+    ///
+    /// **esp-hal interim limitation (current release):** on the bare-metal path
+    /// `start()` only *validates* this value — it does **not** yet set the radio
+    /// SSID. The caller still controls the AP name via `ApConfig::open(..)` /
+    /// `WiFiManager::init_softap_async(..)` before `start()`. Driving the radio
+    /// SSID from `ssid_override` (and the `{prefix}-{MAC}` default) lands with the
+    /// AP bring-up ownership redesign — see
+    /// `docs/features/hal-provisioning-ap-ownership-v1.md`. Until then, set the
+    /// AP name you want directly on the `ApConfig` you pass to `init_softap_async`.
+    pub ssid_override: Option<&'a str>,
     /// Optional WPA2 password for the AP.  `None` opens an unprotected AP and
     /// emits a `warn!` log; `Some(pw)` where `pw.len() <
     /// juggler::wifi::AP_PASSWORD_MIN_LEN` causes `start` to return
@@ -128,6 +159,12 @@ pub enum ProvisioningError {
         /// The minimum acceptable password length.
         min: usize,
     },
+    /// The `ssid_override` value is invalid (empty, whitespace-only, or exceeds
+    /// the 32-byte UTF-8 SSID limit).
+    InvalidSsid {
+        /// The reason the SSID was rejected, as a `&'static str` message.
+        reason: &'static str,
+    },
     /// Reserved for future embassy versions where `spawner.spawn()` may become
     /// fallible again (precedent: embassy 0.7's `SpawnError`).  Currently
     /// unreachable — embassy 0.10 panics on pool exhaustion rather than
@@ -160,6 +197,9 @@ impl core::fmt::Display for ProvisioningError {
         match self {
             ProvisioningError::PasswordTooShort { min } => {
                 write!(f, "AP password too short (minimum {} characters)", min)
+            }
+            ProvisioningError::InvalidSsid { reason } => {
+                write!(f, "invalid SoftAP SSID override: {reason}")
             }
             ProvisioningError::SpawnFailed => write!(f, "embassy task spawn failed"),
             ProvisioningError::AlreadyStarted => {
@@ -323,6 +363,7 @@ impl ProvisioningSession {
 /// ```ignore
 /// let session = ProvisioningBuilder::new(PortalConfig {
 ///     ssid_prefix: "Rustyfarian",
+///     ssid_override: None,
 ///     ap_password: Some("provision-me"),
 ///     channel: 1,
 ///     device_name: "hive-01",
@@ -332,6 +373,15 @@ impl ProvisioningSession {
 /// .on_event(|e| log::info!("event: {:?}", e))
 /// .start(spawner, ap_handle, store, rng)?;
 /// ```
+///
+/// **AP name ownership (current esp-hal release):** the portal's actual SoftAP
+/// name still comes from `WiFiManager::init_softap_async(..)`, which the caller
+/// invokes to obtain the `SoftApHandle` passed to [`start`](Self::start).  The
+/// [`ssid_prefix`](PortalConfig::ssid_prefix) and
+/// [`ssid_override`](PortalConfig::ssid_override) fields are *validated* by
+/// `start()` but do not yet drive the radio SSID — that unification lands with
+/// the AP bring-up ownership redesign
+/// (`docs/features/hal-provisioning-ap-ownership-v1.md`).
 // `config` is only read inside the embassy+chip-gated `start` method.
 #[cfg_attr(
     not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
@@ -404,6 +454,22 @@ impl<'a> ProvisioningBuilder<'a> {
         // that a caller selecting an unsupported profile gets a clean error
         // without any side effects.
         validate_profile(self.config.profile)?;
+
+        // ── Step 0b: validate ssid_override if present ─────────────────────
+        // The bare-metal SoftAP is brought up externally (via
+        // `WiFiManager::init_softap_async`) before `start()` is called, so
+        // `start()` does not set the radio SSID.  However, `ssid_override`
+        // must still be validated early so callers receive a clean error
+        // rather than silently running a portal with an invalid SSID name.
+        // A zero MAC is used here because the MAC suffix is only appended on
+        // the `None` path (infallible, derives a harmless string we discard),
+        // and the `Some` path only inspects the override string itself.
+        resolve_softap_ssid(
+            self.config.ssid_override,
+            self.config.ssid_prefix,
+            &[0u8; 6],
+        )
+        .map_err(|reason| ProvisioningError::InvalidSsid { reason })?;
 
         // ── Step 1: validate AP password ───────────────────────────────────
         if let Some(pw) = self.config.ap_password {
@@ -879,6 +945,53 @@ mod tests {
                 profile: SchemaProfile::LorawanFieldDevice
             }),
             "LorawanFieldDevice must be rejected by validate_profile with ProfileNotSupported"
+        );
+    }
+
+    // ── InvalidSsid error-contract tests ──────────────────────────────────────
+
+    /// `InvalidSsid` renders its `reason` in the Display message and carries only
+    /// a `&'static str` — the public error contract for a rejected
+    /// `ssid_override`.
+    ///
+    /// The `reason` strings originate in
+    /// `juggler::provisioning::resolve_softap_ssid` and are mapped verbatim by
+    /// `start()` (`.map_err(|reason| ProvisioningError::InvalidSsid { reason })`).
+    /// This test locks the mapping's public surface: the Display format prefixes
+    /// the resolver reason with a stable, non-credential-bearing message so a
+    /// caller can surface it directly.
+    #[test]
+    fn invalid_ssid_display_includes_reason() {
+        // A reason string emitted verbatim by resolve_softap_ssid.
+        let err = ProvisioningError::InvalidSsid {
+            reason: "SSID is whitespace-only",
+        };
+        let display_str = alloc::format!("{err}");
+        assert!(
+            display_str.contains("SSID is whitespace-only"),
+            "InvalidSsid Display must include the resolver reason (got: {display_str})"
+        );
+        assert!(
+            display_str.to_lowercase().contains("ssid"),
+            "InvalidSsid Display must mention SSID (got: {display_str})"
+        );
+    }
+
+    /// `InvalidSsid`'s `reason` never echoes the rejected SSID input — the
+    /// resolver's `&'static str` reasons are fixed messages, so an invalid
+    /// override name cannot leak into logs via the error path.
+    #[test]
+    fn invalid_ssid_carries_no_input_bytes() {
+        const SENTINEL: &str = "SSID-SENTINEL-9C4A";
+        let err = ProvisioningError::InvalidSsid {
+            reason: "SSID exceeds 32 bytes",
+        };
+        let debug_str = alloc::format!("{err:?}");
+        let display_str = alloc::format!("{err}");
+        assert!(
+            !debug_str.contains(SENTINEL) && !display_str.contains(SENTINEL),
+            "InvalidSsid must not echo caller-supplied SSID bytes \
+             (debug: {debug_str}, display: {display_str})"
         );
     }
 
