@@ -29,7 +29,9 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_idf_network::provisioning::{PortalConfig, ProvisioningBuilder, SchemaProfile};
+//! use rustyfarian_esp_idf_network::provisioning::{
+//!     PortalConfig, PortalDefaults, ProvisioningBuilder, SchemaProfile,
+//! };
 //!
 //! let config = PortalConfig {
 //!     ssid_prefix: "Rustyfarian",
@@ -39,6 +41,8 @@
 //!     device_name: "hive-01",
 //!     firmware_version: env!("CARGO_PKG_VERSION"),
 //!     profile: SchemaProfile::LorawanFieldDevice,
+//!     // Optional: seed the form on a fresh device (e.g. from `option_env!`).
+//!     defaults: PortalDefaults::default(),
 //! };
 //!
 //! let session = ProvisioningBuilder::new(config)
@@ -66,7 +70,7 @@ pub use boot::{
 
 pub use juggler::provisioning::{
     derive_softap_ssid, resolve_softap_ssid, Field, FieldError, LoraFields, MqttFields,
-    ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
+    PortalDefaults, ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
 };
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -124,6 +128,14 @@ pub struct PortalConfig<'a> {
     /// `wifi_pass` and `app_key`: redacted, never pre-filled, re-entered on
     /// every submission.
     pub profile: SchemaProfile,
+    /// Non-secret pre-fill defaults for the portal form.
+    ///
+    /// Seeds the form on a **fresh / factory-reset device** (empty store) so a
+    /// tester can review pre-populated values instead of retyping them. Secrets
+    /// (`wifi_pass`, `mqtt_pass`, `app_key`) are never included — see
+    /// [`PortalDefaults`]. A stored configuration always takes precedence over
+    /// these defaults. Use [`PortalDefaults::default`] for no pre-fill.
+    pub defaults: PortalDefaults<'a>,
 }
 
 /// Experimental: API may change before 1.0.
@@ -474,6 +486,9 @@ impl<'a> ProvisioningBuilder<'a> {
         let firmware_version = Arc::new(self.config.firmware_version.to_string());
         let status_entries = Arc::new(self.status_entries);
         let profile = self.config.profile;
+        let defaults = Arc::new(portal::PortalDefaultsOwned::from_borrowed(
+            &self.config.defaults,
+        ));
 
         let server = portal::start(
             ap_ip,
@@ -485,6 +500,7 @@ impl<'a> ProvisioningBuilder<'a> {
             firmware_version,
             status_entries,
             profile,
+            defaults,
         )?;
 
         let subscription = subscribe_ap_events(&sys_loop, on_event.clone())?;

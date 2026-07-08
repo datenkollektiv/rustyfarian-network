@@ -20,7 +20,7 @@
 
 use heapless::String as HS;
 
-use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
+use juggler::provisioning::{PortalDefaults, ProvisioningConfig, SchemaProfile};
 
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 use juggler::provisioning::resolve_softap_ssid;
@@ -83,6 +83,14 @@ pub struct PortalConfig<'a> {
     /// Provisioning schema profile — selects the form template and the
     /// canonical field set validated by `parse_form`.
     pub profile: SchemaProfile,
+    /// Non-secret pre-fill defaults for the portal form.
+    ///
+    /// Seeds the form on a **fresh / factory-reset device** (empty store),
+    /// letting a tester review pre-populated values instead of retyping them.
+    /// Secrets (`wifi_pass`, `mqtt_pass`) are never included — see
+    /// [`PortalDefaults`]. A stored configuration always takes precedence over
+    /// these defaults. Use [`PortalDefaults::default`] for no pre-fill.
+    pub defaults: PortalDefaults<'a>,
 }
 
 /// Lifecycle event delivered to the `on_event` callback registered via
@@ -369,6 +377,8 @@ impl ProvisioningSession {
 ///     device_name: "hive-01",
 ///     firmware_version: env!("CARGO_PKG_VERSION"),
 ///     profile: SchemaProfile::WifiMqttDevice,
+///     // Optional: seed the form on a fresh device (e.g. from `option_env!`).
+///     defaults: juggler::provisioning::PortalDefaults::default(),
 /// })
 /// .on_event(|e| log::info!("event: {:?}", e))
 /// .start(spawner, ap_handle, store, rng)?;
@@ -528,6 +538,7 @@ impl<'a> ProvisioningBuilder<'a> {
             firmware_version: fw_ver,
             device_name: dev_name,
             profile: self.config.profile,
+            defaults: portal::PortalDefaultsOwned::from_borrowed(&self.config.defaults),
         };
 
         // ── Step 6: spawn tasks ─────────────────────────────────────────────
@@ -674,18 +685,79 @@ where
 ))]
 pub(crate) mod portal {
     use heapless::String as HS;
-    use juggler::provisioning::SchemaProfile;
+    use juggler::provisioning::{PortalDefaults, SchemaProfile};
 
     /// Maximum length for `firmware_version` in the render config.
     pub(crate) const RENDER_FW_VERSION_MAX: usize = 32;
     /// Maximum length for `device_name` in the render config.
     pub(crate) const RENDER_DEVICE_NAME_MAX: usize = 24;
 
+    /// Field-size caps for the owned pre-fill defaults, matching the canonical
+    /// field lengths validated by `parse_form`.
+    pub(crate) const RENDER_WIFI_SSID_MAX: usize = 32;
+    pub(crate) const RENDER_MQTT_HOST_MAX: usize = 64;
+    pub(crate) const RENDER_MQTT_PORT_MAX: usize = 5;
+    pub(crate) const RENDER_MQTT_USER_MAX: usize = 64;
+    pub(crate) const RENDER_MQTT_CLIENT_MAX: usize = 23;
+    pub(crate) const RENDER_OTA_URL_MAX: usize = 128;
+
+    /// Owned, `'static`-compatible copy of [`PortalDefaults`] carried by the
+    /// HTTP task.
+    ///
+    /// Non-secret by construction (mirrors [`PortalDefaults`]); used only as the
+    /// empty-store pre-fill fallback. The bare-metal tier serves only the
+    /// `WifiMqttDevice` profile, so LoRaWAN EUI defaults have no field here.
+    pub(crate) struct PortalDefaultsOwned {
+        pub wifi_ssid: HS<RENDER_WIFI_SSID_MAX>,
+        pub mqtt_host: HS<RENDER_MQTT_HOST_MAX>,
+        pub mqtt_port: HS<RENDER_MQTT_PORT_MAX>,
+        pub mqtt_user: HS<RENDER_MQTT_USER_MAX>,
+        pub mqtt_client: HS<RENDER_MQTT_CLIENT_MAX>,
+        pub ota_url: HS<RENDER_OTA_URL_MAX>,
+    }
+
+    impl PortalDefaultsOwned {
+        /// Copies the borrowed defaults into owned, capped `heapless` strings.
+        ///
+        /// Values exceeding a cap are silently truncated — an over-long default
+        /// is a build-time misconfiguration and a truncated pre-fill is
+        /// preferable to a runtime panic (same policy as `firmware_version`).
+        pub(crate) fn from_borrowed(d: &PortalDefaults<'_>) -> Self {
+            Self {
+                wifi_ssid: copy_capped(d.wifi_ssid),
+                mqtt_host: copy_capped(d.mqtt_host),
+                mqtt_port: copy_capped(d.mqtt_port),
+                mqtt_user: copy_capped(d.mqtt_user),
+                mqtt_client: copy_capped(d.mqtt_client),
+                ota_url: copy_capped(d.ota_url),
+            }
+        }
+    }
+
+    /// Copies `s` into a `heapless::String<N>`, truncating on a char boundary
+    /// if it exceeds `N` bytes.
+    fn copy_capped<const N: usize>(s: &str) -> HS<N> {
+        let mut out = HS::<N>::new();
+        let mut take = s.len().min(N);
+        while take > 0 && !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        let _ = out.push_str(&s[..take]);
+        out
+    }
+
     /// Owned, `'static`-compatible render configuration for the portal template.
     pub(crate) struct PortalRenderConfig {
         pub firmware_version: HS<RENDER_FW_VERSION_MAX>,
         pub device_name: HS<RENDER_DEVICE_NAME_MAX>,
         pub profile: SchemaProfile,
+        // Only read by the embassy+chip-gated `load_prefill`; on host/test
+        // builds (no chip feature) nothing consumes it, so allow dead_code there.
+        #[cfg_attr(
+            not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+            allow(dead_code)
+        )]
+        pub defaults: PortalDefaultsOwned,
     }
 }
 

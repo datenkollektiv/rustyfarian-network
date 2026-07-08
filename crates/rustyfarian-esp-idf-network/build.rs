@@ -6,6 +6,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LORAWAN_DEV_EUI");
     println!("cargo:rerun-if-env-changed=LORAWAN_APP_EUI");
     println!("cargo:rerun-if-env-changed=LORAWAN_APP_KEY");
+    // Rerun triggers for the non-secret portal pre-fill defaults read via
+    // `option_env!` in the provisioning examples (see `.env.example`).
+    println!("cargo:rerun-if-env-changed=MQTT_HOST");
+    println!("cargo:rerun-if-env-changed=MQTT_PORT");
+    println!("cargo:rerun-if-env-changed=MQTT_USER");
+    println!("cargo:rerun-if-env-changed=MQTT_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=OTA_URL");
     // Rerun trigger for sdkconfig (ESP-IDF config changes require a rebuild).
     // `sdkconfig.defaults` lives at the workspace root, not this crate's root;
     // `rerun-if-changed` paths are relative to the crate dir, so reach up two
