@@ -48,5 +48,5 @@ pub use session::{
 
 pub use juggler::provisioning::{
     derive_softap_ssid, resolve_softap_ssid, Field, FieldError, LoraFields, MqttFields,
-    ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
+    PortalDefaults, ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
 };

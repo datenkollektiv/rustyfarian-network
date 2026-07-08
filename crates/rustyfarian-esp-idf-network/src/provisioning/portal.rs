@@ -32,7 +32,9 @@ use esp_idf_svc::http::Method;
 
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
 use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, WIFI_MQTT_PORTAL_HTML};
-use juggler::provisioning::{parse_form, Field, FieldErrors, ProvisioningInput, SchemaProfile};
+use juggler::provisioning::{
+    parse_form, Field, FieldErrors, PortalDefaults, ProvisioningInput, SchemaProfile,
+};
 
 use crate::provisioning::store::ProvisioningStore;
 use crate::provisioning::{ProvisioningEvent, SharedState};
@@ -91,6 +93,7 @@ pub(crate) fn start(
     firmware_version: Arc<String>,
     status_entries: Arc<Vec<(String, String)>>,
     profile: SchemaProfile,
+    defaults: Arc<PortalDefaultsOwned>,
 ) -> anyhow::Result<EspHttpServer<'static>> {
     let config = Configuration {
         http_port: HTTP_PORT,
@@ -105,8 +108,9 @@ pub(crate) fn start(
         let state = state.clone();
         let store_for_load = store.clone();
         let nonce = nonce.clone();
+        let defaults_for_load = defaults.clone();
         server.fn_handler("/", Method::Get, move |request| {
-            let prefill = load_prefill(&store_for_load, profile);
+            let prefill = load_prefill(&store_for_load, profile, &defaults_for_load);
             let html = render_form(profile, &nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
@@ -360,6 +364,61 @@ fn percent_decode_simple(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Owned, non-secret pre-fill defaults threaded from [`PortalConfig`].
+///
+/// Seeds the form on a fresh / factory-reset device (empty store). Non-secret
+/// by construction (mirrors [`PortalDefaults`]); carries no password or AppKey.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PortalDefaultsOwned {
+    pub wifi_ssid: String,
+    pub dev_eui: String,
+    pub join_eui: String,
+    pub mqtt_host: String,
+    pub mqtt_port: String,
+    pub mqtt_user: String,
+    pub mqtt_client: String,
+    pub ota_url: String,
+}
+
+impl PortalDefaultsOwned {
+    /// Copies the borrowed defaults into owned `String`s.
+    ///
+    /// Values are passed through verbatim — **not validated or truncated here**.
+    /// Defaults are a best-effort convenience for the initial form render; an
+    /// over-long or malformed default surfaces as an ordinary per-field
+    /// validation error on `POST /save` (via `parse_form`), exactly as if it had
+    /// been typed. (The bare-metal tier caps its owned copies to fixed render
+    /// buffers because it has no heap; this `std` tier has no such constraint,
+    /// so it stores the full string.)
+    pub(crate) fn from_borrowed(d: &PortalDefaults<'_>) -> Self {
+        Self {
+            wifi_ssid: d.wifi_ssid.to_string(),
+            dev_eui: d.dev_eui.to_string(),
+            join_eui: d.join_eui.to_string(),
+            mqtt_host: d.mqtt_host.to_string(),
+            mqtt_port: d.mqtt_port.to_string(),
+            mqtt_user: d.mqtt_user.to_string(),
+            mqtt_client: d.mqtt_client.to_string(),
+            ota_url: d.ota_url.to_string(),
+        }
+    }
+}
+
+/// Recomposes an `mqtt://host:port` URI from separate host and port components
+/// (the inverse of the parse-time split).
+///
+/// Returns an empty string when either component is empty — a host-only or
+/// port-only value is not a usable broker URI (and would fail `parse_form`), so
+/// emitting a partial `mqtt://host:` would only mislead. Shared by the
+/// stored-config and `.env`-defaults prefill paths so the two cannot diverge
+/// (parity with the esp-hal `compose_mqtt_uri`).
+fn compose_mqtt_uri(host: &str, port: &str) -> String {
+    if host.is_empty() || port.is_empty() {
+        return String::new();
+    }
+    format!("mqtt://{host}:{port}")
+}
+
 /// Non-secret pre-fill values for the form.
 ///
 /// Carries the union of both profiles' non-secret inputs; only the active
@@ -394,10 +453,41 @@ impl Prefill {
             dev_name: String::new(),
         }
     }
+
+    /// Builds a pre-fill from caller-supplied non-secret defaults for `profile`.
+    ///
+    /// Used as the empty-store fallback (fresh / factory-reset device) so the
+    /// portal form comes up pre-populated. Only the active profile's fields are
+    /// filled; `mqtt_uri` is recomposed from the separate `mqtt_host` +
+    /// `mqtt_port` defaults (mirroring the stored-config path). No secret is
+    /// ever sourced — `PortalDefaultsOwned` carries none.
+    fn from_defaults(defaults: &PortalDefaultsOwned, profile: SchemaProfile) -> Self {
+        let mut prefill = Prefill::empty();
+        // Common to every profile.
+        prefill.wifi_ssid = defaults.wifi_ssid.clone();
+        prefill.ota_url = defaults.ota_url.clone();
+        match profile {
+            SchemaProfile::LorawanFieldDevice => {
+                prefill.dev_eui = defaults.dev_eui.clone();
+                prefill.join_eui = defaults.join_eui.clone();
+            }
+            SchemaProfile::WifiMqttDevice => {
+                prefill.mqtt_uri = compose_mqtt_uri(&defaults.mqtt_host, &defaults.mqtt_port);
+                prefill.mqtt_user = defaults.mqtt_user.clone();
+                prefill.mqtt_client = defaults.mqtt_client.clone();
+            }
+        }
+        prefill
+    }
 }
 
-/// Loads non-secret pre-fill values from NVS for `profile`, falling back to
-/// empty on any error or when unprovisioned.
+/// Loads non-secret pre-fill values from NVS for `profile`.
+///
+/// A stored configuration for the active profile takes precedence. Otherwise —
+/// when unprovisioned, when the stored profile doesn't match, or on a store /
+/// mutex error — falls back to the caller-supplied non-secret `defaults`
+/// (seeded from `.env` on a fresh / factory-reset device) so the form still
+/// comes up pre-populated.
 ///
 /// For the `WifiMqttDevice` profile the `mqtt_uri` field is recomposed from the
 /// stored `mqtt_host` + `mqtt_port` (the inverse of the parse-time split). The
@@ -406,12 +496,13 @@ impl Prefill {
 fn load_prefill(
     store: &Arc<std::sync::Mutex<ProvisioningStore>>,
     profile: SchemaProfile,
+    defaults: &PortalDefaultsOwned,
 ) -> Prefill {
     let guard = match store.lock() {
         Ok(g) => g,
         Err(_) => {
-            log::warn!("load_prefill: store mutex poisoned, rendering empty form");
-            return Prefill::empty();
+            log::warn!("load_prefill: store mutex poisoned, rendering defaults");
+            return Prefill::from_defaults(defaults, profile);
         }
     };
     match guard.load() {
@@ -426,18 +517,18 @@ fn load_prefill(
                 ota_url: cfg.ota_url,
                 dev_name: cfg.device_name,
             };
-            if profile == SchemaProfile::WifiMqttDevice && !cfg.mqtt_host.is_empty() {
-                prefill.mqtt_uri = format!("mqtt://{}:{}", cfg.mqtt_host, cfg.mqtt_port);
+            if profile == SchemaProfile::WifiMqttDevice {
+                prefill.mqtt_uri = compose_mqtt_uri(&cfg.mqtt_host, &cfg.mqtt_port.to_string());
             }
             prefill
         }
         // A stored record under the *other* profile must not pre-fill this
-        // form (its fields do not map); render empty.
-        Ok(Some(_)) => Prefill::empty(),
-        Ok(None) => Prefill::empty(),
+        // form (its fields do not map); fall back to the caller's defaults.
+        Ok(Some(_)) => Prefill::from_defaults(defaults, profile),
+        Ok(None) => Prefill::from_defaults(defaults, profile),
         Err(e) => {
-            log::debug!("load_prefill: store.load() failed, rendering empty form: {e:#}");
-            Prefill::empty()
+            log::debug!("load_prefill: store.load() failed, rendering defaults: {e:#}");
+            Prefill::from_defaults(defaults, profile)
         }
     }
 }
@@ -674,6 +765,74 @@ mod tests {
             &[],
         );
         assert!(json.contains("\"profile\":\"wifi_mqtt\""));
+    }
+
+    #[test]
+    fn from_defaults_populates_active_profile_only() {
+        // Wi-Fi+MQTT: mqtt_uri recomposed from host+port; EUIs stay empty.
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
+            wifi_ssid: "HomeNet",
+            dev_eui: "0102030405060708",
+            join_eui: "70B3D57ED0000000",
+            mqtt_host: "broker.local",
+            mqtt_port: "1883",
+            mqtt_user: "sensor",
+            mqtt_client: "c3-01",
+            ota_url: "http://ota.local/fw.bin",
+        });
+
+        let wifi = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        assert_eq!(wifi.wifi_ssid, "HomeNet");
+        assert_eq!(wifi.mqtt_uri, "mqtt://broker.local:1883");
+        assert_eq!(wifi.mqtt_user, "sensor");
+        assert_eq!(wifi.mqtt_client, "c3-01");
+        assert_eq!(wifi.ota_url, "http://ota.local/fw.bin");
+        assert!(
+            wifi.dev_eui.is_empty(),
+            "EUIs must not fill the Wi-Fi+MQTT form"
+        );
+        assert!(wifi.join_eui.is_empty());
+
+        // LoRaWAN: EUIs fill; MQTT stays empty.
+        let lora = Prefill::from_defaults(&owned, SchemaProfile::LorawanFieldDevice);
+        assert_eq!(lora.wifi_ssid, "HomeNet");
+        assert_eq!(lora.dev_eui, "0102030405060708");
+        assert_eq!(lora.join_eui, "70B3D57ED0000000");
+        assert!(
+            lora.mqtt_uri.is_empty(),
+            "MQTT must not fill the LoRaWAN form"
+        );
+        assert!(lora.mqtt_user.is_empty());
+    }
+
+    #[test]
+    fn from_defaults_empty_yields_empty_prefill() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        assert!(p.wifi_ssid.is_empty());
+        assert!(p.mqtt_uri.is_empty());
+        assert!(p.ota_url.is_empty());
+    }
+
+    #[test]
+    fn from_defaults_partial_mqtt_uri_omitted() {
+        // Host without port (or vice versa) is not a usable broker URI.
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
+            mqtt_host: "broker.local",
+            ..PortalDefaults::default()
+        });
+        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        assert!(p.mqtt_uri.is_empty());
+    }
+
+    #[test]
+    fn compose_mqtt_uri_requires_both_host_and_port() {
+        assert_eq!(
+            compose_mqtt_uri("broker.local", "1883"),
+            "mqtt://broker.local:1883"
+        );
+        assert_eq!(compose_mqtt_uri("broker.local", ""), "");
+        assert_eq!(compose_mqtt_uri("", "1883"), "");
     }
 
     #[test]

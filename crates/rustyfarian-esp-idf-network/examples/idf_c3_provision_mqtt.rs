@@ -55,8 +55,8 @@ use std::time::Duration;
 use anyhow::Context;
 
 use rustyfarian_esp_idf_network::provisioning::{
-    run_wifi_mqtt_portal, BootConfig, PortalConfig, PortalOutcome, ProvisioningEvent,
-    ProvisioningStore, SchemaProfile, WifiMqttBoot, WifiMqttLoadOutcome,
+    run_wifi_mqtt_portal, BootConfig, PortalConfig, PortalDefaults, PortalOutcome,
+    ProvisioningEvent, ProvisioningStore, SchemaProfile, WifiMqttBoot, WifiMqttLoadOutcome,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -117,6 +117,19 @@ fn main() -> anyhow::Result<()> {
             // so the factory-reset arm can open the store for erasure.
             let nvs_for_erase = nvs.clone();
 
+            // Non-secret defaults seed the portal form on a fresh /
+            // factory-reset device (values from `.env`, see `.env.example`).
+            // Secrets (`WIFI_PASS`, `MQTT_PASS`) are never pre-filled.
+            let defaults = PortalDefaults {
+                wifi_ssid: option_env!("WIFI_SSID").unwrap_or(""),
+                mqtt_host: option_env!("MQTT_HOST").unwrap_or(""),
+                mqtt_port: option_env!("MQTT_PORT").unwrap_or(""),
+                mqtt_user: option_env!("MQTT_USER").unwrap_or(""),
+                mqtt_client: option_env!("MQTT_CLIENT_ID").unwrap_or(""),
+                ota_url: option_env!("OTA_URL").unwrap_or(""),
+                ..PortalDefaults::default()
+            };
+
             let boot_config = BootConfig {
                 portal: PortalConfig {
                     ssid_prefix: "Rustyfarian",
@@ -126,6 +139,7 @@ fn main() -> anyhow::Result<()> {
                     device_name: "c3-mqtt-demo",
                     firmware_version: env!("CARGO_PKG_VERSION"),
                     profile: SchemaProfile::WifiMqttDevice,
+                    defaults,
                 },
                 portal_timeout: Some(Duration::from_secs(600)),
                 on_event: Some(Arc::new(|event: ProvisioningEvent| {

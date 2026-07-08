@@ -91,7 +91,7 @@ use juggler::provisioning::SchemaProfile;
     test,
     all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
 ))]
-use super::session::portal::PortalRenderConfig;
+use super::session::portal::{PortalDefaultsOwned, PortalRenderConfig};
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 use super::session::{PortalStore, ProvisioningEvent, ProvisioningOutcome, SharedState};
 
@@ -736,12 +736,66 @@ impl Prefill {
             dev_name: heapless::String::new(),
         }
     }
+
+    /// Builds a pre-fill from caller-supplied non-secret defaults.
+    ///
+    /// Used as the empty-store fallback (fresh / factory-reset device) so the
+    /// portal form comes up pre-populated. The bare-metal tier serves only the
+    /// `WifiMqttDevice` profile; `dev_name` is intentionally left empty so the
+    /// renderer falls back to `PortalRenderConfig.device_name`. No secret is
+    /// ever sourced — `PortalDefaultsOwned` carries none.
+    fn from_defaults(defaults: &PortalDefaultsOwned, profile: SchemaProfile) -> Self {
+        let mut prefill = Prefill::empty();
+        // Common to every profile.
+        let _ = prefill.wifi_ssid.push_str(defaults.wifi_ssid.as_str());
+        let _ = prefill.ota_url.push_str(defaults.ota_url.as_str());
+        // Profile-specific MQTT fields (no-ops for other profiles' templates).
+        if profile == SchemaProfile::WifiMqttDevice {
+            prefill.mqtt_uri = compose_mqtt_uri(&defaults.mqtt_host, &defaults.mqtt_port);
+            let _ = prefill.mqtt_user.push_str(defaults.mqtt_user.as_str());
+            let _ = prefill.mqtt_client.push_str(defaults.mqtt_client.as_str());
+        }
+        prefill
+    }
 }
 
-/// Loads non-secret pre-fill values from the store, falling back to empty on
-/// any error, when unprovisioned, or when the stored profile doesn't match.
+/// Recomposes an `mqtt://host:port` URI from separate host and port strings,
+/// capped at the `Prefill.mqtt_uri` field width.
+///
+/// Returns an empty string when either component is empty — a host-only or
+/// port-only value is not a usable broker URI (and would fail `parse_form`),
+/// so pre-filling a partial URI would only mislead.
+#[cfg(any(
+    test,
+    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+))]
+fn compose_mqtt_uri(host: &str, port: &str) -> heapless::String<74> {
+    let mut uri = heapless::String::<74>::new();
+    if host.is_empty() || port.is_empty() {
+        return uri;
+    }
+    let _ = uri.push_str("mqtt://");
+    let host_take = host.len().min(64);
+    let _ = uri.push_str(&host[..host_take]);
+    let _ = uri.push(':');
+    let port_take = port.len().min(5);
+    let _ = uri.push_str(&port[..port_take]);
+    uri
+}
+
+/// Loads non-secret pre-fill values for the portal form.
+///
+/// A stored configuration for the active profile takes precedence. Otherwise —
+/// when unprovisioned, when the stored profile doesn't match, or on a store
+/// error — falls back to the caller-supplied non-secret `defaults` (seeded from
+/// `.env` on a fresh / factory-reset device) so the form still comes up
+/// pre-populated. Secrets are never sourced from either path.
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
-fn load_prefill(store: &dyn PortalStore, profile: SchemaProfile) -> Prefill {
+fn load_prefill(
+    store: &dyn PortalStore,
+    profile: SchemaProfile,
+    defaults: &PortalDefaultsOwned,
+) -> Prefill {
     match store.load() {
         Ok(Some(cfg)) if cfg.profile() == profile => {
             let mut prefill = Prefill::empty();
@@ -757,34 +811,10 @@ fn load_prefill(store: &dyn PortalStore, profile: SchemaProfile) -> Prefill {
                 .dev_name
                 .push_str(&cfg.device_name()[..cfg.device_name().len().min(24)]);
             if let Some(mqtt) = cfg.mqtt() {
-                // Recompose mqtt_uri from host + port.
-                if !mqtt.host().is_empty() {
-                    // Build mqtt://host:port — capped at 74 chars.
-                    let mut uri = heapless::String::<74>::new();
-                    let _ = uri.push_str("mqtt://");
-                    let host_take = mqtt.host().len().min(64);
-                    let _ = uri.push_str(&mqtt.host()[..host_take]);
-                    let _ = uri.push(':');
-                    // Format port decimal.
-                    let port = mqtt.port();
-                    let mut tmp = [0u8; 5];
-                    let mut tlen = 0;
-                    let mut p = port;
-                    if p == 0 {
-                        tmp[0] = b'0';
-                        tlen = 1;
-                    } else {
-                        while p > 0 {
-                            tmp[tlen] = b'0' + (p % 10) as u8;
-                            p /= 10;
-                            tlen += 1;
-                        }
-                    }
-                    for i in (0..tlen).rev() {
-                        let _ = uri.push(tmp[i] as char);
-                    }
-                    prefill.mqtt_uri = uri;
-                }
+                // Recompose mqtt_uri from the stored host + port.
+                let mut port_str = heapless::String::<5>::new();
+                let _ = core::fmt::write(&mut port_str, format_args!("{}", mqtt.port()));
+                prefill.mqtt_uri = compose_mqtt_uri(mqtt.host(), &port_str);
                 if let Some(u) = mqtt.username() {
                     let _ = prefill.mqtt_user.push_str(&u[..u.len().min(64)]);
                 }
@@ -794,13 +824,13 @@ fn load_prefill(store: &dyn PortalStore, profile: SchemaProfile) -> Prefill {
             }
             prefill
         }
-        Ok(Some(_)) | Ok(None) => Prefill::empty(),
+        Ok(Some(_)) | Ok(None) => Prefill::from_defaults(defaults, profile),
         Err(e) => {
             log::debug!(
-                "load_prefill: store.load() failed ({:?}), rendering empty form",
+                "load_prefill: store.load() failed ({:?}), rendering defaults",
                 e
             );
-            Prefill::empty()
+            Prefill::from_defaults(defaults, profile)
         }
     }
 }
@@ -1068,7 +1098,7 @@ pub(crate) fn dispatch_request(
             }
 
             // ── GET / (and any other GET) → portal HTML ───────────────────
-            let prefill = load_prefill(store, config.profile);
+            let prefill = load_prefill(store, config.profile, &config.defaults);
             let nonce = shared.nonce.as_str();
 
             // Render the template into the back portion of resp_buf.
@@ -2550,6 +2580,67 @@ mod tests {
         );
     }
 
+    // ── Prefill::from_defaults (.env-seeded pre-fill) ─────────────────────────
+
+    /// `from_defaults` maps non-secret `.env` defaults into the Wi-Fi+MQTT
+    /// pre-fill, recomposing `mqtt://host:port` from the separate host/port
+    /// defaults. `dev_name` is left empty so the renderer falls back to
+    /// `PortalRenderConfig.device_name`.
+    #[test]
+    fn from_defaults_populates_wifi_mqtt_fields() {
+        use super::super::session::portal::PortalDefaultsOwned;
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
+
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
+            wifi_ssid: "HomeNet",
+            mqtt_host: "broker.local",
+            mqtt_port: "1883",
+            mqtt_user: "sensor",
+            mqtt_client: "c3-01",
+            ota_url: "http://ota.local/fw.bin",
+            ..PortalDefaults::default()
+        });
+
+        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        assert_eq!(prefill.wifi_ssid.as_str(), "HomeNet");
+        assert_eq!(prefill.mqtt_uri.as_str(), "mqtt://broker.local:1883");
+        assert_eq!(prefill.mqtt_user.as_str(), "sensor");
+        assert_eq!(prefill.mqtt_client.as_str(), "c3-01");
+        assert_eq!(prefill.ota_url.as_str(), "http://ota.local/fw.bin");
+        assert!(
+            prefill.dev_name.is_empty(),
+            "dev_name must stay empty so the renderer falls back to config.device_name"
+        );
+    }
+
+    /// Empty defaults yield an all-empty pre-fill — identical to the previous
+    /// `Prefill::empty()` behavior for an unconfigured device.
+    #[test]
+    fn from_defaults_empty_yields_empty_prefill() {
+        use super::super::session::portal::PortalDefaultsOwned;
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
+
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        assert!(prefill.wifi_ssid.is_empty());
+        assert!(prefill.mqtt_uri.is_empty());
+        assert!(prefill.mqtt_user.is_empty());
+        assert!(prefill.mqtt_client.is_empty());
+        assert!(prefill.ota_url.is_empty());
+    }
+
+    /// A host-only or port-only default is not a usable broker URI, so
+    /// `compose_mqtt_uri` returns empty rather than a partial `mqtt://host:`.
+    #[test]
+    fn compose_mqtt_uri_requires_both_host_and_port() {
+        assert_eq!(
+            compose_mqtt_uri("broker.local", "1883").as_str(),
+            "mqtt://broker.local:1883"
+        );
+        assert!(compose_mqtt_uri("broker.local", "").is_empty());
+        assert!(compose_mqtt_uri("", "1883").is_empty());
+    }
+
     // ── Fix 1: render overflow returns Err ───────────────────────────────────
 
     /// Regression lock for the render-buffer overflow fix: when `out_buf` is
@@ -2564,9 +2655,9 @@ mod tests {
     #[test]
     fn render_returns_err_when_out_buf_too_small_during_substitution() {
         use super::super::session::portal::{
-            PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
+            PortalDefaultsOwned, PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
         };
-        use juggler::provisioning::SchemaProfile;
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
 
         // Build a PortalRenderConfig with a short firmware version + device name.
         let mut fw_ver = heapless::String::<RENDER_FW_VERSION_MAX>::new();
@@ -2577,6 +2668,7 @@ mod tests {
             firmware_version: fw_ver,
             device_name: dev_name,
             profile: SchemaProfile::WifiMqttDevice,
+            defaults: PortalDefaultsOwned::from_borrowed(&PortalDefaults::default()),
         };
 
         // Build a Prefill whose wifi_ssid is at maximum capacity (32 chars).

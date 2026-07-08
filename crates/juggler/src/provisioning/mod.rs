@@ -19,6 +19,7 @@
 //! All public APIs are experimental.
 
 pub mod config;
+pub mod defaults;
 pub mod error;
 pub mod form;
 pub mod html_json_escape;
@@ -32,6 +33,7 @@ pub use config::{
     EXTRA_VALUE_MAX_LEN, MAX_FIELD_ERRORS, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN,
     OTA_URL_MAX_LEN,
 };
+pub use defaults::PortalDefaults;
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};

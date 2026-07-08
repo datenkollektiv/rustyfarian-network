@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use rustyfarian_esp_idf_network::provisioning::{
-    PortalConfig, ProvisioningBuilder, ProvisioningStore, SchemaProfile,
+    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningStore, SchemaProfile,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -93,6 +93,18 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Non-secret defaults seed the portal form on a fresh / factory-reset
+    // device (values from `.env`, see `.env.example`). The LoRaWAN AppKey is a
+    // secret and is never pre-filled — it must be typed on every submission.
+    // `join_eui` maps to the TTN AppEUI (`LORAWAN_APP_EUI`).
+    let defaults = PortalDefaults {
+        wifi_ssid: option_env!("WIFI_SSID").unwrap_or(""),
+        dev_eui: option_env!("LORAWAN_DEV_EUI").unwrap_or(""),
+        join_eui: option_env!("LORAWAN_APP_EUI").unwrap_or(""),
+        ota_url: option_env!("OTA_URL").unwrap_or(""),
+        ..PortalDefaults::default()
+    };
+
     let config = PortalConfig {
         ssid_prefix: "Rustyfarian",
         ssid_override: None,
@@ -101,6 +113,7 @@ fn main() -> anyhow::Result<()> {
         device_name: "c3-provision-demo",
         firmware_version: env!("CARGO_PKG_VERSION"),
         profile: SchemaProfile::LorawanFieldDevice,
+        defaults,
     };
 
     let session = ProvisioningBuilder::new(config)

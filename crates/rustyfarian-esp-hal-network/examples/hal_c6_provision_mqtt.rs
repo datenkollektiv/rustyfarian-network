@@ -57,8 +57,8 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
 use rustyfarian_esp_hal_network::provisioning::{
-    PortalConfig, ProvisioningBuilder, ProvisioningEvent, ProvisioningOutcome, ProvisioningStore,
-    SchemaProfile,
+    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningEvent, ProvisioningOutcome,
+    ProvisioningStore, SchemaProfile,
 };
 use rustyfarian_esp_hal_network::wifi::{ApConfig, ApConfigExt, WiFiManager};
 
@@ -233,6 +233,20 @@ async fn main(spawner: Spawner) {
     // In esp-hal 1.1.0, `Rng::new()` takes no peripheral argument.
     let rng = esp_hal::rng::Rng::new();
 
+    // Non-secret defaults seed the portal form on a fresh / factory-reset
+    // device so testing does not mean retyping every field. Values come from
+    // `.env` at build time (see `.env.example`). Secrets (`WIFI_PASS`,
+    // `MQTT_PASS`) are intentionally never pre-filled and must be typed.
+    let defaults = PortalDefaults {
+        wifi_ssid: option_env!("WIFI_SSID").unwrap_or(""),
+        mqtt_host: option_env!("MQTT_HOST").unwrap_or(""),
+        mqtt_port: option_env!("MQTT_PORT").unwrap_or(""),
+        mqtt_user: option_env!("MQTT_USER").unwrap_or(""),
+        mqtt_client: option_env!("MQTT_CLIENT_ID").unwrap_or(""),
+        ota_url: option_env!("OTA_URL").unwrap_or(""),
+        ..PortalDefaults::default()
+    };
+
     let portal_config = PortalConfig {
         ssid_prefix: PORTAL_SSID_PREFIX,
         ssid_override: None,
@@ -241,6 +255,7 @@ async fn main(spawner: Spawner) {
         device_name: DEVICE_NAME,
         firmware_version: FIRMWARE_VERSION,
         profile: SchemaProfile::WifiMqttDevice,
+        defaults,
     };
 
     let session = ProvisioningBuilder::new(portal_config)
