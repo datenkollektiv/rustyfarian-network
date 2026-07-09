@@ -53,3 +53,30 @@ jobs:
 
       - name: Test (all platform-independent unit tests)
         run: just test
+
+  check-sta-only:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup ESP-RS toolchain (RISC-V)
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          ldproxy: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup cargo config
+        run: cp .cargo/config.toml.dist .cargo/config.toml
+
+      - name: Setup just
+        uses: extractions/setup-just@v2
+
+      - name: Check STA-only (wifi feature with SoftAP disabled)
+        run: just check-sta-only

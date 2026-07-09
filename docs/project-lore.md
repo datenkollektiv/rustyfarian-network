@@ -100,6 +100,19 @@ Fix when introducing a `no_std` consumer of a workspace-inherited dep:
 3. Re-run `just verify`; the warning should be gone and the `no_std` consumer should compile against the actual `no_std` core (if it secretly used a `std`-gated item, this is where it surfaces as a compile error).
 Detection: any `cargo` invocation that emits the `default-features is ignored` warning means the workspace-deps relationship is broken — treat it like a `-D warnings` finding even though it does not fail the build.
 
+**`ESP_IDF_SDKCONFIG_DEFAULTS` must list ABSOLUTE paths; a relative list silently applies NEITHER the base defaults nor the overlay, so a sdkconfig-override check passes while testing the wrong config.**
+`embuild`/`esp-idf-sys` does not resolve a relative `ESP_IDF_SDKCONFIG_DEFAULTS` entry against the cargo workspace root the way the default (unset) resolution of `sdkconfig.defaults` does.
+With `ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.sta-only.defaults"` the generated `.../esp-idf-sys-*/out/sdkconfig` reverts to IDF defaults (e.g. `CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584` instead of the workspace's `32768`) — proof both files were dropped.
+This produced a false pass for the STA-only check: `--features wifi` "compiled with SoftAP disabled" while SoftAP was actually still `y`.
+Fix: build the list from absolute paths — the `check-sta-only` recipe uses `ESP_IDF_SDKCONFIG_DEFAULTS="{{justfile_directory()}}/sdkconfig.defaults;{{justfile_directory()}}/sdkconfig.sta-only.defaults"`.
+Verify a config override actually took by grepping `out/sdkconfig` for the target symbol (a disabled kconfig is written `# CONFIG_X is not set`, not `CONFIG_X=n`), not by trusting compile success.
+
+**`just clean-idf` does not force an `esp-idf-sys` reconfigure for `cargo check`, because it removes `release/build/esp-idf-sys-*` while `cargo check` builds under `debug/`.**
+Switching sdkconfig variants needs a full CMake reconfigured; the release-only `rm -rf` is a no-op for the debug profile, so a `cargo check` after `just clean-idf` reuses the stale (wrong-variant) esp-idf-sys and can silently test the previous config.
+Fix for variant-switching check recipes: clean the package outright with `cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}` (profile-agnostic) before and after, rather than `just clean-idf`.
+A dedicated per-variant `--target-dir` looks cleaner (no cleans, cached re-runs) but each one carries a full ~1-2 GB esp-idf build tree, so a second IDF target dir overflows the sized RAM disk (`/Volumes/RustBuilds`, 8 GB) — the clean-in-place approach is what actually fits.
+Context: all three points here were found while building the STA-only `just check-sta-only` gate (see `docs/features/wifi-softap-cfg-gate-v1.md`).
+
 ---
 
 ## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)

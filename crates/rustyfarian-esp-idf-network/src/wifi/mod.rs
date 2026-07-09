@@ -60,10 +60,11 @@ use anyhow::Context as _;
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, AuthMethod, BlockingWifi, ClientConfiguration, Configuration,
-    EspWifi, WifiEvent,
-};
+use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
+// Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
+// (where `SoftApManager` is cfg'd out) does not warn on unused imports.
+#[cfg(esp_idf_esp_wifi_softap_support)]
+use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod};
 use pennant::PulseEffect;
 use rgb::RGB8;
 
@@ -551,10 +552,16 @@ pub fn softap_mac() -> anyhow::Result<[u8; 6]> {
 /// [`TxPowerLevel::Low`] is suggested as an optional tweak for C3 Super Mini
 /// boards if AP association proves unreliable — this is a plausible mitigation,
 /// not a verified fix for the AP path.
+///
+/// Available only when the linked ESP-IDF is built with
+/// `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y` (the default); on a SoftAP-disabled
+/// sdkconfig this item is not compiled.
+#[cfg(esp_idf_esp_wifi_softap_support)]
 pub struct SoftApManager {
     wifi: EspWifi<'static>,
 }
 
+#[cfg(esp_idf_esp_wifi_softap_support)]
 impl SoftApManager {
     /// Starts a SoftAP from the given [`ApConfig`].
     ///
@@ -700,6 +707,11 @@ impl SoftApManager {
 /// AP netif's main DNS to the AP IP and enabling the DHCP-server DNS offer
 /// mirrors what the esp-hal DHCP path does in Option 6 of its hand-rolled
 /// OFFER/ACK messages.
+///
+/// Available only when the linked ESP-IDF is built with
+/// `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y` (the default); on a SoftAP-disabled
+/// sdkconfig this item is not compiled.
+#[cfg(esp_idf_esp_wifi_softap_support)]
 fn pin_ap_netif_ip(wifi: &EspWifi<'_>) -> anyhow::Result<()> {
     use core::ffi::c_void;
 

@@ -21,6 +21,9 @@ features = ["wifi", "mqtt", "lora", "espnow", "ota", "provisioning"]
 # (embuild::espidf::sysenv::output()); cargo-machete does not scan build.rs.
 ignored = ["embuild"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp_idf_esp_wifi_softap_support)'] }
+
 [lib]
 name = "rustyfarian_esp_idf_network"
 

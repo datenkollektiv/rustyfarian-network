@@ -57,20 +57,22 @@ compile_error!(
 - **The check build needs its own sdkconfig.** embuild resolves `sdkconfig.defaults` from the workspace root (see project lore), so the SoftAP-disabled variant must be selected via `ESP_IDF_SDKCONFIG_DEFAULTS` pointing at a dedicated defaults file, and the recipe must account for stale `esp-idf-sys` build artifacts between variant switches.
 - **Targets.** The check build uses `riscv32imac-esp-espidf` (the `just verify` target).
 
-## Open Questions
+## Resolved Questions
 
-- [ ] Does `espnow` (`init_with_radio`'s `Configuration::AccessPoint` path) compile with SoftAP disabled, or does it need the same gate / `compile_error!`?
-- [ ] Where do the SoftAP-disabled defaults file live (`sdkconfig.sta-only.defaults` at workspace root vs. a `ci/` subdirectory), given embuild's workspace-root resolution rule?
-- [ ] Does cfg-hiding `SoftApManager` (and `pin_ap_netif_ip`) on SoftAP-disabled builds count as a breaking API change? (These items only disappear for an sdkconfig that previously could not compile against this crate at all, so no build that currently succeeds loses API.) This determines whether the bump is patch (0.4.x) or minor (0.5.0).
+- `espnow` (`init_with_radio`'s `Configuration::AccessPoint` path) compiles with SoftAP disabled without additional gating. The only `ap_netif()` call sites in the workspace were the two in `SoftApManager`; `init_with_radio` uses `Configuration::AccessPoint` and `AccessPointConfiguration` (both ungated public types in `esp-idf-svc`) but never calls `ap_netif()`, so it needs no gate or `compile_error!`.
+- SoftAP-disabled defaults live at the workspace root as `sdkconfig.sta-only.defaults`, a single-line overlay (`CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n`) layered on top of `sdkconfig.defaults`. The overlay file location resolution is correct, but `ESP_IDF_SDKCONFIG_DEFAULTS` must use ABSOLUTE paths: embuild/esp-idf-sys does not resolve a relative overlay list against the workspace root. A relative list silently applies NEITHER file — the base `sdkconfig.defaults` and the overlay are both dropped, SoftAP stays enabled, and `--features wifi` compiles against a SoftAP-ENABLED IDF while appearing to test the disabled path (false pass). The `just check-sta-only` recipe therefore builds absolute paths from `{{justfile_directory()}}` to ensure the overlay is correctly staged.
+- API-breaking question: cfg-hiding `SoftApManager` and `pin_ap_netif_ip` does not break existing builds because these items only disappear for an sdkconfig that previously could not compile against this crate at all, so no currently-succeeding build loses API. This analysis supports a patch (0.4.x) bump, though the version decision is the maintainer's call.
 
 ## State
 
-- [ ] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Design approved
+- [x] Core implementation
+- [x] Tests passing — verified by `just check-sta-only` (SoftAP-disabled build) and unchanged SoftAP-enabled builds (`just check-wifi`, `just check-provisioning`). No host unit tests exist for compile-time cfg gating; verification is compile-success with both gate states.
+- [x] Documentation updated
 
 ## Acceptance criteria
+
+All criteria met; SoftAP-enabled default build is unchanged; STA-only capability verified by `just check-sta-only` build now running.
 
 1. `cargo check` equivalent via `just` for `--features wifi` succeeds against a sdkconfig with `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n` on `riscv32imac-esp-espidf`.
 2. The default (SoftAP-enabled) build of every feature combination is unchanged: `just verify` passes with no public-API diff.
@@ -84,3 +86,5 @@ compile_error!(
 ## Session Log
 
 - 2026-07-08 — Feature doc created from the beekeeper review-queue request after triage confirmed the regression is unaddressed (`wifi/mod.rs:645` and `:716` still call `ap_netif()` unguarded; no `esp_idf_esp_wifi_softap_support` cfg anywhere in the workspace). Chose the request's preferred option 1 (IDF cfg, no new Cargo feature); added the `provisioning` `compile_error!` and the espnow verification question, both discovered during triage.
+- 2026-07-08 — Implemented. `SoftApManager` + `pin_ap_netif_ip` gated `#[cfg(esp_idf_esp_wifi_softap_support)]` in `src/wifi/mod.rs` with rustdoc requirement statements. Provisioning module gated `#[all(feature = "provisioning", esp_idf_esp_wifi_softap_support)]` in `src/lib.rs` with targeted `compile_error!` for the disabled case. Added `[lints.rust]` check-cfg declaration in `Cargo.toml` for clean `cargo check` on SoftAP-disabled builds. Created `sdkconfig.sta-only.defaults` workspace-root overlay (`CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n`). Added `just check-sta-only` recipe: uses `cargo clean -p esp-idf-sys` before and after (not `just clean-idf`, which only removes release artifacts), passes ABSOLUTE overlay paths via `{{justfile_directory()}}` to ensure embuild correctly stages the overlay, and runs `cargo check` to verify compile. Verified `espnow` compiles SoftAP-disabled (uses ungated `Configuration::AccessPoint`, never calls `ap_netif()`). SoftAP-enabled default build unchanged; STA-only capability verified by the new check build. Hardware-in-the-loop validated on 2026-07-08: with SoftAP disabled the generated sdkconfig shows `# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set`, `--features wifi` compiles clean (zero warnings, after gating the now-unused `AccessPointConfiguration`/`AuthMethod` imports), and `--features provisioning` fails with exactly the single `compile_error!` (no E0432/E0599 cascade). SoftAP-enabled `just check-wifi`/`check-provisioning` unchanged. An initial relative-path version of the recipe was a false pass—caught and fixed during this validation.
+- 2026-07-09 — PR review round. Generalized the `provisioning` `compile_error!` text from "set CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y in sdkconfig.defaults" to "enable CONFIG_ESP_WIFI_SOFTAP_SUPPORT in the ESP-IDF sdkconfig used for this build" to avoid assuming downstream consumers use this repo's sdkconfig layout. Considered isolating `check-sta-only` in a dedicated `--target-dir` to avoid the before/after `cargo clean -p esp-idf-sys` (reviewer suggestion), but rejected: a second target dir incurs a full ~1–2 GB esp-idf build tree, overflowing the 8 GB RAM disk with `No space left on device`; re-validated the in-place clean recipe as the correct fit. Trimmed the CHANGELOG entry to a tighter user-facing summary, deferring the deep build-system rationale to this feature doc.

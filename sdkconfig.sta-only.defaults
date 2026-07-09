@@ -1,0 +1,6 @@
+# sdkconfig.sta-only.defaults — SoftAP-disabled overlay for the STA-only check build.
+#
+# Layered on top of sdkconfig.defaults via ESP_IDF_SDKCONFIG_DEFAULTS by the
+# `just check-sta-only` recipe. Proves `--features wifi` compiles for consumers
+# that disable SoftAP to reclaim flash/RAM. See docs/features/wifi-softap-cfg-gate-v1.md.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n

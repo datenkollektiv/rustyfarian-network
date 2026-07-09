@@ -18,6 +18,7 @@ fn main() {
     // `rerun-if-changed` paths are relative to the crate dir, so reach up two
     // levels (crates/rustyfarian-esp-idf-network/ -> workspace root).
     println!("cargo:rerun-if-changed=../../sdkconfig.defaults");
+    println!("cargo:rerun-if-changed=../../sdkconfig.sta-only.defaults");
     // Required for ESP-IDF ldproxy linker argument injection.
     embuild::espidf::sysenv::output();
 }
