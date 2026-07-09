@@ -113,6 +113,12 @@ Fix for variant-switching check recipes: clean the package outright with `cargo 
 A dedicated per-variant `--target-dir` looks cleaner (no cleans, cached re-runs) but each one carries a full ~1-2 GB esp-idf build tree, so a second IDF target dir overflows the sized RAM disk (`/Volumes/RustBuilds`, 8 GB) — the clean-in-place approach is what actually fits.
 Context: all three points here were found while building the STA-only `just check-sta-only` gate (see `docs/features/wifi-softap-cfg-gate-v1.md`).
 
+**A doctest in a `#[cfg(any(feature = "X", test))]`-gated module is silently NOT collected under `cargo test --no-default-features` — rustdoc does not set `cfg(test)`, so the module is invisible to the doc build.**
+Symptom: `Doc-tests <crate> … running 0 tests` even though you just added a `///`/`//!` example to that module, so a doctest "regression guard" never actually runs.
+Several tier modules are gated `#[cfg(any(feature = "<domain>", test))]` so their host-compilable parts run under `just test-<domain>-hal` (`cargo test --no-default-features`, which sets `cfg(test)`); the unit-test build sees the module but the separate rustdoc pass does not.
+Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test] fn … }` (present under `cfg(test)`), not a doctest — see the `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs` and `docs/features/ota-domain-reexport-parity-v1.md`.
+(A bare `pub use` also does not catch an *omitted* re-export: the tier crate still compiles; only a consumer-style `use` of the missing name fails, which is what the guard test provides.)
+
 ---
 
 ## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)
@@ -302,7 +308,7 @@ Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = G
 On ESP32-S3 (ESP-IDF v5.3.3) a null TX buffer collapses the effective TX length to zero at the hardware level, so the C driver's `rxlength <= txlength` full-duplex check fails — even though at the Rust level `rxlength == length`.
 Half-duplex mode is NOT a fix: `SOC_SPI_HD_BOTH_INOUT_SUPPORTED` is undefined on ESP32-S3, so half-duplex rejects the simultaneous-TX+RX `TransferInPlace` calls `sx126x` uses for `get_status` and friends.
 Fix: wrap the `SpiDeviceDriver` in a `FullDuplexDevice` adapter that rewrites each `Operation::Read(buf)` into `Operation::Transfer(buf, &zeroes[..buf.len()])` (the SX1262 ignores MOSI during read phases, so zeroed TX is harmless) — see `FullDuplexDevice` in `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`.
-The zero scratch buffer must be sized to the actual read length (allocated per transaction), not a fixed cap: `read_buffer` can read a full 255-byte downlink payload, and a short TX slice re-triggers the same error.
+The zero-scratch buffer must be sized to the actual read length (allocated per transaction), not a fixed cap: `read_buffer` can read a full 255-byte downlink payload, and a short TX slice re-triggers the same error.
 The bare-metal `hal_esp32s3_join` example never hit this because it hand-issues `Operation::Transfer(&mut rx, &tx)` with equal-length buffers.
 
 **`FullDuplexDevice::transaction` must not allocate unconditionally — `sx126x::reset()` calls it inside `critical_section::with`.**
