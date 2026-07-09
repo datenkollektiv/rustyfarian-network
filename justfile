@@ -93,6 +93,21 @@ check-provisioning:
 check-espnow:
     cargo check -p rustyfarian-esp-idf-network --features espnow --target-dir {{ idf_dir }}
 
+# check that --features wifi still compiles with SoftAP disabled (STA-only consumers).
+# Fully cleans esp-idf-sys before AND after: switching sdkconfig variants forces a
+# CMake reconfigure, and we must not leave a SoftAP-disabled cache for later builds.
+# `cargo check` uses the debug profile, so `clean-idf` (which only rm's release/) is
+# NOT enough here — clean the esp-idf-sys package outright instead. (A dedicated
+# target dir was considered but doubles the ~1-2 GB IDF tree and overflows the RAM disk.)
+# ESP_IDF_SDKCONFIG_DEFAULTS paths MUST be absolute: embuild does not resolve the
+# relative overlay list against the workspace root, so a relative list silently
+# applies neither file (base defaults AND overlay dropped → SoftAP stays on → false pass).
+check-sta-only:
+    cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}
+    ESP_IDF_SDKCONFIG_DEFAULTS="{{ justfile_directory() }}/sdkconfig.defaults;{{ justfile_directory() }}/sdkconfig.sta-only.defaults" \
+        cargo check -p rustyfarian-esp-idf-network --features wifi --target-dir {{ idf_dir }}
+    cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}
+
 # check the ESP-IDF network crate with all features enabled together
 check-idf-all:
     cargo check -p rustyfarian-esp-idf-network --all-features --target-dir {{ idf_dir }}

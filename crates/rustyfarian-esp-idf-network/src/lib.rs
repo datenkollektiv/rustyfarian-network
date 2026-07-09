@@ -77,5 +77,13 @@ pub mod espnow;
 pub mod ota;
 
 /// SoftAP captive-portal provisioning driver.
-#[cfg(feature = "provisioning")]
+#[cfg(all(feature = "provisioning", esp_idf_esp_wifi_softap_support))]
 pub mod provisioning;
+
+// The captive-portal `provisioning` feature drives `SoftApManager`, which is
+// only compiled when the linked ESP-IDF has SoftAP support. Emit one clear
+// error naming the fix instead of a wall of unresolved-import errors.
+#[cfg(all(feature = "provisioning", not(esp_idf_esp_wifi_softap_support)))]
+compile_error!(
+    "the `provisioning` feature requires SoftAP support; enable CONFIG_ESP_WIFI_SOFTAP_SUPPORT in the ESP-IDF sdkconfig used for this build (see docs/features/wifi-softap-cfg-gate-v1.md)"
+);
