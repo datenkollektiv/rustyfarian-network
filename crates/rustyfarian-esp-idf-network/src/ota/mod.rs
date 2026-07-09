@@ -12,18 +12,42 @@
 //! session.fetch_and_apply("http://192.168.1.1/firmware.bin", &expected_sha256).unwrap();
 //! esp_idf_svc::hal::reset::restart();
 //! ```
+//!
+//! # Firmware metadata (re-exported)
+//!
+//! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], and the
+//! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]) are re-exported from
+//! `juggler::ota` here — matching the `wifi`/`espnow` domains — so a
+//! version-gated updater needs only this crate, with no separate `juggler`
+//! dependency to parse a sidecar digest + version:
+//!
+//! ```
+//! use rustyfarian_esp_idf_network::ota::{ImageMetadata, Version};
+//!
+//! let meta = ImageMetadata::parse(
+//!     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+//!     "1.4.0",
+//! )
+//! .unwrap();
+//! assert_eq!(meta.version, Version::new(1, 4, 0));
+//! ```
 
 mod downloader;
 mod flasher;
 
-pub use juggler::ota::OtaError;
+// Re-export the full public surface of `juggler::ota` for domain parity with the
+// `wifi`/`espnow` modules, so OTA consumers import metadata/version types from
+// this crate rather than adding a redundant direct `juggler` dependency.
+// `StreamingVerifier` is also used internally below (via this same import).
+pub use juggler::ota::{
+    bytes_to_hex, hex_to_bytes, ImageMetadata, OtaError, OtaState, StreamingVerifier, Version,
+};
 
 use std::io::Write;
 use std::time::Duration;
 
 use downloader::FirmwareDownloader;
 use flasher::{FirmwareFlasher, OtaWriter};
-use juggler::ota::StreamingVerifier;
 
 use esp_idf_svc::ota::EspOta;
 
