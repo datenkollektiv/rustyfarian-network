@@ -33,10 +33,7 @@ June 2026 also landed the bare-metal `rustyfarian-esp-hal-provisioning` crate wi
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Finish hal_c3_connect_async hardware validation — AP reconnect loop + heap headroom (feature-doc)
-              : WifiMqttDevice boot helper (feature-doc)
-              : SoftAP SSID override (feature-doc)
-              : MQTT acknowledged publish (publish_acked) — blocks on QoS 1 PUBACK for OTA contract v0 rollback-evidence gate (feature-doc)
+    Ready     : esp-hal SoftAP bring-up for ssid_override parity with esp-idf — start takes AP peripherals, resolves SSID via shared resolver against real AP MAC, broadcasts either verbatim override or prefix-plus-MAC default, completes hal half of ssid-override (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line
