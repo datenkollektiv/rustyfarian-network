@@ -53,7 +53,7 @@ When in doubt, label or describe your change as:
 ## 🧪 Testing
 
 If your change affects behavior:
-- Pure logic in `rustyfarian-network-pure` can be tested on the host with `cargo test`
+- Pure logic in `juggler` can be tested on the host with `cargo test`
 - Changes to the ESP-IDF crates require an ESP32 board; mention what you tested (or couldn't test) in the PR description
 
 If your change is cleanup-only:

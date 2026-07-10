@@ -336,7 +336,7 @@ mod driver {
             // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
             //
             // Default to Low (8.5 dBm) if the caller left tx_power at Medium (the
-            // wifi_pure default). Medium (~13 dBm) still causes auth failures on
+            // juggler::wifi default). Medium (~13 dBm) still causes auth failures on
             // PCB-antenna boards; Low is the safe baseline for bare-metal.
             let quarter_dbm = if config.tx_power == TxPowerLevel::default() {
                 TxPowerLevel::Low.to_quarter_dbm()

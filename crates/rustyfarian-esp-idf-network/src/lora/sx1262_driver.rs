@@ -1082,7 +1082,7 @@ where
     }
 }
 
-/// Map `lora-modulation` types (used by lorawan-device) to `lora_pure` types.
+/// Map `lora-modulation` types (used by lorawan-device) to `juggler::lora` types.
 ///
 /// Returns `Err(LoraError::InvalidRfConfig)` for any unrecognised parameter value.
 fn map_rf_config(

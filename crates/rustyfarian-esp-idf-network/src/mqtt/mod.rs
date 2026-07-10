@@ -671,7 +671,7 @@ where
 /// Newtype wrapper around `EspMqttClient<'static>`.
 ///
 /// Exists solely to satisfy the orphan rule: `SubscribeClient` is defined in
-/// `rustyfarian-network-pure` and `EspMqttClient` is defined in `esp-idf-svc`,
+/// `juggler` and `EspMqttClient` is defined in `esp-idf-svc`,
 /// so neither crate can implement the trait for the other.  Wrapping the client
 /// in a local type makes the `impl` legal without changing runtime behaviour.
 /// `Deref`/`DerefMut` forward all other method calls transparently.

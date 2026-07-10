@@ -4,7 +4,7 @@ Foundation work to prepare `rustyfarian-esp-hal-wifi` for async integration.
 Adds an opt-in `embassy` Cargo feature that pulls in the embassy ecosystem crates without changing any existing behavior.
 This is a prerequisite for `wifi-manager-async-v1` and `hal-c3-connect-async-example-v1`.
 
-Source: `docs/embassy-integration-research.md` (2026-03-20), Option B "blocking + async companion" recommendation.
+Source: `docs/archive/embassy-integration-research.md` (2026-03-20), Option B "blocking + async companion" recommendation.
 
 > **Scope note:** This document covers only the dependency / feature wiring.
 > The async API (`WiFiManager::init_async`, `AsyncWifiHandle`, `wait_for_ip`)
@@ -62,5 +62,5 @@ Source: `docs/embassy-integration-research.md` (2026-03-20), Option B "blocking 
 
 ## Session Log
 
-- 2026-04-08 — Feature doc created from `docs/embassy-integration-research.md`
+- 2026-04-08 — Feature doc created from `docs/archive/embassy-integration-research.md`
 - 2026-04-08 — Implemented: workspace deps added, `embassy` feature block added to `rustyfarian-esp-hal-wifi`, `check-wifi-hal-embassy` just recipe added (uses `-Zbuild-std=core,alloc` for RISC-V bare-metal targets), CHANGELOG updated. `just fmt`, `just verify`, and the new recipe all pass clean on ESP32-C6 and ESP32-C3.
