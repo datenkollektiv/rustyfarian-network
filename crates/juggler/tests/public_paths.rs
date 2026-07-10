@@ -168,8 +168,22 @@ fn mqtt_public_paths() {
 #[cfg(feature = "std")]
 #[test]
 fn mqtt_std_public_paths() {
-    use juggler::mqtt::{format_broker_url, spawn_subscriber_thread, QoS, SubscribeClient};
+    use juggler::mqtt::{
+        format_broker_url, spawn_subscriber_thread, AckOutcome, MessageId, PendingAcks, QoS,
+        SubscribeClient,
+    };
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    // Acknowledged-publish correlation surface is reachable and usable.
+    let _: MessageId = 1;
+    let acks = PendingAcks::new();
+    let waiter = acks.register(1);
+    acks.resolve(1, AckOutcome::Acked);
+    assert_eq!(
+        waiter.wait(Duration::from_millis(50)),
+        Some(AckOutcome::Acked)
+    );
 
     // QoS enum is reachable.
     let _: QoS = QoS::AtLeastOnce;

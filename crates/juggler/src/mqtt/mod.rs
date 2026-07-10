@@ -366,6 +366,215 @@ pub fn spawn_subscriber_thread<C>(
     }
 }
 
+// ── Acknowledged-publish correlation ───────────────────────────────────────
+
+/// Message identifier assigned by the MQTT client to an outgoing publish.
+///
+/// This is the same `u32` id space that `esp-idf-svc`'s `EspMqttClient::enqueue`
+/// returns and that `EventPayload::Published` echoes when the broker's PUBACK
+/// arrives — the two carry the identical `msg_id`, which is what makes the
+/// correlation in [`PendingAcks`] sound. Kept as a plain alias so the pure tier
+/// stays free of any ESP-IDF type.
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+pub type MessageId = u32;
+
+/// Terminal outcome of an in-flight acknowledged (QoS 1) publish.
+///
+/// A timeout is *not* an outcome here — it is the absence of one, reported as
+/// `None` from [`AckWaiter::wait`].
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The broker acknowledged the publish (PUBACK received).
+    Acked,
+    /// The MQTT session dropped before the acknowledgment arrived.
+    Disconnected,
+}
+
+/// Per-message rendezvous: the outcome slot plus the condvar the publisher parks on.
+#[cfg(feature = "std")]
+type AckSlot = std::sync::Arc<(std::sync::Mutex<Option<AckOutcome>>, std::sync::Condvar)>;
+
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct PendingInner {
+    /// Publishers currently blocked waiting for their PUBACK.
+    waiters: std::collections::HashMap<MessageId, AckSlot>,
+    /// Outcomes that arrived before their waiter registered (see
+    /// [`PendingAcks::resolve`]). Drained by [`PendingAcks::register`]; bounded
+    /// by the number of un-awaited in-flight ids.
+    early: std::collections::HashMap<MessageId, AckOutcome>,
+}
+
+/// Registry correlating in-flight QoS 1 publishes to their PUBACK.
+///
+/// A publisher [`register`](PendingAcks::register)s the [`MessageId`] its enqueue
+/// call returned and receives an [`AckWaiter`] to block on; the event-loop thread
+/// calls [`resolve`](PendingAcks::resolve) when a `Published` event arrives, or
+/// [`fail_all`](PendingAcks::fail_all) when the session drops. The two threads
+/// meet on a per-message condvar, mirroring the `AckStatus` pattern `espnow` uses
+/// for ESP-NOW send confirmation.
+///
+/// Cloning shares the same underlying map (an `Arc` handle), so the publish
+/// handle and the event loop observe the same registry. This type is pure: it
+/// performs no I/O and knows nothing about ESP-IDF, so it is fully host-testable.
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+#[derive(Clone, Default)]
+pub struct PendingAcks {
+    inner: std::sync::Arc<std::sync::Mutex<PendingInner>>,
+}
+
+#[cfg(feature = "std")]
+impl PendingAcks {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers interest in the PUBACK for `id` and returns a waiter to block on.
+    ///
+    /// If the outcome already arrived — a `Published` or disconnect that raced
+    /// ahead of this call (see [`resolve`](Self::resolve)) — the returned waiter
+    /// is pre-resolved and [`wait`](AckWaiter::wait) returns immediately.
+    pub fn register(&self, id: MessageId) -> AckWaiter {
+        let mut inner = self.lock();
+        let slot: AckSlot = if let Some(outcome) = inner.early.remove(&id) {
+            std::sync::Arc::new((
+                std::sync::Mutex::new(Some(outcome)),
+                std::sync::Condvar::new(),
+            ))
+        } else {
+            let slot: AckSlot =
+                std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+            inner.waiters.insert(id, std::sync::Arc::clone(&slot));
+            slot
+        };
+        drop(inner);
+        AckWaiter {
+            id,
+            slot,
+            registry: self.clone(),
+        }
+    }
+
+    /// Records the terminal `outcome` for `id`, waking any waiter.
+    ///
+    /// If no waiter has registered yet, the outcome is buffered so the next
+    /// [`register`](Self::register) for `id` resolves immediately. This closes
+    /// the window between a publisher's enqueue returning an id and its
+    /// `register` — a window that cannot occur in practice, since a PUBACK is a
+    /// network round-trip away while the `register` is the next instruction, but
+    /// the buffer makes the ordering correct by construction and testable.
+    pub fn resolve(&self, id: MessageId, outcome: AckOutcome) {
+        let mut inner = self.lock();
+        if let Some(slot) = inner.waiters.remove(&id) {
+            drop(inner);
+            Self::fill(&slot, outcome);
+        } else {
+            inner.early.insert(id, outcome);
+        }
+    }
+
+    /// Fails every outstanding waiter with `outcome` (used on `Disconnected`).
+    ///
+    /// Also clears the early-outcome buffer, whose entries are stale once the
+    /// session has dropped.
+    pub fn fail_all(&self, outcome: AckOutcome) {
+        let mut inner = self.lock();
+        inner.early.clear();
+        let slots: Vec<AckSlot> = inner.waiters.drain().map(|(_, slot)| slot).collect();
+        drop(inner);
+        for slot in slots {
+            Self::fill(&slot, outcome);
+        }
+    }
+
+    /// Removes a waiter without resolving it (cleanup on timeout / drop).
+    fn cancel(&self, id: MessageId) {
+        let mut inner = self.lock();
+        inner.waiters.remove(&id);
+        inner.early.remove(&id);
+    }
+
+    /// Stores `outcome` in a slot and wakes the parked publisher.
+    fn fill(slot: &AckSlot, outcome: AckOutcome) {
+        let (lock, cvar) = &**slot;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        cvar.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Number of waiters currently registered (introspection for tests).
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.lock().waiters.len()
+    }
+}
+
+/// A handle a publisher blocks on until its PUBACK arrives or a timeout elapses.
+///
+/// Returned by [`PendingAcks::register`]. Completing [`wait`](Self::wait) removes
+/// the corresponding registry entry, so a timed-out publish never leaks a slot.
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+pub struct AckWaiter {
+    id: MessageId,
+    slot: AckSlot,
+    registry: PendingAcks,
+}
+
+#[cfg(feature = "std")]
+impl AckWaiter {
+    /// Blocks until the outcome is known or `timeout` elapses.
+    ///
+    /// Returns `Some(AckOutcome)` when the broker acknowledged
+    /// ([`Acked`](AckOutcome::Acked)) or the session dropped
+    /// ([`Disconnected`](AckOutcome::Disconnected)), or `None` on timeout. In
+    /// every case the registry entry for this message is removed before
+    /// returning, so a late resolution after a timeout is harmlessly discarded.
+    pub fn wait(self, timeout: std::time::Duration) -> Option<AckOutcome> {
+        let (lock, cvar) = &*self.slot;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        while guard.is_none() {
+            match deadline {
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (g, _timed_out) = cvar
+                        .wait_timeout(guard, deadline - now)
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = g;
+                }
+                // `now + timeout` overflowed (an implausibly large timeout): park
+                // without a deadline until resolved.
+                None => {
+                    guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        let outcome = *guard;
+        drop(guard);
+        // On timeout the slot is still in `waiters`; drop it so it can neither
+        // leak nor be resolved into the void. On a resolved outcome
+        // `resolve`/`fail_all` already removed it, and this is a cheap no-op.
+        self.registry.cancel(self.id);
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "std")]
@@ -959,6 +1168,118 @@ mod tests {
         assert_eq!(
             subscribed.lock().unwrap().as_slice(),
             ["commands/#", "ota/manifest"]
+        );
+    }
+
+    // ── PendingAcks (acknowledged-publish correlation) ───────────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_resolve_before_wait_returns_immediately() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        let waiter = acks.register(7);
+        // Resolve on this thread before waiting: the slot is filled synchronously.
+        acks.resolve(7, AckOutcome::Acked);
+        assert_eq!(
+            waiter.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Acked)
+        );
+        assert_eq!(acks.waiter_count(), 0, "resolved waiter must be removed");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_early_resolution_survives_until_register() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        // Outcome arrives BEFORE any waiter registers — buffered, not dropped.
+        acks.resolve(42, AckOutcome::Acked);
+        let waiter = acks.register(42);
+        assert_eq!(
+            waiter.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Acked)
+        );
+        assert_eq!(acks.waiter_count(), 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_timeout_returns_none_and_cleans_up() {
+        use super::PendingAcks;
+        let acks = PendingAcks::new();
+        let waiter = acks.register(1);
+        assert_eq!(acks.waiter_count(), 1);
+        // Never resolved → times out.
+        assert_eq!(waiter.wait(Duration::from_millis(30)), None);
+        assert_eq!(
+            acks.waiter_count(),
+            0,
+            "a timed-out waiter must not leak a slot"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_cross_thread_wakeup() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        let waiter = acks.register(99);
+        let acks_bg = acks.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            acks_bg.resolve(99, AckOutcome::Acked);
+        });
+        // Generous timeout: the resolve fires well before it.
+        assert_eq!(waiter.wait(Duration::from_secs(2)), Some(AckOutcome::Acked));
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_fail_all_disconnects_every_waiter() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        let w1 = acks.register(1);
+        let w2 = acks.register(2);
+        assert_eq!(acks.waiter_count(), 2);
+        acks.fail_all(AckOutcome::Disconnected);
+        assert_eq!(
+            w1.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Disconnected)
+        );
+        assert_eq!(
+            w2.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Disconnected)
+        );
+        assert_eq!(acks.waiter_count(), 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_fail_all_clears_stale_early_buffer() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        // An early outcome buffered before a session drop is stale afterwards.
+        acks.resolve(5, AckOutcome::Acked);
+        acks.fail_all(AckOutcome::Disconnected);
+        // A new publish reusing id 5 must not pick up the pre-drop outcome; with
+        // no fresh resolution it times out.
+        let waiter = acks.register(5);
+        assert_eq!(waiter.wait(Duration::from_millis(30)), None);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_clone_shares_one_registry() {
+        use super::{AckOutcome, PendingAcks};
+        let acks = PendingAcks::new();
+        let waiter = acks.register(3);
+        // Resolving through an independent clone must reach the original's waiter.
+        acks.clone().resolve(3, AckOutcome::Acked);
+        assert_eq!(
+            waiter.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Acked)
         );
     }
 }

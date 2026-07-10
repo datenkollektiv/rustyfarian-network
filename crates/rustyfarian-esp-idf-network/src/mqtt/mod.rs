@@ -38,6 +38,28 @@
 //! }
 //! ```
 //!
+//! ## Acknowledged publish
+//!
+//! When a caller must know that a specific message was durably received — e.g.
+//! clearing persistent state only after a status publish is confirmed — use
+//! [`MqttHandle::publish_acked`]. It publishes at QoS 1 and blocks until the
+//! broker's PUBACK arrives or a timeout elapses, returning a typed
+//! [`PublishAckError`] that separates retry-eligible broker-timing outcomes from
+//! local faults. It must **not** be called from an event-loop callback (it would
+//! deadlock the thread that delivers the PUBACK); such misuse returns
+//! [`PublishAckError::WrongThread`] rather than hanging.
+//!
+//! ```ignore
+//! use rustyfarian_esp_idf_network::mqtt::PublishAckError;
+//! use std::time::Duration;
+//!
+//! match handle.publish_acked("ota/status", b"rolled_back", true, Duration::from_secs(5)) {
+//!     Ok(()) => { /* PUBACK received — safe to clear rollback state */ }
+//!     Err(PublishAckError::Timeout | PublishAckError::Disconnected) => { /* keep state, retry */ }
+//!     Err(e) => log::error!("publish_acked failed: {}", e),
+//! }
+//! ```
+//!
 //! ## Battery-optimized configuration
 //!
 //! On thermally constrained boards (e.g. ESP32-C3 Super Mini) where MQTT is
@@ -66,7 +88,8 @@ pub use pennant::{SimpleLed, StatusLed};
 use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, next_state, spawn_subscriber_thread,
     validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
-    validate_subscribe_filter, MqttConnectionState, MqttEvent, QoS as PureQoS, SubscribeClient,
+    validate_subscribe_filter, AckOutcome, MqttConnectionState, MqttEvent, PendingAcks,
+    QoS as PureQoS, SubscribeClient,
 };
 
 /// Poll interval used while waiting for the MQTT broker connection to be confirmed.
@@ -152,6 +175,46 @@ impl std::fmt::Display for TryPublishError {
         }
     }
 }
+
+/// Error returned by [`MqttHandle::publish_acked`].
+///
+/// The variants separate **broker-timing outcomes** (retry-eligible) from
+/// **local/programming faults**, so a caller — e.g. the OTA rollback-evidence
+/// publish that must clear NVS only after a confirmed PUBACK — knows whether to
+/// keep its state and retry, or to treat the failure as a bug to fix.
+#[derive(Debug)]
+pub enum PublishAckError {
+    /// No PUBACK arrived within the timeout. A broker-timing outcome: the caller
+    /// should keep its state (e.g. leave NVS untouched) and retry later.
+    Timeout,
+    /// The MQTT session dropped before the PUBACK. Also broker-timing and
+    /// retry-eligible; never reported as a false `Ok`.
+    Disconnected,
+    /// Called from the MQTT event-loop thread — i.e. from inside an `on_connect`
+    /// or `on_message` callback — where blocking on the PUBACK would deadlock the
+    /// very thread that must deliver it. A programming error; fix the call site.
+    WrongThread,
+    /// A local, non-broker failure: topic validation rejected the publish, the
+    /// underlying `enqueue` call failed, or the client mutex was poisoned. Says
+    /// nothing about broker reachability and is not resolved by retrying.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for PublishAckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "publish not acknowledged within timeout"),
+            Self::Disconnected => write!(f, "MQTT session dropped before acknowledgment"),
+            Self::WrongThread => write!(
+                f,
+                "publish_acked called from the MQTT event-loop thread (forbidden — would deadlock)"
+            ),
+            Self::Other(e) => write!(f, "{:#}", e),
+        }
+    }
+}
+
+impl std::error::Error for PublishAckError {}
 
 /// Last Will and Testament configuration.
 ///
@@ -922,6 +985,17 @@ impl<'a> MqttBuilder<'a> {
         let connected_for_thread = Arc::clone(&connected);
         let connected_for_handle = Arc::clone(&connected);
 
+        // Acknowledged-publish correlation, shared between the event loop (which
+        // resolves PUBACKs) and the handle (which registers and waits).
+        let pending = PendingAcks::new();
+        let pending_for_thread = pending.clone();
+
+        // Identity of the event-loop thread, published once the thread starts so
+        // `publish_acked` can refuse to block on it (see `PublishAckError::WrongThread`).
+        let event_loop_thread: Arc<Mutex<Option<std::thread::ThreadId>>> =
+            Arc::new(Mutex::new(None));
+        let event_loop_thread_for_thread = Arc::clone(&event_loop_thread);
+
         // Alive token: the thread holds a Weak reference; when the last
         // MqttHandle clone is dropped (taking the Arc<()> refcount to zero),
         // upgrade() returns None and the event loop exits at the next event.
@@ -940,6 +1014,11 @@ impl<'a> MqttBuilder<'a> {
             .stack_size(BUILDER_EVENT_LOOP_STACK_SIZE)
             .spawn(move || {
                 log::info!("[mqtt] builder event loop started");
+                // Record this thread's identity so publish_acked can detect (and
+                // reject) a misuse that would block the event loop on its own PUBACK.
+                if let Ok(mut slot) = event_loop_thread_for_thread.lock() {
+                    *slot = Some(std::thread::current().id());
+                }
                 let mut state = MqttConnectionState::Connecting;
 
                 loop {
@@ -1021,6 +1100,10 @@ impl<'a> MqttBuilder<'a> {
                                 state = next;
                                 connected_for_thread.store(false, Ordering::Release);
                                 log::info!("[mqtt] disconnected");
+                                // Fail every in-flight acked publish: a dropped
+                                // session must never masquerade as a PUBACK, and a
+                                // waiter should not spin to its full timeout.
+                                pending_for_thread.fail_all(AckOutcome::Disconnected);
                                 if let Some(ref f) = on_disconnect {
                                     f();
                                 }
@@ -1038,6 +1121,13 @@ impl<'a> MqttBuilder<'a> {
                         EventPayload::Subscribed(id) => {
                             log::info!("[mqtt] subscription confirmed (id: {})", id);
                         }
+                        EventPayload::Published(msg_id) => {
+                            // Broker acknowledged a QoS 1 publish. Wake any
+                            // publish_acked caller waiting on this message id;
+                            // fire-and-forget publishes register no waiter, so
+                            // this is a cheap no-op for them.
+                            pending_for_thread.resolve(msg_id, AckOutcome::Acked);
+                        }
                         EventPayload::Error(e) => {
                             log::error!("[mqtt] error: {:?}", e);
                         }
@@ -1052,6 +1142,8 @@ impl<'a> MqttBuilder<'a> {
         Ok(MqttHandle {
             client: shared_client,
             connected: connected_for_handle,
+            pending,
+            event_loop_thread,
             _alive: alive,
         })
     }
@@ -1143,6 +1235,12 @@ impl<'a> MqttBuilder<'a> {
 pub struct MqttHandle {
     client: Arc<Mutex<SubscribableClient>>,
     connected: Arc<AtomicBool>,
+    // Registry correlating in-flight acked publishes to their PUBACK; shared
+    // with the event-loop thread, which resolves entries on `Published`.
+    pending: PendingAcks,
+    // Identity of the event-loop thread, used by publish_acked to reject calls
+    // made from inside a callback (which would deadlock).
+    event_loop_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
     // Keeps the event loop alive.  When the last clone is dropped the
     // Arc refcount reaches zero, and the thread's Weak::upgrade() returns
     // None, causing the event loop to exit.
@@ -1188,6 +1286,90 @@ impl MqttHandle {
             .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
         guard.enqueue(topic, qos, retain, payload)?;
         Ok(())
+    }
+
+    /// Publishes with QoS 1 and blocks until the broker acknowledges the message
+    /// (PUBACK) or `timeout` elapses.
+    ///
+    /// Unlike [`publish`](Self::publish) and friends — which enqueue and return
+    /// before any acknowledgment — this reports, with a bounded wait, whether a
+    /// specific message was durably received. It exists for the one ack-gated
+    /// action in the OTA contract: clearing NVS rollback state only after the
+    /// `rolled_back` status publish is confirmed, so an unreachable broker
+    /// retries next boot instead of losing the evidence.
+    ///
+    /// # QoS
+    ///
+    /// The publish is always QoS 1 — the only level that yields a PUBACK to wait
+    /// on. There is deliberately no `qos` parameter: QoS 0 produces no
+    /// acknowledgment, and QoS 2's exactly-once handshake is out of scope.
+    ///
+    /// # Threading
+    ///
+    /// **Must not be called from an MQTT event-loop callback**
+    /// ([`on_connect`](MqttBuilder::on_connect) / [`on_message`](MqttBuilder::on_message)):
+    /// the PUBACK is delivered by the event-loop thread, so blocking it on its
+    /// own acknowledgment would deadlock. Such a call returns
+    /// [`PublishAckError::WrongThread`] instead of hanging. Call it from a normal
+    /// task/thread (e.g. the main loop).
+    ///
+    /// The client mutex is held only long enough to enqueue and read the message
+    /// id; it is released before the wait, so the event loop can take it and
+    /// deliver the PUBACK.
+    ///
+    /// # Errors
+    ///
+    /// - [`PublishAckError::Timeout`] — no PUBACK within `timeout` (retry-eligible).
+    /// - [`PublishAckError::Disconnected`] — the session dropped before the ack
+    ///   (retry-eligible; never a false `Ok`).
+    /// - [`PublishAckError::WrongThread`] — called from the event-loop thread.
+    /// - [`PublishAckError::Other`] — topic validation, `enqueue`, or a poisoned
+    ///   mutex failed (a local fault, not a broker outcome).
+    pub fn publish_acked(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        retained: bool,
+        timeout: Duration,
+    ) -> Result<(), PublishAckError> {
+        // Refuse to block the event-loop thread on its own PUBACK.
+        if let Some(event_loop_id) = *self
+            .event_loop_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            if std::thread::current().id() == event_loop_id {
+                return Err(PublishAckError::WrongThread);
+            }
+        }
+
+        validate_publish_topic(topic)
+            .map_err(|e| PublishAckError::Other(anyhow::anyhow!("invalid publish topic: {}", e)))?;
+
+        // Enqueue under the client mutex to obtain the message id, then release
+        // the mutex *before* waiting so the event loop can deliver the PUBACK.
+        let msg_id = {
+            let mut guard = self.client.lock().map_err(|_| {
+                PublishAckError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
+            })?;
+            guard
+                .enqueue(topic, QoS::AtLeastOnce, retained, payload)
+                .map_err(|e| PublishAckError::Other(e.into()))?
+        };
+
+        // Register after enqueue; the pure registry's early-outcome buffer makes
+        // the (practically impossible) enqueue→register race correct regardless.
+        let waiter = self.pending.register(msg_id);
+        log::debug!(
+            "[mqtt] publish_acked to '{}' (msg_id={}), awaiting PUBACK",
+            topic,
+            msg_id
+        );
+        match waiter.wait(timeout) {
+            Some(AckOutcome::Acked) => Ok(()),
+            Some(AckOutcome::Disconnected) => Err(PublishAckError::Disconnected),
+            None => Err(PublishAckError::Timeout),
+        }
     }
 
     /// Non-blocking publish with QoS 1 and no retain flag.
