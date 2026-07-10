@@ -462,7 +462,7 @@ mod tests {
         WiFiConfig::new(TEST_SSID, TEST_PSK)
     }
 
-    // ── Validation tests (migrated from rustyfarian-network-pure) ────────
+    // ── Validation tests (migrated from the former rustyfarian-network-pure) ────────
 
     #[test]
     fn empty_ssid_is_rejected() {

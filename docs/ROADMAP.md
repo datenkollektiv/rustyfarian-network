@@ -36,26 +36,26 @@ timeline
     Ready     : esp-hal SoftAP bring-up for ssid_override parity with esp-idf — start takes AP peripherals, resolves SSID via shared resolver against real AP MAC, broadcasts either verbatim override or prefix-plus-MAC default, completes hal half of ssid-override (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
-              : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-wifi and the Wi-Fi/MQTT-only vision line
-              : rustyfarian-network-pure scope ADR — document the cross-cutting catch-all rule (including why it is the only non-no_std pure crate)
+              : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
+              : juggler scope ADR — document the cross-cutting catch-all rule for the consolidated pure crate
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
               : ESP-NOW scan country-code awareness — query esp_wifi_get_country() at scan start and restrict probed channels to schan..schan+nchan-1 instead of hardcoded 1-13, eliminates ESP_ERR_WIFI_NOT_ALLOWED_CHANNEL warnings on US/FCC and other restricted-band regions
               : MQTT subscribe-during-shutdown race fix — detached subscriber thread spawned on Connected can block forever in esp_mqtt_client_subscribe if last MqttHandle is dropped before SUBACK, track in-flight subscriptions via a shared atomic counter, gate event-loop exit on count==0 so the loop keeps pumping events until SubscribeAck arrives, also close the window where is_connected() reads true before the subscriber thread has sent SUBSCRIBE
-              : LED/timeout dedup — extract the shared status-LED pulse + timeout-poll loop duplicated between rustyfarian-esp-idf-wifi (blocking vs LED paths) and MqttBuilder.build_and_wait into one helper
+              : LED/timeout dedup — extract the shared status-LED pulse + timeout-poll loop duplicated between rustyfarian-esp-idf-network (blocking vs LED paths) and MqttBuilder.build_and_wait into one helper
               : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
               : CI hardware-tier build job — compile one example per tier (Xtensa IDF + bare-metal) in CI to close the just-verify blind spot
               : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
-              : rustyfarian-esp-idf-provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
+              : rustyfarian-esp-idf-network provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
               : OTA security model doc — threat model, rollback policy, signed-manifest question
-              : WifiDriver async/sync trait ADR — document trait duality + first paragraph of wifi-pure rustdoc
-              : Contract tests in wifi-pure — generic run_contract_tests() over any WifiDriver implementation, conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
+              : WifiDriver async/sync trait ADR — document trait duality + first paragraph of the juggler wifi rustdoc
+              : Contract tests in juggler wifi — generic run_contract_tests() over any WifiDriver implementation, conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
               : LoRa post-adoption backlog — PartialEq, heapless Deque FIFO, CRC-32, hardware driver, state machine
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
-              : rustyfarian-esp-hal-mqtt — minimq-based bare-metal MQTT (after async MQTT ADR)
+              : bare-metal MQTT domain in rustyfarian-esp-hal-network — minimq-based (after async MQTT ADR)
 ```
 
 ---

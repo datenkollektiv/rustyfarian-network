@@ -6,7 +6,7 @@ Replaces the manual smoltcp DHCP polling loop with `embassy-net` and exposes com
 Depends on `embassy-feature-flag-v1`.
 Consumed by `hal-c3-connect-async-example-v1`.
 
-Source: `docs/embassy-integration-research.md` — Option B "blocking + async companion".
+Source: `docs/archive/embassy-integration-research.md` — Option B "blocking + async companion".
 
 ## Decisions
 
@@ -71,5 +71,5 @@ impl AsyncWifiHandle {
 
 ## Session Log
 
-- 2026-04-08 — Feature doc created from `docs/embassy-integration-research.md`
+- 2026-04-08 — Feature doc created from `docs/archive/embassy-integration-research.md`
 - 2026-04-08 — Implemented: `AsyncWifiHandle` struct added to the driver module, `WiFiManager::init_async` + private `into_async_handle()` method, `AsyncWifiHandle::wait_for_ip()` helper. `WifiDevice` already implements `embassy_net_driver::Driver` unconditionally via `esp-radio/wifi`, so no feature bridging was needed. `StackResources<3>` baseline (DHCP + 1 TCP + 1 UDP) wired via a function-local `StaticCell`. Seeded embassy-net's RNG from `esp_hal::time::Instant::now().duration_since_epoch().as_micros()`. `just fmt`, `just verify`, and `just check-wifi-hal-embassy` all pass clean on ESP32-C6 and ESP32-C3.

@@ -1,5 +1,9 @@
 # Embassy Integration Research
 
+> **Archived 2026-07-10.** Superseded historical research — the `embassy` feature it recommended has shipped and the stack has since moved to esp-radio 0.18 / esp-hal 1.1. Crate names below (`rustyfarian-esp-hal-wifi`, `wifi-pure`) are pre-consolidation and now map to `rustyfarian-esp-hal-network` / `juggler`. Kept for provenance only; not maintained.
+>
+> **See instead (current):** the async-only Wi-Fi API — `WiFiManager::init_async` / `AsyncWifiHandle` in `crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`; ADR `docs/adr/006-no-std-esp-hal-wifi.md`; the `hal_c3_connect_async*` examples; and the esp-radio 0.18 API rename reference in `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`. Implementation record: the archived `embassy-feature-flag-v1`, `wifi-manager-async-v1`, and `hal-c3-connect-async-example-v1` feature docs.
+
 Research into async Wi-Fi support for `rustyfarian-esp-hal-wifi` using the
 embassy ecosystem.
 Conducted 2026-03-20 against esp-hal 1.0, esp-radio 0.17, esp-rtos 0.2.

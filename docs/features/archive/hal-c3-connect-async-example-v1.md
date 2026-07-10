@@ -6,7 +6,7 @@ Serves as the hardware validation for both `embassy-feature-flag-v1` and `wifi-m
 
 Depends on `embassy-feature-flag-v1` and `wifi-manager-async-v1`.
 
-Source: `docs/embassy-integration-research.md` — example code sketch under Option A.
+Source: `docs/archive/embassy-integration-research.md` — example code sketch under Option A.
 
 ## Decisions
 
@@ -60,7 +60,7 @@ Source: `docs/embassy-integration-research.md` — example code sketch under Opt
 
 ## Session Log
 
-- 2026-04-08 — Feature doc created from `docs/embassy-integration-research.md`
+- 2026-04-08 — Feature doc created from `docs/archive/embassy-integration-research.md`
 - 2026-04-08 — Implemented: `examples/hal_c3_connect_async.rs` using `#[esp_rtos::main]` with two spawned tasks (`wifi_task` + `net_task`). Destructures `AsyncWifiHandle` (stack is `Copy`, keeps main's reference while moving controller/runner into tasks). `esp_alloc::heap_allocator!(size: 72 * 1024)` — single-region on C3. `WiFiManager::init_async` internally calls `esp_rtos::start()` via `init_inner`, which works from inside the embassy executor created by `#[esp_rtos::main]` (the macro creates the executor but does not start the RTOS — that is still the user's/library's responsibility). Added `[[example]] required-features = ["esp32c3", "rt", "embassy"]` to the crate Cargo.toml. `scripts/build-example.sh` grew a `*_async*` case that appends the `embassy` feature automatically, mirroring the existing `*_rgb*` pattern. `just fmt`, `just verify`, and `just build-example hal_c3_connect_async` all pass clean.
 - 2026-04-10 — Fixed `scripts/flash.sh` missing the `*_async*` → `embassy` feature detection that `build-example.sh` already had. Hardware validation on real ESP32-C3: build, flash, Wi-Fi connect, and DHCP lease all confirmed working. AP reconnect loop test still pending.
 - 2026-06-18 — **Reconnect-loop hardware validation COMPLETE; build regression found + fixed first.** Resuming the trailing validation, `just build-example hal_c3_connect_async` no longer compiled (8 errors): `embassy-executor` / `embassy-time` were unresolved, cascading into misleading `no method unwrap found for impl Future` errors because the unresolved `#[embassy_executor::task]` attribute left the task fns untransformed. Root cause: `rustyfarian-esp-hal-wifi` never declared `embassy-executor` / `embassy-time` — the library does not use them, only the three async examples do. Fixed by adding both as `[dev-dependencies]` (workspace-pinned, already vetted via the provisioning crate); this also unbroke `hal_c3_connect_async_led` / `hal_c6_connect_async_led`. Added free-heap logging to `wifi_task` on link-up and disconnect so reconnect success and leak-detection are observable on serial. On-hardware result (ESP32-C3 Super Mini, kicked from the router 3×): reconnect loop fires, re-associates with no reset, and the disconnect-time free heap is constant at 26988 B across all cycles (no leak; link-up readings 24764–26024 B are transient buffers). All validation boxes ticked.

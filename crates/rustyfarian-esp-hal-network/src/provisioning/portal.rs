@@ -1700,7 +1700,7 @@ mod tests {
     /// flowing into the `nonce: &str` parameter of `render_portal_template`
     /// (and the cluster of `nonce_matches` tests below).  The same
     /// const-indirection pattern is documented in CLAUDE.md
-    /// (*Common Resolution Failures* table) and used by `wifi-pure::tests`
+    /// (*Common Resolution Failures* table) and used by the `juggler::wifi` tests
     /// (`TEST_PSK`); see also `docs/project-lore.md` "CodeQL / GitHub
     /// Advanced Security".
     const TEST_NONCE_FIXTURE_8HEX: &str = "cafebabe";

@@ -168,3 +168,31 @@ Tooling fix surfaced during validation (also delivered as part of this feature):
   - ESP32-C6-DevKitC-1 with `hal_c6_connect_async_led` — joined Wi-Fi, DHCP lease acquired, embassy multitask survival confirmed, WS2812 LED transitions blue pulse → dim green on association.
   ESP32-S3 LoRa hardware run remains gated by Phase 5 TTN v3 EU868 hardware availability per `docs/ROADMAP.md` — not a prerequisite for closing this feature.
   Two project-lore entries added: the auto-detect Bluetooth-port pitfall, and the orphaned `espflash monitor` port-lock pitfall (`lsof` to diagnose).
+
+---
+
+## esp-radio 0.18 API rename reference
+
+Moved here from `docs/project-lore.md` on 2026-07-10 during a lore-condense pass: the 0.17→0.18 migration is complete, so these rename maps are historical reference rather than active lore.
+The workspace is on `esp-radio 0.18` (`rustyfarian-esp-hal-network`); consult these only when reading pre-0.18 code or planning a further upgrade.
+
+**STA rename map (any HAL crate consuming the bare-metal Wi-Fi surface applied these):**
+- `WifiDevice<'d, MODE>` → `Interface<'d>` (the `MODE` generic is gone — `embassy_net::Runner<'static, Interface<'static>>` replaces `Runner<'static, WifiDevice<'static>>`)
+- `ModeConfig` → `Config`; `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`
+- `ClientConfig` → `StationConfig` (lives at `esp_radio::wifi::sta::StationConfig` — the `sta` submodule is `pub` but `StationConfig` is **not** re-exported at `esp_radio::wifi`, so `use esp_radio::wifi::{StationConfig, ...}` fails with `E0603 private struct`; import the full path instead)
+- The old top-level `Config` → `ControllerConfig`
+- `Interfaces.sta` → `Interfaces.station`
+- `WifiEvent::StaDisconnected` → `WifiEvent::StationDisconnected`
+- `WifiError::Disconnected` is now a tuple variant `Disconnected(DisconnectedStationInfo)` — pattern matches that previously used the unit variant break
+- `controller.is_connected()` returns `bool` directly, not `Result<bool, WifiError>`
+- `controller.connect()`, `disconnect()`, `start()` (sync) — all removed; replacements are `connect_async().await`, `disconnect_async().await`; `set_config()` is now idempotent and starts the radio (`esp_wifi_start`) but does **not** initiate association — `connect_async()` must still be called explicitly
+- `controller.wait_for_event(WifiEvent::StaDisconnected)` removed; replacement is `controller.wait_for_disconnect_async().await -> Result<DisconnectedStationInfo, WifiError>`
+- `esp_radio::wifi::new()` signature is now `(WIFI<'d>, ControllerConfig)` — the prior `radio_ref` parameter is gone; `esp_radio::init()` is now `pub(crate)` and not part of user code
+
+**AP-mode surface map (companion to the STA rename map; Phase 0 of ADR 015 surfaced these names):**
+- `Interfaces.ap` → `Interfaces.access_point` (the AP-side field; mirror of `Interfaces.station`).
+- `WifiEvent::ApStaConnected` → `WifiEvent::AccessPointStationConnected`; `WifiEvent::ApStaDisconnected` → `WifiEvent::AccessPointStationDisconnected`.
+- `AccessPointConfig` lives at `esp_radio::wifi::ap::AccessPointConfig` (the `ap` submodule is `pub` but `AccessPointConfig` is not re-exported at `esp_radio::wifi` — same pattern as `StationConfig`).
+- `AccessPointConfig::with_password` takes `impl Into<String>` (so `password.into()` works; bare `&str` does NOT — opposite of `StationConfig::with_ssid` which takes `&str` directly). `AccessPointConfig::with_auth_method(AuthenticationMethod)` is the auth-method setter; pass `AuthenticationMethod::None` for open, `AuthenticationMethod::WPA2Personal` for WPA2.
+- **`WifiController::start_async()` does NOT exist** — the AP (and STA) radio is started by `set_config()` triggering `esp_wifi_start()` internally on a mode transition. Any code that spawns a `wifi_task` and calls `start_async()` is wrong on both sides; the wifi_task goes directly to the event-listening loop (`controller.wait_for_event(WifiEvent::AccessPointStationConnected).await` or similar) after `init_softap_async` returns.
+- Source: `esp-radio-0.18.0/src/wifi/ap.rs` and `esp-radio-0.18.0/src/wifi/mod.rs` (`Interfaces` struct, `WifiEvent` enum).

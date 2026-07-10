@@ -115,7 +115,7 @@ const CANONICAL_KEYS: [&str; 13] = [
 /// Stack buffer size for a single `get_str` read.
 ///
 /// Every stored value is below this bound (the longest, the OTA URL, is capped
-/// at 128 bytes by `provisioning-pure`).
+/// at 128 bytes by `juggler::provisioning`).
 const READ_BUF_LEN: usize = 256;
 
 /// Maximum bytes the `extras_idx` value may occupy.

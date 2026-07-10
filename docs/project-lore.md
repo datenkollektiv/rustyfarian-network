@@ -27,12 +27,9 @@ Fix: replace `dtolnay/rust-toolchain@stable` in the `format` job with `esp-rs/xt
 (`ldproxy: false` suffices — the linker proxy is not needed for a format check).
 The `esp` toolchain ships `rustfmt`, so no separate stable step is required.
 
-**`just fmt` must be run before `just verify` (and before every commit) — skipping it causes CI to fail.**
-`just verify` calls `just fmt-check` which only *detects* formatting drift; it does not fix it.
-Any code change that was not passed through `cargo fmt` first will cause `fmt-check` to fail in CI
-with no compiler error to aid diagnosis.
-Fix: always run `just fmt` then `just verify` in that order; see the `## Completion Gate` section
-in `CLAUDE.md`.
+**`just fmt` must be run before `just verify` (and before every commit) — skipping it fails CI.**
+`just verify` calls `just fmt-check`, which only *detects* formatting drift (no compiler error to aid diagnosis); it does not fix it.
+Fix: always run `just fmt` then `just verify` in that order; see the `## Completion Gate` in `CLAUDE.md`.
 
 **Every crate that builds examples against ESP-IDF needs a `build.rs` calling `embuild::espidf::sysenv::output()`.**
 `cargo:rustc-link-arg` emitted by `esp-idf-sys` does not propagate through transitive deps to the example binary's linker.
@@ -67,7 +64,7 @@ Fix: `scripts/flash.sh` and `scripts/build-example.sh` derive the chip from the 
 
 **`sdkconfig.defaults` must be placed at the workspace root for embuild to pick it up — not in the crate root.**
 In a Cargo workspace, `embuild` (used by `esp-idf-sys`) resolves `sdkconfig.defaults` relative to the workspace root (where the top-level `Cargo.toml` lives), not relative to the crate that's being built.
-Placing the file in a crate subdirectory (e.g. `crates/rustyfarian-esp-idf-lora/sdkconfig.defaults`) is silently ignored: `esp-idf-sys` recompiles but CMake reconfigures without the custom settings, and the generated `sdkconfig` retains all defaults.
+Placing the file in a crate subdirectory (e.g. `crates/rustyfarian-esp-idf-network/sdkconfig.defaults`) is silently ignored: `esp-idf-sys` recompiles but CMake reconfigures without the custom settings, and the generated `sdkconfig` retains all defaults.
 Fix: place `sdkconfig.defaults` at the workspace root and declare it in `build.rs` as `cargo:rerun-if-changed=../../sdkconfig.defaults`.
 The main task stack is commonly the first setting needed: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` is sufficient for full LoRaWAN OTAA crypto on ESP-IDF.
 
@@ -90,15 +87,13 @@ Fix: always pin cross-repo git deps with `tag = "vX.Y.Z"` (or `rev = "<sha>"`).
 Upstream release waves then cannot reach into this workspace without a deliberate, coordinated bump.
 
 **A crate-level `default-features = false` on a workspace-inherited dependency is silently ignored unless the workspace declaration also says `default-features = false`.**
-Cargo's workspace-deps inheritance rule: a crate inheriting a dep via `workspace = true` may override `features`, but a `default-features` override only takes effect when the workspace declaration **already** has `default-features = false`.
-If the workspace declaration omits `default-features` (the implicit `true`) or sets it to `true` explicitly, every consumer pulls default features even when they wrote `default-features = false`.
-Cargo emits `warning: 'default-features' is ignored for <crate>, since 'default-features' was [not specified | true] for 'workspace.dependencies.<crate>', this could become a hard error in the future` — easy to miss because `cargo check` / `cargo clippy` still exit 0.
-Symptom this caused in this workspace: `provisioning-pure` (a `no_std` crate) silently inherited the `std` feature of `rustyfarian-network-pure` for two days (2026-06-12 → 2026-06-14), so the ADR 014 §2 `no_std` consumer-side contract held only on paper, not at the build layer.
+Cargo's workspace-deps inheritance rule: a crate inheriting a dep via `workspace = true` may override `features`, but a `default-features` override only takes effect when the workspace declaration **already** has `default-features = false`; otherwise every consumer pulls default features even when it wrote `default-features = false`.
+Cargo emits `warning: 'default-features' is ignored for <crate>, since 'default-features' was [not specified | true] for 'workspace.dependencies.<crate>'` — easy to miss because `cargo check` / `cargo clippy` still exit 0, so a `no_std` consumer can silently inherit an upstream `std` feature (this bit a `no_std` provisioning consumer inheriting `std` from the shared pure crate — both since consolidated into `juggler` — breaking the ADR 014 §2 `no_std` contract at the build layer while it held on paper).
 Fix when introducing a `no_std` consumer of a workspace-inherited dep:
 1. Set the workspace declaration to `default-features = false`.
 2. Every `std`-needing consumer opts back in with `features = ["std"]`.
-3. Re-run `just verify`; the warning should be gone and the `no_std` consumer should compile against the actual `no_std` core (if it secretly used a `std`-gated item, this is where it surfaces as a compile error).
-Detection: any `cargo` invocation that emits the `default-features is ignored` warning means the workspace-deps relationship is broken — treat it like a `-D warnings` finding even though it does not fail the build.
+3. Re-run `just verify` — a secret `std`-gated use now surfaces as a compile error.
+Treat the `default-features is ignored` warning as a `-D warnings`-class finding even though it does not fail the build.
 
 **`ESP_IDF_SDKCONFIG_DEFAULTS` must list ABSOLUTE paths; a relative list silently applies NEITHER the base defaults nor the overlay, so a sdkconfig-override check passes while testing the wrong config.**
 `embuild`/`esp-idf-sys` does not resolve a relative `ESP_IDF_SDKCONFIG_DEFAULTS` entry against the cargo workspace root the way the default (unset) resolution of `sdkconfig.defaults` does.
@@ -128,42 +123,22 @@ The 0.17 `smoltcp` Cargo feature is gone; the `wifi` feature now pulls `embassy-
 Any blocking poll loop that drove `smoltcp::iface::Interface` directly off `WifiDevice` (the `WiFiManager::wait_connected` + DHCP path used in the network workspace before the upgrade) has no equivalent in 0.18 — the option is to drop the sync surface and route everything through `embassy-net`.
 Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 'smoltcp' has been removed (#4870)`) and verified by grep against the unpacked source: zero `smoltcp` references in `wifi/mod.rs`, only `impl Driver for Interface<'_>` (`embassy_net_driver::Driver`) remains.
 
-**`esp-radio 0.18` rename map (any HAL crate consuming the bare-metal Wi-Fi surface needs to apply these):**
-- `WifiDevice<'d, MODE>` → `Interface<'d>` (the `MODE` generic is gone — `embassy_net::Runner<'static, Interface<'static>>` replaces `Runner<'static, WifiDevice<'static>>`)
-- `ModeConfig` → `Config`; `ModeConfig::Client(ClientConfig)` → `Config::Station(StationConfig)`
-- `ClientConfig` → `StationConfig` (lives at `esp_radio::wifi::sta::StationConfig` — the `sta` submodule is `pub` but `StationConfig` is **not** re-exported at `esp_radio::wifi`, so `use esp_radio::wifi::{StationConfig, ...}` fails with `E0603 private struct`; import the full path instead)
-- The old top-level `Config` → `ControllerConfig`
-- `Interfaces.sta` → `Interfaces.station`
-- `WifiEvent::StaDisconnected` → `WifiEvent::StationDisconnected`
-- `WifiError::Disconnected` is now a tuple variant `Disconnected(DisconnectedStationInfo)` — pattern matches that previously used the unit variant break
-- `controller.is_connected()` returns `bool` directly, not `Result<bool, WifiError>`
-- `controller.connect()`, `disconnect()`, `start()` (sync) — all removed; replacements are `connect_async().await`, `disconnect_async().await`; `set_config()` is now idempotent and starts the radio (`esp_wifi_start`) but does **not** initiate association — `connect_async()` must still be called explicitly
-- `controller.wait_for_event(WifiEvent::StaDisconnected)` removed; replacement is `controller.wait_for_disconnect_async().await -> Result<DisconnectedStationInfo, WifiError>`
-- `esp_radio::wifi::new()` signature is now `(WIFI<'d>, ControllerConfig)` — the prior `radio_ref` parameter is gone; `esp_radio::init()` is now `pub(crate)` and not part of user code
-
-**`esp-radio 0.18` AP-mode surface map (companion to the STA rename map above) — Phase 0 of ADR 015 surfaced these names:**
-- `Interfaces.ap` → `Interfaces.access_point` (the AP-side field; mirror of `Interfaces.station`).
-- `WifiEvent::ApStaConnected` → `WifiEvent::AccessPointStationConnected`; `WifiEvent::ApStaDisconnected` → `WifiEvent::AccessPointStationDisconnected`.
-- `AccessPointConfig` lives at `esp_radio::wifi::ap::AccessPointConfig` (the `ap` submodule is `pub` but `AccessPointConfig` is not re-exported at `esp_radio::wifi` — same pattern as `StationConfig`).
-- `AccessPointConfig::with_password` takes `impl Into<String>` (so `password.into()` works; bare `&str` does NOT — opposite of `StationConfig::with_ssid` which takes `&str` directly). `AccessPointConfig::with_auth_method(AuthenticationMethod)` is the auth-method setter; pass `AuthenticationMethod::None` for open, `AuthenticationMethod::WPA2Personal` for WPA2.
-- **`WifiController::start_async()` does NOT exist** — the AP (and STA) radio is started by `set_config()` triggering `esp_wifi_start()` internally on a mode transition (already noted in the rename map for STA; the same is true for AP). Any code that spawns a `wifi_task` and calls `start_async()` is wrong on both sides; the wifi_task goes directly to the event-listening loop (`controller.wait_for_event(WifiEvent::AccessPointStationConnected).await` or similar) after `init_softap_async` returns.
-- The feature doc `docs/features/esp-hal-provisioning-v1.md` candidate-signatures section refers to `interfaces.ap` and `start_async()`; treat those as illustrative placeholders, not the real API.
-Source: `esp-radio-0.18.0/src/wifi/ap.rs` and `esp-radio-0.18.0/src/wifi/mod.rs` (`Interfaces` struct, `WifiEvent` enum).
+**The `esp-radio 0.18` STA + AP-mode API rename maps live in `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`** ("esp-radio 0.18 API rename reference") — the 0.17→0.18 migration is complete, so they are historical reference, not active lore.
 
 **`embassy-sync = =0.8.0` is a workspace-wide lock set by `esp-rtos 0.3.0`; many published async networking crates (incl. the `edge-net 0.7.x` family) still target `embassy-sync 0.7.2` and cannot coexist.**
 Cargo only allows one version of `embassy-sync` in the graph because the trait surface (`Mutex`, `Signal`, `CriticalSection`) is API-incompatible across the 0.7 → 0.8 boundary, and downgrading the workspace pin would break every other embassy-using crate.
 A crate evaluation that checks only license + transitive surface will miss this and fail at the resolver, not at the compiler.
 Fix: before adding any async networking crate to the bare-metal estate, run `cargo tree -i embassy-sync` or read the candidate's `Cargo.toml` and confirm it binds `embassy-sync 0.8.x`. Discovered during the ADR 015 Phase 2 substrate evaluation of `edge-dhcp 0.7.0` / `edge-nal-embassy 0.8.1` — both blocked, hand-rolled fallback proceeded per ADR 015 §3.
 
-**`embassy-net` feature flags `udp`, `tcp`, `proto-ipv4`, and `medium-ethernet` are independently gated; the workspace's `embassy` feature in `rustyfarian-esp-hal-wifi` enables none of them.**
-Pulling `embassy-net` into the dep graph does not provide `UdpSocket` or `TcpSocket` — those types live in `embassy_net::udp` and `embassy_net::tcp` modules behind their own feature flags, each adding a `smoltcp` module pair internally.
-Symptom when missing: `E0432: unresolved import 'embassy_net::udp'` (or `tcp`) even with `embassy-net` in the dep graph, OR a `smoltcp` `compile_error!` deep in the dep graph if `proto-ipv4`/`medium-ethernet` are also missing (the OTA-side entry below covers that variant).
-Fix: forward every required feature on the consuming crate's `embassy-net` dep — see `provisioning-spike = ["embassy", "embassy-net/udp", "embassy-net/tcp"]` in `crates/rustyfarian-esp-hal-wifi/Cargo.toml`. Discovered during Phase 2 spike DHCP-half then HTTP-half.
+**`embassy-net` feature flags `udp`, `tcp`, `proto-ipv4`, `dhcpv4`, and `medium-ethernet` are independently gated; pulling `embassy-net` into the graph enables none of them by default.**
+`UdpSocket`/`TcpSocket` live in `embassy_net::udp`/`embassy_net::tcp` behind their own feature flags, each adding a `smoltcp` module pair internally.
+Symptom when missing: `E0432: unresolved import 'embassy_net::udp'` (or `tcp`), OR an unrelated-looking `smoltcp` `compile_error!` deep in the dep graph when `proto-ipv4`/`medium-ethernet` are absent.
+Fix: forward every required feature on the *consuming crate's* `embassy-net` dep, not just the app-level network stack — `rustyfarian-esp-hal-network`'s `embassy` feature does this via `embassy-net?/{udp,tcp,dhcpv4,proto-ipv4,medium-ethernet}` (see its `Cargo.toml`). Applies to the DHCP/HTTP provisioning substrate and the OTA client alike.
 
 **`embassy-net::TcpSocket` server-side accept-loop: `accept(port)` is the listen-set AND the wait-point; `close()` is FIN-only; `flush()` must follow before reusing the socket.**
 There is no separate `listen()` + `wait_for_accept()` split — one `accept(port).await?` call puts the socket into listen mode on the given port and suspends until a connection arrives.
 After serving a request, `close()` only shuts the **write** half (sends FIN); `flush()` must be awaited next so smoltcp actually emits the FIN before the next `accept()` reuses the socket — without it, the previous connection lingers in FIN-WAIT and the next accept races against teardown.
-`abort()` is the same story (sends RST instead of FIN, still needs `flush()` to push the packet out). Pattern: `loop { socket.accept(port).await?; serve(socket); socket.close(); socket.flush().await; }`. Lives in `crates/rustyfarian-esp-hal-wifi/src/http_server.rs::run`.
+`abort()` is the same story (sends RST instead of FIN, still needs `flush()` to push the packet out). Pattern: `loop { socket.accept(port).await?; serve(socket); socket.close(); socket.flush().await; }`. Lives in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs::run`.
 
 **Pass workspace invariants by binding-at-construction, not by per-call argument — host tests miss the call-site indirection.**
 The Phase 2 DHCP server's `LeaseTable::allocate(mac, requested, pool_start, ...)` took `pool_start` as a runtime arg; three call sites in `run` had to pass it, one passed `server_ip` (192.168.4.1) instead. Host tests called `LeaseTable::allocate` directly with the correct constant and never exercised the call-site indirection — the bug only surfaced on hardware when the phone got `192.168.4.1` for its DHCP lease and stalled on "IP configuration failure".
@@ -171,7 +146,7 @@ Fix: when designing a `pub(crate)` state machine helper, bind workspace-invarian
 The HTTP server applied this prospectively: `build_response` does NOT take `Connection: close` as a parameter — it's a server-wide invariant. Same principle for other private helpers in the spike.
 
 **`StaticCell<[u8; N]>` requires `N` to be a compile-time constant — runtime `config.buf_size: usize` fields cannot back the allocation.**
-The bare-metal substrate (DHCP / HTTP servers in `rustyfarian-esp-hal-wifi`) needs `'static`-lifetime socket buffers via `StaticCell`, but the buffer size lives in the type signature, so a `HttpServerConfig.rx_buf_size` field cannot drive a `StaticCell<[u8; rx_buf_size]>` allocation.
+The bare-metal substrate (DHCP / HTTP servers in `rustyfarian-esp-hal-network`) needs `'static`-lifetime socket buffers via `StaticCell`, but the buffer size lives in the type signature, so a `HttpServerConfig.rx_buf_size` field cannot drive a `StaticCell<[u8; rx_buf_size]>` allocation.
 The const-generic workaround (`HttpServer<const RX: usize, const TX: usize>`) propagates the generics through every consumer, which bloats the surface.
 Fix for spike-quality code: use `const` defaults for the `StaticCell` backing buffers and keep the `config.buf_size` fields as forward-compat documentation markers; for production code, lift the sizes to const generics on the server type.
 
@@ -189,7 +164,7 @@ ESP-IDF limits TX power internally for regulatory compliance; the bare-metal blo
 The same hardware and credentials connect fine under the ESP-IDF std stack.
 Fix: declare `esp_wifi_set_max_tx_power` via `extern "C"` (the symbol is already linked transitively via `esp-radio`) and call it immediately after `controller.set_config()` — `set_config` triggers `esp_wifi_start()` internally, and the call must come *after* that; calling it before returns `ESP_ERR_WIFI_NOT_STARTED` (error 12290 / `0x3002`).
 Use `esp_wifi_set_max_tx_power(34)` (34 × 0.25 dBm = 8.5 dBm).
-Workaround lives in `WiFiManager::init_async` (`crates/rustyfarian-esp-hal-wifi/src/lib.rs`) and in `hal_c3_connect_async_upstream.rs` for the upstream-verbatim example.
+Workaround lives in `WiFiManager::init_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`) and in `hal_c3_connect_async_upstream.rs` for the upstream-verbatim example.
 Upstream references: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
 
 **`embassy-executor 0.10` removed `Spawner::must_spawn`; `#[embassy_executor::task]` macros now return `Result<SpawnToken<...>, SpawnError>`.**
@@ -199,13 +174,13 @@ The compiler hint `consider using Result::expect to unwrap the Result<SpawnToken
 
 **The `esp-rtos 0.3.0` async executor panics `unwrap of self.time_driver.as_mut() failed: NoneError` on the *first* `.await` park if `esp_rtos::start` was never called — and `start` is the call that installs the time driver.**
 The executor reads the time driver every time a task parks, so this trips on *any* await, not just `Timer::after` — `core::future::pending().await` panics identically.
-In this workspace `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-wifi/src/lib.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
+In this workspace `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
 Surfaced on hardware 2026-06-18: `hal_c3_provision_mqtt` logged the loaded config then panicked in the idle loop.
 Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `SW_INTERRUPT`.
 
 **A missing `embassy-executor` dependency makes `#[embassy_executor::task]` silently no-op and surfaces as misleading `no method named 'unwrap' found for ... impl Future<Output = ()>` errors, not a clear "macro not found".**
 When `embassy_executor` is unresolved, the `#[embassy_executor::task]` attribute cannot expand, so the annotated fn stays a plain `async fn` returning `impl Future` instead of the spawnable token the macro would produce; the real cause (`error[E0432]: unresolved import embassy_executor`) is buried above a cascade of `.unwrap()`-on-Future errors at every `spawner.spawn(task().unwrap())` call site.
-Hit 2026-06-18 when resuming `hal_c3_connect_async` validation: `rustyfarian-esp-hal-wifi` declared `embassy-net` + `static_cell` but never `embassy-executor` / `embassy-time`, so all three async examples failed to compile.
+Hit 2026-06-18 when resuming `hal_c3_connect_async` validation: `rustyfarian-esp-hal-network` declared `embassy-net` + `static_cell` but never `embassy-executor` / `embassy-time`, so all three async examples failed to compile.
 Fix: the library doesn't use these crates — only the examples do — so add `embassy-executor` + `embassy-time` as `[dev-dependencies]` (workspace-pinned), not as `embassy`-feature optional deps. Read the *first* error (the unresolved import), not the cascade.
 
 ---
@@ -307,7 +282,7 @@ Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = G
 `sx126x` issues register and buffer reads as `Operation::Write` + `Operation::Read` pairs; `esp-idf-hal 0.46` translates `Operation::Read(buf)` into an `spi_transaction_t` with `tx_buffer = NULL` and `length = rxlength = buf.len() * 8`.
 On ESP32-S3 (ESP-IDF v5.3.3) a null TX buffer collapses the effective TX length to zero at the hardware level, so the C driver's `rxlength <= txlength` full-duplex check fails — even though at the Rust level `rxlength == length`.
 Half-duplex mode is NOT a fix: `SOC_SPI_HD_BOTH_INOUT_SUPPORTED` is undefined on ESP32-S3, so half-duplex rejects the simultaneous-TX+RX `TransferInPlace` calls `sx126x` uses for `get_status` and friends.
-Fix: wrap the `SpiDeviceDriver` in a `FullDuplexDevice` adapter that rewrites each `Operation::Read(buf)` into `Operation::Transfer(buf, &zeroes[..buf.len()])` (the SX1262 ignores MOSI during read phases, so zeroed TX is harmless) — see `FullDuplexDevice` in `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`.
+Fix: wrap the `SpiDeviceDriver` in a `FullDuplexDevice` adapter that rewrites each `Operation::Read(buf)` into `Operation::Transfer(buf, &zeroes[..buf.len()])` (the SX1262 ignores MOSI during read phases, so zeroed TX is harmless) — see `FullDuplexDevice` in `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`.
 The zero-scratch buffer must be sized to the actual read length (allocated per transaction), not a fixed cap: `read_buffer` can read a full 255-byte downlink payload, and a short TX slice re-triggers the same error.
 The bare-metal `hal_esp32s3_join` example never hit this because it hand-issues `Operation::Transfer(&mut rx, &tx)` with equal-length buffers.
 
@@ -331,14 +306,14 @@ The slow path (Vec-based rewrite for `Read` operations) is safe because all six 
 **CodeQL's `rust/hard-coded-cryptographic-value` query flags string literals reaching parameters named `password`, `credential`, or similar — even in test code.**
 The query traces taint from any string literal into a credential-named parameter and raises a Critical alert regardless of context; test helpers like `WiFiConfig::new("ssid", "pass")` trigger it on the second parameter.
 Fix: define test fixtures with non-credential names (e.g. `TEST_PSK`) and route them through a helper (e.g. `test_config()`); for empty passwords use `&String::new()` instead of `""`.
-The indirection breaks the direct literal-to-credential-parameter flow that CodeQL traces — see `crates/wifi-pure/src/lib.rs` test module.
+The indirection breaks the direct literal-to-credential-parameter flow that CodeQL traces — see the `crates/juggler/src/wifi/` test module.
 
 ## OTA MVP — Three-Crate Triad
 
 **`#![no_std]` test code cannot use `format!` or `.to_string()` even on the host target.**
 The `cargo test` harness links against `std`, but the crate's `#![no_std]` attribute still blocks implicit `std` imports inside `#[cfg(test)] mod tests` blocks.
 Workaround: use `core::fmt::Write` into a `heapless::String` buffer, or explicitly `use alloc::string::ToString` if the crate has `extern crate alloc`.
-Surface: building tests for `crates/ota-pure/`.
+Surface: building tests for the `ota` domain in `crates/juggler/`.
 
 **`esp-idf-svc 0.52.x` requires `embedded-svc 0.29`, not `0.28`.**
 Pinning `embedded-svc = "0.28"` in `[workspace.dependencies]` while `esp-idf-svc 0.52` transitively pulls `0.29` produces a silent trait-version mismatch: `Headers::content_len` is defined in both crate versions, but `EspHttpConnection` only implements it for `0.29`.
@@ -349,28 +324,23 @@ Fix: declare `embedded-svc = "0.29"` to align with the version `esp-idf-svc 0.52
 Older versions of `esp-storage` exposed `FlashStorage::new()` with no arguments; the 0.9 release made the peripheral explicit and consumes ownership.
 Any wrapper crate must expose this peripheral in its public constructor or store `FlashStorage` directly — `EspHalOtaManager::new()` therefore takes `(config, FLASH<'d>)` and is generic over `'d`.
 Calling `FlashStorage::new()` more than once per boot panics.
-Surface: `crates/rustyfarian-esp-hal-ota/src/manager.rs`.
+Surface: `crates/rustyfarian-esp-hal-network/src/ota/manager.rs`.
 
 **`embassy-net::TcpSocket` does not implement `embedded_io_async::Write`.**
 Use the inherent `socket.write(&buf).await` method directly in a partial-write-safe loop.
 Trying to import `embedded_io_async::Write` and call `.write_all()` on a `TcpSocket` fails to compile with "trait not implemented".
 
-**`smoltcp` raises a `compile_error!` if `embassy-net` is pulled in without `proto-ipv4` + `tcp` + `medium-ethernet` features.**
-The features must be declared on the optional `embassy-net` dep in the consuming crate's `Cargo.toml`, not just on the application-level network stack.
-Failure mode: `cargo check` produces an unrelated-looking smoltcp `compile_error!` deep in the dep graph; the fix is to add the features to the lib crate's `embassy-net` declaration.
-See `crates/rustyfarian-esp-hal-ota/Cargo.toml` for the working pattern.
-
 **Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon.**
 `u64::from_str` accepts a leading `+`, but RFC 7230 §3.3.2 requires `1*DIGIT` (no sign).
 A permissive parser paired with a stricter upstream cache becomes a request-smuggling primitive.
 Similarly, RFC 7230 §3.2.4 forbids whitespace between header name and colon — accepting `Content-Length\t: 0` makes the name fail case-insensitive comparison and silently disables the duplicate-CL check.
-Both rejections live in `crates/rustyfarian-esp-hal-ota/src/http.rs::parse_header` and `HeaderState::feed`; the dedicated host tests cover both vectors.
+Both rejections live in `crates/rustyfarian-esp-hal-network/src/ota/http.rs::parse_header` and `HeaderState::feed`; the dedicated host tests cover both vectors.
 
 **Logging URLs that may contain RFC 3986 userinfo leaks credentials.**
 Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS is rejected; logging the URL verbatim spills credentials into `espflash monitor` output.
 Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
 The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
-See `crates/rustyfarian-esp-idf-ota/src/downloader.rs::url_for_log`.
+See `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs::url_for_log`.
 
 ## ESP-NOW
 
@@ -384,34 +354,24 @@ Symptom: coordinator (AP-locked) receives every scan probe but zero data frames;
 send callback fires `FAIL` ~30 ms after each TX (7 × 802.11 short-retry).
 Fix: use `init_with_radio` (SoftAP) so the beacon schedule holds the channel. See ADR 012.
 
-**Promiscuous-bracket per-send re-pin is fundamentally racy.**
-`set_promiscuous(false)` is a FreeRTOS task-switch trigger; the Wi-Fi driver task can
-preempt before `esp_now_send` and return `ESP_ERR_ESPNOW_CHAN` (0x3069) on a meaningful
-fraction of sends.
-Fix: prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when
-SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
+**Promiscuous-bracket per-send re-pin is fundamentally racy — and protects TX but not ACK reception.**
+`set_promiscuous(false)` is a FreeRTOS task-switch trigger; the Wi-Fi driver task can preempt before `esp_now_send` and return `ESP_ERR_ESPNOW_CHAN` (0x3069) on a meaningful fraction of sends.
+Even when TX succeeds, the background scanner can hop off-channel before the coordinator's 802.11 ACK arrives — the frame is delivered but `send_and_wait` sees `FAIL` (~10–20 % `"scout-probe"` retries in `init_with_radio_sta` despite ~99 % end-to-end delivery).
+Fix: prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
 
 **Roaming peers cause false-positive channel detection in `scan_for_peer`.**
 A peer's STA briefly visits every channel during an AP roam scan and hardware-ACKs unicast
 frames addressed to its MAC even while not associated, so a first-ACK-wins scan latches
 onto the wrong channel.
 Fix: leave `ScanConfig::probe_confirmations` ≥ 1 with `confirmation_gap` longer than a
-typical scan dwell (defaults: 1 / 150 ms). See `crates/espnow-pure/src/lib.rs`.
+typical scan dwell (defaults: 1 / 150 ms). See `crates/juggler/src/espnow/mod.rs`.
 
 **`scan_for_peer` failure cascade leaves the radio on the last-probed channel.**
 A failed re-scan removed the peer entry and left the radio on (e.g.) ch 11, so the next
 `send_and_wait` aborted before TX with "peer not found", adding an extra round-trip
 before recovery.
 Fix: the `Err` branch of `scan_for_peer` restores both the peer registration and the
-radio channel from `pinned_channel`. See `crates/rustyfarian-esp-idf-espnow/src/lib.rs`.
-
-**The promiscuous-bracket fallback protects TX but not ACK reception.**
-After `esp_now_send` returns, the background scanner is free to hop off the channel
-before the coordinator's 802.11 ACK arrives — frame is delivered but `send_and_wait`
-sees `FAIL`.
-Symptom in `init_with_radio_sta`: ~10–20 % `"scout-probe"` retries even though end-to-end
-delivery is ~99 %.
-Mitigation: prefer `init_with_radio` (SoftAP). See ADR 012.
+radio channel from `pinned_channel`. See `crates/rustyfarian-esp-idf-network/src/espnow/mod.rs`.
 
 ---
 
@@ -429,7 +389,7 @@ literal in example/log code is wrong.
 Fix: pin the AP netif explicitly before `wifi.start()` via the raw FFI sequence
 `esp_netif_dhcps_stop → esp_netif_set_ip_info → esp_netif_dhcps_start` on
 `wifi.ap_netif().handle()` (requires `use esp_idf_svc::handle::RawHandle;`). See
-`SoftApManager::start` / `pin_ap_netif_ip` in `rustyfarian-esp-idf-wifi`. A full `espflash
+`SoftApManager::start` / `pin_ap_netif_ip` in `rustyfarian-esp-idf-network` (`wifi` module). A full `espflash
 erase-flash` also clears the stale netif state but does not prevent recurrence.
 
 **ESP-IDF httpd's default request-header buffer (`CONFIG_HTTPD_MAX_REQ_HDR_LEN = 512 B`) is too small for modern browsers and silently returns `HTTP 431 Request Header Fields Too Large` on form POSTs.**
@@ -458,11 +418,11 @@ Fix: explicitly set `Cache-Control: no-store` on the `GET /` response by using
 `request.into_ok_response()`. Without this, reconnecting to the SoftAP is the only reliable way
 to invalidate the cached HTML.
 
-**Provisioning UI: `wifi_pure::validate_password` enforces only `<= PASSWORD_MAX_LEN` — empty is treated as "open network", but a 1–7-character non-empty password is silently accepted by the pure crate even though WPA2-Personal requires `>= 8`.**
+**Provisioning UI: `juggler::wifi::validate_password` enforces only `<= PASSWORD_MAX_LEN` — empty is treated as "open network", but a 1–7-character non-empty password is silently accepted by the pure crate even though WPA2-Personal requires `>= 8`.**
 Symptom: a user typing a 4-char test password gets a "successfully provisioned" log
 (`Already provisioned: ... wifi_pass len=4 (secret)`), but the STA association will fail at boot
 because WPA2-Personal needs >= 8 bytes (`AP_PASSWORD_MIN_LEN`).
-Fix: `provisioning-pure::form::validate_wifi_password` adds a `TooShort { min: 8 }` error when
+Fix: `juggler::provisioning::form::validate_wifi_password` adds a `TooShort { min: 8 }` error when
 the value is non-empty and below the floor; the form adds `minlength="8"` to the input (HTML5
 `minlength` is only enforced when the field is non-empty, so open networks still work).
 
@@ -522,11 +482,11 @@ The SX1262 datasheet (§13.3.6, Rev 2.2) documents that when `SetDIO3AsTCXOCtrl`
 5. `Calibrate(0x7F)` — all blocks; the FSM now uses the TCXO reference
 6. wait BUSY
 
-**Secondary issue: `sx126x::wait_on_busy` is unbounded.** The crate spins with `while let Ok(true) = self.busy_pin.is_high() {}` — no timeout, no yield. This starves the FreeRTOS IDLE task, causes task-watchdog fires every 5 s, and hides which command stalled. The fix (implemented in `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`) replaces the opaque `init()` call with a step-by-step instrumented sequence where every command is logged before issuance, and busy-waits poll `get_status()` over SPI with a 1 ms `FreeRtos::delay_ms` yield and a 500-iteration (500 ms) hard cap. On timeout, `get_device_errors()` is read and logged before returning `LoraError::BusyTimeout`.
+**Secondary issue: `sx126x::wait_on_busy` is unbounded.** The crate spins with `while let Ok(true) = self.busy_pin.is_high() {}` — no timeout, no yield. This starves the FreeRTOS IDLE task, causes task-watchdog fires every 5 s, and hides which command stalled. The fix (implemented in `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`) replaces the opaque `init()` call with a step-by-step instrumented sequence where every command is logged before issuance, and busy-waits poll `get_status()` over SPI with a 1 ms `FreeRtos::delay_ms` yield and a 500-iteration (500 ms) hard cap. On timeout, `get_device_errors()` is read and logged before returning `LoraError::BusyTimeout`.
 
 **Also: TCXO startup delay was increased from 5 ms to 10 ms** as a conservative cold-start margin. The Heltec V3 TCXO is rated ≤2 ms, but 10 ms gives 5× headroom against oscillator startup jitter; the field is internal to the chip and does not extend the BUSY-wait — it tells the SX1262 how long to wait internally before driving any XOSC-dependent operation after the TCXO power rail is enabled.
 
-Fix is in: `crates/rustyfarian-esp-idf-lora/src/sx1262_driver.rs`, functions `init_sx1262` and `wait_busy_spi`.
+Fix is in: `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`, functions `init_sx1262` and `wait_busy_spi`.
 
 ---
 
