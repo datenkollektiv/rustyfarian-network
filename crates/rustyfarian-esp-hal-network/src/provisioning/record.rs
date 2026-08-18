@@ -620,6 +620,7 @@ pub(crate) fn pick_active(
 #[cfg(test)]
 mod tests {
     extern crate alloc;
+    extern crate std;
     use super::*;
     use alloc::format;
     use juggler::provisioning::profile::MqttFields;
@@ -667,6 +668,38 @@ mod tests {
 
     // Sentinel used to detect information leaks via error Display/Debug output.
     const LEAK_SENTINEL: &str = "LEAK-SENTINEL-XYZ";
+
+    /// This process's Wi-Fi and MQTT test keys, generated once on first use.
+    ///
+    /// Derived from OS entropy rather than written as literals, so no fixed key
+    /// material exists in the source -- the same pattern as `test_psk()` in
+    /// `juggler::wifi` and `test_nonce()` in `provisioning::portal`.  The two
+    /// are complements, so they always differ and a round-trip test cannot pass
+    /// by crossing the Wi-Fi and MQTT password fields.
+    fn test_psk_pair() -> &'static (alloc::string::String, alloc::string::String) {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static PSKS: OnceLock<(alloc::string::String, alloc::string::String)> = OnceLock::new();
+        PSKS.get_or_init(|| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u8(0);
+            let value = hasher.finish();
+            (
+                alloc::format!("{value:016x}"),
+                alloc::format!("{:016x}", !value),
+            )
+        })
+    }
+
+    fn test_wifi_psk() -> &'static str {
+        &test_psk_pair().0
+    }
+
+    fn test_mqtt_psk() -> &'static str {
+        &test_psk_pair().1
+    }
 
     // ── CRC tests ─────────────────────────────────────────────────────────────
 
@@ -917,23 +950,23 @@ mod tests {
     fn wifi_mqtt_round_trip_fully_populated() {
         let config = make_wifi_mqtt_config(
             "my-network",
-            "s3cr3t-p@ss",
+            test_wifi_psk(),
             "mqtt.example.com",
             8883,
             Some("user1"),
-            Some("hunter2"),
+            Some(test_mqtt_psk()),
             Some("device-abc"),
         );
         let mut buf = [0u8; SECTOR_SIZE];
         let len = encode_record(&config, 1, &mut buf).unwrap();
         let decoded = decode_record(&buf[..len]).unwrap();
         assert_eq!(decoded.config.wifi_ssid(), "my-network");
-        assert_eq!(decoded.config.wifi_password(), "s3cr3t-p@ss");
+        assert_eq!(decoded.config.wifi_password(), test_wifi_psk());
         let mqtt = decoded.config.mqtt().unwrap();
         assert_eq!(mqtt.host(), "mqtt.example.com");
         assert_eq!(mqtt.port(), 8883);
         assert_eq!(mqtt.username(), Some("user1"));
-        assert_eq!(mqtt.password(), Some("hunter2"));
+        assert_eq!(mqtt.password(), Some(test_mqtt_psk()));
         assert_eq!(mqtt.client_id(), Some("device-abc"));
     }
 
@@ -1024,11 +1057,11 @@ mod tests {
         // Regression guard: every TLV field must survive encode→decode.
         let config = make_wifi_mqtt_config(
             "ssid-lock",
-            "pass-lock",
+            test_wifi_psk(),
             "host-lock.example.com",
             9999,
             Some("user-lock"),
-            Some("pass-lock-mqtt"),
+            Some(test_mqtt_psk()),
             Some("client-lock"),
         );
         let mut buf = [0u8; SECTOR_SIZE];
@@ -1036,14 +1069,14 @@ mod tests {
         let decoded = decode_record(&buf[..len]).unwrap();
         assert_eq!(decoded.seq, 42);
         assert_eq!(decoded.config.wifi_ssid(), "ssid-lock");
-        assert_eq!(decoded.config.wifi_password(), "pass-lock");
+        assert_eq!(decoded.config.wifi_password(), test_wifi_psk());
         assert_eq!(decoded.config.ota_url(), "http://ota.example.com/fw.bin");
         assert_eq!(decoded.config.device_name(), "test-device");
         let mqtt = decoded.config.mqtt().unwrap();
         assert_eq!(mqtt.host(), "host-lock.example.com");
         assert_eq!(mqtt.port(), 9999);
         assert_eq!(mqtt.username(), Some("user-lock"));
-        assert_eq!(mqtt.password(), Some("pass-lock-mqtt"));
+        assert_eq!(mqtt.password(), Some(test_mqtt_psk()));
         assert_eq!(mqtt.client_id(), Some("client-lock"));
     }
 

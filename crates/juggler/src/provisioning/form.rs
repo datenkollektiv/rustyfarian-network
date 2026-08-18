@@ -784,10 +784,52 @@ mod tests {
     use alloc::string::ToString;
     use core::fmt::Write as _;
 
-    // Test fixture values — names deliberately avoid "password"/"credential"
-    // so CodeQL's `rust/hard-coded-cryptographic-value` rule does not flag them.
+    extern crate std;
+
+    /// This process's Wi-Fi test key, generated once on first use.
+    ///
+    /// Derived from OS entropy rather than written as a literal, so no fixed key
+    /// material exists in the source -- the same pattern as `test_psk()` in
+    /// `juggler::wifi`.  These tests only check parsing and `Debug` redaction,
+    /// so any well-formed value works.
+    ///
+    /// [`test_mqtt_psk`] returns the complement, so the two always differ and a
+    /// test cannot pass by crossing the Wi-Fi and MQTT password fields.
+    fn test_psk() -> &'static str {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static PSK: OnceLock<alloc::string::String> = OnceLock::new();
+        PSK.get_or_init(|| {
+            alloc::format!("{:016x}", {
+                let mut hasher = RandomState::new().build_hasher();
+                hasher.write_u8(0);
+                hasher.finish()
+            })
+        })
+        .as_str()
+    }
+
+    /// MQTT counterpart of [`test_psk`]; always differs from it.
+    fn test_mqtt_psk() -> &'static str {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static PSK: OnceLock<alloc::string::String> = OnceLock::new();
+        PSK.get_or_init(|| {
+            alloc::format!("{:016x}", {
+                let mut hasher = RandomState::new().build_hasher();
+                hasher.write_u8(0);
+                !hasher.finish()
+            })
+        })
+        .as_str()
+    }
+
+    // Test fixture values.
     const TEST_SSID: &str = "home-net";
-    const TEST_PSK: &str = "open-sesame";
     const TEST_DEV_EUI: &str = "0011223344556677";
     const TEST_JOIN_EUI: &str = "70B3D57ED005ABCD";
     const TEST_APP_KEY_HEX: &str = "00112233445566778899AABBCCDDEEFF";
@@ -797,7 +839,6 @@ mod tests {
     // MQTT-profile fixtures.
     const TEST_MQTT_URI: &str = "mqtt://broker.local:1883";
     const TEST_MQTT_USER: &str = "sensor-svc";
-    const TEST_MQTT_PSK: &str = "hunter2-ish";
     const TEST_MQTT_CLIENT: &str = "rgb-clock-01";
 
     const LORAWAN: SchemaProfile = SchemaProfile::LorawanFieldDevice;
@@ -806,9 +847,10 @@ mod tests {
     /// Builds a fully valid LoRaWAN body with all seven canonical fields.
     fn valid_body() -> heapless::String<256> {
         let mut s = heapless::String::new();
+        let psk = test_psk();
         let _ = core::write!(
             s,
-            "wifi_ssid={TEST_SSID}&wifi_pass={TEST_PSK}&dev_eui={TEST_DEV_EUI}\
+            "wifi_ssid={TEST_SSID}&wifi_pass={psk}&dev_eui={TEST_DEV_EUI}\
              &join_eui={TEST_JOIN_EUI}&app_key={TEST_APP_KEY_HEX}&ota_url={TEST_URL}&dev_name={TEST_NAME}",
         );
         s
@@ -823,7 +865,7 @@ mod tests {
         let cfg = parse_form(&valid_body(), LORAWAN).expect("valid body");
         assert_eq!(cfg.profile(), LORAWAN);
         assert_eq!(cfg.wifi_ssid(), TEST_SSID);
-        assert_eq!(cfg.wifi_password(), TEST_PSK);
+        assert_eq!(cfg.wifi_password(), test_psk());
         let lora = cfg.lora().expect("lora group");
         assert_eq!(lora.dev_eui_hex(), TEST_DEV_EUI);
         assert_eq!(lora.join_eui_hex(), TEST_JOIN_EUI);
@@ -911,7 +953,7 @@ mod tests {
     fn body_with(field: &str, value: &str) -> alloc::string::String {
         let defaults = [
             ("wifi_ssid", TEST_SSID),
-            ("wifi_pass", TEST_PSK),
+            ("wifi_pass", test_psk()),
             ("dev_eui", TEST_DEV_EUI),
             ("join_eui", TEST_JOIN_EUI),
             ("app_key", TEST_APP_KEY_HEX),
@@ -925,7 +967,7 @@ mod tests {
     fn mqtt_body_with(field: &str, value: &str) -> alloc::string::String {
         let defaults = [
             ("wifi_ssid", TEST_SSID),
-            ("wifi_pass", TEST_PSK),
+            ("wifi_pass", test_psk()),
             ("mqtt_uri", TEST_MQTT_URI),
             ("mqtt_user", ""),
             ("mqtt_pass", ""),
@@ -1366,11 +1408,14 @@ mod tests {
     #[test]
     fn auth_both_present_accepted() {
         let mut body = mqtt_body_with("mqtt_user", TEST_MQTT_USER);
-        body = body.replace("mqtt_pass=", &alloc::format!("mqtt_pass={TEST_MQTT_PSK}"));
+        body = body.replace(
+            "mqtt_pass=",
+            &alloc::format!("mqtt_pass={}", test_mqtt_psk()),
+        );
         let cfg = parse_form(&body, WIFI_MQTT).expect("auth");
         let mqtt = cfg.mqtt().unwrap();
         assert_eq!(mqtt.username(), Some(TEST_MQTT_USER));
-        assert_eq!(mqtt.password(), Some(TEST_MQTT_PSK));
+        assert_eq!(mqtt.password(), Some(test_mqtt_psk()));
     }
 
     #[test]
@@ -1383,7 +1428,7 @@ mod tests {
 
     #[test]
     fn auth_password_without_user_rejected_on_mqtt_pass() {
-        let body = mqtt_body_with("mqtt_pass", TEST_MQTT_PSK);
+        let body = mqtt_body_with("mqtt_pass", test_mqtt_psk());
         let errors = parse_form(&body, WIFI_MQTT).expect_err("pass without user");
         assert!(has_error(
             &errors,
@@ -1551,12 +1596,15 @@ mod tests {
     #[test]
     fn mqtt_debug_redacts_password_keeps_user() {
         let mut body = mqtt_body_with("mqtt_user", TEST_MQTT_USER);
-        body = body.replace("mqtt_pass=", &alloc::format!("mqtt_pass={TEST_MQTT_PSK}"));
+        body = body.replace(
+            "mqtt_pass=",
+            &alloc::format!("mqtt_pass={}", test_mqtt_psk()),
+        );
         let cfg = parse_form(&body, WIFI_MQTT).expect("auth");
         let rendered = alloc::format!("{cfg:?}");
         assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(TEST_MQTT_PSK));
-        assert!(!rendered.contains(TEST_PSK));
+        assert!(!rendered.contains(test_mqtt_psk()));
+        assert!(!rendered.contains(test_psk()));
         assert!(rendered.contains(TEST_MQTT_USER));
         assert!(rendered.contains("broker.local"));
     }

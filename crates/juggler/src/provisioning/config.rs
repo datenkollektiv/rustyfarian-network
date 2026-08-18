@@ -208,13 +208,36 @@ mod tests {
     use crate::provisioning::SchemaProfile;
     use alloc::format;
 
-    // Fixture values named to avoid CodeQL's hardcoded-credential rule.
-    const TEST_PSK: &str = "open-sesame";
+    extern crate std;
+
     const TEST_APP_KEY_HEX: &str = "00112233445566778899AABBCCDDEEFF";
 
+    /// This process's Wi-Fi test key, generated once on first use.
+    ///
+    /// Derived from OS entropy rather than written as a literal, so no fixed key
+    /// material exists in the source -- the same pattern as `test_psk()` in
+    /// `juggler::wifi`.  These tests only check parsing and `Debug` redaction,
+    /// so any well-formed value works.
+    fn test_psk() -> &'static str {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static PSK: OnceLock<alloc::string::String> = OnceLock::new();
+        PSK.get_or_init(|| {
+            alloc::format!("{:016x}", {
+                let mut hasher = RandomState::new().build_hasher();
+                hasher.write_u8(0);
+                hasher.finish()
+            })
+        })
+        .as_str()
+    }
+
     fn parsed_config() -> crate::provisioning::ProvisioningConfig {
+        let psk = test_psk();
         let body = format!(
-            "wifi_ssid=home&wifi_pass={TEST_PSK}&dev_eui=0011223344556677\
+            "wifi_ssid=home&wifi_pass={psk}&dev_eui=0011223344556677\
              &join_eui=70B3D57ED005ABCD&app_key={TEST_APP_KEY_HEX}\
              &ota_url=http://example.com/fw.bin&dev_name=hive"
         );
@@ -226,7 +249,7 @@ mod tests {
         let cfg = parsed_config();
         let rendered = format!("{cfg:?}");
         assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(TEST_PSK));
+        assert!(!rendered.contains(test_psk()));
         assert!(!rendered.contains(TEST_APP_KEY_HEX));
     }
 

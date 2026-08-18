@@ -305,8 +305,34 @@ The slow path (Vec-based rewrite for `Read` operations) is safe because all six 
 
 **CodeQL's `rust/hard-coded-cryptographic-value` query flags string literals reaching parameters named `password`, `credential`, or similar — even in test code.**
 The query traces taint from any string literal into a credential-named parameter and raises a Critical alert regardless of context; test helpers like `WiFiConfig::new("ssid", "pass")` trigger it on the second parameter.
-Fix: define test fixtures with non-credential names (e.g. `TEST_PSK`) and route them through a helper (e.g. `test_config()`); for empty passwords use `&String::new()` instead of `""`.
-The indirection breaks the direct literal-to-credential-parameter flow that CodeQL traces — see the `crates/juggler/src/wifi/` test module.
+
+**Renaming the constant or routing it through a helper does NOT clear the alert.**
+This was recorded here as a fix and is wrong — it cost a second failed remediation attempt (PR #91, 2026-08-18).
+The query is interprocedural taint tracking: the *source* is the literal, not the binding name, and flow follows `const` bindings and function calls to the sink.
+`const TEST_PSK: &str = "open-sesame"` passed through `test_config()` is the same finding as the inline literal.
+Evidence: that exact shape was already in `crates/juggler/src/wifi/mod.rs` and the alerts stayed open.
+
+Tricks that *do* silence it — building the value from a `[u8; N]` via `core::str::from_utf8`, for instance — work by breaking CodeQL's dataflow at an unmodelled conversion, not by removing the hardcoded value.
+They are obfuscation, they make the fixture unreadable, and they regress silently when the query pack adds the missing flow summary.
+Do not use them.
+
+**Correct handling: generate the fixture at runtime from real entropy.**
+This removes the key material from the source — what the rule actually asks for — and the alert closes on its own.
+Both sites in this workspace use a `OnceLock<String>` filled from `std::collections::hash_map::RandomState`, generated once per test process:
+`test_psk()` in `crates/juggler/src/wifi/mod.rs` (16 hex digits) and `test_nonce()` in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs` (8 hex digits).
+
+**A test that compares the fixture against a request body is not a blocker** — build the body at runtime too.
+The `nonce_matches` test formats both bodies with `alloc::format!("_nonce={}&...")`, and `test_nonce_mismatch()` returns the bitwise complement so the mismatch assertion cannot flake on an unlucky draw.
+What such a test verifies is match-versus-mismatch behaviour, not any particular value, so nothing is lost.
+An earlier revision of this entry claimed this case required dismissal; that was too pessimistic.
+
+Dismissal ("Used in tests" in the code scanning UI) remains valid where a fixture genuinely pins an externally-fixed value, but prefer generation.
+Path-based exclusion via a CodeQL config is not an option for fixtures in inline `#[cfg(test)]` modules, since ignoring the file would also drop the production code in it from analysis.
+
+Two further mechanics that wasted time:
+alerts on `/security/code-scanning` are per-branch and reflect the **default branch**, so nothing closes until the change merges to `main` and the push-triggered scan reruns;
+and the alert list is not public — reading it needs repo write access plus `security-events`, so a fix cannot be targeted from a clone alone.
+Always read the real alert locations before editing; both failed attempts guessed at them.
 
 ## OTA MVP — Three-Crate Triad
 
