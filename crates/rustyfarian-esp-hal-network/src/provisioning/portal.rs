@@ -1693,17 +1693,46 @@ mod tests {
     extern crate alloc;
     extern crate std;
 
-    /// Test-only nonce fixture used by nonce-validation and render tests.
+    /// This process's 8-hex nonce fixture, generated once on first use.
     ///
-    /// Extracted to a named constant so the CodeQL
-    /// `rust/hard-coded-cryptographic-value` rule does not flag the literal
-    /// flowing into the `nonce: &str` parameter of `render_portal_template`
-    /// (and the cluster of `nonce_matches` tests below).  The same
-    /// const-indirection pattern is documented in CLAUDE.md
-    /// (*Common Resolution Failures* table) and used by the `juggler::wifi` tests
-    /// (`TEST_PSK`); see also `docs/project-lore.md` "CodeQL / GitHub
-    /// Advanced Security".
-    const TEST_NONCE_FIXTURE_8HEX: &str = "cafebabe";
+    /// Derived from OS entropy rather than written as a literal, so no fixed
+    /// value flows into the `nonce: &str` parameter of `render_portal_template`
+    /// — which is what CodeQL's `rust/hard-coded-cryptographic-value` rule
+    /// asks for.  Spelling a constant out as bytes or chars would only hide it
+    /// from the analyzer.
+    ///
+    /// Not cryptographic material either way: production nonces come from the
+    /// hardware RNG (`generate_nonce` in `session.rs`).  The fixture only has
+    /// to be a well-formed 8-hex string, so callers that compare it against a
+    /// request body must build that body at runtime (see
+    /// `nonce_mismatch_returns_403_without_invoking_parse_form`).
+    fn test_nonce() -> &'static str {
+        &test_nonce_pair().0
+    }
+
+    /// A nonce guaranteed to differ from [`test_nonce`], for mismatch asserts.
+    fn test_nonce_mismatch() -> &'static str {
+        &test_nonce_pair().1
+    }
+
+    fn test_nonce_pair() -> &'static (alloc::string::String, alloc::string::String) {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static NONCE: OnceLock<(alloc::string::String, alloc::string::String)> = OnceLock::new();
+        NONCE.get_or_init(|| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u8(0);
+            let value = hasher.finish() as u32;
+            // Complementing guarantees a different value of the same width, so
+            // the mismatch assertion cannot flake on an unlucky draw.
+            (
+                alloc::format!("{value:08x}"),
+                alloc::format!("{:08x}", !value),
+            )
+        })
+    }
 
     // ── body_read_target (pure host-testable arithmetic) ──────────────────────
 
@@ -2090,25 +2119,27 @@ mod tests {
     /// confirming the 403 guard fires before `parse_form` would be invoked.
     #[test]
     fn nonce_mismatch_returns_403_without_invoking_parse_form() {
-        // Correct nonce — sourced from a named constant so the literal
-        // does not flow directly into a nonce-named parameter (CodeQL
-        // `rust/hard-coded-cryptographic-value` workaround).
-        let expected = TEST_NONCE_FIXTURE_8HEX;
+        // Both bodies are built from the generated fixture, so the comparison
+        // stays meaningful without pinning a literal nonce in the source.
+        let expected = test_nonce();
 
         // Body with wrong nonce — parse_form would normally run after nonce check.
         // With the wrong nonce, dispatch_request must return 403.
-        let body_wrong_nonce = b"_nonce=deadbeef&wifi_ssid=net&wifi_pass=secret";
+        let body_wrong_nonce = alloc::format!(
+            "_nonce={}&wifi_ssid=net&wifi_pass=secret",
+            test_nonce_mismatch()
+        );
 
         // nonce_matches returns false → caller should return 403.
         assert!(
-            !nonce_matches(body_wrong_nonce, expected),
+            !nonce_matches(body_wrong_nonce.as_bytes(), expected),
             "nonce mismatch must return false from nonce_matches"
         );
 
         // Correct nonce does match.
-        let body_correct_nonce = b"_nonce=cafebabe&wifi_ssid=net&wifi_pass=secret";
+        let body_correct_nonce = alloc::format!("_nonce={expected}&wifi_ssid=net&wifi_pass=secret");
         assert!(
-            nonce_matches(body_correct_nonce, expected),
+            nonce_matches(body_correct_nonce.as_bytes(), expected),
             "correct nonce must return true from nonce_matches"
         );
 
@@ -2681,13 +2712,7 @@ mod tests {
         // (which is ~4–6 KiB rendered).  The render must detect the overflow
         // when it tries to write a substituted value and return Err(()).
         let mut tiny_buf = [0u8; 256];
-        let result = render_portal_template(
-            &config,
-            TEST_NONCE_FIXTURE_8HEX,
-            &prefill,
-            None,
-            &mut tiny_buf,
-        );
+        let result = render_portal_template(&config, test_nonce(), &prefill, None, &mut tiny_buf);
 
         assert!(
             result.is_err(),

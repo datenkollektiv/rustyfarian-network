@@ -20,11 +20,42 @@
 //   just test-ota          → -p juggler --features ota
 //   just test-provisioning → -p juggler --features provisioning
 
+/// This process's Wi-Fi test key, generated once on first use.
+///
+/// Derived from OS entropy rather than written as a literal, so no fixed key
+/// material exists in the source — the same pattern as `test_psk()` in
+/// `juggler::wifi`'s unit tests and `test_nonce()` in the esp-hal portal tests.
+/// These are public-path smoke tests, so any value within
+/// `AP_PASSWORD_MIN_LEN..=PASSWORD_MAX_LEN` works; the result is 16 lowercase
+/// hex digits, so length and character class are identical on every run.
+#[allow(dead_code)] // not every feature combination compiles a test that uses it
+fn test_psk() -> &'static str {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+
+    static PSK: OnceLock<String> = OnceLock::new();
+    PSK.get_or_init(|| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(0);
+        let mut psk = String::new();
+        for byte in hasher.finish().to_le_bytes() {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                psk.push(char::from_digit(u32::from(nibble), 16).expect("nibble is < 16"));
+            }
+        }
+        psk
+    })
+    .as_str()
+}
+
 // ── wifi ─────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "wifi")]
 #[test]
 fn wifi_public_paths() {
+    const TEST_WIFI_SSID: &str = "TestNet";
+
     use juggler::wifi::{
         validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name,
         ApConfig, ConnectMode, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_CHANNEL_MAX,
@@ -43,30 +74,30 @@ fn wifi_public_paths() {
     let _: u64 = POLL_INTERVAL_MS;
 
     // Validator functions are callable.
-    assert!(validate_ssid("TestNet").is_ok());
-    assert!(validate_password("hunter2").is_ok());
+    assert!(validate_ssid(TEST_WIFI_SSID).is_ok());
+    assert!(validate_password(test_psk()).is_ok());
     assert_eq!(wifi_disconnect_reason_name(201), Some("NO_AP_FOUND"));
     assert_eq!(wifi_disconnect_reason_name(0), None);
 
     // WiFiConfig builder chain.
-    let cfg = WiFiConfig::new("TestNet", "hunter2")
+    let cfg = WiFiConfig::new(TEST_WIFI_SSID, test_psk())
         .with_timeout(60)
         .with_power_save(WifiPowerSave::MinModem)
         .with_tx_power(TxPowerLevel::Low);
-    assert_eq!(cfg.ssid, "TestNet");
+    assert_eq!(cfg.ssid, TEST_WIFI_SSID);
     assert!(matches!(
         cfg.connect_mode,
         ConnectMode::Blocking { timeout_secs: 60 }
     ));
 
-    let cfg_nb = WiFiConfig::new("Net", "pw").connect_nonblocking();
+    let cfg_nb = WiFiConfig::new("Net", test_psk()).connect_nonblocking();
     assert!(matches!(cfg_nb.connect_mode, ConnectMode::NonBlocking));
 
     // TxPowerLevel::to_quarter_dbm is reachable.
     assert_eq!(TxPowerLevel::Medium.to_quarter_dbm(), 52i8);
 
     // ApConfig builder chain.
-    let ap = ApConfig::wpa2("RustyNet", "password12")
+    let ap = ApConfig::wpa2("RustyNet", test_psk())
         .with_channel(6)
         .with_max_connections(2)
         .with_tx_power(TxPowerLevel::Low);
@@ -85,11 +116,13 @@ fn wifi_public_paths() {
 #[cfg(all(feature = "wifi", feature = "mock"))]
 #[test]
 fn wifi_mock_public_paths() {
+    const TEST_WIFI_SSID: &str = "ssid";
+
     use juggler::wifi::mock::{MockWifiDriver, MockWifiError};
     use juggler::wifi::WifiDriver;
 
     let mut drv = MockWifiDriver::new();
-    drv.configure("ssid", "psk").unwrap();
+    drv.configure(TEST_WIFI_SSID, test_psk()).unwrap();
     drv.start().unwrap();
     drv.connect().unwrap();
     assert!(drv.is_connected().unwrap());
@@ -527,11 +560,21 @@ fn provisioning_public_paths() {
     assert!(ssid.as_str().ends_with("AB12"));
 
     // parse_form returns a typed result; field-error types are reachable from it.
-    let body = "wifi_ssid=MyNet&wifi_password=hunter2&\
-                dev_eui=0000000000000001&join_eui=0000000000000002&\
-                app_key=00000000000000000000000000000003&\
-                ota_url=http%3A%2F%2Fota.local%2Ffirmware.bin&device_name=node01";
-    let result = parse_form(body, SchemaProfile::LorawanFieldDevice);
+    const TEST_WIFI_SSID: &str = "MyNet";
+    let test_wifi_psk = test_psk();
+    const TEST_DEV_EUI: &str = "0000000000000001";
+    const TEST_JOIN_EUI: &str = "0000000000000002";
+    const TEST_APP_KEY_HEX: &str = "00000000000000000000000000000003";
+    const TEST_OTA_URL_ENCODED: &str = "http%3A%2F%2Fota.local%2Ffirmware.bin";
+    const TEST_DEVICE_NAME: &str = "node01";
+
+    let body = format!(
+        "wifi_ssid={TEST_WIFI_SSID}&wifi_password={test_wifi_psk}&\
+         dev_eui={TEST_DEV_EUI}&join_eui={TEST_JOIN_EUI}&\
+         app_key={TEST_APP_KEY_HEX}&\
+         ota_url={TEST_OTA_URL_ENCODED}&device_name={TEST_DEVICE_NAME}"
+    );
+    let result = parse_form(&body, SchemaProfile::LorawanFieldDevice);
     // Either Ok(ProvisioningConfig) or Err(FieldErrors) — both types must be reachable.
     fn _uses_config(_: &ProvisioningConfig) {}
     fn _uses_field_errors(_: &FieldErrors) {}

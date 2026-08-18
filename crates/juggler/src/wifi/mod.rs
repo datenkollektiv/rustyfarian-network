@@ -448,18 +448,47 @@ pub trait WifiDriver {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use alloc::string::String;
 
-    // Test fixture values — names deliberately avoid "password"/"credential"
-    // so that CodeQL's `rust/hard-coded-cryptographic-value` rule does not
-    // flag them as hardcoded secrets.
     const TEST_SSID: &str = "test-net";
-    const TEST_PSK: &str = "open-sesame";
+
+    /// This process's Wi-Fi test key, generated once on first use.
+    ///
+    /// Derived from OS entropy rather than written as a literal, so no fixed
+    /// key material exists in the source at all — which is what CodeQL's
+    /// `rust/hard-coded-cryptographic-value` rule actually asks for. Spelling a
+    /// constant out as bytes or chars would only hide it from the analyzer.
+    ///
+    /// Any value in `AP_PASSWORD_MIN_LEN..=PASSWORD_MAX_LEN` works: the tests
+    /// below exercise validation, builder defaults, and `Debug` redaction, and
+    /// none of them depend on a specific value. The result is 16 lowercase hex
+    /// digits, so length and character class are identical on every run.
+    fn test_psk() -> &'static str {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::OnceLock;
+
+        static PSK: OnceLock<String> = OnceLock::new();
+        PSK.get_or_init(|| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u8(0);
+            let mut psk = String::new();
+            for byte in hasher.finish().to_le_bytes() {
+                for nibble in [byte >> 4, byte & 0x0f] {
+                    psk.push(char::from_digit(u32::from(nibble), 16).expect("nibble is < 16"));
+                }
+            }
+            psk
+        })
+        .as_str()
+    }
 
     /// Shorthand for building a `WiFiConfig` with test fixture values.
     fn test_config() -> WiFiConfig<'static> {
-        WiFiConfig::new(TEST_SSID, TEST_PSK)
+        WiFiConfig::new(TEST_SSID, test_psk())
     }
 
     // ── Validation tests (migrated from the former rustyfarian-network-pure) ────────
@@ -541,7 +570,7 @@ mod tests {
     fn wifi_config_new_defaults() {
         let config = test_config();
         assert_eq!(config.ssid, TEST_SSID);
-        assert_eq!(config.password, TEST_PSK);
+        assert_eq!(config.password, test_psk());
         match config.connect_mode {
             ConnectMode::Blocking { timeout_secs } => assert_eq!(timeout_secs, 30),
             ConnectMode::NonBlocking => panic!("expected Blocking"),
@@ -570,7 +599,7 @@ mod tests {
         let mut driver = mock::MockWifiDriver::new();
         assert!(!driver.is_connected().unwrap());
 
-        driver.configure(TEST_SSID, TEST_PSK).unwrap();
+        driver.configure(TEST_SSID, test_psk()).unwrap();
         assert!(driver.configured);
 
         driver.start().unwrap();
@@ -675,7 +704,7 @@ mod tests {
         let mut driver = mock::MockWifiDriver::new();
         driver.fail_connect = true;
 
-        driver.configure(TEST_SSID, TEST_PSK).unwrap();
+        driver.configure(TEST_SSID, test_psk()).unwrap();
         driver.start().unwrap();
         assert!(driver.connect().is_err());
         assert!(!driver.is_connected().unwrap());
@@ -695,9 +724,9 @@ mod tests {
 
     #[test]
     fn ap_config_wpa2_defaults() {
-        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK);
+        let config = ApConfig::wpa2(TEST_SSID, test_psk());
         assert_eq!(config.ssid, TEST_SSID);
-        assert_eq!(config.password, Some(TEST_PSK));
+        assert_eq!(config.password, Some(test_psk()));
         assert_eq!(config.channel, AP_CHANNEL_MIN);
         assert_eq!(config.max_connections, AP_MAX_CONNECTIONS_DEFAULT);
         assert_eq!(config.tx_power, TxPowerLevel::Medium);
@@ -705,7 +734,7 @@ mod tests {
 
     #[test]
     fn ap_config_chained_builders() {
-        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK)
+        let config = ApConfig::wpa2(TEST_SSID, test_psk())
             .with_channel(6)
             .with_max_connections(2)
             .with_tx_power(TxPowerLevel::Low);
@@ -717,7 +746,7 @@ mod tests {
     #[test]
     fn ap_config_valid_passes() {
         assert!(validate_ap_config(&ApConfig::open(TEST_SSID)).is_ok());
-        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, TEST_PSK)).is_ok());
+        assert!(validate_ap_config(&ApConfig::wpa2(TEST_SSID, test_psk())).is_ok());
     }
 
     #[test]
@@ -756,10 +785,10 @@ mod tests {
 
     #[test]
     fn ap_config_debug_redacts_password() {
-        let config = ApConfig::wpa2(TEST_SSID, TEST_PSK);
+        let config = ApConfig::wpa2(TEST_SSID, test_psk());
         let rendered = alloc::format!("{:?}", config);
         assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(TEST_PSK));
+        assert!(!rendered.contains(test_psk()));
     }
 
     #[test]
