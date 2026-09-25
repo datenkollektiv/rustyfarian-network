@@ -23,7 +23,7 @@ rustup then selects the correct toolchain automatically in any shell session wit
 A CI job that installs only `stable` (e.g. via `dtolnay/rust-toolchain@stable`) will fail with
 `error: custom toolchain 'esp' specified in override file '...rust-toolchain.toml' is not installed`
 even though `cargo fmt` itself does not compile ESP-IDF code.
-Fix: replace `dtolnay/rust-toolchain@stable` in the `format` job with `esp-rs/xtensa-toolchain@v1.6`
+Fix: replace `dtolnay/rust-toolchain@stable` in the `format` job with `esp-rs/xtensa-toolchain@v1.7.0`
 (`ldproxy: false` suffices — the linker proxy is not needed for a format check).
 The `esp` toolchain ships `rustfmt`, so no separate stable step is required.
 
@@ -117,6 +117,18 @@ Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test]
 ---
 
 ## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)
+
+**`esp-radio` gates every bare-metal `esp-hal` wave: `esp-radio 0.18.0` requires `esp-hal ~1.1.0-rc.0`, so bumping the workspace to `esp-hal 1.2.x` fails at the resolver, not the compiler.**
+The error is `failed to select a version for esp-hal ... required by package esp-radio v0.18.0 ... versions that meet the requirements ~1.1.0-rc.0 are: 1.1.2, 1.1.1, 1.1.0`, which never names the real constraint (no stable `esp-radio` exists for the newer `esp-hal` minor).
+The only `esp-radio` targeting `esp-hal ~1.2.0` is `1.0.0-beta.1` (2026-09-15; `beta.2` was yanked), so the September 2026 wave that `rustyfarian-ws2812 0.7.0` adopted is unreachable here without taking a pre-release into the published Wi-Fi driver.
+Fix: before planning a wave, read the sparse index (`curl -s https://index.crates.io/es/p-/esp-radio`) and confirm a non-prerelease `esp-radio` whose `esp-hal` requirement matches the target minor; resolve the candidate pin set on a scratch crate under `tmp/` (`cargo generate-lockfile`) before touching the workspace.
+Every companion crate follows the same gate: `rustyfarian-esp-hal-ws2812 0.7` pins `esp-hal =1.2.2`, so it is blocked too — see `audit/2026-09-25-quarterly-plan.md` (local) and the `CHANGELOG.md` Unreleased entry.
+
+**Two semver-incompatible `pennant` versions in one graph make `StatusLed` two different traits: a `Ws2812Rmt` from `rustyfarian-esp-hal-ws2812 0.6` implements `pennant 0.6::StatusLed`, and a crate that imports `pennant 0.7::StatusLed` gets `E0599 no method named set_color` on it.**
+The type clearly implements "StatusLed", but trait identity is per crate version, so the method is invisible and the error message never mentions the second `pennant`.
+This surfaces whenever the ws2812 tiers diverge — as of 2026-09-25 the IDF driver is on 0.7 (`pennant ^0.7`) and the HAL driver on 0.6 (`pennant ^0.6`).
+Fix: `rustyfarian-esp-hal-network` declares `pennant = "0.6"` directly instead of `workspace = true` while the split lasts; per ADR 005 no consumer uses both tiers, so the two re-exported `StatusLed` traits never meet. Diagnose with `cargo tree -i pennant`.
+
 
 **`esp-radio 0.18` deleted the `smoltcp` feature and the `smoltcp::phy::Device` impl on `WifiDevice` — the bare-metal Wi-Fi controller is now async-only and tied to `embassy-net`.**
 The 0.17 `smoltcp` Cargo feature is gone; the `wifi` feature now pulls `embassy-net-driver` instead.

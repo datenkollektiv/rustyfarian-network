@@ -160,7 +160,13 @@ esp32s3 = [
 juggler          = { workspace = true, default-features = false }
 log              = { workspace = true }
 embedded-hal     = { workspace = true }
-pennant          = { workspace = true }
+# Declared directly (not via the workspace table): `rustyfarian-esp-hal-ws2812 0.6`
+# implements `pennant 0.6`'s `StatusLed`, so this crate's `StatusLed` re-export and
+# `S: StatusLed` bounds (wifi, lora) must be the 0.6 trait for a `Ws2812Rmt` to
+# satisfy them, and `hal_c6_connect_async_led` needs it in scope for `set_color`.
+# Revert to `workspace = true` when the HAL driver moves to 0.7 with the next
+# bare-metal wave (see root Cargo.toml).
+pennant          = { version = "0.6", features = ["hal"] }
 rgb              = { workspace = true }
 # TODO post-1.0: gate embassy-sync and heapless on the `provisioning` feature.
 # Currently always-on because session.rs references these types unconditionally

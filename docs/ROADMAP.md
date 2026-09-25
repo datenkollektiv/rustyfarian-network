@@ -1,10 +1,11 @@
 # Roadmap
 
-*Last updated: July 2026*
+*Last updated: September 2026*
 
 ## Context & recent milestones
 
-The bare-metal stack is aligned on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6.
+The bare-metal stack stays on the April 2026 esp-hal wave (`esp-hal 1.1.0` / `esp-radio 0.18.0` / `esp-rtos 0.3.0` / embassy 0.10), hardware-validated on ESP32-C3 and ESP32-C6, by constraint rather than choice: `esp-radio 0.18` is the newest stable esp-radio and it cannot resolve against `esp-hal 1.2`, so the September 2026 wave (which `rustyfarian-ws2812 0.7.0` adopted) waits for `esp-radio 1.0.0` stable; until then the HAL tier lags ws2812 by one release (`rustyfarian-esp-hal-ws2812 0.6`, `pennant 0.6` declared directly).
+The ESP-IDF tier moved to the September 2026 stack on 2026-09-25 (`esp-idf-svc 0.53` / `esp-idf-hal 0.47` / `esp-idf-sys 0.38.1`, `rustyfarian-esp-idf-ws2812 0.7`, `pennant 0.7`), compile-verified; the wave decision is recorded in the `CHANGELOG.md` Unreleased entry for the September 2026 ESP-IDF stack.
 The bare-metal Wi-Fi surface is async-only — `esp-radio 0.18` removed direct `smoltcp` integration and made the controller async-only, so `WiFiManager::init_async` + `AsyncWifiHandle` is the single public path.
 TTN v3 EU868 OTAA join and the first uplink were validated on hardware (2026-06-17, Heltec V3); the remaining Phase 5 work is the first downlink (FPort 10) and session persistence.
 A May 2026 deep-dive review surfaced a set of workspace-hygiene and architecture-clarity items now tracked in Near and Midterm: README crate-status table, pure-crate scope ADR, OTA security model, contract tests, and `WifiDriver` trait documentation.

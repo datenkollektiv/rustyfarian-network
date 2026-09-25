@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.6
+        uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
           ldproxy: true
@@ -40,7 +40,7 @@ jobs:
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
       - name: Setup just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
@@ -59,10 +59,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.6
+        uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
           ldproxy: true
@@ -76,7 +76,7 @@ jobs:
         run: cp .cargo/config.toml.dist .cargo/config.toml
 
       - name: Setup just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Check STA-only (wifi feature with SoftAP disabled)
         run: just check-sta-only

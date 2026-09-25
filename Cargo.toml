@@ -24,14 +24,14 @@ rgb = "0.8"
 
 # ESP-IDF dependencies
 embuild = "0.33"
-esp-idf-svc = "0.52"
-esp-idf-hal = "0.46"
+esp-idf-svc = "0.53"
+esp-idf-hal = "0.47"
 embedded-hal = "1"
 embedded-svc = "0.29"
 
 # LoRa / LoRaWAN dependencies
 heapless = "0.9"
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 lorawan-device = { version = "0.12", default-features = false, features = ["default-crypto", "region-eu868", "region-us915"] }
 lora-modulation = "0.1"
 sx126x = "0.3"
@@ -69,9 +69,14 @@ esp-backtrace = { version = "=0.19.0", default-features = false, features = ["pa
 ssd1306 = "0.9"
 embedded-graphics = "0.8"
 
-# Cross-repo dependencies — rustyfarian-ws2812 v0.6.0 wave, resolves from crates.io.
+# Cross-repo dependencies — rustyfarian-ws2812, resolves from crates.io.
 # `hal` feature pulls in `SimpleLed` (the `embedded-hal` `OutputPin` adapter for
-# simple on/off GPIO LEDs), re-exported by the Wi-Fi and MQTT crates.
-pennant = { version = "0.6", features = ["hal"] }
-rustyfarian-esp-idf-ws2812 = { version = "0.6" }
+# simple on/off GPIO LEDs), re-exported by both tier crates.
+# The IDF driver and `pennant` follow the v0.7.0 wave (2026-09-25). The HAL driver
+# stays on v0.6.0 because v0.7.0 pins `esp-hal =1.2.2`, which `esp-radio 0.18`
+# (the newest stable esp-radio) cannot resolve against; it moves with the next
+# bare-metal wave once `esp-radio 1.0.0` is stable. `rustyfarian-esp-hal-network`
+# therefore declares `pennant 0.6` directly instead of using this entry.
+pennant = { version = "0.7", features = ["hal"] }
+rustyfarian-esp-idf-ws2812 = { version = "0.7" }
 rustyfarian-esp-hal-ws2812 = { version = "0.6", default-features = false, features = ["pennant"] }
