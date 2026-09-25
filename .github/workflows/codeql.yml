@@ -21,10 +21,10 @@ jobs:
     name: Analyze Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Xtensa Rust toolchain
-        uses: esp-rs/xtensa-toolchain@v1.6
+        uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           default: true
           ldproxy: false

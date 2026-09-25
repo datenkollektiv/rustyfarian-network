@@ -73,7 +73,6 @@ Key crates to check each month:
 | `lora-modulation`   | range         | patch-safe                                 |
 | `sx126x`            | range         | patch-safe                                 |
 | `static_cell`       | range         | patch-safe                                 |
-| `embedded-io-async` | range         | patch-safe                                 |
 
 Check with:
 
@@ -107,9 +106,12 @@ cargo search rustyfarian-esp-hal-ws2812
 cargo search rustyfarian-esp-idf-ws2812
 ```
 
-Current: `0.6.0`. These crates now resolve from crates.io (switched from git deps
-when all three HAL driver crates were published). A ws2812 minor or major bump that
-changes esp-hal version pins belongs to the quarterly wave cycle, not monthly.
+Current: `pennant 0.7.0`, `rustyfarian-esp-idf-ws2812 0.7.0`, `rustyfarian-esp-hal-ws2812 0.6.0`
+(since 2026-09-25). These crates resolve from crates.io. The HAL driver lags one release
+because `0.7.0` pins `esp-hal =1.2.2`, which `esp-radio 0.18` cannot resolve against;
+`rustyfarian-esp-hal-network` therefore declares `pennant 0.6` directly instead of via
+the workspace table. A ws2812 minor or major bump that changes esp-hal version pins
+belongs to the quarterly wave cycle, not monthly.
 
 ### Security scanning
 
@@ -166,12 +168,17 @@ Watch for `rust/hard-coded-cryptographic-value` CodeQL alerts in test code — u
 - [ ] Check `pennant` / `rustyfarian-esp-*-ws2812` for new crates.io releases
 - [ ] Verify all five CI workflows are green on `main`
 - [ ] Check RUSTSEC-2023-0089 exception — is an upgrade path now available?
+- [ ] `cargo audit` yanked-crate warnings — resolvable in range via `just update`?
 
 ### Quarterly checklist
 
 - [ ] Everything in the monthly checklist
 - [ ] Evaluate minor version bumps for all non-pinned crates
 - [ ] Evaluate esp-hal / embassy wave upgrade (check `esp-hal` release notes for new wave)
+- [ ] Before planning a bare-metal wave: confirm `esp-radio` has a **stable** (non-prerelease)
+      release whose `esp-hal` requirement matches the target `esp-hal` minor —
+      `curl -s https://index.crates.io/es/p-/esp-radio` lists every version with its deps.
+      Without it the wave cannot resolve (2026-09-25: `esp-hal 1.2` needs `esp-radio 1.0.0-beta.x`)
 - [ ] Evaluate `ws2812` minor/major bump alongside esp-hal wave
 - [ ] Review `deny.toml` advisory exceptions — resolve any that now have a fix
 - [ ] Review `esp-idf-svc` + `esp-idf-hal` minor bumps (can be breaking)
