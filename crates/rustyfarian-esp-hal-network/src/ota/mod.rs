@@ -7,12 +7,13 @@
 //!
 //! # Firmware metadata (re-exported)
 //!
-//! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], and the
-//! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]) are re-exported from
+//! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
+//! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
+//! policy ([`decide_update`], [`UpdateDecision`]) are re-exported from
 //! `juggler::ota` here — matching the `wifi`/`espnow` domains — so a
 //! version-gated updater (parse a sidecar digest + version via
-//! [`ImageMetadata::parse`], compare [`Version`]) needs only this crate and no
-//! separate `juggler` dependency.
+//! [`ImageMetadata::parse`], compare [`Version`] via [`decide_update`]) needs
+//! only this crate and no separate `juggler` dependency.
 
 // Internal HTTP/1.1 GET client — implementation detail per ADR 011 §2.
 // Module is private; no item in this module is part of the public API.
@@ -22,7 +23,8 @@ mod http;
 // `wifi`/`espnow` modules, so OTA consumers import metadata/version types from
 // this crate rather than adding a redundant direct `juggler` dependency.
 pub use juggler::ota::{
-    bytes_to_hex, hex_to_bytes, ImageMetadata, OtaError, OtaState, StreamingVerifier, Version,
+    bytes_to_hex, decide_update, hex_to_bytes, ImageMetadata, OtaError, OtaState,
+    StreamingVerifier, UpdateDecision, Version,
 };
 
 // Parity guard: every public `juggler::ota` type must stay re-exported from this
@@ -35,8 +37,8 @@ mod reexport_parity_guard {
     #[test]
     fn ota_public_surface_is_reexported_from_this_crate() {
         use crate::ota::{
-            bytes_to_hex, hex_to_bytes, ImageMetadata, OtaError, OtaState, StreamingVerifier,
-            Version,
+            bytes_to_hex, decide_update, hex_to_bytes, ImageMetadata, OtaError, OtaState,
+            StreamingVerifier, UpdateDecision, Version,
         };
 
         fn assert_exported<T>() {}
@@ -52,6 +54,10 @@ mod reexport_parity_guard {
         )
         .expect("valid sidecar metadata");
         assert_eq!(meta.version, Version::new(1, 4, 0));
+        assert_eq!(
+            decide_update(Version::new(1, 3, 0), meta.version),
+            UpdateDecision::Apply
+        );
     }
 }
 

@@ -15,14 +15,15 @@
 //!
 //! # Firmware metadata (re-exported)
 //!
-//! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], and the
-//! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]) are re-exported from
+//! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
+//! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
+//! policy ([`decide_update`], [`UpdateDecision`]) are re-exported from
 //! `juggler::ota` here — matching the `wifi`/`espnow` domains — so a
 //! version-gated updater needs only this crate, with no separate `juggler`
-//! dependency to parse a sidecar digest + version:
+//! dependency to parse a sidecar digest + version and decide whether to apply it:
 //!
 //! ```
-//! use rustyfarian_esp_idf_network::ota::{ImageMetadata, Version};
+//! use rustyfarian_esp_idf_network::ota::{decide_update, ImageMetadata, UpdateDecision, Version};
 //!
 //! let meta = ImageMetadata::parse(
 //!     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -30,6 +31,10 @@
 //! )
 //! .unwrap();
 //! assert_eq!(meta.version, Version::new(1, 4, 0));
+//! assert_eq!(
+//!     decide_update(Version::new(1, 3, 0), meta.version),
+//!     UpdateDecision::Apply
+//! );
 //! ```
 
 mod downloader;
@@ -40,7 +45,8 @@ mod flasher;
 // this crate rather than adding a redundant direct `juggler` dependency.
 // `StreamingVerifier` is also used internally below (via this same import).
 pub use juggler::ota::{
-    bytes_to_hex, hex_to_bytes, ImageMetadata, OtaError, OtaState, StreamingVerifier, Version,
+    bytes_to_hex, decide_update, hex_to_bytes, ImageMetadata, OtaError, OtaState,
+    StreamingVerifier, UpdateDecision, Version,
 };
 
 use std::io::Write;
