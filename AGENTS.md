@@ -30,6 +30,7 @@ just setup-toolchain       # one-time: install ESP toolchain via espup
 just setup-cargo-config    # one-time: copy .cargo/config.toml.dist → .cargo/config.toml
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy — non-modifying, must pass clean
+just clippy-hal            # clippy the bare-metal crate on its own C3/C6 targets (not in verify)
 just test                  # all platform-independent unit tests (no ESP toolchain needed)
 just build-example <name>  # build a hardware example with auto-detected chip + target
 just flash <name>          # build + flash to a connected board
@@ -38,6 +39,7 @@ just run <name>            # flash + serial monitor
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.
 `just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
+`just verify` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac` before committing changes to it.
 The pure tier (`juggler`) iterates fast without the ESP toolchain — see `just test` (all tests), or target specific domains via `-p juggler --features wifi,mock` etc.
 Bare-metal and ESP-IDF builds are isolated into `target/hal` and `target/idf` (host/IDE builds use `target/ide`); this routing is automatic.
 On macOS, `just ramdisk attach` optionally backs those directories with a RAM disk for faster builds, and `just doctor` reports the resolved target dirs and RAM disk status.

@@ -116,18 +116,23 @@ Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test]
 
 ---
 
-## esp-hal April 2026 Stack (esp-radio 0.18, esp-hal 1.1, embassy 0.10)
+## esp-hal Bare-Metal Stack (esp-radio / esp-hal waves)
 
-**`esp-radio` gates every bare-metal `esp-hal` wave: `esp-radio 0.18.0` requires `esp-hal ~1.1.0-rc.0`, so bumping the workspace to `esp-hal 1.2.x` fails at the resolver, not the compiler.**
-The error is `failed to select a version for esp-hal ... required by package esp-radio v0.18.0 ... versions that meet the requirements ~1.1.0-rc.0 are: 1.1.2, 1.1.1, 1.1.0`, which never names the real constraint (no stable `esp-radio` exists for the newer `esp-hal` minor).
-The only `esp-radio` targeting `esp-hal ~1.2.0` is `1.0.0-beta.1` (2026-09-15; `beta.2` was yanked), so the September 2026 wave that `rustyfarian-ws2812 0.7.0` adopted is unreachable here without taking a pre-release into the published Wi-Fi driver.
-Fix: before planning a wave, read the sparse index (`curl -s https://index.crates.io/es/p-/esp-radio`) and confirm a non-prerelease `esp-radio` whose `esp-hal` requirement matches the target minor; resolve the candidate pin set on a scratch crate under `tmp/` (`cargo generate-lockfile`) before touching the workspace.
-Every companion crate follows the same gate: `rustyfarian-esp-hal-ws2812 0.7` pins `esp-hal =1.2.2`, so it is blocked too — see `audit/2026-09-25-quarterly-plan.md` (local) and the `CHANGELOG.md` Unreleased entry.
+**`esp-radio` gates bare-metal waves: `esp-radio 0.18` requires `esp-hal ~1.1`, so `esp-hal 1.2.x` waves fail at the resolver until an `esp-radio` targeting `1.2` ships.**
+Only `esp-radio 1.0.0-beta.1` targets `esp-hal ~1.2.0`; this workspace took the pre-release deliberately to stay in lockstep with `rustyfarian-ws2812 0.7.0`.
+Fix: read the sparse index (`curl -s https://index.crates.io/es/p-/esp-radio`) before planning a wave to confirm a non-prerelease targeting the target `esp-hal` minor.
+Re-pin to `1.0.0` when it ships.
 
-**Two semver-incompatible `pennant` versions in one graph make `StatusLed` two different traits: a `Ws2812Rmt` from `rustyfarian-esp-hal-ws2812 0.6` implements `pennant 0.6::StatusLed`, and a crate that imports `pennant 0.7::StatusLed` gets `E0599 no method named set_color` on it.**
-The type clearly implements "StatusLed", but trait identity is per crate version, so the method is invisible and the error message never mentions the second `pennant`.
-This surfaces whenever the ws2812 tiers diverge — as of 2026-09-25 the IDF driver is on 0.7 (`pennant ^0.7`) and the HAL driver on 0.6 (`pennant ^0.6`).
-Fix: `rustyfarian-esp-hal-network` declares `pennant = "0.6"` directly instead of `workspace = true` while the split lasts; per ADR 005 no consumer uses both tiers, so the two re-exported `StatusLed` traits never meet. Diagnose with `cargo tree -i pennant`.
+**`esp-storage 0.10` made `embedded-storage` trait impls an opt-in feature — `FlashStorage` silently stops implementing `NorFlash` after the bump.**
+Fix: enable `features = ["embedded-storage"]` on `esp-storage` for provisioning store's `NorFlash` bound; use inherent `FlashRegion::{capacity, write}` methods for OTA manager.
+
+**`esp-radio 1.0.0-beta.1` API: controller-only return, STA/AP as singletons (`Interface::station()` / `Interface::access_point()`), `StationConfig` takes typed `Ssid` / `Password` / `AuthenticationMethodConfig`.**
+`Ssid::try_from` / `Password::try_from` reject oversized input (0.18 truncated); empty password stays `Wpa2Personal("")` (scanning default).
+`Interface` panics on second `station()` call; use `try_station()` to probe.
+
+**Two semver-incompatible `pennant` versions make `StatusLed` two different traits — trait identity is per crate version.**
+Symptom: `E0599 no method named set_color` on a `Ws2812Rmt` from `pennant 0.6` when a consumer imports `pennant 0.7::StatusLed`.
+Fix: keep tier crates on matching `pennant` versions; diagnose with `cargo tree -i pennant`.
 
 
 **`esp-radio 0.18` deleted the `smoltcp` feature and the `smoltcp::phy::Device` impl on `WifiDevice` — the bare-metal Wi-Fi controller is now async-only and tied to `embassy-net`.**
@@ -171,13 +176,9 @@ The password setter still needs `.into()` because its parameter type is the more
 The pin moved from the `configure_tx` parameter to a chained `.with_pin(...)` call so that channel configuration can be reused independently of pin assignment.
 The reference migration is in the `rustyfarian-ws2812` repo's CHANGELOG entry for the April 2026 wave (file: `crates/rustyfarian-esp-hal-ws2812/examples/hal_c6_*.rs`).
 
-**ESP32-C3 bare-metal Wi-Fi (esp-radio 0.18) fails with `AuthenticationExpired` (reason 2) on every WPA2 AP because the binary blob transmits at full power (~20 dBm), which the Super Mini PCB antenna reflects back into the chip and corrupts auth frames.**
-ESP-IDF limits TX power internally for regulatory compliance; the bare-metal blob does not.
-The same hardware and credentials connect fine under the ESP-IDF std stack.
-Fix: declare `esp_wifi_set_max_tx_power` via `extern "C"` (the symbol is already linked transitively via `esp-radio`) and call it immediately after `controller.set_config()` — `set_config` triggers `esp_wifi_start()` internally, and the call must come *after* that; calling it before returns `ESP_ERR_WIFI_NOT_STARTED` (error 12290 / `0x3002`).
-Use `esp_wifi_set_max_tx_power(34)` (34 × 0.25 dBm = 8.5 dBm).
-Workaround lives in `WiFiManager::init_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`) and in `hal_c3_connect_async_upstream.rs` for the upstream-verbatim example.
-Upstream references: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
+**TX-power coupling on ESP32-C3/C6 Super Mini (PCB antenna reflects full TX, corrupting WPA2 auth frames).**
+April 2026 (esp-radio 0.18): bare-metal blob transmits ~20 dBm; ESP-IDF clamps to 8.5 dBm. Workaround: call `esp_wifi_set_max_tx_power(34)` (8.5 dBm) after `set_config()`.
+September 2026 (esp-radio 1.0.0-beta.1): driver applies 5 dBm default inside `WifiController::new`; crate no longer forces TX power on unset default, instead inherits driver's own. At 5 dBm, C3 Super Mini joins cleanly (validated hardware 2026-09-26); couples effective default to `esp-radio`'s own — re-validate on every version bump. Pass `TxPowerLevel::Low` explicitly via `WiFiConfig::with_tx_power` to restore 8.5 dBm.
 
 **`embassy-executor 0.10` removed `Spawner::must_spawn`; `#[embassy_executor::task]` macros now return `Result<SpawnToken<...>, SpawnError>`.**
 Old: `spawner.must_spawn(my_task(arg));`
@@ -186,9 +187,9 @@ The compiler hint `consider using Result::expect to unwrap the Result<SpawnToken
 
 **The `esp-rtos 0.3.0` async executor panics `unwrap of self.time_driver.as_mut() failed: NoneError` on the *first* `.await` park if `esp_rtos::start` was never called — and `start` is the call that installs the time driver.**
 The executor reads the time driver every time a task parks, so this trips on *any* await, not just `Timer::after` — `core::future::pending().await` panics identically.
-In this workspace `esp_rtos::start(timg.timer0, sw_ints.software_interrupt0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
+In this workspace `esp_rtos::start(timg.timer0, from_cpu_intr0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
 Surfaced on hardware 2026-06-18: `hal_c3_provision_mqtt` logged the loaded config then panicked in the idle loop.
-Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `SW_INTERRUPT`.
+Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `FROM_CPU_INTR0`.
 
 **A missing `embassy-executor` dependency makes `#[embassy_executor::task]` silently no-op and surfaces as misleading `no method named 'unwrap' found for ... impl Future<Output = ()>` errors, not a clear "macro not found".**
 When `embassy_executor` is unresolved, the `#[embassy_executor::task]` attribute cannot expand, so the annotated fn stays a plain `async fn` returning `impl Future` instead of the spawnable token the macro would produce; the real cause (`error[E0432]: unresolved import embassy_executor`) is buried above a cascade of `.unwrap()`-on-Future errors at every `spawner.spawn(task().unwrap())` call site.
@@ -211,6 +212,18 @@ Symptom: `[INFO ] Serial port: '/dev/cu.usbmodem1101'` followed by `Error: Faile
 This is a *different* failure mode from auto-detect picking the wrong port — here the right port is selected but `open()` fails because another process holds it.
 Diagnose: `lsof /dev/cu.usbmodem1101` shows the holding `espflash` PID; kill it and retry.
 Common cause: closing a terminal tab without sending SIGINT to the foreground `espflash monitor`, leaving the process orphaned and still holding the FD.
+
+**A shell helper that prefixes `$PWD/` onto a caller-supplied directory silently breaks when the justfile passes an absolute path — which it does whenever the RAM disk is attached.**
+`find_idf_bootloader` in `scripts/lib.sh` globbed `"$PWD/$idf_dir/…"`, so with `idf_dir` = `/Volumes/RustBuilds/targets/idf/<project>` the pattern became `/Users/…/rustyfarian-network//Volumes/…` and matched nothing, while the bootloader sat exactly where it was expected.
+The symptom is self-contradictory output — `ensure-bootloader.sh` reports "building `idf_c3_connect` to populate it", the build succeeds, and `flash.sh` then warns "no IDF-built bootloader cached" — so every bare-metal flash rebuilt an IDF example (~12 s) and silently fell back to the espflash bundled bootloader, disabling the protection described above.
+Fix: normalise the directory before globbing (absolute stays as-is, relative gets `$PWD/`), and re-check after the populating build so a failed harvest cannot pass silently.
+The re-check is fatal only on `xtensa-*` targets, where the bundled bootloader is genuinely incompatible; on RISC-V it warns and lets `flash.sh` fall through, matching the `c6` path that has always relied on the bundled bootloader.
+
+**The IDF-built v5.3.3 bootloader successfully boots bare-metal esp-hal images — verified 2026-09-26 on both RISC-V and Xtensa.**
+With the `$PWD/`-prefix cache fix in place, `just run hal_c3_connect_async_led` flashed an esp-hal 1.2.2 bare-metal binary together with the IDF v5.3.3 bootloader (harvested from an IDF example build) and it booted cleanly on ESP32-C3 (RISC-V): serial output shows `boot: ESP-IDF v5.3.3 2nd stage bootloader`, followed by Wi-Fi and DHCP coming up normally. The same workaround (`espflash flash --bootloader <path> --ignore-app-descriptor`) boots an `esp-bootloader-esp-idf 0.6` bare-metal image on Heltec WiFi LoRa 32 V3 (Xtensa ESP32-S3), validating the app-descriptor compat fix on both architecture families. This upgrades a previously-stated assumption ("the v5.3.3 bootloader is believed to work for both IDF and bare-metal binaries") into a tested fact across targets.
+
+**The harvested bootloader is cached inside the RAM-disk target dir and does not survive reboot or detach — first bare-metal flash afterwards rebuilds the full IDF example (~1m26s) just to re-harvest the ~26 KB `bootloader.bin`.**
+The bottleneck is not the harvest operation itself (~12 s warm cache), but the full ESP-IDF CMake build that precedes it when the cache is cold. A future improvement (not yet implemented) would copy the harvested `bootloader.bin` to a persistent cache outside the RAM disk, keyed by chip and IDF version, so a reboot or `just ramdisk detach` followed by another bare-metal flash would reuse the file instead of triggering a full rebuild. Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
 
 ---
 

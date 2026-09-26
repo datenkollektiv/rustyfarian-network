@@ -3,7 +3,7 @@
 //! This crate consolidates four formerly-separate bare-metal crates into one,
 //! with per-domain + chip feature gates:
 //!
-//! - [`wifi`] — async STA + SoftAP Wi-Fi via `esp-radio 0.18`
+//! - [`wifi`] — async STA + SoftAP Wi-Fi via `esp-radio 1.0.0-beta.1` (pre-release, exact-pinned)
 //!   (requires `embassy`; supported on `esp32c3`, `esp32c6`)
 //! - [`lora`] — synchronous LoRa stub via embedded-hal SPI + GPIO
 //!   (all chips; `esp32s3` uses hardware integration)

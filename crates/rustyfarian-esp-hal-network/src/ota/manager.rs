@@ -6,8 +6,6 @@
 
 use embassy_net::tcp::TcpSocket;
 use embassy_time::{with_timeout, Duration};
-use embedded_storage::ReadStorage;
-use embedded_storage::Storage;
 use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
@@ -54,7 +52,7 @@ pub struct OtaManagerConfig {
 /// # Flash peripheral
 ///
 /// The `FLASH` peripheral is consumed at construction time via `FlashStorage::new()`.
-/// In `esp-storage 0.9.0`, `FlashStorage::new()` takes ownership of the
+/// Since `esp-storage 0.9.0`, `FlashStorage::new()` takes ownership of the
 /// `esp_hal::peripherals::FLASH` peripheral and panics if called more than once
 /// per boot.  The manager stores the resulting `FlashStorage` and re-uses it
 /// for every OTA operation.
@@ -145,7 +143,8 @@ impl<'d> EspHalOtaManager<'d> {
             log::error!("next_partition failed: {:?}", e);
             OtaError::PartitionNotFound
         })?;
-        // `capacity()` comes from `embedded_storage::ReadStorage`.
+        // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
+        // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
         let max_bytes = region.capacity() as u64;
         // Defensive: `region.write(offset: u32, ...)` and the per-chunk math
         // below cast the running offset to `u32`. The real ESP32-C3/-C6 OTA
@@ -203,7 +202,7 @@ impl<'d> EspHalOtaManager<'d> {
             }
             let chunk = &chunk_buf[..n];
             verifier.update(chunk);
-            // `write()` comes from `embedded_storage::Storage`.
+            // `write()` is the inherent `FlashRegion` method (see `capacity()` above).
             region
                 .write((content_length - remaining) as u32, chunk)
                 .map_err(|e| {

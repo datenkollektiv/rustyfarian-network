@@ -218,7 +218,7 @@ async fn main(spawner: Spawner) {
         .with_channel(1)
         .with_ap_peripherals(
             peripherals.TIMG0,
-            peripherals.SW_INTERRUPT,
+            peripherals.FROM_CPU_INTR0,
             peripherals.WIFI,
         );
 

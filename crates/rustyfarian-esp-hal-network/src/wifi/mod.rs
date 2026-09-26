@@ -1,7 +1,8 @@
 //! Wi-Fi driver for ESP-HAL projects (bare-metal, `no_std`).
 //!
-//! Provides a thin async wrapper around `esp-radio 0.18`'s Wi-Fi controller.
-//! In `esp-radio 0.18` the bare-metal Wi-Fi controller is async-only — the
+//! Provides a thin async wrapper around `esp-radio 1.0.0-beta.1`'s Wi-Fi controller
+//! (a pre-release, pinned exactly; see the crate README "Dependency pins").
+//! Since `esp-radio 0.18` the bare-metal Wi-Fi controller is async-only — the
 //! synchronous `connect`/`disconnect`/`start` methods that existed in 0.17
 //! were removed, and direct `smoltcp` integration was deleted in favour of
 //! `embassy-net`.  As a result this crate now exposes a single async entry
@@ -20,7 +21,7 @@
 //! esp_alloc::heap_allocator!(size: 72 * 1024);
 //!
 //! let config = WiFiConfig::new("MyNetwork", "password123")
-//!     .with_peripherals(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
+//!     .with_peripherals(peripherals.TIMG0, peripherals.FROM_CPU_INTR0, peripherals.WIFI);
 //! let AsyncWifiHandle { controller, stack, runner } = WiFiManager::init_async(config)?;
 //! // spawn `runner.run().await` and a task that owns `controller`
 //! ```
@@ -109,7 +110,7 @@ impl<P: embedded_hal::digital::OutputPin> StatusLed for ActiveLowLed<P> {
 ))]
 compile_error!(
     "rustyfarian-esp-hal-network on bare-metal requires the `embassy` feature \
-     (esp-radio 0.18 is async-only). Enable both: --features <chip>,embassy"
+     (esp-radio is async-only since 0.18). Enable both: --features <chip>,embassy"
 );
 
 // ─── Real implementation (behind chip + embassy feature gates) ──────────────
@@ -120,12 +121,12 @@ mod driver {
         Config as NetConfig, DhcpConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
         StaticConfigV4,
     };
-    use esp_hal::interrupt::software::SoftwareInterruptControl;
     use esp_hal::timer::timg::TimerGroup;
     use esp_radio::wifi::ap::AccessPointConfig;
     use esp_radio::wifi::sta::StationConfig;
     use esp_radio::wifi::{
-        AuthenticationMethod, Config, ControllerConfig, Interface, PowerSaveMode, WifiController,
+        AuthenticationMethodConfig, Config, ControllerConfig, Interface, Password, PowerSaveMode,
+        Ssid, WifiController,
     };
     use juggler::wifi::{
         validate_ap_config, validate_password, validate_ssid, ApConfig, TxPowerLevel, WiFiConfig,
@@ -143,7 +144,7 @@ mod driver {
         power_save: WifiPowerSave,
         tx_power: TxPowerLevel,
         timg0: esp_hal::peripherals::TIMG0<'static>,
-        sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+        from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
         wifi: esp_hal::peripherals::WIFI<'static>,
     }
 
@@ -156,7 +157,7 @@ mod driver {
         fn with_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
-            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalWifiConfig<'a>;
     }
@@ -165,7 +166,7 @@ mod driver {
         fn with_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
-            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalWifiConfig<'a> {
             HalWifiConfig {
@@ -174,7 +175,7 @@ mod driver {
                 power_save: self.power_save,
                 tx_power: self.tx_power,
                 timg0,
-                sw_interrupt,
+                from_cpu_intr0,
                 wifi,
             }
         }
@@ -220,21 +221,22 @@ mod driver {
         pub stack: Stack<'static>,
         /// Runner for the network task — `runner.run().await` must be polled
         /// continuously in a dedicated task.
-        pub runner: Runner<'static, Interface<'static>>,
+        pub runner: Runner<'static, Interface>,
     }
 
     /// Bare-metal Wi-Fi manager namespace.
     ///
-    /// In `esp-radio 0.18` the controller is async-only, so this type is a
+    /// Since `esp-radio 0.18` the controller is async-only, so this type is a
     /// unit struct that exposes the [`init_async`][WiFiManager::init_async]
     /// constructor.  All useful work happens on the returned
     /// [`AsyncWifiHandle`] and the spawned tasks driving it.
     pub struct WiFiManager;
 
     impl WiFiManager {
-        /// Initialises the scheduler and the Wi-Fi radio, sets the station
-        /// credentials before the radio starts, and builds the `embassy-net`
-        /// stack — but does **not** initiate association.
+        /// Initialises the scheduler and the Wi-Fi radio, applies the station
+        /// credentials immediately after controller construction (which is what
+        /// starts the radio), and builds the `embassy-net` stack — but does
+        /// **not** initiate association.
         ///
         /// # Readiness
         ///
@@ -261,89 +263,138 @@ mod driver {
         /// covers DHCP plus one TCP and one UDP socket — the baseline used by
         /// `embassy-net`'s own examples.  Applications that need more
         /// concurrent sockets must build their own stack on top of the
-        /// `Interface` returned by `esp_radio::wifi::new(..)`:
+        /// station `Interface` singleton:
         ///
         /// ```ignore
-        /// let (controller, interfaces) =
-        ///     esp_radio::wifi::new(peripherals.WIFI, ControllerConfig::default())?;
+        /// let controller =
+        ///     esp_radio::wifi::WifiController::new(peripherals.WIFI, ControllerConfig::default())?;
         /// // configure `controller` as in `init_async` above ...
         /// static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
         /// let resources = RESOURCES.init(StackResources::<8>::new());
         /// let (stack, runner) = embassy_net::new(
-        ///     interfaces.station,
+        ///     esp_radio::wifi::Interface::station(),
         ///     NetConfig::dhcpv4(DhcpConfig::default()),
         ///     resources,
         ///     seed,
         /// );
         /// ```
         ///
+        /// # Authentication
+        ///
+        /// The station is always configured as WPA2-Personal, including when
+        /// `password` is empty.  An empty password does **not** select an open
+        /// network and will not associate with an open AP — it is accepted (with
+        /// a `warn` log) rather than rejected, so that validation stays
+        /// symmetric with
+        /// [`validate_password`][juggler::wifi::validate_password], which bounds
+        /// only the maximum length, and so that STA behaviour stays identical to
+        /// the ESP-IDF tier.  Joining an open network is not supported by this
+        /// constructor.
+        ///
         /// # TX-power policy
         ///
         /// When `tx_power` is left at [`TxPowerLevel::Medium`] (the default),
-        /// `init_async` silently overrides it to [`TxPowerLevel::Low`] (8.5 dBm).
+        /// `init_async` sets no TX power at all and defers to whatever default
+        /// `esp-radio` itself applied — 5 dBm as of `esp-radio 1.0.0-beta.1`,
+        /// which `WifiController::new` sets internally.  Only an explicitly
+        /// requested [`TxPowerLevel`] is applied.
         ///
-        /// This is a deliberate library-wide default: PCB-antenna boards such as
-        /// the ESP32-C3/C6 Super Mini reflect RF energy at full power (~20 dBm),
-        /// corrupting WPA2 auth frames.  8.5 dBm is a safe baseline for all
-        /// bare-metal builds; callers with external antennas can raise it by
-        /// passing an explicit [`TxPowerLevel`] via
+        /// The reason is the auth-frame corruption pathology on PCB-antenna
+        /// boards such as the ESP32-C3/C6 Super Mini, which reflect RF energy
+        /// back into the chip at high power and make every WPA2 AP deauth with
+        /// `AuthenticationExpired` (reason 2).  Against `esp-radio 0.18`, whose
+        /// default was ~20 dBm, this crate forced 8.5 dBm to stay below that
+        /// threshold.  `esp-radio 1.0.0-beta.1` already defaults to 5 dBm, which
+        /// is lower still, so forcing 8.5 dBm would only *raise* power — the
+        /// conservative choice is to leave the driver default alone while the
+        /// pathology is unre-validated under beta.1's ESP-IDF 6.1 Wi-Fi blob.
+        ///
+        /// This couples the effective default to `esp-radio`'s own: **any
+        /// `esp-radio` bump must re-check it**, because a driver default above
+        /// ~8.5 dBm would silently reintroduce the pathology on those boards.
+        /// See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md`.
+        ///
+        /// Callers can set power explicitly — in either direction — by passing a
+        /// [`TxPowerLevel`] via
         /// [`WiFiConfig::with_tx_power`][juggler::wifi::WiFiConfig::with_tx_power].
+        /// Note that an explicit [`TxPowerLevel::Medium`] is indistinguishable
+        /// from the unset default and is therefore *not* applied.
         ///
         /// # One-shot
         ///
         /// Call at most once per boot — a `static` `StackResources` is
-        /// initialised via [`StaticCell`] and a second call will panic.
+        /// initialised via [`StaticCell`] and the station [`Interface`] is a
+        /// singleton; a second call will panic.
         pub fn init_async(config: HalWifiConfig<'_>) -> Result<AsyncWifiHandle, WifiError> {
             validate_ssid(config.ssid).map_err(|_| WifiError::ConfigureFailed)?;
             validate_password(config.password).map_err(|_| WifiError::ConfigureFailed)?;
 
             // 1. Start the scheduler (esp-radio requires a running scheduler).
             let timg = TimerGroup::new(config.timg0);
-            let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
-            esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
+            esp_rtos::start(timg.timer0, config.from_cpu_intr0);
 
             // 2. Construct the Wi-Fi controller with a default ControllerConfig
             //    (empty station config).  Credentials are applied via an explicit
-            //    `set_config` call immediately after `wifi::new` returns (step 3).
-            let (mut controller, interfaces) =
-                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
-                    .map_err(WifiError::Driver)?;
+            //    `set_config` call immediately after construction (step 3).
+            let mut controller = WifiController::new(config.wifi, ControllerConfig::default())
+                .map_err(WifiError::Driver)?;
 
-            // 3. Apply station credentials.  esp_radio::wifi::new already called
-            //    set_config internally with an empty StationConfig (which starts the
-            //    radio driver via esp_wifi_start).  This call updates the SSID/password
-            //    so wifi_task's first connect_async uses the real credentials.
+            // 3. Apply station credentials.  `WifiController::new` already applied
+            //    an empty StationConfig (which starts the radio driver via
+            //    esp_wifi_start).  This call updates the SSID/password so
+            //    wifi_task's first connect_async uses the real credentials.
+            //    `Ssid`/`Password` reject oversized values instead of truncating;
+            //    `validate_ssid`/`validate_password` above already enforce the
+            //    same limits, so a failure here is a driver-level surprise.
+            //    WPA2-Personal is kept even for an empty password: that is what
+            //    `StationConfig::default()` selected in 0.18 (and still does), it
+            //    doubles as the minimum security level for scanning, and it keeps
+            //    STA behaviour identical to the ESP-IDF tier.
+            let ssid = Ssid::try_from(config.ssid).map_err(WifiError::Driver)?;
+            let authentication = AuthenticationMethodConfig::Wpa2Personal(
+                Password::try_from(config.password).map_err(WifiError::Driver)?,
+            );
             let station = StationConfig::default()
-                .with_ssid(config.ssid)
-                .with_password(config.password.into());
+                .with_ssid(ssid)
+                .with_authentication(authentication);
             controller
                 .set_config(&Config::Station(station))
                 .map_err(WifiError::Driver)?;
 
-            // 4. Limit TX power to 8.5 dBm (34 × 0.25 dBm).
+            // 4. TX power: apply ONLY an explicitly requested level.
             //
             // ESP32-C3/C6 Super Mini and similar PCB-antenna boards reflect RF energy
-            // back into the chip at full power (~20 dBm), corrupting WPA2 auth frames
-            // and causing every AP to deauth with reason 2 (AuthenticationExpired).
-            // ESP-IDF limits TX power internally for regulatory compliance; the
-            // bare-metal blob does not.  This call must come after set_config() (step 3)
-            // because that is what triggers esp_wifi_start() — calling it before returns
-            // ESP_ERR_WIFI_NOT_STARTED (0x3002).
+            // back into the chip at high power, corrupting WPA2 auth frames and causing
+            // every AP to deauth with reason 2 (AuthenticationExpired).  ESP-IDF limits
+            // TX power internally for regulatory compliance; the bare-metal blob does
+            // not.  Against esp-radio 0.18, whose default was ~20 dBm, this crate forced
+            // 8.5 dBm to stay under that threshold.
+            //
+            // esp-radio 1.0.0-beta.1 applies a 5 dBm default of its own inside
+            // `WifiController::new` (`esp_wifi_set_max_tx_power(20)`), which is LOWER
+            // than 8.5 dBm — forcing 8.5 would only raise it.  So when the caller left
+            // tx_power at the juggler default we now set nothing and inherit the driver
+            // default, which is the conservative choice while the pathology is
+            // unre-validated under beta.1's ESP-IDF 6.1 blob (maintainer's call,
+            // 2026-09-26).
+            //
+            // WARNING: this couples our effective default to esp-radio's. Any esp-radio
+            // bump MUST re-check that default — anything above ~8.5 dBm silently
+            // reintroduces the pathology on PCB-antenna boards.
+            //
+            // An explicit level is still applied verbatim. The call is only valid after
+            // esp_wifi_start() (before it returns ESP_ERR_WIFI_NOT_STARTED, 0x3002);
+            // since esp-radio 1.0.0-beta.1 the initial station config inside
+            // `WifiController::new` (step 2) is what starts the radio — `set_config`
+            // only restarts it on a mode change — so both steps 2 and 3 precede it.
             //
             // The symbol is already in the linked binary via esp-radio's dependency on
             // esp-wifi-sys; no extra crate dependency is needed.
             //
             // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
-            //
-            // Default to Low (8.5 dBm) if the caller left tx_power at Medium (the
-            // juggler::wifi default). Medium (~13 dBm) still causes auth failures on
-            // PCB-antenna boards; Low is the safe baseline for bare-metal.
-            let quarter_dbm = if config.tx_power == TxPowerLevel::default() {
-                TxPowerLevel::Low.to_quarter_dbm()
-            } else {
-                config.tx_power.to_quarter_dbm()
-            };
-            set_tx_power_or_log(quarter_dbm);
+            if config.tx_power != TxPowerLevel::default() {
+                set_tx_power_or_log(config.tx_power.to_quarter_dbm());
+            }
 
             // 5. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);
@@ -383,7 +434,7 @@ mod driver {
                 .as_micros();
 
             let (stack, runner) = embassy_net::new(
-                interfaces.station,
+                Interface::station(),
                 NetConfig::dhcpv4(DhcpConfig::default()),
                 resources,
                 seed,
@@ -430,7 +481,7 @@ mod driver {
     pub struct HalApConfig<'a> {
         ap: ApConfig<'a>,
         timg0: esp_hal::peripherals::TIMG0<'static>,
-        sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+        from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
         wifi: esp_hal::peripherals::WIFI<'static>,
     }
 
@@ -444,7 +495,7 @@ mod driver {
         fn with_ap_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
-            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalApConfig<'a>;
     }
@@ -453,13 +504,13 @@ mod driver {
         fn with_ap_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
-            sw_interrupt: esp_hal::peripherals::SW_INTERRUPT<'static>,
+            from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalApConfig<'a> {
             HalApConfig {
                 ap: self,
                 timg0,
-                sw_interrupt,
+                from_cpu_intr0,
                 wifi,
             }
         }
@@ -476,7 +527,7 @@ mod driver {
     ///   [`WifiController::wait_for_access_point_connected_event_async`] —
     ///   **the AP radio is already started by the time `init_softap_async`
     ///   returns** (`set_config(Config::AccessPoint(_))` triggers
-    ///   `esp_wifi_start()` internally in `esp-radio 0.18`).  There is no
+    ///   `esp_wifi_start()` internally since `esp-radio 0.18`).  There is no
     ///   separate `controller.start_async()` call on either the STA or AP
     ///   side; the `wifi_task` goes straight into the event loop.
     ///
@@ -488,7 +539,7 @@ mod driver {
         pub stack: Stack<'static>,
         /// Runner for the network task — `runner.run().await` must be polled
         /// continuously in a dedicated task.
-        pub runner: Runner<'static, Interface<'static>>,
+        pub runner: Runner<'static, Interface>,
     }
 
     // Separate StaticCell for the AP stack so calling both `init_async` and
@@ -498,7 +549,7 @@ mod driver {
 
     impl WiFiManager {
         /// Initialises the scheduler and the Wi-Fi radio in SoftAP mode, applies
-        /// the AP configuration, clamps TX power, and builds the `embassy-net`
+        /// the AP configuration, sets TX power, and builds the `embassy-net`
         /// stack with a static IPv4 address (`192.168.4.1/24`).
         ///
         /// # AP configuration
@@ -510,17 +561,18 @@ mod driver {
         ///
         /// # TX-power policy
         ///
-        /// Unlike the STA path, the AP path applies the `tx_power` from
-        /// [`ApConfig`] directly, without overriding `Medium` to `Low`.  The
-        /// STA Medium-to-Low override defends against an auth-frame corruption
-        /// pathology (`AuthenticationExpired`, reason 2) that exists only for
-        /// clients connecting to a remote AP; the AP itself is unaffected by
+        /// The AP path applies the `tx_power` from [`ApConfig`] directly,
+        /// including [`TxPowerLevel::Medium`].  This differs from the STA path,
+        /// which applies nothing when `tx_power` is left at the default and
+        /// inherits `esp-radio`'s own — a caution against the auth-frame
+        /// corruption pathology (`AuthenticationExpired`, reason 2) that affects
+        /// only a station associating with a remote AP; an AP is unaffected by
         /// that PCB-antenna reflection mode.  Callers that need lower power
         /// (e.g. a captive-portal restricted to a small room) can pass an
         /// explicit [`TxPowerLevel`] via
         /// [`ApConfig::with_tx_power`][juggler::wifi::ApConfig::with_tx_power].
         ///
-        /// TX-power clamping must happen **after** `set_config()`, which is
+        /// The TX-power call must happen **after** `set_config()`, which is
         /// what triggers `esp_wifi_start()`.  Failure is non-fatal and logged
         /// at `warn`.
         ///
@@ -535,13 +587,12 @@ mod driver {
         /// # One-shot per boot
         ///
         /// Call at most once per boot — a `static` `StackResources` is
-        /// initialised via [`StaticCell`] and a second call will panic.
-        /// If you need both STA and AP in the same firmware, call
-        /// [`WiFiManager::init_async`] first for STA, then
-        /// `init_softap_async` for AP; the scheduler is started by
-        /// `init_async`, so `init_softap_async` must be called afterwards.
-        /// Calling `init_softap_async` before `init_async` also works, but
-        /// calling either twice is not supported.
+        /// initialised via [`StaticCell`] and the access-point [`Interface`]
+        /// is a singleton; a second call will panic.
+        /// STA and AP in one firmware are not supported through these two
+        /// entry points: each consumes `TIMG0`, `FROM_CPU_INTR0` and `WIFI`,
+        /// and a second `set_config` would switch the radio out of the first
+        /// mode.  Pick one per boot.
         pub fn init_softap_async(config: HalApConfig<'_>) -> Result<SoftApHandle, WifiError> {
             validate_ap_config(&config.ap).map_err(|_| WifiError::ConfigureFailed)?;
 
@@ -554,42 +605,38 @@ mod driver {
 
             // 1. Start the scheduler.
             let timg = TimerGroup::new(config.timg0);
-            let sw_ints = SoftwareInterruptControl::new(config.sw_interrupt);
-            esp_rtos::start(timg.timer0, sw_ints.software_interrupt0);
+            esp_rtos::start(timg.timer0, config.from_cpu_intr0);
 
             // 2. Construct the Wi-Fi controller with default ControllerConfig.
-            //    `esp_radio::wifi::new` starts the radio driver; AP credentials
+            //    `WifiController::new` starts the radio driver; AP credentials
             //    are applied via `set_config` immediately after (step 3).
-            let (mut controller, interfaces) =
-                esp_radio::wifi::new(config.wifi, ControllerConfig::default())
-                    .map_err(WifiError::Driver)?;
+            let mut controller = WifiController::new(config.wifi, ControllerConfig::default())
+                .map_err(WifiError::Driver)?;
 
             // 3. Build the esp-radio AP config and apply it.
-            let mut ap_cfg = AccessPointConfig::default()
-                .with_ssid(config.ap.ssid)
+            let ssid = Ssid::try_from(config.ap.ssid).map_err(WifiError::Driver)?;
+            let authentication = match config.ap.password {
+                Some(pw) => AuthenticationMethodConfig::Wpa2Personal(
+                    Password::try_from(pw).map_err(WifiError::Driver)?,
+                ),
+                None => AuthenticationMethodConfig::Open,
+            };
+            let ap_cfg = AccessPointConfig::default()
+                .with_ssid(ssid)
                 .with_channel(config.ap.channel)
-                .with_max_connections(config.ap.max_connections as u16);
-
-            match config.ap.password {
-                Some(pw) => {
-                    ap_cfg = ap_cfg
-                        .with_auth_method(AuthenticationMethod::Wpa2Personal)
-                        .with_password(pw.into());
-                }
-                None => {
-                    ap_cfg = ap_cfg.with_auth_method(AuthenticationMethod::None);
-                }
-            }
+                .with_max_connections(config.ap.max_connections as u16)
+                .with_authentication(authentication);
 
             controller
                 .set_config(&Config::AccessPoint(ap_cfg))
                 .map_err(WifiError::Driver)?;
 
-            // 4. Clamp TX power.
+            // 4. Set TX power.
             //
             // AP mode is not affected by the STA-specific PCB-reflection pathology,
             // so we apply the configured level directly rather than overriding it.
-            // Must be called after set_config() (which triggers esp_wifi_start()).
+            // Must be called after set_config(): the STA→AP mode change is what
+            // triggers esp_wifi_start() here.
             //
             // SAFETY: identical to the STA path — `esp_wifi_set_max_tx_power` is
             // provided by esp-wifi-sys, always linked by esp-radio, and only valid
@@ -628,7 +675,7 @@ mod driver {
             };
 
             let (stack, runner) = embassy_net::new(
-                interfaces.access_point,
+                Interface::access_point(),
                 NetConfig::ipv4_static(static_cfg),
                 resources,
                 seed,
@@ -642,7 +689,7 @@ mod driver {
         }
     }
 
-    /// Clamps the TX power to `quarter_dbm` (units of 0.25 dBm).
+    /// Sets the maximum TX power to `quarter_dbm` (units of 0.25 dBm).
     ///
     /// Shared by the STA and AP init paths so the extern declaration and
     /// SAFETY comment live in one place.

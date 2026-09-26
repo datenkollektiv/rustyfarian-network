@@ -80,3 +80,44 @@ jobs:
 
       - name: Check STA-only (wifi feature with SoftAP disabled)
         run: just check-sta-only
+
+  build-examples:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup ESP-RS toolchain (RISC-V + Xtensa)
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          # ldproxy IS required here: this job links an ESP-IDF binary
+          # (`just build-example idf_c3_connect`), and `.cargo/config.toml`
+          # sets `linker = "ldproxy"` for the *-espidf targets. The
+          # `ldproxy: false` guidance in CLAUDE.md applies only to the format
+          # job, which runs `cargo fmt` and never links.
+          ldproxy: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup cargo config
+        run: cp .cargo/config.toml.dist .cargo/config.toml
+
+      - name: Setup just
+        uses: extractions/setup-just@v4
+
+      - name: Build IDF example (idf_c3_connect)
+        run: just build-example idf_c3_connect
+
+      - name: Build bare-metal example (hal_c3_connect_async)
+        run: just build-example hal_c3_connect_async
+
+      # `just verify` lints only the workspace default target, so the bare-metal
+      # crate is otherwise never linted on riscv32imc/riscv32imac. Run it here
+      # rather than in `verify` to keep local pre-commit runs fast.
+      - name: Clippy the bare-metal crate on its own targets
+        run: just clippy-hal

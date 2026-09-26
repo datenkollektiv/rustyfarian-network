@@ -15,10 +15,15 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 
 | Feature        | What it gates                                             | Requires `embassy` | Notes                                              |
 |:---------------|:----------------------------------------------------------|:-------------------|:---------------------------------------------------|
-| `wifi`         | Async Wi-Fi STA/AP via `esp-radio 0.18`                   | Yes                | Implies `embassy`; auto-enables it.                |
+| `wifi`         | Async Wi-Fi STA/AP via `esp-radio 1.0.0-beta.1`           | Yes                | Implies `embassy`; auto-enables it.                |
 | `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.        |
 | `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.   |
 | `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V). |
+
+### Dependency pins and MSRV
+
+Exact pins are public API: `esp-hal =1.2.2`, `esp-rtos =0.4.0`, `esp-radio =1.0.0-beta.1` (pre-release; re-pins to `1.0.0` on release), `esp-alloc =0.11.0`, `esp-bootloader-esp-idf =0.6.0`, `esp-storage =0.10.0`, `esp-println =0.18.0`, `esp-backtrace =0.20.0`, Embassy `0.10`/`0.8.0`/`0.8.0`/`0.5.1`.
+Minimum Rust is 1.95.
 
 ### Chip Features
 
@@ -67,51 +72,119 @@ rustyfarian-esp-hal-network = { version = "0.4", features = ["provisioning", "es
 
 ## Example: Async Wi-Fi Connect
 
+Condensed from `examples/hal_c3_connect_async.rs`.
+`init_async` is synchronous: it starts the `esp-rtos` scheduler, configures the radio, and builds the `embassy-net` stack, but does not associate.
+The caller spawns one task that owns the `WifiController` (association and reconnects) and one that drives the network `Runner`; `stack` is `Copy` and is used for sockets.
+
 ```rust
-use rustyfarian_esp_hal_network::wifi::WiFiManager;
-use rustyfarian_esp_hal_network::wifi::WiFiConfig;
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use esp_radio::wifi::{Interface, WifiController};
+use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) {
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
+    let config = WiFiConfig::new("MyNetwork", "password123").with_peripherals(
+        peripherals.TIMG0,
+        peripherals.FROM_CPU_INTR0,
+        peripherals.WIFI,
+    );
+    let AsyncWifiHandle { controller, stack, runner } =
+        WiFiManager::init_async(config).expect("Wi-Fi init failed");
+
+    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
+
+    stack.wait_config_up().await;
+    let v4 = stack.config_v4().expect("no IPv4 config");
+    esp_println::println!("connected, IP {}", v4.address);
+}
 
 #[embassy_executor::task]
-async fn wifi_task(
-    peripherals: esp_hal::peripherals::Peripherals,
-) {
-    let mut wifi = WiFiManager::init_async(
-        peripherals.modem,
-        peripherals.radio_clock_control,
-        WiFiConfig::new("MyNetwork", "password123"),
-    ).await.expect("Wi-Fi init failed");
-
+async fn wifi_task(mut controller: WifiController<'static>) {
     loop {
-        if wifi.is_connected().await {
-            println!("Connected!");
-            break;
+        match controller.connect_async().await {
+            Ok(_) => {
+                let _ = controller.wait_for_disconnect_async().await;
+                Timer::after(Duration::from_millis(500)).await;
+            }
+            Err(_) => Timer::after(Duration::from_secs(5)).await,
         }
-        Timer::after(Duration::from_millis(100)).await;
     }
 }
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, Interface>) -> ! {
+    runner.run().await
+}
 ```
+
+The ESP32-C6 needs two heap regions (a 64 KiB `#[esp_hal::ram(reclaimed)]` region for the radio plus 36 KiB of DRAM); see `examples/hal_c6_connect_async_led.rs`.
 
 ## Example: Async SoftAP + Provisioning
 
+Condensed from `examples/hal_c3_provision_mqtt.rs`.
+The SoftAP is brought up through `init_softap_async`, the credential store lives in a dedicated flash partition, and `ProvisioningBuilder::start` spawns the DHCP, DNS and HTTP tasks.
+The library never reboots or erases on its own; the host acts on the `ProvisioningOutcome`.
+
 ```rust
-use rustyfarian_esp_hal_network::provisioning::ProvisioningPortal;
-use rustyfarian_esp_hal_network::provisioning::SchemaProfile;
+use embassy_executor::Spawner;
+use rustyfarian_esp_hal_network::provisioning::{
+    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningOutcome, ProvisioningStore,
+    SchemaProfile,
+};
+use rustyfarian_esp_hal_network::wifi::{ApConfig, ApConfigExt, WiFiManager};
 
-let portal = ProvisioningPortal::new(
-    SchemaProfile::WifiMqttDevice,
-).await?;
+const FLASH_PARTITION_OFFSET: u32 = 0x300000;
+const FLASH_PARTITION_SIZE: u32 = 8192;
 
-loop {
-    match portal.poll().await {
-        Ok(Some(credentials)) => {
-            println!("Received: {:?}", credentials);
-            break;
+#[esp_rtos::main]
+async fn main(spawner: Spawner) {
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
+    let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
+    let store = ProvisioningStore::open(flash, FLASH_PARTITION_OFFSET, FLASH_PARTITION_SIZE)
+        .expect("provisioning store open");
+
+    let ap_config = ApConfig::open("rustyfarian").with_channel(1).with_ap_peripherals(
+        peripherals.TIMG0,
+        peripherals.FROM_CPU_INTR0,
+        peripherals.WIFI,
+    );
+    let softap = WiFiManager::init_softap_async(ap_config).expect("SoftAP init");
+    let rng = esp_hal::rng::Rng::new();
+
+    let portal_config = PortalConfig {
+        ssid_prefix: "rustyfarian",
+        ssid_override: None,
+        ap_password: None,
+        channel: 1,
+        device_name: "field-device",
+        firmware_version: env!("CARGO_PKG_VERSION"),
+        profile: SchemaProfile::WifiMqttDevice,
+        defaults: PortalDefaults::default(),
+    };
+
+    let session = ProvisioningBuilder::new(portal_config)
+        .start(spawner, softap, store, rng)
+        .expect("provisioning start");
+
+    match session.wait_outcome().await {
+        ProvisioningOutcome::Committed(cfg) => {
+            esp_println::println!("committed for SSID of {} bytes", cfg.wifi_ssid().len());
         }
-        Ok(None) => { /* still polling */ }
-        Err(e) => eprintln!("Portal error: {}", e),
+        ProvisioningOutcome::FactoryResetRequested => {}
+        ProvisioningOutcome::HostAborted => {}
     }
 }
 ```
+
+The already-provisioned boot path must not `.await` before Wi-Fi is up: `esp_rtos::start` runs inside `init_async` / `init_softap_async`, and the executor panics on its first park without it.
+The full example shows the `is_provisioned()` branch, the `on_event` hook, and the build-time-seeded `PortalDefaults`.
 
 ## Integration with juggler
 

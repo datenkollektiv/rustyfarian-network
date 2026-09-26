@@ -818,7 +818,7 @@ pub(crate) mod tasks {
 
     /// Drives the embassy-net stack — must be polled continuously.
     #[embassy_executor::task]
-    pub(crate) async fn net_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
+    pub(crate) async fn net_task(mut runner: Runner<'static, Interface>) -> ! {
         runner.run().await
     }
 

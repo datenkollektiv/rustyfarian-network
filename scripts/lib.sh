@@ -14,10 +14,19 @@ fi
 find_idf_bootloader() {
     local idf_target="$1"
     local idf_dir="${2:-target/idf}"
+    # Normalize idf_dir: if absolute (starts with /), use as-is; if relative, prefix with PWD.
+    # This allows callers to pass either relative paths (e.g., target/idf) or absolute
+    # paths (e.g., /Volumes/RustBuilds/targets/idf/project-name) from the justfile.
+    local resolved_idf_dir
+    if [[ "$idf_dir" = /* ]]; then
+        resolved_idf_dir="$idf_dir"
+    else
+        resolved_idf_dir="$PWD/$idf_dir"
+    fi
     # nullglob makes the array empty (not a literal pattern string) when nothing matches,
     # so the zero/one/many logic below is reliable without an additional -e check.
     shopt -s nullglob
-    local bl_candidates=( "$PWD/$idf_dir/$idf_target/release/build"/esp-idf-sys-*/out/build/bootloader/bootloader.bin )
+    local bl_candidates=( "$resolved_idf_dir/$idf_target/release/build"/esp-idf-sys-*/out/build/bootloader/bootloader.bin )
     shopt -u nullglob
     if [ ${#bl_candidates[@]} -gt 0 ]; then
         if [ ${#bl_candidates[@]} -gt 1 ]; then

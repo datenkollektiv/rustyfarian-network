@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# Required by esp-hal 1.2 / esp-rtos 0.4 / esp-radio 1.0.0-beta.1 (all declare 1.95.0).
+# The `esp` toolchain reports `1.95.0-nightly`, which Cargo accepts for "1.95".
+rust-version = "1.95"
 description = "Bare-metal (esp-hal) async drivers for Wi-Fi, LoRa, OTA, and provisioning on ESP32-C3, ESP32-C6, ESP32-S3, and ESP32"
 keywords    = ["esp32", "esp-hal", "embedded", "no-std", "async"]
 categories  = ["embedded", "hardware-support", "no-std"]
@@ -22,10 +25,10 @@ default = []
 
 # ── Domain features ──────────────────────────────────────────────────────────
 
-# wifi: async STA + SoftAP via esp-radio 0.18.
+# wifi: async STA + SoftAP via esp-radio 1.0.0-beta.1 (pre-release, exact-pinned).
 # The compile_error! guard remains in wifi/mod.rs: enabling any chip feature
 # without `embassy` triggers a compile error in the wifi module.
-# `embassy` is implied by `wifi` (esp-radio 0.18 is async-only).
+# `embassy` is implied by `wifi` (esp-radio is async-only since 0.18).
 wifi = [
     "juggler/wifi",
     "dep:esp-hal",
@@ -160,13 +163,7 @@ esp32s3 = [
 juggler          = { workspace = true, default-features = false }
 log              = { workspace = true }
 embedded-hal     = { workspace = true }
-# Declared directly (not via the workspace table): `rustyfarian-esp-hal-ws2812 0.6`
-# implements `pennant 0.6`'s `StatusLed`, so this crate's `StatusLed` re-export and
-# `S: StatusLed` bounds (wifi, lora) must be the 0.6 trait for a `Ws2812Rmt` to
-# satisfy them, and `hal_c6_connect_async_led` needs it in scope for `set_color`.
-# Revert to `workspace = true` when the HAL driver moves to 0.7 with the next
-# bare-metal wave (see root Cargo.toml).
-pennant          = { version = "0.6", features = ["hal"] }
+pennant          = { workspace = true }
 rgb              = { workspace = true }
 # TODO post-1.0: gate embassy-sync and heapless on the `provisioning` feature.
 # Currently always-on because session.rs references these types unconditionally
@@ -189,7 +186,8 @@ esp-rtos                = { workspace = true, optional = true }
 esp-alloc               = { workspace = true, optional = true }
 esp-backtrace           = { workspace = true, optional = true }
 esp-bootloader-esp-idf  = { workspace = true, optional = true }
-esp-storage             = { workspace = true, optional = true, features = ["critical-section"] }
+# `embedded-storage`: the `NorFlash` impls the provisioning store needs are opt-in since esp-storage 0.10.
+esp-storage             = { workspace = true, optional = true, features = ["critical-section", "embedded-storage"] }
 esp-println             = { workspace = true, optional = true }
 
 embedded-hal-bus        = { workspace = true, optional = true }
