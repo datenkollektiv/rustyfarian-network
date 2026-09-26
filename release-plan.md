@@ -48,7 +48,7 @@ Before publishing for real, run the one-command pre-flight (it also runs version
 just release-publish-validate
 ```
 
-For just the pre-juggler packaging dry-run portion (also run in CI by `.github/workflows/publish-dry-run.yml`):
+For just the pre-juggler packaging dry-run portion:
 
 ```sh
 just release-dry-run

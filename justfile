@@ -434,7 +434,7 @@ release-publish-validate:
 # pre-publish packaging validation (needs a clean tree): juggler gets a full
 # `cargo publish --dry-run` (host-buildable); the two -network crates get
 # `cargo package --list` because their `cargo publish --dry-run` resolves
-# `juggler ^0.4` against the crates.io index, which only succeeds AFTER juggler is
+# `juggler ^0.5` against the crates.io index, which only succeeds AFTER juggler is
 # published — their real dry-run therefore happens as the ordered publish proceeds.
 [group('Release')]
 release-dry-run:
@@ -443,13 +443,13 @@ release-dry-run:
     cargo package --list -p rustyfarian-esp-hal-network > /dev/null
 
 # verify IDF network crate packages cleanly against IDF target (no upload; requires espup)
-# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.4 from index)
+# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.5 from index)
 [group('Release')]
 release-dry-run-idf:
     cargo +esp publish --dry-run -p rustyfarian-esp-idf-network --target {{ idf_target }} --target-dir {{ idf_dir }}
 
 # verify HAL network crate packages cleanly against bare-metal target (no upload)
-# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.4 from index)
+# NOTE: only succeeds AFTER juggler is published to crates.io (resolves juggler ^0.5 from index)
 [group('Release')]
 release-dry-run-hal:
     cargo publish --dry-run -p rustyfarian-esp-hal-network -Zbuild-std=core,alloc --target {{ hal_target }} --target-dir {{ hal_dir }}

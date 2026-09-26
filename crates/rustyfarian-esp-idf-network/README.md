@@ -47,7 +47,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustyfarian-esp-idf-network = { version = "0.4", features = ["wifi", "mqtt"] }
+rustyfarian-esp-idf-network = { version = "0.5", features = ["wifi", "mqtt"] }
 ```
 
 ## Example: Wi-Fi + MQTT

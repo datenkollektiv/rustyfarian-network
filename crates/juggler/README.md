@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-juggler = { version = "0.4", features = ["wifi", "mqtt"] }
+juggler = { version = "0.5", features = ["wifi", "mqtt"] }
 ```
 
 To compile for your target (ESP32, bare-metal, or host), no additional configuration is needed — the pure crate runs everywhere.
