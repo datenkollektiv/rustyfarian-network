@@ -31,6 +31,7 @@ just setup-cargo-config    # one-time: copy .cargo/config.toml.dist → .cargo/c
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy — non-modifying, must pass clean
 just clippy-hal            # clippy the bare-metal crate on its own C3/C6 targets (not in verify)
+just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
 just test                  # all platform-independent unit tests (no ESP toolchain needed)
 just build-example <name>  # build a hardware example with auto-detected chip + target
 just flash <name>          # build + flash to a connected board

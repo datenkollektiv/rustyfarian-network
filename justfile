@@ -404,6 +404,7 @@ verify:
     just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
     just ci
     just check-idf
+    just clippy-provisioning-tests
     just check-hal
     just check-no-credential-logging
     just check-library-never-reboots
