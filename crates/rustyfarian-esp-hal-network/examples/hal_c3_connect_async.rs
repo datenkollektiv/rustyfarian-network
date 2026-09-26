@@ -62,7 +62,7 @@ async fn main(spawner: Spawner) {
 
     let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
         peripherals.TIMG0,
-        peripherals.SW_INTERRUPT,
+        peripherals.FROM_CPU_INTR0,
         peripherals.WIFI,
     );
 
@@ -137,6 +137,6 @@ async fn wifi_task(mut controller: WifiController<'static>) {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, Interface<'static>>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, Interface>) -> ! {
     runner.run().await
 }

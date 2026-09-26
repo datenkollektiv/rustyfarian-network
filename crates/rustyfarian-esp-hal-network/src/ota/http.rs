@@ -435,7 +435,7 @@ pub(crate) mod async_client {
                 return None;
             }
             match self.data.windows(2).position(|w| w == b"\r\n") {
-                Some(pos) if pos == 0 => {
+                Some(0) => {
                     // Blank line — end of headers.
                     self.data = &[];
                     None

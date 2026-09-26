@@ -167,6 +167,19 @@ check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-pro
 check-network-pure-no-std:
     cargo check -p juggler --no-default-features
 
+# run clippy on the esp-hal network crate (bare-metal targets: ESP32-C6 + ESP32-C3)
+# Lints all four domains (wifi, lora, ota, provisioning) on both RISC-V targets.
+# `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
+clippy-hal:
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features lora,esp32c6,rt -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features lora,esp32c3,rt -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target riscv32imc-unknown-none-elf -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c3,unstable,rt,embassy -- -D warnings
+
 # ── Test & Lint ───────────────────────────────────────────────────────────
 
 # run clippy on the entire workspace

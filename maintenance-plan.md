@@ -106,12 +106,8 @@ cargo search rustyfarian-esp-hal-ws2812
 cargo search rustyfarian-esp-idf-ws2812
 ```
 
-Current: `pennant 0.7.0`, `rustyfarian-esp-idf-ws2812 0.7.0`, `rustyfarian-esp-hal-ws2812 0.6.0`
-(since 2026-09-25). These crates resolve from crates.io. The HAL driver lags one release
-because `0.7.0` pins `esp-hal =1.2.2`, which `esp-radio 0.18` cannot resolve against;
-`rustyfarian-esp-hal-network` therefore declares `pennant 0.6` directly instead of via
-the workspace table. A ws2812 minor or major bump that changes esp-hal version pins
-belongs to the quarterly wave cycle, not monthly.
+Current: `pennant 0.7.0`, `rustyfarian-esp-idf-ws2812 0.7.0`, `rustyfarian-esp-hal-ws2812 0.7.0` (all from crates.io, coordinated 2026-09-25).
+A ws2812 minor or major bump belongs to the quarterly wave cycle.
 
 ### Security scanning
 

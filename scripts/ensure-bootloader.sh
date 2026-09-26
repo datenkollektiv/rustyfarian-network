@@ -57,6 +57,32 @@ bl=$(find_idf_bootloader "$idf_target" "$idf_dir")
 if [ -z "$bl" ]; then
     printf 'IDF bootloader not cached for %s — building %s to populate it...\n' "$chip" "$idf_example"
     "$SCRIPT_DIR/build-example.sh" "$idf_example" "$hal_dir" "$idf_dir"
+    # Re-check after building: the build should have generated the bootloader via esp-idf-sys.
+    # If it's still missing, that indicates a build or cache issue that must not be silently ignored.
+    bl=$(find_idf_bootloader "$idf_target" "$idf_dir")
+    if [ -z "$bl" ]; then
+        printf 'Error: IDF bootloader still not found after building %s.\n' "$idf_example" >&2
+        printf 'Expected under: %s/%s/release/build/esp-idf-sys-*/out/build/bootloader/\n' "$idf_dir" "$idf_target" >&2
+        printf 'Verify esp-idf-sys built successfully and the build output was not corrupted.\n' >&2
+        case "$idf_target" in
+            xtensa-*)
+                # Fatal on Xtensa: the espflash-bundled v5.5.1 bootloader has a 32 KB vs
+                # 64 KB MMU page-size mismatch with v5.3.3 binaries, so there is no safe
+                # fallback and flashing would produce a board that does not boot.
+                printf 'Fatal on Xtensa (%s) — the espflash bundled bootloader is not a safe fallback.\n' "$chip" >&2
+                exit 1
+                ;;
+            *)
+                # Non-fatal on RISC-V: the bundled bootloader is generally compatible there
+                # (same rationale as the c6 early exit above), so warn loudly and let
+                # flash.sh fall through to its existing bundled-bootloader path rather than
+                # blocking the flash entirely.
+                printf 'Continuing on RISC-V (%s) — flash.sh will fall back to the espflash bundled bootloader.\n' "$chip" >&2
+                exit 0
+                ;;
+        esac
+    fi
+    printf 'Bootloader cached for %s: %s\n' "$chip" "$bl"
 else
     printf 'Bootloader already cached for %s: %s\n' "$chip" "$bl"
 fi
