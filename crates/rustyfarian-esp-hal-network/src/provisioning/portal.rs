@@ -1223,29 +1223,36 @@ pub(crate) fn dispatch_request(
                         log::info!("POST /save rejected: {} field error(s)", errors.len());
 
                         // Re-render with errors.
-                        let mut errors_html = heapless::String::<512>::new();
+                        // Heap-allocated: nine field errors plus the resubmit
+                        // hint outgrow any small fixed buffer, and a silently
+                        // truncated block would leave unclosed tags.
+                        let mut errors_html = alloc::string::String::new();
                         if !errors.is_empty() {
-                            let _ = errors_html
+                            errors_html
                                 .push_str("<div class=\"errors\"><strong>Please fix:</strong><ul>");
                             for err in &errors {
-                                let _ = errors_html.push_str("<li>");
+                                errors_html.push_str("<li>");
                                 // Use html_escape_to for field names.
                                 html_escape_to(err.field.form_name(), |s| {
-                                    let _ = errors_html.push_str(s);
+                                    errors_html.push_str(s);
                                 });
-                                let _ = errors_html.push_str(": ");
+                                errors_html.push_str(": ");
                                 // Format the error message via alloc::format! since
                                 // alloc is available in bare-metal embassy builds.
                                 let err_str = alloc::format!("{}", err.error);
                                 html_escape_to(err_str.as_str(), |s| {
-                                    let _ = errors_html.push_str(s);
+                                    errors_html.push_str(s);
                                 });
-                                let _ = errors_html.push_str("</li>");
+                                errors_html.push_str("</li>");
                             }
-                            let _ = errors_html.push_str("</ul></div>");
+                            errors_html.push_str("</ul><p>");
+                            errors_html.push_str(juggler::provisioning::templates::RESUBMIT_HINT);
+                            errors_html.push_str("</p></div>");
                         }
 
-                        let prefill = Prefill::empty();
+                        // Stored / default values, never the rejected
+                        // submission (and never a secret).
+                        let prefill = load_prefill(store, config.profile, &config.defaults);
                         const HDR_RES: usize = 200;
                         if resp_buf.len() < HDR_RES {
                             return Err(());
@@ -1314,8 +1321,11 @@ pub(crate) fn dispatch_request(
                                 });
 
                                 // Re-render with banner.
-                                let banner = "<div class=\"errors\">Could not save credentials to flash. Please try again.</div>";
-                                let prefill = Prefill::empty();
+                                let banner = alloc::format!(
+                                    "<div class=\"errors\">Could not save credentials to flash. Please try again.<p>{}</p></div>",
+                                    juggler::provisioning::templates::RESUBMIT_HINT,
+                                );
+                                let prefill = load_prefill(store, config.profile, &config.defaults);
                                 const HDR_RES: usize = 200;
                                 if resp_buf.len() < HDR_RES {
                                     return Err(());
@@ -1324,7 +1334,7 @@ pub(crate) fn dispatch_request(
                                     config,
                                     shared.nonce.as_str(),
                                     &prefill,
-                                    Some(banner),
+                                    Some(banner.as_str()),
                                     &mut resp_buf[HDR_RES..],
                                 )
                                 .map_err(|_| ())?;
@@ -2670,6 +2680,51 @@ mod tests {
         );
         assert!(compose_mqtt_uri("broker.local", "").is_empty());
         assert!(compose_mqtt_uri("", "1883").is_empty());
+    }
+
+    /// Renders the full Wi-Fi+MQTT form into a host buffer with the given
+    /// configured device name.
+    fn render_with_device_name(prefill: &Prefill, device_name: &str) -> std::string::String {
+        use super::super::session::portal::{
+            PortalDefaultsOwned, PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
+        };
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
+
+        let mut dev_name = heapless::String::<RENDER_DEVICE_NAME_MAX>::new();
+        let _ = dev_name.push_str(device_name);
+        let config = PortalRenderConfig {
+            firmware_version: heapless::String::<RENDER_FW_VERSION_MAX>::new(),
+            device_name: dev_name,
+            profile: SchemaProfile::WifiMqttDevice,
+            defaults: PortalDefaultsOwned::from_borrowed(&PortalDefaults::default()),
+        };
+        let mut buf = std::vec![0u8; 16 * 1024];
+        let len = render_portal_template(&config, test_nonce(), prefill, None, &mut buf)
+            .expect("render must fit a 16 KiB buffer");
+        std::string::String::from_utf8(buf[..len].to_vec()).expect("rendered HTML is UTF-8")
+    }
+
+    /// Empty store (defaults path) → the `dev_name` input carries the
+    /// configured `PortalConfig.device_name`.
+    #[test]
+    fn empty_store_renders_configured_device_name() {
+        use super::super::session::portal::PortalDefaultsOwned;
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
+
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        let html = render_with_device_name(&prefill, "rgb-clock");
+        assert!(html.contains("name=\"dev_name\" value=\"rgb-clock\""));
+    }
+
+    /// A stored device name takes precedence over the configured one.
+    #[test]
+    fn stored_device_name_wins_in_render() {
+        let mut prefill = Prefill::empty();
+        let _ = prefill.dev_name.push_str("user-renamed");
+        let html = render_with_device_name(&prefill, "rgb-clock");
+        assert!(html.contains("name=\"dev_name\" value=\"user-renamed\""));
+        assert!(!html.contains("rgb-clock"));
     }
 
     // ── Fix 1: render overflow returns Err ───────────────────────────────────

@@ -3,7 +3,7 @@
 //! A [`SchemaProfile`] is a closed, workspace-curated selection of field groups
 //! (see [ADR 014](../../../docs/adr/014-wifi-mqtt-provisioning-profile.md)).
 //! Exactly two exist: [`SchemaProfile::LorawanFieldDevice`] (Core + LoRaWAN +
-//! OTA) and [`SchemaProfile::WifiMqttDevice`] (Core + MQTT + OTA). Each owns the
+//! OTA) and [`SchemaProfile::WifiMqttDevice`] (Core + MQTT + optional OTA). Each owns the
 //! canonical [`Field`] list its form renders and validates, returned by
 //! [`SchemaProfile::fields`].
 //!
@@ -31,7 +31,7 @@ const LORAWAN_FIELDS: [Field; 7] = [
 ];
 
 /// The canonical fields of [`SchemaProfile::WifiMqttDevice`] (Core + MQTT +
-/// OTA), indexed positionally for the working slots in `parse_form`.
+/// optional OTA), indexed positionally for the working slots in `parse_form`.
 const WIFI_MQTT_FIELDS: [Field; 8] = [
     Field::WifiSsid,
     Field::WifiPassword,
@@ -55,8 +55,9 @@ pub enum SchemaProfile {
     /// Core + LoRaWAN + OTA — the beekeeper field-device schema (unchanged
     /// from v1).
     LorawanFieldDevice,
-    /// Core + MQTT + OTA — Wi-Fi credentials, an MQTT broker, an OTA URL, and a
-    /// device name, with no LoRaWAN.
+    /// Core + MQTT + optional OTA — Wi-Fi credentials, an MQTT broker, an
+    /// optional OTA URL (empty means "no OTA configured"), and a device name,
+    /// with no LoRaWAN.
     WifiMqttDevice,
 }
 

@@ -49,9 +49,9 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <input id="mqtt_client" name="mqtt_client" value="{{MQTT_CLIENT}}" maxlength="23" title="Optional, at most 23 characters. Leave blank to let the firmware derive one.">
 <p class="hint">Optional, at most 23 characters. Blank lets the firmware derive one.</p>
 
-<label for="ota_url">OTA update URL</label>
-<input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128">
-<p class="hint">Plain http:// only.</p>
+<label for="ota_url">OTA update URL (optional)</label>
+<input id="ota_url" name="ota_url" value="{{OTA_URL}}" placeholder="optional" maxlength="128" title="Optional, plain http:// only. Leave blank if this device has no OTA.">
+<p class="hint">Optional, plain http:// only. Leave blank for no OTA.</p>
 
 <label for="dev_name">Device name</label>
 <input id="dev_name" name="dev_name" value="{{DEV_NAME}}" maxlength="24">

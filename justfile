@@ -85,9 +85,19 @@ check-provisioning-pure:
 check-ota-idf:
     cargo check -p rustyfarian-esp-idf-network --features ota --target-dir {{ idf_dir }}
 
+# type-check (clippy) the esp-idf ota unit tests; they cannot run on the host
+# (esp-idf-sys), and the workspace `clippy` never enables `ota`
+clippy-ota-tests:
+    cargo clippy -p rustyfarian-esp-idf-network --features ota --tests --target-dir {{ idf_dir }} -- -D warnings
+
 # check the esp-idf provisioning domain of the consolidated ESP-IDF network crate
 check-provisioning:
     cargo check -p rustyfarian-esp-idf-network --features provisioning --target-dir {{ idf_dir }}
+
+# type-check (clippy) the esp-idf provisioning unit tests; they cannot run on the
+# host (esp-idf-sys), and the workspace `clippy` never enables `provisioning`
+clippy-provisioning-tests:
+    cargo clippy -p rustyfarian-esp-idf-network --features provisioning --tests --target-dir {{ idf_dir }} -- -D warnings
 
 # check the esp-idf espnow domain of the consolidated ESP-IDF network crate
 check-espnow:

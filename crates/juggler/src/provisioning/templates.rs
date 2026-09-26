@@ -41,9 +41,28 @@ pub const WIFI_MQTT_PORTAL_HTML: &str = include_str!("assets/portal_wifi_mqtt.ht
 /// No `{{APP_KEY}}` placeholder exists — the AppKey is never pre-filled.
 pub const LORAWAN_PORTAL_HTML: &str = include_str!("assets/portal_lorawan.html");
 
+/// Experimental: API may change before 1.0.
+///
+/// Hint appended to every error block rendered after a rejected or failed
+/// `POST /save`.
+///
+/// Such re-renders show the stored / default values, never the rejected
+/// submission (so no secret is ever echoed); this tells the user why their
+/// input is gone. Plain text with no HTML-special characters, so tiers can
+/// embed it without escaping.
+pub const RESUBMIT_HINT: &str =
+    "The form shows the saved or default values, not your submission. Re-enter your changes and any passwords.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tiers embed the hint verbatim inside HTML, so it must need no escaping.
+    #[test]
+    fn resubmit_hint_has_no_html_special_chars() {
+        assert!(!RESUBMIT_HINT.is_empty());
+        assert!(!RESUBMIT_HINT.contains(['<', '>', '&', '"', '\'']));
+    }
 
     /// The Wi-Fi + MQTT template must contain the CSRF nonce placeholder and
     /// the SSID pre-fill placeholder so the portal can be secured and

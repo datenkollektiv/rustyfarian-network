@@ -4,6 +4,7 @@
 //! so it can be composed with any `Write`-based download loop.
 
 use esp_idf_svc::ota::{EspOta, EspOtaUpdate};
+use esp_idf_svc::sys::esp_ota_get_next_update_partition;
 
 use juggler::ota::OtaError;
 
@@ -26,15 +27,42 @@ impl FirmwareFlasher {
         Ok(Self { ota })
     }
 
-    /// Begin an OTA write session.
+    /// Size in bytes of the partition the next update will be written to.
+    ///
+    /// This is the same partition [`begin`](Self::begin) opens, so an image no
+    /// larger than this fits.
+    pub fn update_partition_capacity(&self) -> Result<usize, OtaError> {
+        // SAFETY: `esp_ota_get_next_update_partition` only reads the partition
+        // table; a null `start_from` selects the slot after the running one. A
+        // non-null result points at a partition-table entry that lives for the
+        // whole program, so borrowing it via `as_ref` is sound.
+        let partition = unsafe { esp_ota_get_next_update_partition(core::ptr::null()).as_ref() };
+        match partition {
+            Some(partition) => Ok(partition.size as usize),
+            None => {
+                log::error!("No OTA update partition found");
+                Err(OtaError::PartitionNotFound)
+            }
+        }
+    }
+
+    /// Begin an OTA write session for an image of exactly `image_len` bytes.
+    ///
+    /// Only the sectors covering `image_len` are erased (instead of the whole
+    /// partition). The caller must have checked `image_len` against
+    /// [`update_partition_capacity`](Self::update_partition_capacity) and must
+    /// reject a body shorter than `image_len` before completing the update.
     ///
     /// Returns an [`OtaWriter`] that must be either completed with
     /// [`OtaWriter::complete`] or aborted with [`OtaWriter::abort`].
-    pub fn begin(&mut self) -> Result<OtaWriter<'_>, OtaError> {
-        let update = self.ota.initiate_update().map_err(|e| {
-            log::error!("Failed to initiate OTA update: {:?}", e);
-            OtaError::FlashWriteFailed
-        })?;
+    pub fn begin(&mut self, image_len: usize) -> Result<OtaWriter<'_>, OtaError> {
+        let update = self
+            .ota
+            .initiate_update_with_known_size(image_len)
+            .map_err(|e| {
+                log::error!("Failed to initiate OTA update: {:?}", e);
+                OtaError::FlashWriteFailed
+            })?;
 
         log::info!("OTA write session started");
         Ok(OtaWriter {
@@ -88,7 +116,8 @@ impl<'a> OtaWriter<'a> {
     /// Abort the OTA update.
     ///
     /// The previous firmware remains active; the inactive slot is left in an
-    /// aborted state until the next `begin()` call erases it.
+    /// aborted state until the next `begin()` call erases the sectors the next
+    /// image needs and overwrites them.
     pub fn abort(self) -> Result<(), OtaError> {
         self.update.abort().map_err(|e| {
             log::error!("Failed to abort OTA update: {:?}", e);

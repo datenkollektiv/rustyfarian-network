@@ -5,7 +5,7 @@
 //! It may be removed if a workspace HTTP dependency arrives later.
 //!
 //! The client accepts **only** `HTTP/1.1 200 OK` responses with exactly one
-//! valid `Content-Length` header.  Everything else is an explicit error before
+//! valid, non-zero `Content-Length` header.  Everything else is an explicit error before
 //! any flash partition is touched.
 
 // When building without the embassy + chip features, the parsing types and
@@ -42,6 +42,8 @@ pub(crate) enum HttpError {
     TransferEncodingPresent,
     /// The declared `Content-Length` exceeds the caller-supplied `max_bytes` limit.
     BodyTooLarge,
+    /// The declared `Content-Length` is `0` — there is no image to flash.
+    EmptyBody,
     /// I/O error reading from the socket.
     Io,
     /// Connection closed before the full response header was received.
@@ -67,6 +69,11 @@ impl From<HttpError> for OtaError {
             // status 0 so callers know it was a protocol-shape rejection rather
             // than a network error.
             HttpError::TransferEncodingPresent => OtaError::DownloadFailed { status: 0 },
+
+            // A zero-length image is a protocol-shape rejection too; the
+            // ESP-IDF tier maps it the same way. Without this, an empty body
+            // would reach the SHA-256 check with nothing written to the slot.
+            HttpError::EmptyBody => OtaError::DownloadFailed { status: 0 },
 
             // Structural parse failures: the TCP endpoint answered but did not
             // speak recognisable HTTP/1.1 — treat as server unreachable.
@@ -295,6 +302,9 @@ impl HeaderState {
             return Err(HttpError::TransferEncodingPresent);
         }
         let content_length = self.content_length.ok_or(HttpError::MissingContentLength)?;
+        if content_length == 0 {
+            return Err(HttpError::EmptyBody);
+        }
         if content_length > max_bytes {
             return Err(HttpError::BodyTooLarge);
         }
@@ -641,11 +651,12 @@ mod tests {
     }
 
     #[test]
-    fn header_content_length_zero() {
+    fn header_content_length_zero_rejected() {
         let mut state = HeaderState::new();
         state.feed(b"Content-Length: 0").unwrap();
-        let resp = state.finish(u64::MAX).unwrap();
-        assert_eq!(resp.content_length, 0);
+        assert_eq!(state.finish(u64::MAX), Err(HttpError::EmptyBody));
+        let ota_err: OtaError = HttpError::EmptyBody.into();
+        assert_eq!(ota_err, OtaError::DownloadFailed { status: 0 });
     }
 
     #[test]

@@ -168,7 +168,8 @@ pub struct StoredConfig {
     /// MQTT client ID, or `None` when the host derives one at boot / the
     /// `LorawanFieldDevice` profile.
     pub mqtt_client: Option<String>,
-    /// OTA update URL.
+    /// OTA update URL; empty means "no OTA configured" (only possible for the
+    /// `WifiMqttDevice` profile, where the URL is optional).
     pub ota_url: String,
     /// Device name.
     pub device_name: String,

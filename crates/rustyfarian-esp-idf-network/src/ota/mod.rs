@@ -46,7 +46,7 @@ pub use juggler::ota::{
 use std::io::Write;
 use std::time::Duration;
 
-use downloader::FirmwareDownloader;
+use downloader::{check_content_length, FirmwareDownloader};
 use flasher::{FirmwareFlasher, OtaWriter};
 
 use esp_idf_svc::ota::EspOta;
@@ -89,9 +89,20 @@ impl OtaSession {
     /// Fetch firmware from `url`, verify its SHA-256 against `expected_sha256`,
     /// write it to the inactive OTA slot, and set that slot as the boot partition.
     ///
+    /// The server is contacted before any flash is touched: a connection or
+    /// HTTP-status failure, a response without a `Content-Length` (including
+    /// chunked transfer), and an image larger than the inactive partition
+    /// ([`OtaError::InsufficientSpace`]) all fail without erasing anything.
+    /// A body that ends before `Content-Length` bytes arrive fails with
+    /// `DownloadFailed { status: 0 }`, as on the esp-hal tier.
+    ///
     /// The operation is streaming: the full image is never held in RAM.
-    /// Bytes are written to the inactive partition as they arrive — flash
+    /// Once the headers pass, only the sectors the image needs are erased and
+    /// bytes are written to the inactive partition as they arrive — flash
     /// **is** modified during the download, even on the failure path.
+    /// The connection stays open, unread, during that erase; a server whose
+    /// send timeout is shorter than the erase drops it, which fails safely as
+    /// `ServerUnreachable` with the boot slot unchanged.
     /// On verification failure (or any download / flash error), the OTA write
     /// session is aborted and the **boot slot is left unchanged**, so the
     /// device continues to boot the running image; the inactive partition is
@@ -108,8 +119,14 @@ impl OtaSession {
         let downloader = FirmwareDownloader::new(url)
             .with_timeout(Duration::from_secs(self.config.timeout_secs));
 
+        let response = downloader.connect()?;
+
         let mut flasher = FirmwareFlasher::new()?;
-        let mut ota_writer = flasher.begin()?;
+        let image_len = check_content_length(
+            response.content_length(),
+            flasher.update_partition_capacity()?,
+        )?;
+        let mut ota_writer = flasher.begin(image_len)?;
         let mut verifier = StreamingVerifier::new();
 
         let result = {
@@ -117,10 +134,8 @@ impl OtaSession {
                 inner: &mut ota_writer,
                 verifier: &mut verifier,
             };
-            downloader.download(&mut verifying_writer, |downloaded, total| {
-                if let Some(total) = total {
-                    log::debug!("OTA progress: {}/{} bytes", downloaded, total);
-                }
+            response.stream(image_len, &mut verifying_writer, |downloaded, total| {
+                log::debug!("OTA progress: {}/{} bytes", downloaded, total);
             })
         };
 
