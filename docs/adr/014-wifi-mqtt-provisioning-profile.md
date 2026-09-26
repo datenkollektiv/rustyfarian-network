@@ -44,7 +44,7 @@ The field groups are:
 Exactly two profiles exist:
 
 - `LorawanFieldDevice` = Core + LoRaWAN + OTA — today's behaviour, unchanged.
-- `WifiMqttDevice` = Core + MQTT + OTA — the new profile `rustyfarian-rgb-clock` needs.
+- `WifiMqttDevice` = Core + MQTT + OTA (OTA optional since the 2026-09-26 amendment below) — the new profile `rustyfarian-rgb-clock` needs.
 
 Generic host-defined schemas remain rejected, reaffirming ADR 013 §4: centralised validation is the load-bearing piece of `provisioning-pure`, and a generic schema scatters validation rules across every downstream.
 A profile is not a generic schema — it is a closed, workspace-curated combination of field groups whose validation still lives in the pure crate.
@@ -175,6 +175,15 @@ These landed with acceptance on 2026-06-12 and are recorded for the follow-throu
 - Any `VISION.md` / `README.md` / `CHANGELOG.md` wording that describes the schema as "four-field" is updated to reflect two profiles.
   (The "four-field" phrasing appeared in `docs/ROADMAP.md`, `CHANGELOG.md`, and ADR 013; it was not in `VISION.md` or the README, both of which were checked when the ADR landed.)
 - The feature doc's seven open questions are signed off and Phases 1–4 are implemented.
+
+## Amendment 2026-09-26 — OTA URL optional for WifiMqttDevice
+
+The `ota_url` field is now optional for the `WifiMqttDevice` profile.
+An absent or empty value is accepted and stored as an empty string; `ProvisioningConfig::ota_url()` returns `""`, meaning "no OTA configured".
+A non-empty value is still validated (plain `http://` with a non-empty host, max 128 bytes; `https://` rejected per ADR 011).
+`LorawanFieldDevice` keeps `ota_url` required — beekeeper field devices rely on OTA.
+Motivation: `rustyfarian-rgb-clock` uses `WifiMqttDevice` but implements no OTA; users previously had to invent a placeholder URL.
+NVS/flash layout unchanged — both stores already round-trip empty strings.
 
 ## References
 

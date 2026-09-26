@@ -36,7 +36,12 @@ fn url_for_log(url: &str) -> String {
     }
 }
 
-/// Downloads firmware over plain HTTP and writes it to an arbitrary `Write` sink.
+/// Downloads firmware over plain HTTP.
+///
+/// Split into two phases so no flash is touched before the server has
+/// answered: [`connect`](Self::connect) opens the connection and reads the
+/// response headers, and [`FirmwareResponse::stream`] then writes the body to
+/// an arbitrary `Write` sink.
 pub struct FirmwareDownloader {
     url: String,
     timeout: Duration,
@@ -59,39 +64,70 @@ impl FirmwareDownloader {
         self
     }
 
-    /// Download the firmware, writing each chunk to `writer` and calling
-    /// `progress(bytes_downloaded, total_bytes)` after each chunk.
-    ///
-    /// Returns the total number of bytes downloaded.
+    /// Open the connection and read the `200` response headers.
     ///
     /// HTTPS URLs are rejected; only plain `http://` is accepted at MVP scope.
-    pub fn download<W, F>(&self, writer: &mut W, mut progress: F) -> Result<usize, OtaError>
-    where
-        W: Write,
-        F: FnMut(usize, Option<usize>),
-    {
+    pub fn connect(&self) -> Result<FirmwareResponse, OtaError> {
         log::info!(
             "Starting firmware download from: {}",
             url_for_log(&self.url)
         );
 
-        let mut client = create_http_connection(&self.url, self.timeout)?;
+        let client = create_http_connection(&self.url, self.timeout)?;
+        let content_length = client.content_len();
+        Ok(FirmwareResponse {
+            client,
+            content_length,
+        })
+    }
+}
 
-        let total_size = client.content_len().map(|len| len as usize);
-        if let Some(size) = total_size {
-            log::info!("Firmware size: {} bytes", size);
-        }
+/// A `200` response whose body has not been read yet.
+pub struct FirmwareResponse {
+    client: EspHttpConnection,
+    /// The declared `Content-Length`; `None` when absent or chunked.
+    content_length: Option<u64>,
+}
+
+impl FirmwareResponse {
+    /// The declared `Content-Length`, or `None` when the response carries none
+    /// (including `Transfer-Encoding: chunked`).
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    /// Stream exactly `expected_len` body bytes into `writer`, calling
+    /// `progress(bytes_downloaded, expected_len)` after each chunk.
+    ///
+    /// `expected_len` is the validated `Content-Length` (see
+    /// [`check_content_length`]). A connection that closes before all of it
+    /// arrives is a transport failure (`DownloadFailed { status: 0 }`, matching
+    /// the esp-hal tier), not a successful download.
+    ///
+    /// Returns the total number of bytes downloaded.
+    pub fn stream<W, F>(
+        mut self,
+        expected_len: usize,
+        writer: &mut W,
+        mut progress: F,
+    ) -> Result<usize, OtaError>
+    where
+        W: Write,
+        F: FnMut(usize, usize),
+    {
+        log::info!("Firmware size: {} bytes", expected_len);
 
         let mut downloaded = 0usize;
         let mut buffer = [0u8; DOWNLOAD_BUFFER_SIZE];
 
-        loop {
+        while downloaded < expected_len {
+            let want = (expected_len - downloaded).min(DOWNLOAD_BUFFER_SIZE);
             // The embedded-svc `read()` error type collapses connection-reset,
             // DNS-mid-stream, and read-timeout into one `IOError`. Map all of
             // them to `ServerUnreachable` — most production failures are
             // connection-shaped, and a true read-timeout is also a server that
             // stopped answering. A future hardened build can differentiate.
-            let bytes_read = client.read(&mut buffer).map_err(|e| {
+            let bytes_read = self.client.read(&mut buffer[..want]).map_err(|e| {
                 log::error!("Read error during firmware download: {:?}", e);
                 OtaError::ServerUnreachable
             })?;
@@ -106,18 +142,70 @@ impl FirmwareDownloader {
             })?;
 
             downloaded += bytes_read;
-            progress(downloaded, total_size);
+            progress(downloaded, expected_len);
 
             if downloaded % (64 * 1024) < DOWNLOAD_BUFFER_SIZE {
-                if let Some(total) = total_size {
-                    let percent = (downloaded * 100) / total;
-                    log::debug!("Download progress: {}% ({}/{})", percent, downloaded, total);
-                }
+                let percent = (downloaded * 100) / expected_len;
+                log::debug!(
+                    "Download progress: {}% ({}/{})",
+                    percent,
+                    downloaded,
+                    expected_len
+                );
             }
         }
 
+        check_body_complete(downloaded, expected_len)?;
         log::info!("Download complete: {} bytes", downloaded);
         Ok(downloaded)
+    }
+}
+
+/// Validate the declared `Content-Length` against the update partition's
+/// `capacity`, returning the image length to stream.
+///
+/// Mirrors the esp-hal tier's strict transport (ADR 011 §2): a missing
+/// `Content-Length` (including chunked transfer) or a zero-length body is a
+/// protocol-shape rejection (`DownloadFailed { status: 0 }`), and an image
+/// larger than the partition is `InsufficientSpace`. Zero is rejected
+/// explicitly because `esp_ota_begin` treats an image size of `0` as "erase
+/// the whole partition".
+pub fn check_content_length(
+    content_length: Option<u64>,
+    capacity: usize,
+) -> Result<usize, OtaError> {
+    match content_length {
+        None => {
+            log::error!("Firmware response has no Content-Length (missing or chunked); rejected");
+            Err(OtaError::DownloadFailed { status: 0 })
+        }
+        Some(0) => {
+            log::error!("Firmware response declares an empty body; rejected");
+            Err(OtaError::DownloadFailed { status: 0 })
+        }
+        Some(len) if len > capacity as u64 => {
+            log::error!(
+                "Firmware image ({} bytes) exceeds the OTA partition ({} bytes)",
+                len,
+                capacity
+            );
+            Err(OtaError::InsufficientSpace)
+        }
+        Some(len) => Ok(len as usize),
+    }
+}
+
+/// Reject a body that ended before `expected` bytes arrived.
+fn check_body_complete(received: usize, expected: usize) -> Result<(), OtaError> {
+    if received == expected {
+        Ok(())
+    } else {
+        log::error!(
+            "Firmware download ended early: {} of {} bytes received",
+            received,
+            expected
+        );
+        Err(OtaError::DownloadFailed { status: 0 })
     }
 }
 
@@ -184,7 +272,41 @@ pub fn create_http_connection(url: &str, timeout: Duration) -> Result<EspHttpCon
 
 #[cfg(test)]
 mod tests {
-    use super::url_for_log;
+    use super::{check_body_complete, check_content_length, url_for_log};
+    use juggler::ota::OtaError;
+
+    const SHAPE_REJECTED: OtaError = OtaError::DownloadFailed { status: 0 };
+
+    #[test]
+    fn content_length_within_capacity_accepted() {
+        assert_eq!(check_content_length(Some(1024), 4096), Ok(1024));
+        assert_eq!(check_content_length(Some(4096), 4096), Ok(4096));
+    }
+
+    #[test]
+    fn content_length_over_capacity_is_insufficient_space() {
+        assert_eq!(
+            check_content_length(Some(4097), 4096),
+            Err(OtaError::InsufficientSpace)
+        );
+        assert_eq!(
+            check_content_length(Some(u64::MAX), 4096),
+            Err(OtaError::InsufficientSpace)
+        );
+    }
+
+    #[test]
+    fn missing_or_zero_content_length_rejected() {
+        assert_eq!(check_content_length(None, 4096), Err(SHAPE_REJECTED));
+        assert_eq!(check_content_length(Some(0), 4096), Err(SHAPE_REJECTED));
+    }
+
+    #[test]
+    fn short_body_rejected_complete_body_accepted() {
+        assert_eq!(check_body_complete(100, 100), Ok(()));
+        assert_eq!(check_body_complete(99, 100), Err(SHAPE_REJECTED));
+        assert_eq!(check_body_complete(0, 100), Err(SHAPE_REJECTED));
+    }
 
     #[test]
     fn url_without_userinfo_unchanged() {

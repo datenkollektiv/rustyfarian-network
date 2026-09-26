@@ -109,6 +109,10 @@ impl ProvisioningConfig {
     /// Experimental: API may change before 1.0.
     ///
     /// The validated OTA update URL.
+    ///
+    /// An empty string means "no OTA configured". This is only possible under
+    /// [`SchemaProfile::WifiMqttDevice`], where the URL is optional (ADR 014
+    /// amendment); `LorawanFieldDevice` configs always carry a non-empty URL.
     pub fn ota_url(&self) -> &str {
         &self.ota_url
     }

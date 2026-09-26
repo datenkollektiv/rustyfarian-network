@@ -157,7 +157,7 @@ impl<'d> EspHalOtaManager<'d> {
 
         // 4. Send GET request and parse headers.
         //    `fetch_get` validates status 200, exactly-one Content-Length,
-        //    no Transfer-Encoding, and Content-Length <= max_bytes.
+        //    no Transfer-Encoding, and 0 < Content-Length <= max_bytes.
         //    Wrapped in `with_timeout` so a stalled server cannot hang the
         //    OTA path indefinitely.
         let http_resp = with_timeout(timeout, fetch_get(socket, &parsed, max_bytes))

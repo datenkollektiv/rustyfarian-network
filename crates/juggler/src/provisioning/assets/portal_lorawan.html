@@ -46,8 +46,8 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <p class="hint">32 hex characters. Example: <code>0102030405060708090A0B0C0D0E0F10</code>.</p>
 
 <label for="ota_url">OTA update URL</label>
-<input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128">
-<p class="hint">Plain http:// only.</p>
+<input id="ota_url" name="ota_url" value="{{OTA_URL}}" maxlength="128" required title="Required, plain http:// only.">
+<p class="hint">Required, plain http:// only.</p>
 
 <label for="dev_name">Device name</label>
 <input id="dev_name" name="dev_name" value="{{DEV_NAME}}" maxlength="24">

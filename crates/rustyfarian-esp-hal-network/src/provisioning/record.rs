@@ -994,6 +994,25 @@ mod tests {
     }
 
     #[test]
+    fn wifi_mqtt_round_trip_without_ota_url() {
+        let body = format!(
+            "wifi_ssid=net&wifi_pass={}&mqtt_uri=mqtt://b.local:1883&dev_name=clock",
+            test_wifi_psk()
+        );
+        let config = juggler::provisioning::parse_form(
+            &body,
+            juggler::provisioning::SchemaProfile::WifiMqttDevice,
+        )
+        .expect("ota_url is optional for WifiMqttDevice");
+        assert_eq!(config.ota_url(), "");
+        let mut buf = [0u8; SECTOR_SIZE];
+        let len = encode_record(&config, 1, &mut buf).unwrap();
+        let decoded = decode_record(&buf[..len]).unwrap();
+        assert_eq!(decoded.config.ota_url(), "");
+        assert_eq!(decoded.config.device_name(), "clock");
+    }
+
+    #[test]
     fn profile_discriminator_round_trip() {
         let config = make_wifi_mqtt_config("net", "p", "b.local", 1883, None, None, None);
         let mut buf = [0u8; SECTOR_SIZE];

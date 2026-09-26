@@ -276,7 +276,9 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
             Field::AppKey => validate_app_key(slot, &mut app_key_hex, &mut errors),
             Field::MqttUri => validate_mqtt_uri(slot, &mut mqtt_host, &mut mqtt_port, &mut errors),
             Field::MqttClient => validate_mqtt_client(slot, &mut mqtt_client, &mut errors),
-            Field::OtaUrl => validate_ota_url(slot, &mut ota_url, &mut errors),
+            Field::OtaUrl => {
+                validate_ota_url(slot, ota_url_required(profile), &mut ota_url, &mut errors)
+            }
             Field::DeviceName => validate_device_name(slot, &mut device_name, &mut errors),
             // MqttPass is validated jointly with MqttUser below.
             Field::MqttUser | Field::MqttPass | Field::Form => {}
@@ -514,8 +516,21 @@ fn validate_hex<const N: usize>(
     let _ = out.push_str(&slot.value);
 }
 
+/// Whether `profile` requires an OTA update URL.
+///
+/// `LorawanFieldDevice` keeps OTA mandatory; for `WifiMqttDevice` it is optional
+/// (ADR 014 amendment) and an absent or empty value is stored as `""`, meaning
+/// "no OTA configured".
+fn ota_url_required(profile: SchemaProfile) -> bool {
+    match profile {
+        SchemaProfile::LorawanFieldDevice => true,
+        SchemaProfile::WifiMqttDevice => false,
+    }
+}
+
 fn validate_ota_url(
     slot: &Slot,
+    required: bool,
     out: &mut heapless::String<OTA_URL_MAX_LEN>,
     errors: &mut FieldErrors,
 ) {
@@ -524,12 +539,21 @@ fn validate_ota_url(
         return;
     }
     if !slot.seen {
-        push_field_error(errors, Field::OtaUrl, ValidationError::Missing);
+        if required {
+            push_field_error(errors, Field::OtaUrl, ValidationError::Missing);
+        }
         return;
     }
     if slot.value.is_empty() {
-        push_field_error(errors, Field::OtaUrl, ValidationError::Empty);
-        return;
+        if required {
+            push_field_error(errors, Field::OtaUrl, ValidationError::Empty);
+            return;
+        }
+        // An over-long value also leaves `value` empty; it must fall through
+        // to the `TooLong` check rather than be accepted as "no OTA".
+        if !slot.overflowed {
+            return;
+        }
     }
     if slot.overflowed || slot.value.len() > OTA_URL_MAX_LEN {
         push_field_error(
@@ -1175,6 +1199,102 @@ mod tests {
             Field::OtaUrl,
             ValidationError::TooLong { max: 128 }
         ));
+    }
+
+    // ── OTA URL optionality per profile ─────────────────────────────────
+
+    /// Builds a valid `WifiMqttDevice` body with the `ota_url` pair omitted.
+    fn mqtt_body_without_ota() -> alloc::string::String {
+        let body = mqtt_body_with("ota_url", "");
+        body.replace("&ota_url=", "")
+    }
+
+    #[test]
+    fn wifi_mqtt_absent_ota_url_accepted_as_empty() {
+        let body = mqtt_body_without_ota();
+        assert!(!body.contains("ota_url"));
+        let cfg = parse_form(&body, WIFI_MQTT).expect("ota_url is optional");
+        assert_eq!(cfg.ota_url(), "");
+    }
+
+    #[test]
+    fn wifi_mqtt_empty_ota_url_accepted_as_empty() {
+        let cfg = parse_form(&mqtt_body_with("ota_url", ""), WIFI_MQTT).expect("empty ota_url");
+        assert_eq!(cfg.ota_url(), "");
+    }
+
+    #[test]
+    fn wifi_mqtt_valid_ota_url_kept() {
+        let cfg = parse_form(&mqtt_body_with("ota_url", TEST_URL), WIFI_MQTT).expect("valid");
+        assert_eq!(cfg.ota_url(), TEST_URL);
+    }
+
+    #[test]
+    fn wifi_mqtt_invalid_non_empty_ota_url_still_rejected() {
+        for bad in [
+            "example.com/x",
+            "https://example.com/x",
+            "http://",
+            "ftp://h/x",
+        ] {
+            let errors =
+                parse_form(&mqtt_body_with("ota_url", bad), WIFI_MQTT).expect_err("invalid url");
+            assert!(
+                has_error(&errors, Field::OtaUrl, ValidationError::InvalidUrl),
+                "{bad} should be InvalidUrl"
+            );
+        }
+    }
+
+    #[test]
+    fn wifi_mqtt_too_long_ota_url_still_rejected() {
+        let mut url129 = alloc::string::String::from("http://");
+        while url129.len() < 129 {
+            url129.push('h');
+        }
+        let errors = parse_form(&mqtt_body_with("ota_url", &url129), WIFI_MQTT).expect_err("129");
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::TooLong { max: 128 }
+        ));
+    }
+
+    #[test]
+    fn wifi_mqtt_oversized_ota_url_not_accepted_as_empty() {
+        // Exceeds the decode buffer, so the slot overflows with an empty value.
+        let mut huge = alloc::string::String::from("http://");
+        while huge.len() <= VALUE_DECODE_MAX {
+            huge.push('h');
+        }
+        let errors = parse_form(&mqtt_body_with("ota_url", &huge), WIFI_MQTT).expect_err("huge");
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::TooLong { max: 128 }
+        ));
+    }
+
+    #[test]
+    fn wifi_mqtt_duplicate_ota_url_still_rejected() {
+        let body = alloc::format!("{}&ota_url=http://h/y", mqtt_body_with("ota_url", ""));
+        let errors = parse_form(&body, WIFI_MQTT).expect_err("duplicate");
+        assert!(has_error(
+            &errors,
+            Field::OtaUrl,
+            ValidationError::Duplicate
+        ));
+    }
+
+    #[test]
+    fn lorawan_ota_url_still_required() {
+        let errors = parse_form(&body_with("ota_url", ""), LORAWAN).expect_err("empty");
+        assert!(has_error(&errors, Field::OtaUrl, ValidationError::Empty));
+
+        let body = body_with("ota_url", "").replace("&ota_url=", "");
+        assert!(!body.contains("ota_url"));
+        let errors = parse_form(&body, LORAWAN).expect_err("missing");
+        assert!(has_error(&errors, Field::OtaUrl, ValidationError::Missing));
     }
 
     // ── Device name ─────────────────────────────────────────────────────

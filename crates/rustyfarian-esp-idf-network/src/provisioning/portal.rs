@@ -31,12 +31,12 @@ use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
-use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, WIFI_MQTT_PORTAL_HTML};
+use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, RESUBMIT_HINT, WIFI_MQTT_PORTAL_HTML};
 use juggler::provisioning::{
     parse_form, Field, FieldErrors, PortalDefaults, ProvisioningInput, SchemaProfile,
 };
 
-use crate::provisioning::store::ProvisioningStore;
+use crate::provisioning::store::{ProvisioningStore, StoredConfig};
 use crate::provisioning::{ProvisioningEvent, SharedState};
 
 /// Selects the shared template for `profile`.
@@ -109,8 +109,9 @@ pub(crate) fn start(
         let store_for_load = store.clone();
         let nonce = nonce.clone();
         let defaults_for_load = defaults.clone();
+        let device_name = device_name.clone();
         server.fn_handler("/", Method::Get, move |request| {
-            let prefill = load_prefill(&store_for_load, profile, &defaults_for_load);
+            let prefill = load_prefill(&store_for_load, profile, &defaults_for_load, &device_name);
             let html = render_form(profile, &nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
@@ -129,6 +130,8 @@ pub(crate) fn start(
         let store = store.clone();
         let nonce = nonce.clone();
         let on_event = on_event.clone();
+        let defaults = defaults.clone();
+        let device_name = device_name.clone();
         server.fn_handler("/save", Method::Post, move |mut request| {
             let body = match read_body(&mut request) {
                 BodyRead::Ok(b) => b,
@@ -136,7 +139,7 @@ pub(crate) fn start(
                     let html = render_form_with_banner(
                         profile,
                         &nonce,
-                        &Prefill::empty(),
+                        &load_prefill(&store, profile, &defaults, &device_name),
                         "Request body too large — please try again.",
                     );
                     let mut response = request.into_status_response(413)?;
@@ -179,7 +182,7 @@ pub(crate) fn start(
                             let html = render_form_with_banner(
                                 profile,
                                 &nonce,
-                                &Prefill::empty(),
+                                &load_prefill(&store, profile, &defaults, &device_name),
                                 "Could not save credentials to flash. Please try again.",
                             );
                             let mut response = request.into_status_response(500)?;
@@ -191,7 +194,8 @@ pub(crate) fn start(
                     state.apply(ProvisioningInput::InvalidSubmission);
                     (on_event)(ProvisioningEvent::SubmissionRejected);
                     log::info!("POST /save rejected: {} field error(s)", errors.len());
-                    let html = render_form(profile, &nonce, &Prefill::empty(), &errors);
+                    let prefill = load_prefill(&store, profile, &defaults, &device_name);
+                    let html = render_form(profile, &nonce, &prefill, &errors);
                     let mut response = request.into_status_response(400)?;
                     response.write_all(html.as_bytes())?;
                 }
@@ -438,9 +442,7 @@ struct Prefill {
 }
 
 impl Prefill {
-    /// An all-empty pre-fill (used when re-rendering after a POST: secrets are
-    /// never echoed and non-secret values came from the rejected submission,
-    /// which we deliberately do not round-trip).
+    /// An all-empty pre-fill, the base the defaults path fills in.
     fn empty() -> Self {
         Self {
             wifi_ssid: String::new(),
@@ -459,13 +461,20 @@ impl Prefill {
     /// Used as the empty-store fallback (fresh / factory-reset device) so the
     /// portal form comes up pre-populated. Only the active profile's fields are
     /// filled; `mqtt_uri` is recomposed from the separate `mqtt_host` +
-    /// `mqtt_port` defaults (mirroring the stored-config path). No secret is
-    /// ever sourced — `PortalDefaultsOwned` carries none.
-    fn from_defaults(defaults: &PortalDefaultsOwned, profile: SchemaProfile) -> Self {
+    /// `mqtt_port` defaults (mirroring the stored-config path). `dev_name` is the
+    /// caller's configured `device_name` — `PortalDefaults` intentionally has no
+    /// device-name field. No secret is ever sourced — `PortalDefaultsOwned`
+    /// carries none.
+    fn from_defaults(
+        defaults: &PortalDefaultsOwned,
+        profile: SchemaProfile,
+        device_name: &str,
+    ) -> Self {
         let mut prefill = Prefill::empty();
         // Common to every profile.
         prefill.wifi_ssid = defaults.wifi_ssid.clone();
         prefill.ota_url = defaults.ota_url.clone();
+        prefill.dev_name = device_name.to_string();
         match profile {
             SchemaProfile::LorawanFieldDevice => {
                 prefill.dev_eui = defaults.dev_eui.clone();
@@ -486,8 +495,12 @@ impl Prefill {
 /// A stored configuration for the active profile takes precedence. Otherwise —
 /// when unprovisioned, when the stored profile doesn't match, or on a store /
 /// mutex error — falls back to the caller-supplied non-secret `defaults`
-/// (seeded from `.env` on a fresh / factory-reset device) so the form still
-/// comes up pre-populated.
+/// (seeded from `.env` on a fresh / factory-reset device) and the configured
+/// `device_name`, so the form still comes up pre-populated.
+///
+/// Also used to re-render the form after a rejected `POST /save`: the rejected
+/// submission itself is deliberately not round-tripped (no secret is ever
+/// echoed), but the form shows the stored / default values instead of blanks.
 ///
 /// For the `WifiMqttDevice` profile the `mqtt_uri` field is recomposed from the
 /// stored `mqtt_host` + `mqtt_port` (the inverse of the parse-time split). The
@@ -497,16 +510,38 @@ fn load_prefill(
     store: &Arc<std::sync::Mutex<ProvisioningStore>>,
     profile: SchemaProfile,
     defaults: &PortalDefaultsOwned,
+    device_name: &str,
 ) -> Prefill {
-    let guard = match store.lock() {
-        Ok(g) => g,
+    let stored = match store.lock() {
+        Ok(guard) => match guard.load() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                log::debug!("load_prefill: store.load() failed, rendering defaults: {e:#}");
+                None
+            }
+        },
         Err(_) => {
             log::warn!("load_prefill: store mutex poisoned, rendering defaults");
-            return Prefill::from_defaults(defaults, profile);
+            None
         }
     };
-    match guard.load() {
-        Ok(Some(cfg)) if cfg.profile == profile => {
+    prefill_for(stored, profile, defaults, device_name)
+}
+
+/// Chooses the pre-fill source: `stored` when it belongs to the active
+/// `profile`, otherwise the caller's `defaults` plus the configured
+/// `device_name`.
+///
+/// A stored record under the *other* profile must not pre-fill this form (its
+/// fields do not map), so it is treated like an empty store.
+fn prefill_for(
+    stored: Option<StoredConfig>,
+    profile: SchemaProfile,
+    defaults: &PortalDefaultsOwned,
+    device_name: &str,
+) -> Prefill {
+    match stored {
+        Some(cfg) if cfg.profile == profile => {
             let mut prefill = Prefill {
                 wifi_ssid: cfg.wifi_ssid,
                 dev_eui: cfg.dev_eui_hex,
@@ -522,14 +557,7 @@ fn load_prefill(
             }
             prefill
         }
-        // A stored record under the *other* profile must not pre-fill this
-        // form (its fields do not map); fall back to the caller's defaults.
-        Ok(Some(_)) => Prefill::from_defaults(defaults, profile),
-        Ok(None) => Prefill::from_defaults(defaults, profile),
-        Err(e) => {
-            log::debug!("load_prefill: store.load() failed, rendering defaults: {e:#}");
-            Prefill::from_defaults(defaults, profile)
-        }
+        _ => Prefill::from_defaults(defaults, profile, device_name),
     }
 }
 
@@ -589,6 +617,7 @@ fn render_template(
 fn render_banner(message: &str) -> String {
     let mut out = String::from("<div class=\"errors\">");
     out.push_str(&html_escape(message));
+    push_resubmit_hint(&mut out);
     out.push_str("</div>");
     out
 }
@@ -608,8 +637,17 @@ fn render_errors(errors: &FieldErrors) -> String {
         out.push_str(&html_escape(&error.error.to_string()));
         out.push_str("</li>");
     }
-    out.push_str("</ul></div>");
+    out.push_str("</ul>");
+    push_resubmit_hint(&mut out);
+    out.push_str("</div>");
     out
+}
+
+/// Appends the shared [`RESUBMIT_HINT`] paragraph to an error block.
+fn push_resubmit_hint(out: &mut String) {
+    out.push_str("<p>");
+    out.push_str(RESUBMIT_HINT);
+    out.push_str("</p>");
 }
 
 /// Human-readable label for a form field.
@@ -727,6 +765,24 @@ mod tests {
     }
 
     #[test]
+    fn error_blocks_carry_resubmit_hint() {
+        let mut errors = FieldErrors::new();
+        let _ = errors.push(juggler::provisioning::FieldError {
+            field: Field::OtaUrl,
+            error: juggler::provisioning::ValidationError::InvalidUrl,
+        });
+        let block = render_errors(&errors);
+        assert!(block.contains(RESUBMIT_HINT));
+        assert!(block.ends_with("</p></div>"));
+
+        let banner = render_banner("Could not save credentials to flash. Please try again.");
+        assert!(banner.contains(RESUBMIT_HINT));
+        assert!(banner.ends_with("</p></div>"));
+
+        assert!(render_errors(&FieldErrors::new()).is_empty());
+    }
+
+    #[test]
     fn html_escape_covers_all_five() {
         assert_eq!(
             html_escape("<a href=\"x\">&'"),
@@ -781,7 +837,7 @@ mod tests {
             ota_url: "http://ota.local/fw.bin",
         });
 
-        let wifi = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        let wifi = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
         assert_eq!(wifi.wifi_ssid, "HomeNet");
         assert_eq!(wifi.mqtt_uri, "mqtt://broker.local:1883");
         assert_eq!(wifi.mqtt_user, "sensor");
@@ -794,7 +850,7 @@ mod tests {
         assert!(wifi.join_eui.is_empty());
 
         // LoRaWAN: EUIs fill; MQTT stays empty.
-        let lora = Prefill::from_defaults(&owned, SchemaProfile::LorawanFieldDevice);
+        let lora = Prefill::from_defaults(&owned, SchemaProfile::LorawanFieldDevice, "");
         assert_eq!(lora.wifi_ssid, "HomeNet");
         assert_eq!(lora.dev_eui, "0102030405060708");
         assert_eq!(lora.join_eui, "70B3D57ED0000000");
@@ -808,7 +864,7 @@ mod tests {
     #[test]
     fn from_defaults_empty_yields_empty_prefill() {
         let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
         assert!(p.wifi_ssid.is_empty());
         assert!(p.mqtt_uri.is_empty());
         assert!(p.ota_url.is_empty());
@@ -821,8 +877,117 @@ mod tests {
             mqtt_host: "broker.local",
             ..PortalDefaults::default()
         });
-        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
+        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
         assert!(p.mqtt_uri.is_empty());
+    }
+
+    /// Runtime-generated secret fixture (16 hex digits from a fresh
+    /// `RandomState`), so no string literal flows into a password field — see
+    /// `test_psk()` in `juggler::wifi` for why.
+    fn test_secret() -> String {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(0);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// Runtime-generated nonce fixture (8 hex digits, the same shape
+    /// `generate_nonce` produces), so no string literal flows into a `nonce`
+    /// parameter — see `test_nonce()` in the bare-metal portal for why.
+    ///
+    /// Callers only need a well-formed token; these tests assert on rendered
+    /// form fields, not on the nonce itself.
+    fn test_nonce() -> String {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(0);
+        format!("{:08x}", hasher.finish() as u32)
+    }
+
+    fn stored_wifi_mqtt(device_name: &str) -> StoredConfig {
+        StoredConfig {
+            profile: SchemaProfile::WifiMqttDevice,
+            wifi_ssid: "StoredNet".to_string(),
+            wifi_password: test_secret(),
+            dev_eui_hex: String::new(),
+            join_eui_hex: String::new(),
+            app_key_hex: String::new(),
+            mqtt_host: "stored.local".to_string(),
+            mqtt_port: 8883,
+            mqtt_user: Some("stored-user".to_string()),
+            mqtt_pass: Some(test_secret()),
+            mqtt_client: None,
+            ota_url: String::new(),
+            device_name: device_name.to_string(),
+            extras: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_store_prefills_configured_device_name() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        for profile in [
+            SchemaProfile::WifiMqttDevice,
+            SchemaProfile::LorawanFieldDevice,
+        ] {
+            let p = prefill_for(None, profile, &owned, "rgb-clock");
+            assert_eq!(p.dev_name, "rgb-clock");
+            let html = render_form(profile, &test_nonce(), &p, &FieldErrors::new());
+            assert!(html.contains("value=\"rgb-clock\""));
+        }
+    }
+
+    #[test]
+    fn stored_device_name_wins_over_configured() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let p = prefill_for(
+            Some(stored_wifi_mqtt("user-renamed")),
+            SchemaProfile::WifiMqttDevice,
+            &owned,
+            "rgb-clock",
+        );
+        assert_eq!(p.dev_name, "user-renamed");
+        assert_eq!(p.wifi_ssid, "StoredNet");
+        assert_eq!(p.mqtt_uri, "mqtt://stored.local:8883");
+    }
+
+    #[test]
+    fn other_profile_record_falls_back_to_configured_device_name() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let p = prefill_for(
+            Some(stored_wifi_mqtt("user-renamed")),
+            SchemaProfile::LorawanFieldDevice,
+            &owned,
+            "rgb-clock",
+        );
+        assert_eq!(p.dev_name, "rgb-clock");
+        assert!(p.wifi_ssid.is_empty());
+    }
+
+    #[test]
+    fn stored_prefill_never_renders_secrets() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let stored = stored_wifi_mqtt("dev");
+        let wifi_password = stored.wifi_password.clone();
+        let mqtt_pass = stored.mqtt_pass.clone().unwrap_or_default();
+        let p = prefill_for(
+            Some(stored),
+            SchemaProfile::WifiMqttDevice,
+            &owned,
+            "rgb-clock",
+        );
+        let html = render_form(
+            SchemaProfile::WifiMqttDevice,
+            &test_nonce(),
+            &p,
+            &FieldErrors::new(),
+        );
+        assert!(!html.contains(&wifi_password));
+        assert!(!html.contains(&mqtt_pass));
     }
 
     #[test]
