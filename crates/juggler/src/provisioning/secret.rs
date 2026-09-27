@@ -29,8 +29,10 @@ pub(crate) fn scrub<const N: usize>(s: &mut heapless::String<N>) {
     let vec = unsafe { s.as_mut_vec() };
     // Grow to the full capacity so every byte the buffer can ever hold is
     // covered by the zeroize pass below, not just the bytes currently in use.
-    // `N` is this vector's own capacity, so this cannot fail.
-    let _ = vec.resize_default(N);
+    // `N` is this vector's own capacity, so this cannot fail; the whole
+    // full-capacity argument rests on it, so a violation must not pass silently.
+    let grown = vec.resize_default(N);
+    debug_assert!(grown.is_ok(), "scrub: resize to own capacity failed");
     vec.as_mut_slice().zeroize();
     vec.clear();
 }

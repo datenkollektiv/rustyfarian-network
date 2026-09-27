@@ -12,7 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::mqtt::spawn_connect_thread` — runs an optional connect-time prelude and then the builder subscriptions on one short-lived thread; `spawn_subscriber_thread` is kept as a thin wrapper.
 - `juggler::mqtt::ConnectionEpoch` — generation-checked connected flag so a stale connect helper can never mark a dead connection as connected.
 - `juggler::mqtt::CallbackScope` / `in_callback` — thread-local marker for "inside an MQTT callback", host-tested and lock-free.
+- [`idf_c3_mqtt_callback_guard`](crates/rustyfarian-esp-idf-network/examples/idf_c3_mqtt_callback_guard.rs) example: a self-contained hardware check for the MQTT callback contract (startup message + `on_connect` publish, and `try_publish` / `publish` from `on_message` failing fast with `WrongThread`).
+- [ADR 017](docs/adr/017-mqtt-callback-threading-contract.md) records the MQTT callback threading contract and why releasing the event before `on_message` was rejected.
 - `just doctor` reports whether the MQTT broker configured in `.env` (`MQTT_HOST` / `MQTT_PORT`) accepts a TCP connection; optional, never fatal, credentials are not read.
+- `juggler::provisioning::SessionState` / `SessionOutcome` (`std` feature) — the provisioning portal's shared commit/wait state, moved from `rustyfarian-esp-idf-network` so its host toolchain can run a regression test for the commit/wait race fixed in bug 002/003; covered by `just test-provisioning`.
+  `apply`, `apply_and_notify`, and `commit` return `Result<_, InvalidTransition>` so a caller can refuse the request behind a rejected transition; `wait_committed` is single-consumer (every other waiter gets `None` and a `warn` log).
 
 ### Changed
 
@@ -24,16 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Signatures are unchanged and the variant's `Display` text is method-neutral.
 - `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
 - Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule.
+- `idf_c3_provision` / `idf_c3_provision_mqtt` examples log secrets as `set` / `missing` instead of their length, so no value derived from a Wi-Fi password or LoRaWAN AppKey reaches a log line (CodeQL `rust/cleartext-logging`).
   Use the `client` argument in `on_connect`.
   Never call a `MqttHandle` method from a callback, and never call the client from `on_message` / `on_disconnect`.
 - The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`).
   Their `.env` handling is shared in `examples/common/env.rs`.
+- `try_publish`, `try_publish_retained`, `TryPublishError`, and the module docs state that "non-blocking" holds only outside the MQTT callbacks; inside one the call returns `TryPublishError::Other` carrying `PublishAckError::WrongThread`.
 - `idf_c3_mqtt_button_oled` treats the SSD1306 as optional: when no display answers on I2C at boot it logs one warning and runs headless, so the button/MQTT path can be tested on a bare ESP32-C3.
 - Workspace version and the `juggler` dependency minimum raised to `0.5.1`.
   `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
 - Examples no longer fall back to literal placeholder credentials (`WIFI_PASS`, `WIFI_PSK`, LoRaWAN EUIs/AppKey).
   Unset values are the type default and the LoRa examples fail fast at startup.
   This also clears the CodeQL hard-coded-credential findings on example code.
+- `rustyfarian-esp-idf-network`'s `provisioning` feature now enables `juggler/std`, so its `SharedState` is a thin alias over `juggler::provisioning::SessionState`; the crate's own public API is unchanged.
 
 ### Fixed
 
@@ -41,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   esp-mqtt delivers events while holding its recursive `api_lock`.
   esp-idf-svc 0.53 parks the mqtt task until our event loop calls `next()` again.
   `is_connected()` therefore stayed `false` and the broker fired the LWT.
+  rustyfarian-rgb-clock confirmed the `on_message` variant on an ESP32-C3 with 0.5.0: a `try_publish` from `on_message` hung the client until reset.
 - A three-way cycle appeared whenever `on_connect` was registered.
   It involved a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex.
   The event loop no longer takes the client mutex at all.
@@ -58,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See [docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md](docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md).
 - `ExtraField`'s `Debug` output (and therefore `ProvisioningConfig`'s) printed extra-field values verbatim, so a secret extra such as `api_token` reached logs.
   The value is now shown as `"<redacted>"`; the key stays visible.
+- `ExtraField` scrubs its own value on drop, so a clone taken out of `ProvisioningConfig::extras()` no longer leaves a secret extra (e.g. `api_token`) in freed memory.
+  Because of the new `Drop` impl its public fields can be borrowed or cloned but no longer moved out.
+- The portal's `/save` reported success (the committed page and `ProvisioningEvent::Committed`) even when the session refused the commit, e.g. a valid submission after `/factory-reset` or a double submit; the credentials were written to NVS and then lost to the pending reset.
+  `/save` now checks the transition before touching NVS and answers `409` once the session is committed, reset-pending, or already saving; `/factory-reset` answers `409` after a commit or during a save.
+  The first terminal event now stands: up to 0.5.0 a valid submission after a reset request still resolved the waiter as committed.
 
 ## [0.5.0] - 2026-09-26
 

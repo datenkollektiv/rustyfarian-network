@@ -793,6 +793,13 @@ std::thread_local! {
     // `a` first would restore `false` even though `b` is still active). A
     // counter only cares how many scopes are currently open, so drop order
     // is irrelevant.
+    //
+    // The initializer is already `const { .. }`-wrapped; clippy 0.1.95 still
+    // flags `missing_const_for_thread_local` here (a pre-existing false
+    // positive, first reached by `just clippy-provisioning-tests` once the
+    // `provisioning` feature started enabling `juggler/std`, not introduced
+    // by that wiring).
+    #[allow(clippy::missing_const_for_thread_local)]
     static CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 

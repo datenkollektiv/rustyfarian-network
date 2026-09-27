@@ -265,6 +265,15 @@ Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe
 User rule: from `on_connect` use the `client` argument, never `MqttHandle`; from `on_message` / `on_disconnect` never touch the client, hand the work to another thread.
 `rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; see `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`.
 
+**You cannot "release the event before `on_message`": esp-idf-svc 0.53 calls `receiver.done()` only inside `EspMqttConnection::next()`.**
+Dropping the borrowed event releases nothing, and the next `next()` blocks until the next event arrives, which re-parks the mqtt task while it holds `api_lock`.
+A working variant needs a pump thread, a dispatcher thread, and a bounded queue, and the pump must drop on overflow.
+esp-mqtt runs `deliver_publish` before it sends the QoS 1 PUBACK, so a dropped message is lost after the broker has seen it acknowledged.
+Rejected in ADR 017 in favour of the `WrongThread` guard.
+`try_lock` in `try_publish` never helped either, because the block is inside `esp_mqtt_client_enqueue`, not on the Rust mutex.
+Field-confirmed 2026-09-28: rustyfarian-rgb-clock on 0.5.0 hung for good on a `try_publish` from `on_message`.
+Hardware check: `idf_c3_mqtt_callback_guard`.
+
 ---
 
 ## LoRaWAN / TTN v3 (EU868)
@@ -366,7 +375,7 @@ Do not use them.
 **Correct handling: generate the fixture at runtime from real entropy.**
 This removes the key material from the source — what the rule actually asks for — and the alert closes on its own.
 Both sites in this workspace use a `OnceLock<String>` filled from `std::collections::hash_map::RandomState`, generated once per test process:
-`test_psk()` in `crates/juggler/src/wifi/mod.rs` (16 hex digits) and `test_nonce()` in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs` (8 hex digits).
+`test_psk()` in `crates/juggler/src/test_support.rs` (16 hex digits) and `test_nonce()` in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs` (8 hex digits).
 
 **A test that compares the fixture against a request body is not a blocker** — build the body at runtime too.
 The `nonce_matches` test formats both bodies with `alloc::format!("_nonce={}&...")`, and `test_nonce_mismatch()` returns the bitwise complement so the mismatch assertion cannot flake on an unlucky draw.

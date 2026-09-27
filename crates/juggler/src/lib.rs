@@ -77,6 +77,10 @@
 #[cfg(test)]
 extern crate alloc;
 
+// Shared test fixtures; every user sits under `wifi` (provisioning implies it).
+#[cfg(all(test, feature = "wifi"))]
+pub(crate) mod test_support;
+
 // ── Always-available (no feature gate) ──────────────────────────────────────
 // backoff and status_colors are used across wifi+mqtt and have zero external deps.
 pub mod backoff;

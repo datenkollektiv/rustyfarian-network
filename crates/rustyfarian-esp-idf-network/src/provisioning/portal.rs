@@ -163,21 +163,43 @@ pub(crate) fn start(
 
             match parse_form(&body, profile) {
                 Ok(config) => {
-                    state.apply(ProvisioningInput::ValidSubmission);
+                    // Gate before touching NVS: once the session is Committed,
+                    // FactoryResetPending, or already Persisting another
+                    // submission, the first terminal event stands and this
+                    // one must not be written or reported as saved.
+                    if let Err(t) = state.apply(ProvisioningInput::ValidSubmission) {
+                        log::warn!("POST /save refused: session already {:?}", t.state);
+                        let mut response = request.into_status_response(409)?;
+                        response.write_all(SESSION_FINISHED_BODY)?;
+                        return Ok(());
+                    }
                     let persist = store
                         .lock()
                         .map_err(|_| anyhow::anyhow!("store mutex poisoned"))
                         .and_then(|mut s| s.save(&config));
                     match persist {
                         Ok(()) => {
-                            state.commit(config);
+                            // Unreachable with the gate above (only this
+                            // handler leaves Persisting), but never report a
+                            // commit the session did not accept.
+                            if let Err(t) = state.commit(config) {
+                                log::error!(
+                                    "POST /save: persisted but commit refused from {:?}",
+                                    t.state
+                                );
+                                let mut response = request.into_status_response(409)?;
+                                response.write_all(SESSION_FINISHED_BODY)?;
+                                return Ok(());
+                            }
                             (on_event)(ProvisioningEvent::Committed);
                             let mut response = request.into_ok_response()?;
                             response.write_all(COMMITTED_HTML.as_bytes())?;
                         }
                         Err(e) => {
                             log::error!("POST /save persist failed: {e:#}");
-                            state.apply(ProvisioningInput::PersistFailed);
+                            // Persisting always accepts PersistFailed; a
+                            // rejection is already logged by the session.
+                            let _ = state.apply(ProvisioningInput::PersistFailed);
                             let html = render_form_with_banner(
                                 profile,
                                 &nonce,
@@ -190,7 +212,9 @@ pub(crate) fn start(
                     }
                 }
                 Err(errors) => {
-                    state.apply(ProvisioningInput::InvalidSubmission);
+                    // Nothing is persisted on this path, so a rejection (the
+                    // session already finished) only needs the session's log.
+                    let _ = state.apply(ProvisioningInput::InvalidSubmission);
                     (on_event)(ProvisioningEvent::SubmissionRejected);
                     log::info!("POST /save rejected: {} field error(s)", errors.len());
                     let prefill = load_prefill(&store, profile, &defaults, &device_name);
@@ -256,7 +280,15 @@ pub(crate) fn start(
                 response.write_all(b"Forbidden: session token mismatch.")?;
                 return Ok(());
             }
-            state.apply_and_notify(ProvisioningInput::FactoryReset);
+            // A reset after a commit, or while a submission is being
+            // persisted, is refused: the saved credentials stand and the host
+            // is never told a reset was requested.
+            if let Err(t) = state.apply_and_notify(ProvisioningInput::FactoryReset) {
+                log::warn!("POST /factory-reset refused: session already {:?}", t.state);
+                let mut response = request.into_status_response(409)?;
+                response.write_all(SESSION_FINISHED_BODY)?;
+                return Ok(());
+            }
             (on_event)(ProvisioningEvent::FactoryResetRequested);
             log::info!("Factory reset requested via portal");
             let mut response = request.into_ok_response()?;
@@ -751,6 +783,13 @@ const FACTORY_RESET_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf
 <title>Factory reset</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
 <h1>Factory reset requested</h1><p>The host application will complete the reset.</p>\
 </body></html>";
+
+/// `409` body for a `/save` or `/factory-reset` that arrives after the session
+/// already reached a terminal state (or while a submission is being saved):
+/// the first terminal event stands and nothing was changed.
+const SESSION_FINISHED_BODY: &[u8] =
+    b"Conflict: this provisioning session has already finished or is saving \
+      another submission; nothing was changed. Wait for the device to restart.";
 
 #[cfg(test)]
 mod tests {

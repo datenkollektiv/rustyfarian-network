@@ -264,8 +264,10 @@ test-ota:
     cargo test --target {{ host_target }} -p juggler --features ota
 
 # run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
+# `std` additionally enables the `session` module (SessionState/SessionOutcome
+# and their commit/wait race regression tests), which needs std::sync/std::time.
 test-provisioning:
-    cargo test --target {{ host_target }} -p juggler --features provisioning
+    cargo test --target {{ host_target }} -p juggler --features provisioning,std
 
 # run all substrate unit tests (DHCP codec + allocation policy, DNS
 # catch-all codec, HTTP parser + routing + minimal-500 fallback) on the host
