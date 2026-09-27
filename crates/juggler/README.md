@@ -70,13 +70,13 @@ assert_eq!(state, MqttConnectionState::Connected);
 
 Compile and run all pure-crate unit tests on your host (no ESP toolchain required):
 
-```sh
+```bash
 cargo test -p juggler --all-features
 ```
 
 To test a specific domain:
 
-```sh
+```bash
 cargo test -p juggler --features wifi,mqtt
 ```
 

@@ -4,9 +4,13 @@
 
 ## Context & recent milestones
 
-Both tiers moved to September 2026 stack (2026-09-25): bare-metal pins `esp-hal 1.2.2` / `esp-radio 1.0.0-beta.1` (pre-release; re-pin to 1.0.0 stable when available), IDF pins `esp-idf-svc 0.53` / `esp-idf-hal 0.47`.
+Both tiers moved to the September 2026 stack on 2026-09-25.
+The bare-metal tier pins `esp-hal 1.2.2` and `esp-radio 1.0.0-beta.1` (pre-release; re-pin to `1.0.0` stable when available).
+The IDF tier pins `esp-idf-svc 0.53` and `esp-idf-hal 0.47`.
 Hardware validated 2026-09-26: bare-metal C3 STA join, C6 SoftAP provisioning, S3 SX1262 bring-up; provisioning reboot-to-STA not exercised; IDF C3 validated.
-Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `smoltcp` integration; TTN OTAA join and first uplink validated 2026-06-17; see `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
+Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `smoltcp` integration.
+The TTN OTAA join and first uplink were validated 2026-06-17.
+See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
 
 ## Forward plan
 
@@ -58,7 +62,8 @@ timeline
 ## June 2026 code deep-dive findings
 
 Full review of all 13 crates (~13k lines), the build scripts, and CI.
-Overall verdict: the pure-first architecture is consistently executed (thin HAL wrappers, ~208 host tests in the pure layer, minimal and justified unsafe); the items below are the deltas worth fixing.
+Overall verdict: the pure-first architecture is consistently executed (thin HAL wrappers, ~208 host tests in the pure layer, minimal and justified unsafe).
+The items below are the deltas worth fixing.
 Items promoted to the timeline are marked; the rest are small enough to batch into a hygiene session.
 
 |  # | Area                | Finding                                                                                                                                                                                                                                                                                  | Tracked                                                                       |
@@ -73,7 +78,11 @@ Items promoted to the timeline are marked; the rest are small enough to batch in
 |  9 | lora-pure           | `LorawanDevice::process()` returns `NoUpdate` — `PhyRxTx` bridge unwired pending TTN hardware validation (known, documented HIGH RISK)                                                                                                                                                   | Mid term (Phase 5, already tracked)                                           |
 | 10 | Pure layer          | Minor style drift: error types vary between `&'static str`, concrete enums, and generic `LorawanError<E>`; acceptable, candidate for the pure-scope ADR to codify                                                                                                                        | Near term (folded into pure-scope ADR)                                        |
 
-Positive findings worth keeping in mind (no action): `rustyfarian-esp-hal-ota`'s hand-rolled HTTP/1.1 parser is the security high-water mark (33 tests covering RFC 7230 smuggling vectors); MQTT's SUBACK-deadlock avoidance (resolved via `MqttBuilder::subscribe`) and `Weak`-based event-loop shutdown are solid; ESP-NOW's failed-scan recovery restores both peer registration and the last-known-good channel (see #6 for the staleness trade-off).
+Positive findings worth keeping in mind (no action):
+
+- `rustyfarian-esp-hal-ota`'s hand-rolled HTTP/1.1 parser is the security high-water mark (33 tests covering RFC 7230 smuggling vectors).
+- MQTT's SUBACK-deadlock avoidance (resolved via `MqttBuilder::subscribe`) and its `Weak`-based event-loop shutdown are solid.
+- ESP-NOW's failed-scan recovery restores both peer registration and the last-known-good channel (see #6 for the staleness trade-off).
 
 ---
 
@@ -98,7 +107,8 @@ All steps use TTN v3 EU868.
 **Step 1 — Gateway & RF sanity**
 
 - Confirm a TTN-connected EU868 gateway is online (TTN Console → Gateways → "connected recently").
-  For the current Pi 4 + RAK5146 SPI EU868/GPS gateway setup, see the [operational runbook](https://devops.datenkollektiv.de/pages/lorawan-gateway-rak5146-trixie.html) and the shorter [Trixie gateway write-up](https://devops.datenkollektiv.de/lorawan-gateway-rak5146-trixie.html).
+  For the current Pi 4 + RAK5146 SPI EU868/GPS gateway setup, see the [operational runbook](https://devops.datenkollektiv.de/pages/lorawan-gateway-rak5146-trixie.html).
+  A shorter [Trixie gateway write-up](https://devops.datenkollektiv.de/lorawan-gateway-rak5146-trixie.html) is also available.
 - Place the device within metres for initial tests; use a correct EU868 antenna.
 
 **Step 2 — SX1262 bring-up (before LoRaWAN)**

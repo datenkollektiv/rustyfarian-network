@@ -8,7 +8,7 @@ and cross-repo (`rustyfarian-ws2812`) coordination.
 
 ### Build command
 
-```sh
+```bash
 just fmt && just verify
 ```
 
@@ -17,7 +17,7 @@ targets), and `just clippy`. It does **not** cover Xtensa IDF or bare-metal targ
 
 For hardware examples, also run:
 
-```sh
+```bash
 just build-example <name>
 ```
 
@@ -25,7 +25,7 @@ A clean `just verify` with no warnings is the acceptance bar for each maintenanc
 
 ### Test command
 
-```sh
+```bash
 just test
 ```
 
@@ -76,7 +76,7 @@ Key crates to check each month:
 
 Check with:
 
-```sh
+```bash
 cargo outdated --depth 1
 ```
 
@@ -100,7 +100,7 @@ history and compatibility notes.
 
 Check whether a new release is available on crates.io each cycle:
 
-```sh
+```bash
 cargo search pennant
 cargo search rustyfarian-esp-hal-ws2812
 cargo search rustyfarian-esp-idf-ws2812
@@ -111,7 +111,7 @@ A ws2812 minor or major bump belongs to the quarterly wave cycle.
 
 ### Security scanning
 
-```sh
+```bash
 cargo audit          # local advisory check
 just deny            # license + bans + advisories via cargo-deny
 ```
@@ -141,7 +141,7 @@ Five workflows in `.github/workflows/`:
 
 Monthly check: confirm all five workflows are green on `main`.
 
-```sh
+```bash
 gh run list --branch main --limit 20
 ```
 

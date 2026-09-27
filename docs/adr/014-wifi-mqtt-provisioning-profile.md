@@ -4,29 +4,35 @@
 
 Accepted — maintainer signed off 2026-06-12; implemented the same day on the `soft-ap` branch.
 
-The canonical sign-off anchor is the State checklist in the feature doc ([wifi-mqtt-provisioning-profile-v1.md](../features/wifi-mqtt-provisioning-profile-v1.md)), which records acceptance; no issue tracker exists in this workspace by convention.
+The canonical sign-off anchor is the State checklist in the feature doc ([wifi-mqtt-provisioning-profile-v1.md](../features/archive/wifi-mqtt-provisioning-profile-v1.md)), which records acceptance.
+No issue tracker exists in this workspace by convention.
 
 ## Context
 
 A new ESP32 downstream, `rustyfarian-rgb-clock`, needs SoftAP provisioning.
 It is the first device in the workspace that wants Wi-Fi credentials, an MQTT broker, an OTA URL, and a device name — and no LoRaWAN at all.
-The provisioning triad shipped on the `soft-ap` branch ([ADR 013](013-softap-provisioning-acceptance.md), [feature doc](../features/softap-provisioning-v1.md)) only knows one schema: the beekeeper four-field set (Wi-Fi credentials + LoRaWAN OTAA keys + OTA URL + device name).
+The provisioning triad shipped on the `soft-ap` branch ([ADR 013](013-softap-provisioning-acceptance.md), [feature doc](../features/archive/softap-provisioning-v1.md)).
+It only knows one schema: the beekeeper four-field set (Wi-Fi credentials + LoRaWAN OTAA keys + OTA URL + device name).
 
 ADR 013 §4 deliberately locked that single four-field schema and rejected a generic host-defined schema, because centralised form validation is the load-bearing piece of `provisioning-pure`.
 ADR 013 also left an extras escape hatch: opaque `x_*` name/value pairs carried alongside the canonical fields.
 Those extras are unsuitable for MQTT credentials.
-They have no typed validation, no `Debug` redaction, no secret handling in the portal (the portal pre-fills extras as plain non-secret values), and their NVS key name is capped at 13 bytes by the `x_` prefix rule.
+They have no typed validation, no `Debug` redaction, and no secret handling in the portal.
+The portal pre-fills extras as plain non-secret values.
+Their NVS key name is capped at 13 bytes by the `x_` prefix rule.
 Routing an MQTT password through the extras mechanism would defeat the credential-hygiene work ADR 013 was built around.
 
 ADR 013's Consequences anticipated exactly this case.
-Its "Negative" section noted that hosts needing fundamentally different provisioning data — "no LoRaWAN, no OTA" — would otherwise "carry unused surface in their NVS layout, or layer their own provisioning UI alongside rather than on top".
+Its "Negative" section noted that hosts needing fundamentally different provisioning data — "no LoRaWAN, no OTA" —
+would otherwise "carry unused surface in their NVS layout, or layer their own provisioning UI alongside rather than on top".
 `rustyfarian-rgb-clock` is that host.
 
-The workspace North Star (`VISION.md:5`: "Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence") makes a Wi-Fi + MQTT provisioning profile the most on-brand profile the workspace could offer.
+The workspace North Star (`VISION.md:5`: "Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence")
+makes a Wi-Fi + MQTT provisioning profile the most on-brand profile the workspace could offer.
 A device that provisions Wi-Fi and an MQTT broker through the shared portal is the literal embodiment of the North Star.
 
 Five decisions need to be locked before implementation begins.
-The feature doc ([wifi-mqtt-provisioning-profile-v1.md](../features/wifi-mqtt-provisioning-profile-v1.md)) carries the seven implementation-level open questions that these decisions imply.
+The feature doc ([wifi-mqtt-provisioning-profile-v1.md](../features/archive/wifi-mqtt-provisioning-profile-v1.md)) carries the seven implementation-level open questions that these decisions imply.
 
 ## Decision
 
@@ -46,7 +52,8 @@ Exactly two profiles exist:
 - `LorawanFieldDevice` = Core + LoRaWAN + OTA — today's behaviour, unchanged.
 - `WifiMqttDevice` = Core + MQTT + OTA (OTA optional since the 2026-09-26 amendment below) — the new profile `rustyfarian-rgb-clock` needs.
 
-Generic host-defined schemas remain rejected, reaffirming ADR 013 §4: centralised validation is the load-bearing piece of `provisioning-pure`, and a generic schema scatters validation rules across every downstream.
+Generic host-defined schemas remain rejected, reaffirming ADR 013 §4.
+Centralised validation is the load-bearing piece of `provisioning-pure`, and a generic schema scatters validation rules across every downstream.
 A profile is not a generic schema — it is a closed, workspace-curated combination of field groups whose validation still lives in the pure crate.
 
 Rejected alternatives:
@@ -68,7 +75,9 @@ The MQTT group is grounded in the actual consumer, `rustyfarian-esp-idf-mqtt`:
 - **Optional client ID** — maps onto the `client_id` argument of `MqttConfig::new`.
 
 Validation delegates wherever a pure validator already exists.
-Extending the established `no_std`-leaf delegation pattern (`wifi-pure`, `lora-pure`) to the MQTT group requires `rustyfarian-network-pure` to acquire a `no_std`-safe surface first, because unlike those leaves it is `std` today (`mqtt.rs:266` `spawn_subscriber_thread` uses `std::thread` and `std::sync`; `mqtt.rs:18` `format_broker_url` returns `String`).
+Extending the established `no_std`-leaf delegation pattern (`wifi-pure`, `lora-pure`) to the MQTT group requires `rustyfarian-network-pure` to acquire a `no_std`-safe surface first.
+Unlike those leaves, it is `std` today.
+That is because `mqtt.rs:266` `spawn_subscriber_thread` uses `std::thread` and `std::sync`, and `mqtt.rs:18` `format_broker_url` returns `String`.
 The client-ID rule is the 23-byte MQTT 3.1.1 cap (`CLIENT_ID_MAX_LEN = 23` in `rustyfarian-network-pure::mqtt`).
 
 #### Sub-decision: `rustyfarian-network-pure` gains a `no_std`-safe surface
@@ -78,7 +87,9 @@ That feature gates only the two std-dependent items — `spawn_subscriber_thread
 The validators — `validate_client_id`, `CLIENT_ID_MAX_LEN`, and the topic validators — sit in the `no_std` core, as do `backoff.rs` and `status_colors.rs`, which have no std usage.
 `provisioning-pure` depends on `rustyfarian-network-pure` with `default-features = false`, picking up the validators without dragging in `std`.
 The MQTT consumers (`rustyfarian-esp-idf-mqtt`) keep the default `std` feature and are unaffected.
-This extraction landed **before Phase 1** of the feature plan (Phase 0, 2026-06-12), since Phase 1's MQTT validators delegate into it; the implementation also moved `QoS` and the `SubscribeClient` trait behind the `std` gate because the trait's `anyhow` dependency forced it, and made `anyhow` itself optional behind `std`.
+This extraction landed **before Phase 1** of the feature plan (Phase 0, 2026-06-12), since Phase 1's MQTT validators delegate into it.
+The implementation also moved `QoS` and the `SubscribeClient` trait behind the `std` gate because the trait's `anyhow` dependency forced it.
+It also made `anyhow` itself optional behind `std`.
 
 Rejected alternatives:
 
@@ -87,7 +98,8 @@ Rejected alternatives:
 - **Duplicate the 23-byte rule in `provisioning-pure`** — validator drift, the exact failure mode the delegation pattern exists to prevent.
 
 Plain `mqtt://` only.
-TLS stays out of scope, matching `format_broker_url`'s single hard-coded `mqtt://` scheme in `rustyfarian-network-pure` and the workspace's plain-transport posture — the same posture ADR 011 took for plain-HTTP OTA.
+TLS stays out of scope, matching `format_broker_url`'s single hard-coded `mqtt://` scheme in `rustyfarian-network-pure` and the workspace's plain-transport posture.
+That is the same posture ADR 011 took for plain-HTTP OTA.
 
 ### 3. The profile mechanism lives in `provisioning-pure`; the same two crates serve both profiles
 
@@ -103,10 +115,14 @@ This honours ADR 013 §2 (two crates at acceptance) and §3 (the portal is inter
 
 The NVS layout gains a `profile` discriminator key (string-valued: `lorawan` or `wifi_mqtt`) and the `SCHEMA_VERSION` constant bumps from `1` to `2`.
 
-`mqtt_port` is stored as a string, like every other value key in the namespace: it is written once and read once per boot, the string path adds zero new store surface, and the read-then-connect path reuses the existing `read_str` / `set_str` already in use for every other value.
+`mqtt_port` is stored as a string, like every other value key in the namespace.
+It is written once and read once per boot, and the string path adds zero new store surface.
+The read-then-connect path reuses the existing `read_str` / `set_str` already in use for every other value.
 This is decided plainly and does not depend on confirming `EspNvs::set_u16` / `get_u16` (those were unverified in-repo and are deliberately not relied upon).
 
-Canonical namespace keys — `schema_ver`, `profile`, and the field keys — are reserved; host extensions must use the `x_*` prefix carried forward from ADR 013, so no collision with a host extension is possible today, and `profile` joins the reserved set explicitly.
+Canonical namespace keys — `schema_ver`, `profile`, and the field keys — are reserved.
+Host extensions must use the `x_*` prefix carried forward from ADR 013.
+No collision with a host extension is possible today, and `profile` joins the reserved set explicitly.
 
 Existing provisioned devices are not re-provisioned.
 `load` treats `schema_ver == 1` with an absent `profile` key as the `lorawan` profile.
@@ -161,11 +177,14 @@ Bumping `schema_ver` to 2 while reading absent-`profile` v1 records as `lorawan`
 
 ### Negative
 
-- **The `Field` enum and the capacity proof grow** — `WifiMqttDevice` has eight canonical fields versus LoRaWAN's seven, so `MAX_FIELD_ERRORS` becomes 9 and all four capacity-proof comment sites in `provisioning-pure` must be amended (see feature doc Q4).
+- **The `Field` enum and the capacity proof grow** — `WifiMqttDevice` has eight canonical fields versus LoRaWAN's seven.
+  `MAX_FIELD_ERRORS` becomes 9, and all four capacity-proof comment sites in `provisioning-pure` must be amended (see feature doc Q4).
 - **The portal ships profile-specific HTML** — two complete templates selected per profile, accepting some duplicated head/CSS/nonce/footer markup (feature doc Q5).
 - **`parse_form`'s signature breaks** — it gains a profile parameter.
   Acceptable: all public APIs are experimental.
-- **`rustyfarian-network-pure` gains a `no_std`-safe surface** — `provisioning-pure` depends on it (`default-features = false`) for `validate_client_id`, which requires the `#![cfg_attr(not(feature = "std"), no_std)]` extraction in §2 to land before Phase 1; this is bounded work, not free.
+- **`rustyfarian-network-pure` gains a `no_std`-safe surface** — `provisioning-pure` depends on it (`default-features = false`) for `validate_client_id`.
+  That requires the `#![cfg_attr(not(feature = "std"), no_std)]` extraction in §2 to land before Phase 1.
+  This is bounded work, not free.
 
 ### Implications
 
@@ -189,8 +208,9 @@ NVS/flash layout unchanged — both stores already round-trip empty strings.
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; locks the four-field schema and the extras escape hatch this ADR builds on and generalises.
 - [ADR 011](011-ota-crate-hosting-and-transport.md) — OTA crate hosting and plain-HTTP transport; precedent for accepting a non-goal and keeping plain transport in scope.
-- [docs/features/wifi-mqtt-provisioning-profile-v1.md](../features/wifi-mqtt-provisioning-profile-v1.md) — feature doc carrying the seven implementation-level open questions and the phased plan.
-- [docs/features/softap-provisioning-v1.md](../features/softap-provisioning-v1.md) — the v1 provisioning triad this profile extends.
+- [docs/features/wifi-mqtt-provisioning-profile-v1.md](../features/archive/wifi-mqtt-provisioning-profile-v1.md)
+  — feature doc carrying the seven implementation-level open questions and the phased plan.
+- [docs/features/softap-provisioning-v1.md](../features/archive/softap-provisioning-v1.md) — the v1 provisioning triad this profile extends.
 - `VISION.md:5` — the North Star this profile most directly serves.
 - `crates/rustyfarian-esp-idf-mqtt/src/lib.rs` — `MqttConfig::new` / `with_auth`, the MQTT-group consumer.
 - `crates/rustyfarian-network-pure/src/mqtt.rs` — `validate_client_id`, `CLIENT_ID_MAX_LEN`, `format_broker_url`.

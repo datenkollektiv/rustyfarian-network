@@ -16,19 +16,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `on_connect` runs on the per-connect helper thread (after the `with_startup_message()` publish, before the subscriptions), so `client.enqueue()` / `client.subscribe()` on its `client` argument are safe; `is_connected()` still flips only after it returns, and on resumed sessions `on_message` may overlap it.
-- `MqttHandle::publish`, `publish_retained`, `publish_with`, `try_publish*`, `subscribe`, and `publish_acked` reject calls from inside any callback with an error carrying `PublishAckError::WrongThread` (via `anyhow::Error` / `TryPublishError::Other`); signatures are unchanged and the variant's `Display` text is method-neutral.
+- `on_connect` runs on the per-connect helper thread (after the `with_startup_message()` publish, before the subscriptions).
+  Calling `client.enqueue()` / `client.subscribe()` on its `client` argument from `on_connect` is therefore safe.
+  `is_connected()` still flips only after it returns, and on resumed sessions `on_message` may overlap it.
+- `MqttHandle::publish`, `publish_retained`, `publish_with`, `try_publish*`, `subscribe`, and `publish_acked` reject calls from inside any callback.
+  The error carries `PublishAckError::WrongThread` (via `anyhow::Error` / `TryPublishError::Other`).
+  Signatures are unchanged and the variant's `Display` text is method-neutral.
 - `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
-- Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule: use the `client` argument in `on_connect`, never call a `MqttHandle` method from a callback, never call the client from `on_message` / `on_disconnect`.
-- The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`) and share their `.env` handling in `examples/common/env.rs`.
+- Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule.
+  Use the `client` argument in `on_connect`.
+  Never call a `MqttHandle` method from a callback, and never call the client from `on_message` / `on_disconnect`.
+- The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`).
+  Their `.env` handling is shared in `examples/common/env.rs`.
 - `idf_c3_mqtt_button_oled` treats the SSD1306 as optional: when no display answers on I2C at boot it logs one warning and runs headless, so the button/MQTT path can be tested on a bare ESP32-C3.
-- Workspace version and the `juggler` dependency minimum raised to `0.5.1`: `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
-- Examples no longer fall back to literal placeholder credentials (`WIFI_PASS`, `WIFI_PSK`, LoRaWAN EUIs/AppKey); unset values are the type default and the LoRa examples fail fast at startup, which also clears the CodeQL hard-coded-credential findings on example code.
+- Workspace version and the `juggler` dependency minimum raised to `0.5.1`.
+  `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
+- Examples no longer fall back to literal placeholder credentials (`WIFI_PASS`, `WIFI_PSK`, LoRaWAN EUIs/AppKey).
+  Unset values are the type default and the LoRa examples fail fast at startup.
+  This also clears the CodeQL hard-coded-credential findings on example code.
 
 ### Fixed
 
-- `with_startup_message()`, any `client.enqueue()` / `client.subscribe()` inside `on_connect`, and any `MqttHandle` call from a callback deadlocked the ESP-IDF MQTT event loop: esp-mqtt delivers events while holding its recursive `api_lock`, and esp-idf-svc 0.53 parks the mqtt task until our event loop calls `next()` again, so `is_connected()` stayed `false` and the broker fired the LWT.
-- A three-way cycle whenever `on_connect` was registered: a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex. The event loop no longer takes the client mutex at all. See [docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md](docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md).
+- `with_startup_message()`, any `client.enqueue()` / `client.subscribe()` inside `on_connect`, and any `MqttHandle` call from a callback deadlocked the ESP-IDF MQTT event loop.
+  esp-mqtt delivers events while holding its recursive `api_lock`.
+  esp-idf-svc 0.53 parks the mqtt task until our event loop calls `next()` again.
+  `is_connected()` therefore stayed `false` and the broker fired the LWT.
+- A three-way cycle appeared whenever `on_connect` was registered.
+  It involved a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex.
+  The event loop no longer takes the client mutex at all.
+  See [docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md](docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md).
 
 ## [0.5.0] - 2026-09-26
 
@@ -184,7 +200,10 @@ This release introduces an OTA MVP across both stacks, completes the April 2026 
 - Examples: `idf_c3_connect`, `idf_c3_mqtt`, `idf_esp32_mqtt`; hardware reference `docs/heltec-wifi-lora-32-v3.md`
 - CI: pure-crate test job for all host tests (`rustyfarian-network-pure`, `wifi-pure`, `lora-pure`, `espnow-pure`)
 
-[Unreleased]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/datenkollektiv/rustyfarian-network/releases/tag/v0.1.0

@@ -7,12 +7,18 @@ Evaluated against the `rustyfarian-ws2812` project philosophy: pure logic in `no
 
 ## Executive Summary
 
-- The ESP ecosystem has converged on **two distinct namespaces** — `esp-idf-*` (std, ESP-IDF/FreeRTOS) and `esp-hal-*` / `esp-*` (no_std, bare-metal) — which are treated as separate ecosystems, not as feature variants of a single crate.
-- The broader embedded-Rust community follows the same pattern: **separate crates per execution model**, as demonstrated by the `embedded-hal` v1.0 split into `embedded-hal`, `embedded-hal-async`, and `embedded-hal-nb`.
-- Cargo's feature flags are **suitable for additive, non-exclusive options** (e.g., `defmt` support, optional peripheral enablement) but are the **wrong tool for mutually exclusive hardware backends** due to Cargo's feature unification semantics.
-- The Rust API Guidelines (C-FEATURE rule) mandate feature names to be direct and additive; features representing hardware backend selection violate this rule because selecting one backend logically disables another.
-- Third-party crates that target the ESP ecosystem should **not** use the `esp-idf-*` or `esp-hal-*` prefix as it implies membership of the official `esp-rs` organisation; they should prefix with their own project or organisation name.
-- The `rustyfarian-ws2812` workspace already follows the ecosystem-validated pattern (separate crates, project-prefixed names), and no reconsideration is warranted.
+- The ESP ecosystem has converged on **two distinct namespaces** — `esp-idf-*` (std, ESP-IDF/FreeRTOS) and `esp-hal-*` / `esp-*` (no_std, bare-metal).
+- The two namespaces are treated as separate ecosystems, not as feature variants of a single crate.
+- The broader embedded-Rust community follows the same pattern: **separate crates per execution model**.
+- The `embedded-hal` v1.0 split into `embedded-hal`, `embedded-hal-async`, and `embedded-hal-nb` demonstrates this.
+- Cargo's feature flags are **suitable for additive, non-exclusive options**, such as `defmt` support or optional peripheral enablement.
+- They are the **wrong tool for mutually exclusive hardware backends**, due to Cargo's feature unification semantics.
+- The Rust API Guidelines (C-FEATURE rule) mandate feature names to be direct and additive.
+- Features representing hardware backend selection violate this rule, because selecting one backend logically disables another.
+- Third-party crates that target the ESP ecosystem should **not** use the `esp-idf-*` or `esp-hal-*` prefix.
+- Those prefixes imply membership of the official `esp-rs` organisation.
+- Third-party crates should instead prefix with their own project or organisation name.
+- The `rustyfarian-ws2812` workspace already follows the ecosystem-validated pattern of separate crates with project-prefixed names, and no reconsideration is warranted.
 
 ---
 
@@ -60,7 +66,8 @@ It does not attempt to support `esp-hal` via a feature flag.
 The community counterpart to `ws2812-esp32-rmt-driver`.
 Implements `SmartLedsWrite` wrapping an `esp-hal` RMT channel.
 Targets bare-metal exclusively; does not support esp-idf.
-The `esp-hal-smartled2` fork (published to crates.io as `esp-hal-smartled2`) is described as "based on the official no-std esp-hal, unlike `ws2812-esp32-rmt-driver` which is based on the unofficial esp-idf SDK."
+The `esp-hal-smartled2` fork is published to crates.io under that name.
+It is described as "based on the official no-std esp-hal, unlike `ws2812-esp32-rmt-driver` which is based on the unofficial esp-idf SDK."
 The naming convention embeds the HAL signal: `esp-hal-smartled` vs `ws2812-esp32-rmt-driver`.
 
 - Crates: `esp-hal-smartled` (community), `esp-hal-smartled2` (fork)
@@ -90,7 +97,8 @@ Each crate has its own version history and can evolve independently.
 Driver authors declare explicit dependencies on only the execution model(s) they require.
 
 The `lora-phy` crate follows the same approach.
-The `lora-rs` workspace is organised as multiple focused packages (`lora-modulation`, `lora-phy`, `lorawan-encoding`, `lorawan-device`, `lorawan-macros`), all `no_std`, with hardware integration handled through trait implementations rather than feature flags.
+The `lora-rs` workspace is organised as multiple focused packages (`lora-modulation`, `lora-phy`, `lorawan-encoding`, `lorawan-device`, `lorawan-macros`), all `no_std`.
+Hardware integration there is handled through trait implementations rather than feature flags.
 Board-specific support is provided by implementing the `InterfaceVariant` trait in a separate integration layer, not by gating it behind a feature in the core crate.
 
 ---
@@ -101,7 +109,8 @@ Board-specific support is provided by implementing the `InterfaceVariant` trait 
 <summary><strong>The Cargo feature unification problem</strong></summary>
 
 Cargo's dependency resolver takes the **union** of all features enabled for a given crate across the entire dependency graph.
-If package A enables `feature = "esp-idf"` and package B enables `feature = "esp-hal"` on the same driver crate, both features are activated simultaneously — even if they are mutually exclusive at the hardware level.
+If package A enables `feature = "esp-idf"` and package B enables `feature = "esp-hal"` on the same driver crate, both features are activated simultaneously.
+That happens even if they are mutually exclusive at the hardware level.
 
 The practical consequence: you cannot use feature flags to select between two backends when both could be pulled in by different crates in the same workspace or application.
 The Cargo book states: "Features should be additive. That is, enabling a feature should not disable functionality, and it should usually be safe to enable any combination of features."
@@ -117,9 +126,11 @@ For hardware backends, only option (1) is applicable in an embedded context.
 
 The feature unification problem is amplified in Cargo workspaces.
 When multiple workspace members depend on the same crate with different feature sets, Cargo unifies those features for the entire workspace build.
-A workspace that contains both an `esp-idf`-based crate and an `esp-hal`-based crate would force both feature sets to be active simultaneously if they were expressed as features of a shared driver crate — breaking the build.
+A workspace that contains both an `esp-idf`-based crate and an `esp-hal`-based crate would force both feature sets to be active simultaneously.
+If they were expressed as features of a shared driver crate, that would break the build.
 
-The Cargo resolver v2 (which this workspace already uses: `resolver = "2"`) improves the situation for platform-specific and dev-dependencies, but does not solve the fundamental problem of mutually exclusive user-visible features.
+The Cargo resolver v2 (which this workspace already uses: `resolver = "2"`) improves the situation for platform-specific and dev-dependencies.
+It does not solve the fundamental problem of mutually exclusive user-visible features.
 Resolver v2 only avoids unifying features across build-time vs run-time boundary, not across two workspace members that both depend on the same crate at run time.
 
 </details>
@@ -181,16 +192,16 @@ Implementation details belong in keywords and documentation, not in the crate na
 
 ## Authoritative Sources: Summary of Positions
 
-| Source                              | Position                                                                                                                       |
-|:------------------------------------|:-------------------------------------------------------------------------------------------------------------------------------|
-| Cargo Book (Features chapter)       | Features must be additive; mutually exclusive features should be avoided; recommended alternative is separate packages         |
-| `embedded-hal` v1.0 blog post       | Different execution models belong in separate crates; within a crate, use features only for additive options like `defmt`      |
-| Rust API Guidelines (C-FEATURE)     | Feature names must be direct, additive, and not negatively framed; no `use-` or `with-` prefixes                               |
-| The Embedded Rust Book (HAL naming) | HAL crates named after chip/family with `-hal` suffix, dashes not underscores                                                  |
-| ESP ecosystem practice              | `esp-idf-*` and `esp-hal-*` are distinct namespaces; separate crates, not feature-gated variants                               |
-| WS2812 ecosystem practice           | `ws2812-esp32-rmt-driver` (esp-idf) and `esp-hal-smartled` (esp-hal) are separate crates with no shared feature flag mechanism |
-| `lora-phy` / `lora-rs`              | Separate crates per concern; trait-based hardware integration, not feature flags                                               |
-| Effective Rust (Item 26)            | Feature creep introduces combinatorial CI burden; keep features additive and minimal                                           |
+| Source                              | Position                                                                     |
+|:------------------------------------|:-----------------------------------------------------------------------------|
+| Cargo Book (Features chapter)       | Features must be additive; avoid mutually exclusive ones; use separate packages |
+| `embedded-hal` v1.0 blog post       | One crate per execution model; features only for additive options (`defmt`)  |
+| Rust API Guidelines (C-FEATURE)     | Feature names direct, additive, positive; no `use-` / `with-` prefixes       |
+| The Embedded Rust Book (HAL naming) | HAL crates named after chip/family with `-hal` suffix, dashes not underscores |
+| ESP ecosystem practice              | `esp-idf-*` and `esp-hal-*` are distinct namespaces, not feature-gated variants |
+| WS2812 ecosystem practice           | Split crates: `ws2812-esp32-rmt-driver` (esp-idf) / `esp-hal-smartled` (esp-hal) |
+| `lora-phy` / `lora-rs`              | Separate crates per concern; trait-based hardware integration, not feature flags |
+| Effective Rust (Item 26)            | Feature creep adds combinatorial CI burden; keep features additive and minimal |
 
 ---
 
@@ -232,7 +243,8 @@ Both driver crates use feature flags correctly:
 - `esp32c6`, `unstable` — chip and stability gate forwarded to `esp-hal`; these are HAL-imposed requirements, not new concerns introduced by this project
 
 The `esp32c6` and `unstable` features in `rustyfarian-esp-hal-ws2812` are worth monitoring.
-If support for additional ESP32 chips is added, consider whether additional `espXXX` feature flags remain manageable or whether chip selection should be pushed entirely to the caller via `esp-hal`'s own feature flags without re-exposing them.
+If support for additional ESP32 chips is added, consider whether additional `espXXX` feature flags remain manageable.
+Otherwise, consider pushing chip selection entirely to the caller via `esp-hal`'s own feature flags without re-exposing them.
 The current pinning to `esp-hal = "1.0.0"` mitigates this risk for now.
 
 ### The `rustyfarian-` prefix is the right long-term choice

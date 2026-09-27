@@ -99,5 +99,5 @@ let (espnow, result) = EspIdfEspNow::init_with_radio_scanning(
 ## References
 
 - [ADR 008 — ESP-NOW Radio-Only Initialisation](008-espnow-radio-only-init.md)
-- [Feature request: espnow-channel-scanning](../../review-queue/espnow-channel-scanning.md)
+- Feature request "espnow-channel-scanning" (processed; this ADR is its outcome)
 - Espressif `esp-now` C library: `ESPNOW_CHANNEL_ALL` in `espnow.c`

@@ -30,7 +30,8 @@ Before any publication attempt:
   - ESP-IDF example: `just build-example idf_c3_connect`
   - Bare-metal example: `just build-example hal_c3_connect_async`
 - [ ] `cargo audit` shows no new advisories beyond those allowlisted in `deny.toml`
-- [x] `CHANGELOG.md` `[0.4.0]` section is cut with entries documenting all changes in this release (already done — `## [0.4.0] - 2026-06-20` with an empty `[Unreleased]` above it; see Changelog Update below)
+- [x] `CHANGELOG.md` `[0.4.0]` section is cut with entries documenting all changes in this release.
+  Already done — `## [0.4.0] - 2026-06-20` with an empty `[Unreleased]` above it (see Changelog Update below).
 - [ ] Per-crate `README.md` files exist and are accurate:
   - `crates/juggler/README.md` ✓
   - `crates/rustyfarian-esp-idf-network/README.md` ✓
@@ -44,37 +45,48 @@ Before any publication attempt:
 
 Before publishing for real, run the one-command pre-flight (it also runs version-lockstep, `just verify`, package-content, and audit checks):
 
-```sh
+```bash
 just release-publish-validate
 ```
 
 For just the pre-juggler packaging dry-run portion:
 
-```sh
+```bash
 just release-dry-run
 ```
 
 What it validates and a fundamental ordering constraint:
 
-- **`juggler`** gets a full `cargo publish --dry-run` (it is host-buildable): this verify-builds the crate, packages the tarball (confirming README + dual licenses + all source files are included), and exercises the metadata — with no actual upload.
-- **`rustyfarian-esp-idf-network`** and **`rustyfarian-esp-hal-network`** get `cargo package --list` only at this stage. A full `cargo publish --dry-run` for them resolves `juggler ^0.4` **against the crates.io index** (the published manifest drops the local `path`), so it fails with `no matching package named 'juggler' found` until juggler is actually published. This is the same staged constraint the sibling `rustyfarian-ws2812` workspace handles. Once juggler is live, their real cross-target dry-run can be run via `just release-dry-run-idf` / `just release-dry-run-hal` (Stage 2 below) before the actual publish.
+- **`juggler`** gets a full `cargo publish --dry-run` (it is host-buildable).
+  This verify-builds the crate, packages the tarball (confirming README + dual licenses + all source files are included), and exercises the metadata — with no actual upload.
+- **`rustyfarian-esp-idf-network`** and **`rustyfarian-esp-hal-network`** get `cargo package --list` only at this stage.
+  A full `cargo publish --dry-run` for them resolves `juggler ^0.4` **against the crates.io index** (the published manifest drops the local `path`).
+  It therefore fails with `no matching package named 'juggler' found` until juggler is actually published.
+  This is the same staged constraint the sibling `rustyfarian-ws2812` workspace handles.
+  Once juggler is live, their real cross-target dry-run can be run via `just release-dry-run-idf` / `just release-dry-run-hal` (Stage 2 below) before the actual publish.
 
-The two `-network` crates are **verify-built against their real cross-compilation target** (not the host, and **not** `--no-verify`): the IDF crate against `riscv32imac-esp-espidf` via the `esp` toolchain, the HAL crate against `riscv32imac-unknown-none-elf`. This matches the `rustyfarian-ws2812` convention and means the verify-build actually runs where `esp-idf-sys` / bare-metal code compiles, rather than being skipped.
+The two `-network` crates are **verify-built against their real cross-compilation target** (not the host, and **not** `--no-verify`).
+The IDF crate builds against `riscv32imac-esp-espidf` via the `esp` toolchain, the HAL crate against `riscv32imac-unknown-none-elf`.
+This matches the `rustyfarian-ws2812` convention and means the verify-build actually runs where `esp-idf-sys` / bare-metal code compiles, rather than being skipped.
 
-**Expected outcome:** juggler's dry-run succeeds; both `-network` crates package cleanly with README + `LICENSE-MIT` + `LICENSE-APACHE` included. If juggler's dry-run fails, fix the issue (missing `version`, forbidden path-dep, excluded file) and re-run before publishing.
+**Expected outcome:** juggler's dry-run succeeds, and both `-network` crates package cleanly with README + `LICENSE-MIT` + `LICENSE-APACHE` included.
+If juggler's dry-run fails, fix the issue (missing `version`, forbidden path-dep, excluded file) and re-run before publishing.
 
 ## Publication Order and Rationale
 
-All publishing is driven through `just` recipes (never raw `cargo publish`), mirroring the `rustyfarian-ws2812` convention. Each crate is published against its real target; the publish recipes carry a `[confirm]` prompt. The three crates **must** be published in this staged order.
+All publishing is driven through `just` recipes (never raw `cargo publish`), mirroring the `rustyfarian-ws2812` convention.
+Each crate is published against its real target; the publish recipes carry a `[confirm]` prompt.
+The three crates **must** be published in this staged order.
 
 ### Stage 1 — Publish `juggler` first
 
-```sh
+```bash
 just release-publish juggler
 ```
 
 (Recipe: `cargo publish -p juggler --target {{ host_target }}`.)
-Rationale: `juggler` has no internal crate dependencies; it is self-contained and host-buildable. Once published and indexed, the two `-network` crates can resolve `juggler ^0.4` from crates.io.
+Rationale: `juggler` has no internal crate dependencies; it is self-contained and host-buildable.
+Once published and indexed, the two `-network` crates can resolve `juggler ^0.4` from crates.io.
 
 Expected time on crates.io: ~2–5 minutes after the command succeeds.
 
@@ -82,7 +94,7 @@ Expected time on crates.io: ~2–5 minutes after the command succeeds.
 
 These resolve `juggler ^0.4` from the crates.io index and verify-build against the real cross-target, so they only work after Stage 1 is indexed:
 
-```sh
+```bash
 just release-dry-run-idf   # cargo +esp publish --dry-run ... --target riscv32imac-esp-espidf
 just release-dry-run-hal   # cargo publish --dry-run ... -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf
 ```
@@ -91,15 +103,19 @@ If either fails on something other than transient indexing, fix before Stage 3.
 
 ### Stage 3 — Publish the dependent crates
 
-```sh
+```bash
 just release-publish-idf   # cargo +esp publish -p rustyfarian-esp-idf-network --target riscv32imac-esp-espidf --target-dir {{ idf_dir }}
 just release-publish-hal   # cargo publish -p rustyfarian-esp-hal-network -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf --target-dir {{ hal_dir }}
 ```
 
 Both depend on `juggler = "0.4"` (published in Stage 1). They are verify-built against their **real cross-compilation target**, not the host:
 
-- **IDF crate:** `esp-idf-svc` / `esp-idf-hal` are always-on deps and the crate ships a `build.rs`, so a host verify-build would fail (`esp-idf-sys` rejects `aarch64-apple-darwin` / CI x86). Publishing with `cargo +esp publish --target riscv32imac-esp-espidf` runs the verify-build under the ESP toolchain where it compiles. (This is why the host-target default fails — the fix is the correct target, **not** `--no-verify`.)
-- **HAL crate:** a bare-metal `no_std` crate built for `riscv32imac-unknown-none-elf`. The `-Zbuild-std=core,alloc` override is required because the workspace `.cargo/config.toml` default `build-std = ["std", "panic_abort"]` cannot build `std` for a bare-metal target (same override the `check-hal*` recipes use).
+- **IDF crate:** `esp-idf-svc` / `esp-idf-hal` are always-on deps and the crate ships a `build.rs`, so a host verify-build would fail (`esp-idf-sys` rejects `aarch64-apple-darwin` / CI x86).
+  Publishing with `cargo +esp publish --target riscv32imac-esp-espidf` runs the verify-build under the ESP toolchain where it compiles.
+  (This is why the host-target default fails — the fix is the correct target, **not** `--no-verify`.)
+- **HAL crate:** a bare-metal `no_std` crate built for `riscv32imac-unknown-none-elf`.
+  The `-Zbuild-std=core,alloc` override is required because the workspace `.cargo/config.toml` default `build-std = ["std", "panic_abort"]` cannot build `std` for a bare-metal target.
+  (Same override the `check-hal*` recipes use.)
 
 Expected time on crates.io: ~2–5 minutes after each command succeeds.
 
@@ -141,14 +157,14 @@ If the publication date slips past 2026-06-20, update the `## [0.4.0]` date line
 
 After all three crates are published (Stages 1–3 via the `just release-publish*` recipes) and crates.io confirms availability:
 
-```sh
+```bash
 git tag -a v0.4.0 -m "v0.4.0: First publication to crates.io — 16→3 crate consolidation"
 git push origin v0.4.0
 ```
 
 Then merge or fast-forward `prepare-crates-publishing` to `main`:
 
-```sh
+```bash
 git checkout main
 git pull origin main
 git merge --ff-only prepare-crates-publishing  # or: git rebase prepare-crates-publishing
@@ -193,27 +209,34 @@ Once all three crates are on crates.io (verified by visiting their crates.io pag
 - [ ] Verify `rustyfarian-esp-hal-network 0.4.0` is published: https://crates.io/crates/rustyfarian-esp-hal-network
 - [ ] Check that each crate's documentation page builds (or documents the known limitation for the HAL/IDF crates):
   - `juggler` docs should build on docs.rs (pure crate, any platform)
-  - `rustyfarian-esp-idf-network` docs will most likely **fail to build on docs.rs**: `esp-idf-sys` requires network access and the full ESP-IDF C toolchain at build time, neither of which the docs.rs sandbox provides. The `[package.metadata.docs.rs]` `default-target = "riscv32imc-esp-espidf"` is set as a best effort, but treat a failed docs.rs build as expected, not a regression — the README on the crates.io page carries the primary documentation.
-  - `rustyfarian-esp-hal-network` docs will not build on docs.rs (bare-metal-only); the page should show feature documentation. If the build fails, the README on the crates.io page is the primary documentation.
+  - `rustyfarian-esp-idf-network` docs will most likely **fail to build on docs.rs**.
+    `esp-idf-sys` requires network access and the full ESP-IDF C toolchain at build time, neither of which the docs.rs sandbox provides.
+    The `[package.metadata.docs.rs]` `default-target = "riscv32imc-esp-espidf"` is set as a best effort, but treat a failed docs.rs build as expected, not a regression.
+    The README on the crates.io page carries the primary documentation.
+  - `rustyfarian-esp-hal-network` docs will not build on docs.rs (bare-metal-only); the page should show feature documentation.
+    If the build fails, the README on the crates.io page is the primary documentation.
 - [ ] Spot-check a GitHub Actions workflow or local build that depends on the published crates via `Cargo.toml` (not path deps) to confirm external resolution works
 
 ## Credentials and Registry Authentication
 
 - **crates.io token:** Required; obtain from https://crates.io/settings/tokens (login required)
-- **Access scope:** Because all three crate names are **new** on crates.io, the token must include the **"publish new crates"** scope and must not be allowlisted to other crate names. (A token scoped to "publish updates" only, or restricted to a different crate allowlist, fails on the first publish.) Token scopes are visible only in the crates.io web UI, not via the API.
+- **Access scope:** Because all three crate names are **new** on crates.io, the token must include the **"publish new crates"** scope and must not be allowlisted to other crate names.
+  (A token scoped to "publish updates" only, or restricted to a different crate allowlist, fails on the first publish.)
+  Token scopes are visible only in the crates.io web UI, not via the API.
 
 **Authentication method (this project): `CARGO_REGISTRY_TOKEN` environment variable.**
 
-The token is provided to `cargo publish` via the `CARGO_REGISTRY_TOKEN` environment variable, exported from `.envrc` (loaded by direnv in the interactive shell). `cargo publish` reads it automatically — no `cargo login` and no `~/.cargo/credentials.toml` file are required.
+The token is provided to `cargo publish` via the `CARGO_REGISTRY_TOKEN` environment variable, exported from `.envrc` (loaded by direnv in the interactive shell).
+`cargo publish` reads it automatically — no `cargo login` and no `~/.cargo/credentials.toml` file are required.
 
-```sh
+```bash
 # .envrc (loaded by direnv; the value lives in the developer's local environment, not in git)
 export CARGO_REGISTRY_TOKEN="<crates.io token>"
 ```
 
 Verify the token is present and valid before publishing (does not print the secret):
 
-```sh
+```bash
 test -n "$CARGO_REGISTRY_TOKEN" && echo "token set" || echo "token NOT set — check .envrc / direnv"
 curl -s -H "Authorization: $CARGO_REGISTRY_TOKEN" https://crates.io/api/v1/me | python3 -m json.tool
 ```
@@ -222,20 +245,22 @@ A JSON body containing your `user` confirms the token is valid. (The "publish ne
 
 The same `CARGO_REGISTRY_TOKEN` is used by all three `cargo publish` invocations.
 
-**Alternative (`cargo login`):** if you prefer not to use the environment variable, run `cargo login` once to store the token in `~/.cargo/credentials.toml`. Do not use both methods at once. `.envrc` must never commit the real token to git.
+**Alternative (`cargo login`):** if you prefer not to use the environment variable, run `cargo login` once to store the token in `~/.cargo/credentials.toml`.
+Do not use both methods at once.
+`.envrc` must never commit the real token to git.
 
 ## Rollback Procedure
 
 If a crate must be yanked or the release retracted after publication:
 
 1. **Yank the crate (remove from dependency resolution, keep history):**
-   ```sh
+   ```bash
    cargo yank --version 0.4.0 <crate>
    ```
    Yank in reverse dependency order (the two `-network` crates first, then `juggler`). Requires the same `CARGO_REGISTRY_TOKEN` / credentials that published it.
 
 2. **Or: delete the release on GitHub** (if not yet heavily used):
-   ```sh
+   ```bash
    git push --delete origin v0.4.0
    git tag -d v0.4.0
    ```

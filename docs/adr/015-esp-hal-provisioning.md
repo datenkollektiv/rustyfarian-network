@@ -7,7 +7,7 @@ Proposed — awaiting maintainer sign-off.
 The maintainer explicitly requested an ADR-level evaluation of the two load-bearing technology choices — the captive-portal network substrate and the flash credential store — rather than a gut-feel pick.
 This ADR recommends; the maintainer decides.
 
-The canonical sign-off anchor is the State checklist in the feature doc ([esp-hal-provisioning-v1.md](../features/esp-hal-provisioning-v1.md)), which records acceptance.
+The canonical sign-off anchor is the State checklist in the feature doc ([esp-hal-provisioning-v1.md](../features/archive/esp-hal-provisioning-v1.md)), which records acceptance.
 No issue tracker exists in this workspace by convention.
 
 ## Context
@@ -40,7 +40,7 @@ A `WifiMqttDevice` provisioning crate on bare-metal therefore provisions credent
 This ADR states that dependency plainly rather than pretending the consumer already exists.
 
 Five decisions need to be locked before implementation begins.
-This ADR holds the durable architecture; the planning-level figures those decisions imply are locked in the feature doc ([esp-hal-provisioning-v1.md](../features/esp-hal-provisioning-v1.md)) as "Locked at planning pass" Decisions-table rows, and the implementation-level open questions live there too.
+This ADR holds the durable architecture; the planning-level figures those decisions imply are locked in the feature doc ([esp-hal-provisioning-v1.md](../features/archive/esp-hal-provisioning-v1.md)) as "Locked at planning pass" Decisions-table rows, and the implementation-level open questions live there too.
 
 ## Decision
 
@@ -230,7 +230,7 @@ These are follow-through items, actioned at acceptance, not in this ADR:
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; reserves the `rustyfarian-esp-hal-provisioning` name (§2) and locks the no-parallel-Wi-Fi-stack and private-HTTP positions this ADR builds on.
 - [ADR 014](014-wifi-mqtt-provisioning-profile.md) — the `WifiMqttDevice` profile and the `SchemaProfile` generalisation this crate provisions; same downstream (`rustyfarian-rgb-clock`).
 - [ADR 011](011-ota-crate-hosting-and-transport.md) — OTA crate hosting and plain-transport precedent; the private hand-rolled HTTP *client* this ADR contrasts with a portal's three-protocol surface.
-- [docs/features/esp-hal-provisioning-v1.md](../features/esp-hal-provisioning-v1.md) — feature doc carrying the open questions, the signature-only design, and the phased plan.
+- [docs/features/esp-hal-provisioning-v1.md](../features/archive/esp-hal-provisioning-v1.md) — feature doc carrying the open questions, the signature-only design, and the phased plan.
 - `crates/rustyfarian-esp-hal-wifi/src/lib.rs` — the async-only STA estate the AP path joins; the `compile_error!` embassy guard and the `extern "C" esp_wifi_set_max_tx_power` TX-power clamp.
 - `crates/rustyfarian-esp-hal-ota/src/http.rs` — the only bare-metal TCP code: the hand-rolled strict no-alloc HTTP/1.1 *client* precedent.
 - `crates/rustyfarian-esp-idf-provisioning/src` — the ESP-IDF reference portal: `lib.rs` (builder / session), `portal.rs` (HTTP + security contract), `dns.rs` (DNS catch-all), `store.rs` (NVS persistence and the v1→v2 migration).
