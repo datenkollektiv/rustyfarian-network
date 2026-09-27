@@ -36,10 +36,12 @@ provisioning = ["wifi", "mqtt", "lora", "dep:heapless", "dep:zeroize"]
 # (uses std::collections::VecDeque); host-test environments always have alloc.
 mock = ["wifi", "lora", "espnow"]
 
-# std feature — enables the subscriber-thread helpers inside the mqtt module.
-# These require std::thread and std::sync and anyhow::Result.
-# The merged crate is no_std by default; std is opt-in for platform crates that
-# need spawn_subscriber_thread, format_broker_url, SubscribeClient, and QoS.
+# std feature — enables the std-only helpers: in mqtt, the connect/subscriber
+# threads, CallbackScope, ConnectionEpoch, SubscribeClient (std::thread,
+# std::sync, anyhow::Result); with provisioning, provisioning::SessionState
+# (std::sync::Condvar). It implies mqtt, which provisioning enables anyway, so
+# a provisioning build only adds anyhow.
+# The merged crate is no_std by default; std is opt-in for platform crates.
 std = ["mqtt", "dep:anyhow"]
 
 [dependencies]

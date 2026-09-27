@@ -81,7 +81,7 @@ espnow = ["juggler/wifi", "juggler/espnow"]
 ota = ["juggler/ota", "dep:embedded-svc"]
 
 # provisioning: SoftAP captive portal.
-provisioning = ["wifi", "juggler/provisioning", "dep:embedded-svc"]
+provisioning = ["wifi", "juggler/provisioning", "juggler/std", "dep:embedded-svc"]
 
 [dev-dependencies]
 rustyfarian-esp-idf-ws2812 = { workspace = true }
@@ -114,6 +114,10 @@ required-features = ["wifi", "mqtt"]
 
 [[example]]
 name = "idf_c3_mqtt_led_grid"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c3_mqtt_callback_guard"
 required-features = ["wifi", "mqtt"]
 
 [[example]]

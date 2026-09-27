@@ -455,36 +455,7 @@ mod tests {
 
     const TEST_SSID: &str = "test-net";
 
-    /// This process's Wi-Fi test key, generated once on first use.
-    ///
-    /// Derived from OS entropy rather than written as a literal, so no fixed
-    /// key material exists in the source at all — which is what CodeQL's
-    /// `rust/hard-coded-cryptographic-value` rule actually asks for. Spelling a
-    /// constant out as bytes or chars would only hide it from the analyzer.
-    ///
-    /// Any value in `AP_PASSWORD_MIN_LEN..=PASSWORD_MAX_LEN` works: the tests
-    /// below exercise validation, builder defaults, and `Debug` redaction, and
-    /// none of them depend on a specific value. The result is 16 lowercase hex
-    /// digits, so length and character class are identical on every run.
-    fn test_psk() -> &'static str {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        use std::sync::OnceLock;
-
-        static PSK: OnceLock<String> = OnceLock::new();
-        PSK.get_or_init(|| {
-            let mut hasher = RandomState::new().build_hasher();
-            hasher.write_u8(0);
-            let mut psk = String::new();
-            for byte in hasher.finish().to_le_bytes() {
-                for nibble in [byte >> 4, byte & 0x0f] {
-                    psk.push(char::from_digit(u32::from(nibble), 16).expect("nibble is < 16"));
-                }
-            }
-            psk
-        })
-        .as_str()
-    }
+    use crate::test_support::test_psk;
 
     /// Shorthand for building a `WiFiConfig` with test fixture values.
     fn test_config() -> WiFiConfig<'static> {

@@ -83,8 +83,9 @@ pub(crate) const APP_KEY_HEX_LEN: usize = 32;
 ///
 /// # Secret lifetime
 ///
-/// When a `ProvisioningConfig`, [`LoraFields`], or [`MqttFields`] value is
-/// dropped, the Wi-Fi password, the MQTT password, the AppKey, and every
+/// When a `ProvisioningConfig`, [`LoraFields`], [`MqttFields`], or
+/// [`ExtraField`](crate::provisioning::ExtraField) value (including a clone)
+/// is dropped, the Wi-Fi password, the MQTT password, the AppKey, and every
 /// extra field's value in *that value's own storage* are overwritten (zeroed,
 /// via [`zeroize`]) before the memory is released.
 ///
@@ -229,18 +230,16 @@ impl fmt::Debug for ProvisioningConfig {
 }
 
 impl Drop for ProvisioningConfig {
-    /// Scrubs `wifi_password` and every extra field's value before the memory
-    /// is released; see the `# Secret lifetime` section above.
+    /// Scrubs `wifi_password` before the memory is released; see the
+    /// `# Secret lifetime` section above.
     ///
-    /// `lora` and `mqtt` scrub their own secret (the AppKey / MQTT password
-    /// respectively) via their own `Drop` impls, chained automatically once
-    /// this function returns. `wifi_ssid`, `ota_url`, `device_name`, and
-    /// every extra field's *key* are not secrets and are left as-is.
+    /// `lora`, `mqtt`, and each entry of `extras` scrub their own secret (the
+    /// AppKey, the MQTT password, the extra field's value) via their own
+    /// `Drop` impls, chained automatically once this function returns.
+    /// `wifi_ssid`, `ota_url`, `device_name`, and every extra field's *key*
+    /// are not secrets and are left as-is.
     fn drop(&mut self) {
         crate::provisioning::secret::scrub(&mut self.wifi_password);
-        for extra in self.extras.iter_mut() {
-            crate::provisioning::secret::scrub(&mut extra.value);
-        }
     }
 }
 
@@ -254,27 +253,7 @@ mod tests {
 
     const TEST_APP_KEY_HEX: &str = "00112233445566778899AABBCCDDEEFF";
 
-    /// This process's Wi-Fi test key, generated once on first use.
-    ///
-    /// Derived from OS entropy rather than written as a literal, so no fixed key
-    /// material exists in the source -- the same pattern as `test_psk()` in
-    /// `juggler::wifi`.  These tests only check parsing and `Debug` redaction,
-    /// so any well-formed value works.
-    fn test_psk() -> &'static str {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        use std::sync::OnceLock;
-
-        static PSK: OnceLock<alloc::string::String> = OnceLock::new();
-        PSK.get_or_init(|| {
-            alloc::format!("{:016x}", {
-                let mut hasher = RandomState::new().build_hasher();
-                hasher.write_u8(0);
-                hasher.finish()
-            })
-        })
-        .as_str()
-    }
+    use crate::test_support::test_psk;
 
     fn parsed_config() -> crate::provisioning::ProvisioningConfig {
         let psk = test_psk();
@@ -412,5 +391,22 @@ mod tests {
         unsafe { ManuallyDrop::drop(&mut cfg) };
 
         assert_scrubbed("lora.app_key_hex", app_key);
+    }
+
+    /// A clone taken out of a config is scrubbed on its own drop, not only
+    /// through the owning config (bug 003 follow-up).
+    #[test]
+    fn drop_scrubs_cloned_extra_field_value() {
+        use core::mem::ManuallyDrop;
+
+        let cfg = mqtt_config_with_extra();
+        let mut extra = ManuallyDrop::new(cfg.extras()[0].clone());
+        let value = window(&extra.value);
+        assert_eq!(unsafe { bytes_at(value) }, test_psk().as_bytes());
+
+        unsafe { ManuallyDrop::drop(&mut extra) };
+
+        assert_scrubbed("cloned extra.value", value);
+        assert_eq!(cfg.extras()[0].value, test_psk(), "the original is intact");
     }
 }

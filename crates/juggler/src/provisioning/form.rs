@@ -61,15 +61,26 @@ const MAX_CANONICAL_FIELDS: usize = 8;
 ///
 /// The value is opaque and may be a secret (an API token, say), so it is
 /// treated as one: the [`Debug`](core::fmt::Debug) impl shows the key but
-/// redacts the value as `"<redacted>"`, and the owning
-/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig) scrubs it
-/// on drop.
+/// redacts the value as `"<redacted>"`, and every `ExtraField` — including a
+/// clone taken out of a
+/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig) — scrubs
+/// its value on drop. Because of that `Drop` impl, the fields can be borrowed
+/// or cloned but not moved out of the struct.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExtraField {
     /// The extra field's key (at most [`EXTRA_KEY_MAX_LEN`] bytes).
     pub key: heapless::String<EXTRA_KEY_MAX_LEN>,
     /// The extra field's value (at most [`EXTRA_VALUE_MAX_LEN`] bytes).
     pub value: heapless::String<EXTRA_VALUE_MAX_LEN>,
+}
+
+impl Drop for ExtraField {
+    /// Scrubs the value (possibly a secret) before the memory is released;
+    /// the key is not a secret and is left as-is. See bug 003
+    /// (`docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md`).
+    fn drop(&mut self) {
+        crate::provisioning::secret::scrub(&mut self.value);
+    }
 }
 
 impl core::fmt::Debug for ExtraField {
@@ -825,30 +836,7 @@ mod tests {
 
     extern crate std;
 
-    /// This process's Wi-Fi test key, generated once on first use.
-    ///
-    /// Derived from OS entropy rather than written as a literal, so no fixed key
-    /// material exists in the source -- the same pattern as `test_psk()` in
-    /// `juggler::wifi`.  These tests only check parsing and `Debug` redaction,
-    /// so any well-formed value works.
-    ///
-    /// [`test_mqtt_psk`] returns the complement, so the two always differ and a
-    /// test cannot pass by crossing the Wi-Fi and MQTT password fields.
-    fn test_psk() -> &'static str {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        use std::sync::OnceLock;
-
-        static PSK: OnceLock<alloc::string::String> = OnceLock::new();
-        PSK.get_or_init(|| {
-            alloc::format!("{:016x}", {
-                let mut hasher = RandomState::new().build_hasher();
-                hasher.write_u8(0);
-                hasher.finish()
-            })
-        })
-        .as_str()
-    }
+    use crate::test_support::test_psk;
 
     /// MQTT counterpart of [`test_psk`]; always differs from it.
     fn test_mqtt_psk() -> &'static str {

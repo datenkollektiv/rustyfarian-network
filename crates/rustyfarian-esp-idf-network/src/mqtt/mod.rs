@@ -30,11 +30,21 @@
 //! ## Non-blocking publish
 //!
 //! For time-critical loops (e.g. ESP-NOW at 50 Hz), use [`MqttHandle::try_publish`]
-//! to avoid blocking when the connect helper thread holds the client mutex
-//! (running the startup publish, `on_connect`, or SUBSCRIBE enqueues) or
-//! another publisher is waiting on esp-mqtt's `api_lock` during a connect
-//! handshake. Messages are silently dropped on `WouldBlock` — buffer or count
-//! misses at the application layer if lossless delivery matters:
+//! to avoid blocking behind holders of the client mutex: the connect helper
+//! thread (running the startup publish, `on_connect`, or SUBSCRIBE enqueues)
+//! or another publisher stuck inside `enqueue` on esp-mqtt's `api_lock` during
+//! a connect handshake. `WouldBlock` covers only the client mutex, though:
+//! with the mutex free, the `enqueue` call itself blocks on `api_lock` for
+//! the duration of a (re)connect handshake, so even `try_publish` can stall
+//! during poor connectivity. Messages are silently dropped on `WouldBlock` —
+//! buffer or count misses at the application layer if lossless delivery
+//! matters.
+//!
+//! "Non-blocking" holds only **outside** the MQTT callbacks. From inside
+//! `on_message`, `on_disconnect`, or `on_connect`, `try_publish` returns
+//! `TryPublishError::Other` carrying [`PublishAckError::WrongThread`]
+//! immediately (before 0.5.1 it hung the client forever — the block is inside
+//! esp-mqtt's `api_lock`, which `try_lock` cannot see):
 //!
 //! ```ignore
 //! use rustyfarian_esp_idf_network::mqtt::TryPublishError;
@@ -175,6 +185,10 @@ use esp_idf_svc::mqtt::client::{
 
 /// Error returned by the `try_publish*` family when the publish cannot
 /// complete without blocking.
+///
+/// A call from inside an MQTT callback is reported as [`Other`](Self::Other)
+/// wrapping [`PublishAckError::WrongThread`]; detect it with
+/// `e.downcast_ref::<PublishAckError>()` on the inner `anyhow::Error`.
 #[derive(Debug)]
 pub enum TryPublishError {
     /// The MQTT client mutex is held by the connect helper thread (running
@@ -1559,18 +1573,25 @@ impl MqttHandle {
         }
     }
 
-    /// Non-blocking publish with QoS 1 and no retain flag.
+    /// Non-blocking publish with QoS 1 and no retain flag — non-blocking only
+    /// when called outside the MQTT callbacks.
     ///
     /// Returns [`TryPublishError::WouldBlock`] if the MQTT client mutex is
     /// held by the connect helper thread or another blocked publisher (see
-    /// [`TryPublishError::WouldBlock`]).
+    /// [`TryPublishError::WouldBlock`]). From inside `on_message`,
+    /// `on_disconnect`, or `on_connect` it returns [`TryPublishError::Other`]
+    /// wrapping [`PublishAckError::WrongThread`] (see
+    /// [`try_publish_with`](Self::try_publish_with)).
     pub fn try_publish(&self, topic: &str, payload: &str) -> Result<(), TryPublishError> {
         self.try_publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
     }
 
-    /// Non-blocking retained publish with QoS 1.
+    /// Non-blocking retained publish with QoS 1 — non-blocking only when
+    /// called outside the MQTT callbacks.
     ///
-    /// Returns [`TryPublishError::WouldBlock`] if the mutex is held.
+    /// Returns [`TryPublishError::WouldBlock`] if the mutex is held, and
+    /// [`TryPublishError::Other`] wrapping [`PublishAckError::WrongThread`]
+    /// from inside any callback.
     pub fn try_publish_retained(&self, topic: &str, payload: &str) -> Result<(), TryPublishError> {
         self.try_publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
     }

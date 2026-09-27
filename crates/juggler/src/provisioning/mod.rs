@@ -25,6 +25,8 @@ pub mod form;
 pub mod html_json_escape;
 pub mod profile;
 pub(crate) mod secret;
+#[cfg(feature = "std")]
+pub mod session;
 pub mod ssid;
 pub mod state;
 pub mod templates;
@@ -38,6 +40,8 @@ pub use defaults::PortalDefaults;
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};
+#[cfg(feature = "std")]
+pub use session::{SessionOutcome, SessionState};
 pub use ssid::{derive_softap_ssid, resolve_softap_ssid};
 pub use state::{
     resolve_wait, InvalidTransition, ProvisioningInput, ProvisioningState, WaitResolution,

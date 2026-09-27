@@ -73,8 +73,8 @@ pub use juggler::provisioning::{
     PortalDefaults, ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
 };
 
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 
@@ -84,9 +84,16 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
 use crate::wifi::{softap_mac, ApConfig, SoftApManager};
-use juggler::provisioning::{resolve_wait, ProvisioningInput, WaitResolution};
 
 use dns::DnsResponder;
+
+/// Shared session state, cloned into every HTTP handler.
+///
+/// A thin alias over the host-testable [`juggler::provisioning::SessionState`]
+/// — see that type for the implementation and its host-run regression tests
+/// (`just test-provisioning`), which esp-idf-sys blocks from running against
+/// this crate directly.
+pub(crate) type SharedState = juggler::provisioning::SessionState;
 
 /// Experimental: API may change before 1.0.
 ///
@@ -157,250 +164,11 @@ pub enum ProvisioningEvent {
 /// [`run_wifi_mqtt_portal`](boot::run_wifi_mqtt_portal) to map into
 /// [`PortalOutcome`](boot::PortalOutcome).
 ///
-/// Only consumed by the `mqtt`-gated `boot` module; gated accordingly.
+/// A thin alias over [`juggler::provisioning::SessionOutcome`] — see that type
+/// for the host-run regression tests. Only consumed by the `mqtt`-gated `boot`
+/// module; gated accordingly.
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
-#[derive(Debug)]
-pub(crate) enum SessionWait {
-    /// A valid submission was committed.
-    ///
-    /// Carries no payload: the caller of [`wait_outcome`](SharedState::wait_outcome)
-    /// discards the config, so returning it here would clone the ~1.3 KB
-    /// [`ProvisioningConfig`] onto the caller's stack for nothing (bug
-    /// `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`). A caller
-    /// that needs the config should use
-    /// [`ProvisioningSession::wait_committed`] instead.
-    Committed,
-    /// The factory-reset button was pressed.
-    FactoryResetRequested,
-    /// The optional timeout elapsed with no terminal event.
-    TimedOut,
-}
-
-/// Shared session state behind an `Arc<Mutex<…>>` plus a [`Condvar`].
-///
-/// `std` `Mutex`/`Condvar` are available and correct under ESP-IDF `std`.
-struct StateInner {
-    state: ProvisioningState,
-    committed: Option<ProvisioningConfig>,
-}
-
-/// Handle to the shared session state, cloned into every HTTP handler.
-#[derive(Clone)]
-pub(crate) struct SharedState {
-    inner: Arc<(Mutex<StateInner>, Condvar)>,
-    start: Instant,
-}
-
-impl SharedState {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new((
-                Mutex::new(StateInner {
-                    state: ProvisioningState::AwaitingSubmission,
-                    committed: None,
-                }),
-                Condvar::new(),
-            )),
-            start: Instant::now(),
-        }
-    }
-
-    /// The current provisioning state.
-    pub(crate) fn current(&self) -> ProvisioningState {
-        self.inner
-            .0
-            .lock()
-            .map(|g| g.state)
-            .unwrap_or(ProvisioningState::AwaitingSubmission)
-    }
-
-    /// Drives the state machine by `input`, logging (but not failing on) an
-    /// invalid transition.
-    pub(crate) fn apply(&self, input: ProvisioningInput) {
-        if let Ok(mut guard) = self.inner.0.lock() {
-            match guard.state.apply(input) {
-                Ok(next) => guard.state = next,
-                Err(t) => log::warn!("provisioning state machine: {t}"),
-            }
-        }
-    }
-
-    /// Applies `input` to the state machine AND notifies any condvar waiters.
-    ///
-    /// Use this instead of [`apply`](Self::apply) when the transition reaches a
-    /// terminal state that a [`wait_outcome`](Self::wait_outcome) caller must
-    /// observe — specifically the `FactoryReset → FactoryResetPending` path.
-    pub(crate) fn apply_and_notify(&self, input: ProvisioningInput) {
-        if let Ok(mut guard) = self.inner.0.lock() {
-            match guard.state.apply(input) {
-                Ok(next) => guard.state = next,
-                Err(t) => log::warn!("provisioning state machine: {t}"),
-            }
-            self.inner.1.notify_all();
-        }
-    }
-
-    /// Applies `ProvisioningInput::PersistOk`, stores the committed config, and
-    /// wakes any waiter — all under one lock acquisition.
-    ///
-    /// `wait_committed`/`wait_outcome` key on the state via [`resolve_wait`] —
-    /// the state is the single source of truth for the waiter's signal, not
-    /// the presence of `guard.committed`, because `wait_committed` moves the
-    /// payload out with `take()` and a later observer must still see
-    /// `Committed`. The state and the payload must therefore be published
-    /// together: a separate `apply(PersistOk)` before storing the payload
-    /// would let a waiter that wakes in between (timeout slice or spurious
-    /// wakeup) observe `Committed` with no payload and return `None`.
-    ///
-    /// An invalid transition is logged and nothing is stored, like
-    /// [`apply`](Self::apply).
-    pub(crate) fn commit(&self, config: ProvisioningConfig) {
-        if let Ok(mut guard) = self.inner.0.lock() {
-            match guard.state.apply(ProvisioningInput::PersistOk) {
-                Ok(next) => {
-                    guard.committed = Some(config);
-                    guard.state = next;
-                    self.inner.1.notify_all();
-                }
-                Err(t) => log::warn!("provisioning state machine: {t}"),
-            }
-        }
-    }
-
-    /// Seconds since the session started, for `/status` `uptime_s`.
-    pub(crate) fn uptime_secs(&self) -> u64 {
-        self.start.elapsed().as_secs()
-    }
-
-    /// Blocks until the config is committed or the optional timeout elapses.
-    ///
-    /// A `Some(timeout)` is treated as a wall-clock deadline computed once at
-    /// entry; spurious wakeups consume the elapsed slice instead of restarting
-    /// the timer, so the total wait never exceeds the caller's requested
-    /// duration.
-    ///
-    /// The config is moved out of shared state with `take()`, never cloned
-    /// (bug `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`), so
-    /// it can only be returned once: a second call after a successful return
-    /// resolves `Committed` from the state (see [`resolve_wait`]) but finds
-    /// `guard.committed` already empty and returns `None` immediately without
-    /// blocking. A factory-reset request does not resolve this wait (unlike
-    /// [`wait_outcome`](Self::wait_outcome)) — it keeps blocking until a
-    /// commit or the timeout, matching prior behaviour.
-    fn wait_committed(&self, timeout: Option<Duration>) -> Option<ProvisioningConfig> {
-        let (lock, cvar) = &*self.inner;
-        let mut guard = match lock.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!(
-                    "provisioning wait_committed: state mutex poisoned, \
-                     treating as timeout: {e}"
-                );
-                return None;
-            }
-        };
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            if resolve_wait(guard.state) == WaitResolution::Committed {
-                return guard.committed.take();
-            }
-            match deadline {
-                None => match cvar.wait(guard) {
-                    Ok(g) => guard = g,
-                    Err(e) => {
-                        log::warn!(
-                            "provisioning wait_committed: condvar poisoned, \
-                             treating as timeout: {e}"
-                        );
-                        return None;
-                    }
-                },
-                Some(d) => {
-                    let remaining = d.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return None;
-                    }
-                    match cvar.wait_timeout(guard, remaining) {
-                        Ok((g, _)) => guard = g,
-                        Err(e) => {
-                            log::warn!(
-                                "provisioning wait_committed: condvar poisoned, \
-                                 treating as timeout: {e}"
-                            );
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Blocks until the session reaches a terminal state or the optional timeout
-    /// elapses.
-    ///
-    /// Terminal states are:
-    /// - A committed config → [`SessionWait::Committed`]
-    /// - `FactoryResetPending` state → [`SessionWait::FactoryResetRequested`]
-    /// - Timeout elapsed → [`SessionWait::TimedOut`]
-    ///
-    /// Unlike [`wait_committed`](Self::wait_committed), this method also wakes
-    /// on the factory-reset path, provided the factory-reset handler calls
-    /// [`apply_and_notify`](Self::apply_and_notify) rather than bare
-    /// [`apply`](Self::apply).
-    #[cfg(all(feature = "provisioning", feature = "mqtt"))]
-    pub(crate) fn wait_outcome(&self, timeout: Option<Duration>) -> SessionWait {
-        let (lock, cvar) = &*self.inner;
-        let mut guard = match lock.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!(
-                    "provisioning wait_outcome: state mutex poisoned, \
-                     treating as timeout: {e}"
-                );
-                return SessionWait::TimedOut;
-            }
-        };
-        let deadline = timeout.map(|t| Instant::now() + t);
-        loop {
-            // Delegate the per-iteration terminal-state decision to the pure,
-            // host-tested juggler function so the "factory-reset unblocks an
-            // indefinite wait" contract is locked by juggler unit tests.
-            match resolve_wait(guard.state) {
-                WaitResolution::Committed => return SessionWait::Committed,
-                WaitResolution::FactoryReset => return SessionWait::FactoryResetRequested,
-                WaitResolution::Pending => {}
-            }
-            match deadline {
-                None => match cvar.wait(guard) {
-                    Ok(g) => guard = g,
-                    Err(e) => {
-                        log::warn!(
-                            "provisioning wait_outcome: condvar poisoned, \
-                             treating as timeout: {e}"
-                        );
-                        return SessionWait::TimedOut;
-                    }
-                },
-                Some(d) => {
-                    let remaining = d.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return SessionWait::TimedOut;
-                    }
-                    match cvar.wait_timeout(guard, remaining) {
-                        Ok((g, _)) => guard = g,
-                        Err(e) => {
-                            log::warn!(
-                                "provisioning wait_outcome: condvar poisoned, \
-                                 treating as timeout: {e}"
-                            );
-                            return SessionWait::TimedOut;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+pub(crate) type SessionWait = juggler::provisioning::SessionOutcome;
 
 /// Default maximum AP connections (mirrors `juggler::wifi::AP_MAX_CONNECTIONS_DEFAULT`).
 const DEFAULT_MAX_CONNECTIONS: u8 = juggler::wifi::AP_MAX_CONNECTIONS_DEFAULT;
