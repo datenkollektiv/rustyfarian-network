@@ -4,8 +4,8 @@
 > The PR that introduces this doc lands ADR 015 and the planning content below; Phases 0–4 are follow-up PRs that begin only after ADR 015 is accepted and the open-question proposals are signed off.
 > The State checklist at the bottom is the authoritative progress record — at the time this doc landed, only "Design drafted (ADR 015 proposed)" is true.
 
-Feature doc for the bare-metal SoftAP captive-portal provisioning crate proposed by [ADR 015](../adr/015-esp-hal-provisioning.md).
-The crate, `rustyfarian-esp-hal-provisioning`, brings the `WifiMqttDevice` profile already shipped on the ESP-IDF tier ([ADR 014](../adr/014-wifi-mqtt-provisioning-profile.md) / [feature doc](wifi-mqtt-provisioning-profile-v1.md)) to the bare-metal esp-hal stack, for the `rustyfarian-rgb-clock` downstream moving onto that stack.
+Feature doc for the bare-metal SoftAP captive-portal provisioning crate proposed by [ADR 015](../../adr/015-esp-hal-provisioning.md).
+The crate, `rustyfarian-esp-hal-provisioning`, brings the `WifiMqttDevice` profile already shipped on the ESP-IDF tier ([ADR 014](../../adr/014-wifi-mqtt-provisioning-profile.md) / [feature doc](wifi-mqtt-provisioning-profile-v1.md)) to the bare-metal esp-hal stack, for the `rustyfarian-rgb-clock` downstream moving onto that stack.
 
 This is a hybrid doc: it carries the decisions ADR 015 locks (once accepted), the open questions and proposed answers that will drive the implementation, a signature-only design sketch, and a phased plan.
 ADR 015 and the proposed answers below are **Proposed — awaiting maintainer sign-off**; the maintainer asked for both load-bearing technology choices (network substrate, flash store) to be evaluated at ADR level rather than picked by gut feel, so the ADR recommends and the maintainer decides.

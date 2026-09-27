@@ -1,7 +1,7 @@
 # Feature: Wi-Fi + MQTT Provisioning Profile v1
 
-Feature doc for the second provisioning schema profile proposed by [ADR 014](../adr/014-wifi-mqtt-provisioning-profile.md).
-The profile adds a `WifiMqttDevice` schema (Wi-Fi credentials + MQTT broker + OTA URL + device name, no LoRaWAN) to the SoftAP provisioning triad already shipped on the `soft-ap` branch under [ADR 013](../adr/013-softap-provisioning-acceptance.md) / [feature doc](softap-provisioning-v1.md).
+Feature doc for the second provisioning schema profile proposed by [ADR 014](../../adr/014-wifi-mqtt-provisioning-profile.md).
+The profile adds a `WifiMqttDevice` schema (Wi-Fi credentials + MQTT broker + OTA URL + device name, no LoRaWAN) to the SoftAP provisioning triad already shipped on the `soft-ap` branch under [ADR 013](../../adr/013-softap-provisioning-acceptance.md) / [feature doc](softap-provisioning-v1.md).
 
 This is a hybrid doc: it records the decisions locked by ADR 014 (accepted 2026-06-12) and the open questions and phased plan that drove the implementation.
 ADR 014 and the seven proposed answers below were signed off on 2026-06-12 and implemented the same day; durable outcomes are promoted into the "Locked at implementation" Decisions sub-table.

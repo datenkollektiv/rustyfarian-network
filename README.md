@@ -1,11 +1,16 @@
 # Rustyfarian Network
 
 <p align="center">
-  <img src="docs/steampunk-meets-future-in-network-lab.png" alt="juggler — networking &amp; messaging. A steampunk fairground on the left (no_std / esp-hal) and a futuristic network-operations dashboard on the right (std / esp-idf), with the rustyfarian juggler mascot juggling TCP, UDP, MQTT, and WiFi between two ESP32-C6 boards: &quot;One chip. Two universes.&quot;" width="720">
+  <img
+    src="docs/steampunk-meets-future-in-network-lab.png"
+    alt="juggler — networking &amp; messaging. A steampunk fairground (no_std / esp-hal) and a
+    futuristic network-operations dashboard (std / esp-idf), with the rustyfarian juggler mascot
+    juggling TCP, UDP, MQTT, and WiFi between two ESP32-C6 boards. One chip. Two universes."
+    width="720">
 </p>
 
 [![CI](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/rust.yml)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-esp--toolchain-orange.svg)](https://github.com/esp-rs/rust)
 [![cargo fmt](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/fmt.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/fmt.yml)
 [![cargo clippy](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml/badge.svg)](https://github.com/datenkollektiv/rustyfarian-network/actions/workflows/clippy.yml)
@@ -28,8 +33,12 @@ Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA support libraries for ESP32 projects.
 - Minimal friction: a few lines of `Cargo.toml` and no surprises
 
 **Out of scope:** General-purpose application-layer clients (HTTP, CoAP, WebSocket) and BLE provisioning flows.
-The OTA feature (in both `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`) carries its own internal HTTP/1.1 GET client for firmware download, but this is an implementation detail and not published as a reusable workspace HTTP API.
-SoftAP captive-portal provisioning ships with two `SchemaProfile`s — `LorawanFieldDevice` and `WifiMqttDevice` — under [ADR 013](docs/adr/013-softap-provisioning-acceptance.md) (acceptance, 2026-06-11) and [ADR 014](docs/adr/014-wifi-mqtt-provisioning-profile.md) (Wi-Fi + MQTT generalisation, 2026-06-12); the captive-portal HTTP server follows the same internal-transport pattern as the OTA client.
+The OTA feature (in both `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`) carries its own internal HTTP/1.1 GET client for firmware download.
+This is an implementation detail and is not published as a reusable workspace HTTP API.
+SoftAP captive-portal provisioning ships with two `SchemaProfile`s — `LorawanFieldDevice` and `WifiMqttDevice`.
+They are specified under [ADR 013](docs/adr/013-softap-provisioning-acceptance.md) (acceptance, 2026-06-11)
+and [ADR 014](docs/adr/014-wifi-mqtt-provisioning-profile.md) (Wi-Fi + MQTT generalisation, 2026-06-12).
+The captive-portal HTTP server follows the same internal-transport pattern as the OTA client.
 
 *Full vision, success signals, and open questions: [VISION.md](./VISION.md)*
 
@@ -49,11 +58,24 @@ a pattern common in application development but rare in embedded Rust.
 
 **Three publishable crates — one per HAL tier, all with feature-gated domain selection:**
 
-| Crate                                                               | Tier               | Description                                                                  | crates.io                                                                                                                             | Docs                                                                                                                 |
-|:--------------------------------------------------------------------|:-------------------|:-----------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------|
-| [`juggler`](crates/juggler)                                         | Pure (no_std)      | Platform-independent types, validation, state machines — fully host-testable | [![crates.io](https://img.shields.io/crates/v/juggler.svg)](https://crates.io/crates/juggler)                                         | [![docs.rs](https://img.shields.io/docsrs/juggler)](https://docs.rs/juggler)                                         |
-| [`rustyfarian-esp-idf-network`](crates/rustyfarian-esp-idf-network) | ESP-IDF (std)      | ESP-IDF drivers with blocking APIs and LED status feedback                   | [![crates.io](https://img.shields.io/crates/v/rustyfarian-esp-idf-network.svg)](https://crates.io/crates/rustyfarian-esp-idf-network) | [![readme](https://img.shields.io/badge/docs-readme-blue)](crates/rustyfarian-esp-idf-network/README.md)             |
-| [`rustyfarian-esp-hal-network`](crates/rustyfarian-esp-hal-network) | Bare-metal (async) | Bare-metal `esp-hal` drivers with async/await via `embassy`                  | [![crates.io](https://img.shields.io/crates/v/rustyfarian-esp-hal-network.svg)](https://crates.io/crates/rustyfarian-esp-hal-network) | [![docs.rs](https://img.shields.io/docsrs/rustyfarian-esp-hal-network)](https://docs.rs/rustyfarian-esp-hal-network) |
+| Crate                                                               | Tier               | Description                                                                  | crates.io                              | Docs                                 |
+|:--------------------------------------------------------------------|:-------------------|:-----------------------------------------------------------------------------|:---------------------------------------|:-------------------------------------|
+| [`juggler`](crates/juggler)                                         | Pure (no_std)      | Platform-independent types, validation, state machines — fully host-testable | [![crates.io][cio-juggler]][cl-juggler] | [![docs.rs][dr-juggler]][dl-juggler] |
+| [`rustyfarian-esp-idf-network`](crates/rustyfarian-esp-idf-network) | ESP-IDF (std)      | ESP-IDF drivers with blocking APIs and LED status feedback                   | [![crates.io][cio-idf]][cl-idf]        | [![readme][dr-idf]][rl-idf]          |
+| [`rustyfarian-esp-hal-network`](crates/rustyfarian-esp-hal-network) | Bare-metal (async) | Bare-metal `esp-hal` drivers with async/await via `embassy`                  | [![crates.io][cio-hal]][cl-hal]        | [![docs.rs][dr-hal]][dl-hal]         |
+
+[cio-juggler]: https://img.shields.io/crates/v/juggler.svg
+[cl-juggler]: https://crates.io/crates/juggler
+[dr-juggler]: https://img.shields.io/docsrs/juggler
+[dl-juggler]: https://docs.rs/juggler
+[cio-idf]: https://img.shields.io/crates/v/rustyfarian-esp-idf-network.svg
+[cl-idf]: https://crates.io/crates/rustyfarian-esp-idf-network
+[dr-idf]: https://img.shields.io/badge/docs-readme-blue
+[rl-idf]: crates/rustyfarian-esp-idf-network/README.md
+[cio-hal]: https://img.shields.io/crates/v/rustyfarian-esp-hal-network.svg
+[cl-hal]: https://crates.io/crates/rustyfarian-esp-hal-network
+[dr-hal]: https://img.shields.io/docsrs/rustyfarian-esp-hal-network
+[dl-hal]: https://docs.rs/rustyfarian-esp-hal-network
 
 > Domain features (`wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`) and chip features (`esp32c3`/`c6`/`s3`/`esp32`) are selected per dependency; `default = []`.
 > `rustyfarian-esp-idf-network` links to its crate README rather than docs.rs — `esp-idf-sys` cannot build in the docs.rs sandbox.
@@ -113,7 +135,8 @@ mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
 
 ### LWT and Retained Messages
 
-The retained-status idiom publishes `"online"` from `on_connect` using its `client` argument when the connection is first established; the LWT automatically sends `"offline"` if the TCP connection drops.
+The retained-status idiom publishes `"online"` from `on_connect` using its `client` argument when the connection is first established.
+The LWT automatically sends `"offline"` if the TCP connection drops.
 
 ```rust
 use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, LwtConfig};
@@ -159,13 +182,13 @@ For RGB LEDs, implement the `StatusLed` trait from `pennant`.
 Each crate includes runnable examples for specific ESP32 targets.
 List all examples with `just` and build one with:
 
-```sh
+```bash
 just build-example idf_c3_connect
 ```
 
 To flash to a connected board:
 
-```sh
+```bash
 just flash idf_c3_connect
 ```
 
@@ -175,7 +198,7 @@ See `crates/*/examples/` for the full set, including Wi-Fi, MQTT, and LoRaWAN OT
 
 After cloning, run the one-time setup before building or running examples:
 
-```sh
+```bash
 just setup-toolchain
 just setup-cargo-config
 ```
@@ -196,7 +219,7 @@ This isolation is always active and needs no setup.
 On macOS you can optionally back the embedded target directories with a RAM disk for
 faster, SSD-sparing builds:
 
-```sh
+```bash
 just doctor           # show RAM disk status, resolved target dirs, sccache, and MQTT broker reachability (.env)
 just ramdisk attach   # create and mount the RAM disk (idempotent, 6 GB default)
 just ramdisk detach   # eject the RAM disk

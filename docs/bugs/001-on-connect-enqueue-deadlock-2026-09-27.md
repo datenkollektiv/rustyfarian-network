@@ -76,7 +76,7 @@ Proposed fix, in two steps:
 - Re-verify on hardware: `idf_c3_mqtt`, `idf_c3_mqtt_button_oled`, and one `with_startup_message()` user.
 
 ## Owner
-Florian Waibel — fix on branch `fix/mqtt-on-connect-deadlock` (uncommitted until hardware checks pass).
+Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), `5550775` (credential fallbacks), `2f2597a` (optional OLED); branch `fix/mqtt-on-connect-deadlock` deleted.
 
 ## Fix Status (0.5.x patch, landed on the branch)
 - The event-loop thread never takes the client mutex any more; on every `Connected` one helper thread (`juggler::mqtt::spawn_connect_thread`) runs the `with_startup_message()` publish, then `on_connect`, then the builder subscriptions.
@@ -103,3 +103,4 @@ Florian Waibel — fix on branch `fix/mqtt-on-connect-deadlock` (uncommitted unt
 - 2026-09-27 — Second code review round: `spawn_connect_thread` reports spawn failure so the event loop still confirms the epoch, `CallbackScope` made `!Send` / `#[must_use]` / depth-counted, stale helpers skip the prelude via `ConnectionEpoch::is_current`, stale rustdoc corrected; `just verify`, `just test-mqtt` (103 passed), and all four MQTT example builds green; hardware checks pending.
 - 2026-09-27 — Commit `db8e789` reviewed; follow-ups: `doctor.sh` broker probe passes host/port as arguments, host regression test holds the client mutex from a publisher thread while the helper is spawned, `on_connect`/`on_disconnect` overlap and the helper-spawn readiness exception documented, workspace version and `juggler` minimum raised to 0.5.1; kept open pending hardware checks.
 - 2026-09-27 — Third review: helper-spawn failure no longer confirms the epoch (contract kept, documented), stale-helper limits documented precisely, host test for a disconnect/reconnect while `on_connect` is blocked; still open pending hardware checks.
+- 2026-09-27 — Merged to `main` as four commits (`511b37f`, `76d0d6e`, `5550775`, `2f2597a`) and pushed; `idf_c3_mqtt_button_oled` headless path confirmed on hardware, broker connection still blocked by a stale shell export; bug stays open until the MQTT paths are verified.

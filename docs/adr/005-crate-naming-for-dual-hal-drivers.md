@@ -9,14 +9,17 @@ The core decision of this ADR — that the three HAL tiers (`pure` / `esp-idf` /
 ## Context
 
 During an internal review of ADR 004 in this project, an incorrect naming rationale was discovered.
-That ADR claimed the crate should retain the name `rustyfarian-esp-idf-lora` despite hosting `esp-hal` support because a sister project's crate (`rustyfarian-esp-idf-ws2812`) uses a single Cargo package with feature flags to support both stacks.
+That ADR claimed the crate should retain the name `rustyfarian-esp-idf-lora` despite hosting `esp-hal` support.
+Its rationale was that a sister project's crate (`rustyfarian-esp-idf-ws2812`) uses a single Cargo package with feature flags to support both stacks.
 
 This claim is factually incorrect.
 The `rustyfarian-ws2812` workspace uses **separate crates** (`rustyfarian-esp-idf-ws2812` and `rustyfarian-esp-hal-ws2812`), not a single crate with feature flags.
 That decision is formally documented in ADR 005 of the `rustyfarian-ws2812` project.
 
 Therefore, `rustyfarian-esp-idf-lora` lacks a valid precedent for the single-crate-with-features approach.
-This ADR documents the research conducted to evaluate both approaches, confirms that the separate-crates pattern is the correct one, and establishes naming guidance for all future `rustyfarian-*` HAL driver crates.
+This ADR documents the research conducted to evaluate both approaches.
+It confirms that the separate-crates pattern is the correct one.
+It establishes naming guidance for all future `rustyfarian-*` HAL driver crates.
 
 ### The two approaches are under evaluation
 
@@ -110,14 +113,15 @@ preserving the semantic accuracy of the semver contract.
 
 Independent research confirmed this pattern across multiple authoritative sources:
 
-| Source                          | Pattern                                                                                                                                                      |
-|:--------------------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `embedded-hal` v1.0 (Jan 2024)  | Split into `embedded-hal`, `embedded-hal-async`, `embedded-hal-nb`, `embedded-hal-bus` — one crate per execution model, not feature flags                    |
-| `esp-rs` organization           | `esp-idf-hal` and `esp-hal` are entirely separate packages with separate version histories                                                                   |
-| WS2812 ecosystem                | `ws2812-esp32-rmt-driver` (esp-idf) and `esp-hal-smartled` (esp-hal) — separate crates; the former's README explicitly directs `esp-hal` users to the latter |
-| `lora-phy` / `lora-rs`          | Workspace of focused `no_std` crates; hardware integration via trait implementation, not feature flags                                                       |
-| Rust API Guidelines (C-FEATURE) | Features must be additive and named directly; mutually exclusive backends violate this rule                                                                  |
+| Source                          | Pattern                                                                        |
+|:--------------------------------|:-------------------------------------------------------------------------------|
+| `embedded-hal` v1.0 (Jan 2024)  | Split into `embedded-hal`, `-async`, `-nb`, `-bus` (one per execution model)   |
+| `esp-rs` organization           | `esp-idf-hal` and `esp-hal`: separate packages with separate version histories |
+| WS2812 ecosystem                | Split crates: `ws2812-esp32-rmt-driver` (esp-idf) / `esp-hal-smartled` (esp-hal) |
+| `lora-phy` / `lora-rs`          | Focused `no_std` crates; hardware integration via traits, not feature flags    |
+| Rust API Guidelines (C-FEATURE) | Features must be additive and direct; mutually exclusive backends violate this |
 
+The `ws2812-esp32-rmt-driver` README explicitly directs `esp-hal` users to `esp-hal-smartled`.
 Detailed source citations are available in
 [`docs/hal-naming-and-packaging-conventions.md`](../hal-naming-and-packaging-conventions.md).
 

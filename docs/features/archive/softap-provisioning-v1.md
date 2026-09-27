@@ -1,7 +1,7 @@
 # Feature: SoftAP Provisioning v1
 
 Feature doc for the SoftAP captive-portal provisioning triad accepted by
-[ADR 013](../adr/013-softap-provisioning-acceptance.md).
+[ADR 013](../../adr/013-softap-provisioning-acceptance.md).
 The implementation plan below was drafted 2026-06-11 and implemented the same day (Phases 1–5).
 All open questions are resolved and signed off; the Decisions table records the locked architecture across three sub-tables (ADR 013, planning pass, and implementation).
 The Design section remains an illustrative sketch; where the code deviated, the Session Log records it.
