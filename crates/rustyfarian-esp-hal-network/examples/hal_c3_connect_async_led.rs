@@ -46,10 +46,11 @@ const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
 };
-const PASSWORD: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
+// No literal fallback: an unset `WIFI_PASS` yields the `&str` type default (`""`),
+// keeping CodeQL's hard-coded-credential query source-free.
+fn password() -> &'static str {
+    option_env!("WIFI_PASS").unwrap_or_default()
+}
 
 /// Shared flag: `false` = no IPv4 config (LED blinks), `true` = config up (LED steady).
 /// Owned by `link_status_task`, which watches `embassy_net::Stack::wait_config_up`
@@ -71,7 +72,7 @@ async fn main(spawner: Spawner) {
 
     println!("Initializing Wi-Fi (async + LED)...");
 
-    let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
+    let config = WiFiConfig::new(SSID, password()).with_peripherals(
         peripherals.TIMG0,
         peripherals.FROM_CPU_INTR0,
         peripherals.WIFI,

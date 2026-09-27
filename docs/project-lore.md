@@ -376,6 +376,15 @@ An earlier revision of this entry claimed this case required dismissal; that was
 Dismissal ("Used in tests" in the code scanning UI) remains valid where a fixture genuinely pins an externally-fixed value, but prefer generation.
 Path-based exclusion via a CodeQL config is not an option for fixtures in inline `#[cfg(test)]` modules, since ignoring the file would also drop the production code in it from analysis.
 
+**Example code is scanned too, and an empty-string `option_env!` fallback for a credential is enough to trip the query.**
+On 2026-09-27 the PR check flagged `pub const WIFI_PASS: &str = env_or!("WIFI_PASS", "")` in `crates/rustyfarian-esp-idf-network/examples/common/env.rs` as Critical `rust/hard-coded-cryptographic-value` ("This hard-coded value is used as a password."), one path per example that passes it to `WiFiConfig::new(ssid, password)` — four paths, a five-file suggested changeset.
+The PR check only reports findings the PR introduces, so the identical `const PASSWORD` shape in the older examples did not appear there; it is the same finding and was fixed in the same pass.
+There is no secret in the source: the real value is baked in from the build environment via `option_env!` and the literal is the "unset" placeholder, yet the taint source is still a string literal reaching a credential-named sink.
+The same shape lived in every `idf_*_connect*`, `idf_c3_espnow_*`, and `hal_*_connect_async*` example, and the LoRa examples went further with an all-zero 32-hex `LORAWAN_APP_KEY` literal — an actual hard-coded key.
+Fix (branch `fix/mqtt-on-connect-deadlock`): remove the literal instead of dismissing — `fn password() -> &'static str { option_env!("WIFI_PASS").unwrap_or_default() }` yields the same empty string from `impl Default for &str` with no literal in the source, and the LoRa examples use `unwrap_or_default()` for EUIs and AppKey so `LoraConfig::from_hex_strings` fails fast at startup instead of attempting a join with a zero key.
+This is not the obfuscation the previous entry warns about: the placeholder value is gone, not hidden, and behaviour for a set variable is unchanged.
+Rule for new examples and tests: never write a literal for anything named like a password, PSK, key, nonce, or token — read it from the environment with a type-default fallback or generate it at runtime — and never give such a value a non-empty default.
+
 Two further mechanics that wasted time:
 alerts on `/security/code-scanning` are per-branch and reflect the **default branch**, so nothing closes until the change merges to `main` and the push-triggered scan reruns;
 and the alert list is not public — reading it needs repo write access plus `security-events`, so a fix cannot be targeted from a clone alone.

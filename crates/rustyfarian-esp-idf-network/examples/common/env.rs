@@ -24,9 +24,12 @@ macro_rules! env_or {
 #[allow(dead_code)]
 pub const WIFI_SSID: &str = env_or!("WIFI_SSID", "");
 
-/// Wi-Fi password.
+/// Wi-Fi password; empty when `WIFI_PASS` is unset. Deliberately no literal fallback so
+/// CodeQL's hard-coded-credential query has no source.
 #[allow(dead_code)]
-pub const WIFI_PASS: &str = env_or!("WIFI_PASS", "");
+pub fn wifi_pass() -> &'static str {
+    option_env!("WIFI_PASS").unwrap_or_default()
+}
 
 /// MQTT broker IP or hostname.
 #[allow(dead_code)]

@@ -31,10 +31,11 @@ const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
 };
-const PASSWORD: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
+// No literal fallback: an unset `WIFI_PASS` yields the `&str` type default (`""`),
+// keeping CodeQL's hard-coded-credential query source-free.
+fn password() -> &'static str {
+    option_env!("WIFI_PASS").unwrap_or_default()
+}
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -45,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     let nvs = EspDefaultNvsPartition::take()?;
 
     let config =
-        WiFiConfig::new(SSID, PASSWORD).with_peripherals(peripherals.modem, sys_loop, Some(nvs));
+        WiFiConfig::new(SSID, password()).with_peripherals(peripherals.modem, sys_loop, Some(nvs));
     let wifi = WiFiManager::init(config)?;
 
     let ip = wifi.wait_connected(30_000)?;

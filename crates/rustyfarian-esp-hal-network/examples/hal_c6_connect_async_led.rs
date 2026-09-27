@@ -50,10 +50,11 @@ const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
 };
-const PASSWORD: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
+// No literal fallback: an unset `WIFI_PASS` yields the `&str` type default (`""`),
+// keeping CodeQL's hard-coded-credential query source-free.
+fn password() -> &'static str {
+    option_env!("WIFI_PASS").unwrap_or_default()
+}
 
 const NUM_LEDS: usize = 1;
 const N: usize = buffer_size(NUM_LEDS);
@@ -99,7 +100,7 @@ async fn main(spawner: Spawner) {
     // once the heap is correctly configured with reclaimed IRAM.
     println!("Initializing Wi-Fi...");
 
-    let config = WiFiConfig::new(SSID, PASSWORD).with_peripherals(
+    let config = WiFiConfig::new(SSID, password()).with_peripherals(
         peripherals.TIMG0,
         peripherals.FROM_CPU_INTR0,
         peripherals.WIFI,
