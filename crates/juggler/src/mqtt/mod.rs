@@ -345,20 +345,26 @@ pub trait SubscribeClient {
 ///
 /// On rapid reconnects, an earlier connect thread may still be running when a
 /// new `Connected` event fires and spawns a fresh one.  Both threads share the
-/// same `Arc<Mutex<C>>`, so they serialize behind the mutex.  A stale thread
-/// may run its `prelude` — a startup publish, an `on_connect` callback, or
-/// both — against the newer connection; this is a harmless duplicate (brokers
-/// also accept a duplicate SUBSCRIBE per MQTT §3.8). Note that an `enqueue`
-/// call on a disconnected esp-mqtt client does not error — it queues into the
-/// client's outbox and is replayed on the next connection; only `subscribe`
-/// returns an error in that case. When the prelude also confirms a connection
-/// epoch (see [`ConnectionEpoch`]), the stale thread's confirmation fails
-/// harmlessly instead of marking a dead connection as connected, and the
-/// ESP-IDF adapter's prelude also checks [`ConnectionEpoch::is_current`]
-/// before doing any work, so a stale helper skips the prelude entirely once a
-/// newer `Connected`/`Disconnected` has landed. Either outcome is safe and the
-/// fresh thread on the new connection will redo the prelude and re-subscribe
-/// correctly.
+/// same `Arc<Mutex<C>>`, so they serialize behind the mutex.
+///
+/// A stale helper that has **not yet started** its `prelude` is expected to
+/// be skipped by the caller's own prelude logic: the ESP-IDF adapter checks
+/// [`ConnectionEpoch::is_current`] before doing any work, so a stale helper
+/// that loses the race to a newer `Connected`/`Disconnected` returns
+/// immediately without touching the client or the epoch.
+///
+/// A stale helper whose `prelude` has **already started**, however, runs to
+/// completion — it cannot be cancelled mid-flight. Client calls it makes (a
+/// startup publish, subscriptions from an `on_connect` callback) are not
+/// undone: `enqueue` on a disconnected esp-mqtt client does not error, it
+/// queues into the client's outbox and is replayed on the next connection, so
+/// those effects surface later rather than being lost; `subscribe` does
+/// return an error in that case. Only the stale helper's own readiness
+/// confirmation is rejected: when the prelude also confirms a connection
+/// epoch (see [`ConnectionEpoch`]), the stale thread's `confirm` fails once
+/// the generation has moved on, so it cannot mark a dead connection as
+/// connected. The fresh thread on the new connection still redoes the
+/// prelude and re-subscribes correctly.
 ///
 /// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
 /// Pass the platform-specific constant (e.g. 8192) for embedded targets.
@@ -1592,6 +1598,205 @@ mod tests {
 
         assert!(spawned);
         wait_for_count(&log, 1);
+    }
+
+    /// Regression test for the three-way connect-time deadlock cycle (see
+    /// `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`): a publisher
+    /// blocked on esp-mqtt's `api_lock` during the handshake holds the client
+    /// mutex indefinitely — that lock can only be released once the event
+    /// loop thread returns to `next()`. `spawn_connect_thread` is the only
+    /// thing the event loop thread calls on `Connected`, so it must return
+    /// without itself acquiring the client mutex; otherwise the event loop
+    /// thread would join the publisher in waiting on a mutex neither can ever
+    /// release.
+    ///
+    /// The publisher thread below stands in for that blocked publish: it
+    /// locks `client` and holds the lock until explicitly released. While it
+    /// holds the lock, `spawn_connect_thread` must still return quickly (its
+    /// own client-mutex acquisition happens on the spawned thread, not the
+    /// caller's), and the prelude/subscribe must not run until the publisher
+    /// releases the lock — standing in for the event loop thread calling
+    /// `next()` again and the mqtt task releasing `api_lock`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn connect_thread_returns_while_publisher_holds_client_mutex() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        // Publisher thread: holds the client mutex until told to let go,
+        // simulating a publish parked on `api_lock` during the handshake.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let publisher_client = Arc::clone(&client);
+        let publisher = std::thread::spawn(move || {
+            let _guard = publisher_client.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            // Held until the "event released" signal, standing in for the
+            // event loop thread calling `next()` again.
+            release_rx.recv().unwrap();
+        });
+
+        // Block until the publisher definitely holds the mutex before
+        // exercising the helper under test.
+        locked_rx.recv().unwrap();
+
+        let prelude_log = Arc::clone(&log);
+        let prelude = move |_client: &mut BlockingMockClient| {
+            prelude_log.lock().unwrap().push("prelude".to_string());
+        };
+
+        let before = std::time::Instant::now();
+        let spawned = spawn_connect_thread(
+            Arc::clone(&client),
+            Some(prelude),
+            vec![("commands/#".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+        let elapsed = before.elapsed();
+
+        assert!(spawned, "spawn_connect_thread reported a spawn failure");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "spawn_connect_thread blocked for {elapsed:?} while the \
+             publisher held the client mutex — it must never wait on that \
+             mutex itself before returning"
+        );
+
+        // `try_lock` on a std `Mutex` fails with `WouldBlock` while another
+        // thread owns the lock — confirms the publisher still holds it.
+        assert!(
+            matches!(client.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "publisher must still hold the client mutex at this point"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the connect thread must not have run yet: the client mutex is \
+             still held by the publisher"
+        );
+
+        // Release the publisher — stands in for the event loop thread
+        // calling `next()` again, letting the mqtt task release `api_lock`.
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+
+        wait_for_count(&log, 2);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["prelude", "commands/#"],
+            "the connect thread must complete once the client mutex is free"
+        );
+    }
+
+    /// Regression test for `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`
+    /// "Remaining Items": the stale-helper protection (`ConnectionEpoch`)
+    /// cannot cancel a running `on_connect` — it can only stop it from
+    /// flipping the connected flag after the fact.
+    ///
+    /// Helper 1's prelude checks `is_current` (true), signals it started, and
+    /// then blocks — standing in for a slow `on_connect` still executing.
+    /// While it is blocked, a disconnect and a fast reconnect happen, and
+    /// helper 2 is spawned for the new connection. Both helpers share the
+    /// same client mutex, so helper 2's prelude cannot run until helper 1's
+    /// finishes. Once helper 1 is released, it confirms its now-stale token
+    /// (must fail) and subscribes its topic; only then does helper 2 acquire
+    /// the mutex, confirm its still-current token (must succeed), and
+    /// subscribe its own topic — proving the two helpers' work is serialized
+    /// by the mutex rather than interleaved.
+    #[cfg(feature = "std")]
+    #[test]
+    fn connect_thread_stale_helper_blocked_in_on_connect_cannot_confirm_after_reconnect() {
+        use super::ConnectionEpoch;
+
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let epoch = Arc::new(ConnectionEpoch::new());
+        let t1 = epoch.advance();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let confirm1 = Arc::new(Mutex::new(None::<bool>));
+
+        let epoch1 = Arc::clone(&epoch);
+        let confirm1_clone = Arc::clone(&confirm1);
+        let prelude1 = move |_client: &mut BlockingMockClient| {
+            assert!(
+                epoch1.is_current(t1),
+                "helper 1 must still be current when its prelude starts"
+            );
+            started_tx.send(()).unwrap();
+            // Stands in for a slow on_connect still running when the
+            // connection it belongs to is superseded.
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test thread must release helper 1 within 2s");
+            *confirm1_clone.lock().unwrap() = Some(epoch1.confirm(t1));
+        };
+        spawn_connect_thread(
+            Arc::clone(&client),
+            Some(prelude1),
+            vec![("h1/topic".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("helper 1's prelude must start within 2s");
+
+        // Simulate a disconnect followed by a fast reconnect while helper 1
+        // is still blocked in its (stale) on_connect.
+        let _ = epoch.advance();
+        let t2 = epoch.advance();
+
+        let confirm2 = Arc::new(Mutex::new(None::<bool>));
+        let epoch2 = Arc::clone(&epoch);
+        let confirm2_clone = Arc::clone(&confirm2);
+        let prelude2 = move |_client: &mut BlockingMockClient| {
+            *confirm2_clone.lock().unwrap() = Some(epoch2.confirm(t2));
+        };
+        spawn_connect_thread(
+            Arc::clone(&client),
+            Some(prelude2),
+            vec![("h2/topic".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+
+        // Let helper 1's stale on_connect finish.
+        release_tx.send(()).unwrap();
+
+        wait_for_count(&log, 2);
+
+        assert_eq!(
+            confirm1.lock().unwrap().as_ref(),
+            Some(&false),
+            "helper 1's confirm must fail: its token was superseded while \
+             it was blocked"
+        );
+        assert_eq!(
+            confirm2.lock().unwrap().as_ref(),
+            Some(&true),
+            "helper 2's confirm must succeed: its token is still current"
+        );
+        assert!(
+            epoch.is_connected(),
+            "the current connection must end up marked connected"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["h1/topic", "h2/topic"],
+            "the two helpers must serialize on the client mutex: helper 1's \
+             work (including its stale confirm) completes before helper 2's \
+             starts"
+        );
     }
 
     // ── PendingAcks (acknowledged-publish correlation) ───────────────────────

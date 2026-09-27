@@ -87,9 +87,9 @@ Florian Waibel — fix on branch `fix/mqtt-on-connect-deadlock` (uncommitted unt
 - Rustdoc, both READMEs, CHANGELOG, `docs/project-lore.md` "MQTT Event Loop", and a CLAUDE.md failure row describe the final rule: use the `client` argument in `on_connect`, never `MqttHandle` from any callback, never the client from `on_message` / `on_disconnect`.
 
 ## Remaining Items
-- Release: `rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; bump the workspace `juggler` dependency to `version = "0.5.1"` when releasing.
+- Helper-spawn failure (heap exhaustion): the epoch stays unconfirmed, so `is_connected()` is `false` while the transport is up; `MqttHandle` publishes still work, subscriptions and `on_connect` retry on the next reconnect; an injectable spawner would make this path host-testable.
+- A running `on_connect` cannot be cancelled by a disconnect; it is documented as short-lived and idempotent, and a connection-aware callback API is a candidate for the next breaking release.
 - 0.6 (now optional): `on_connect` → `Fn(bool)` is no longer needed for safety; `with_connect_message(topic, payload, retain)` remains a convenience idea.
-- Branch hygiene: the `examples/common/env.rs` + `MQTT_PORT` refactor and the direnv lore entry are unrelated to this bug and should be committed separately from the fix.
 - Hardware re-check pending: `idf_c3_mqtt` (retained status now published from `on_connect`), `idf_c3_mqtt_button_oled`, one `with_startup_message()` user.
 
 ## Links
@@ -101,3 +101,5 @@ Florian Waibel — fix on branch `fix/mqtt-on-connect-deadlock` (uncommitted unt
 - 2026-09-27 — 0.5.x fix landed on `fix/mqtt-on-connect-deadlock` (helper-thread startup publish, `WrongThread` guard on all `MqttHandle` publish/subscribe methods, docs/examples/README/CHANGELOG/lore); review found the connect-time mutex cycle (documented, deferred); `just verify` and both MQTT example builds green; hardware checks pending, not closed.
 - 2026-09-27 — Second review found the connect-time mutex cycle reachable from any unguarded publish; `on_connect` moved onto the helper thread, `ConnectionEpoch` + `CallbackScope` added to juggler, examples publish the retained status from `on_connect` again; hardware checks still pending, not closed.
 - 2026-09-27 — Second code review round: `spawn_connect_thread` reports spawn failure so the event loop still confirms the epoch, `CallbackScope` made `!Send` / `#[must_use]` / depth-counted, stale helpers skip the prelude via `ConnectionEpoch::is_current`, stale rustdoc corrected; `just verify`, `just test-mqtt` (103 passed), and all four MQTT example builds green; hardware checks pending.
+- 2026-09-27 — Commit `db8e789` reviewed; follow-ups: `doctor.sh` broker probe passes host/port as arguments, host regression test holds the client mutex from a publisher thread while the helper is spawned, `on_connect`/`on_disconnect` overlap and the helper-spawn readiness exception documented, workspace version and `juggler` minimum raised to 0.5.1; kept open pending hardware checks.
+- 2026-09-27 — Third review: helper-spawn failure no longer confirms the epoch (contract kept, documented), stale-helper limits documented precisely, host test for a disconnect/reconnect while `on_connect` is blocked; still open pending hardware checks.
