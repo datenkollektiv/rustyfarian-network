@@ -152,15 +152,18 @@ fn main() -> anyhow::Result<()> {
 
     // ─── Credentials (compile-time env vars) ──────────────────────────────────
 
-    let dev_eui_hex = option_env!("LORAWAN_DEV_EUI").unwrap_or("0000000000000000");
-    let app_eui_hex = option_env!("LORAWAN_APP_EUI").unwrap_or("0000000000000000");
-    let app_key_hex = option_env!("LORAWAN_APP_KEY").unwrap_or("00000000000000000000000000000000");
+    // No zero-key literal fallback: an unset var yields "", which `from_hex_strings`
+    // rejects below, so a missing key fails fast at startup instead of attempting a
+    // join TTN will reject.
+    let dev_eui_hex = option_env!("LORAWAN_DEV_EUI").unwrap_or_default();
+    let app_eui_hex = option_env!("LORAWAN_APP_EUI").unwrap_or_default();
+    let app_key_hex = option_env!("LORAWAN_APP_KEY").unwrap_or_default();
 
     let lora_config =
         LoraConfig::from_hex_strings(Region::EU868, dev_eui_hex, app_eui_hex, app_key_hex)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "invalid LoRaWAN credentials — check LORAWAN_DEV_EUI/APP_EUI/APP_KEY"
+                    "LoRaWAN credentials unset or invalid — set LORAWAN_DEV_EUI/LORAWAN_APP_EUI/LORAWAN_APP_KEY at build time"
                 )
             })?;
 

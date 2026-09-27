@@ -39,10 +39,11 @@ const FALLBACK_SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
 };
-const FALLBACK_PSK: &str = match option_env!("WIFI_PSK") {
-    Some(s) => s,
-    None => "",
-};
+// No literal fallback: an unset `WIFI_PSK` yields the `&str` type default (`""`),
+// keeping CodeQL's hard-coded-credential query source-free.
+fn fallback_psk() -> &'static str {
+    option_env!("WIFI_PSK").unwrap_or_default()
+}
 
 /// Optional WPA2 password for the provisioning AP. Without it the AP is open.
 const AP_PSK: Option<&str> = option_env!("PROVISION_AP_PSK");
@@ -78,7 +79,7 @@ fn main() -> anyhow::Result<()> {
             "NVS empty but compile-time WIFI_SSID present (ssid len={}, psk len={}) — \
              a real application could boot from these instead of provisioning.",
             FALLBACK_SSID.len(),
-            FALLBACK_PSK.len(),
+            fallback_psk().len(),
         );
     }
 

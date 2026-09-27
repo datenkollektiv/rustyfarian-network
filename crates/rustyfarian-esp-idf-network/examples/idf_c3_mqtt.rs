@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let wifi_config = WiFiConfig::new(env::WIFI_SSID, env::WIFI_PASS);
+    let wifi_config = WiFiConfig::new(env::WIFI_SSID, env::wifi_pass());
     let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), wifi_config)?;
 
     match wifi.get_ip(10_000)? {

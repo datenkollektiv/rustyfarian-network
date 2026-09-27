@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
         peripherals.modem,
         sys_loop,
         Some(nvs),
-        WiFiConfig::new(env::WIFI_SSID, env::WIFI_PASS),
+        WiFiConfig::new(env::WIFI_SSID, env::wifi_pass()),
     )?;
     match wifi.get_ip(10_000)? {
         Some(ip) => log::info!("Wi-Fi connected — {}", ip),

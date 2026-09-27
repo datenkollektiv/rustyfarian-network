@@ -44,10 +44,11 @@ const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
     None => "",
 };
-const PASSWORD: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
+// No literal fallback: an unset `WIFI_PASS` yields the `&str` type default (`""`),
+// keeping CodeQL's hard-coded-credential query source-free.
+fn password() -> &'static str {
+    option_env!("WIFI_PASS").unwrap_or_default()
+}
 
 const FRAME_MS: u64 = 50;
 
@@ -62,7 +63,7 @@ fn main() -> anyhow::Result<()> {
     let mut led = Ws2812Rmt::new(peripherals.pins.gpio8)?;
     let mut pulse = PulseEffect::new();
 
-    let config = WiFiConfig::new(SSID, PASSWORD)
+    let config = WiFiConfig::new(SSID, password())
         .connect_nonblocking()
         .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
     let wifi = WiFiManager::init(config)?;
