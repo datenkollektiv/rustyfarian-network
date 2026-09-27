@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
 - Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule: use the `client` argument in `on_connect`, never call a `MqttHandle` method from a callback, never call the client from `on_message` / `on_disconnect`.
 - The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`) and share their `.env` handling in `examples/common/env.rs`.
+- `idf_c3_mqtt_button_oled` treats the SSD1306 as optional: when no display answers on I2C at boot it logs one warning and runs headless, so the button/MQTT path can be tested on a bare ESP32-C3.
 - Workspace version and the `juggler` dependency minimum raised to `0.5.1`: `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
 - Examples no longer fall back to literal placeholder credentials (`WIFI_PASS`, `WIFI_PSK`, LoRaWAN EUIs/AppKey); unset values are the type default and the LoRa examples fail fast at startup, which also clears the CodeQL hard-coded-credential findings on example code.
 

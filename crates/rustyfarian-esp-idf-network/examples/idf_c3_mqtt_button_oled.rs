@@ -1,7 +1,9 @@
-//! MQTT publisher with button trigger and OLED status display for ESP32-C3 Super Mini.
+//! MQTT publisher with button trigger and optional OLED status display for ESP32-C3 Super Mini.
 //!
 //! Publishes `"pressed"` to `c3-button/events` whenever the push button is pressed.
-//! The SSD1306 OLED shows Wi-Fi status, MQTT connection state, and cumulative press count.
+//! If an SSD1306 OLED answers on I2C at boot it shows Wi-Fi status, MQTT connection state,
+//! and the cumulative press count; if nothing answers, the example logs a warning once and
+//! runs headless with the same behaviour on the serial console.
 //!
 //! Designed to pair with `idf_c3_mqtt_led_grid`: button presses on this device
 //! trigger LED toggles on the other.
@@ -11,8 +13,8 @@
 //! | Component | GPIO |
 //! |-----------|------|
 //! | B3F push button (other leg to 3V3) | 4 |
-//! | SSD1306 128×64 OLED SDA | 8 |
-//! | SSD1306 128×64 OLED SCL | 9 |
+//! | SSD1306 128×64 OLED SDA (optional) | 8 |
+//! | SSD1306 128×64 OLED SCL (optional) | 9 |
 //!
 //! # Environment variables (set at compile time)
 //!
@@ -50,13 +52,37 @@ use esp_idf_svc::{
 };
 use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
 use std::time::{Duration, Instant};
 
 #[path = "common/env.rs"]
 mod env;
 
 const EVENTS_TOPIC: &str = "c3-button/events";
+
+type Oled = Ssd1306<
+    I2CInterface<I2cDriver<'static>>,
+    DisplaySize128x64,
+    BufferedGraphicsMode<DisplaySize128x64>,
+>;
+
+/// Redraws the OLED with one text line per entry, 12 px apart; a no-op when no
+/// display was detected at boot.
+fn show(display: &mut Option<Oled>, lines: &[&str]) {
+    let Some(display) = display.as_mut() else {
+        return;
+    };
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let _ = display.clear(BinaryColor::Off);
+    for (i, line) in lines.iter().enumerate() {
+        let y = 12 * (i as i32 + 1);
+        let _ = Text::new(line, Point::new(0, y), style).draw(display);
+    }
+    let _ = display.flush();
+}
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -70,31 +96,33 @@ fn main() -> anyhow::Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    // ── OLED display (SDA=GPIO8, SCL=GPIO9) ──────────────────────────────
+    // ── OLED display (SDA=GPIO8, SCL=GPIO9), optional ─────────────────────
+    // `init()` fails with an I2C error when no SSD1306 answers on the bus; the
+    // example then runs headless instead of aborting.
     let i2c = I2cDriver::new(
         peripherals.i2c0,
         peripherals.pins.gpio8,
         peripherals.pins.gpio9,
         &I2cConfig::new().baudrate(Hertz(400_000)),
     )?;
-    let mut display = Ssd1306::new(
+    let mut oled = Ssd1306::new(
         I2CDisplayInterface::new(i2c),
         DisplaySize128x64,
         DisplayRotation::Rotate180,
     )
     .into_buffered_graphics_mode();
-    display
-        .init()
-        .map_err(|e| anyhow::anyhow!("OLED init: {:?}", e))?;
+    let mut display: Option<Oled> = match oled.init() {
+        Ok(()) => Some(oled),
+        Err(e) => {
+            log::warn!(
+                "no SSD1306 OLED detected on SDA=GPIO8/SCL=GPIO9 ({:?}) — running headless",
+                e
+            );
+            None
+        }
+    };
 
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-
-    let _ = display.clear(BinaryColor::Off);
-    let _ = Text::new("WiFi connecting...", Point::new(0, 12), text_style).draw(&mut display);
-    let _ = display.flush();
+    show(&mut display, &["WiFi connecting..."]);
 
     // ── Button (GPIO4, active high with internal pull-down; other leg to 3V3) ──
     let button = PinDriver::input(peripherals.pins.gpio4, Pull::Down)?;
@@ -117,11 +145,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let _ = display.clear(BinaryColor::Off);
-    let _ = Text::new("WiFi OK", Point::new(0, 12), text_style).draw(&mut display);
-    let _ = Text::new(&ip_str, Point::new(0, 24), text_style).draw(&mut display);
-    let _ = Text::new("MQTT connecting...", Point::new(0, 36), text_style).draw(&mut display);
-    let _ = display.flush();
+    show(&mut display, &["WiFi OK", &ip_str, "MQTT connecting..."]);
 
     // ── MQTT (non-blocking) ───────────────────────────────────────────────
     let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
@@ -178,8 +202,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Refresh OLED at ~5 Hz
-        if last_display.elapsed() > Duration::from_millis(200) {
+        // Refresh OLED at ~5 Hz (no-op when running headless)
+        if display.is_some() && last_display.elapsed() > Duration::from_millis(200) {
             last_display = Instant::now();
             let mqtt_line = if handle.is_connected() {
                 "MQTT: connected"
@@ -187,12 +211,7 @@ fn main() -> anyhow::Result<()> {
                 "MQTT: ---"
             };
             let btn_line = format!("Presses: {}", press_count);
-            let _ = display.clear(BinaryColor::Off);
-            let _ = Text::new("WiFi OK", Point::new(0, 12), text_style).draw(&mut display);
-            let _ = Text::new(&ip_str, Point::new(0, 24), text_style).draw(&mut display);
-            let _ = Text::new(mqtt_line, Point::new(0, 36), text_style).draw(&mut display);
-            let _ = Text::new(&btn_line, Point::new(0, 48), text_style).draw(&mut display);
-            let _ = display.flush();
+            show(&mut display, &["WiFi OK", &ip_str, mqtt_line, &btn_line]);
         }
 
         std::thread::sleep(Duration::from_millis(20));
