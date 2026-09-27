@@ -21,6 +21,7 @@ log = "0.4"
 nb = "1"
 rand_core = { version = "0.6", default-features = false }
 rgb = "0.8"
+zeroize = { version = "1.9.0", default-features = false }
 
 # ESP-IDF dependencies
 embuild = "0.33"
