@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# doctor.sh — check development prerequisites (RAM disk, sccache)
+# doctor.sh — check development prerequisites (RAM disk, sccache, tooling, MQTT broker)
 # Usage: scripts/doctor.sh <ramdisk> <hal_dir> <idf_dir>
 
 ramdisk="$1"
@@ -45,6 +45,34 @@ if command -v npx >/dev/null 2>&1; then
     fi
 else
     printf "  npx        MISSING  install Node.js  (needed for: just lint-docs)\n"
+fi
+
+# --- MQTT broker (optional) — reachability of the broker the idf_*_mqtt examples use ---
+# MQTT_HOST / MQTT_PORT come from .env via `set dotenv-load` in the justfile.
+# TCP reachability only: credentials are never read and the check is never fatal.
+probe_tcp() {
+    # $1 host  $2 port — succeeds when a TCP connection opens within ~3 s
+    bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1 &
+    local pid=$! rc=0 i
+    for i in 1 2 3 4 5 6; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" || rc=$?
+            return "$rc"
+        fi
+        sleep 0.5
+    done
+    { kill -9 "$pid" && wait "$pid"; } >/dev/null 2>&1 || true
+    return 1
+}
+
+mqtt_host="${MQTT_HOST:-}"
+mqtt_port="${MQTT_PORT:-1883}"
+if [ -z "$mqtt_host" ]; then
+    printf "  mqtt broker --       MQTT_HOST not set in .env  (optional, needed for: idf_*_mqtt examples)\n"
+elif probe_tcp "$mqtt_host" "$mqtt_port"; then
+    printf "  mqtt broker ok       %s:%s\n" "$mqtt_host" "$mqtt_port"
+else
+    printf "  mqtt broker UNREACHABLE %s:%s  (check MQTT_HOST/MQTT_PORT in .env, is the broker running?)\n" "$mqtt_host" "$mqtt_port"
 fi
 
 # --- Cargo tooling (verify, dependency hygiene, flashing) ---

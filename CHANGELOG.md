@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `juggler::mqtt::spawn_connect_thread` — runs an optional connect-time prelude and then the builder subscriptions on one short-lived thread; `spawn_subscriber_thread` is kept as a thin wrapper.
+- `juggler::mqtt::ConnectionEpoch` — generation-checked connected flag so a stale connect helper can never mark a dead connection as connected.
+- `juggler::mqtt::CallbackScope` / `in_callback` — thread-local marker for "inside an MQTT callback", host-tested and lock-free.
+- `just doctor` reports whether the MQTT broker configured in `.env` (`MQTT_HOST` / `MQTT_PORT`) accepts a TCP connection; optional, never fatal, credentials are not read.
+
+### Changed
+
+- `on_connect` runs on the per-connect helper thread (after the `with_startup_message()` publish, before the subscriptions), so `client.enqueue()` / `client.subscribe()` on its `client` argument are safe; `is_connected()` still flips only after it returns, and on resumed sessions `on_message` may overlap it.
+- `MqttHandle::publish`, `publish_retained`, `publish_with`, `try_publish*`, `subscribe`, and `publish_acked` reject calls from inside any callback with an error carrying `PublishAckError::WrongThread` (via `anyhow::Error` / `TryPublishError::Other`); signatures are unchanged and the variant's `Display` text is method-neutral.
+- `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
+- Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule: use the `client` argument in `on_connect`, never call a `MqttHandle` method from a callback, never call the client from `on_message` / `on_disconnect`.
+- The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`) and share their `.env` handling in `examples/common/env.rs`.
+- Release note: `rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; bump the workspace `juggler` dependency to `version = "0.5.1"` when releasing.
+
+### Fixed
+
+- `with_startup_message()`, any `client.enqueue()` / `client.subscribe()` inside `on_connect`, and any `MqttHandle` call from a callback deadlocked the ESP-IDF MQTT event loop: esp-mqtt delivers events while holding its recursive `api_lock`, and esp-idf-svc 0.53 parks the mqtt task until our event loop calls `next()` again, so `is_connected()` stayed `false` and the broker fired the LWT.
+- A three-way cycle whenever `on_connect` was registered: a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex. The event loop no longer takes the client mutex at all. See [docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md](docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md).
+
 ## [0.5.0] - 2026-09-26
 
 ### Added

@@ -21,6 +21,7 @@
 //! | `WIFI_SSID` | `""` | Wi-Fi network name |
 //! | `WIFI_PASS` | `""` | Wi-Fi password |
 //! | `MQTT_HOST` | (required) | MQTT broker IP or hostname |
+//! | `MQTT_PORT` | `1883` | MQTT broker port |
 //! | `MQTT_CLIENT_ID` | `c3-button` | Unique device identifier |
 //!
 //! # Build and flash
@@ -47,36 +48,23 @@ use esp_idf_svc::{
     },
     nvs::EspDefaultNvsPartition,
 };
-use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
+use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use std::time::{Duration, Instant};
 
-const WIFI_SSID: &str = match option_env!("WIFI_SSID") {
-    Some(s) => s,
-    None => "",
-};
-const WIFI_PASS: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
-const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
-    Some(h) => h,
-    None => "",
-};
-const MQTT_CLIENT_ID: &str = match option_env!("MQTT_CLIENT_ID") {
-    Some(id) => id,
-    None => "c3-button",
-};
+#[path = "common/env.rs"]
+mod env;
+
 const EVENTS_TOPIC: &str = "c3-button/events";
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    if MQTT_HOST.is_empty() {
-        anyhow::bail!("MQTT_HOST not configured — set it at build time");
-    }
+    let client_id = env::mqtt_client_id("c3-button");
+    env::log_config(client_id);
+    env::mqtt_host()?;
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -116,7 +104,7 @@ fn main() -> anyhow::Result<()> {
         peripherals.modem,
         sys_loop,
         Some(nvs),
-        WiFiConfig::new(WIFI_SSID, WIFI_PASS),
+        WiFiConfig::new(env::WIFI_SSID, env::WIFI_PASS),
     )?;
     let ip_str = match wifi.get_ip(10_000)? {
         Some(ip) => {
@@ -136,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     let _ = display.flush();
 
     // ── MQTT (non-blocking) ───────────────────────────────────────────────
-    let handle = MqttBuilder::new(MqttConfig::new(MQTT_HOST, 1883, MQTT_CLIENT_ID))
+    let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
         .on_connect(|_client, _is_clean| {
             log::info!("[mqtt] connected");
             Ok(())

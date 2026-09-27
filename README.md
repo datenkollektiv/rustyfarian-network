@@ -102,10 +102,7 @@ if let Some(ip) = wifi.get_ip(10000)? {
 
 let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 let mqtt = MqttBuilder::new(mqtt_config)
-    .on_connect(|client, _clean_session| {
-        client.subscribe("commands", QoS::AtMostOnce)?;
-        Ok(())
-    })
+    .subscribe("commands", QoS::AtMostOnce)
     .on_message(|topic, data| {
         println!("Received on {}: {:?}", topic, data);
     })
@@ -116,6 +113,8 @@ mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
 
 ### LWT and Retained Messages
 
+The retained-status idiom publishes `"online"` from `on_connect` using its `client` argument when the connection is first established; the LWT automatically sends `"offline"` if the TCP connection drops.
+
 ```rust
 use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, LwtConfig};
 use esp_idf_svc::mqtt::client::QoS;
@@ -125,16 +124,15 @@ let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device")
     .with_lwt(lwt);
 
 let mqtt = MqttBuilder::new(mqtt_config)
+    .subscribe("commands", QoS::AtMostOnce)
     .on_connect(|client, _clean_session| {
-        client.subscribe("commands", QoS::AtMostOnce)?;
+        client.enqueue("device/status", QoS::AtLeastOnce, true, b"online")?;
         Ok(())
     })
     .on_message(|topic, data| {
         println!("Received on {}: {:?}", topic, data);
     })
     .build()?;
-
-mqtt.publish_with("device/status", b"online", QoS::AtLeastOnce, true)?;
 ```
 
 ## LED Status Feedback
@@ -199,7 +197,7 @@ On macOS you can optionally back the embedded target directories with a RAM disk
 faster, SSD-sparing builds:
 
 ```sh
-just doctor           # show RAM disk status, resolved target dirs, and sccache
+just doctor           # show RAM disk status, resolved target dirs, sccache, and MQTT broker reachability (.env)
 just ramdisk attach   # create and mount the RAM disk (idempotent, 6 GB default)
 just ramdisk detach   # eject the RAM disk
 ```

@@ -315,24 +315,126 @@ pub trait SubscribeClient {
     fn subscribe_topic(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()>;
 }
 
-/// Spawns a short-lived thread that subscribes `client` to each topic in `topics`.
+/// Spawns a single connect-time helper thread that runs an optional `prelude`
+/// followed by every subscription in `topics`, all under one lock of `client`.
 ///
-/// The thread runs independently so that a blocking `subscribe_topic` implementation
-/// (e.g. `EspMqttClient::subscribe` on esp-idf-svc 0.52+, which waits for SUBACK)
-/// does not prevent the caller (event loop thread) from processing further events.
+/// Runs connect-time client calls off the event-loop thread. esp-mqtt (and
+/// mirrored event-loop implementations) dispatch the `Connected` event — and
+/// every event after it — from the mqtt task while holding a recursive
+/// `api_lock`, and the transport keeps that task parked until our event-loop
+/// thread calls `next()` again. Any client call made from the event-loop
+/// thread *while it is still inside the callback handling that event* — a
+/// startup publish, a subscribe, anything that reaches `api_lock` — therefore
+/// waits forever on a lock the parked task can never release. Moving both the
+/// connect-time publish (`prelude`) and every subscription onto this thread
+/// lets the event-loop thread return to `next()` immediately instead.
+///
+/// # Ordering
+///
+/// `prelude`, when present, runs to completion before any topic in `topics`
+/// is subscribed — a startup/liveness publish reaches the broker's outgoing
+/// queue before the SUBSCRIBE packets. `prelude` must be best-effort: it is
+/// responsible for logging its own failures and must never panic, since
+/// there is no caller left on this thread to observe one.
+///
+/// # No-op
+///
+/// If `prelude` is `None` and `topics` is empty, no thread is spawned.
 ///
 /// # Stale-thread safety
 ///
-/// On rapid reconnects, an earlier subscriber thread may still be running when a
+/// On rapid reconnects, an earlier connect thread may still be running when a
 /// new `Connected` event fires and spawns a fresh one.  Both threads share the
-/// same `Arc<Mutex<C>>`, so they serialize behind the mutex.  The stale thread
-/// either completes a harmless duplicate subscribe (brokers accept this per
-/// MQTT §3.8), or if the client has since disconnected, `subscribe_topic` returns
-/// an error that is logged as a warning.  Either outcome is safe and the fresh
-/// thread on the new connection will re-subscribe correctly.
+/// same `Arc<Mutex<C>>`, so they serialize behind the mutex.  A stale thread
+/// may run its `prelude` — a startup publish, an `on_connect` callback, or
+/// both — against the newer connection; this is a harmless duplicate (brokers
+/// also accept a duplicate SUBSCRIBE per MQTT §3.8). Note that an `enqueue`
+/// call on a disconnected esp-mqtt client does not error — it queues into the
+/// client's outbox and is replayed on the next connection; only `subscribe`
+/// returns an error in that case. When the prelude also confirms a connection
+/// epoch (see [`ConnectionEpoch`]), the stale thread's confirmation fails
+/// harmlessly instead of marking a dead connection as connected, and the
+/// ESP-IDF adapter's prelude also checks [`ConnectionEpoch::is_current`]
+/// before doing any work, so a stale helper skips the prelude entirely once a
+/// newer `Connected`/`Disconnected` has landed. Either outcome is safe and the
+/// fresh thread on the new connection will redo the prelude and re-subscribe
+/// correctly.
 ///
 /// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
 /// Pass the platform-specific constant (e.g. 8192) for embedded targets.
+///
+/// # Returns
+///
+/// `true` if either a thread was spawned, or there was nothing to do (`prelude`
+/// is `None` and `topics` is empty — see [No-op](#no-op)). `false` only if
+/// `std::thread::Builder::spawn` itself failed (e.g. the OS refused to create a
+/// new thread); the failure is also logged via `log::warn!`. Callers that have
+/// work which absolutely must run somewhere (rather than being silently
+/// skipped) should react to `false` by confirming/cleaning up whatever
+/// bookkeeping was expecting the thread to run.
+///
+/// Requires the `std` feature (uses `std::thread` and `std::sync`).
+#[cfg(feature = "std")]
+pub fn spawn_connect_thread<C, F>(
+    client: std::sync::Arc<std::sync::Mutex<C>>,
+    prelude: Option<F>,
+    topics: Vec<(String, QoS)>,
+    stack_size: usize,
+) -> bool
+where
+    C: SubscribeClient + Send + 'static,
+    F: FnOnce(&mut C) + Send + 'static,
+{
+    if prelude.is_none() && topics.is_empty() {
+        return true;
+    }
+    let mut builder = std::thread::Builder::new();
+    if stack_size > 0 {
+        builder = builder.stack_size(stack_size);
+    }
+    match builder.spawn(move || {
+        let mut guard = match client.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                log::warn!("[mqtt] connect thread: client mutex poisoned: {}", e);
+                return;
+            }
+        };
+        if let Some(prelude) = prelude {
+            prelude(&mut guard);
+        }
+        for (topic, qos) in &topics {
+            match guard.subscribe_topic(topic.as_str(), *qos) {
+                Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
+                Err(e) => log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e),
+            }
+        }
+    }) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("[mqtt] failed to spawn connect thread: {:#}", e);
+            false
+        }
+    }
+}
+
+/// Spawns a short-lived thread that subscribes `client` to each topic in `topics`.
+///
+/// The thread runs independently so that a blocking `subscribe_topic` implementation
+/// (e.g. `EspMqttClient::subscribe` on esp-idf-svc, which blocks on esp-mqtt's
+/// `api_lock` while an event is being delivered) does not prevent the caller
+/// (event loop thread) from processing further events.
+///
+/// Thin wrapper over [`spawn_connect_thread`] with no prelude — see its docs for
+/// the full rationale (including stale-thread safety on rapid reconnects).
+///
+/// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
+/// Pass the platform-specific constant (e.g. 8192) for embedded targets.
+///
+/// Unlike [`spawn_connect_thread`], this always returns `()`: a subscribe-only
+/// caller has no prelude bookkeeping to confirm or clean up, so a spawn
+/// failure (logged internally as a warning) is not actionable here — the next
+/// reconnect will simply retry.
 ///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
@@ -343,27 +445,7 @@ pub fn spawn_subscriber_thread<C>(
 ) where
     C: SubscribeClient + Send + 'static,
 {
-    let mut builder = std::thread::Builder::new();
-    if stack_size > 0 {
-        builder = builder.stack_size(stack_size);
-    }
-    if let Err(e) = builder.spawn(move || {
-        let mut guard = match client.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!("[mqtt] subscriber thread: client mutex poisoned: {}", e);
-                return;
-            }
-        };
-        for (topic, qos) in &topics {
-            match guard.subscribe_topic(topic.as_str(), *qos) {
-                Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
-                Err(e) => log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e),
-            }
-        }
-    }) {
-        log::warn!("[mqtt] failed to spawn subscriber thread: {:#}", e);
-    }
+    let _spawned = spawn_connect_thread(client, None::<fn(&mut C)>, topics, stack_size);
 }
 
 // ── Acknowledged-publish correlation ───────────────────────────────────────
@@ -572,6 +654,189 @@ impl AckWaiter {
         // `resolve`/`fail_all` already removed it, and this is a cheap no-op.
         self.registry.cancel(self.id);
         outcome
+    }
+}
+
+// ── Connect-time callback safety ─────────────────────────────────────────────
+
+/// Opaque state snapshot returned by [`ConnectionEpoch::advance`].
+///
+/// Passed back to [`ConnectionEpoch::confirm`] to atomically claim "connected"
+/// for the connection that was current when the token was issued. Carries no
+/// public accessors — callers only round-trip it.
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochToken(u32);
+
+/// Tracks the current MQTT connection generation and whether it is confirmed
+/// connected, in a single `AtomicU32`.
+///
+/// A per-connect helper thread runs `on_connect` off the event-loop thread (see
+/// [`spawn_connect_thread`]) and, once it returns, wants to flip "connected" to
+/// `true`. But the helper may still be running when a fast disconnect/reconnect
+/// happens: a stale helper from a dead connection must never mark a *newer*
+/// connection's connected flag, and must never resurrect a *dropped*
+/// connection's flag either. `ConnectionEpoch` makes that race-free without a
+/// lock: [`advance`](Self::advance) — called by the event loop on every
+/// `Connected` *and* every `Disconnected` — bumps the generation and clears the
+/// connected bit, returning an [`EpochToken`] that snapshots the new
+/// generation. The helper holds onto that token and calls
+/// [`confirm`](Self::confirm) after `on_connect` finishes; the compare-exchange
+/// only succeeds if no `advance` happened in between, so a stale helper's
+/// `confirm` harmlessly fails instead of flipping the flag for a connection
+/// state that no longer applies.
+///
+/// The `u32` packs `generation << 1 | connected_bit` so both fields move
+/// together in one atomic operation.
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+#[derive(Default, Debug)]
+pub struct ConnectionEpoch(std::sync::atomic::AtomicU32);
+
+#[cfg(feature = "std")]
+impl ConnectionEpoch {
+    /// Creates a fresh epoch: generation 0, not connected.
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// Bumps the generation and clears the connected bit, returning a token
+    /// that identifies this new generation.
+    ///
+    /// Call on every `Connected` (a fresh connection to confirm) and every
+    /// `Disconnected` (the current connection is gone; any in-flight helper's
+    /// token is now stale).
+    pub fn advance(&self) -> EpochToken {
+        use std::sync::atomic::Ordering;
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            let generation = (current >> 1).wrapping_add(1);
+            let next = generation << 1;
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return EpochToken(next),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Atomically sets the connected bit, but only if `token` still matches the
+    /// current generation.
+    ///
+    /// Returns `true` if the state was flipped to connected, `false` if a
+    /// later [`advance`](Self::advance) (from any subsequent `Connected` or
+    /// `Disconnected`) made `token` stale, in which case the state is left
+    /// untouched. A second `confirm` with the same already-succeeded token is
+    /// also a no-op returning `false`, since the stored value has moved on to
+    /// `token.0 | 1` and no longer equals `token.0`.
+    pub fn confirm(&self, token: EpochToken) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0
+            .compare_exchange(token.0, token.0 | 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Returns `true` if the current generation has been confirmed connected.
+    pub fn is_connected(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// Returns `true` if `token` still identifies the current generation and
+    /// has not yet been confirmed.
+    ///
+    /// A [`confirm`](Self::confirm) call changes the stored value away from
+    /// `token.0` (to `token.0 | 1`), so `is_current` also returns `false`
+    /// once `token` has already been confirmed — this reports "still worth
+    /// starting work for", not merely "no reconnect happened yet". Intended
+    /// for a connect helper to check *before* doing any work (e.g. a startup
+    /// publish or `on_connect`), so a helper that is already stale by the
+    /// time it starts running can skip that work entirely instead of doing
+    /// it and then discovering [`confirm`](Self::confirm) fails.
+    pub fn is_current(&self, token: EpochToken) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0.load(Ordering::Acquire) == token.0
+    }
+
+    /// Constructs an epoch at a specific packed raw state (whitebox test hook
+    /// for exercising generation wraparound without billions of iterations).
+    #[cfg(test)]
+    fn from_raw(raw: u32) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(raw))
+    }
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    // Depth counter rather than a boolean: a plain flag restored to a
+    // captured "previous" value breaks under out-of-order drops (e.g. two
+    // scopes entered as `a` then `b`, but dropped as `a` then `b` — dropping
+    // `a` first would restore `false` even though `b` is still active). A
+    // counter only cares how many scopes are currently open, so drop order
+    // is irrelevant.
+    static CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `true` if the current thread is inside a [`CallbackScope`].
+///
+/// Used by `MqttHandle` methods to refuse to run when called from a thread
+/// that is currently executing an MQTT callback (`on_connect`, `on_message`,
+/// `on_disconnect`) — such a call would deadlock, either on the client mutex
+/// (already held by the thread) or on esp-mqtt's `api_lock` (held for the
+/// duration of the event dispatch that is running the callback).
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+pub fn in_callback() -> bool {
+    CALLBACK_DEPTH.with(|cell| cell.get() > 0)
+}
+
+/// RAII guard marking the current thread as executing an MQTT callback.
+///
+/// [`enter`](Self::enter) increments the thread-local depth counter observed
+/// by [`in_callback`]; dropping the guard decrements it, so nested scopes
+/// (e.g. a callback that itself triggers another callback context) unwind
+/// correctly regardless of the order in which they are dropped.
+///
+/// Not [`Send`]: the guard manipulates a thread-local, so entering it on one
+/// thread and dropping it on another would decrement the wrong thread's
+/// counter. Moving the value across threads is prevented at compile time via
+/// a `PhantomData<*const ()>` field (`*const ()` is `!Send`).
+///
+/// Requires the `std` feature.
+#[cfg(feature = "std")]
+#[must_use = "the scope ends when this guard is dropped"]
+#[derive(Debug)]
+pub struct CallbackScope {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "std")]
+impl CallbackScope {
+    /// Marks the current thread as inside an MQTT callback.
+    pub fn enter() -> Self {
+        CALLBACK_DEPTH.with(|cell| cell.set(cell.get() + 1));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for CallbackScope {
+    fn drop(&mut self) {
+        // `try_with` (rather than `with`): thread-local destruction order is
+        // unspecified, so this drop can in principle run after
+        // `CALLBACK_DEPTH` has already been torn down on a dying thread.
+        // `with` would panic in that case; silently doing nothing is
+        // correct because the counter no longer matters to a thread that is
+        // shutting down.
+        let _ = CALLBACK_DEPTH.try_with(|cell| cell.set(cell.get().saturating_sub(1)));
     }
 }
 
@@ -1060,7 +1325,7 @@ mod tests {
     // ── spawn_subscriber_thread ──────────────────────────────────────────────
 
     #[cfg(feature = "std")]
-    use super::{spawn_subscriber_thread, QoS, SubscribeClient};
+    use super::{spawn_connect_thread, spawn_subscriber_thread, QoS, SubscribeClient};
     #[cfg(feature = "std")]
     use std::sync::{Arc, Condvar, Mutex};
     #[cfg(feature = "std")]
@@ -1100,12 +1365,16 @@ mod tests {
         }
     }
 
-    /// Regression test for the SUBACK deadlock (esp-idf-svc 0.52+).
+    /// Regression test for the connect-time `api_lock` deadlock (esp-idf-svc
+    /// 0.52+).
     ///
-    /// The old architecture called `subscribe()` on the event loop thread inside
-    /// the `Connected` handler.  `subscribe()` blocks until SUBACK, but the event
-    /// loop can only receive SUBACK by calling `connection.next()` — which it cannot
-    /// do while blocked inside the handler.
+    /// The old architecture called `subscribe()` on the event loop thread
+    /// inside the `Connected` handler. esp-mqtt dispatches `Connected` — and
+    /// every event after it — while holding its recursive `api_lock`, and
+    /// esp-idf-svc keeps the mqtt task parked until the event loop thread
+    /// calls `connection.next()` again; any client call made from inside
+    /// that handler, `subscribe()` included, would therefore wait on
+    /// `api_lock` forever.
     ///
     /// The fix spawns a separate subscriber thread.  This test verifies that the
     /// spawner returns in <100 ms even while the mock's `subscribe_topic` is still
@@ -1169,6 +1438,160 @@ mod tests {
             subscribed.lock().unwrap().as_slice(),
             ["commands/#", "ota/manifest"]
         );
+    }
+
+    // ── spawn_connect_thread ─────────────────────────────────────────────────
+
+    /// The prelude (e.g. a connect-time startup publish) must complete before
+    /// any topic in `topics` is subscribed, so the broker sees a liveness ping
+    /// ahead of the SUBSCRIBE packets.  `BlockingMockClient::subscribed` doubles
+    /// as an ordered log here: the prelude and every `subscribe_topic` call push
+    /// into the same vector under the same client lock.
+    #[cfg(feature = "std")]
+    #[test]
+    fn connect_thread_runs_prelude_before_subscribes() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let prelude_log = Arc::clone(&log);
+        let prelude = move |_client: &mut BlockingMockClient| {
+            prelude_log.lock().unwrap().push("prelude".to_string());
+        };
+
+        spawn_connect_thread(
+            client,
+            Some(prelude),
+            vec![
+                ("commands/#".to_string(), QoS::AtLeastOnce),
+                ("ota/manifest".to_string(), QoS::AtLeastOnce),
+            ],
+            0,
+        );
+
+        wait_for_count(&log, 3);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["prelude", "commands/#", "ota/manifest"]
+        );
+    }
+
+    /// Regression test mirroring `subscriber_thread_does_not_block_caller`, but
+    /// with the blocking work moved into the prelude: the spawner must return
+    /// immediately even while the prelude is still parked, or the event loop
+    /// thread that called it would deadlock on `api_lock` exactly like the
+    /// old inline `subscribe()` case.
+    #[cfg(feature = "std")]
+    #[test]
+    fn connect_thread_does_not_block_caller() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let prelude_gate = Arc::clone(&gate);
+        let prelude_log = Arc::clone(&log);
+        let prelude = move |_client: &mut BlockingMockClient| {
+            let (lock, cvar) = &*prelude_gate;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cvar.wait(ready).unwrap();
+            }
+            prelude_log.lock().unwrap().push("prelude".to_string());
+        };
+
+        let before = std::time::Instant::now();
+        spawn_connect_thread(
+            client,
+            Some(prelude),
+            vec![("commands/#".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+        let elapsed = before.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "spawn_connect_thread blocked for {elapsed:?}; \
+             event loop thread would have deadlocked"
+        );
+        assert!(log.lock().unwrap().is_empty());
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        wait_for_count(&log, 2);
+        assert_eq!(log.lock().unwrap().as_slice(), ["prelude", "commands/#"]);
+    }
+
+    /// A prelude must still run even when there are no topics to subscribe —
+    /// e.g. `with_startup_message()` without any `MqttBuilder::subscribe` call.
+    #[cfg(feature = "std")]
+    #[test]
+    fn connect_thread_with_prelude_and_no_topics_still_runs_prelude() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let prelude_log = Arc::clone(&log);
+        let prelude = move |_client: &mut BlockingMockClient| {
+            prelude_log.lock().unwrap().push("prelude".to_string());
+        };
+
+        spawn_connect_thread(client, Some(prelude), Vec::new(), 0);
+
+        wait_for_count(&log, 1);
+        assert_eq!(log.lock().unwrap().as_slice(), ["prelude"]);
+    }
+
+    /// No prelude and no topics: nothing to do is not a spawn failure.
+    #[cfg(feature = "std")]
+    #[test]
+    fn spawn_connect_thread_noop_returns_true() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let spawned =
+            spawn_connect_thread(client, None::<fn(&mut BlockingMockClient)>, Vec::new(), 0);
+
+        assert!(spawned, "nothing to do must not be reported as a failure");
+    }
+
+    /// A real spawn (a thread is actually created) also reports success.
+    /// `std::thread::Builder::spawn` failing is not something a host test can
+    /// force reliably, so this only pins down the success case.
+    #[cfg(feature = "std")]
+    #[test]
+    fn spawn_connect_thread_normal_case_returns_true() {
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = Arc::new(Mutex::new(BlockingMockClient {
+            gate: Arc::clone(&gate),
+            subscribed: Arc::clone(&log),
+        }));
+
+        let spawned = spawn_connect_thread(
+            client,
+            None::<fn(&mut BlockingMockClient)>,
+            vec![("commands/#".to_string(), QoS::AtLeastOnce)],
+            0,
+        );
+
+        assert!(spawned);
+        wait_for_count(&log, 1);
     }
 
     // ── PendingAcks (acknowledged-publish correlation) ───────────────────────
@@ -1281,5 +1704,196 @@ mod tests {
             waiter.wait(Duration::from_millis(50)),
             Some(AckOutcome::Acked)
         );
+    }
+
+    // ── ConnectionEpoch ───────────────────────────────────────────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn fresh_epoch_is_not_connected() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        assert!(!epoch.is_connected());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn confirm_succeeds_flips_connected() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::default();
+        let token = epoch.advance();
+        assert!(epoch.confirm(token));
+        assert!(epoch.is_connected());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn advance_clears_connected() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let token = epoch.advance();
+        assert!(epoch.confirm(token));
+        assert!(epoch.is_connected());
+        // A Disconnected event also calls advance(); the token is discarded.
+        let _ = epoch.advance();
+        assert!(!epoch.is_connected());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn stale_token_confirm_fails_and_stays_disconnected() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let stale_token = epoch.advance();
+        // A fast disconnect/reconnect happens before the stale helper confirms.
+        let _fresh_token = epoch.advance();
+        assert!(!epoch.confirm(stale_token));
+        assert!(!epoch.is_connected());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn second_confirm_with_same_token_is_a_noop() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let token = epoch.advance();
+        assert!(epoch.confirm(token));
+        assert!(!epoch.confirm(token), "second confirm must not re-succeed");
+        assert!(epoch.is_connected(), "connected state must be unaffected");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn generation_wraps_without_panic() {
+        use super::ConnectionEpoch;
+        // Start one advance() away from the packed u32's generation ceiling
+        // (0x7FFF_FFFF << 1, connected=1) so the very next advance() truncates
+        // the shift back to generation 0 instead of panicking.
+        let epoch = ConnectionEpoch::from_raw(0xFFFF_FFFF);
+        let token = epoch.advance();
+        assert!(!epoch.is_connected(), "advance() must clear connected");
+        assert!(
+            epoch.confirm(token),
+            "wrapped generation must still confirm"
+        );
+        assert!(epoch.is_connected());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn is_current_true_for_fresh_token_false_after_advance() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let token = epoch.advance();
+        assert!(epoch.is_current(token));
+        // A Disconnected (or a fresh Connected) event calls advance() again;
+        // the earlier token is no longer current.
+        let _ = epoch.advance();
+        assert!(!epoch.is_current(token));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn is_current_false_after_own_confirm() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let token = epoch.advance();
+        assert!(epoch.confirm(token));
+        assert!(
+            !epoch.is_current(token),
+            "confirm() moves the stored value to token.0 | 1, so it no \
+             longer equals token.0"
+        );
+    }
+
+    /// Two fast reconnects race two helpers: `t1`'s helper is still running
+    /// when `t2`'s connection lands and finishes first. `t1`'s later confirm
+    /// must not undo `t2`'s.
+    #[cfg(feature = "std")]
+    #[test]
+    fn stale_confirm_after_fresh_confirm_leaves_connected() {
+        use super::ConnectionEpoch;
+        let epoch = ConnectionEpoch::new();
+        let t1 = epoch.advance();
+        let t2 = epoch.advance();
+        assert!(epoch.confirm(t2));
+        assert!(!epoch.confirm(t1));
+        assert!(epoch.is_connected());
+    }
+
+    // ── CallbackScope / in_callback ──────────────────────────────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn in_callback_is_false_by_default() {
+        use super::in_callback;
+        assert!(!in_callback());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn in_callback_is_true_inside_scope() {
+        use super::{in_callback, CallbackScope};
+        let _scope = CallbackScope::enter();
+        assert!(in_callback());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn in_callback_is_false_after_drop() {
+        use super::{in_callback, CallbackScope};
+        {
+            let _scope = CallbackScope::enter();
+            assert!(in_callback());
+        }
+        assert!(!in_callback());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn another_thread_does_not_see_this_threads_scope() {
+        use super::{in_callback, CallbackScope};
+        let _scope = CallbackScope::enter();
+        assert!(in_callback());
+        let other_saw = std::thread::spawn(in_callback).join().unwrap();
+        assert!(!other_saw, "in_callback must be per-thread");
+        assert!(in_callback(), "this thread's scope must be unaffected");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn nested_scopes_restore_correctly() {
+        use super::{in_callback, CallbackScope};
+        assert!(!in_callback());
+        let outer = CallbackScope::enter();
+        assert!(in_callback());
+        {
+            let inner = CallbackScope::enter();
+            assert!(in_callback());
+            drop(inner);
+            assert!(in_callback(), "outer scope must still be active");
+        }
+        drop(outer);
+        assert!(!in_callback());
+    }
+
+    /// Regression test for the previous "restore captured previous value"
+    /// design: dropping the two scopes in the order they were entered (not
+    /// nested/LIFO order) must still leave `in_callback()` correct after
+    /// each drop, because the depth counter does not care which scope is
+    /// dropped when — only how many are currently open. `CallbackScope`
+    /// is not `Send` (see its doc comment), so `a`/`b` here are always
+    /// entered and dropped on this same thread; this test exercises
+    /// non-LIFO *drop order* on one thread, not cross-thread drops.
+    #[cfg(feature = "std")]
+    #[test]
+    fn scopes_dropped_out_of_order_still_clear() {
+        use super::{in_callback, CallbackScope};
+        let a = CallbackScope::enter();
+        let b = CallbackScope::enter();
+        drop(a);
+        assert!(in_callback(), "b is still open");
+        drop(b);
+        assert!(!in_callback());
     }
 }

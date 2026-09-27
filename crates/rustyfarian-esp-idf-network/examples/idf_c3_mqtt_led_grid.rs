@@ -23,6 +23,7 @@
 //! | `WIFI_SSID` | `""` | Wi-Fi network name |
 //! | `WIFI_PASS` | `""` | Wi-Fi password |
 //! | `MQTT_HOST` | (required) | MQTT broker IP or hostname |
+//! | `MQTT_PORT` | `1883` | MQTT broker port |
 //! | `MQTT_CLIENT_ID` | `c3-leds` | Unique device identifier |
 //!
 //! # Build and flash
@@ -39,7 +40,7 @@ use esp_idf_svc::{
     mqtt::client::{EspMqttClient, QoS},
     nvs::EspDefaultNvsPartition,
 };
-use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
+use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 use std::{
     sync::{
@@ -49,31 +50,18 @@ use std::{
     time::Duration,
 };
 
-const WIFI_SSID: &str = match option_env!("WIFI_SSID") {
-    Some(s) => s,
-    None => "",
-};
-const WIFI_PASS: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
-const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
-    Some(h) => h,
-    None => "",
-};
-const MQTT_CLIENT_ID: &str = match option_env!("MQTT_CLIENT_ID") {
-    Some(id) => id,
-    None => "c3-leds",
-};
+#[path = "common/env.rs"]
+mod env;
+
 const SUBSCRIBE_TOPIC: &str = "c3-button/events";
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    if MQTT_HOST.is_empty() {
-        anyhow::bail!("MQTT_HOST not configured — set it at build time");
-    }
+    let client_id = env::mqtt_client_id("c3-leds");
+    env::log_config(client_id);
+    env::mqtt_host()?;
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -92,7 +80,7 @@ fn main() -> anyhow::Result<()> {
         peripherals.modem,
         sys_loop,
         Some(nvs),
-        WiFiConfig::new(WIFI_SSID, WIFI_PASS),
+        WiFiConfig::new(env::WIFI_SSID, env::WIFI_PASS),
     )?;
     match wifi.get_ip(10_000)? {
         Some(ip) => log::info!("Wi-Fi connected — {}", ip),
@@ -103,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     let msg_count = Arc::new(AtomicU32::new(0));
     let msg_count_cb = Arc::clone(&msg_count);
 
-    let handle = MqttBuilder::new(MqttConfig::new(MQTT_HOST, 1883, MQTT_CLIENT_ID))
+    let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
         .subscribe(SUBSCRIBE_TOPIC, QoS::AtLeastOnce)
         .on_connect(|_client: &mut EspMqttClient<'_>, _is_clean: bool| {
             log::info!("[mqtt] connected");

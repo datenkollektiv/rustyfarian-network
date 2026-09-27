@@ -202,8 +202,8 @@ fn mqtt_public_paths() {
 #[test]
 fn mqtt_std_public_paths() {
     use juggler::mqtt::{
-        format_broker_url, spawn_subscriber_thread, AckOutcome, MessageId, PendingAcks, QoS,
-        SubscribeClient,
+        format_broker_url, in_callback, spawn_connect_thread, spawn_subscriber_thread, AckOutcome,
+        CallbackScope, ConnectionEpoch, EpochToken, MessageId, PendingAcks, QoS, SubscribeClient,
     };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -239,7 +239,35 @@ fn mqtt_std_public_paths() {
     // still be running when the assertion below executes, but that is fine for
     // a path-smoke test).
     let client = Arc::new(Mutex::new(NoopClient));
-    spawn_subscriber_thread(client, vec![("sensors/#".to_string(), QoS::AtLeastOnce)], 0);
+    spawn_subscriber_thread(
+        client.clone(),
+        vec![("sensors/#".to_string(), QoS::AtLeastOnce)],
+        0,
+    );
+
+    // spawn_connect_thread is callable and returns a bool.
+    let spawned: bool = spawn_connect_thread(
+        client,
+        Some(|_client: &mut NoopClient| {}),
+        vec![("commands/#".to_string(), QoS::AtLeastOnce)],
+        0,
+    );
+    assert!(spawned);
+
+    // ConnectionEpoch / EpochToken: connect-time callback safety surface.
+    let epoch = ConnectionEpoch::new();
+    assert!(!epoch.is_connected());
+    let token: EpochToken = epoch.advance();
+    assert!(epoch.is_current(token));
+    assert!(epoch.confirm(token));
+    assert!(epoch.is_connected());
+
+    // CallbackScope / in_callback: reachable and usable.
+    assert!(!in_callback());
+    let scope = CallbackScope::enter();
+    assert!(in_callback());
+    drop(scope);
+    assert!(!in_callback());
 }
 
 // ── lora ──────────────────────────────────────────────────────────────────────
