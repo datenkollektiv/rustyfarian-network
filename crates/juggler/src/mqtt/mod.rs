@@ -347,24 +347,28 @@ pub trait SubscribeClient {
 /// new `Connected` event fires and spawns a fresh one.  Both threads share the
 /// same `Arc<Mutex<C>>`, so they serialize behind the mutex.
 ///
-/// A stale helper that has **not yet started** its `prelude` is expected to
-/// be skipped by the caller's own prelude logic: the ESP-IDF adapter checks
-/// [`ConnectionEpoch::is_current`] before doing any work, so a stale helper
-/// that loses the race to a newer `Connected`/`Disconnected` returns
-/// immediately without touching the client or the epoch.
+/// This function has no notion of staleness itself: once spawned, the thread
+/// always runs `prelude` and then every subscription.  Staleness is handled at
+/// two distinct points, by two distinct parties:
 ///
-/// A stale helper whose `prelude` has **already started**, however, runs to
-/// completion — it cannot be cancelled mid-flight. Client calls it makes (a
-/// startup publish, subscriptions from an `on_connect` callback) are not
-/// undone: `enqueue` on a disconnected esp-mqtt client does not error, it
-/// queues into the client's outbox and is replayed on the next connection, so
-/// those effects surface later rather than being lost; `subscribe` does
-/// return an error in that case. Only the stale helper's own readiness
-/// confirmation is rejected: when the prelude also confirms a connection
-/// epoch (see [`ConnectionEpoch`]), the stale thread's `confirm` fails once
-/// the generation has moved on, so it cannot mark a dead connection as
-/// connected. The fresh thread on the new connection still redoes the
-/// prelude and re-subscribes correctly.
+/// 1. **Before any work starts — the caller decides.** The caller may skip the
+///    spawn, or make the prelude return immediately, when the connection the
+///    helper was created for is already gone.  The ESP-IDF adapter does the
+///    latter: its prelude's first instruction is a [`ConnectionEpoch::is_current`]
+///    check, so a helper that lost the race to a newer `Connected` or
+///    `Disconnected` touches neither the client nor the epoch (the subscriptions
+///    still run; brokers accept a duplicate SUBSCRIBE per MQTT §3.8).
+/// 2. **After work has started — nothing cancels it.** A prelude that has begun
+///    its startup publish or `on_connect` runs to completion.  Client calls it
+///    makes are not undone: `enqueue` on a disconnected esp-mqtt client queues
+///    into the outbox and is replayed on the next connection, while `subscribe`
+///    returns an error.  The only thing a stale helper can still be denied is
+///    the readiness confirmation: its [`ConnectionEpoch::confirm`] fails once
+///    the generation has moved on, so it cannot mark a dead connection as
+///    connected.
+///
+/// The fresh thread on the new connection redoes the prelude and re-subscribes
+/// regardless of what the stale one did.
 ///
 /// Pass `stack_size = 0` to use the OS thread-stack default (suitable for host tests).
 /// Pass the platform-specific constant (e.g. 8192) for embedded targets.
@@ -693,6 +697,10 @@ pub struct EpochToken(u32);
 /// only succeeds if no `advance` happened in between, so a stale helper's
 /// `confirm` harmlessly fails instead of flipping the flag for a connection
 /// state that no longer applies.
+///
+/// The epoch protects only this flag.  It does not cancel a helper whose work
+/// is already in flight — see the "Stale-thread safety" section of
+/// [`spawn_connect_thread`] for what a stale helper can and cannot do.
 ///
 /// The `u32` packs `generation << 1 | connected_bit` so both fields move
 /// together in one atomic operation.
