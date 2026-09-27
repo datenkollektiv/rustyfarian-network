@@ -52,6 +52,9 @@ rustyfarian-esp-idf-network = { version = "0.5", features = ["wifi", "mqtt"] }
 
 ## Example: Wi-Fi + MQTT
 
+Register subscriptions on the builder; publish retained status from `on_connect` using its `client` argument.
+Never call `MqttHandle` methods from any callback.
+
 ```rust
 use rustyfarian_esp_idf_network::wifi::{WiFiManager, WiFiConfig};
 use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
@@ -72,8 +75,9 @@ if let Some(ip) = wifi.get_ip(10000)? {
 
 let mqtt_config = MqttConfig::new("mqtt.example.com", 1883, "my-device");
 let mqtt = MqttBuilder::new(mqtt_config)
+    .subscribe("commands/#", QoS::AtMostOnce)
     .on_connect(|client, _clean_session| {
-        client.subscribe("commands/#", QoS::AtMostOnce)?;
+        client.enqueue("status", QoS::AtLeastOnce, true, b"online")?;
         Ok(())
     })
     .on_message(|topic, data| {
@@ -81,7 +85,9 @@ let mqtt = MqttBuilder::new(mqtt_config)
     })
     .build()?;
 
-mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
+while !mqtt.is_connected() {
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
 ```
 
 ## Example: SX1262 LoRa with OTAA Join

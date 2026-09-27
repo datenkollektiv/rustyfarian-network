@@ -114,6 +114,11 @@ Several tier modules are gated `#[cfg(any(feature = "<domain>", test))]` so thei
 Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test] fn … }` (present under `cfg(test)`), not a doctest — see the `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs` and `docs/features/ota-domain-reexport-parity-v1.md`.
 (A bare `pub use` also does not catch an *omitted* re-export: the tier crate still compiles; only a consumer-style `use` of the missing name fails, which is what the guard test provides.)
 
+**A shell export (e.g. a direnv `.envrc`) silently overrides the same key in `.env` for every `just` build.**
+`set dotenv-load` never overwrites a variable that is already in the environment, so a stale `MQTT_HOST` in `.envrc` wins over a correct `.env`, and the example binary connects to the wrong broker while `.env` looks right.
+The compile-time `Config — ... mqtt_host=... mqtt_port=...` log line printed by `examples/common/env.rs` is the source of truth for what was baked in; compare it against `.env` before debugging the network.
+Fix: keep build-time keys in `.env` only, remove them from `.envrc`, then `direnv reload` and rebuild (`build.rs` has `rerun-if-env-changed` for each key).
+
 ---
 
 ## esp-hal Bare-Metal Stack (esp-radio / esp-hal waves)
@@ -242,6 +247,23 @@ automatically deregisters the callback.
 If the subscription is bound to a local variable that goes out of scope (e.g. inside an `if` branch),
 the handler fires zero times.
 Fix: store the subscription in the owning struct (e.g. as `Option<EspSystemSubscription<'static>>`).
+
+---
+
+## MQTT Event Loop (`esp-mqtt` / `esp-idf-svc`)
+
+**Any `esp_mqtt_client_*` call made from an `MqttBuilder` callback on the event-loop thread deadlocks the client for good.**
+esp-mqtt (IDF v5.3.3) dispatches `CONNECTED`, `DATA`, and the disconnect path from `esp_mqtt_task` while holding its recursive `api_lock`, and esp-idf-svc 0.53 parks that task until our event loop calls `next()` again.
+A recursive mutex re-enters only for its owning task, so our thread waits on `api_lock` while the mqtt task waits on our `next()`.
+Symptom: `[mqtt] connected (clean_session=...)` is logged, `is_connected()` stays `false`, keepalives stop, and the broker publishes the LWT.
+The older "blocks until SUBACK" explanation was wrong: `EspMqttClient::subscribe` returns a message id without waiting, which is why a plain `enqueue` (the `with_startup_message()` publish) hung just the same.
+A second, three-way cycle existed whenever `on_connect` was registered: a publisher holding the Rust client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop blocked on that mutex to hand `on_connect` its `client` argument.
+Fix (bug 001): the event-loop thread never takes the client mutex; one per-connect helper thread (`juggler::mqtt::spawn_connect_thread`) runs the startup publish, then `on_connect`, then the builder subscriptions.
+Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe()` inside it are safe.
+`is_connected()` still flips only after `on_connect` returns, through a generation-checked compare-and-swap (`juggler::mqtt::ConnectionEpoch`), so a stale helper after a fast reconnect cannot mark a dead connection connected.
+`MqttHandle::publish*`, `try_publish*`, `subscribe`, and `publish_acked` return `PublishAckError::WrongThread` from inside any callback, detected through the thread-local `juggler::mqtt::CallbackScope`.
+User rule: from `on_connect` use the `client` argument, never `MqttHandle`; from `on_message` / `on_disconnect` never touch the client, hand the work to another thread.
+`rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; see `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`.
 
 ---
 

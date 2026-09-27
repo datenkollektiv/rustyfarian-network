@@ -2,9 +2,11 @@
 //!
 //! Demonstrates all three `MqttBuilder` callbacks:
 //!
-//! - `on_connect` — subscribes to the command topic and publishes a retained "online" status
+//! - `on_connect` — publishes a retained "online" status through its `client` argument (safe: it runs on the per-connect helper thread, not on the event loop)
 //! - `on_disconnect` — logs the disconnection so reconnect attempts are visible in the TTY
 //! - `on_message` — dispatches incoming commands by matching on the topic suffix
+//!
+//! The command subscription is registered with [`MqttBuilder::subscribe`](rustyfarian_esp_idf_network::mqtt::MqttBuilder::subscribe); no callback ever calls a [`MqttHandle`](rustyfarian_esp_idf_network::mqtt::MqttHandle) method.
 //!
 //! The LWT configuration ensures the broker publishes `{client_id}/status = "offline"` if
 //! the device disconnects unexpectedly (e.g. power loss, crash, network failure).
@@ -22,9 +24,11 @@
 //! | `WIFI_SSID` | `""` | Wi-Fi network name |
 //! | `WIFI_PASS` | `""` | Wi-Fi password |
 //! | `MQTT_HOST` | (required) | MQTT broker IP or hostname |
+//! | `MQTT_PORT` | `1883` | MQTT broker port |
 //! | `MQTT_CLIENT_ID` | `esp32c3-demo` | Unique device identifier |
 //!
-//! With [direnv](https://direnv.net/) and a populated `.envrc`, all variables are set automatically.
+//! `just` loads a populated `.env` automatically (`set dotenv-load`); a shell export, e.g. from a
+//! direnv `.envrc`, takes precedence over `.env`, so keep each key in one place.
 //!
 //! # Build and flash
 //!
@@ -39,46 +43,24 @@
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::{EspMqttClient, QoS};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::{LwtConfig, MqttBuilder, MqttConfig};
+use rustyfarian_esp_idf_network::mqtt::{LwtConfig, MqttBuilder};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 
-const WIFI_SSID: &str = match option_env!("WIFI_SSID") {
-    Some(s) => s,
-    None => "",
-};
-const WIFI_PASS: &str = match option_env!("WIFI_PASS") {
-    Some(s) => s,
-    None => "",
-};
-const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
-    Some(h) => h,
-    None => "",
-};
-const MQTT_CLIENT_ID: &str = match option_env!("MQTT_CLIENT_ID") {
-    Some(id) => id,
-    None => "esp32c3-mqtt",
-};
+#[path = "common/env.rs"]
+mod env;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!(
-        "Config — ssid={} mqtt_host={} client_id={}",
-        WIFI_SSID,
-        MQTT_HOST,
-        MQTT_CLIENT_ID
-    );
-    if MQTT_HOST.is_empty() {
-        anyhow::bail!(
-            "MQTT_HOST not configured — set it at build time, e.g.:\n  MQTT_HOST=192.168.1.100 cargo build ...\nSee .env.example for all available variables."
-        );
-    }
-    if MQTT_CLIENT_ID.len() > 23 {
+    let client_id = env::mqtt_client_id("esp32c3-mqtt");
+    env::log_config(client_id);
+    env::mqtt_host()?;
+    if client_id.len() > 23 {
         anyhow::bail!(
             "MQTT_CLIENT_ID '{}' is {} bytes — MQTT 3.1.1 maximum is 23",
-            MQTT_CLIENT_ID,
-            MQTT_CLIENT_ID.len()
+            client_id,
+            client_id.len()
         );
     }
 
@@ -86,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let wifi_config = WiFiConfig::new(WIFI_SSID, WIFI_PASS);
+    let wifi_config = WiFiConfig::new(env::WIFI_SSID, env::WIFI_PASS);
     let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), wifi_config)?;
 
     match wifi.get_ip(10_000)? {
@@ -94,22 +76,21 @@ fn main() -> anyhow::Result<()> {
         None => log::warn!("Wi-Fi connected but IP not yet assigned"),
     }
 
-    let lwt_topic = format!("{}/status", MQTT_CLIENT_ID);
+    let lwt_topic = format!("{}/status", client_id);
     let lwt = LwtConfig::new(&lwt_topic, b"offline", QoS::AtLeastOnce, true);
-    let mqtt_config = MqttConfig::new(MQTT_HOST, 1883, MQTT_CLIENT_ID).with_lwt(lwt);
+    let mqtt_config = env::mqtt_config(client_id)?.with_lwt(lwt);
 
-    let status_topic = format!("{}/status", MQTT_CLIENT_ID);
-    let commands_topic = format!("{}/commands/#", MQTT_CLIENT_ID);
+    let status_topic = format!("{}/status", client_id);
+    let commands_topic = format!("{}/commands/#", client_id);
 
     let handle = MqttBuilder::new(mqtt_config)
+        .subscribe(&commands_topic, QoS::AtLeastOnce)
         .on_connect(move |client: &mut EspMqttClient<'_>, is_clean: bool| {
             if is_clean {
                 log::info!("[mqtt] connected — clean session");
             } else {
                 log::info!("[mqtt] connected — session resumed");
             }
-            client.subscribe(&commands_topic, QoS::AtLeastOnce)?;
-            log::info!("[mqtt] subscribed to {}", commands_topic);
             client.enqueue(&status_topic, QoS::AtLeastOnce, true, b"online")?;
             log::info!("[mqtt] published retained status=online");
             Ok(())
@@ -131,7 +112,7 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("MQTT handle ready — waiting for broker connection...");
 
-    let heartbeat_topic = format!("{}/heartbeat", MQTT_CLIENT_ID);
+    let heartbeat_topic = format!("{}/heartbeat", client_id);
     let mut counter: u64 = 0;
 
     loop {

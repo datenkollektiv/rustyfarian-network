@@ -27,7 +27,7 @@ idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targ
 
 # ── Build Environment ─────────────────────────────────────────────────────
 
-# show RAM disk status, resolved target dirs, sccache, and required/optional tooling
+# show RAM disk status, resolved target dirs, sccache, required/optional tooling, and MQTT broker reachability (.env)
 doctor:
     @scripts/doctor.sh "{{ ramdisk }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
@@ -243,9 +243,9 @@ test-backoff:
 test-mqtt:
     cargo test --target {{ host_target }} -p juggler --features std mqtt
 
-# run subscriber-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
+# run subscriber-thread and connect-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
 test-subscriber-thread:
-    cargo test --target {{ host_target }} -p juggler --features std subscriber_thread
+    cargo test --target {{ host_target }} -p juggler --features std -- subscriber_thread connect_thread
 
 # run platform-independent Wi-Fi unit tests (host toolchain, no ESP-IDF needed)
 test-wifi:
