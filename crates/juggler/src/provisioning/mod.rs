@@ -24,6 +24,7 @@ pub mod error;
 pub mod form;
 pub mod html_json_escape;
 pub mod profile;
+pub(crate) mod secret;
 pub mod ssid;
 pub mod state;
 pub mod templates;

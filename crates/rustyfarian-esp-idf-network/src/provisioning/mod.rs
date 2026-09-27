@@ -84,11 +84,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
 use crate::wifi::{softap_mac, ApConfig, SoftApManager};
-use juggler::provisioning::ProvisioningInput;
-// `resolve_wait` / `WaitResolution` are only referenced by the mqtt-gated
-// `wait_outcome`; gate the import so a `provisioning`-only build stays warning-free.
-#[cfg(all(feature = "provisioning", feature = "mqtt"))]
-use juggler::provisioning::{resolve_wait, WaitResolution};
+use juggler::provisioning::{resolve_wait, ProvisioningInput, WaitResolution};
 
 use dns::DnsResponder;
 
@@ -165,8 +161,15 @@ pub enum ProvisioningEvent {
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
 #[derive(Debug)]
 pub(crate) enum SessionWait {
-    /// A valid submission was committed; carries the parsed config.
-    Committed(ProvisioningConfig),
+    /// A valid submission was committed.
+    ///
+    /// Carries no payload: the caller of [`wait_outcome`](SharedState::wait_outcome)
+    /// discards the config, so returning it here would clone the ~1.3 KB
+    /// [`ProvisioningConfig`] onto the caller's stack for nothing (bug
+    /// `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`). A caller
+    /// that needs the config should use
+    /// [`ProvisioningSession::wait_committed`] instead.
+    Committed,
     /// The factory-reset button was pressed.
     FactoryResetRequested,
     /// The optional timeout elapsed with no terminal event.
@@ -237,11 +240,30 @@ impl SharedState {
         }
     }
 
-    /// Stores the committed config and wakes any `wait_committed` waiter.
-    pub(crate) fn set_committed(&self, config: ProvisioningConfig) {
+    /// Applies `ProvisioningInput::PersistOk`, stores the committed config, and
+    /// wakes any waiter — all under one lock acquisition.
+    ///
+    /// `wait_committed`/`wait_outcome` key on the state via [`resolve_wait`] —
+    /// the state is the single source of truth for the waiter's signal, not
+    /// the presence of `guard.committed`, because `wait_committed` moves the
+    /// payload out with `take()` and a later observer must still see
+    /// `Committed`. The state and the payload must therefore be published
+    /// together: a separate `apply(PersistOk)` before storing the payload
+    /// would let a waiter that wakes in between (timeout slice or spurious
+    /// wakeup) observe `Committed` with no payload and return `None`.
+    ///
+    /// An invalid transition is logged and nothing is stored, like
+    /// [`apply`](Self::apply).
+    pub(crate) fn commit(&self, config: ProvisioningConfig) {
         if let Ok(mut guard) = self.inner.0.lock() {
-            guard.committed = Some(config);
-            self.inner.1.notify_all();
+            match guard.state.apply(ProvisioningInput::PersistOk) {
+                Ok(next) => {
+                    guard.committed = Some(config);
+                    guard.state = next;
+                    self.inner.1.notify_all();
+                }
+                Err(t) => log::warn!("provisioning state machine: {t}"),
+            }
         }
     }
 
@@ -256,6 +278,15 @@ impl SharedState {
     /// entry; spurious wakeups consume the elapsed slice instead of restarting
     /// the timer, so the total wait never exceeds the caller's requested
     /// duration.
+    ///
+    /// The config is moved out of shared state with `take()`, never cloned
+    /// (bug `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`), so
+    /// it can only be returned once: a second call after a successful return
+    /// resolves `Committed` from the state (see [`resolve_wait`]) but finds
+    /// `guard.committed` already empty and returns `None` immediately without
+    /// blocking. A factory-reset request does not resolve this wait (unlike
+    /// [`wait_outcome`](Self::wait_outcome)) — it keeps blocking until a
+    /// commit or the timeout, matching prior behaviour.
     fn wait_committed(&self, timeout: Option<Duration>) -> Option<ProvisioningConfig> {
         let (lock, cvar) = &*self.inner;
         let mut guard = match lock.lock() {
@@ -270,8 +301,8 @@ impl SharedState {
         };
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            if let Some(config) = guard.committed.clone() {
-                return Some(config);
+            if resolve_wait(guard.state) == WaitResolution::Committed {
+                return guard.committed.take();
             }
             match deadline {
                 None => match cvar.wait(guard) {
@@ -334,15 +365,8 @@ impl SharedState {
             // Delegate the per-iteration terminal-state decision to the pure,
             // host-tested juggler function so the "factory-reset unblocks an
             // indefinite wait" contract is locked by juggler unit tests.
-            match resolve_wait(guard.committed.is_some(), guard.state) {
-                WaitResolution::Committed => {
-                    return SessionWait::Committed(
-                        guard
-                            .committed
-                            .clone()
-                            .expect("committed flag set implies Some"),
-                    );
-                }
+            match resolve_wait(guard.state) {
+                WaitResolution::Committed => return SessionWait::Committed,
                 WaitResolution::FactoryReset => return SessionWait::FactoryResetRequested,
                 WaitResolution::Pending => {}
             }
@@ -583,6 +607,22 @@ impl ProvisioningSession {
     /// With `timeout = None` it blocks indefinitely; with `Some(d)` it returns
     /// `None` if no commit occurs within `d`. This is the blocking convenience
     /// the host's provisioning-mode main loop sits in.
+    ///
+    /// # Stack budget
+    ///
+    /// The returned [`ProvisioningConfig`] is a by-value struct of `heapless`
+    /// buffers, roughly 1.3 KB on a 32-bit target. It is moved (not cloned) out
+    /// of the session onto the caller's stack, so the caller's task needs
+    /// headroom for it in addition to its own frames — see
+    /// `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`. The exact
+    /// per-target figure is `core::mem::size_of::<ProvisioningConfig>()`, which
+    /// is usable in a `const` assertion against the caller's own stack budget;
+    /// the struct's layout follows the `heapless` bounds in `juggler`, so no
+    /// hand-maintained size constant is published. The config
+    /// can only be taken once: a second call after a successful return yields
+    /// `None` immediately without blocking. Callers that do not need the
+    /// config should prefer `run_wifi_mqtt_portal` (requires the `mqtt`
+    /// feature), which never puts it on the caller's stack at all.
     pub fn wait_committed(&self, timeout: Option<Duration>) -> Option<ProvisioningConfig> {
         self.state.wait_committed(timeout)
     }

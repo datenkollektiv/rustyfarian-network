@@ -170,8 +170,7 @@ pub(crate) fn start(
                         .and_then(|mut s| s.save(&config));
                     match persist {
                         Ok(()) => {
-                            state.apply(ProvisioningInput::PersistOk);
-                            state.set_committed(config);
+                            state.commit(config);
                             (on_event)(ProvisioningEvent::Committed);
                             let mut response = request.into_ok_response()?;
                             response.write_all(COMMITTED_HTML.as_bytes())?;

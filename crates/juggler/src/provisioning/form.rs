@@ -58,12 +58,27 @@ const MAX_CANONICAL_FIELDS: usize = 8;
 ///
 /// An opaque host-defined key/value pair carried alongside the canonical
 /// schema (the ADR 013 §4 extension mechanism).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The value is opaque and may be a secret (an API token, say), so it is
+/// treated as one: the [`Debug`](core::fmt::Debug) impl shows the key but
+/// redacts the value as `"<redacted>"`, and the owning
+/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig) scrubs it
+/// on drop.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExtraField {
     /// The extra field's key (at most [`EXTRA_KEY_MAX_LEN`] bytes).
     pub key: heapless::String<EXTRA_KEY_MAX_LEN>,
     /// The extra field's value (at most [`EXTRA_VALUE_MAX_LEN`] bytes).
     pub value: heapless::String<EXTRA_VALUE_MAX_LEN>,
+}
+
+impl core::fmt::Debug for ExtraField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExtraField")
+            .field("key", &self.key.as_str())
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Outcome of percent-decoding a single key or value.

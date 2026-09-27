@@ -28,7 +28,7 @@ mqtt = []
 lora = ["dep:heapless", "dep:nb", "dep:lorawan-device"]
 espnow = []
 ota = ["dep:heapless", "dep:sha2"]
-provisioning = ["wifi", "mqtt", "lora", "dep:heapless"]
+provisioning = ["wifi", "mqtt", "lora", "dep:heapless", "dep:zeroize"]
 
 # Mock feature — test doubles for radio and ESP-NOW drivers
 # A single shared mock feature is used because only two domains have mocks with
@@ -53,3 +53,4 @@ nb = { workspace = true, optional = true }
 lorawan-device = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }

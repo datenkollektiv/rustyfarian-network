@@ -103,6 +103,10 @@ impl SchemaProfile {
 ///
 /// The validated LoRaWAN OTAA credentials of a
 /// [`SchemaProfile::LorawanFieldDevice`] submission.
+///
+/// The AppKey is scrubbed (zeroed) from memory when this value is dropped;
+/// see the `# Secret lifetime` section on
+/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig).
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoraFields {
     pub(crate) dev_eui_hex: heapless::String<EUI_HEX_LEN>,
@@ -163,6 +167,19 @@ impl fmt::Debug for LoraFields {
     }
 }
 
+impl Drop for LoraFields {
+    /// Scrubs the AppKey before the memory is released.
+    ///
+    /// `dev_eui_hex` and `join_eui_hex` are device identifiers, not secrets
+    /// (see the redaction note on [`ProvisioningConfig`]'s `Debug` impl), so
+    /// they are left as-is.
+    ///
+    /// [`ProvisioningConfig`]: crate::provisioning::ProvisioningConfig
+    fn drop(&mut self) {
+        crate::provisioning::secret::scrub(&mut self.app_key_hex);
+    }
+}
+
 /// Experimental: API may change before 1.0.
 ///
 /// The validated MQTT broker fields of a [`SchemaProfile::WifiMqttDevice`]
@@ -172,6 +189,10 @@ impl fmt::Debug for LoraFields {
 /// time so the load-then-connect path needs no re-parsing. `username`,
 /// `password`, and `client_id` are optional: an anonymous, host-derived-client
 /// connection leaves all three `None`.
+///
+/// The password is scrubbed (zeroed) from memory when this value is dropped;
+/// see the `# Secret lifetime` section on
+/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MqttFields {
     pub(crate) host: heapless::String<MQTT_HOST_MAX_LEN>,
@@ -259,6 +280,20 @@ impl fmt::Debug for MqttFields {
             .field("password", &self.password().map(|_| "<redacted>"))
             .field("client_id", &self.client_id())
             .finish()
+    }
+}
+
+impl Drop for MqttFields {
+    /// Scrubs the password before the memory is released.
+    ///
+    /// `host`, `username`, and `client_id` are not secrets (see the redaction
+    /// note on [`ProvisioningConfig`]'s `Debug` impl), so they are left as-is.
+    ///
+    /// [`ProvisioningConfig`]: crate::provisioning::ProvisioningConfig
+    fn drop(&mut self) {
+        if let Some(password) = self.password.as_mut() {
+            crate::provisioning::secret::scrub(password);
+        }
     }
 }
 

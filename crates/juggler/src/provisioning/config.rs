@@ -80,6 +80,28 @@ pub(crate) const APP_KEY_HEX_LEN: usize = 32;
 /// deliberately redacts *fewer* fields than `LoraConfig`: the DevEUI, JoinEUI,
 /// and the MQTT username are device identifiers rather than secrets and are
 /// useful verbatim in field logs, so they are shown.
+///
+/// # Secret lifetime
+///
+/// When a `ProvisioningConfig`, [`LoraFields`], or [`MqttFields`] value is
+/// dropped, the Wi-Fi password, the MQTT password, the AppKey, and every
+/// extra field's value in *that value's own storage* are overwritten (zeroed,
+/// via [`zeroize`]) before the memory is released.
+///
+/// This is best-effort hygiene for the final location only, not a guarantee
+/// that no copy of a secret survives:
+///
+/// - The fields are inline `heapless` buffers, so every Rust move (returning
+///   the config, `Option::take`, pushing into a collection) is a bitwise copy
+///   that leaves the bytes behind in the source location, which is never
+///   scrubbed.
+/// - Buffers outside this type are not covered: the raw form body and the
+///   parser's percent-decode scratch, NVS encode buffers, and any `&str`
+///   the caller copies out of an accessor.
+/// - A panic dump that prints live stack frames while the config is still
+///   alive exposes it regardless; keeping fewer copies on the stack is the
+///   mitigation for that case
+///   (bug 002, `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProvisioningConfig {
     pub(crate) wifi_ssid: heapless::String<{ crate::wifi::SSID_MAX_LEN }>,
@@ -206,6 +228,22 @@ impl fmt::Debug for ProvisioningConfig {
     }
 }
 
+impl Drop for ProvisioningConfig {
+    /// Scrubs `wifi_password` and every extra field's value before the memory
+    /// is released; see the `# Secret lifetime` section above.
+    ///
+    /// `lora` and `mqtt` scrub their own secret (the AppKey / MQTT password
+    /// respectively) via their own `Drop` impls, chained automatically once
+    /// this function returns. `wifi_ssid`, `ota_url`, `device_name`, and
+    /// every extra field's *key* are not secrets and are left as-is.
+    fn drop(&mut self) {
+        crate::provisioning::secret::scrub(&mut self.wifi_password);
+        for extra in self.extras.iter_mut() {
+            crate::provisioning::secret::scrub(&mut extra.value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::provisioning::parse_form;
@@ -284,5 +322,95 @@ mod tests {
         assert_eq!(cfg.profile(), SchemaProfile::LorawanFieldDevice);
         assert!(cfg.lora().is_some());
         assert!(cfg.mqtt().is_none());
+    }
+
+    /// A `WifiMqttDevice` fixture that routes the runtime test key through
+    /// every secret slot a portal submission can carry: the Wi-Fi password,
+    /// the MQTT password, and an opaque extra field.
+    fn mqtt_config_with_extra() -> crate::provisioning::ProvisioningConfig {
+        let psk = test_psk();
+        let body = format!(
+            "wifi_ssid=home&wifi_pass={psk}&mqtt_uri=mqtt://broker.local:1883\
+             &mqtt_user=hive&mqtt_pass={psk}&ota_url=http://example.com/fw.bin\
+             &dev_name=hive&api_token={psk}"
+        );
+        parse_form(&body, SchemaProfile::WifiMqttDevice).expect("valid fixture body")
+    }
+
+    #[test]
+    fn debug_redacts_mqtt_password_and_extra_values() {
+        let cfg = mqtt_config_with_extra();
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("api_token"), "extra keys stay visible");
+        assert!(
+            !rendered.contains(test_psk()),
+            "leaked a secret: {rendered}"
+        );
+    }
+
+    /// Address and length of a live secret buffer, recorded so the same bytes
+    /// can be re-read after the owning config has been dropped in place.
+    fn window(s: &str) -> (*const u8, usize) {
+        (s.as_ptr(), s.len())
+    }
+
+    /// Re-read a recorded window.
+    ///
+    /// # Safety
+    ///
+    /// The storage the window points into must still be allocated: the tests
+    /// keep the config inside a `ManuallyDrop` on their own stack frame, so
+    /// running `Drop` in place releases nothing.
+    unsafe fn bytes_at((ptr, len): (*const u8, usize)) -> &'static [u8] {
+        core::slice::from_raw_parts(ptr, len)
+    }
+
+    fn assert_scrubbed(label: &str, w: (*const u8, usize)) {
+        let bytes = unsafe { bytes_at(w) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "{label} buffer still holds {} non-zero bytes after drop",
+            bytes.iter().filter(|&&b| b != 0).count()
+        );
+    }
+
+    #[test]
+    fn drop_scrubs_wifi_password_mqtt_password_and_extra_value() {
+        use core::mem::ManuallyDrop;
+
+        let mut cfg = ManuallyDrop::new(mqtt_config_with_extra());
+        let wifi = window(cfg.wifi_password());
+        let mqtt = window(
+            cfg.mqtt()
+                .expect("mqtt group")
+                .password()
+                .expect("password"),
+        );
+        let extra = window(&cfg.extras()[0].value);
+        assert_eq!(cfg.extras()[0].key, "api_token");
+
+        // Sanity: the buffers hold the secret while the config is alive.
+        assert_eq!(unsafe { bytes_at(wifi) }, test_psk().as_bytes());
+        assert_eq!(unsafe { bytes_at(mqtt) }, test_psk().as_bytes());
+        assert_eq!(unsafe { bytes_at(extra) }, test_psk().as_bytes());
+
+        unsafe { ManuallyDrop::drop(&mut cfg) };
+
+        assert_scrubbed("wifi_password", wifi);
+        assert_scrubbed("mqtt.password", mqtt);
+        assert_scrubbed("extras[0].value", extra);
+    }
+
+    #[test]
+    fn drop_scrubs_lora_app_key() {
+        use core::mem::ManuallyDrop;
+
+        let mut cfg = ManuallyDrop::new(parsed_config());
+        let app_key = window(cfg.lora().expect("lora group").app_key_hex());
+        assert_eq!(unsafe { bytes_at(app_key) }, TEST_APP_KEY_HEX.as_bytes());
+
+        unsafe { ManuallyDrop::drop(&mut cfg) };
+
+        assert_scrubbed("lora.app_key_hex", app_key);
     }
 }

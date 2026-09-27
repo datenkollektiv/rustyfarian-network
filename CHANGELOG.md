@@ -45,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It involved a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex.
   The event loop no longer takes the client mutex at all.
   See [docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md](docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md).
+- `ProvisioningSession::wait_committed` and the internal `wait_outcome` cloned the ~1.3 KB `ProvisioningConfig` onto the caller's stack; `run_wifi_mqtt_portal` then discarded the copy.
+  A consumer with `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000` overflowed the main task right after `Provisioning event: Committed`.
+  `wait_committed` now moves the config out with `take()`, `run_wifi_mqtt_portal` never copies it, and the portal publishes `ProvisioningState::Committed` and the payload under one lock so a waiter after the payload was taken still resolves via `juggler::provisioning::resolve_wait`, which now keys on the state alone, and no waiter can observe the state before the payload.
+  Both functions document the caller's stack budget.
+  See [docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md](docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md).
+- `ProvisioningConfig` left the Wi-Fi password, the MQTT password, the LoRaWAN AppKey, and every extra-field value readable in freed stack and heap memory after the value was dropped.
+  `ProvisioningConfig`, `LoraFields`, and `MqttFields` now implement `Drop` and overwrite the full backing buffer of each secret with zeros before the memory is released.
+  The overwrite uses `zeroize` (`default-features = false`, no transitive crates), a new optional `juggler` dependency enabled by the `provisioning` feature.
+  Non-secret fields, `Clone`, `from_storage_parts`, and all accessors are unchanged.
+  The scrub covers only each value's final storage: moves of the inline `heapless` buffers, the raw form body, parser and NVS scratch buffers, and a panic dump of live stack frames (bug 002) are not covered.
+  See [docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md](docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md).
+- `ExtraField`'s `Debug` output (and therefore `ProvisioningConfig`'s) printed extra-field values verbatim, so a secret extra such as `api_token` reached logs.
+  The value is now shown as `"<redacted>"`; the key stays visible.
 
 ## [0.5.0] - 2026-09-26
 

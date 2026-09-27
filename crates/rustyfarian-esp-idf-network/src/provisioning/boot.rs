@@ -286,6 +286,18 @@ mod inner {
     /// This function never calls `restart()` or `erase()`.  Those decisions
     /// belong to the caller.
     ///
+    /// # Stack budget
+    ///
+    /// This function blocks the calling task for the portal's whole lifetime,
+    /// but the wait itself is cheap: it resolves to a [`PortalOutcome`] enum,
+    /// and the committed [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig)
+    /// is never copied onto the caller's stack — the portal's HTTP handlers run
+    /// on their own `httpd` tasks. The workspace's own examples run with
+    /// `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` (`sdkconfig.defaults`). Before
+    /// this contract was fixed, a 0.5.0 consumer with an 8000-byte main task
+    /// overflowed its stack right after logging `Provisioning event: Committed`
+    /// (see `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`).
+    ///
     /// # Errors
     ///
     /// Returns `Err` on operational failures: SoftAP startup, store open, DNS
@@ -305,7 +317,7 @@ mod inner {
             .context("failed to start provisioning portal")?;
 
         match session.wait_outcome(config.portal_timeout) {
-            SessionWait::Committed(_config) => {
+            SessionWait::Committed => {
                 // Commit-durability rule: return JustProvisioned even if shutdown
                 // errors; the caller restarts anyway.
                 if let Err(e) = session.shutdown() {
