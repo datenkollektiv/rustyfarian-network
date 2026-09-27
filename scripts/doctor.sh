@@ -52,7 +52,7 @@ fi
 # TCP reachability only: credentials are never read and the check is never fatal.
 probe_tcp() {
     # $1 host  $2 port — succeeds when a TCP connection opens within ~3 s
-    bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1 &
+    bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" >/dev/null 2>&1 &
     local pid=$! rc=0 i
     for i in 1 2 3 4 5 6; do
         if ! kill -0 "$pid" 2>/dev/null; then

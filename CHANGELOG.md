@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
 - Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule: use the `client` argument in `on_connect`, never call a `MqttHandle` method from a callback, never call the client from `on_message` / `on_disconnect`.
 - The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`) and share their `.env` handling in `examples/common/env.rs`.
-- Release note: `rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; bump the workspace `juggler` dependency to `version = "0.5.1"` when releasing.
+- Workspace version and the `juggler` dependency minimum raised to `0.5.1`: `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
 
 ### Fixed
 

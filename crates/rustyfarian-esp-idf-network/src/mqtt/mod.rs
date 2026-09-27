@@ -844,7 +844,11 @@ impl<'a> MqttBuilder<'a> {
     ///   `is_connected()` returns `true`.
     /// - **Failures**: subscribe errors are logged as warnings and not
     ///   propagated.  Failed subscriptions are retried automatically on the
-    ///   next reconnect.
+    ///   next reconnect. If the per-connect helper thread itself cannot be
+    ///   spawned, no subscription is sent for that connection at all, an
+    ///   `error!` is logged, and [`is_connected()`](MqttHandle::is_connected)
+    ///   stays `false` for that connection until the next reconnect retries
+    ///   the whole sequence.
     /// - **Duplicates**: registering the same `(topic, qos)` pair more than
     ///   once is intentionally preserved — duplicate SUBSCRIBE packets are
     ///   handled safely by brokers per MQTT §3.8.
@@ -891,6 +895,33 @@ impl<'a> MqttBuilder<'a> {
     /// Must not wait for a thread whose job is to publish via this MQTT
     /// client: that thread would block trying to acquire the client mutex
     /// this callback already holds, deadlocking both.
+    ///
+    /// # Overlap
+    ///
+    /// `on_connect` runs on a per-connect helper thread and is not
+    /// serialized against the event-loop thread beyond the client mutex:
+    /// [`on_message`](Self::on_message) (for a resumed session, see above)
+    /// and [`on_disconnect`](Self::on_disconnect) may both run concurrently
+    /// with an in-flight `on_connect` — including a `disconnect` for the
+    /// same connection this callback is still handling, or an `on_connect`
+    /// for a *later* connection racing ahead of it. Application state
+    /// touched by more than one of these callbacks must be synchronized by
+    /// the application; the epoch only protects the library's internal
+    /// connected flag, not caller state. A stale `on_connect` for a
+    /// connection already superseded by a newer `Connected`/`Disconnected`
+    /// is skipped before it starts, but one that has already started runs
+    /// to completion rather than being cancelled mid-flight.
+    ///
+    /// Keep `on_connect` short-lived and idempotent: it may race a
+    /// disconnect/reconnect and, once started, cannot be cancelled. A
+    /// retained publish issued from a stale callback is replayed by
+    /// esp-mqtt on the next connection, which is why the retained-status
+    /// idiom (`client.enqueue(topic, QoS::AtLeastOnce, true, ...)`) is safe
+    /// to call here even from a stale, superseded callback — but a
+    /// non-idempotent side effect (e.g. incrementing a counter, sending a
+    /// one-shot command) is not, since it may run twice for what the
+    /// application sees as a single connection. A connection-aware
+    /// callback API is a possible future breaking change.
     pub fn on_connect<F>(mut self, f: F) -> Self
     where
         F: Fn(&mut EspMqttClient<'_>, bool) -> anyhow::Result<()> + Send + 'static,
@@ -906,6 +937,8 @@ impl<'a> MqttBuilder<'a> {
     /// It runs on the event-loop thread while esp-mqtt holds its recursive
     /// `api_lock`; do not call any [`MqttHandle`] method from it (such a call
     /// returns [`PublishAckError::WrongThread`]).
+    /// May run while an [`on_connect`](Self::on_connect) from the same or a
+    /// previous connection is still executing on its helper thread.
     pub fn on_disconnect<F>(mut self, f: F) -> Self
     where
         F: Fn() + Send + 'static,
@@ -1131,10 +1164,15 @@ impl<'a> MqttBuilder<'a> {
                                     let prelude = move |client: &mut SubscribableClient| {
                                         if !epoch.is_current(token) {
                                             // A newer Connected/Disconnected already advanced
-                                            // the epoch before this helper even started. The
-                                            // subscribes that still follow in
-                                            // spawn_connect_thread are harmless duplicates, so
-                                            // there is nothing else to guard here.
+                                            // the epoch before this helper even started its
+                                            // prelude — the caller-side guard documented on
+                                            // `spawn_connect_thread` ("Stale-thread safety"):
+                                            // a helper that has not yet started is expected to
+                                            // skip its work here. The subscribe topics passed
+                                            // to `spawn_connect_thread` are not gated by this
+                                            // check and still run against the client below;
+                                            // that is fine, brokers accept a duplicate
+                                            // SUBSCRIBE per MQTT §3.8.
                                             log::debug!(
                                                 "[mqtt] connect helper: stale connection, \
                                                  skipping startup publish and on_connect"
@@ -1191,13 +1229,19 @@ impl<'a> MqttBuilder<'a> {
                                         // module docs): esp-mqtt holds its recursive
                                         // api_lock for the whole connect handshake, and
                                         // this thread must return to next() promptly.
-                                        // Give up on on_connect/subscriptions for this
-                                        // connection instead.
-                                        epoch_for_thread.confirm(token);
+                                        //
+                                        // Confirming the epoch here would also violate the
+                                        // `is_connected()` contract, which promises that
+                                        // `on_connect` has already completed — it has not
+                                        // run at all. So the epoch is left unconfirmed:
+                                        // `MqttHandle::publish*` still enqueue (they do not
+                                        // check readiness), any consumer gating on
+                                        // `is_connected()` keeps waiting, and the next
+                                        // `Connected` event retries the whole sequence.
                                         log::error!(
-                                            "[mqtt] could not spawn the connect helper \
-                                             thread; on_connect and subscriptions skipped \
-                                             for this connection"
+                                            "[mqtt] could not spawn the connect helper thread; \
+                                             on_connect and subscriptions skipped, connection \
+                                             NOT marked ready until the next reconnect"
                                         );
                                     }
                                 }
@@ -1265,6 +1309,12 @@ impl<'a> MqttBuilder<'a> {
     /// Uses [`MqttConfig::connection_timeout_ms`] (default: 5000 ms) as the
     /// connection deadline.
     /// The LED borrow is released when this method returns.
+    /// Success here does not guarantee the subscriptions were sent — see
+    /// [`MqttHandle::is_connected`]. If the per-connect helper thread fails
+    /// to spawn on the first connect (see "Helper-spawn failure" on
+    /// [`is_connected`](MqttHandle::is_connected)), `is_connected()` never
+    /// becomes `true` for that attempt, so this method times out and
+    /// returns an error — even though the broker was in fact reachable.
     ///
     /// # Example
     ///
@@ -1639,6 +1689,17 @@ impl MqttHandle {
     /// disconnect/reconnect has since superseded — cannot flip this flag for
     /// the newer connection: the underlying [`ConnectionEpoch`] rejects its
     /// `confirm` once the generation has moved on.
+    ///
+    /// # Helper-spawn failure
+    ///
+    /// If the per-connect helper thread cannot be spawned (e.g. heap
+    /// exhaustion), this stays `false` for that connection even though the
+    /// transport is up: `on_connect` never ran, so the "on_connect
+    /// completed" contract above cannot be satisfied. An `error!` is logged.
+    /// [`MqttHandle::publish`] and the other `publish*` methods still
+    /// enqueue normally — they do not check readiness — but subscriptions
+    /// registered on the builder and `on_connect` itself are skipped for
+    /// this connection and are retried on the next reconnect.
     pub fn is_connected(&self) -> bool {
         self.epoch.is_connected()
     }
