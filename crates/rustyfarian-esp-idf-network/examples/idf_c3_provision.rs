@@ -48,6 +48,16 @@ fn fallback_psk() -> &'static str {
 /// Optional WPA2 password for the provisioning AP. Without it the AP is open.
 const AP_PSK: Option<&str> = option_env!("PROVISION_AP_PSK");
 
+/// Maps a secret's emptiness to a log-safe literal, so no value derived from
+/// the secret itself ever reaches a log macro.
+fn presence(is_empty: bool) -> &'static str {
+    if is_empty {
+        "missing"
+    } else {
+        "set"
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -59,15 +69,19 @@ fn main() -> anyhow::Result<()> {
     let store = ProvisioningStore::open(nvs.clone())?;
     if store.is_provisioned()? {
         if let Some(cfg) = store.load()? {
+            // Never log anything derived from a secret — not even its length.
+            // Fresh literals keep the secrets out of the log's data flow.
+            let app_key_state = presence(cfg.app_key_hex.is_empty());
+            let wifi_pass_state = presence(cfg.wifi_password.is_empty());
             log::info!(
                 "Already provisioned: ssid len={}, dev_eui={}, ota_url len={}, name={}, \
-                 app_key len={} (secret), wifi_pass len={} (secret)",
+                 app_key={}, wifi_pass={}",
                 cfg.wifi_ssid.len(),
                 cfg.dev_eui_hex,
                 cfg.ota_url.len(),
                 cfg.device_name,
-                cfg.app_key_hex.len(),
-                cfg.wifi_password.len(),
+                app_key_state,
+                wifi_pass_state,
             );
             log::info!("A real application would now proceed to normal STA boot.");
         }
@@ -75,11 +89,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     if !FALLBACK_SSID.is_empty() {
+        let psk_state = presence(fallback_psk().is_empty());
         log::info!(
-            "NVS empty but compile-time WIFI_SSID present (ssid len={}, psk len={}) — \
+            "NVS empty but compile-time WIFI_SSID present (ssid len={}, psk={}) — \
              a real application could boot from these instead of provisioning.",
             FALLBACK_SSID.len(),
-            fallback_psk().len(),
+            psk_state,
         );
     }
 
