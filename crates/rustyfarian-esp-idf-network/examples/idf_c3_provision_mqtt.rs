@@ -225,15 +225,22 @@ fn main() -> anyhow::Result<()> {
     let wifi_cfg = boot.wifi_config();
     let mqtt_cfg = boot.mqtt_config();
 
+    // Never log anything derived from a secret — not even its length.
+    // A fresh literal keeps the password out of the log's data flow.
+    let wifi_pass_state = if wifi_cfg.password.is_empty() {
+        "missing"
+    } else {
+        "set"
+    };
+
     log::info!(
         "Loaded provisioned config: wifi_ssid len={}, mqtt_host len={}, mqtt_port={}, \
-         mqtt_client_id len={}, wifi_pass len={} (secret)",
+         mqtt_client_id len={}, wifi_pass={}",
         wifi_cfg.ssid.len(),
         mqtt_cfg.host.len(),
         mqtt_cfg.port,
         mqtt_cfg.client_id.len(),
-        // Log secrets by length only — never the values themselves.
-        wifi_cfg.password.len(),
+        wifi_pass_state,
     );
 
     log::info!("A real application would now proceed to normal STA + MQTT boot.");
