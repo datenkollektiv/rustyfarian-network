@@ -159,6 +159,28 @@ const FACTORY_RESET_HTML: &[u8] = b"<!DOCTYPE html><html><head><meta charset=\"u
 <p>The host application will complete the reset.</p>\
 </body></html>";
 
+/// `409` body for a `/save` or `/factory-reset` that arrives after the session
+/// already reached a terminal state (or while a submission is being saved):
+/// the first terminal event stands and nothing was changed.
+const SESSION_FINISHED_BODY: &[u8] =
+    b"Conflict: this provisioning session has already finished or is saving \
+      another submission; nothing was changed. Wait for the device to restart.";
+
+/// Applies `input` to the session state held in `cell`.
+///
+/// On success the cell holds the next state.  A refused transition leaves the
+/// cell untouched and is returned so the caller can refuse the request before
+/// any side effect (flash write, outcome signal, event callback) — the first
+/// terminal event of a session stands.
+pub(crate) fn transition(
+    cell: &core::cell::Cell<juggler::provisioning::ProvisioningState>,
+    input: juggler::provisioning::ProvisioningInput,
+) -> Result<juggler::provisioning::ProvisioningState, juggler::provisioning::InvalidTransition> {
+    let next = cell.get().apply(input)?;
+    cell.set(next);
+    Ok(next)
+}
+
 /// GET /factory-reset — confirmation page with nonce-bearing POST form.
 const FACTORY_RESET_CONFIRM_HTML_PART1: &str =
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
@@ -470,6 +492,7 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
         414 => "URI Too Long",
@@ -1044,8 +1067,8 @@ struct PortalState<'r> {
 /// | GET    | PROBE_PATHS           | 302    | Redirect to portal root        |
 /// | GET    | /factory-reset        | 200    | Confirmation form              |
 /// | GET    | / (any path not above) | 200   | Portal HTML page (captive-portal catch-all) |
-/// | POST   | /save                 | 200/400/403/500 | Credential commit |
-/// | POST   | /factory-reset        | 200/403 | Factory-reset signal          |
+/// | POST   | /save                 | 200/400/403/409/500 | Credential commit (409: session already finished) |
+/// | POST   | /factory-reset        | 200/403/409 | Factory-reset signal (409: session already finished) |
 /// | POST   | anything else         | 404    | Not found (POST-only — unknown GETs hit the catch-all row above) |
 #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
 #[allow(clippy::result_unit_err, clippy::too_many_arguments)]
@@ -1296,12 +1319,22 @@ pub(crate) fn dispatch_request(
                         return Ok(total);
                     }
                     Ok(config_to_save) => {
-                        // Apply ValidSubmission to state machine.
-                        shared.state.lock(|cell| {
-                            if let Ok(next) = cell.get().apply(ProvisioningInput::ValidSubmission) {
-                                cell.set(next);
-                            }
-                        });
+                        // Gate before touching flash: once the session is
+                        // Committed or FactoryResetPending, the first terminal
+                        // event stands and this submission must not be
+                        // written, signalled, or reported as accepted.
+                        if let Err(t) = shared
+                            .state
+                            .lock(|cell| transition(cell, ProvisioningInput::ValidSubmission))
+                        {
+                            log::warn!("POST /save refused: session already {:?}", t.state);
+                            return build_response(
+                                resp_buf,
+                                409,
+                                "text/plain; charset=utf-8",
+                                SESSION_FINISHED_BODY,
+                            );
+                        }
                         if let Some(cb) = shared.on_event {
                             (cb)(ProvisioningEvent::SubmissionAccepted);
                         }
@@ -1312,12 +1345,9 @@ pub(crate) fn dispatch_request(
                         match save_result {
                             Err(e) => {
                                 log::error!("POST /save persist failed: {:?}", e);
-                                shared.state.lock(|cell| {
-                                    if let Ok(next) =
-                                        cell.get().apply(ProvisioningInput::PersistFailed)
-                                    {
-                                        cell.set(next);
-                                    }
+                                // Persisting always accepts PersistFailed.
+                                let _ = shared.state.lock(|cell| {
+                                    transition(cell, ProvisioningInput::PersistFailed)
                                 });
 
                                 // Re-render with banner.
@@ -1360,13 +1390,25 @@ pub(crate) fn dispatch_request(
                                 return Ok(total);
                             }
                             Ok(()) => {
-                                // Persist succeeded.
-                                shared.state.lock(|cell| {
-                                    if let Ok(next) = cell.get().apply(ProvisioningInput::PersistOk)
-                                    {
-                                        cell.set(next);
-                                    }
-                                });
+                                // Persist succeeded.  Unreachable with the gate
+                                // above (only this handler leaves Persisting),
+                                // but never signal a commit the session did
+                                // not accept.
+                                if let Err(t) = shared
+                                    .state
+                                    .lock(|cell| transition(cell, ProvisioningInput::PersistOk))
+                                {
+                                    log::error!(
+                                        "POST /save: persisted but commit refused from {:?}",
+                                        t.state
+                                    );
+                                    return build_response(
+                                        resp_buf,
+                                        409,
+                                        "text/plain; charset=utf-8",
+                                        SESSION_FINISHED_BODY,
+                                    );
+                                }
 
                                 // Clone config_to_save before moving into signal.
                                 let committed_config = config_to_save;
@@ -1402,11 +1444,20 @@ pub(crate) fn dispatch_request(
                     );
                 }
 
-                shared.state.lock(|cell| {
-                    if let Ok(next) = cell.get().apply(ProvisioningInput::FactoryReset) {
-                        cell.set(next);
-                    }
-                });
+                // A reset after a commit is refused: the saved credentials
+                // stand and the host is never told a reset was requested.
+                if let Err(t) = shared
+                    .state
+                    .lock(|cell| transition(cell, ProvisioningInput::FactoryReset))
+                {
+                    log::warn!("POST /factory-reset refused: session already {:?}", t.state);
+                    return build_response(
+                        resp_buf,
+                        409,
+                        "text/plain; charset=utf-8",
+                        SESSION_FINISHED_BODY,
+                    );
+                }
                 shared
                     .outcome
                     .signal(ProvisioningOutcome::FactoryResetRequested);
@@ -2820,5 +2871,83 @@ mod tests {
                 "bytes beyond the second request body must still be 0xFF (no lingering creds)"
             );
         }
+    }
+
+    // ── Session gate: the first terminal event stands ───────────────────────
+
+    use core::cell::Cell;
+    use juggler::provisioning::{ProvisioningInput, ProvisioningState};
+
+    #[test]
+    fn transition_accepts_and_stores_the_next_state() {
+        let cell = Cell::new(ProvisioningState::AwaitingSubmission);
+        assert_eq!(
+            transition(&cell, ProvisioningInput::ValidSubmission),
+            Ok(ProvisioningState::Persisting)
+        );
+        assert_eq!(cell.get(), ProvisioningState::Persisting);
+        assert_eq!(
+            transition(&cell, ProvisioningInput::PersistOk),
+            Ok(ProvisioningState::Committed)
+        );
+        assert_eq!(cell.get(), ProvisioningState::Committed);
+    }
+
+    #[test]
+    fn save_after_factory_reset_is_refused_and_reset_stands() {
+        let cell = Cell::new(ProvisioningState::AwaitingSubmission);
+        assert!(transition(&cell, ProvisioningInput::FactoryReset).is_ok());
+
+        let refused = transition(&cell, ProvisioningInput::ValidSubmission)
+            .expect_err("a submission after a reset must be refused before store.save");
+        assert_eq!(refused.state, ProvisioningState::FactoryResetPending);
+        assert_eq!(cell.get(), ProvisioningState::FactoryResetPending);
+    }
+
+    #[test]
+    fn save_after_commit_is_refused_and_commit_stands() {
+        let cell = Cell::new(ProvisioningState::Committed);
+        let refused = transition(&cell, ProvisioningInput::ValidSubmission)
+            .expect_err("a second submission after a commit must be refused");
+        assert_eq!(refused.state, ProvisioningState::Committed);
+        assert_eq!(cell.get(), ProvisioningState::Committed);
+    }
+
+    #[test]
+    fn factory_reset_after_commit_or_while_persisting_is_refused() {
+        for state in [ProvisioningState::Committed, ProvisioningState::Persisting] {
+            let cell = Cell::new(state);
+            let refused = transition(&cell, ProvisioningInput::FactoryReset)
+                .expect_err("reset must be refused once a submission was accepted");
+            assert_eq!(refused.state, state);
+            assert_eq!(
+                cell.get(),
+                state,
+                "a refused reset must not change the state"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_ok_outside_persisting_is_refused_so_no_commit_is_signalled() {
+        let cell = Cell::new(ProvisioningState::FactoryResetPending);
+        assert!(transition(&cell, ProvisioningInput::PersistOk).is_err());
+        assert_eq!(cell.get(), ProvisioningState::FactoryResetPending);
+    }
+
+    #[test]
+    fn session_finished_response_is_409_conflict_and_not_cached() {
+        let mut buf = [0u8; 512];
+        let n = build_response(
+            &mut buf,
+            409,
+            "text/plain; charset=utf-8",
+            SESSION_FINISHED_BODY,
+        )
+        .expect("409 response fits");
+        let resp = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(resp.contains("Cache-Control: no-store\r\n"));
+        assert!(resp.ends_with(core::str::from_utf8(SESSION_FINISHED_BODY).unwrap()));
     }
 }
