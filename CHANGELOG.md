@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The portal's `/save` reported success (the committed page and `ProvisioningEvent::Committed`) even when the session refused the commit, e.g. a valid submission after `/factory-reset` or a double submit; the credentials were written to NVS and then lost to the pending reset.
   `/save` now checks the transition before touching NVS and answers `409` once the session is committed, reset-pending, or already saving; `/factory-reset` answers `409` after a commit or during a save.
   The first terminal event now stands: up to 0.5.0 a valid submission after a reset request still resolved the waiter as committed.
+- The bare-metal (`rustyfarian-esp-hal-network`) portal had the same flaw: a valid `/save` after `/factory-reset` (or a second submit after a commit) was still written to flash, signalled `ProvisioningOutcome::Committed`, and emitted `SubmissionAccepted` / `Committed`; `/factory-reset` after a commit still signalled `FactoryResetRequested`.
+  Because the outcome `Signal` keeps only the last value, the later request overrode the first and the user was shown a page for something that did not happen.
+  Both routes now answer `409` without writing flash, signalling, or emitting an event when the session refuses the transition, and `Committed` is signalled only after `PersistOk` is accepted.
 
 ## [0.5.0] - 2026-09-26
 
