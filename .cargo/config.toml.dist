@@ -97,3 +97,8 @@ ESP_IDF_TOOLS_INSTALL_DIR = "global"
 # --ldproxy-linker as a rustc-link-arg.  Cargo only sets RUSTC_LINKER for the
 # host-side build script when it is explicitly present here.
 RUSTC_LINKER = "ldproxy"
+# embuild (esp-idf-sys) derives the project root from the parent of the target-dir,
+# which breaks when --target-dir points outside the workspace (e.g. a RAM disk).
+# Setting this explicitly ensures sdkconfig.defaults is always applied regardless
+# of where the target directory lives.
+ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
