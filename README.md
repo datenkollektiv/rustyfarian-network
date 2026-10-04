@@ -77,6 +77,43 @@ a pattern common in application development but rare in embedded Rust.
 [dr-hal]: https://img.shields.io/docsrs/rustyfarian-esp-hal-network
 [dl-hal]: https://docs.rs/rustyfarian-esp-hal-network
 
+The following diagram shows the dependency hierarchy across tiers and which domains each provides:
+
+```mermaid
+graph TB
+    app["ESP32 firmware application"]
+
+    juggler["juggler (Pure tier)<br/>wifi, mqtt, lora, espnow, ota, provisioning<br/>(no_std, host-testable)"]
+
+    idfnet["rustyfarian-esp-idf-network (ESP-IDF tier)<br/>wifi, mqtt, lora, espnow, ota, provisioning<br/>(std, FreeRTOS)"]
+
+    halnet["rustyfarian-esp-hal-network (Bare-metal tier)<br/>wifi, lora, ota, provisioning<br/>(no_std, async+embassy)"]
+
+    espidf["esp-idf-svc<br/>esp-idf-hal"]
+
+    halupstream["esp-hal, esp-radio, esp-rtos<br/>embassy-net, embassy-executor, embassy-time"]
+
+    app -->|"std, blocking"| idfnet
+    app -->|"no_std, async"| halnet
+    app -->|"pure logic"| juggler
+
+    idfnet --> juggler
+    idfnet --> espidf
+
+    halnet --> juggler
+    halnet --> halupstream
+
+    classDef pureStyle fill:#e8f4f8,stroke:#0066cc,stroke-width:2px,color:#000
+    classDef idfStyle fill:#fff0e6,stroke:#ff9900,stroke-width:2px,color:#000
+    classDef halStyle fill:#e6ffe6,stroke:#00cc00,stroke-width:2px,color:#000
+    classDef upstreamStyle fill:#f9f9f9,stroke:#999,stroke-width:1px,color:#333
+
+    class juggler pureStyle
+    class idfnet idfStyle
+    class halnet halStyle
+    class espidf,halupstream upstreamStyle
+```
+
 > Domain features (`wifi`, `mqtt`, `lora`, `espnow`, `ota`, `provisioning`) and chip features (`esp32c3`/`c6`/`s3`/`esp32`) are selected per dependency; `default = []`.
 > `rustyfarian-esp-idf-network` links to its crate README rather than docs.rs — `esp-idf-sys` cannot build in the docs.rs sandbox.
 
