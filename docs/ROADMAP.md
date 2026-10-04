@@ -1,6 +1,6 @@
 # Roadmap
 
-*Last updated: September 2026*
+*Last updated: October 2026*
 
 ## Context & recent milestones
 
@@ -45,9 +45,10 @@ timeline
               : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
               : rustyfarian-esp-idf-network provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
               : ESP-IDF OTA error mapping hardening — downloader maps every read() error to ServerUnreachable, making DownloadTimeout unreachable, but stalled server and unreachable server are operationally different, distinguish timeout via subclass of esp_http_client error below embedded-svc (see downloader.rs lines 125-129)
+              : OTA decision core hardware validation — run the reconcile recovery contract on a C3 reference consumer (crash before activation, power loss after mark_valid, rollback report delivery), see ota-decision-core-v1
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
-              : OTA security model doc — threat model, rollback policy, signed-manifest question
+              : OTA security model doc — threat model, signed-manifest question (rollback policy covered by the OTA decision core)
               : WifiDriver async/sync trait ADR — document trait duality + first paragraph of the juggler wifi rustdoc
               : Contract tests in juggler wifi — generic run_contract_tests() over any WifiDriver implementation, conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
               : LoRa post-adoption backlog — PartialEq, heapless Deque FIFO, CRC-32, hardware driver, state machine

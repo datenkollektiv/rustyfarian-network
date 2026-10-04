@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::ota::decide_offer` / `OfferDecision` — `decide_update` plus a refused-version loop guard, so a redelivered offer for a version the device rolled back from is `Refused` instead of retried.
+  Requested by rustyfarian-rgb-clock; re-exported from both tier `ota` modules.
+- `juggler::ota::reconcile` with `AttemptRecord`, `BootFacts`, `ReconcileAction`, `SlotId`, and `SlotState` — pure boot reconciliation that turns persisted attempt evidence and bootloader facts into the next action (await health check, refuse image, report rollback, complete, clear, defer), with unparseable versions and failed slot reads expressed as `None`.
+  `ReconcileAction::CompleteAttempt` recovers an interrupted success cleanup: the attempted image is running and `Valid`, so the consumer clears a differing refused version and then the attempt.
+  `ReconcileAction::ClearAttempt` is abandoned-attempt cleanup only and never clears a refusal.
+  `AttemptRecord.boot_selected` is durable evidence that the target slot was selected for boot, persisted after `fetch_and_apply` returns `Ok`, so a new image that crashes before persisting `activated` still reads as a rollback.
+  `BootFacts.report_persisted` / `ReportRollback.report_already_persisted` deduplicate the durable, retried report per attempt.
+  `AttemptRecord.attempt_id` (echoed in `ReportRollback`) is the stable event id for at-least-once report delivery; admission stays blocked while a report is undelivered.
+  A host lifecycle simulation (`crates/juggler/tests/ota_lifecycle.rs`) injects crashes and failed writes at every step.
+  Requested by rustyfarian-rgb-clock; re-exported from both tier `ota` modules.
+- `OtaError::code` — a stable, lowercase snake_case wire code per variant (`checksum_mismatch`, `download_failed`, ...).
+  Requested by rustyfarian-rgb-clock; available through both tier re-exports of `OtaError`.
 - `juggler::mqtt::spawn_connect_thread` — runs an optional connect-time prelude and then the builder subscriptions on one short-lived thread; `spawn_subscriber_thread` is kept as a thin wrapper.
 - `juggler::mqtt::ConnectionEpoch` — generation-checked connected flag so a stale connect helper can never mark a dead connection as connected.
 - `juggler::mqtt::CallbackScope` / `in_callback` — thread-local marker for "inside an MQTT callback", host-tested and lock-free.

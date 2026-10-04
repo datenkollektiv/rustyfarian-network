@@ -17,7 +17,7 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 | `mqtt`         | MQTT state machine, connection state, QoS handling                             | (none)                             | `std` feature adds `spawn_subscriber_thread`, `SubscribeClient`. |
 | `lora`         | LoRa/LoRaWAN types, coding rates, spreading factors, device state machine      | `heapless`, `nb`, `lorawan-device` | Radio-agnostic LoRaWAN join and TX/RX state.                     |
 | `espnow`       | ESP-NOW frame types, MAC address validation                                    | (none)                             | Peer-to-peer frame abstraction.                                  |
-| `ota`          | OTA manifest parsing, firmware update state machine                            | `heapless`, `sha2`                 | Partition-agnostic update orchestration.                         |
+| `ota`          | OTA metadata, SHA-256 verifier, offer and boot-reconciliation decisions        | `heapless`, `sha2`                 | Pure A/B recovery logic; stable `OtaError::code()` wire codes.   |
 | `provisioning` | Provisioning schema profiles, field validators, credential storage abstraction | `heapless`                         | Enables: `wifi`, `mqtt`, `lora`                                  |
 | `mock`         | Test doubles for radio and MQTT drivers                                        | (alloc)                            | Host-testing feature only; never shipped.                        |
 | `std`          | MQTT helper traits: `spawn_subscriber_thread`, `SubscribeClient`, `QoS`        | `anyhow`                           | Host-only; requires `std::thread` and `std::sync`.               |
