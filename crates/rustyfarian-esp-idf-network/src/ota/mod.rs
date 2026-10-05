@@ -18,7 +18,8 @@
 //! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
 //! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
 //! policy ([`decide_update`], [`UpdateDecision`]), the offer decision with its
-//! refused-version guard ([`decide_offer`], [`OfferDecision`]), and boot
+//! refused-version guard and admission gate ([`decide_offer`],
+//! [`OfferDecision`], [`Admission`]), and boot
 //! reconciliation ([`reconcile`], [`AttemptRecord`], [`BootFacts`],
 //! [`ReconcileAction`], [`SlotId`], [`SlotState`]) are re-exported from
 //! `juggler::ota` here — matching the `wifi`/`espnow` domains — so a
@@ -48,9 +49,9 @@ mod flasher;
 // this crate rather than adding a redundant direct `juggler` dependency.
 // `StreamingVerifier` is also used internally below (via this same import).
 pub use juggler::ota::{
-    bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, AttemptRecord, BootFacts,
-    ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState,
-    StreamingVerifier, UpdateDecision, Version,
+    bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, Admission, AttemptRecord,
+    BootFacts, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId,
+    SlotState, StreamingVerifier, UpdateDecision, Version,
 };
 
 use std::io::Write;

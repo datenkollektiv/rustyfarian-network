@@ -16,10 +16,12 @@ sequenceDiagram
     participant T as OtaSession or OtaManager (tier crate)
     participant B as Bootloader
 
-    App->>J: decide_offer(running, offered, refused)
+    App->>J: decide_offer(running, offered, refused, admission)
     J-->>App: OfferDecision
-    alt Skip, Reject, Refused, an open attempt, or an undelivered report
+    alt Skip, Reject, or Refused
         App->>App: report the refusal, no download
+    else Blocked (attempt or report undelivered)
+        App->>App: retain the offer, no download
     else Apply
         App->>App: persist AttemptRecord (new attempt_id, version, target slot)
         App->>T: fetch_and_apply(url, metadata)
@@ -72,17 +74,28 @@ Around `OtaSession`, the application had to grow its own decision logic, which t
 `UpdateDecision` is not `#[non_exhaustive]`, so adding a variant would break exhaustive matches; add a sibling instead:
 
 ```rust
+pub enum Admission {
+    Open,
+    Blocked,
+}
+
+impl Admission {
+    pub fn from_records(attempt_exists: bool, report_undelivered: bool) -> Self;
+}
+
 pub enum OfferDecision {
     Apply,
     Skip,
     Reject,
     Refused,
+    Blocked,
 }
 
-pub fn decide_offer(running: Version, offered: Version, refused: Option<Version>) -> OfferDecision;
+pub fn decide_offer(running: Version, offered: Version, refused: Option<Version>, admission: Admission) -> OfferDecision;
 ```
 
-`Refused` wins only when `offered` would otherwise be `Apply` and equals `refused`; `Skip` and `Reject` keep their meaning.
+`decide_offer` now takes an `Admission` parameter, computed from `Admission::from_records(attempt_exists, report_undelivered)` — `Blocked` if either is true.
+Precedence: `Skip`, `Reject`, and `Refused` are unchanged. Only an otherwise-`Apply` becomes `Blocked`; if `Blocked` applies, the consumer retains the offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates once admission reopens.
 The consumer persists `refused` (set when a rollback leaves a version, kept until a different version passes the health check after `mark_valid`); v1 keeps a single refused version.
 
 ### 2. Boot reconciliation as a pure function
@@ -219,7 +232,7 @@ stateDiagram-v2
 - **AwaitHealthCheck:** the attempted image is running and awaits verification. Persist `activated = true` if `mark_activated` is set, then run the health policy. After `mark_valid()` succeeds, clear a refused version that differs from the running one, then clear the attempt (same cleanup as `CompleteAttempt`). A reset or failed write in between is recovered by the next boot's `CompleteAttempt`.
 - **CompleteAttempt:** the attempted image is running, matches the manifest, and is `Valid`; the update succeeded but cleanup may be unfinished. Clear a refused version that differs from the running one, then clear the attempt. If the refusal clear fails, keep the attempt (retried at runtime or next boot).
 - **ClearAttempt:** the attempt did not produce evidence of a healthy different version. Never clears a refused version; used when the slot never booted, or booted but never passed health checks, or the download was interrupted before the boot slot was switched.
-- **RefuseImage:** the attempted image is running but versions do not match. Persist the activation mark (if `mark_activated`), even if that write fails. Persist the rollback request; never mark valid; roll back; keep the attempt.
+- **RefuseImage:** the attempted image is running but versions do not match. Persist the activation mark (if `mark_activated`), even if that write fails. Never mark valid; roll back; keep the attempt. (A consumer rollback request layer is optional bookkeeping; persist it separately if used.)
 - **ReportRollback:** the previous image runs and the attempted image was activated or selected for boot before rolling back. Persist the rollback report (unless `report_already_persisted`), then persist the refused version (if `left` is `Some`). Do not treat as best-effort; if either write fails keep the attempt; clear the attempt only after both writes are durable.
 - **Defer:** keep all records and retry at runtime with refreshed facts (re-read the update slot) or at the next boot. No persistence action required.
 
@@ -230,11 +243,11 @@ The backend deduplication key is the tuple `(device identity, attempt_id)`.
 Skipped ids are harmless (gaps in the sequence), but reused ids can suppress a real report.
 The counter survives the attempt deletion and must be reserved durably **before** the update starts: write the next counter value in separate durable storage first, then write the attempt record.
 This order ensures the counter always advances and is never shadowed by a failed attempt write.
-Factory reset and counter exhaustion require a consumer identity and reset policy (e.g., a per-install epoch alongside the id).
+Factory reset and counter exhaustion require a consumer identity and reset policy; recommended: a random 32-bit install epoch generated when the counter is first created (first boot or after flash erase), stored with the counter, sent with every report for backend deduplication on (device identity, epoch, attempt_id).
 
 #### Reporting
 
-`report_persisted` is an armed (persisted) report state, not a request; read it after confirming any pending rollback request, and fail-safe if the read fails (do not call `reconcile`).
+`report_persisted` means a rollback report for THIS attempt is persisted (delivered or not), correlated by `attempt_id`. If the consumer maintains an optional rollback request layer, resolve it before reading `report_persisted`. Fail-safe if the read fails: do not call `reconcile`.
 The report belongs to the current attempt only; correlate by `attempt_id`.
 Delivery is at-least-once: the report carries `attempt_id` as a stable event id for backend deduplication.
 v1 maintains a single report record: admission is blocked while an undelivered report exists, in addition to while an attempt record exists (a second failed update while reporting is offline cannot overwrite the first report).
@@ -242,7 +255,8 @@ v1 maintains a single report record: admission is blocked while an undelivered r
 #### Refusal lifetime and admission
 
 A refused version is kept until a DIFFERENT version passes the health check (after `mark_valid`), not cleared on acceptance or download; v1 keeps a single refused version (explicitly limited history).
-While any attempt record exists, no new offer is accepted (`Defer`, `AwaitHealthCheck`, `RefuseImage`, or `ReportRollback` with failed writes).
+New offer admission is controlled by `Admission::from_records(attempt_exists, report_undelivered)`: if either is true, an offer that would otherwise be `Apply` becomes `Blocked` (`Skip`, `Reject` and `Refused` take precedence). The consumer retains a `Blocked` offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates it once admission reopens (after `ClearAttempt`, `CompleteAttempt`, or report delivered).
+A retained MQTT command is not re-triggered by the broker's retain flag; the operator must republish it or the consumer must resubscribe.
 
 #### Runtime retry
 
@@ -323,6 +337,8 @@ Report the HTTP status (`DownloadFailed.status`) and operation context alongside
 |                                    `attempt_id` as event id | Version + slot does not identify repeated attempts; enables at-least-once delivery with backend dedup                                                   | Dedup by version + slot                                                                                        |
 |             Admission blocked while a report is undelivered | One report record cannot hold a backlog                                                                                                                 | Durable report queue (deferred)                                                                                |
 |                                  `Unknown` stays conclusive | It means no otadata record or rollback disabled, never a failed read                                                                                    | Defer on `Unknown` (wedges rollback-disabled devices)                                                          |
+|                    `OfferDecision::Blocked` via `Admission` | Admission was doc-only and re-derived per consumer; exported as `Admission::from_records(attempt_exists, report_undelivered)` → `Blocked`               | Exported `admit()` bool helper (breaks Decisions pattern of *reasons* for outcomes)                            |
+|                        Write sequences stay in the consumer | `ReportRollback`/`CompleteAttempt`/`ClearAttempt` persistence order is storage-specific; no one-size-fits-all trait                                     | Exported helpers for these sequences (couples storage into juggler)                                            |
 
 </details>
 
@@ -341,6 +357,23 @@ Report the HTTP status (`DownloadFailed.status`) and operation context alongside
   Rollback reason stays the consumer's naming; the decision only reports that a rollback occurred.
 - [x] esp-idf-svc folds `ABORTED` and `INVALID` into `SlotState::Invalid` (`esp-idf-svc 0.53 src/ota.rs:643`); does `SlotState` need to distinguish them for the esp-hal tier?
   `SlotState` keeps a single `Invalid` variant; no decision distinguishes them.
+
+## Consumer feedback (rgb-clock migration)
+
+Collected while migrating `rustyfarian-rgb-clock` onto `255ca6e`, before this branch merges.
+None of these block the consumer; each is either worked around downstream or accepted for v1.
+
+- [x] **Rollbacks without an attempt have no model.**
+  Resolved: `health_deadline` and `unhealthy` rollbacks occur during `AwaitHealthCheck` with the attempt present, so they flow through `ReportRollback`. Rollback reason is consumer naming (persist next to the attempt before rolling back, attach when `ReportRollback` fires).
+  Operator rollbacks after `mark_valid` have no attempt and stay outside `reconcile` in v1; if they share the report record they block admission and take their event id from the same durable counter.
+- [x] **The consumer glue lives only in the test.**
+  Resolved: admission adopted as `Admission { Open, Blocked }` with `from_records(attempt_exists, report_undelivered)`; write sequences stay consumer-side with reason (storage-specific).
+- [x] **A refused retained offer is not re-triggered.**
+  Resolved: `OfferDecision::Blocked` signals the case; the consumer keeps the offer and re-evaluates it once admission reopens, since a retained MQTT command is not redelivered without resubscribing (otherwise the operator republishes).
+- [x] **Id epoch policy is left open.**
+  Resolved: recommended epoch scheme — random 32-bit install epoch generated at first counter creation, stored with counter, sent with every report; backend dedupes on (device identity, epoch, attempt_id).
+- [x] **`RefuseImage { mark_activated }` overlaps with the consumer's rollback request.**
+  Resolved: `RefuseImage` decoupled from consumer's rollback-request layer. Next boot relies on `activated`/`boot_selected` in attempt record; if rollback never happened the same image boots `PendingVerify` and `RefuseImage` recurs.
 
 ## Validation
 
@@ -367,5 +400,7 @@ The simulation now also splits send from ack, models an offline reporting channe
 - 2026-10-04 — Clarified after a PR review: the exhaustive oracle was a one-off check outside the repository (`tmp/`, not committed); the committed coverage is the unit tests plus `crates/juggler/tests/ota_lifecycle.rs`.
 - 2026-10-04 — Third review: `CompleteAttempt` fixes interrupted success cleanup leaving a stale refusal; attempt-id scope and persistence order documented; boot-slot window limitation qualified.
 - 2026-10-04 — Documentation pass: record-lifecycle state diagram, download-failure and CompleteAttempt recovery paths in the sequence diagram, section 2.1 consolidated.
+- 2026-10-05 — Consumer feedback from the rgb-clock migration design (pinned at `255ca6e`) added; hardware validation on the ESP32-C3 pending.
+- 2026-10-05 — Consumer feedback resolved: admission folded into `decide_offer` (`Admission`, `OfferDecision::Blocked`), `RefuseImage`/report docs decoupled from consumer's rollback request, epoch scheme recommended; write-sequence helpers declined.
 
 </details>

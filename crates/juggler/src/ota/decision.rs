@@ -64,11 +64,65 @@ pub fn decide_update(running: Version, offered: Version) -> UpdateDecision {
 
 /// Experimental: API may change before 1.0.
 ///
+/// Whether the device may admit a new firmware offer right now.
+///
+/// Build it with [`Admission::from_records`] from two facts the consumer reads
+/// from its own storage, and pass it to [`decide_offer`].
+///
+/// Admission is [`Blocked`](Admission::Blocked) while either condition holds:
+///
+/// - An attempt record exists (see [`AttemptRecord`](super::AttemptRecord)).
+///   Overwriting it with a new attempt destroys unresolved evidence of what
+///   happened to the previous one (see the [`reconcile`](super::reconcile)
+///   module docs).
+/// - A report is undelivered.
+///   v1 keeps a single report record, so a second report must not overwrite
+///   it.
+///   This includes consumer-originated rollback reports (for example an
+///   operator rollback after `mark_valid`) if the consumer stores them in the
+///   same record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// No attempt record and no undelivered report: a new offer may start.
+    Open,
+    /// An attempt record or an undelivered report exists: do not start a new
+    /// attempt yet.
+    Blocked,
+}
+
+impl Admission {
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Derive the admission state: [`Admission::Blocked`] if an attempt record
+    /// exists or a report is undelivered, otherwise [`Admission::Open`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use juggler::ota::Admission;
+    ///
+    /// assert_eq!(Admission::from_records(false, false), Admission::Open);
+    /// assert_eq!(Admission::from_records(true, false), Admission::Blocked);
+    /// assert_eq!(Admission::from_records(false, true), Admission::Blocked);
+    /// ```
+    #[must_use]
+    pub fn from_records(attempt_exists: bool, report_undelivered: bool) -> Self {
+        if attempt_exists || report_undelivered {
+            Self::Blocked
+        } else {
+            Self::Open
+        }
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
 /// The outcome of [`decide_offer`]: [`UpdateDecision`] plus a loop guard for
-/// versions the device previously rolled back from.
+/// versions the device previously rolled back from, and the admission gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfferDecision {
-    /// The offered version is strictly newer and has not been refused.
+    /// The offered version is strictly newer, has not been refused, and
+    /// admission is open.
     Apply,
     /// The offered version is identical to the running one.
     Skip,
@@ -77,16 +131,23 @@ pub enum OfferDecision {
     /// The offered version would be applied, but the device already rolled
     /// back from exactly this version and must not retry it.
     Refused,
+    /// The offered version would be applied, but admission is
+    /// [`Blocked`](Admission::Blocked).
+    /// Keep the offer and re-evaluate it once admission reopens.
+    Blocked,
 }
 
 /// Experimental: API may change before 1.0.
 ///
 /// Decide whether to apply an offered firmware version, honouring a
-/// previously refused version.
+/// previously refused version and the admission gate.
 ///
 /// Delegates to [`decide_update`]: `Skip` and `Reject` are returned
-/// unchanged, and `Apply` becomes [`OfferDecision::Refused`] if and only if
-/// `refused == Some(offered)`.
+/// unchanged.
+/// An otherwise-`Apply` becomes [`OfferDecision::Refused`] if and only if
+/// `refused == Some(offered)`, and otherwise [`OfferDecision::Blocked`] if
+/// `admission` is [`Admission::Blocked`].
+/// `Refused` wins over `Blocked`: a refused version is never worth retrying.
 ///
 /// The consumer persists `refused`: set it when a rollback leaves a version
 /// (see [`ReconcileAction::ReportRollback`](super::ReconcileAction::ReportRollback)).
@@ -105,33 +166,51 @@ pub enum OfferDecision {
 ///
 /// # Admission
 ///
-/// While an attempt record exists, do not call this to accept a new offer:
-/// overwriting the record destroys unresolved evidence (see the
-/// [`reconcile`](super::reconcile) module docs).
-/// Admission is also blocked while an undelivered report exists: v1 keeps a
-/// single report record, and a second rollback must not overwrite it.
-/// Refuse the offer (and keep the retained command) until the report is
-/// delivered.
+/// Build `admission` with [`Admission::from_records`]: it is blocked while an
+/// attempt record exists (overwriting it destroys unresolved evidence, see the
+/// [`reconcile`](super::reconcile) module docs) or a report is undelivered
+/// (v1 keeps a single report record).
+///
+/// On [`OfferDecision::Blocked`] the offer is not dropped by the core, and
+/// nothing re-triggers it: a retained MQTT command is not redelivered without
+/// resubscribing.
+/// The consumer must keep the offer (for example in RAM) and call
+/// `decide_offer` again once admission reopens, that is after
+/// `ClearAttempt`, `CompleteAttempt`, or delivery of the pending report.
+/// Otherwise the operator must republish the offer.
 ///
 /// # Example
 ///
 /// ```
-/// use juggler::ota::{decide_offer, OfferDecision, Version};
+/// use juggler::ota::{decide_offer, Admission, OfferDecision, Version};
 ///
 /// let running = Version::new(1, 2, 0);
 /// let offered = Version::new(1, 3, 0);
 ///
-/// assert_eq!(decide_offer(running, offered, None), OfferDecision::Apply);
 /// assert_eq!(
-///     decide_offer(running, offered, Some(offered)),
+///     decide_offer(running, offered, None, Admission::Open),
+///     OfferDecision::Apply
+/// );
+/// assert_eq!(
+///     decide_offer(running, offered, Some(offered), Admission::Open),
 ///     OfferDecision::Refused
 /// );
+/// assert_eq!(
+///     decide_offer(running, offered, None, Admission::from_records(true, false)),
+///     OfferDecision::Blocked
+/// );
 /// ```
-pub fn decide_offer(running: Version, offered: Version, refused: Option<Version>) -> OfferDecision {
+pub fn decide_offer(
+    running: Version,
+    offered: Version,
+    refused: Option<Version>,
+    admission: Admission,
+) -> OfferDecision {
     match decide_update(running, offered) {
         UpdateDecision::Skip => OfferDecision::Skip,
         UpdateDecision::Reject => OfferDecision::Reject,
         UpdateDecision::Apply if refused == Some(offered) => OfferDecision::Refused,
+        UpdateDecision::Apply if admission == Admission::Blocked => OfferDecision::Blocked,
         UpdateDecision::Apply => OfferDecision::Apply,
     }
 }
@@ -213,21 +292,33 @@ mod tests {
     }
 
     #[test]
+    fn admission_from_records_table() {
+        assert_eq!(Admission::from_records(false, false), Admission::Open);
+        assert_eq!(Admission::from_records(true, false), Admission::Blocked);
+        assert_eq!(Admission::from_records(false, true), Admission::Blocked);
+        assert_eq!(Admission::from_records(true, true), Admission::Blocked);
+    }
+
+    #[test]
     fn decide_offer_table() {
         let v = Version::new;
+        let open = Admission::Open;
+        let blocked = Admission::Blocked;
         let cases = [
-            // (running, offered, refused, expected)
-            (v(1, 0, 0), v(2, 0, 0), None, OfferDecision::Apply),
+            // (running, offered, refused, admission, expected)
+            (v(1, 0, 0), v(2, 0, 0), None, open, OfferDecision::Apply),
             (
                 v(1, 0, 0),
                 v(2, 0, 0),
                 Some(v(2, 0, 0)),
+                open,
                 OfferDecision::Refused,
             ),
             (
                 v(1, 0, 0),
                 v(2, 0, 0),
                 Some(v(1, 5, 0)),
+                open,
                 OfferDecision::Apply,
             ),
             // refused == running: still Skip.
@@ -235,21 +326,24 @@ mod tests {
                 v(1, 0, 0),
                 v(1, 0, 0),
                 Some(v(1, 0, 0)),
+                open,
                 OfferDecision::Skip,
             ),
-            (v(1, 0, 0), v(1, 0, 0), None, OfferDecision::Skip),
+            (v(1, 0, 0), v(1, 0, 0), None, open, OfferDecision::Skip),
             // refused older offered: still Reject.
             (
                 v(2, 0, 0),
                 v(1, 0, 0),
                 Some(v(1, 0, 0)),
+                open,
                 OfferDecision::Reject,
             ),
-            (v(2, 0, 0), v(1, 0, 0), None, OfferDecision::Reject),
+            (v(2, 0, 0), v(1, 0, 0), None, open, OfferDecision::Reject),
             (
                 v(2, 0, 0),
                 v(1, 0, 0),
                 Some(v(3, 0, 0)),
+                open,
                 OfferDecision::Reject,
             ),
             // refused differs from offered: Apply.
@@ -257,14 +351,41 @@ mod tests {
                 v(1, 0, 0),
                 v(1, 1, 0),
                 Some(v(1, 2, 0)),
+                open,
                 OfferDecision::Apply,
             ),
+            // Blocked turns only an otherwise-Apply into Blocked.
+            (
+                v(1, 0, 0),
+                v(2, 0, 0),
+                None,
+                blocked,
+                OfferDecision::Blocked,
+            ),
+            (
+                v(1, 0, 0),
+                v(2, 0, 0),
+                Some(v(1, 5, 0)),
+                blocked,
+                OfferDecision::Blocked,
+            ),
+            // Refused beats Blocked.
+            (
+                v(1, 0, 0),
+                v(2, 0, 0),
+                Some(v(2, 0, 0)),
+                blocked,
+                OfferDecision::Refused,
+            ),
+            // Skip and Reject are unaffected by Blocked.
+            (v(1, 0, 0), v(1, 0, 0), None, blocked, OfferDecision::Skip),
+            (v(2, 0, 0), v(1, 0, 0), None, blocked, OfferDecision::Reject),
         ];
-        for (running, offered, refused, expected) in cases {
+        for (running, offered, refused, admission, expected) in cases {
             assert_eq!(
-                decide_offer(running, offered, refused),
+                decide_offer(running, offered, refused, admission),
                 expected,
-                "running={running:?} offered={offered:?} refused={refused:?}"
+                "running={running:?} offered={offered:?} refused={refused:?} admission={admission:?}"
             );
         }
     }

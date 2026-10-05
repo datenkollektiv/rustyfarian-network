@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `juggler::ota::decide_offer` / `OfferDecision` — `decide_update` plus a refused-version loop guard, so a redelivered offer for a version the device rolled back from is `Refused` instead of retried.
+- `juggler::ota::decide_offer` / `OfferDecision` / `Admission` — `decide_update` plus a refused-version loop guard, so a redelivered offer for a version the device rolled back from is `Refused` instead of retried, and an admission gate (`Admission::from_records(attempt_exists, report_undelivered)`) so an offer arriving while an attempt record or undelivered report exists is `OfferDecision::Blocked` and must be kept and re-evaluated once admission reopens.
   Requested by rustyfarian-rgb-clock; re-exported from both tier `ota` modules.
 - `juggler::ota::reconcile` with `AttemptRecord`, `BootFacts`, `ReconcileAction`, `SlotId`, and `SlotState` — pure boot reconciliation that turns persisted attempt evidence and bootloader facts into the next action (await health check, refuse image, report rollback, complete, clear, defer), with unparseable versions and failed slot reads expressed as `None`.
   `ReconcileAction::CompleteAttempt` recovers an interrupted success cleanup: the attempted image is running and `Valid`, so the consumer clears a differing refused version and then the attempt.
