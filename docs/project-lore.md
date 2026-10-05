@@ -433,6 +433,32 @@ Strip `userinfo` (split at `://`, drop everything up to the last `@` in the auth
 The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
 See `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs::url_for_log`.
 
+## OTA Consumer Runtime
+
+**ESP-IDF NVS `set` replaces a key stored with another type — no `ESP_ERR_NVS_TYPE_MISMATCH` on write.**
+On a typed read, NVS returns "not found" if the key holds another type; but on `nvs_set_u8` / `nvs_set_u32`, ESP-IDF v5.3.3 `nvs_storage.cpp` `Storage::writeItem` (lines 397, 474, 514) looks the key up with `ItemType::ANY`, writes the new entry, then erases the old one — all in one commit — so `set` succeeds even if the key was previously a string or a different numeric type (with `CONFIG_NVS_LEGACY_DUP_KEYS_COMPATIBILITY` off; under the legacy mode an unreachable duplicate would linger, but a typed read never sees it).
+Consequence: repairing a corrupt (wrong-type) key needs no remove-then-set window; a direct `set` clears both the old entry and its type tag in a single operation — see `repair_corrupt` in `crates/juggler/src/ota/persist/store.rs`.
+
+**serde silently ignores `deny_unknown_fields` on unit variants of an internally tagged enum.**
+The derive macro `#[serde(tag = "status", deny_unknown_fields)]` has a known limitation: `deny_unknown_fields` is silently ignored for unit variants (`Downloading`) in an internally tagged enum.
+Test: `{"status":"downloading","x":1}` deserializes as `OtaStatus::Downloading` with no error, even though the schema forbids unknown fields.
+Consequence: the wire status deserializer is hand-written (`crates/juggler/src/ota/wire/status.rs`) to enforce strict field rejection.
+Also: `FieldValue` and `FieldKey` visitors pre-check JSON shape (the first `{` and the `status` value); error messages are fixed text and never quote the input, so type confusion or out-of-range numbers cannot leak the wire format for fuzzing.
+
+**`EspOta::new()` returns `ESP_ERR_INVALID_STATE` (0x103) while another `EspOta` is alive.**
+`esp-idf-svc 0.53.0` `src/ota.rs` lines 455–461 guard `EspOta` as a process singleton via a static `taken` flag: if true, `EspOta::new()` fails with `ESP_ERR_INVALID_STATE`; the same error from a later read of an open handle is a plain failure, not "busy".
+This workspace's boot-facts reader treats `ESP_ERR_INVALID_STATE` from `new()` only as "handle in use" and retries boundedly (`read_hardware_facts` in `crates/rustyfarian-esp-idf-network/src/ota/boot_facts.rs`).
+Consequence: the busy-code constant is pinned via compile-time assertions (line 64: `assert!(BUSY_CODE == 0x103)`), and this module must be re-checked on an `esp-idf-svc` bump, because a move to another error code would silently break busy detection.
+
+**A delivered rollback report's stale `rb_id` can swallow a new report after attempt-counter loss.**
+Delivered reports keep their `rb_id` (the id of the failed attempt) for deduplication at the backend.
+If `att_ctr` is lost (NVS corruption, power loss), the next attempt id restarts from stored records.
+If `next_attempt_id()` floored only against `att_ctr` (not `rb_id`/`att_id`/`rq_id`), and the counter is lost, a new attempt could reissue the same id as a stale delivered report.
+The reconcile logic then sees: old report with `rb_id=X`, new attempt with `att_id=X`, checks if the report is pending (`rb == 1`), finds it is not (`rb == 0`, delivered), and silently adopts nothing — the new report is lost and never sent.
+Fix (lines 559–564 in `store.rs`): `next_attempt_id()` floors at the highest id from all four keys (`att_ctr`, `att_id`, `rb_id`, `rq_id`), and only a still-pending report (`rb == 1`) is adopted; a delivered report (`rb == 0`) with a matching id is not, so a fresh report is created.
+Test coverage: `crates/juggler/src/ota/persist/tests/counter_loss.rs` lines 104–119 (`a_lost_counter_does_not_swallow_the_next_rollback_report`) and lines 122–134 (`a_delivered_report_with_the_attempts_id_is_not_adopted`).
+Lesson: never let an id that is still referenced (in any stored record) be reissued; when a counter is lost, all stored ids become floor references.
+
 ## ESP-NOW
 
 The detailed analysis, decision, and consequence trail for the channel-stability work

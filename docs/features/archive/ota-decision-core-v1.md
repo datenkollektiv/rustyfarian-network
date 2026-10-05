@@ -74,9 +74,14 @@ Around `OtaSession`, the application had to grow its own decision logic, which t
 `UpdateDecision` is not `#[non_exhaustive]`, so adding a variant would break exhaustive matches; add a sibling instead:
 
 ```rust
+pub enum BlockedBy {
+    AttemptUnresolved,
+    ReportPending,
+}
+
 pub enum Admission {
     Open,
-    Blocked,
+    Blocked(BlockedBy),
 }
 
 impl Admission {
@@ -94,8 +99,8 @@ pub enum OfferDecision {
 pub fn decide_offer(running: Version, offered: Version, refused: Option<Version>, admission: Admission) -> OfferDecision;
 ```
 
-`decide_offer` now takes an `Admission` parameter, computed from `Admission::from_records(attempt_exists, report_undelivered)` — `Blocked` if either is true.
-Precedence: `Skip`, `Reject`, and `Refused` are unchanged. Only an otherwise-`Apply` becomes `Blocked`; if `Blocked` applies, the consumer retains the offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates once admission reopens.
+`decide_offer` now takes an `Admission` parameter, computed from `Admission::from_records(attempt_exists, report_undelivered)` — `Blocked(BlockedBy::AttemptUnresolved)` if an attempt record exists, `Blocked(BlockedBy::ReportPending)` if a report is undelivered, else `Open`.
+Precedence: `Skip`, `Reject`, and `Refused` are unchanged. Only an otherwise-`Apply` becomes `Blocked`; if `Blocked` applies, the consumer retains the offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates once admission reopens; the `BlockedBy` cause allows the consumer to log which condition blocked it.
 The consumer persists `refused` (set when a rollback leaves a version, kept until a different version passes the health check after `mark_valid`); v1 keeps a single refused version.
 
 ### 2. Boot reconciliation as a pure function
@@ -255,7 +260,7 @@ v1 maintains a single report record: admission is blocked while an undelivered r
 #### Refusal lifetime and admission
 
 A refused version is kept until a DIFFERENT version passes the health check (after `mark_valid`), not cleared on acceptance or download; v1 keeps a single refused version (explicitly limited history).
-New offer admission is controlled by `Admission::from_records(attempt_exists, report_undelivered)`: if either is true, an offer that would otherwise be `Apply` becomes `Blocked` (`Skip`, `Reject` and `Refused` take precedence). The consumer retains a `Blocked` offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates it once admission reopens (after `ClearAttempt`, `CompleteAttempt`, or report delivered).
+New offer admission is controlled by `Admission::from_records(attempt_exists, report_undelivered)`: if `attempt_exists` is true, `Blocked(BlockedBy::AttemptUnresolved)` is returned (attempt takes precedence); else if `report_undelivered` is true, `Blocked(BlockedBy::ReportPending)` is returned; else `Open`. An offer that would otherwise be `Apply` becomes `Blocked` in either case (`Skip`, `Reject` and `Refused` take precedence). The consumer retains a `Blocked` offer (e.g. in RAM for MQTT, or durable for other bindings) and re-evaluates it once admission reopens (after `ClearAttempt`, `CompleteAttempt`, or report delivered).
 A retained MQTT command is not re-triggered by the broker's retain flag; the operator must republish it or the consumer must resubscribe.
 
 #### Runtime retry
@@ -367,7 +372,7 @@ None of these block the consumer; each is either worked around downstream or acc
   Resolved: `health_deadline` and `unhealthy` rollbacks occur during `AwaitHealthCheck` with the attempt present, so they flow through `ReportRollback`. Rollback reason is consumer naming (persist next to the attempt before rolling back, attach when `ReportRollback` fires).
   Operator rollbacks after `mark_valid` have no attempt and stay outside `reconcile` in v1; if they share the report record they block admission and take their event id from the same durable counter.
 - [x] **The consumer glue lives only in the test.**
-  Resolved: admission adopted as `Admission { Open, Blocked }` with `from_records(attempt_exists, report_undelivered)`; write sequences stay consumer-side with reason (storage-specific).
+  Resolved: admission adopted as `Admission { Open, Blocked }` (since 2026-10-05 `Blocked(BlockedBy)`) with `from_records(attempt_exists, report_undelivered)`; write sequences stay consumer-side with reason (storage-specific).
 - [x] **A refused retained offer is not re-triggered.**
   Resolved: `OfferDecision::Blocked` signals the case; the consumer keeps the offer and re-evaluates it once admission reopens, since a retained MQTT command is not redelivered without resubscribing (otherwise the operator republishes).
 - [x] **Id epoch policy is left open.**
@@ -402,5 +407,6 @@ The simulation now also splits send from ack, models an offline reporting channe
 - 2026-10-04 — Documentation pass: record-lifecycle state diagram, download-failure and CompleteAttempt recovery paths in the sequence diagram, section 2.1 consolidated.
 - 2026-10-05 — Consumer feedback from the rgb-clock migration design (pinned at `255ca6e`) added; hardware validation on the ESP32-C3 pending.
 - 2026-10-05 — Consumer feedback resolved: admission folded into `decide_offer` (`Admission`, `OfferDecision::Blocked`), `RefuseImage`/report docs decoupled from consumer's rollback request, epoch scheme recommended; write-sequence helpers declined.
+- 2026-10-05 — API refinement after sub-project B review: `Admission::Blocked(BlockedBy)` typed variant with `AttemptUnresolved` (attempt takes precedence) and `ReportPending` causes; `from_records` semantics updated to document precedence; docs updated for Refusal lifetime and admission section.
 
 </details>

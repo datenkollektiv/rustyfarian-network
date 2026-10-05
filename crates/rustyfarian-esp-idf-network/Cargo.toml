@@ -22,7 +22,18 @@ features = ["wifi", "mqtt", "lora", "espnow", "ota", "provisioning"]
 ignored = ["embuild"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(esp_idf_esp_wifi_softap_support)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(esp_idf_esp_wifi_softap_support)',
+    'cfg(esp_idf_idf_target_esp32)',
+    'cfg(esp_idf_idf_target_esp32s2)',
+    'cfg(esp_idf_idf_target_esp32s3)',
+    'cfg(esp_idf_idf_target_esp32c2)',
+    'cfg(esp_idf_idf_target_esp32c3)',
+    'cfg(esp_idf_idf_target_esp32c5)',
+    'cfg(esp_idf_idf_target_esp32c6)',
+    'cfg(esp_idf_idf_target_esp32h2)',
+    'cfg(esp_idf_idf_target_esp32p4)',
+] }
 
 [lib]
 name = "rustyfarian_esp_idf_network"
@@ -78,7 +89,7 @@ lora = [
 espnow = ["juggler/wifi", "juggler/espnow"]
 
 # ota: Streaming download + SHA-256 verify + partition swap.
-ota = ["juggler/ota", "dep:embedded-svc"]
+ota = ["juggler/ota", "juggler/ota-wire", "dep:embedded-svc"]
 
 # provisioning: SoftAP captive portal.
 provisioning = ["wifi", "juggler/provisioning", "juggler/std", "dep:embedded-svc"]
@@ -151,3 +162,7 @@ required-features = ["provisioning"]
 [[example]]
 name = "idf_c3_provision_mqtt"
 required-features = ["wifi", "mqtt", "provisioning"]
+
+[[example]]
+name = "idf_c3_ota_runtime"
+required-features = ["wifi", "mqtt", "ota"]

@@ -13,12 +13,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MQTT_USER");
     println!("cargo:rerun-if-env-changed=MQTT_CLIENT_ID");
     println!("cargo:rerun-if-env-changed=OTA_URL");
+    // Rerun triggers for the OTA runtime example (firmware version, topic prefix).
+    println!("cargo:rerun-if-env-changed=FIRMWARE_VERSION");
+    println!("cargo:rerun-if-env-changed=OTA_TOPIC_PREFIX");
+    println!("cargo:rerun-if-env-changed=OTA_DEMO_UNHEALTHY");
+    println!("cargo:rerun-if-env-changed=OTA_FAILURE_DEADLINE_SECS");
     // Rerun trigger for sdkconfig (ESP-IDF config changes require a rebuild).
     // `sdkconfig.defaults` lives at the workspace root, not this crate's root;
     // `rerun-if-changed` paths are relative to the crate dir, so reach up two
     // levels (crates/rustyfarian-esp-idf-network/ -> workspace root).
     println!("cargo:rerun-if-changed=../../sdkconfig.defaults");
     println!("cargo:rerun-if-changed=../../sdkconfig.sta-only.defaults");
+    println!("cargo:rerun-if-changed=../../sdkconfig.ota.defaults");
+    println!("cargo:rerun-if-changed=../../partitions.ota.csv");
     // Required for ESP-IDF ldproxy linker argument injection.
     embuild::espidf::sysenv::output();
 }

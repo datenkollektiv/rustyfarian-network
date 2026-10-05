@@ -61,6 +61,10 @@ ota = [
     "embassy",
 ]
 
+# ota-wire: opt-in OTA wire contract (command/manifest/status JSON). Pulls serde, serde_json and `alloc`;
+# the consumer must provide a global allocator (`wifi` brings `esp-alloc`).
+ota-wire = ["ota", "juggler/ota-wire"]
+
 # provisioning: SoftAP captive-portal (always requires wifi + embassy).
 # `esp-storage` is required for the flash credential store on RISC-V targets.
 provisioning = [
@@ -207,7 +211,7 @@ embassy-time     = { workspace = true }
 # [dependencies] entry so that `cfg(test)` compilation with --no-default-features
 # can reach juggler::ota, juggler::provisioning, juggler::wifi, and juggler::mqtt
 # without pulling in any chip-specific hardware crate.
-juggler = { workspace = true, default-features = false, features = ["ota", "provisioning", "wifi", "mqtt"] }
+juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt"] }
 
 [[example]]
 name = "hal_c3_connect_async"

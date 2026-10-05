@@ -33,13 +33,15 @@ The ESP-IDF and esp-hal tiers implement the traits and hardware lifecycle; they 
 All build, test, lint, and flash operations go through `just` recipes — never invoke `cargo` directly for these.
 
 ```bash
-just setup-toolchain       # one-time: install ESP toolchain via espup
-just setup-cargo-config    # one-time: copy .cargo/config.toml.dist → .cargo/config.toml
+just setup                 # idempotent: create .cargo/config.toml if missing, install ESP toolchain via espup, run doctor
 just fmt                   # cargo fmt — modifies files
-just verify                # fmt-check + deny + check + clippy — non-modifying, must pass clean
+just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
 just clippy-hal            # clippy the bare-metal crate on its own C3/C6 targets (not in verify)
 just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
-just test                  # all platform-independent unit tests (no ESP toolchain needed)
+just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
+just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify)
+just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify)
+just test                  # all platform-independent unit tests (no ESP toolchain needed; in verify)
 just build-example <name>  # build a hardware example with auto-detected chip + target
 just flash <name>          # build + flash to a connected board
 just run <name>            # flash + serial monitor

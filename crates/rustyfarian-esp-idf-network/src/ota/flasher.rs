@@ -6,7 +6,7 @@
 use esp_idf_svc::ota::{EspOta, EspOtaUpdate};
 use esp_idf_svc::sys::esp_ota_get_next_update_partition;
 
-use juggler::ota::OtaError;
+use juggler::ota::{ActivationPermit, OtaError};
 
 /// Manages the OTA flash partition handle.
 pub struct FirmwareFlasher {
@@ -103,7 +103,11 @@ impl<'a> OtaWriter<'a> {
     ///
     /// Sets the new partition as the boot partition.
     /// The device will boot from the new firmware on the next reboot.
-    pub fn complete(self) -> Result<(), OtaError> {
+    ///
+    /// Takes an [`ActivationPermit`], obtainable only from a successful
+    /// pre-activation deadline check, so a timed-out download cannot reach this
+    /// call.
+    pub fn complete(self, _permit: ActivationPermit) -> Result<(), OtaError> {
         self.update.complete().map_err(|e| {
             log::error!("Failed to complete OTA update: {:?}", e);
             OtaError::FlashWriteFailed

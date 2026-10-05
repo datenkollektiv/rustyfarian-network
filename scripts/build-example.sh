@@ -93,6 +93,24 @@ case "$prefix" in
 
         idf_features=$(get_example_features_from_toml "$example" "$pkg_dir") || exit 1
 
+        # If this example requires OTA, apply the OTA sdkconfig overlay (rollback + custom partition table).
+        # The overlay is layered on sdkconfig.defaults via ESP_IDF_SDKCONFIG_DEFAULTS.
+        if printf '%s' "$idf_features" | grep -q "ota"; then
+            # Get the workspace root (parent of this script's directory)
+            workspace_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+            ota_sdkconfig="$workspace_root/sdkconfig.ota.defaults"
+            if [ -f "$ota_sdkconfig" ]; then
+                # The partition-table path must be absolute (ESP-IDF resolves a relative one against the
+                # generated esp-idf-sys project, not the workspace), so it is written to a generated
+                # overlay instead of being hard-coded in the committed sdkconfig.ota.defaults.
+                mkdir -p "$idf_dir"
+                case "$idf_dir" in /*) idf_dir_abs="$idf_dir" ;; *) idf_dir_abs="$workspace_root/$idf_dir" ;; esac
+                ota_partitions_overlay="$idf_dir_abs/sdkconfig.ota-partitions.defaults"
+                printf 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="%s"\n' "$workspace_root/partitions.ota.csv" > "$ota_partitions_overlay"
+                export ESP_IDF_SDKCONFIG_DEFAULTS="$workspace_root/sdkconfig.defaults;$ota_sdkconfig;$ota_partitions_overlay"
+            fi
+        fi
+
         # Detect chip and set MCU / Cargo target
         chip=$(printf '%s' "$example" | cut -d_ -f2)
         case "$chip" in

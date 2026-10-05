@@ -482,6 +482,153 @@ fn espnow_mock_public_paths() {
 
 // ── ota ───────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "ota-wire")]
+#[test]
+fn ota_persist_public_paths() {
+    use juggler::ota::{
+        note_boot_slot, reconcile_boot, slot_for_partition, slot_from_label, slot_label, Admission,
+        BootDisposition, BootFault, BootOutcome, BootWarnings, BusyTally, CorruptRecord, Delivery,
+        HardwareFacts, HardwareReadError, KvError, KvStr, NoteBoot, NoteBootError, OtaKv, OtaStore,
+        PendingReport, PendingReportView, ReasonNote, RefusalNote, RepairedRecord, ReportRecord,
+        RollbackNoted, RollbackRequest, SettleOutcome, SlotId, SlotState, StoreError,
+        StoredAttempt, UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
+    };
+
+    struct EmptyKv;
+    impl OtaKv for EmptyKv {
+        fn get_u8(&self, _: &str) -> Result<Option<u8>, KvError> {
+            Ok(None)
+        }
+        fn get_u32(&self, _: &str) -> Result<Option<u32>, KvError> {
+            Ok(None)
+        }
+        fn get_str(&self, _: &str) -> Result<Option<KvStr>, KvError> {
+            Ok(None)
+        }
+        fn set_u8(&mut self, _: &str, _: u8) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn set_u32(&mut self, _: &str, _: u32) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn set_str(&mut self, _: &str, _: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn remove(&mut self, _: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+    }
+
+    fn assert_exported<T>() {}
+    assert_exported::<BootFault>();
+    assert_exported::<BootWarnings>();
+    assert_exported::<CorruptRecord>();
+    assert_exported::<Delivery>();
+    assert_exported::<RollbackNoted>();
+    assert_exported::<NoteBootError>();
+    assert_exported::<PendingReport>();
+    assert_exported::<ReasonNote>();
+    assert_exported::<RefusalNote>();
+    assert_exported::<RepairedRecord>();
+    assert_exported::<ReportRecord>();
+    assert_exported::<RollbackRequest>();
+    assert_exported::<StoreError>();
+    assert_exported::<StoredAttempt>();
+    assert_exported::<SettleOutcome>();
+    assert_exported::<UpdateSlot>();
+
+    assert_eq!(NVS_NAMESPACE, "ota");
+    assert_eq!(slot_for_partition("factory"), FACTORY_SLOT);
+    assert_eq!(slot_from_label("ota_1"), Some(SlotId(1)));
+    assert_eq!(slot_label(SlotId(0)), Some("ota_0"));
+
+    let mut store = OtaStore::open(EmptyKv, || 1);
+    assert_eq!(store.admission(), Admission::Open);
+    assert_eq!(store.pending_report(), Ok(PendingReportView::None));
+    assert_eq!(
+        note_boot_slot(&mut store, || Ok(SlotId(0))),
+        Ok(NoteBoot::NoAttempt)
+    );
+    let hw = HardwareFacts {
+        running_slot: SlotId(0),
+        running_state: SlotState::Valid,
+        update_slot: UpdateSlot::Absent,
+    };
+    let outcome: BootOutcome = reconcile_boot(&mut store, Ok(hw), None);
+    assert_eq!(
+        outcome.disposition,
+        BootDisposition::Settled(SettleOutcome::NoRequest)
+    );
+    assert!(outcome.admission_open_at_boot && outcome.slot_released);
+    let failed = reconcile_boot(&mut store, Err(HardwareReadError::Busy), None);
+    assert!(failed.refuse_mark_valid && !failed.slot_released);
+    assert_eq!(BusyTally::new().into_error(), HardwareReadError::Busy);
+}
+
+#[cfg(feature = "ota-wire")]
+#[test]
+fn ota_runtime_public_paths() {
+    use core::time::Duration;
+    use juggler::ota::runtime::{
+        decide_intake, plan_rollback, rejects_delta, DeliveryStep, Feed, HealthAction,
+        HealthConfig, HealthEvent, HealthMachine, IntakeDecision, ManifestBody, OfferPlan,
+        PublishOutcome, PublishStep, ReporterConfig, ReporterMachine, Retention, SendResult,
+    };
+    use juggler::ota::{
+        ConfigError, DeadlineAction, FailReason, HealthVerdict, OtaCommand, OtaSettings, OtaStacks,
+        OtaTimings, Version, MIN_STACK_BYTES,
+    };
+
+    let settings = OtaSettings::new("dev/ota/command", "dev/ota/status", Version::new(1, 0, 0))
+        .expect("valid topics");
+    assert_eq!(settings.stacks, OtaStacks::default());
+    assert_eq!(settings.timings.deadline_action, DeadlineAction::Rollback);
+    assert_eq!(MIN_STACK_BYTES, 4096);
+    assert_eq!(
+        OtaSettings::new("a", "a", Version::new(1, 0, 0)),
+        Err(ConfigError::SameTopic)
+    );
+
+    let decision = decide_intake(
+        OtaCommand::parse(br#"{"action":"repair"}"#),
+        false,
+        || true,
+        |_| SendResult::Sent,
+    );
+    assert_eq!(decision, IntakeDecision::Queued);
+
+    let timings = OtaTimings::default();
+    let mut health = HealthMachine::new(HealthConfig::from(&timings));
+    assert_eq!(
+        health.step(Duration::ZERO, false, HealthEvent::Begin),
+        HealthAction::ReadSlot
+    );
+    assert!(HealthVerdict::Applied.publishes_applied());
+
+    let mut reporter = ReporterMachine::new(ReporterConfig::from(&timings));
+    assert!(reporter.report_due(Duration::ZERO));
+    assert_eq!(
+        reporter.on_publish(Duration::ZERO, PublishOutcome::Acked),
+        PublishStep::MarkDelivered
+    );
+    let _ = DeliveryStep::Done;
+    assert_eq!(rejects_delta(3, 1), 2);
+
+    let mut body = ManifestBody::new(Duration::from_secs(10));
+    assert_eq!(body.feed(10, Duration::ZERO), Feed::Continue);
+
+    let mut retention = Retention::new();
+    retention.on_command(&OtaCommand::Repair);
+    assert!(!retention.has_offer());
+    let _: Option<OfferPlan> = None;
+    assert_eq!(
+        plan_rollback(Version::new(2, 0, 0), Version::new(1, 0, 0), true, || Err(
+            juggler::ota::HardwareReadError::Busy
+        )),
+        Err(FailReason::VersionMismatch)
+    );
+}
+
 #[cfg(feature = "ota")]
 #[test]
 fn ota_public_paths() {

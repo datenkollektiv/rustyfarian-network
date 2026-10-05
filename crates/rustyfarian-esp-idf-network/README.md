@@ -11,14 +11,14 @@ All features are **opt-in** and fully compatible with each other.
 
 Domain features are opt-in; `default = []` means you explicitly declare which domains you need:
 
-| Feature        | What it gates                                                  | Enables juggler feature | Chip support | Notes                                            |
-|:---------------|:---------------------------------------------------------------|:------------------------|:-------------|:-------------------------------------------------|
-| `wifi`         | Wi-Fi STA/AP manager, LED status feedback                      | `wifi`                  | All          | Blocking API; includes softAP lifecycle.         |
-| `mqtt`         | MQTT client with builder and automatic reconnection            | `mqtt`, `std`           | All          | Requires `wifi` for bootstrap (compile-checked). |
-| `lora`         | SX1262 radio driver, LoRaWAN OTAA/ADR support                  | `lora`                  | All          | Requires `sx126x` and `lorawan-device` crates.   |
-| `espnow`       | ESP-NOW peer-to-peer messaging, broadcast mode                 | `espnow`                | All          | No Wi-Fi required; works in AP or isolation.     |
-| `ota`          | Over-the-air firmware update (streaming, SHA-256 verified)     | `ota`                   | All          | Blocking API; downloads firmware from HTTPS.     |
-| `provisioning` | SoftAP captive-portal Wi-Fi and device credential provisioning | `provisioning`          | All          | Requires `wifi` feature; NVS credential store.   |
+| Feature        | What it gates                                                  | Enables juggler feature | Chip support | Notes                                                      |
+|:---------------|:---------------------------------------------------------------|:------------------------|:-------------|:-----------------------------------------------------------|
+| `wifi`         | Wi-Fi STA/AP manager, LED status feedback                      | `wifi`                  | All          | Blocking API; includes softAP lifecycle.                   |
+| `mqtt`         | MQTT client with builder and automatic reconnection            | `mqtt`, `std`           | All          | Requires `wifi` for bootstrap (compile-checked).           |
+| `lora`         | SX1262 radio driver, LoRaWAN OTAA/ADR support                  | `lora`                  | All          | Requires `sx126x` and `lorawan-device` crates.             |
+| `espnow`       | ESP-NOW peer-to-peer messaging, broadcast mode                 | `espnow`                | All          | No Wi-Fi required; works in AP or isolation.               |
+| `ota`          | Over-the-air firmware update (streaming, SHA-256 verified)     | `ota`                   | All          | Blocking API; downloads firmware from HTTP only (ADR 011). |
+| `provisioning` | SoftAP captive-portal Wi-Fi and device credential provisioning | `provisioning`          | All          | Requires `wifi` feature; NVS credential store.             |
 
 **Special notes:**
 
@@ -49,6 +49,10 @@ Add to your `Cargo.toml`:
 [dependencies]
 rustyfarian-esp-idf-network = { version = "0.5", features = ["wifi", "mqtt"] }
 ```
+
+## Example: Wi-Fi + MQTT (OTA Runtime)
+
+For OTA-enabled firmware using the runtime loop, see [`docs/runbooks/ota-hardware-test.md`](../../docs/runbooks/ota-hardware-test.md) for the full test procedure and [`examples/idf_c3_ota_runtime.rs`](examples/idf_c3_ota_runtime.rs) for example integration (command intake, worker start, health policy, restart callback).
 
 ## Example: Wi-Fi + MQTT
 

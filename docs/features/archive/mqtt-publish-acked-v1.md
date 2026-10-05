@@ -142,10 +142,10 @@ calls.
 
 ## Open Questions
 
-- [ ] **Exact `PublishAckError` variant set.** `Timeout`, `Disconnected`, `WrongThread`, `Other` are the minimum. Is a separate `EnqueueFailed` worth splitting from `Other`? (Leaning: fold into `Other` for v1.)
+- [x] **Exact `PublishAckError` variant set.** `Timeout`, `Disconnected`, `WrongThread`, `Other` are the minimum. Is a separate `EnqueueFailed` worth splitting from `Other`? (Leaning: fold into `Other` for v1.) **Resolved:** shipped as `Timeout`, `Disconnected`, `WrongThread`, `Other(anyhow::Error)`; enqueue failures go to `Other`.
 - [x] **`MessageId` id-space verification** — *promoted to a blocking pre-implementation prerequisite* (see the `MessageId` correlation Constraint and the first State item). **Resolved 2026-07-10** against esp-idf-svc 0.52.1 / embedded-svc 0.29.0: `MessageId = u32`; `enqueue → enqueue_cstr` returns `check(esp_mqtt_client_enqueue(..))` and `check` returns `Ok(result as MessageId)` (the ESP-IDF-assigned `msg_id`); `EventPayload::Published(self.0.msg_id as _)` echoes that same `msg_id`. Same `u32` id space — no divergence, so the registry keys directly off `enqueue`'s return.
-- [ ] **Retained-only convenience wrapper?** OTA will always publish `rolled_back` retained. Do we also want a `publish_retained_acked(topic, payload, timeout)` thin wrapper, or is the `retained: bool` parameter on `publish_acked` enough? (Leaning: parameter only, matching `publish_with`.)
-- [ ] **QoS 2 follow-up.** Deferred by decision; track as a future `-v2` if a consumer needs exactly-once ack semantics.
+- [x] **Retained-only convenience wrapper?** OTA will always publish `rolled_back` retained. Do we also want a `publish_retained_acked(topic, payload, timeout)` thin wrapper, or is the `retained: bool` parameter on `publish_acked` enough? (Leaning: parameter only, matching `publish_with`.) **Resolved:** parameter only; no wrapper shipped.
+- [x] **QoS 2 follow-up.** Deferred by decision; track as a future `-v2` if a consumer needs exactly-once ack semantics. **Closed:** deferred, no consumer has asked.
 - [x] **Where the event-loop `ThreadId` is captured and stored** so the `WrongThread` guard can read it. **Resolved:** stored in an `Arc<Mutex<Option<ThreadId>>>` shared into the event-loop closure (which sets it to `std::thread::current().id()` at thread start) and held on `MqttHandle`; `publish_acked` reads it and returns `WrongThread` on a match.
 
 ## State

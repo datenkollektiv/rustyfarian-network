@@ -87,7 +87,19 @@ pub enum Admission {
     Open,
     /// An attempt record or an undelivered report exists: do not start a new
     /// attempt yet.
-    Blocked,
+    /// The [`BlockedBy`] says which.
+    Blocked(BlockedBy),
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Why [`Admission`] is [`Blocked`](Admission::Blocked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedBy {
+    /// An attempt record exists and is unresolved.
+    AttemptUnresolved,
+    /// A report is undelivered.
+    ReportPending,
 }
 
 impl Admission {
@@ -95,20 +107,30 @@ impl Admission {
     ///
     /// Derive the admission state: [`Admission::Blocked`] if an attempt record
     /// exists or a report is undelivered, otherwise [`Admission::Open`].
+    /// An existing attempt record takes precedence over an undelivered report
+    /// as the cause.
     ///
     /// # Example
     ///
     /// ```
-    /// use juggler::ota::Admission;
+    /// use juggler::ota::{Admission, BlockedBy};
     ///
     /// assert_eq!(Admission::from_records(false, false), Admission::Open);
-    /// assert_eq!(Admission::from_records(true, false), Admission::Blocked);
-    /// assert_eq!(Admission::from_records(false, true), Admission::Blocked);
+    /// assert_eq!(
+    ///     Admission::from_records(true, false),
+    ///     Admission::Blocked(BlockedBy::AttemptUnresolved)
+    /// );
+    /// assert_eq!(
+    ///     Admission::from_records(false, true),
+    ///     Admission::Blocked(BlockedBy::ReportPending)
+    /// );
     /// ```
     #[must_use]
     pub fn from_records(attempt_exists: bool, report_undelivered: bool) -> Self {
-        if attempt_exists || report_undelivered {
-            Self::Blocked
+        if attempt_exists {
+            Self::Blocked(BlockedBy::AttemptUnresolved)
+        } else if report_undelivered {
+            Self::Blocked(BlockedBy::ReportPending)
         } else {
             Self::Open
         }
@@ -210,7 +232,9 @@ pub fn decide_offer(
         UpdateDecision::Skip => OfferDecision::Skip,
         UpdateDecision::Reject => OfferDecision::Reject,
         UpdateDecision::Apply if refused == Some(offered) => OfferDecision::Refused,
-        UpdateDecision::Apply if admission == Admission::Blocked => OfferDecision::Blocked,
+        UpdateDecision::Apply if matches!(admission, Admission::Blocked(_)) => {
+            OfferDecision::Blocked
+        }
         UpdateDecision::Apply => OfferDecision::Apply,
     }
 }
@@ -294,16 +318,18 @@ mod tests {
     #[test]
     fn admission_from_records_table() {
         assert_eq!(Admission::from_records(false, false), Admission::Open);
-        assert_eq!(Admission::from_records(true, false), Admission::Blocked);
-        assert_eq!(Admission::from_records(false, true), Admission::Blocked);
-        assert_eq!(Admission::from_records(true, true), Admission::Blocked);
+        let attempt = Admission::Blocked(BlockedBy::AttemptUnresolved);
+        let report = Admission::Blocked(BlockedBy::ReportPending);
+        assert_eq!(Admission::from_records(true, false), attempt);
+        assert_eq!(Admission::from_records(false, true), report);
+        assert_eq!(Admission::from_records(true, true), attempt);
     }
 
     #[test]
     fn decide_offer_table() {
         let v = Version::new;
         let open = Admission::Open;
-        let blocked = Admission::Blocked;
+        let blocked = Admission::Blocked(BlockedBy::ReportPending);
         let cases = [
             // (running, offered, refused, admission, expected)
             (v(1, 0, 0), v(2, 0, 0), None, open, OfferDecision::Apply),
@@ -367,6 +393,13 @@ mod tests {
                 v(2, 0, 0),
                 Some(v(1, 5, 0)),
                 blocked,
+                OfferDecision::Blocked,
+            ),
+            (
+                v(1, 0, 0),
+                v(2, 0, 0),
+                None,
+                Admission::Blocked(BlockedBy::AttemptUnresolved),
                 OfferDecision::Blocked,
             ),
             // Refused beats Blocked.

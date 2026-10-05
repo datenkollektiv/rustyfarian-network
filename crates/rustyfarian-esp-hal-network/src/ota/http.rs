@@ -116,34 +116,77 @@ pub(crate) struct ParsedUrl<'a> {
     /// the `Host` field-value must mirror the authority component).
     pub port: u16,
     pub path: &'a str,
+    /// Query including the leading `?`, or empty.
+    pub query: &'a str,
 }
 
-/// Parse `http://host[:port]/path`.
+/// Parse `http://host[:port][/path][?query][#fragment]`.
 ///
 /// `https://` is rejected — plain HTTP only (ADR 011 §2).
-/// The path defaults to `/` when absent.
+/// The scheme is matched case-insensitively.
+/// Userinfo (everything up to the last `@` in the authority) is dropped: this client does no authentication and never logs it.
+/// The authority ends at the first `/`, `?` or `#`; the fragment is never sent.
+/// The path defaults to `/` when absent; a path-less URL with a query yields path `/` plus that query.
+/// Any ASCII whitespace or control character is rejected so a URL can never inject request headers.
 pub(crate) fn parse_url(url: &str) -> Result<ParsedUrl<'_>, HttpError> {
-    let rest = url.strip_prefix("http://").ok_or(HttpError::BadUrl)?;
-
-    // Split host[:port] from path at the first `/`.
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        let port_str = &authority[colon + 1..];
-        let port: u16 = port_str.parse().map_err(|_| HttpError::BadUrl)?;
-        (&authority[..colon], port)
-    } else {
-        (authority, 80u16)
-    };
-
-    if host.is_empty() {
+    const SCHEME: &str = "http://";
+    let prefix = url.get(..SCHEME.len()).ok_or(HttpError::BadUrl)?;
+    if !prefix.eq_ignore_ascii_case(SCHEME) {
+        return Err(HttpError::BadUrl);
+    }
+    let rest = &url[SCHEME.len()..];
+    if rest
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
         return Err(HttpError::BadUrl);
     }
 
-    Ok(ParsedUrl { host, port, path })
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let tail = tail.split('#').next().unwrap_or("");
+    let (path, query) = match tail.find('?') {
+        Some(q) => (&tail[..q], &tail[q..]),
+        None => (tail, ""),
+    };
+    let path = if path.is_empty() { "/" } else { path };
+
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let (host, port_str) = if host_port.starts_with('[') {
+        let close = host_port.find(']').ok_or(HttpError::BadUrl)?;
+        let after = &host_port[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return Err(HttpError::BadUrl),
+        };
+        (&host_port[..=close], port)
+    } else {
+        match host_port.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    let port: u16 = match port_str {
+        Some(p) => {
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpError::BadUrl);
+            }
+            p.parse().map_err(|_| HttpError::BadUrl)?
+        }
+        None => 80,
+    };
+
+    if host.is_empty() || host == "[]" {
+        return Err(HttpError::BadUrl);
+    }
+
+    Ok(ParsedUrl {
+        host,
+        port,
+        path,
+        query,
+    })
 }
 
 // ── Pure parsing functions (always compile, no I/O) ─────────────────────────
@@ -367,9 +410,14 @@ pub(crate) mod async_client {
         // 1. Send the request.
         let mut req_buf = [0u8; 256];
         // Format: GET /path HTTP/1.1\r\nHost: host[:port]\r\nConnection: close\r\n\r\n
-        let req_len =
-            super::format_get_request(&mut req_buf, parsed.host, parsed.port, parsed.path)
-                .map_err(|_| super::super::OtaError::ServerUnreachable)?;
+        let req_len = super::format_get_request(
+            &mut req_buf,
+            parsed.host,
+            parsed.port,
+            parsed.path,
+            parsed.query,
+        )
+        .map_err(|_| super::super::OtaError::ServerUnreachable)?;
 
         // Write the full request, handling partial writes (embassy-net TcpSocket::write
         // does not impl embedded_io_async::Write, so we use its native write() directly).
@@ -486,10 +534,12 @@ pub(crate) fn format_get_request(
     host: &str,
     port: u16,
     path: &str,
+    query: &str,
 ) -> Result<usize, ()> {
     let mut pos = 0;
     write_bytes(buf, &mut pos, b"GET ")?;
     write_bytes(buf, &mut pos, path.as_bytes())?;
+    write_bytes(buf, &mut pos, query.as_bytes())?;
     write_bytes(buf, &mut pos, b" HTTP/1.1\r\nHost: ")?;
     write_bytes(buf, &mut pos, host.as_bytes())?;
     if port != 80 {
@@ -808,6 +858,69 @@ mod tests {
         assert_eq!(p.path, "/");
     }
 
+    #[test]
+    fn url_scheme_is_case_insensitive() {
+        let p = parse_url("HTTP://h/fw.bin").unwrap();
+        assert_eq!((p.host, p.port, p.path), ("h", 80, "/fw.bin"));
+    }
+
+    #[test]
+    fn url_userinfo_is_stripped() {
+        let p = parse_url("http://u:pw@h/x").unwrap();
+        assert_eq!((p.host, p.port, p.path), ("h", 80, "/x"));
+        let p = parse_url("http://u:pw@h:81/x").unwrap();
+        assert_eq!((p.host, p.port), ("h", 81));
+    }
+
+    #[test]
+    fn url_query_without_path_gets_root_path() {
+        let p = parse_url("http://h?x=1").unwrap();
+        assert_eq!((p.host, p.path, p.query), ("h", "/", "?x=1"));
+        let p = parse_url("http://h/a?x=1#frag").unwrap();
+        assert_eq!((p.path, p.query), ("/a", "?x=1"));
+        let p = parse_url("http://h#frag").unwrap();
+        assert_eq!((p.host, p.path, p.query), ("h", "/", ""));
+    }
+
+    #[test]
+    fn url_with_control_or_whitespace_is_rejected() {
+        for url in [
+            "http://h/x\r\nX-Evil: 1",
+            "http://h/x\n",
+            "http://h/x\r",
+            "http://h/x y",
+            "http://h\0/x",
+            "http://   /x",
+        ] {
+            assert!(parse_url(url).is_err(), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn url_bad_port_or_host_is_rejected() {
+        for url in [
+            "http://h:abc/x",
+            "http://h:99999/x",
+            "http://h:/x",
+            "http://:80/x",
+            "http://[",
+            "http://[]",
+            "http://[::1",
+            "http://",
+        ] {
+            assert!(parse_url(url).is_err(), "{url:?}");
+        }
+        let p = parse_url("http://[::1]:8080/x").unwrap();
+        assert_eq!((p.host, p.port), ("[::1]", 8080));
+    }
+
+    #[test]
+    fn get_request_appends_query() {
+        let mut buf = [0u8; 128];
+        let n = format_get_request(&mut buf, "h", 80, "/", "?x=1").unwrap();
+        assert!(buf[..n].starts_with(b"GET /?x=1 HTTP/1.1\r\n"));
+    }
+
     // ── GET request formatting (Host header port handling) ───────────────────
 
     #[test]
@@ -815,7 +928,7 @@ mod tests {
         // RFC 7230 §5.4: when the authority's port is the default (80 for HTTP),
         // the Host field-value MAY omit it. We omit it for compactness.
         let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "192.168.1.1", 80, "/fw.bin").unwrap();
+        let n = format_get_request(&mut buf, "192.168.1.1", 80, "/fw.bin", "").unwrap();
         let req = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             req,
@@ -829,7 +942,7 @@ mod tests {
         // when it is not the HTTP/1.1 default. Omitting it on :8080 caused the
         // P2 review finding.
         let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "192.168.1.1", 8080, "/fw.bin").unwrap();
+        let n = format_get_request(&mut buf, "192.168.1.1", 8080, "/fw.bin", "").unwrap();
         let req = core::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(
             req,
@@ -841,7 +954,7 @@ mod tests {
     fn host_header_includes_low_non_default_port() {
         // Boundary: any port other than 80 is "non-default" — including 81.
         let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "host", 81, "/").unwrap();
+        let n = format_get_request(&mut buf, "host", 81, "/", "").unwrap();
         let req = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(req.contains("Host: host:81\r\n"));
     }
@@ -850,7 +963,7 @@ mod tests {
     fn host_header_includes_max_port() {
         // u16::MAX boundary: 5 ASCII digits must fit.
         let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "h", 65535, "/").unwrap();
+        let n = format_get_request(&mut buf, "h", 65535, "/", "").unwrap();
         let req = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(req.contains("Host: h:65535\r\n"));
     }
