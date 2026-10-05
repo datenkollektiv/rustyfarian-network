@@ -11,8 +11,8 @@
 
 use juggler::backoff::ExponentialBackoff;
 use juggler::ota::{
-    decide_offer, reconcile, AttemptRecord, BootFacts, OfferDecision, ReconcileAction, SlotId,
-    SlotState, Version,
+    decide_offer, reconcile, Admission, AttemptRecord, BootFacts, OfferDecision, ReconcileAction,
+    SlotId, SlotState, Version,
 };
 
 const V_RUNNING: Version = Version::new(1, 0, 0);
@@ -443,11 +443,9 @@ impl Device {
 
     /// The consumer's offer handler (a retained command may redeliver it).
     fn offer(&mut self, version: Version, behaviour: Behaviour) -> Result<Offer, Crash> {
-        if self.nvs.attempt.is_some() || self.undelivered() {
-            return Ok(Offer::Declined);
-        }
         let running = self.running_image().version;
-        if decide_offer(running, version, self.nvs.refused) != OfferDecision::Apply {
+        let admission = Admission::from_records(self.nvs.attempt.is_some(), self.undelivered());
+        if decide_offer(running, version, self.nvs.refused, admission) != OfferDecision::Apply {
             return Ok(Offer::Declined);
         }
         let target = 1 - self.running;

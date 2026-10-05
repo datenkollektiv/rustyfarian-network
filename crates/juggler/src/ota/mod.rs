@@ -12,7 +12,7 @@ pub mod state;
 pub mod verifier;
 pub mod version;
 
-pub use decision::{decide_offer, decide_update, OfferDecision, UpdateDecision};
+pub use decision::{decide_offer, decide_update, Admission, OfferDecision, UpdateDecision};
 pub use error::OtaError;
 pub use metadata::ImageMetadata;
 pub use reconcile::{reconcile, AttemptRecord, BootFacts, ReconcileAction, SlotId, SlotState};

@@ -10,7 +10,8 @@
 //! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
 //! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
 //! policy ([`decide_update`], [`UpdateDecision`]), the offer decision with its
-//! refused-version guard ([`decide_offer`], [`OfferDecision`]), and boot
+//! refused-version guard and admission gate ([`decide_offer`],
+//! [`OfferDecision`], [`Admission`]), and boot
 //! reconciliation ([`reconcile`], [`AttemptRecord`], [`BootFacts`],
 //! [`ReconcileAction`], [`SlotId`], [`SlotState`]) are re-exported from
 //! `juggler::ota` here — matching the `wifi`/`espnow` domains — so a
@@ -26,9 +27,9 @@ mod http;
 // `wifi`/`espnow` modules, so OTA consumers import metadata/version types from
 // this crate rather than adding a redundant direct `juggler` dependency.
 pub use juggler::ota::{
-    bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, AttemptRecord, BootFacts,
-    ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState,
-    StreamingVerifier, UpdateDecision, Version,
+    bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, Admission, AttemptRecord,
+    BootFacts, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId,
+    SlotState, StreamingVerifier, UpdateDecision, Version,
 };
 
 // Parity guard: every public `juggler::ota` type must stay re-exported from this
@@ -41,9 +42,9 @@ mod reexport_parity_guard {
     #[test]
     fn ota_public_surface_is_reexported_from_this_crate() {
         use crate::ota::{
-            bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, AttemptRecord,
-            BootFacts, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId,
-            SlotState, StreamingVerifier, UpdateDecision, Version,
+            bytes_to_hex, decide_offer, decide_update, hex_to_bytes, reconcile, Admission,
+            AttemptRecord, BootFacts, ImageMetadata, OfferDecision, OtaError, OtaState,
+            ReconcileAction, SlotId, SlotState, StreamingVerifier, UpdateDecision, Version,
         };
 
         fn assert_exported<T>() {}
@@ -51,6 +52,7 @@ mod reexport_parity_guard {
         assert_exported::<OtaState>();
         assert_exported::<StreamingVerifier>();
         assert_exported::<OfferDecision>();
+        assert_exported::<Admission>();
         assert_exported::<AttemptRecord>();
         assert_exported::<BootFacts>();
         assert_exported::<ReconcileAction>();
@@ -70,7 +72,7 @@ mod reexport_parity_guard {
             UpdateDecision::Apply
         );
         assert_eq!(
-            decide_offer(Version::new(1, 3, 0), meta.version, None),
+            decide_offer(Version::new(1, 3, 0), meta.version, None, Admission::Open),
             OfferDecision::Apply
         );
         let facts = BootFacts {

@@ -23,18 +23,28 @@
 //!
 //! # Attempt ids (consumer-owned contract)
 //!
-//! The backend deduplicates on (device identity, `attempt_id`).
+//! The backend deduplicates on (device identity, epoch, `attempt_id`).
 //! The id counter must survive deleting the attempt record, and an id must be
 //! reserved durably before the update starts.
 //! With separate storage writes, persist the counter first, then the attempt:
 //! a skipped id is harmless, a reused id can suppress a real report.
-//! A factory reset or counter exhaustion restarts or wraps the ids, so the
-//! consumer needs an identity or reset policy for that (for example a
-//! per-install epoch stored alongside the id).
+//! A factory reset, flash erase, or counter exhaustion restarts or wraps the
+//! ids, so the consumer needs an identity or reset policy for that.
+//!
+//! Recommended epoch scheme: generate a random 32-bit install epoch when the
+//! counter is first created (first boot, or after a flash erase finds no
+//! counter), store it with the counter, and include it in every report.
+//!
+//! Consumer-originated rollback reports (no attempt, for example an operator
+//! rollback after `mark_valid`) are outside [`reconcile`].
+//! If they use the same report record, take their event id from the same
+//! durable counter so ids never collide.
+//! A rollback reason is consumer naming: persist it next to the attempt before
+//! rolling back and attach it when [`ReconcileAction::ReportRollback`] fires.
 //!
 //! # Admission
 //!
-//! While an attempt record exists the consumer must not accept a new offer:
+//! While an attempt record exists the consumer must not start a new attempt:
 //! overwriting the record destroys unresolved evidence.
 //! This covers [`ReconcileAction::Defer`], [`ReconcileAction::AwaitHealthCheck`],
 //! [`ReconcileAction::RefuseImage`], and a [`ReconcileAction::ReportRollback`]
@@ -44,8 +54,14 @@
 //! single report record, so a second rollback must not overwrite a report that
 //! was not delivered yet.
 //! The attempt is cleared once report and refusal are durable, but delivery
-//! may still be pending (for example the reporting channel is offline); offers
-//! are refused until the report is delivered.
+//! may still be pending (for example the reporting channel is offline).
+//!
+//! Derive the state with [`Admission::from_records`](super::Admission::from_records)
+//! and pass it to [`decide_offer`](super::decide_offer): an offer that would
+//! be applied then returns [`OfferDecision::Blocked`](super::OfferDecision::Blocked).
+//! The consumer must keep that offer (for example in RAM) and re-evaluate it
+//! once admission reopens, after `ClearAttempt`, `CompleteAttempt`, or report
+//! delivery; a retained MQTT command is not redelivered without resubscribing.
 //!
 //! # Reporting
 //!
@@ -262,7 +278,8 @@ pub struct BootFacts {
     /// cleared: if delivery erased it while the attempt was retained (a
     /// failed write), the next boot would create a second report for the same
     /// attempt (found by the `ota_lifecycle` simulation).
-    /// Read it AFTER the consumer confirms any pending rollback request. A
+    /// If the consumer keeps its own rollback-request layer (for example to
+    /// record a reason), resolve it before reading this. A
     /// read failure must not default to either value: do not call
     /// [`reconcile`], fail safe.
     pub report_persisted: bool,
@@ -288,7 +305,7 @@ pub enum ReconcileAction {
     /// The refused version is deliberately kept until this point, see
     /// [`decide_offer`](super::decide_offer).
     ///
-    /// While the attempt exists, do not accept a new offer.
+    /// While the attempt exists, admission is blocked (see [`Admission`](super::Admission)).
     AwaitHealthCheck {
         /// Persist `activated = true` on the record.
         mark_activated: bool,
@@ -324,9 +341,14 @@ pub enum ReconcileAction {
     /// The running image is not the one the manifest promised and is still
     /// unverified; it must be rolled back.
     ///
-    /// Persistence order: persist activation (if `mark_activated`), persist
-    /// the rollback request, never mark the image valid, then roll back; keep
-    /// the attempt record.
+    /// Persistence order: persist activation (if `mark_activated`), never mark
+    /// the image valid, then roll back; keep the attempt record.
+    /// The core never reads a persisted rollback request: the next boot relies
+    /// on the attempt record's `activated` / `boot_selected`.
+    /// If the rollback never happened, the same image boots `PendingVerify`
+    /// and [`reconcile`] returns `RefuseImage` again.
+    /// A consumer-side rollback request or reason is optional bookkeeping the
+    /// core does not rely on.
     /// If persisting the activation fails, log it and STILL refuse (never mark
     /// valid) and roll back; do not abort the refusal.
     ///
@@ -341,7 +363,7 @@ pub enum ReconcileAction {
     /// If the rollback fails, never mark the image valid; the health deadline
     /// or the next reset retries.
     ///
-    /// While the attempt exists, do not accept a new offer.
+    /// While the attempt exists, admission is blocked (see [`Admission`](super::Admission)).
     RefuseImage {
         /// The version the manifest promised (`None` if it failed to parse).
         promised: Option<Version>,
@@ -362,7 +384,7 @@ pub enum ReconcileAction {
     /// next boot repeats, and `report_already_persisted` prevents a duplicate
     /// report (even after the report was delivered, see
     /// [`BootFacts::report_persisted`]).
-    /// While the attempt exists, do not accept a new offer.
+    /// While the attempt exists, admission is blocked (see [`Admission`](super::Admission)).
     /// After the attempt is cleared, admission stays blocked until the report
     /// is delivered (v1 keeps a single report record).
     /// A transient write failure may be retried at runtime with refreshed
