@@ -94,7 +94,7 @@ Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), 
 
 ## Links
 - Source report: `review-queue/rustyfarian-network-on-connect-enqueue-deadlock-v1.md`.
-- Related feature doc: `docs/features/mqtt-publish-acked-v1.md` (introduced the `WrongThread` guard).
+- Related feature doc: `docs/features/archive/mqtt-publish-acked-v1.md` (introduced the `WrongThread` guard).
 
 ## Session Log
 - 2026-09-27 — Captured as a defect from the review-queue report, with the root cause checked against esp-idf-svc 0.53.0 and IDF v5.3.3 source.

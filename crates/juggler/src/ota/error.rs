@@ -5,7 +5,7 @@ use core::fmt;
 /// Experimental: API may change before 1.0.
 ///
 /// Errors that can occur during OTA updates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtaError {
     /// The update server could not be reached.
     ServerUnreachable,
@@ -86,6 +86,30 @@ impl fmt::Display for OtaError {
     }
 }
 
+/// Experimental: API may change before 1.0.
+///
+/// Classifies a failed body read.
+///
+/// `is_timeout` is `true` when the read gave up because its wait elapsed
+/// (a stalled server) and `false` for any other transport failure such as a
+/// connection reset.
+/// A timeout is [`OtaError::DownloadTimeout`]; everything else is
+/// [`OtaError::ServerUnreachable`].
+///
+/// ```
+/// use juggler::ota::{classify_read_error, OtaError};
+///
+/// assert_eq!(classify_read_error(true), OtaError::DownloadTimeout);
+/// assert_eq!(classify_read_error(false), OtaError::ServerUnreachable);
+/// ```
+pub const fn classify_read_error(is_timeout: bool) -> OtaError {
+    if is_timeout {
+        OtaError::DownloadTimeout
+    } else {
+        OtaError::ServerUnreachable
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +186,13 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn classify_read_error_maps_timeout_and_other() {
+        assert_eq!(classify_read_error(true), OtaError::DownloadTimeout);
+        assert_eq!(classify_read_error(false), OtaError::ServerUnreachable);
+        assert_eq!(classify_read_error(true).code(), "download_timeout");
+        assert_eq!(classify_read_error(false).code(), "server_unreachable");
     }
 }

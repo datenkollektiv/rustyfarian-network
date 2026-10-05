@@ -13,6 +13,7 @@
 //! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device` |
 //! | `espnow` | `espnow` | none |
 //! | `ota` | `ota` | `heapless`, `sha2` |
+//! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless` (implies wifi+mqtt+lora) |
 //! | `mock` | `wifi::mock`, `lora::mock`, `espnow::mock` | (implies wifi+lora+espnow) |
 //!
@@ -35,6 +36,11 @@
 //!
 //! - **`ota`** — OTA metadata parsing, streaming SHA-256 verification, version
 //!   comparison. Requires `heapless` and `sha2`.
+//!
+//! - **`ota-wire`** — OTA wire contract: command and manifest parsing, status
+//!   JSON, and the frozen `failed` reason codes. Requires `serde` and
+//!   `serde_json` (no default features, `alloc`); implies `ota`. The base `ota`
+//!   feature stays free of both.
 //!
 //! - **`provisioning`** — SoftAP captive-portal form parsing, field validation,
 //!   and provisioning state machine. **This is a meta-feature that enables
@@ -74,7 +80,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 // alloc is needed in tests (provisioning + espnow mocks use alloc::format! etc.)
-#[cfg(test)]
+// and by the `ota-wire` JSON types (String, serde_json).
+#[cfg(any(test, feature = "ota-wire"))]
 extern crate alloc;
 
 // Shared test fixtures; every user sits under `wifi` (provisioning implies it).

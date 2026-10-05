@@ -4,16 +4,42 @@
 //! This module is compiled only when both a chip feature (`esp32c3`,
 //! `esp32c6`, or `esp32`) **and** the `embassy` feature are active.
 
+use core::time::Duration as CoreDuration;
+
 use embassy_net::tcp::TcpSocket;
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{with_timeout, Duration, Instant};
 use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
 use esp_storage::FlashStorage;
-use juggler::ota::{OtaError, StreamingVerifier};
+use juggler::ota::{classify_read_error, ActivationPermit, Deadline, OtaError, StreamingVerifier};
 
 use super::http::async_client::fetch_get;
 use super::http::parse_url;
+
+/// Converts an `embassy_time` duration (microsecond-exact) to `core`.
+fn to_core(d: Duration) -> CoreDuration {
+    CoreDuration::from_micros(d.as_micros())
+}
+
+/// Converts a `core` duration to `embassy_time`, saturating at the maximum.
+fn to_embassy(d: CoreDuration) -> Duration {
+    // Capped well below `u64::MAX` so `Instant::now() + d` in `with_timeout`
+    // cannot overflow.
+    let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+    Duration::from_micros(micros.min(u64::MAX / 2))
+}
+
+/// Selects the next OTA slot for boot.
+///
+/// The only call site of `activate_next_partition`; the permit parameter makes
+/// a timed-out download unable to reach it.
+fn activate(updater: &mut OtaUpdater<'_, '_>, _permit: ActivationPermit) -> Result<(), OtaError> {
+    updater.activate_next_partition().map_err(|e| {
+        log::error!("activate_next_partition failed: {:?}", e);
+        OtaError::FlashWriteFailed
+    })
+}
 
 /// Experimental: API may change before 1.0.
 ///
@@ -26,10 +52,11 @@ pub struct OtaManagerConfig {
     /// A value of `0` is permitted but probably not useful — `embassy_time`
     /// will return `TimeoutError` on the first poll yield, mapped to
     /// [`OtaError::DownloadTimeout`].
-    /// The total wall-clock duration of [`fetch_and_apply`] is unbounded and
+    /// Without [`with_deadline`], the total wall-clock duration of [`fetch_and_apply`] is unbounded and
     /// scales with the firmware size; the timeout caps individual stalls.
     ///
     /// [`fetch_and_apply`]: EspHalOtaManager::fetch_and_apply
+    /// [`with_deadline`]: EspHalOtaManager::with_deadline
     pub timeout_secs: u64,
 }
 
@@ -81,6 +108,7 @@ pub struct OtaManagerConfig {
 pub struct EspHalOtaManager<'d> {
     config: OtaManagerConfig,
     flash: FlashStorage<'d>,
+    deadline: Deadline,
 }
 
 impl<'d> EspHalOtaManager<'d> {
@@ -97,7 +125,58 @@ impl<'d> EspHalOtaManager<'d> {
         Ok(Self {
             config,
             flash: FlashStorage::new(flash),
+            deadline: Deadline::none(),
         })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Limit the whole [`fetch_and_apply`](Self::fetch_and_apply) call to `total`.
+    ///
+    /// The deadline is **cooperative**: the clock starts on entry to
+    /// `fetch_and_apply` and is checked at operation boundaries, namely after
+    /// partition lookup, after connect and headers, after every chunk read and
+    /// every flash write, after SHA-256 verification, and immediately before
+    /// `activate_next_partition`.
+    /// A failed check returns [`OtaError::DownloadTimeout`] and the new slot is
+    /// not activated.
+    ///
+    /// Each network wait uses `min(per-read timeout, remaining deadline)`, so
+    /// network waits never overrun the deadline; blocking flash operations
+    /// (erase, write) cannot be interrupted and may overrun, with expiry
+    /// detected when they return.
+    /// Finalization is different: once the permit is granted and activation
+    /// starts, its result is returned even if it finishes after the deadline.
+    ///
+    /// The deadline is expired when `elapsed >= total`.
+    /// `Duration::ZERO` therefore fails with `DownloadTimeout` before any
+    /// network or flash access.
+    /// Not calling this method means no total limit: behaviour is unchanged
+    /// apart from the read-error mapping noted below.
+    ///
+    /// An operation that fails reports its own error (`ChecksumMismatch`,
+    /// `FlashWriteFailed`, `InsufficientSpace`, ...); `DownloadTimeout` from the
+    /// deadline is reported only when the operation at that boundary succeeded
+    /// but the deadline has elapsed.
+    /// A body read whose wait times out is `DownloadTimeout` whether the
+    /// per-read limit or the deadline was binding; a socket read *error* (for
+    /// example a connection reset) is `ServerUnreachable`.
+    ///
+    /// Invariant: a timeout never selects the new boot slot.
+    /// Activation requires an [`ActivationPermit`] that only a successful
+    /// pre-activation deadline check can produce.
+    ///
+    /// ```ignore
+    /// let mut manager = EspHalOtaManager::new(
+    ///     OtaManagerConfig { timeout_secs: 30 },
+    ///     peripherals.FLASH,
+    /// )?
+    /// .with_deadline(embassy_time::Duration::from_secs(300));
+    /// ```
+    #[must_use]
+    pub fn with_deadline(mut self, total: Duration) -> Self {
+        self.deadline = Deadline::after(to_core(total));
+        self
     }
 
     /// Experimental: API may change before 1.0.
@@ -118,6 +197,8 @@ impl<'d> EspHalOtaManager<'d> {
     /// After this function returns `Ok(())` the caller must reboot the device.
     /// Once the new image has passed its health check, call [`mark_valid`].
     ///
+    /// With [`with_deadline`](Self::with_deadline) set, the whole call is bounded by that total.
+    ///
     /// [`mark_valid`]: EspHalOtaManager::mark_valid
     pub async fn fetch_and_apply(
         &mut self,
@@ -125,7 +206,15 @@ impl<'d> EspHalOtaManager<'d> {
         url: &str,
         expected_sha256: &[u8; 32],
     ) -> Result<(), OtaError> {
-        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let start = Instant::now();
+        let deadline = self.deadline;
+        let per_op = CoreDuration::from_secs(self.config.timeout_secs);
+        let elapsed = || to_core(start.elapsed());
+        let budget = || to_embassy(deadline.clip(per_op, elapsed()));
+
+        // 0. A zero (or already-expired) deadline fails before any network or
+        //    flash access.
+        deadline.check(elapsed())?;
 
         // 1. Parse URL.
         let parsed = parse_url(url).map_err(OtaError::from)?;
@@ -154,44 +243,49 @@ impl<'d> EspHalOtaManager<'d> {
             max_bytes <= u32::MAX as u64,
             "OTA partition exceeds u32 offset range"
         );
+        deadline.check(elapsed())?;
 
         // 4. Send GET request and parse headers.
         //    `fetch_get` validates status 200, exactly-one Content-Length,
         //    no Transfer-Encoding, and 0 < Content-Length <= max_bytes.
-        //    Wrapped in `with_timeout` so a stalled server cannot hang the
-        //    OTA path indefinitely.
-        let http_resp = with_timeout(timeout, fetch_get(socket, &parsed, max_bytes))
+        //    The wait is `min(per-read timeout, remaining deadline)` so a
+        //    stalled server cannot hang the OTA path or outlast the deadline.
+        let http_resp = with_timeout(budget(), fetch_get(socket, &parsed, max_bytes))
             .await
             .map_err(|_| {
                 log::error!(
-                    "OTA: HTTP header phase exceeded {}s timeout",
+                    "OTA: HTTP header phase timed out (per-read {}s or deadline)",
                     self.config.timeout_secs
                 );
-                OtaError::DownloadTimeout
+                classify_read_error(true)
             })??;
+        deadline.check(elapsed())?;
         let content_length = http_resp.content_length;
         log::info!("OTA: downloading {} bytes", content_length);
 
         // 5. Stream body: each chunk feeds both the flash region and the verifier.
-        //    Each socket read is bounded by `timeout` — a peer that stops
-        //    sending bytes mid-body fails the OTA attempt rather than hanging
-        //    the firmware.
+        //    Each socket read waits at most `min(per-read timeout, remaining
+        //    deadline)`; a timed-out wait is `DownloadTimeout`, a socket read
+        //    error is `ServerUnreachable`.
         let mut verifier = StreamingVerifier::new();
         let mut chunk_buf = [0u8; 512];
         let mut remaining = content_length;
 
         while remaining > 0 {
             let to_read = (remaining as usize).min(chunk_buf.len());
-            let n = with_timeout(timeout, socket.read(&mut chunk_buf[..to_read]))
+            let n = with_timeout(budget(), socket.read(&mut chunk_buf[..to_read]))
                 .await
                 .map_err(|_| {
                     log::error!(
-                        "OTA: body chunk read exceeded {}s timeout",
+                        "OTA: body chunk read timed out (per-read {}s or deadline)",
                         self.config.timeout_secs
                     );
-                    OtaError::DownloadTimeout
+                    classify_read_error(true)
                 })?
-                .map_err(|_| OtaError::DownloadTimeout)?;
+                .map_err(|e| {
+                    log::error!("OTA: body chunk read failed: {:?}", e);
+                    classify_read_error(false)
+                })?;
             if n == 0 {
                 // EOF before Content-Length bytes received — peer closed the
                 // socket mid-body. This is a protocol-shape failure (server
@@ -200,6 +294,7 @@ impl<'d> EspHalOtaManager<'d> {
                 log::error!("OTA: short read — EOF before {} bytes remaining", remaining);
                 return Err(OtaError::DownloadFailed { status: 0 });
             }
+            deadline.check(elapsed())?;
             let chunk = &chunk_buf[..n];
             verifier.update(chunk);
             // `write()` is the inherent `FlashRegion` method (see `capacity()` above).
@@ -209,6 +304,7 @@ impl<'d> EspHalOtaManager<'d> {
                     log::error!("Flash write failed: {:?}", e);
                     OtaError::FlashWriteFailed
                 })?;
+            deadline.check(elapsed())?;
             remaining -= n as u64;
         }
 
@@ -220,19 +316,21 @@ impl<'d> EspHalOtaManager<'d> {
             log::error!("OTA: SHA-256 mismatch — boot slot unchanged");
             return Err(OtaError::ChecksumMismatch);
         }
-
         log::info!("OTA: SHA-256 verified — activating next partition");
+        deadline.check(elapsed())?;
 
-        // 7. Activate the new slot.
+        // 7. Pre-activation check: the permit is the only way to call `activate`.
+        let permit = deadline.permit_activation(elapsed()).inspect_err(|_| {
+            log::error!("OTA: deadline exceeded before activation — boot slot unchanged");
+        })?;
+
+        // 8. Activate the new slot, with nothing between the permit and this call.
         //    API mapping (esp-bootloader-esp-idf 0.5.0):
         //      activate_next_partition() = commit / finalize — writes the OTA data
         //        partition so the bootloader boots the new slot on next reset.
         //      set_current_ota_state(OtaImageState::Valid)   = mark_valid / cancel rollback
         //      set_current_ota_state(OtaImageState::Invalid) = signal bootloader to rollback
-        updater.activate_next_partition().map_err(|e| {
-            log::error!("activate_next_partition failed: {:?}", e);
-            OtaError::FlashWriteFailed
-        })?;
+        activate(&mut updater, permit)?;
 
         log::info!("OTA: partition swap complete — reboot to apply");
         Ok(())

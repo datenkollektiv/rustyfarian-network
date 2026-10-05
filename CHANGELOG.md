@@ -9,89 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `juggler::ota::decide_offer` / `OfferDecision` / `Admission` — `decide_update` plus a refused-version loop guard, so a redelivered offer for a version the device rolled back from is `Refused` instead of retried, and an admission gate (`Admission::from_records(attempt_exists, report_undelivered)`) so an offer arriving while an attempt record or undelivered report exists is `OfferDecision::Blocked` and must be kept and re-evaluated once admission reopens.
-  Requested by rustyfarian-rgb-clock; re-exported from both tier `ota` modules.
-- `juggler::ota::reconcile` with `AttemptRecord`, `BootFacts`, `ReconcileAction`, `SlotId`, and `SlotState` — pure boot reconciliation that turns persisted attempt evidence and bootloader facts into the next action (await health check, refuse image, report rollback, complete, clear, defer), with unparseable versions and failed slot reads expressed as `None`.
-  `ReconcileAction::CompleteAttempt` recovers an interrupted success cleanup: the attempted image is running and `Valid`, so the consumer clears a differing refused version and then the attempt.
-  `ReconcileAction::ClearAttempt` is abandoned-attempt cleanup only and never clears a refusal.
-  `AttemptRecord.boot_selected` is durable evidence that the target slot was selected for boot, persisted after `fetch_and_apply` returns `Ok`, so a new image that crashes before persisting `activated` still reads as a rollback.
-  `BootFacts.report_persisted` / `ReportRollback.report_already_persisted` deduplicate the durable, retried report per attempt.
-  `AttemptRecord.attempt_id` (echoed in `ReportRollback`) is the stable event id for at-least-once report delivery; admission stays blocked while a report is undelivered.
-  A host lifecycle simulation (`crates/juggler/tests/ota_lifecycle.rs`) injects crashes and failed writes at every step.
-  Requested by rustyfarian-rgb-clock; re-exported from both tier `ota` modules.
-- `OtaError::code` — a stable, lowercase snake_case wire code per variant (`checksum_mismatch`, `download_failed`, ...).
-  Requested by rustyfarian-rgb-clock; available through both tier re-exports of `OtaError`.
-- `juggler::mqtt::spawn_connect_thread` — runs an optional connect-time prelude and then the builder subscriptions on one short-lived thread; `spawn_subscriber_thread` is kept as a thin wrapper.
-- `juggler::mqtt::ConnectionEpoch` — generation-checked connected flag so a stale connect helper can never mark a dead connection as connected.
-- `juggler::mqtt::CallbackScope` / `in_callback` — thread-local marker for "inside an MQTT callback", host-tested and lock-free.
-- [`idf_c3_mqtt_callback_guard`](crates/rustyfarian-esp-idf-network/examples/idf_c3_mqtt_callback_guard.rs) example: a self-contained hardware check for the MQTT callback contract (startup message + `on_connect` publish, and `try_publish` / `publish` from `on_message` failing fast with `WrongThread`).
-- [ADR 017](docs/adr/017-mqtt-callback-threading-contract.md) records the MQTT callback threading contract and why releasing the event before `on_message` was rejected.
-- `just doctor` reports whether the MQTT broker configured in `.env` (`MQTT_HOST` / `MQTT_PORT`) accepts a TCP connection; optional, never fatal, credentials are not read.
-- `juggler::provisioning::SessionState` / `SessionOutcome` (`std` feature) — the provisioning portal's shared commit/wait state, moved from `rustyfarian-esp-idf-network` so its host toolchain can run a regression test for the commit/wait race fixed in bug 002/003; covered by `just test-provisioning`.
-  `apply`, `apply_and_notify`, and `commit` return `Result<_, InvalidTransition>` so a caller can refuse the request behind a rejected transition; `wait_committed` is single-consumer (every other waiter gets `None` and a `warn` log).
+- OTA consumer runtime and record store (`juggler::ota::{runtime, persist}`, IDF tier `ota`): `OtaRuntime` / `OtaSubmitter` / `OtaHandle` run command intake, an update/rollback/repair worker, a `rolled_back` reporter and the health policy around an app-supplied predicate; the library never restarts on its own.
+  `OtaStore<K: OtaKv>` with `EspNvsKv` persists attempts in 16 NVS keys, `reconcile_boot` returns the next action, and `repair_corrupt` clears unreadable records; see `docs/features/ota-consumer-runtime-v1.md`, including "Behaviour changes versus the first consumer's runbook".
+- OTA wire contract behind the `juggler` `ota-wire` feature: `OtaCommand` (incl. `Repair`), `Manifest`, `OtaStatus` (incl. `Repaired`), `FailReason`, `RollbackReason` and `TARGET_CHIP`, re-exported from both tier `ota` modules.
+- OTA decision core and download deadline: `decide_offer` / `Admission`, `reconcile`, `OtaError::code()`, and `with_deadline` on `OtaSession` (IDF) and `EspHalOtaManager` (HAL), enforced by `ActivationPermit`.
+- Tooling and examples: the `idf_c3_ota_runtime` and `idf_c3_mqtt_callback_guard` examples, public `ota::url_for_log`, `juggler::provisioning::SessionState` for host regression tests, and a broker check in `just doctor`.
 
 ### Changed
 
-- `on_connect` runs on the per-connect helper thread (after the `with_startup_message()` publish, before the subscriptions).
-  Calling `client.enqueue()` / `client.subscribe()` on its `client` argument from `on_connect` is therefore safe.
-  `is_connected()` still flips only after it returns, and on resumed sessions `on_message` may overlap it.
-- `MqttHandle::publish`, `publish_retained`, `publish_with`, `try_publish*`, `subscribe`, and `publish_acked` reject calls from inside any callback.
-  The error carries `PublishAckError::WrongThread` (via `anyhow::Error` / `TryPublishError::Other`).
-  Signatures are unchanged and the variant's `Display` text is method-neutral.
-- `with_startup_message()` publishes from the helper thread, never from the event-loop thread; still best-effort, failures logged at `warn`.
-- Rustdoc, both READMEs, and the `idf_c3_mqtt` / `idf_esp32_mqtt` examples describe the rule.
-- `idf_c3_provision` / `idf_c3_provision_mqtt` examples log secrets as `set` / `missing` instead of their length, so no value derived from a Wi-Fi password or LoRaWAN AppKey reaches a log line (CodeQL `rust/cleartext-logging`).
-  Use the `client` argument in `on_connect`.
-  Never call a `MqttHandle` method from a callback, and never call the client from `on_message` / `on_disconnect`.
-- The `idf_c3_mqtt`, `idf_esp32_mqtt`, `idf_c3_mqtt_button_oled`, and `idf_c3_mqtt_led_grid` examples read the broker port from `MQTT_PORT` (default `1883`).
-  Their `.env` handling is shared in `examples/common/env.rs`.
-- `try_publish`, `try_publish_retained`, `TryPublishError`, and the module docs state that "non-blocking" holds only outside the MQTT callbacks; inside one the call returns `TryPublishError::Other` carrying `PublishAckError::WrongThread`.
-- `idf_c3_mqtt_button_oled` treats the SSD1306 as optional: when no display answers on I2C at boot it logs one warning and runs headless, so the button/MQTT path can be tested on a bare ESP32-C3.
-- Workspace version and the `juggler` dependency minimum raised to `0.5.1`.
-  `rustyfarian-esp-idf-network` imports `spawn_connect_thread`, `ConnectionEpoch`, and `CallbackScope`, which do not exist in `juggler 0.5.0`.
-- Examples no longer fall back to literal placeholder credentials (`WIFI_PASS`, `WIFI_PSK`, LoRaWAN EUIs/AppKey).
-  Unset values are the type default and the LoRa examples fail fast at startup.
-  This also clears the CodeQL hard-coded-credential findings on example code.
-- `rustyfarian-esp-idf-network`'s `provisioning` feature now enables `juggler/std`, so its `SharedState` is a thin alias over `juggler::provisioning::SessionState`; the crate's own public API is unchanged.
+- **Breaking:** `create_http_connection` takes an `accept` parameter, and `OtaCommand`, `OtaStatus`, `FailReason` and `ConfigError` gained variants without being `#[non_exhaustive]`.
+  OTA error codes changed: an IDF per-read timeout is now `download_timeout`, a HAL socket read error is now `server_unreachable`.
+  OTA wire parsing is strict: unknown fields, labels and JSON-array payloads are rejected, and URLs are validated at intake (`command_invalid` / `manifest_invalid`).
+- MQTT callback contract (ADR 017): `on_connect` runs on a per-connect helper thread where `client.enqueue()` / `client.subscribe()` are safe, and `MqttHandle` methods called from any callback return `PublishAckError::WrongThread`.
+- Workspace and `juggler` minimum version `0.5.1`; the IDF `provisioning` feature enables `juggler/std`, `ota` enables `juggler/ota-wire`; examples read `MQTT_PORT` and ship no placeholder credentials.
 
 ### Fixed
 
-- `with_startup_message()`, any `client.enqueue()` / `client.subscribe()` inside `on_connect`, and any `MqttHandle` call from a callback deadlocked the ESP-IDF MQTT event loop.
-  esp-mqtt delivers events while holding its recursive `api_lock`.
-  esp-idf-svc 0.53 parks the mqtt task until our event loop calls `next()` again.
-  `is_connected()` therefore stayed `false` and the broker fired the LWT.
-  rustyfarian-rgb-clock confirmed the `on_message` variant on an ESP32-C3 with 0.5.0: a `try_publish` from `on_message` hung the client until reset.
-- A three-way cycle appeared whenever `on_connect` was registered.
-  It involved a publisher holding the client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop waiting for that mutex.
-  The event loop no longer takes the client mutex at all.
-  See [docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md](docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md).
-- `ProvisioningSession::wait_committed` and the internal `wait_outcome` cloned the ~1.3 KB `ProvisioningConfig` onto the caller's stack; `run_wifi_mqtt_portal` then discarded the copy.
-  A consumer with `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000` overflowed the main task right after `Provisioning event: Committed`.
-  `wait_committed` now moves the config out with `take()`, `run_wifi_mqtt_portal` never copies it, and the portal publishes `ProvisioningState::Committed` and the payload under one lock so a waiter after the payload was taken still resolves via `juggler::provisioning::resolve_wait`, which now keys on the state alone, and no waiter can observe the state before the payload.
-  Both functions document the caller's stack budget.
-  See [docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md](docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md).
-- `ProvisioningConfig` left the Wi-Fi password, the MQTT password, the LoRaWAN AppKey, and every extra-field value readable in freed stack and heap memory after the value was dropped.
-  `ProvisioningConfig`, `LoraFields`, and `MqttFields` now implement `Drop` and overwrite the full backing buffer of each secret with zeros before the memory is released.
-  The overwrite uses `zeroize` (`default-features = false`, no transitive crates), a new optional `juggler` dependency enabled by the `provisioning` feature.
-  Non-secret fields, `Clone`, `from_storage_parts`, and all accessors are unchanged.
-  The scrub covers only each value's final storage: moves of the inline `heapless` buffers, the raw form body, parser and NVS scratch buffers, and a panic dump of live stack frames (bug 002) are not covered.
-  See [docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md](docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md).
-- `ExtraField`'s `Debug` output (and therefore `ProvisioningConfig`'s) printed extra-field values verbatim, so a secret extra such as `api_token` reached logs.
-  The value is now shown as `"<redacted>"`; the key stays visible.
-- `ExtraField` scrubs its own value on drop, so a clone taken out of `ProvisioningConfig::extras()` no longer leaves a secret extra (e.g. `api_token`) in freed memory.
-  Because of the new `Drop` impl its public fields can be borrowed or cloned but no longer moved out.
-- The portal's `/save` reported success (the committed page and `ProvisioningEvent::Committed`) even when the session refused the commit, e.g. a valid submission after `/factory-reset` or a double submit; the credentials were written to NVS and then lost to the pending reset.
-  `/save` now checks the transition before touching NVS and answers `409` once the session is committed, reset-pending, or already saving; `/factory-reset` answers `409` after a commit or during a save.
-  The first terminal event now stands: up to 0.5.0 a valid submission after a reset request still resolved the waiter as committed.
-- The bare-metal (`rustyfarian-esp-hal-network`) portal had the same flaw: a valid `/save` after `/factory-reset` (or a second submit after a commit) was still written to flash, signalled `ProvisioningOutcome::Committed`, and emitted `SubmissionAccepted` / `Committed`; `/factory-reset` after a commit still signalled `FactoryResetRequested`.
-  Because the outcome `Signal` keeps only the last value, the later request overrode the first and the user was shown a page for something that did not happen.
-  Both routes now answer `409` without writing flash, signalling, or emitting an event when the session refuses the transition, and `Committed` is signalled only after `PersistOk` is accepted.
+- MQTT deadlock when callbacks called the client while esp-mqtt held its `api_lock` (`is_connected()` stayed false, LWT fired); see `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`.
+- Provisioning: `wait_committed` stack overflow from a config clone (bug 002), secrets left in freed memory now scrubbed via `zeroize` (bug 003), and both portals answer stale `/save` or `/factory-reset` with `409` without writing flash; see `docs/bugs/archive/`.
 
 ## [0.5.0] - 2026-09-26
 
 ### Added
 
-- `MqttHandle::publish_acked` — QoS 1 publish that blocks until PUBACK or timeout, returning a typed `PublishAckError`; backed by a new host-tested correlation registry in `juggler::mqtt` (`PendingAcks`, `AckWaiter`, `AckOutcome`, `MessageId`). See `docs/features/mqtt-publish-acked-v1.md`.
+- `MqttHandle::publish_acked` — QoS 1 publish that blocks until PUBACK or timeout, returning a typed `PublishAckError`; backed by a new host-tested correlation registry in `juggler::mqtt` (`PendingAcks`, `AckWaiter`, `AckOutcome`, `MessageId`). See `docs/features/archive/mqtt-publish-acked-v1.md`.
 - Both tier `ota` modules re-export the full `juggler::ota` surface instead of `OtaError` alone, so version-gated consumers need no direct `juggler` dependency.
 - `juggler::ota::decide_update` / `UpdateDecision` (Experimental) — `Apply` when the offered version is newer, `Skip` when equal, `Reject` when older; no downgrade path.
 - `rustyfarian-esp-idf-network` `features = ["wifi"]` now compiles against a SoftAP-disabled ESP-IDF; adding `provisioning` to such a build fails with one `compile_error!` instead of a cascade. See `docs/features/archive/wifi-softap-cfg-gate-v1.md`.
