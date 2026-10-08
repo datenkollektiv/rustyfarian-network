@@ -8,6 +8,7 @@ after that many body bytes, which exercises the device's per-read timeout and to
 download deadline (sub-project A, expected status `failed{download_timeout}`).
 """
 import os
+import socketserver
 import sys
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +45,14 @@ def main():
                 if rate:
                     time.sleep(len(chunk) / rate)
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    class Server(ThreadingHTTPServer):
+        # HTTPServer.server_bind resolves the host's FQDN only for a display name; a
+        # malformed system hostname makes that lookup raise, so skip it.
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
+    server = Server(("0.0.0.0", port), Handler)
     server.daemon_threads = True
     mode = f"{rate} B/s" if rate else "full speed"
     if stall_after:
