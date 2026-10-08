@@ -7,14 +7,14 @@
 //! 2. **Route dispatcher** — `dispatch_request` maps each request to one of
 //!    the functional routes: `GET /`, `GET /factory-reset`, `POST /save`,
 //!    `POST /factory-reset`, OS captive-portal probe redirects, or 404.
-//! 3. **Async accept-loop** — `run_portal` (embassy + chip feature gated)
+//! 3. **Async accept-loop** — `run_portal_dyn` (embassy + chip feature gated)
 //!    binds a TCP socket, accepts one connection at a time, reads one request,
 //!    dispatches it, writes one response, then closes and loops.
 //!
 //! # Security posture
 //!
 //! Security-checklist items implemented in this file (see
-//! `docs/features/esp-hal-provisioning-v1.md`):
+//! `docs/features/archive/esp-hal-provisioning-v1.md`):
 //!
 //! - Item 1: nonce check on every mutating POST (`nonce_matches`).
 //! - Item 2: `Prefill` never holds `wifi_pass` or `mqtt_pass`.
@@ -56,7 +56,7 @@
 //! Ensure the main-thread stack is at least **14 KiB** before spawning the
 //! HTTP task.
 
-// When building without the embassy + chip features the async `run_portal`
+// When building without the embassy + chip features the async `run_portal_dyn`
 // function and its TcpSocket usage are compiled away.  Allow dead-code on the
 // types that remain so clippy -D warnings does not fail on stub/host builds.
 #![cfg_attr(
@@ -116,7 +116,7 @@ const DEFAULT_RX_BUF: usize = 1024;
 
 /// Default socket transmit buffer size.
 ///
-/// 6 KiB is the Phase 2B–locked value (see `docs/features/esp-hal-provisioning-v1.md`
+/// 6 KiB is the Phase 2B–locked value (see `docs/features/archive/esp-hal-provisioning-v1.md`
 /// Decisions "Locked at Phase 2B implementation").  Real portal HTML for the
 /// `WifiMqttDevice` profile is 4–6 KiB rendered with placeholders substituted;
 /// a smaller buffer would trip the [`MINIMAL_500`] fallback on every portal GET.

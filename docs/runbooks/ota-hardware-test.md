@@ -688,8 +688,10 @@ Copy this table into your results file and update one cell per run.
 **PASS scenarios (16):** P1–P11, P13, P14, P15, P19, P20.
 
 **Re-run scenarios (2):**
-- P12: PASS (6+0, no resends). The first run measured 6+1 because QoS 1 resent one status during the partition erase; this re-run avoided that by timing the burst after `OTA write session started`.
-- P16: PASS (1.13.0/1.14.0 used). The first run sent commands back-to-back within milliseconds, hitting the single busy slot; re-running with 2 s gaps between commands yielded three `pending_verify` responses before the update ran.
+- P12: PASS (6+0, no resends).
+  The first run measured 6+1 because QoS 1 resent one status during the partition erase; this re-run avoided that by timing the burst after `OTA write session started`.
+- P16: PASS (1.13.0/1.14.0 used).
+  The first run sent commands back-to-back within milliseconds, hitting the single busy slot; re-running with 2 s gaps between commands yielded three `pending_verify` responses before the update ran.
 
 **Skipped scenarios (3):**
 - P17: not run (broker outage scenario needs SRE).
@@ -713,7 +715,7 @@ Copy this table into your results file and update one cell per run.
 
 ### 2026-10-08 Campaign 2 Results (same board, end to end)
 
-**Library state:** `529428d` (bug 005 fix and the `ota-*` / `mosquitto` recipes), versions 2.0.0–2.13.0, local `just mosquitto` broker.
+**Library state:** `2a3ac3f` (bug 005 fix and the `ota-*` / `mosquitto` recipes), versions 2.0.0–2.13.0, local `just mosquitto` broker.
 
 **PASS (21 of 21):** P1–P21, run in one campaign by a driver script that only sequences the runbook's recipes.
 

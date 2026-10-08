@@ -3,7 +3,7 @@ set -euo pipefail
 # build-example.sh — build a named example (no flash)
 # Usage: scripts/build-example.sh <example> [hal_dir [idf_dir]]
 #   example: idf_{chip}_{feature} or hal_{chip}_{name}
-#   e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join
+#   e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_connect_async, hal_esp32s3_join
 #
 # Chip and crate are auto-detected from the example name.
 # MCU and Cargo target are set per chip so the image matches the physical hardware.
@@ -73,7 +73,7 @@ get_example_features_from_toml() {
 }
 
 if [ $# -lt 1 ]; then
-    printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join\n' "$0" >&2
+    printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_connect_async, hal_esp32s3_join\n' "$0" >&2
     exit 2
 fi
 
@@ -169,7 +169,7 @@ case "$prefix" in
 
     *)
         printf 'Error: example name must start with "idf_" or "hal_".\n' >&2
-        printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_join, hal_esp32_join\n' "$0" >&2
+        printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_connect_async, hal_esp32s3_join\n' "$0" >&2
         exit 1
         ;;
 esac

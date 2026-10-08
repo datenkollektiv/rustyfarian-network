@@ -519,7 +519,7 @@ ota-serve rate="0" stall="0":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -d target/ota ]; then
-        echo "target/ota does not exist; run 'just ota-image <example>' first" >&2
+        echo "target/ota does not exist; run 'just ota-image <version>' first" >&2
         exit 1
     fi
     exec python3 scripts/ota-server.py target/ota "${OTA_PORT:-8000}" "{{ rate }}" "{{ stall }}"

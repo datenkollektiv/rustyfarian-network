@@ -2,7 +2,7 @@
 //! validation, SoftAP SSID derivation, and a backend-neutral state machine.
 //!
 //! This module is the host-testable core of the SoftAP captive-portal
-//! provisioning triad (see `docs/features/softap-provisioning-v1.md`). It owns
+//! provisioning triad (see `docs/features/archive/softap-provisioning-v1.md`). It owns
 //! the `application/x-www-form-urlencoded` parser, the structured per-field
 //! error model the HTTP layer renders, and the provisioning state machine that
 //! the ESP-IDF crate drives. It holds no platform dependencies so a future

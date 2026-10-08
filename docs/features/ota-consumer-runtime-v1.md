@@ -310,8 +310,8 @@ Pending: clock adoption on real NVS + full runbook + power-loss scenarios + Watc
 - [x] A–D design approved and implementation complete; host gates green.
 - [x] ADR 018 ("OTA consumer runtime in the library") written.
 - [x] Both consumers' preliminary review received (C/D API, hook wiring, clock adoption path).
-- [ ] A hardware check (ESP32-C3 runbook).
-- [ ] C + D hardware validation (clock adoption on real NVS, full runbook, power-loss scenarios).
+- [x] A hardware check (ESP32-C3 runbook: P10/P11, 2026-10-08).
+- [x] C + D hardware validation: library runbook 21/21 on ESP32-C3 (`2a3ac3f`, 2026-10-08) and rgb-clock adoption tests passed (2026-10-09).
 - [ ] Watchtower v2 hardware validation on second device.
 - [ ] `cargo semver-checks` recipe added and run against v0.5.0 before 0.6.0 release.
 
@@ -328,3 +328,5 @@ Pending: clock adoption on real NVS + full runbook + power-loss scenarios + Watc
 - 2026-10-06 — D design approved: module layout, OtaConfig/OtaSubmitter/OtaRuntime/OtaHandle; health policy; reboot contract.
 - 2026-10-06 — D implemented; `idf_c3_ota_runtime` example builds; runbook doc added.
 - 2026-10-06 — Old layouts (ef7818b..a14f555: `rb_from`/`rb_conf`, missing ids) no longer supported; missing ids are corrupt, cleared by `repair_corrupt`.
+- 2026-10-08 — Hardware validation: runbook 21/21 on ESP32-C3 (campaign 2, local broker); bug 005 (MQTT never auto-reconnected) found and fixed on the way.
+- 2026-10-09 — rgb-clock adoption tests passed; remaining before 0.6.0: `cargo semver-checks` recipe; Watchtower v2 validation follows separately.
