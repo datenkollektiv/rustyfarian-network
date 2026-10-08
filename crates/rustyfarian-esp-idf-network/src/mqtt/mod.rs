@@ -516,7 +516,13 @@ where
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(config.client_id),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
-            reconnect_timeout: config.reconnect_timeout_ms.map(Duration::from_millis),
+            // esp-idf-svc reads `None` as "auto-reconnect disabled"; `Some(ZERO)` keeps
+            // it on with esp-mqtt's 10 s default.
+            reconnect_timeout: Some(
+                config
+                    .reconnect_timeout_ms
+                    .map_or(Duration::ZERO, Duration::from_millis),
+            ),
             task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: config.username,
@@ -1061,7 +1067,13 @@ impl<'a> MqttBuilder<'a> {
         let mqtt_cfg = MqttClientConfiguration {
             client_id: Some(client_id.as_str()),
             keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
-            reconnect_timeout: config.reconnect_timeout_ms.map(Duration::from_millis),
+            // esp-idf-svc reads `None` as "auto-reconnect disabled"; `Some(ZERO)` keeps
+            // it on with esp-mqtt's 10 s default.
+            reconnect_timeout: Some(
+                config
+                    .reconnect_timeout_ms
+                    .map_or(Duration::ZERO, Duration::from_millis),
+            ),
             task_stack: config.task_stack_size,
             lwt: lwt_cfg,
             username: username.as_deref(),
