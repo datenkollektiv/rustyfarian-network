@@ -439,10 +439,75 @@ check-library-never-reboots:
 
 # ── ota ───────────────────────────────────────────────────────────────────
 
-# build an OTA example and produce the app binary, SHA-256 checksum, manifest JSON
+# build an OTA example and produce app binary, SHA-256, manifest, and command (version first)
 [group('ota')]
-ota-image example:
-    scripts/ota-image.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
+ota-image version example="idf_c3_ota_runtime":
+    scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
+
+# baseline flash of idf_c3_ota_runtime with FIRMWARE_VERSION=version
+[group('ota')]
+ota-flash version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! printf '%s' "{{ version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "Error: version must be MAJOR.MINOR.PATCH, got '{{ version }}'" >&2
+        exit 1
+    fi
+    FIRMWARE_VERSION="{{ version }}" scripts/flash.sh "idf_c3_ota_runtime" "{{ hal_dir }}" "{{ idf_dir }}"
+
+# build an unhealthy OTA image (OTA_DEMO_UNHEALTHY=1, optional failure deadline in s)
+[group('ota')]
+ota-image-unhealthy version deadline="" example="idf_c3_ota_runtime":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! printf '%s' "{{ version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "Error: version must be MAJOR.MINOR.PATCH, got '{{ version }}'" >&2
+        exit 1
+    fi
+    if [ -n "{{ deadline }}" ] && ! printf '%s' "{{ deadline }}" | grep -Eq '^[0-9]+$'; then
+        echo "Error: deadline must be a whole number of seconds, got '{{ deadline }}'" >&2
+        exit 1
+    fi
+    export FIRMWARE_VERSION="{{ version }}" OTA_DEMO_UNHEALTHY=1
+    if [ -n "{{ deadline }}" ]; then
+        export OTA_FAILURE_DEADLINE_SECS="{{ deadline }}"
+    fi
+    scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
+
+# publish OTA manifest command for version (fails if not built)
+[group('ota')]
+ota-cmd version:
+    scripts/ota-mqtt.sh cmd "{{ version }}"
+
+# publish tampered manifest command (kind: target|checksum)
+[group('ota')]
+ota-cmd-tampered version kind:
+    scripts/ota-mqtt.sh cmd-tampered "{{ version }}" "{{ kind }}"
+
+# publish raw payload to OTA command topic
+[group('ota')]
+ota-pub payload:
+    scripts/ota-mqtt.sh pub {{ quote(payload) }}
+
+# publish rollback action
+[group('ota')]
+ota-rollback from:
+    scripts/ota-mqtt.sh rollback "{{ from }}"
+
+# publish repair action
+[group('ota')]
+ota-repair:
+    scripts/ota-mqtt.sh repair
+
+# burst publish count commands (kind: repair|invalid)
+[group('ota')]
+ota-burst count kind:
+    scripts/ota-mqtt.sh burst "{{ count }}" "{{ kind }}"
+
+# subscribe to OTA status topic with ISO timestamps (topic: default status)
+[group('ota')]
+ota-sub topic="status":
+    scripts/ota-mqtt.sh sub "{{ topic }}"
 
 # Usage: just ota-serve              (serve at full speed)
 #        just ota-serve 10240        (throttle to 10 KB/s)
@@ -458,6 +523,12 @@ ota-serve rate="0" stall="0":
         exit 1
     fi
     exec python3 scripts/ota-server.py target/ota "${OTA_PORT:-8000}" "{{ rate }}" "{{ stall }}"
+
+# Port: LOCAL_MQTT_PORT (default 1883); `up` prints the MQTT_HOST and MQTT_PORT to use.
+# manage a local test MQTT broker: just mosquitto up | down | status | restart
+[group('ota')]
+mosquitto action:
+    @scripts/mosquitto.sh "{{ action }}"
 
 # ── ci ────────────────────────────────────────────────────────────────────
 

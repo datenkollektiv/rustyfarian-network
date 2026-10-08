@@ -40,3 +40,28 @@ find_idf_bootloader() {
         echo "${bl_candidates[0]}"
     fi
 }
+
+# detect_lan_ip
+# Detect the LAN IP of the default interface.
+# On macOS: uses route + ipconfig
+# On Linux: uses ip route get
+# Outputs the IP address to stdout; returns 0 on success, 1 on failure.
+detect_lan_ip() {
+    if [ "$(uname)" = "Darwin" ]; then
+        # macOS: get default interface and its IP
+        local default_if
+        default_if=$(route -n get default 2>/dev/null | grep interface | awk '{print $2}' || echo "")
+        if [ -n "$default_if" ]; then
+            ipconfig getifaddr "$default_if" 2>/dev/null && return 0
+        fi
+    else
+        # Linux: use `ip route get`
+        local lan_ip
+        lan_ip=$(ip route get 1.1.1.1 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' || echo "")
+        if [ -n "$lan_ip" ]; then
+            printf '%s' "$lan_ip"
+            return 0
+        fi
+    fi
+    return 1
+}

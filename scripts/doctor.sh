@@ -94,3 +94,5 @@ check_cmd cargo-audit    cargo-audit    recommended "cargo install cargo-audit  
 check_cmd cargo-machete  cargo-machete  optional    "cargo install cargo-machete   (needed for: just machete)"
 check_cmd cargo-outdated cargo-outdated optional    "cargo install cargo-outdated  (needed for: monthly dependency review)"
 check_cmd espflash       espflash       optional    "cargo install espflash        (needed for: just flash, just run)"
+check_cmd mosquitto_pub  mosquitto_pub  optional    "brew install mosquitto        (needed for: just ota-* runbook commands)"
+check_cmd mosquitto_sub  mosquitto_sub  optional    "brew install mosquitto        (needed for: just ota-sub)"

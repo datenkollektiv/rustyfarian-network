@@ -274,6 +274,11 @@ Rejected in ADR 017 in favour of the `WrongThread` guard.
 Field-confirmed 2026-09-28: rustyfarian-rgb-clock on 0.5.0 hung for good on a `try_publish` from `on_message`.
 Hardware check: `idf_c3_mqtt_callback_guard`.
 
+**`esp-idf-svc` reads `MqttClientConfiguration::reconnect_timeout: None` as "disable auto-reconnect", not "use the default".**
+`src/mqtt/client.rs` (0.52 and 0.53) sets `disable_auto_reconnect = true` for `None`; the struct's own default is `Some(0)`, which esp-mqtt turns into its 10 s retry.
+Mapping an optional app setting with `.map(Duration::from_millis)` therefore switched reconnects off for every default config: the first connect still works, but after any mid-session disconnect the client stays silent until a reboot — no connect attempts, no errors.
+Fix (bug 005): always pass `Some(...)`, with `Duration::ZERO` when the app sets nothing; reproduce with `just mosquitto down` / `just mosquitto up`.
+
 ---
 
 ## LoRaWAN / TTN v3 (EU868)
@@ -458,6 +463,12 @@ The reconcile logic then sees: old report with `rb_id=X`, new attempt with `att_
 Fix (lines 559–564 in `store.rs`): `next_attempt_id()` floors at the highest id from all four keys (`att_ctr`, `att_id`, `rb_id`, `rq_id`), and only a still-pending report (`rb == 1`) is adopted; a delivered report (`rb == 0`) with a matching id is not, so a fresh report is created.
 Test coverage: `crates/juggler/src/ota/persist/tests/counter_loss.rs` lines 104–119 (`a_lost_counter_does_not_swallow_the_next_rollback_report`) and lines 122–134 (`a_delivered_report_with_the_attempts_id_is_not_adopted`).
 Lesson: never let an id that is still referenced (in any stored record) be reissued; when a counter is lost, all stored ids become floor references.
+
+**Any OTA status can reach subscribers twice: esp-mqtt resends a QoS 1 publish whose PUBACK is not handled within 1 s.**
+`MQTT_DEFAULT_RETRANSMIT_TIMEOUT_MS` is 1000 (`esp-mqtt` `mqtt_config.h`), the workspace `MqttClientConfiguration` keeps the default, and the runtime publishes every status at QoS 1.
+The partition erase after `downloading` stalls the chip for about 6.5 s (until `OTA write session started`), so a status published just before it is resent and the broker forwards the duplicate.
+Found in runbook P12 (2026-10-07): six `repair` commands during the erase gave six `busy` plus one dropped rejection; the same burst after the erase gave exactly six plus none, and a probe showed the broker does not upgrade QoS 0 publishes.
+Consequence: count rejections only outside the erase window, and treat every status as at-least-once — deduplicate `rolled_back` by `epoch` and `attempt_id`; see `docs/runbooks/ota-hardware-test.md` P12.
 
 ## ESP-NOW
 
