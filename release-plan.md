@@ -177,7 +177,9 @@ Create a release page at `https://github.com/datenkollektiv/rustyfarian-network/
 
 - **Tag:** `v0.4.0`
 - **Title:** `v0.4.0 — First Publication to Crates.io`
-- **Body:** Keep it short — a one-line summary, the three crates, the breaking change with a migration link, and condensed fixes. Do **not** paste the full `## [0.4.0]` CHANGELOG section. Template:
+- **Body:** Keep it short — a one-line summary, the three crates, the breaking change with a migration link, and condensed fixes.
+  Do **not** paste the full `## [0.4.0]` CHANGELOG section.
+  Template:
 
 ```markdown
 First publication to crates.io. Consolidates 16 workspace crates into 3 publishable crates, one per HAL tier ([ADR 016](docs/adr/016-crate-consolidation-for-publishing.md)).

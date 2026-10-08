@@ -33,7 +33,8 @@ The decision-core boundary remains: esp-hal has no MQTT (ADR 015), so B, C, D st
 
 ### 2. The consumer keeps three responsibilities
 
-- **Health predicate:** is the newly-booted image healthy? (app-specific criteria: firmware version checks, signature verification, feature detection, uptime metrics)
+- **Health predicate:** is the newly-booted image healthy?
+  (app-specific criteria: firmware version checks, signature verification, feature detection, uptime metrics)
 - **Topics:** MQTT topic names for commands and status (clock: `ota/command`, `ota/status`; Watchtower: `rustyfarian/watchtower/<device-id>/ota/*`)
 - **Version numbering:** version strings and parsing rules (clock: `"1.2.3"`, semver; consumer may prefer `"2026-10-05-abc1234"`, git tags, or others)
 

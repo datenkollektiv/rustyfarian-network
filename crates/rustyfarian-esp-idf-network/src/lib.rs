@@ -49,10 +49,10 @@
 //! Each domain module in this crate re-exports the corresponding types from
 //! [`juggler`] (the platform-agnostic core) for consumer convenience:
 //!
-//! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::WiFiDriver`], etc. from `juggler::wifi`
+//! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::WifiDriver`], etc. from `juggler::wifi`
 //! - `mqtt::*` exports [`mqtt::MqttConnectionState`], validation functions, etc. from `juggler::mqtt`
 //! - `lora::*` exports [`lora::LoraRadio`], [`lora::LorawanDevice`], [`lora::Region`], etc. from `juggler::lora`
-//! - `espnow::*` exports [`espnow::EspNowDriver`], [`espnow::PeerTracker`], etc. from `juggler::espnow`
+//! - `espnow::*` exports [`espnow::EspNowDriver`], [`espnow::ScanConfig`], etc. from `juggler::espnow`
 //! - `ota::*` exports [`ota::OtaError`], [`ota::StreamingVerifier`], etc. from `juggler::ota`
 //! - `provisioning::*` exports [`provisioning::ProvisioningState`], [`provisioning::SchemaProfile`], etc. from `juggler::provisioning`
 
@@ -85,5 +85,5 @@ pub mod provisioning;
 // error naming the fix instead of a wall of unresolved-import errors.
 #[cfg(all(feature = "provisioning", not(esp_idf_esp_wifi_softap_support)))]
 compile_error!(
-    "the `provisioning` feature requires SoftAP support; enable CONFIG_ESP_WIFI_SOFTAP_SUPPORT in the ESP-IDF sdkconfig used for this build (see docs/features/wifi-softap-cfg-gate-v1.md)"
+    "the `provisioning` feature requires SoftAP support; enable CONFIG_ESP_WIFI_SOFTAP_SUPPORT in the ESP-IDF sdkconfig used for this build (see docs/features/archive/wifi-softap-cfg-gate-v1.md)"
 );

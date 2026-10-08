@@ -370,7 +370,7 @@ impl<F: NorFlash> ProvisioningStore<F> {
     /// Integrators should size the spawned HTTP task with at least 14 KiB of
     /// stack to leave headroom for ISR frames and stack canary.
     ///
-    /// See `docs/features/esp-hal-provisioning-v1.md` Decisions
+    /// See `docs/features/archive/esp-hal-provisioning-v1.md` Decisions
     /// "Locked at Phase 2B implementation" for the `DEFAULT_TX_BUF = 6144`
     /// rationale.
     ///

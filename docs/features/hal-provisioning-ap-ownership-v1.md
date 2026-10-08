@@ -51,9 +51,13 @@ When done:
 
 ## Constraints
 
-- **BREAKING API change.** `start()`'s signature changes (AP peripherals instead of `SoftApHandle`); both hal examples and any downstream consumer update their call sites. Bare-metal + pre-1.0 ("API may change before 1.0") → acceptable with a CHANGELOG migration note and an appropriate version bump.
-- **BREAKING behavior change.** hal's default AP SSID changes from `{prefix}` to `{prefix}-{MAC}`; existing hal APs are renamed. Document the rename and the migration (consumers wanting the bare name set `ssid_override: Some("name")`).
-- **MAC must be readable before the AP is up** so the SSID can be baked into `ApConfig`. Confirm the esp-radio/esp-hal path (e.g. `esp_wifi_get_mac` / efuse read) and whether it requires the radio/controller to be initialised first — if the MAC is only available after radio init, the bring-up order must be: init radio → read MAC → resolve SSID → start AP (may mean splitting `init_softap_async`). See Open Questions.
+- **BREAKING API change.** `start()`'s signature changes (AP peripherals instead of `SoftApHandle`); both hal examples and any downstream consumer update their call sites.
+  Bare-metal + pre-1.0 ("API may change before 1.0") → acceptable with a CHANGELOG migration note and an appropriate version bump.
+- **BREAKING behavior change.** hal's default AP SSID changes from `{prefix}` to `{prefix}-{MAC}`; existing hal APs are renamed.
+  Document the rename and the migration (consumers wanting the bare name set `ssid_override: Some("name")`).
+- **MAC must be readable before the AP is up** so the SSID can be baked into `ApConfig`.
+  Confirm the esp-radio/esp-hal path (e.g. `esp_wifi_get_mac` / efuse read) and whether it requires the radio/controller to be initialised first — if the MAC is only available after radio init, the bring-up order must be: init radio → read MAC → resolve SSID → start AP (may mean splitting `init_softap_async`).
+  See Open Questions.
 - **Stays within the existing gate** `#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]`.
 - **AP channel + password come from `PortalConfig`** (`channel`, `ap_password`) — the internally-built `ApConfig` honours them; the existing AP-password length check in `start()` still applies.
 - **Everything else is preserved** — portal HTML, DHCP, DNS catch-all, nonce, factory-reset, `ProvisioningError` surface (plus the `InvalidSsid` variant from `ssid-override-v1`).
@@ -62,8 +66,10 @@ When done:
 
 ## Open Questions
 
-- [ ] Exact esp-radio/esp-hal API to read the AP MAC before bring-up, and whether it needs radio init first. If MAC is only readable post-init, decide how `start()` orders init → MAC → SSID → AP-start (possibly splitting `init_softap_async` into an init step + a start-with-ssid step).
-- [ ] Is `softap_mac()` purely platform (esp-radio FFI) with nothing host-testable, or can the derive be exercised via the existing `resolve_softap_ssid` juggler tests + an on-hardware MAC-suffix check? (Likely the latter — the derivation is already host-tested; only the MAC *read* is platform.)
+- [ ] Exact esp-radio/esp-hal API to read the AP MAC before bring-up, and whether it needs radio init first.
+      If MAC is only readable post-init, decide how `start()` orders init → MAC → SSID → AP-start (possibly splitting `init_softap_async` into an init step + a start-with-ssid step).
+- [ ] Is `softap_mac()` purely platform (esp-radio FFI) with nothing host-testable, or can the derive be exercised via the existing `resolve_softap_ssid` juggler tests + an on-hardware MAC-suffix check?
+      (Likely the latter — the derivation is already host-tested; only the MAC *read* is platform.)
 - [ ] Does the breaking "PortalConfig is the SSID source of truth on both HALs" precedent warrant a short ADR?
 
 ## State

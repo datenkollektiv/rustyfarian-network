@@ -38,7 +38,7 @@ pub use juggler::wifi::{
 /// must reserve one socket slot per long-lived substrate task plus one
 /// spare.  The three substrate modules in `rustyfarian-esp-hal-network`
 /// each own one socket: `dhcp::run` (UDP), `dns_catchall::run` (UDP),
-/// `http_server::run` (TCP).  Adding a fourth long-lived socket-owning
+/// `portal::run_portal_dyn` (TCP).  Adding a fourth long-lived socket-owning
 /// task in `rustyfarian-esp-hal-network` requires bumping this constant
 /// in lockstep — `embassy-net` returns `SocketAlreadyOpen` /
 /// `OutOfResources` on exhaustion rather than blocking.

@@ -357,7 +357,7 @@ pub enum ReconcileAction {
     ///
     /// Rollback tier difference: `rustyfarian-esp-idf-network`
     /// `OtaSession::rollback()` reboots on success (it returns only on
-    /// failure), while `rustyfarian-esp-hal-network` `OtaManager::rollback()`
+    /// failure), while `rustyfarian-esp-hal-network` `EspHalOtaManager::rollback()`
     /// returns `Ok` and the caller must reset (e.g.
     /// `esp_hal::system::software_reset()`).
     /// If the rollback fails, never mark the image valid; the health deadline

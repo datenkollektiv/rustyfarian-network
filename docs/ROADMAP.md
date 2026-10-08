@@ -10,6 +10,7 @@ The IDF tier pins `esp-idf-svc 0.53` and `esp-idf-hal 0.47`.
 Hardware validated 2026-09-26: bare-metal C3 STA join, C6 SoftAP provisioning, S3 SX1262 bring-up; provisioning reboot-to-STA not exercised; IDF C3 validated.
 Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `smoltcp` integration.
 The TTN OTAA join and first uplink were validated 2026-06-17.
+OTA consumer runtime was hardware-validated end to end on 2026-10-08 (library runbook 21/21 on ESP32-C3) and adoption tests passed on 2026-10-09 (rgb-clock); MQTT auto-reconnect is fixed for 0.6.0 (bug 005, broken since 0.4.0).
 See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
 
 ## Forward plan
@@ -44,7 +45,6 @@ timeline
               : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
               : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
               : rustyfarian-esp-idf-network provisioning StoredConfig Debug redaction — the IDF tier's StoredConfig derives Debug over plaintext wifi_password and mqtt_pass, leaking credentials into any caller log line that formats the struct, the bare-metal store closes the same gap by construction via a manual Debug, the IDF tier needs the parallel manual impl with the same — redacted — pattern (surfaced by the Wave-3 security audit of Phase 1)
-              : OTA runtime 0.6.0 hardware validation — adopt the extracted runtime and record store on first consumer (clock), run full reconciliation and power-loss scenarios per docs/runbooks/ota-hardware-test.md
               : OTA runtime Watchtower v2 second-device validation — adopt the runtime on second consumer (Watchtower C3-DevKitM-1), validate against reference runbook
               : cargo semver-checks recipe — add a just recipe that checks for breaking changes before the 0.6.0 release
 

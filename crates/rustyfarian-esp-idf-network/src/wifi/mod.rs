@@ -148,7 +148,7 @@ pub struct WiFiManager {
 impl WiFiManager {
     /// Initializes Wi-Fi from a bundled configuration — the recommended entry point.
     ///
-    /// Mirrors the [`EspHalWifiManager::init`] API from the bare-metal crate
+    /// Mirrors the bare-metal crate's `WiFiManager::init_async` API
     /// so both ESP-IDF and esp-hal projects use the same builder flow:
     ///
     /// ```ignore

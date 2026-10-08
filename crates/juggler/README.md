@@ -25,8 +25,10 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 **Special features:**
 
 - **`provisioning`:** a meta-feature that enables `wifi`, `mqtt`, and `lora` (they are prerequisites for captive-portal profiles).
-- **`std`:** optional support for the standard library, used to implement blocking MQTT subscriber threads. Gated on `#[cfg(feature = "std")]` inside the `mqtt` module; does NOT depend on any HAL.
-- **`mock`:** test-double implementations for host-side unit tests. Never included in release builds; filtered by `cargo publish --dry-run`.
+- **`std`:** optional support for the standard library, used to implement blocking MQTT subscriber threads.
+  Gated on `#[cfg(feature = "std")]` inside the `mqtt` module; does NOT depend on any HAL.
+- **`mock`:** test-double implementations for host-side unit tests.
+  Never included in release builds; filtered by `cargo publish --dry-run`.
 
 ## Cargo.toml
 
