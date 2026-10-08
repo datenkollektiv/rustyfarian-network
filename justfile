@@ -572,6 +572,11 @@ act *job:
 release-publish-validate:
     scripts/release-validate.sh
 
+# check semver compatibility against v0.5.0 tag (tool-checkable crates only; manual review for cross-target crates)
+[group('release')]
+release-semver-check:
+    scripts/release-semver-check.sh
+
 # juggler gets a full `cargo publish --dry-run` (host-buildable); the two -network crates get
 # `cargo package --list` because their `cargo publish --dry-run` resolves `juggler ^0.5` against
 # the crates.io index, which only succeeds AFTER juggler is published — their real dry-run therefore

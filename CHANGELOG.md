@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `create_http_connection` takes an `accept` parameter, and `OtaCommand`, `OtaStatus`, `FailReason` and `ConfigError` gained variants without being `#[non_exhaustive]`.
+- **Breaking:** `juggler::provisioning::resolve_wait` takes only the `ProvisioningState` (the `committed` argument is gone), and `juggler::ota::OtaError` now implements `Copy` (both reported by `just release-semver-check` against `v0.5.0`).
   OTA error codes changed: an IDF per-read timeout is now `download_timeout`, a HAL socket read error is now `server_unreachable`.
-  OTA wire parsing is strict: unknown fields, labels and JSON-array payloads are rejected, and URLs are validated at intake (`command_invalid` / `manifest_invalid`).
+  The new OTA wire enums (`OtaCommand`, `OtaStatus`, `FailReason`, `ConfigError`) are not `#[non_exhaustive]`, so adding a variant later is a breaking change; wire parsing is strict (unknown fields, labels and JSON-array payloads are rejected, URLs are validated at intake).
 - MQTT callback contract (ADR 017): `on_connect` runs on a per-connect helper thread where `client.enqueue()` / `client.subscribe()` are safe, and `MqttHandle` methods called from any callback return `PublishAckError::WrongThread`.
 - Workspace and `juggler` minimum version `0.5.1`; the IDF `provisioning` feature enables `juggler/std`, `ota` enables `juggler/ota-wire`; examples read `MQTT_PORT` and ship no placeholder credentials.
 
