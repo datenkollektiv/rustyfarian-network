@@ -2,8 +2,8 @@
 id: 005
 title: MQTT client never auto-reconnects with the default configuration
 captured-on: 2026-10-08
-doc-version: 1
-status: open-defect
+doc-version: 2
+status: closed
 kind: defect
 ---
 
@@ -54,9 +54,6 @@ Pass `Some(config.reconnect_timeout_ms.map_or(Duration::ZERO, Duration::from_mil
 Applied in the working tree and verified on hardware: the device logs `Error transport connect` about every 15 s during the outage, reconnects within 10 s after the broker returns, and its subscription and heartbeats resume.
 A consumer that wants no reconnect has no API for it today; add one only if someone asks.
 
-## Owner
-Florian Waibel
-
 ## Links
 - Found in `docs/runbooks/ota-hardware-test.md` P17 (broker scaled down), 2026-10-08.
 - Lore: `docs/project-lore.md` "MQTT Event Loop".
@@ -64,3 +61,4 @@ Florian Waibel
 
 ## Session Log
 - 2026-10-08 — Captured as a defect via /bug with root cause and a hardware-verified fix; stays open until the fix is committed and released in 0.6.0
+- 2026-10-09 — Closed: fix released in 0.6.0 (`973b9e7`, tag `v0.6.0`), after the OTA runbook passed 21/21 and rgb-clock tests passed
