@@ -128,6 +128,15 @@ Only `esp-radio 1.0.0-beta.1` targets `esp-hal ~1.2.0`; this workspace took the 
 Fix: read the sparse index (`curl -s https://index.crates.io/es/p-/esp-radio`) before planning a wave to confirm a non-prerelease targeting the target `esp-hal` minor.
 Re-pin to `1.0.0` when it ships.
 
+**The "`esp32s3` is LoRa-only, wifi/ota/provisioning FAIL TO COMPILE BY DESIGN" constraint (merge `45f2d67`, no rationale) was false — corrected 2026-10-14.**
+Every pinned crate (`esp-radio =1.0.0-beta.1`, `esp-storage 0.10`, `esp-bootloader-esp-idf 0.6`, `esp-rtos 0.4`, `esp-alloc 0.11`, `esp-backtrace 0.20`) has an `esp32s3` feature; the crate simply never forwarded it.
+The promised `compile_error!` never existed: S3 + `ota` + `embassy` silently compiled the stub `EspHalOtaManager`.
+Fix: before trusting a "by design" chip restriction, grep the registry `Cargo.toml` of each pinned dep for the chip feature (`~/.cargo/registry/src/*/<crate>-<ver>/Cargo.toml`); the `esp32` Wi-Fi gap is the same story (`esp-radio` supports it, the `esp32` feature forwards no chip).
+
+**ESP32-S3 bare-metal Wi-Fi runs on the same single 72 KiB internal heap as the C3 — no PSRAM region needed.**
+`esp-radio` and `esp-rtos` allocate only via `malloc_internal` / `InternalMemory`, so a PSRAM `esp-alloc` region could never serve Wi-Fi buffers anyway; add PSRAM only for application data.
+Validated 2026-10-14 on CrowPanel 1.28" ESP32-S3: `hal_esp32s3_connect_async` got a DHCP lease with ~26 KB heap free.
+
 **`esp-storage 0.10` made `embedded-storage` trait impls an opt-in feature — `FlashStorage` silently stops implementing `NorFlash` after the bump.**
 Fix: enable `features = ["embedded-storage"]` on `esp-storage` for provisioning store's `NorFlash` bound; use inherent `FlashRegion::{capacity, write}` methods for OTA manager.
 

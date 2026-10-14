@@ -15,7 +15,7 @@
 //!
 //! This crate is `#![no_std]` and host-testable end-to-end using a
 //! `MockFlash` test double in the test suite. The embassy tasks require
-//! `features = ["esp32c3", "embassy", "rt"]` (or `esp32c6`).
+//! `features = ["esp32c3", "embassy", "rt"]` (or `esp32c6` / `esp32s3`).
 //!
 //! # Real-hardware use
 //!

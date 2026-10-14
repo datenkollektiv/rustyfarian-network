@@ -38,7 +38,10 @@
 // and its UdpSocket usage are compiled away.  Allow dead-code on the types
 // that remain so clippy -D warnings does not fail on stub/host builds.
 #![cfg_attr(
-    not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
     allow(dead_code)
 )]
 
@@ -885,7 +888,10 @@ pub(crate) fn validate_pool_geometry(
     Ok(())
 }
 
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -> ! {
     use embassy_net::udp::{PacketMetadata, UdpSocket};
     use static_cell::StaticCell;
@@ -1135,7 +1141,10 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
 /// netif is the only adjacent broadcast domain.  Phase 2 proper, which
 /// migrates this module into `rustyfarian-esp-hal-network`, should
 /// add a unicast path for renew/rebind transitions.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 fn dhcp_broadcast_endpoint() -> embassy_net::IpEndpoint {
     use embassy_net::{IpAddress, IpEndpoint, Ipv4Address};
     IpEndpoint {
@@ -1145,7 +1154,10 @@ fn dhcp_broadcast_endpoint() -> embassy_net::IpEndpoint {
 }
 
 /// Encodes and sends a DHCP NAK to `255.255.255.255:68`.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 async fn do_send_nak(
     sock: &embassy_net::udp::UdpSocket<'_>,
     msg: &DhcpMessage,

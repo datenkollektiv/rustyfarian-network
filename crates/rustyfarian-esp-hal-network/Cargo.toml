@@ -51,8 +51,7 @@ lora = [
     "dep:embedded-hal-bus",
 ]
 
-# ota: async bare-metal OTA manager.
-# esp32s3 is deliberately NOT supported (no esp-storage support for esp32s3).
+# ota: async bare-metal OTA manager (esp32, esp32c3, esp32c6, esp32s3).
 ota = [
     "juggler/ota",
     "dep:esp-hal",
@@ -141,8 +140,9 @@ esp32c6 = [
 ]
 
 # ESP32: Xtensa LX6, xtensa-esp32-none-elf
-# Supports: lora, ota ONLY (no esp-radio support for esp32)
-# wifi and provisioning with esp32 FAIL TO COMPILE BY DESIGN.
+# Supports: lora, ota ONLY. esp-radio does support esp32, but Wi-Fi is not wired:
+# this feature forwards no chip to esp-radio/esp-rtos/esp-alloc, so wifi and
+# provisioning with esp32 do not build.
 esp32 = [
     "esp-hal?/esp32",
     "esp-bootloader-esp-idf?/esp32",
@@ -152,15 +152,17 @@ esp32 = [
 # esp-radio, esp-rtos, esp-alloc, esp-backtrace intentionally NOT listed for esp32.
 
 # ESP32-S3: Xtensa LX7, xtensa-esp32s3-none-elf
-# Supports: lora ONLY (no esp-radio, no ota storage support for esp32s3)
-# wifi, ota, provisioning with esp32s3 FAIL TO COMPILE BY DESIGN.
+# Supports: wifi, lora, ota, provisioning
 esp32s3 = [
     "esp-hal?/esp32s3",
+    "esp-radio?/esp32s3",
+    "esp-rtos?/esp32s3",
+    "esp-alloc?/esp32s3",
     "esp-bootloader-esp-idf?/esp32s3",
+    "esp-storage?/esp32s3",
+    "esp-backtrace?/esp32s3",
     "esp-println?/esp32s3", "esp-println?/uart", "esp-println?/log-04",
 ]
-# esp-radio, esp-rtos, esp-alloc, esp-backtrace, esp-storage intentionally
-# NOT listed for esp32s3.
 
 [dependencies]
 # ── Always-on ────────────────────────────────────────────────────────────────
@@ -232,6 +234,10 @@ required-features = ["provisioning", "esp32c3", "rt", "embassy"]
 [[example]]
 name = "hal_c6_provision_mqtt"
 required-features = ["provisioning", "esp32c6", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32s3_connect_async"
+required-features = ["wifi", "esp32s3", "rt", "embassy"]
 
 [[example]]
 name = "hal_esp32s3_join"

@@ -35,7 +35,7 @@ impl EspHalOtaManager {
     /// Stub constructor that mirrors the real type's surface for typechecks.
     ///
     /// Real OTA usage requires both a chip feature (`esp32c3`, `esp32c6`,
-    /// `esp32`) **and** the `embassy` feature.
+    /// `esp32`, `esp32s3`) **and** the `embassy` feature.
     pub fn new() -> Self {
         Self
     }

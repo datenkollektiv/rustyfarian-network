@@ -29,12 +29,12 @@ Minimum Rust is 1.95.
 
 Select **exactly one** of the following:
 
-| Feature   | Target            | Compiles                                                                     |
-|:----------|:------------------|:-----------------------------------------------------------------------------|
-| `esp32c3` | ESP32-C3 (RISC-V) | All domains ✓                                                                |
-| `esp32c6` | ESP32-C6 (RISC-V) | All domains ✓                                                                |
-| `esp32s3` | ESP32-S3 (Xtensa) | `lora` only (no Wi-Fi, no OTA); compile error if `wifi` or `ota` are enabled |
-| `esp32`   | ESP32 (Xtensa)    | `lora` only (no Wi-Fi, no OTA); compile error if `wifi` or `ota` are enabled |
+| Feature   | Target            | Compiles                                |
+|:----------|:------------------|:----------------------------------------|
+| `esp32c3` | ESP32-C3 (RISC-V) | All domains ✓                          |
+| `esp32c6` | ESP32-C6 (RISC-V) | All domains ✓                          |
+| `esp32s3` | ESP32-S3 (Xtensa) | All domains ✓                          |
+| `esp32`   | ESP32 (Xtensa)    | `lora` and `ota` only (Wi-Fi not wired) |
 
 ### Support Features
 
@@ -62,6 +62,9 @@ rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32c3", 
 
 # LoRa on ESP32-S3 (no async needed)
 rustyfarian-esp-hal-network = { version = "0.5", features = ["lora", "esp32s3", "rt"] }
+
+# Wi-Fi on ESP32-S3
+rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32s3", "embassy", "rt"] }
 
 # Wi-Fi + OTA on ESP32-C6
 rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "ota", "esp32c6", "embassy", "rt"] }
@@ -197,11 +200,10 @@ use rustyfarian_esp_hal_network::lora::LoraConfig;
 
 ## Chip Support Caveats
 
-- **ESP32** (Xtensa LX6): LoRa-only; `esp-radio` (Wi-Fi) does not support this chip.
-- **ESP32-S3** (Xtensa LX7): LoRa-only; `esp-storage` does not support S3, so OTA is unavailable.
+- **ESP32** (Xtensa LX6): LoRa and OTA; Wi-Fi and provisioning are not wired in this crate yet.
+- `esp-radio 1.0.0-beta.1` does support the ESP32, but the `esp32` feature does not forward a chip to `esp-radio`, `esp-rtos` or `esp-alloc`.
+- **ESP32-S3** (Xtensa LX7): Full support for Wi-Fi, LoRa, OTA, and provisioning; flash with the IDF-built bootloader (`just flash` does this).
 - **ESP32-C3 and ESP32-C6** (RISC-V): Full support for Wi-Fi, LoRa, OTA, and provisioning.
-
-Attempting to enable `wifi` or `ota` with `esp32` or `esp32s3` will fail at compile time with a `compile_error!` diagnostic.
 
 ## docs.rs Build Note
 
