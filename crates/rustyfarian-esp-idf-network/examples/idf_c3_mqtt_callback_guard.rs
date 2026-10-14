@@ -35,10 +35,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::mqtt::client::{EspMqttClient, QoS};
+use esp_idf_svc::mqtt::client::EspMqttClient;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
 use rustyfarian_esp_idf_network::mqtt::{
-    LwtConfig, MqttBuilder, MqttHandle, PublishAckError, TryPublishError,
+    to_esp_qos, LwtConfig, MqttBuilder, MqttHandle, PublishAckError, QoS, TryPublishError,
 };
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 
@@ -101,7 +101,7 @@ fn main() -> anyhow::Result<()> {
         .subscribe(&echo_topic, QoS::AtLeastOnce)
         .with_startup_message()
         .on_connect(move |client: &mut EspMqttClient<'_>, is_clean: bool| {
-            client.enqueue(&online_topic, QoS::AtLeastOnce, true, b"online")?;
+            client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
             log::info!("[guard] on_connect published status=online (clean={is_clean})");
             Ok(())
         })

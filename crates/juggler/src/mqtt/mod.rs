@@ -286,22 +286,270 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
     }
 }
 
-// ── Subscriber thread ────────────────────────────────────────────────────────
+// ── Shared configuration types (both tiers) ─────────────────────────────────
 
 /// MQTT Quality of Service level.
 ///
-/// Platform-neutral mirror of `esp_idf_svc::mqtt::client::QoS`.
-/// Used by [`SubscribeClient`] and [`spawn_subscriber_thread`] so that
-/// the subscriber thread machinery can be compiled and tested on any host.
-///
-/// Requires the `std` feature (part of the subscriber-thread machinery).
-#[cfg(feature = "std")]
+/// Platform-neutral mirror of `esp_idf_svc::mqtt::client::QoS` and `minimq::QoS`.
+/// Shared by both tier crates (ADR 019) so one [`MqttConfig`] / [`LwtConfig`]
+/// serves ESP-IDF and bare-metal consumers alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QoS {
     AtMostOnce,
     AtLeastOnce,
     ExactlyOnce,
 }
+
+/// Default stack size for the ESP-IDF MQTT client task, in bytes.
+///
+/// ESP-IDF defaults to 6144 bytes, which overflows during TLS negotiation
+/// error paths. 8 KiB provides headroom for TLS handshakes on ESP32.
+/// Ignored by the bare-metal tier, which runs no separate task.
+pub const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
+
+/// Last Will and Testament configuration.
+///
+/// The broker publishes this message on behalf of the client when it
+/// disconnects unexpectedly (e.g. network loss, crash). A clean
+/// `DISCONNECT` suppresses the LWT.
+#[derive(Debug, Clone)]
+pub struct LwtConfig<'a> {
+    topic: &'a str,
+    payload: &'a [u8],
+    qos: QoS,
+    retain: bool,
+}
+
+impl<'a> LwtConfig<'a> {
+    /// Creates a new LWT configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Topic the broker publishes to on unexpected disconnect
+    /// * `payload` - Message payload
+    /// * `qos` - Quality of Service level
+    /// * `retain` - Whether the broker retains the LWT message
+    pub fn new(topic: &'a str, payload: &'a [u8], qos: QoS, retain: bool) -> Self {
+        Self {
+            topic,
+            payload,
+            qos,
+            retain,
+        }
+    }
+
+    /// Topic the broker publishes the will to.
+    pub fn topic(&self) -> &'a str {
+        self.topic
+    }
+
+    /// Will payload.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// Will QoS.
+    pub fn qos(&self) -> QoS {
+        self.qos
+    }
+
+    /// Whether the broker retains the will.
+    pub fn retain(&self) -> bool {
+        self.retain
+    }
+}
+
+/// MQTT broker connection configuration.
+///
+/// Credentials (`username`, `password`) are redacted in the `Debug` output
+/// (`Some("<redacted>")`) to prevent them from appearing in log files.
+#[derive(Clone)]
+pub struct MqttConfig<'a> {
+    /// MQTT broker hostname or IP address (the bare-metal tier accepts IPv4 literals only).
+    pub host: &'a str,
+    /// MQTT broker port (typically 1883 for unencrypted)
+    pub port: u16,
+    /// Unique client identifier
+    pub client_id: &'a str,
+    /// Keep-alive interval in seconds (default: 30)
+    pub keep_alive_secs: Option<u64>,
+    /// Connection timeout in milliseconds (default: 5000)
+    pub connection_timeout_ms: Option<u64>,
+    /// Interval between automatic reconnection attempts in milliseconds.
+    ///
+    /// When `None` (the default), the tier default of 10 000 ms is used.
+    /// Set via [`with_reconnect_timeout`](Self::with_reconnect_timeout).
+    pub reconnect_timeout_ms: Option<u64>,
+    /// Stack size for the ESP-IDF MQTT client task (default: 8192).
+    ///
+    /// Set via [`with_task_stack_size`](Self::with_task_stack_size).
+    /// The bare-metal tier ignores this field.
+    pub task_stack_size: usize,
+    lwt: Option<LwtConfig<'a>>,
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+}
+
+impl<'a> core::fmt::Debug for MqttConfig<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let redacted_username: Option<&'static str> = if self.username.is_some() {
+            Some("<redacted>")
+        } else {
+            None
+        };
+        let redacted_password: Option<&'static str> = if self.password.is_some() {
+            Some("<redacted>")
+        } else {
+            None
+        };
+        f.debug_struct("MqttConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("keep_alive_secs", &self.keep_alive_secs)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .field("reconnect_timeout_ms", &self.reconnect_timeout_ms)
+            .field("task_stack_size", &self.task_stack_size)
+            .field("lwt", &self.lwt)
+            .field("username", &redacted_username)
+            .field("password", &redacted_password)
+            .finish()
+    }
+}
+
+impl<'a> MqttConfig<'a> {
+    /// Creates a new configuration with the required fields.
+    pub fn new(host: &'a str, port: u16, client_id: &'a str) -> Self {
+        Self {
+            host,
+            port,
+            client_id,
+            keep_alive_secs: None,
+            connection_timeout_ms: None,
+            reconnect_timeout_ms: None,
+            task_stack_size: DEFAULT_MQTT_TASK_STACK_SIZE,
+            lwt: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// Sets the keep-alive interval.
+    pub fn with_keep_alive(mut self, secs: u64) -> Self {
+        self.keep_alive_secs = Some(secs);
+        self
+    }
+
+    /// Sets the connection timeout.
+    pub fn with_timeout(mut self, ms: u64) -> Self {
+        self.connection_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Sets the interval between automatic reconnection attempts.
+    ///
+    /// When the broker is unreachable, the client retries at this interval.
+    /// The default is 10 000 ms on both tiers. Battery-powered or thermally
+    /// constrained devices may want 30 000–60 000 ms to reduce power draw
+    /// during prolonged broker outages.
+    ///
+    /// This does not affect the initial connection wait controlled by
+    /// [`with_timeout`](Self::with_timeout).
+    pub fn with_reconnect_timeout(mut self, ms: u64) -> Self {
+        self.reconnect_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Configures a Last Will and Testament message.
+    ///
+    /// The broker publishes this message when the client disconnects
+    /// unexpectedly. A clean shutdown suppresses the LWT.
+    pub fn with_lwt(mut self, lwt: LwtConfig<'a>) -> Self {
+        self.lwt = Some(lwt);
+        self
+    }
+
+    /// Sets MQTT broker authentication credentials.
+    ///
+    /// For brokers whose ACL keys off a username alone (no password), use
+    /// [`with_username_only`](Self::with_username_only) instead — it omits the
+    /// CONNECT packet's password field rather than transmitting an empty
+    /// string, matching what those brokers expect.
+    pub fn with_auth(mut self, username: &'a str, password: &'a str) -> Self {
+        self.username = Some(username);
+        self.password = Some(password);
+        self
+    }
+
+    /// Sets a username with no password, for brokers that authorise by
+    /// username alone.
+    ///
+    /// The CONNECT packet carries the username and *omits* the password field
+    /// (rather than carrying an empty one). This is semantically distinct on
+    /// the wire from [`with_auth(user, "")`](Self::with_auth) and is what
+    /// broker-side username-only ACL implementations typically expect.
+    pub fn with_username_only(mut self, username: &'a str) -> Self {
+        self.username = Some(username);
+        self.password = None;
+        self
+    }
+
+    /// Overrides the ESP-IDF MQTT client task stack size.
+    ///
+    /// Defaults to 8192 bytes (8 KiB). Increase to 16384 (16 KiB) if stack
+    /// overflows are observed during TLS negotiation on constrained targets.
+    /// No effect on the bare-metal tier.
+    pub fn with_task_stack_size(mut self, bytes: usize) -> Self {
+        self.task_stack_size = bytes;
+        self
+    }
+
+    /// The configured Last Will and Testament, if any.
+    pub fn lwt(&self) -> Option<&LwtConfig<'a>> {
+        self.lwt.as_ref()
+    }
+
+    /// The configured username, if any.
+    pub fn username(&self) -> Option<&'a str> {
+        self.username
+    }
+
+    /// The configured password, if any.
+    ///
+    /// Never log the returned value.
+    pub fn password(&self) -> Option<&'a str> {
+        self.password
+    }
+}
+
+/// Error returned by a tier's `try_publish*` family when the publish cannot
+/// complete without blocking.
+///
+/// `E` is the tier's own error type: `anyhow::Error` on ESP-IDF, the
+/// bare-metal tier's `MqttError` on esp-hal. Both tiers expose a type alias
+/// named `TryPublishError` with `E` filled in.
+#[derive(Debug)]
+pub enum TryPublishError<E> {
+    /// The publish cannot be accepted right now — the client is busy, the
+    /// outbound queue is full, or the session is not connected. The caller
+    /// should retry on the next tick.
+    WouldBlock,
+    /// Any other publish failure (invalid topic, payload too large, enqueue error).
+    Other(E),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for TryPublishError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::WouldBlock => write!(f, "MQTT client busy (would block)"),
+            Self::Other(e) => write!(f, "{:#}", e),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for TryPublishError<E> {}
+
+// ── Subscriber thread ────────────────────────────────────────────────────────
 
 /// Minimal MQTT subscribe surface used by [`spawn_subscriber_thread`].
 ///
@@ -2115,5 +2363,64 @@ mod tests {
         assert!(in_callback(), "b is still open");
         drop(b);
         assert!(!in_callback());
+    }
+
+    // ── Shared config types ──────────────────────────────────────────────────
+
+    #[test]
+    fn mqtt_config_debug_redacts_credentials() {
+        use super::MqttConfig;
+        use crate::test_support::test_psk;
+        let password = test_psk();
+        let config = MqttConfig::new("192.168.1.10", 1883, "dev-01").with_auth("alice", password);
+        let dbg = alloc::format!("{:?}", config);
+        assert!(dbg.contains("192.168.1.10"));
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("alice"));
+        assert!(!dbg.contains(password));
+        assert_eq!(config.username(), Some("alice"));
+        assert_eq!(config.password(), Some(password));
+    }
+
+    #[test]
+    fn mqtt_config_defaults_and_builders() {
+        use super::{LwtConfig, MqttConfig, QoS, DEFAULT_MQTT_TASK_STACK_SIZE};
+        let config = MqttConfig::new("10.0.0.1", 1884, "dev");
+        assert_eq!(config.keep_alive_secs, None);
+        assert_eq!(config.connection_timeout_ms, None);
+        assert_eq!(config.reconnect_timeout_ms, None);
+        assert_eq!(config.task_stack_size, DEFAULT_MQTT_TASK_STACK_SIZE);
+        assert!(config.lwt().is_none());
+        assert!(config.username().is_none());
+
+        let lwt = LwtConfig::new("dev/status", b"offline", QoS::AtLeastOnce, true);
+        let config = config
+            .with_keep_alive(15)
+            .with_timeout(2500)
+            .with_reconnect_timeout(30_000)
+            .with_username_only("bob")
+            .with_lwt(lwt);
+        assert_eq!(config.keep_alive_secs, Some(15));
+        assert_eq!(config.connection_timeout_ms, Some(2500));
+        assert_eq!(config.reconnect_timeout_ms, Some(30_000));
+        assert_eq!(config.username(), Some("bob"));
+        assert_eq!(config.password(), None);
+        let lwt = config.lwt().expect("lwt set");
+        assert_eq!(lwt.topic(), "dev/status");
+        assert_eq!(lwt.payload(), b"offline");
+        assert_eq!(lwt.qos(), QoS::AtLeastOnce);
+        assert!(lwt.retain());
+    }
+
+    #[test]
+    fn try_publish_error_displays_both_variants() {
+        use super::TryPublishError;
+        let would_block: TryPublishError<&str> = TryPublishError::WouldBlock;
+        assert_eq!(
+            alloc::format!("{}", would_block),
+            "MQTT client busy (would block)"
+        );
+        let other: TryPublishError<&str> = TryPublishError::Other("topic too long");
+        assert_eq!(alloc::format!("{}", other), "topic too long");
     }
 }

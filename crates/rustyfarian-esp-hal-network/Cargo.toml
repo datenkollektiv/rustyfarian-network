@@ -41,6 +41,16 @@ wifi = [
     "embassy",
 ]
 
+# mqtt: async MQTT 5 client over the `wifi` embassy-net stack (ADR 019).
+# Implies `wifi` (the runner needs the STA stack) and so `embassy`.
+mqtt = [
+    "wifi",
+    "juggler/mqtt",
+    "dep:minimq",
+    "dep:embassy-futures",
+    "embassy",
+]
+
 # lora: synchronous LoRa stub using embedded-hal SPI + GPIO.
 # No embassy requirement; lora is nb-based and blocking.
 lora = [
@@ -199,11 +209,14 @@ esp-println             = { workspace = true, optional = true }
 embedded-hal-bus        = { workspace = true, optional = true }
 
 embassy-executor        = { workspace = true, optional = true }
+embassy-futures         = { workspace = true, optional = true }
 embassy-net             = { workspace = true, optional = true }
 embassy-time            = { workspace = true, optional = true }
 static_cell             = { workspace = true, optional = true }
 
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
+
+minimq                  = { workspace = true, optional = true }
 
 [dev-dependencies]
 embassy-executor = { workspace = true }
@@ -238,6 +251,14 @@ required-features = ["provisioning", "esp32c6", "rt", "embassy"]
 [[example]]
 name = "hal_esp32s3_connect_async"
 required-features = ["wifi", "esp32s3", "rt", "embassy"]
+
+[[example]]
+name = "hal_c6_mqtt_lwt"
+required-features = ["mqtt", "esp32c6", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32s3_mqtt_lwt"
+required-features = ["mqtt", "esp32s3", "rt", "embassy"]
 
 [[example]]
 name = "hal_esp32s3_join"

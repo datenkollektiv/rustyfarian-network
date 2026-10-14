@@ -6,8 +6,7 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
-//! use esp_idf_svc::mqtt::client::QoS;
+//! use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, QoS};
 //!
 //! let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 //!
@@ -20,6 +19,12 @@
 //!
 //! handle.publish("status", "online")?;
 //! ```
+//!
+//! [`QoS`], [`MqttConfig`], [`LwtConfig`] and [`TryPublishError`] are shared
+//! with the bare-metal tier via `juggler` (ADR 019), so every method of this
+//! module takes the platform-neutral [`QoS`]. Only calls on the raw
+//! `EspMqttClient` — e.g. `client.enqueue(...)` inside `on_connect` — need the
+//! `esp-idf-svc` QoS; convert with [`to_esp_qos`].
 //!
 //! Callbacks must not call any [`MqttHandle`] method — such a call fails fast
 //! with [`PublishAckError::WrongThread`] instead of hanging. From
@@ -109,8 +114,29 @@ use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, in_callback, next_state, spawn_connect_thread,
     validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
     validate_subscribe_filter, AckOutcome, CallbackScope, ConnectionEpoch, MqttConnectionState,
-    MqttEvent, PendingAcks, QoS as PureQoS, SubscribeClient,
+    MqttEvent, PendingAcks, SubscribeClient,
 };
+
+// Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
+// is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
+// negotiation error paths — corrupting the heap and crashing `pthread_exit`.
+pub use juggler::mqtt::{LwtConfig, MqttConfig, QoS, DEFAULT_MQTT_TASK_STACK_SIZE};
+
+/// Error returned by the `try_publish*` family when the publish cannot
+/// complete without blocking.
+///
+/// [`WouldBlock`](juggler::mqtt::TryPublishError::WouldBlock) means the MQTT
+/// client mutex is held by the connect helper thread (running the startup
+/// publish, `on_connect`, or SUBSCRIBE enqueues) or by another publisher
+/// blocked on esp-mqtt's `api_lock` during a connect handshake; the caller
+/// should retry on the next tick. [`Other`](juggler::mqtt::TryPublishError::Other)
+/// carries any other publish failure (invalid topic, enqueue error, poisoned
+/// mutex).
+///
+/// A call from inside an MQTT callback is reported as `Other` wrapping
+/// [`PublishAckError::WrongThread`]; detect it with
+/// `e.downcast_ref::<PublishAckError>()` on the inner `anyhow::Error`.
+pub type TryPublishError = juggler::mqtt::TryPublishError<anyhow::Error>;
 
 /// Poll interval used while waiting for the MQTT broker connection to be confirmed.
 ///
@@ -145,14 +171,6 @@ const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
 /// frames on top of the base helper-thread overhead.
 const CONNECT_THREAD_STACK_SIZE: usize = 12 * 1024;
 
-/// Default stack size for the ESP-IDF MQTT client task.
-///
-/// ESP-IDF defaults to 6144 bytes, which overflows during TLS negotiation
-/// error paths — corrupting the heap and crashing `pthread_exit`.
-/// 8 KiB provides sufficient headroom for TLS handshakes on ESP32.
-/// Override via [`MqttConfig::with_task_stack_size`] if needed.
-const DEFAULT_MQTT_TASK_STACK_SIZE: usize = 8192;
-
 /// Cyan LED colour for the MQTT connecting state.
 ///
 /// Re-exported from [`juggler::status_colors::MQTT_CONNECTING`].
@@ -180,34 +198,8 @@ pub const LED_POLL_INTERVAL_MS: u64 = 50;
 pub const ERROR_PULSE_FRAMES: u32 = 20;
 
 use esp_idf_svc::mqtt::client::{
-    EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS,
+    EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS as EspQoS,
 };
-
-/// Error returned by the `try_publish*` family when the publish cannot
-/// complete without blocking.
-///
-/// A call from inside an MQTT callback is reported as [`Other`](Self::Other)
-/// wrapping [`PublishAckError::WrongThread`]; detect it with
-/// `e.downcast_ref::<PublishAckError>()` on the inner `anyhow::Error`.
-#[derive(Debug)]
-pub enum TryPublishError {
-    /// The MQTT client mutex is held by the connect helper thread (running
-    /// the startup publish, `on_connect`, or SUBSCRIBE enqueues) or by
-    /// another publisher blocked on esp-mqtt's `api_lock` during a connect
-    /// handshake. The caller should retry on the next tick.
-    WouldBlock,
-    /// Any other publish failure (invalid topic, enqueue error, poisoned mutex).
-    Other(anyhow::Error),
-}
-
-impl std::fmt::Display for TryPublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WouldBlock => write!(f, "MQTT client busy (would block)"),
-            Self::Other(e) => write!(f, "{:#}", e),
-        }
-    }
-}
 
 /// Error returned by [`MqttHandle::publish_acked`].
 ///
@@ -261,189 +253,6 @@ impl std::fmt::Display for PublishAckError {
 }
 
 impl std::error::Error for PublishAckError {}
-
-/// Last Will and Testament configuration.
-///
-/// The broker publishes this message on behalf of the client when it
-/// disconnects unexpectedly (e.g. network loss, crash). A clean
-/// `DISCONNECT` (via [`MqttManager::shutdown`]) suppresses the LWT.
-#[derive(Debug, Clone)]
-pub struct LwtConfig<'a> {
-    topic: &'a str,
-    payload: &'a [u8],
-    qos: QoS,
-    retain: bool,
-}
-
-impl<'a> LwtConfig<'a> {
-    /// Creates a new LWT configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Topic the broker publishes to on unexpected disconnect
-    /// * `payload` - Message payload
-    /// * `qos` - Quality of Service level
-    /// * `retain` - Whether the broker retains the LWT message
-    pub fn new(topic: &'a str, payload: &'a [u8], qos: QoS, retain: bool) -> Self {
-        Self {
-            topic,
-            payload,
-            qos,
-            retain,
-        }
-    }
-}
-
-/// MQTT broker connection configuration.
-///
-/// Credentials (`username`, `password`) are redacted in the `Debug` output
-/// (`Some("<redacted>")`) to prevent them from appearing in log files.
-#[derive(Clone)]
-pub struct MqttConfig<'a> {
-    /// MQTT broker hostname or IP address
-    pub host: &'a str,
-    /// MQTT broker port (typically 1883 for unencrypted)
-    pub port: u16,
-    /// Unique client identifier
-    pub client_id: &'a str,
-    /// Keep-alive interval in seconds (default: 30)
-    pub keep_alive_secs: Option<u64>,
-    /// Connection timeout in milliseconds (default: 5000)
-    pub connection_timeout_ms: Option<u64>,
-    /// Interval between automatic reconnection attempts in milliseconds.
-    ///
-    /// When `None` (the default), the ESP-IDF default of 10 000 ms is used.
-    /// Set via [`with_reconnect_timeout`](Self::with_reconnect_timeout).
-    pub reconnect_timeout_ms: Option<u64>,
-    /// Stack size for the ESP-IDF MQTT client task (default: 8192).
-    ///
-    /// Set via [`with_task_stack_size`](Self::with_task_stack_size).
-    pub task_stack_size: usize,
-    lwt: Option<LwtConfig<'a>>,
-    username: Option<&'a str>,
-    password: Option<&'a str>,
-}
-
-impl<'a> std::fmt::Debug for MqttConfig<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_username: Option<&'static str> = if self.username.is_some() {
-            Some("<redacted>")
-        } else {
-            None
-        };
-        let redacted_password: Option<&'static str> = if self.password.is_some() {
-            Some("<redacted>")
-        } else {
-            None
-        };
-        f.debug_struct("MqttConfig")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("client_id", &self.client_id)
-            .field("keep_alive_secs", &self.keep_alive_secs)
-            .field("connection_timeout_ms", &self.connection_timeout_ms)
-            .field("reconnect_timeout_ms", &self.reconnect_timeout_ms)
-            .field("task_stack_size", &self.task_stack_size)
-            .field("lwt", &self.lwt)
-            .field("username", &redacted_username)
-            .field("password", &redacted_password)
-            .finish()
-    }
-}
-
-impl<'a> MqttConfig<'a> {
-    /// Creates a new configuration with the required fields.
-    pub fn new(host: &'a str, port: u16, client_id: &'a str) -> Self {
-        Self {
-            host,
-            port,
-            client_id,
-            keep_alive_secs: None,
-            connection_timeout_ms: None,
-            reconnect_timeout_ms: None,
-            task_stack_size: DEFAULT_MQTT_TASK_STACK_SIZE,
-            lwt: None,
-            username: None,
-            password: None,
-        }
-    }
-
-    /// Sets the keep-alive interval.
-    pub fn with_keep_alive(mut self, secs: u64) -> Self {
-        self.keep_alive_secs = Some(secs);
-        self
-    }
-
-    /// Sets the connection timeout.
-    pub fn with_timeout(mut self, ms: u64) -> Self {
-        self.connection_timeout_ms = Some(ms);
-        self
-    }
-
-    /// Sets the interval between automatic reconnection attempts.
-    ///
-    /// When the broker is unreachable, the ESP-IDF MQTT client retries at
-    /// this interval.  The default is 10 000 ms.  Battery-powered or
-    /// thermally constrained devices may want 30 000–60 000 ms to reduce
-    /// power draw during prolonged broker outages.
-    ///
-    /// This does not affect the initial connection wait controlled by
-    /// [`with_timeout`](Self::with_timeout).
-    ///
-    /// ```ignore
-    /// let config = MqttConfig::new("192.168.1.100", 1883, "sensor-01")
-    ///     .with_reconnect_timeout(30_000); // retry every 30 s instead of 10 s
-    /// ```
-    pub fn with_reconnect_timeout(mut self, ms: u64) -> Self {
-        self.reconnect_timeout_ms = Some(ms);
-        self
-    }
-
-    /// Configures a Last Will and Testament message.
-    ///
-    /// The broker publishes this message when the client disconnects
-    /// unexpectedly. A clean shutdown suppresses the LWT.
-    pub fn with_lwt(mut self, lwt: LwtConfig<'a>) -> Self {
-        self.lwt = Some(lwt);
-        self
-    }
-
-    /// Sets MQTT broker authentication credentials.
-    ///
-    /// For brokers whose ACL keys off a username alone (no password), use
-    /// [`with_username_only`](Self::with_username_only) instead — it omits the
-    /// CONNECT packet's password field rather than transmitting an empty
-    /// string, matching what those brokers expect.
-    pub fn with_auth(mut self, username: &'a str, password: &'a str) -> Self {
-        self.username = Some(username);
-        self.password = Some(password);
-        self
-    }
-
-    /// Sets a username with no password, for brokers that authorise by
-    /// username alone.
-    ///
-    /// The CONNECT packet carries the username and *omits* the password field
-    /// (rather than carrying an empty one). This is semantically distinct on
-    /// the wire from [`with_auth(user, "")`](Self::with_auth) and is what
-    /// broker-side username-only ACL implementations typically expect.
-    pub fn with_username_only(mut self, username: &'a str) -> Self {
-        self.username = Some(username);
-        self.password = None;
-        self
-    }
-
-    /// Overrides the ESP-IDF MQTT client task stack size.
-    ///
-    /// Defaults to 8192 bytes (8 KiB), which provides sufficient headroom
-    /// for TLS handshakes on ESP32.
-    /// Increase to 16384 (16 KiB) if stack overflows are observed during
-    /// TLS negotiation on resource-constrained targets.
-    pub fn with_task_stack_size(mut self, bytes: usize) -> Self {
-        self.task_stack_size = bytes;
-        self
-    }
-}
 
 /// MQTT client manager with automatic connection and event handling.
 ///
@@ -506,11 +315,11 @@ where
             config.port
         );
 
-        let lwt_cfg = config.lwt.as_ref().map(|lwt| LwtConfiguration {
-            topic: lwt.topic,
-            payload: lwt.payload,
-            qos: lwt.qos,
-            retain: lwt.retain,
+        let lwt_cfg = config.lwt().map(|lwt| LwtConfiguration {
+            topic: lwt.topic(),
+            payload: lwt.payload(),
+            qos: to_esp_qos(lwt.qos()),
+            retain: lwt.retain(),
         });
 
         let mqtt_cfg = MqttClientConfiguration {
@@ -525,8 +334,8 @@ where
             ),
             task_stack: config.task_stack_size,
             lwt: lwt_cfg,
-            username: config.username,
-            password: config.password,
+            username: config.username(),
+            password: config.password(),
             ..Default::default()
         };
 
@@ -616,7 +425,9 @@ where
             for topic in &topics {
                 validate_subscribe_filter(topic.as_str())
                     .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
-                manager.client.subscribe(topic.as_str(), QoS::AtLeastOnce)?;
+                manager
+                    .client
+                    .subscribe(topic.as_str(), EspQoS::AtLeastOnce)?;
                 log::info!("Subscribed to '{}'", topic);
             }
         } else {
@@ -664,7 +475,8 @@ where
         validate_publish_topic(topic)
             .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
         log::debug!("Publishing to '{}': {:?}", topic, payload);
-        self.client.enqueue(topic, qos, retain, payload)?;
+        self.client
+            .enqueue(topic, to_esp_qos(qos), retain, payload)?;
         Ok(())
     }
 
@@ -743,27 +555,25 @@ impl std::ops::DerefMut for SubscribableClient {
 }
 
 impl SubscribeClient for SubscribableClient {
-    fn subscribe_topic(&mut self, topic: &str, qos: PureQoS) -> anyhow::Result<()> {
+    fn subscribe_topic(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()> {
         self.0
-            .subscribe(topic, pure_to_idf_qos(qos))
+            .subscribe(topic, to_esp_qos(qos))
             .map(|_| ())
             .map_err(Into::into)
     }
 }
 
-fn pure_to_idf_qos(q: PureQoS) -> QoS {
-    match q {
-        PureQoS::AtMostOnce => QoS::AtMostOnce,
-        PureQoS::AtLeastOnce => QoS::AtLeastOnce,
-        PureQoS::ExactlyOnce => QoS::ExactlyOnce,
-    }
-}
-
-fn idf_to_pure_qos(q: QoS) -> PureQoS {
-    match q {
-        QoS::AtMostOnce => PureQoS::AtMostOnce,
-        QoS::AtLeastOnce => PureQoS::AtLeastOnce,
-        QoS::ExactlyOnce => PureQoS::ExactlyOnce,
+/// Converts the shared [`QoS`] into the `esp-idf-svc` QoS type.
+///
+/// Every [`MqttBuilder`] / [`MqttHandle`] method takes the shared
+/// [`QoS`] and converts internally. Use this only where you call the raw
+/// `EspMqttClient` yourself — e.g. `client.enqueue(...)` inside an
+/// [`on_connect`](MqttBuilder::on_connect) callback.
+pub fn to_esp_qos(qos: QoS) -> EspQoS {
+    match qos {
+        QoS::AtMostOnce => EspQoS::AtMostOnce,
+        QoS::AtLeastOnce => EspQoS::AtLeastOnce,
+        QoS::ExactlyOnce => EspQoS::ExactlyOnce,
     }
 }
 
@@ -804,8 +614,7 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 /// # Example
 ///
 /// ```ignore
-/// use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, LwtConfig};
-/// use esp_idf_svc::mqtt::client::QoS;
+/// use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, MqttConfig, QoS};
 ///
 /// let config = MqttConfig::new("192.168.1.100", 1883, "my-device");
 ///
@@ -813,7 +622,7 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 ///     .subscribe("commands/#", QoS::AtLeastOnce)
 ///     .on_connect(|client, is_clean| {
 ///         log::info!("connected (clean={})", is_clean);
-///         client.enqueue("device/status", QoS::AtLeastOnce, true, b"online")?;
+///         client.enqueue("device/status", to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
 ///         Ok(())
 ///     })
 ///     .on_disconnect(|| log::warn!("MQTT disconnected"))
@@ -827,7 +636,7 @@ pub struct MqttBuilder<'a> {
     on_connect: Option<OnConnectCallback>,
     on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
     on_message: Option<OnMessageCallback>,
-    subscribe_topics: Vec<(String, PureQoS)>,
+    subscribe_topics: Vec<(String, QoS)>,
     with_startup_message: bool,
 }
 
@@ -882,8 +691,7 @@ impl<'a> MqttBuilder<'a> {
     ///     .build()?;
     /// ```
     pub fn subscribe(mut self, topic: impl Into<String>, qos: QoS) -> Self {
-        self.subscribe_topics
-            .push((topic.into(), idf_to_pure_qos(qos)));
+        self.subscribe_topics.push((topic.into(), qos));
         self
     }
 
@@ -936,7 +744,7 @@ impl<'a> MqttBuilder<'a> {
     /// disconnect/reconnect and, once started, cannot be cancelled. A
     /// retained publish issued from a stale callback is replayed by
     /// esp-mqtt on the next connection, which is why the retained-status
-    /// idiom (`client.enqueue(topic, QoS::AtLeastOnce, true, ...)`) is safe
+    /// idiom (`client.enqueue(topic, to_esp_qos(QoS::AtLeastOnce), true, ...)`) is safe
     /// to call here even from a stale, superseded callback — but a
     /// non-idempotent side effect (e.g. incrementing a counter, sending a
     /// one-shot command) is not, since it may run twice for what the
@@ -1048,20 +856,20 @@ impl<'a> MqttBuilder<'a> {
         // broker via EspMqttClient::new(); this is required for authentication
         // and is not a logging operation.  esp_mqtt_client_init() strdup()'s
         // these values immediately; they are never written to any log sink here.
-        let username = config.username.map(|s| s.to_string());
+        let username = config.username().map(|s| s.to_string());
         // codeql[rust/cleartext-logging]
-        let password = config.password.map(|s| s.to_string());
-        let lwt_topic = config.lwt.as_ref().map(|l| l.topic.to_string());
-        let lwt_payload = config.lwt.as_ref().map(|l| l.payload.to_vec());
+        let password = config.password().map(|s| s.to_string());
+        let lwt_topic = config.lwt().map(|l| l.topic().to_string());
+        let lwt_payload = config.lwt().map(|l| l.payload().to_vec());
 
         let lwt_cfg = lwt_topic
             .as_ref()
-            .zip(config.lwt.as_ref())
+            .zip(config.lwt())
             .map(|(topic, lwt)| LwtConfiguration {
                 topic: topic.as_str(),
                 payload: lwt_payload.as_deref().unwrap_or(&[]),
-                qos: lwt.qos,
-                retain: lwt.retain,
+                qos: to_esp_qos(lwt.qos()),
+                retain: lwt.retain(),
             });
 
         let mqtt_cfg = MqttClientConfiguration {
@@ -1208,7 +1016,7 @@ impl<'a> MqttBuilder<'a> {
                                         if let Some(topic) = &startup_topic {
                                             if let Err(e) = client.enqueue(
                                                 topic,
-                                                QoS::AtLeastOnce,
+                                                EspQoS::AtLeastOnce,
                                                 false,
                                                 b"1",
                                             ) {
@@ -1500,7 +1308,7 @@ impl MqttHandle {
             .client
             .lock()
             .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
-        guard.enqueue(topic, qos, retain, payload)?;
+        guard.enqueue(topic, to_esp_qos(qos), retain, payload)?;
         Ok(())
     }
 
@@ -1566,7 +1374,7 @@ impl MqttHandle {
                 PublishAckError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
             })?;
             guard
-                .enqueue(topic, QoS::AtLeastOnce, retained, payload)
+                .enqueue(topic, EspQoS::AtLeastOnce, retained, payload)
                 .map_err(|e| PublishAckError::Other(e.into()))?
         };
 
@@ -1664,7 +1472,7 @@ impl MqttHandle {
             }
         })?;
         guard
-            .enqueue(topic, qos, retain, payload)
+            .enqueue(topic, to_esp_qos(qos), retain, payload)
             .map_err(|e| TryPublishError::Other(e.into()))?;
         Ok(())
     }
@@ -1691,7 +1499,7 @@ impl MqttHandle {
             .client
             .lock()
             .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
-        guard.subscribe(topic, qos)?;
+        guard.subscribe(topic, to_esp_qos(qos))?;
         Ok(())
     }
 

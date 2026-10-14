@@ -41,9 +41,9 @@
 //! ```
 
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::mqtt::client::{EspMqttClient, QoS};
+use esp_idf_svc::mqtt::client::EspMqttClient;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::{LwtConfig, MqttBuilder};
+use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 
 #[path = "common/env.rs"]
@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 log::info!("[mqtt] connected — session resumed");
             }
-            client.enqueue(&status_topic, QoS::AtLeastOnce, true, b"online")?;
+            client.enqueue(&status_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
             log::info!("[mqtt] published retained status=online");
             Ok(())
         })

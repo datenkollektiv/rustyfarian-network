@@ -2,10 +2,9 @@
 
 use std::thread;
 
-use esp_idf_svc::mqtt::client::QoS;
 use juggler::ota::{OtaStatus, OtaTimings};
 
-use crate::mqtt::{MqttHandle, TryPublishError};
+use crate::mqtt::{MqttHandle, QoS, TryPublishError};
 
 /// Publishes `status` without blocking on the client for long.
 ///

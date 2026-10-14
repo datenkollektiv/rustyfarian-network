@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Three firmware crates in `rustbox-backstage` (`firmware-rgb-puzzle-brain`, `firmware-rgb-matrix`, `firmware-rgb-nunchuck`) each contain ~155 lines of nearly identical ESP-NOW wrapper code:
+Three firmware crates in a downstream project (`firmware-rgb-puzzle-brain`, `firmware-rgb-matrix`, `firmware-rgb-nunchuck`) each contain ~155 lines of nearly identical ESP-NOW wrapper code:
 
 - A static `Mutex<Option<SyncSender<EspNowEvent>>>` for bridging the C receive callback into Rust
 - An `unsafe extern "C" fn recv_callback(...)` that copies frames into the channel
@@ -85,7 +85,7 @@ rustyfarian-esp-idf-espnow       — std; wraps esp_idf_sys FFI, implements trai
 
 ### What stays downstream
 
-The `rgb-puzzle-protocol` crate in `rustbox-backstage` encodes and decodes puzzle-specific messages.
+The `rgb-puzzle-protocol` crate in that downstream project encodes and decodes puzzle-specific messages.
 It has no dependency on the transport layer and is unchanged by this extraction.
 
 ## Consequences
