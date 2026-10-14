@@ -19,6 +19,7 @@ host_target := `scripts/host-target.sh`
 hal_target := "riscv32imac-unknown-none-elf"
 hal_c6_target := "riscv32imac-unknown-none-elf"
 hal_c3_target := "riscv32imc-unknown-none-elf"
+hal_s3_target := "xtensa-esp32s3-none-elf"
 
 # ESP-IDF target (publish / dry-run)
 idf_target := "riscv32imac-esp-espidf"
@@ -253,6 +254,9 @@ clippy-hal:
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c6,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32s3,unstable,rt,embassy -- -D warnings
 
 # ── test & lint ───────────────────────────────────────────────────────────
 

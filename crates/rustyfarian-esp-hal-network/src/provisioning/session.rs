@@ -9,7 +9,7 @@
 //!
 //! The public types compile unconditionally.  The `start` body and the embassy
 //! tasks are gated on `#[cfg(all(feature = "embassy", any(feature = "esp32c3",
-//! feature = "esp32c6")))]`.
+//! feature = "esp32c6", feature = "esp32s3")))]`.
 //!
 //! # The library never reboots or erases
 //!
@@ -22,10 +22,16 @@ use heapless::String as HS;
 
 use juggler::provisioning::{PortalDefaults, ProvisioningConfig, SchemaProfile};
 
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 use juggler::provisioning::resolve_softap_ssid;
 
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 use super::store::ProvisioningStore;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -243,7 +249,10 @@ impl core::fmt::Display for ProvisioningError {
 /// unchanged.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 pub(crate) fn validate_profile(profile: SchemaProfile) -> Result<(), ProvisioningError> {
     match profile {
@@ -262,7 +271,10 @@ pub(crate) fn validate_profile(profile: SchemaProfile) -> Result<(), Provisionin
 // Fields are accessed only in embassy+chip builds; the cfg_attr suppresses
 // dead-code warnings in host (no-default-features) builds.
 #[cfg_attr(
-    not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
     allow(dead_code)
 )]
 pub(crate) struct SharedState {
@@ -394,7 +406,10 @@ impl ProvisioningSession {
 /// (`docs/features/hal-provisioning-ap-ownership-v1.md`).
 // `config` is only read inside the embassy+chip-gated `start` method.
 #[cfg_attr(
-    not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
     allow(dead_code)
 )]
 pub struct ProvisioningBuilder<'a> {
@@ -445,7 +460,10 @@ impl<'a> ProvisioningBuilder<'a> {
     /// Panics if `start` is called a second time in the same boot and the
     /// `StaticCell::try_init` path is unavailable.  Prefer checking
     /// [`ProvisioningError::AlreadyStarted`] at runtime.
-    #[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+    #[cfg(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ))]
     pub fn start<F>(
         self,
         spawner: embassy_executor::Spawner,
@@ -592,7 +610,10 @@ impl<'a> ProvisioningBuilder<'a> {
 /// so the integrator cannot accidentally silence it by mistake.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
     if ap_password.is_none() {
@@ -606,13 +627,19 @@ pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
 /// The static AP IP address — `192.168.4.1` in network byte order.
 ///
 /// Matches the address configured by `WiFiManager::init_softap_async`.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 const AP_IP: [u8; 4] = [192, 168, 4, 1];
 
 /// Generates an 8-hex-character session nonce from the hardware RNG.
 ///
 /// Reads 4 bytes from `rng` and formats them as 8 lowercase hex characters.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 fn generate_nonce(rng: esp_hal::rng::Rng) -> HS<16> {
     let value = rng.random();
     let mut nonce = HS::<16>::new();
@@ -647,7 +674,10 @@ fn generate_nonce(rng: esp_hal::rng::Rng) -> HS<16> {
 ///
 /// The leaked allocation is never freed — the provisioning session runs for
 /// the lifetime of the device.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 fn store_cell_init<F>(store: ProvisioningStore<F>) -> &'static dyn PortalStore
 where
     F: embedded_storage::nor_flash::NorFlash + Send + Sync + 'static,
@@ -681,7 +711,10 @@ where
 /// intended name in the portal header.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 pub(crate) mod portal {
     use heapless::String as HS;
@@ -754,7 +787,10 @@ pub(crate) mod portal {
         // Only read by the embassy+chip-gated `load_prefill`; on host/test
         // builds (no chip feature) nothing consumes it, so allow dead_code there.
         #[cfg_attr(
-            not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+            not(all(
+                feature = "embassy",
+                any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+            )),
             allow(dead_code)
         )]
         pub defaults: PortalDefaultsOwned,
@@ -768,7 +804,10 @@ pub(crate) mod portal {
 /// Used to pass the store into the HTTP task without a generic type parameter.
 /// Embassy tasks cannot be generic, so the concrete `ProvisioningStore<F>` is
 /// hidden behind this trait and leaked as a `Box<dyn PortalStore>`.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 pub(crate) trait PortalStore: Send + Sync {
     /// Save `config` to flash.
     fn save(
@@ -782,7 +821,10 @@ pub(crate) trait PortalStore: Send + Sync {
 }
 
 /// Blanket impl of [`PortalStore`] for a `Mutex<RefCell<ProvisioningStore<F>>>`.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 impl<F> PortalStore
     for embassy_sync::blocking_mutex::CriticalSectionMutex<
         core::cell::RefCell<ProvisioningStore<F>>,
@@ -804,7 +846,10 @@ where
     }
 }
 
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 pub(crate) mod tasks {
     use embassy_net::{Runner, Stack};
     use esp_radio::wifi::{Interface, WifiController};

@@ -60,39 +60,63 @@
 // function and its TcpSocket usage are compiled away.  Allow dead-code on the
 // types that remain so clippy -D warnings does not fail on stub/host builds.
 #![cfg_attr(
-    not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
     allow(dead_code)
 )]
 
 // The bare-metal embassy builds have a global allocator (required by esp-radio);
 // bring `alloc` into scope for the validation-error string formatting path.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 extern crate alloc;
 
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 use juggler::provisioning::html_json_escape::html_escape_to;
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 use juggler::provisioning::parse_form;
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 use juggler::provisioning::templates::WIFI_MQTT_PORTAL_HTML;
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 use juggler::provisioning::SchemaProfile;
 
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 use super::session::portal::{PortalDefaultsOwned, PortalRenderConfig};
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 use super::session::{PortalStore, ProvisioningEvent, ProvisioningOutcome, SharedState};
 
 // ── HTTP wire constants ───────────────────────────────────────────────────────
@@ -733,7 +757,10 @@ fn extract_form_field<'a>(body: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// render pass substitutes.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 struct Prefill {
     wifi_ssid: heapless::String<32>,
@@ -746,7 +773,10 @@ struct Prefill {
 
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 impl Prefill {
     fn empty() -> Self {
@@ -790,7 +820,10 @@ impl Prefill {
 /// so pre-filling a partial URI would only mislead.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 fn compose_mqtt_uri(host: &str, port: &str) -> heapless::String<74> {
     let mut uri = heapless::String::<74>::new();
@@ -813,7 +846,10 @@ fn compose_mqtt_uri(host: &str, port: &str) -> heapless::String<74> {
 /// error — falls back to the caller-supplied non-secret `defaults` (seeded from
 /// `.env` on a fresh / factory-reset device) so the form still comes up
 /// pre-populated. Secrets are never sourced from either path.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 fn load_prefill(
     store: &dyn PortalStore,
     profile: SchemaProfile,
@@ -872,7 +908,10 @@ fn load_prefill(
 /// is the compile-time guard.
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 fn template_for(profile: SchemaProfile) -> &'static str {
     match profile {
@@ -901,7 +940,10 @@ fn template_for(profile: SchemaProfile) -> &'static str {
 /// `overflowed` flag and returns `Err(())`).
 #[cfg(any(
     test,
-    all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 #[allow(clippy::result_unit_err)]
 fn render_portal_template(
@@ -1047,7 +1089,10 @@ fn render_portal_template(
 ///
 /// Baked from `PortalConfig` at `start()` time; the portal task holds this
 /// by value.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 #[allow(dead_code)]
 struct PortalState<'r> {
     ap_ip_str: heapless::String<16>, // "192.168.4.1" max
@@ -1070,7 +1115,10 @@ struct PortalState<'r> {
 /// | POST   | /save                 | 200/400/403/409/500 | Credential commit (409: session already finished) |
 /// | POST   | /factory-reset        | 200/403/409 | Factory-reset signal (409: session already finished) |
 /// | POST   | anything else         | 404    | Not found (POST-only — unknown GETs hit the catch-all row above) |
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 #[allow(clippy::result_unit_err, clippy::too_many_arguments)]
 pub(crate) fn dispatch_request(
     req: &ParsedRequest,
@@ -1504,7 +1552,10 @@ pub(crate) fn dispatch_request(
 /// Called from the non-generic `http_task` embassy task.  The store is
 /// accessed via the [`PortalStore`] trait object so no generic type parameter
 /// is needed.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 pub(crate) async fn run_portal_dyn(
     stack: embassy_net::Stack<'static>,
     shared: &'static SharedState,
@@ -1696,7 +1747,10 @@ pub(crate) async fn run_portal_dyn(
 
 /// Read from `socket` until the request headers are complete (`\r\n\r\n`)
 /// or the buffer fills.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 async fn read_request(
     socket: &mut embassy_net::tcp::TcpSocket<'_>,
     buf: &mut [u8],
@@ -1726,7 +1780,10 @@ async fn read_request(
 }
 
 /// Read and discard up to `remaining` bytes from `socket`, honouring `deadline`.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 async fn drain_body_with_deadline(
     socket: &mut embassy_net::tcp::TcpSocket<'_>,
     mut remaining: usize,

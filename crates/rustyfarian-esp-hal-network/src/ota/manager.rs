@@ -2,7 +2,7 @@
 //! `esp_bootloader_esp_idf::OtaUpdater` and `esp-storage`.
 //!
 //! This module is compiled only when both a chip feature (`esp32c3`,
-//! `esp32c6`, or `esp32`) **and** the `embassy` feature are active.
+//! `esp32c6`, `esp32`, or `esp32s3`) **and** the `embassy` feature are active.
 
 use core::time::Duration as CoreDuration;
 

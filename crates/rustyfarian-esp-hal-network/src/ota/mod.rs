@@ -60,15 +60,15 @@ pub use juggler::ota::{
     MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
 
-// One const per supported chip feature. The bare-metal OTA tier supports `esp32`, `esp32c3` and
-// `esp32c6` (`esp32s3` has no OTA storage support, see the feature table in `Cargo.toml`).
+// One const per supported chip feature. The bare-metal OTA tier supports `esp32`, `esp32c3`,
+// `esp32c6` and `esp32s3`.
 // No chip feature is on for host checks and the `ota` stub build; the const is then absent on
 // purpose, so nothing can compare manifests against a made-up chip name.
 // esp-hal itself rejects enabling two chips at once, so at most one of these exists.
 
 /// Experimental: API may change before 1.0.
 ///
-/// The chip this firmware runs on, in the spelling a manifest's `target` uses (`"esp32"`, `"esp32c3"`, `"esp32c6"`).
+/// The chip this firmware runs on, in the spelling a manifest's `target` uses (`"esp32"`, `"esp32c3"`, `"esp32c6"`, `"esp32s3"`).
 ///
 /// Pass it to `Manifest::check_target` (needs the `ota-wire` feature).
 /// Selected by the crate's chip feature; absent when no chip feature is enabled.
@@ -93,6 +93,12 @@ pub const TARGET_CHIP: &str = "esp32c6";
 /// The chip this firmware runs on (`"esp32"`); pass it to `Manifest::check_target`. Absent when no chip feature is enabled.
 #[cfg(feature = "esp32")]
 pub const TARGET_CHIP: &str = "esp32";
+
+/// Experimental: API may change before 1.0.
+///
+/// The chip this firmware runs on (`"esp32s3"`); pass it to `Manifest::check_target`. Absent when no chip feature is enabled.
+#[cfg(feature = "esp32s3")]
+pub const TARGET_CHIP: &str = "esp32s3";
 
 // Parity guard: every public `juggler::ota` type must stay re-exported from this
 // crate's `ota` module (like `wifi`/`espnow`), so OTA consumers never need a
@@ -216,7 +222,12 @@ mod reexport_parity_guard {
             RollbackReason::from_label("operator"),
             RollbackReason::Operator
         );
-        #[cfg(any(feature = "esp32", feature = "esp32c3", feature = "esp32c6"))]
+        #[cfg(any(
+            feature = "esp32",
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32s3"
+        ))]
         assert!(crate::ota::TARGET_CHIP.starts_with("esp32"));
         assert_exported::<BootDisposition>();
         assert_exported::<BootFault>();
@@ -314,22 +325,42 @@ mod reexport_parity_guard {
 
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
 ))]
 mod manager;
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
 ))]
 pub use manager::{EspHalOtaManager, OtaManagerConfig};
 
 #[cfg(not(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
 )))]
 mod stub;
 #[cfg(not(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
 )))]
 pub use stub::{EspHalOtaManager, OtaManagerConfig};

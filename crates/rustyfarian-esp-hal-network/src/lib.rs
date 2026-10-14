@@ -4,13 +4,13 @@
 //! with per-domain + chip feature gates:
 //!
 //! - [`wifi`] — async STA + SoftAP Wi-Fi via `esp-radio 1.0.0-beta.1` (pre-release, exact-pinned)
-//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`)
+//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
 //! - [`lora`] — synchronous LoRa stub via embedded-hal SPI + GPIO
 //!   (all chips; `esp32s3` uses hardware integration)
 //! - [`ota`] — async OTA download + verify + swap
-//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32`)
+//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32`, `esp32s3`)
 //! - [`provisioning`] — SoftAP captive-portal credential provisioning
-//!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`)
+//!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
 //!
 //! # Feature flags
 //!
@@ -24,7 +24,7 @@
 //! | `esp32c3` | Target chip ESP32-C3 |
 //! | `esp32c6` | Target chip ESP32-C6 |
 //! | `esp32` | Target chip ESP32 (lora + ota only) |
-//! | `esp32s3` | Target chip ESP32-S3 (lora only) |
+//! | `esp32s3` | Target chip ESP32-S3 |
 //! | `unstable` | Forward `esp-hal/unstable` |
 //! | `rt` | Forward `esp-hal/rt` |
 //! | `ws2812` | Enable `rustyfarian-esp-hal-ws2812` LED dep |

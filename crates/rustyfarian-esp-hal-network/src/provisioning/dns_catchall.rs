@@ -35,7 +35,10 @@
 // and its UdpSocket usage are compiled away.  Allow dead-code on the types
 // that remain so clippy -D warnings does not fail on stub/host builds.
 #![cfg_attr(
-    not(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6"))),
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
     allow(dead_code)
 )]
 
@@ -429,7 +432,10 @@ pub fn encode_response(
 ///
 /// Bind failure, send errors, and malformed packets are all logged at `warn`
 /// and do not abort the server loop.
-#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
 pub async fn run(stack: embassy_net::Stack<'static>, config: DnsCatchallConfig) -> ! {
     use embassy_net::udp::{PacketMetadata, UdpSocket};
     use static_cell::StaticCell;
