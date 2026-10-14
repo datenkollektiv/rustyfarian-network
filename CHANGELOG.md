@@ -9,8 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bare-metal MQTT: new `mqtt` feature on `rustyfarian-esp-hal-network` (ADR 019) — an async MQTT 5 client over `minimq =0.13.5` and the Wi-Fi `embassy-net` stack, with LWT, a startup message republished on every (re)connect, builder subscriptions re-issued after reconnect, auto-reconnect, a non-blocking `try_publish*` family returning `TryPublishError::WouldBlock`, an inbound message queue, and all buffers static.
+  Chips `esp32c3`, `esp32c6`, `esp32s3`; examples `hal_c6_mqtt_lwt` and `hal_esp32s3_mqtt_lwt`; runbook `docs/runbooks/esp-hal-mqtt-hardware-test.md`; `just clippy-hal` and `just check-hal` cover the feature.
+- Shared MQTT configuration in `juggler::mqtt` (no `std` needed): `QoS`, `MqttConfig`, `LwtConfig`, `DEFAULT_MQTT_TASK_STACK_SIZE` and the generic `TryPublishError<E>`, used by both tier crates.
 - ESP32-S3 support for `wifi`, `provisioning` and `ota` in `rustyfarian-esp-hal-network`: the `esp32s3` feature now selects the chip on `esp-radio`, `esp-rtos`, `esp-alloc`, `esp-storage` and `esp-backtrace`, and `ota::TARGET_CHIP` is `"esp32s3"`.
 - Example `hal_esp32s3_connect_async` (Wi-Fi station join plus DHCP), and S3 Wi-Fi, OTA and provisioning lines in `just clippy-hal`.
+
+### Changed
+
+- **Breaking (IDF tier):** `rustyfarian_esp_idf_network::mqtt` now takes `juggler::mqtt::QoS` everywhere (`MqttBuilder::subscribe`, `LwtConfig::new`, `publish_with`, `try_publish_with`, `publish_acked`, …) and re-exports it as `mqtt::QoS`; `MqttConfig`, `LwtConfig` and `TryPublishError` are re-exports/aliases of the `juggler` types.
+  Migration: import `QoS` from `rustyfarian_esp_idf_network::mqtt` instead of `esp_idf_svc::mqtt::client`, and convert with `mqtt::to_esp_qos(..)` where an `on_connect` closure calls the raw `EspMqttClient::enqueue`.
+- Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).
 
 ### Fixed
 

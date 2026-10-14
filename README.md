@@ -149,8 +149,7 @@ juggler = { version = "0.5", features = ["wifi", "mqtt"] }
 
 ```rust
 use rustyfarian_esp_idf_network::wifi::{WiFiManager, WiFiConfig};
-use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
-use esp_idf_svc::mqtt::client::QoS;
+use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, QoS};
 
 let wifi_config = WiFiConfig::new("MyNetwork", "password123");
 let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), wifi_config, None::<&mut MyLed>)?;
@@ -176,8 +175,7 @@ The retained-status idiom publishes `"online"` from `on_connect` using its `clie
 The LWT automatically sends `"offline"` if the TCP connection drops.
 
 ```rust
-use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, LwtConfig};
-use esp_idf_svc::mqtt::client::QoS;
+use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, MqttConfig, QoS};
 
 let lwt = LwtConfig::new("device/status", b"offline", QoS::AtLeastOnce, true);
 let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device")
@@ -186,7 +184,7 @@ let mqtt_config = MqttConfig::new("192.168.1.100", 1883, "my-device")
 let mqtt = MqttBuilder::new(mqtt_config)
     .subscribe("commands", QoS::AtMostOnce)
     .on_connect(|client, _clean_session| {
-        client.enqueue("device/status", QoS::AtLeastOnce, true, b"online")?;
+        client.enqueue("device/status", to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
         Ok(())
     })
     .on_message(|topic, data| {

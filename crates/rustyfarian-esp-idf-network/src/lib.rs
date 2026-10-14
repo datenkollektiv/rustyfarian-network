@@ -51,6 +51,9 @@
 //!
 //! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::WifiDriver`], etc. from `juggler::wifi`
 //! - `mqtt::*` exports [`mqtt::MqttConnectionState`], validation functions, etc. from `juggler::mqtt`
+//!   and the config types shared with the bare-metal tier — [`mqtt::QoS`],
+//!   [`mqtt::MqttConfig`], [`mqtt::LwtConfig`], [`mqtt::TryPublishError`]; raw
+//!   `EspMqttClient` calls convert QoS with [`mqtt::to_esp_qos`]
 //! - `lora::*` exports [`lora::LoraRadio`], [`lora::LorawanDevice`], [`lora::Region`], etc. from `juggler::lora`
 //! - `espnow::*` exports [`espnow::EspNowDriver`], [`espnow::ScanConfig`], etc. from `juggler::espnow`
 //! - `ota::*` exports [`ota::OtaError`], [`ota::StreamingVerifier`], etc. from `juggler::ota`

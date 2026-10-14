@@ -28,9 +28,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::mqtt::client::QoS;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
+use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::ota::runtime::{channel, open_records, OtaConfig, RestartFn};
 use rustyfarian_esp_idf_network::ota::Version;
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};

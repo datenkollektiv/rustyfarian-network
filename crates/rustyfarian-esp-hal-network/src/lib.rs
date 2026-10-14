@@ -5,6 +5,8 @@
 //!
 //! - [`wifi`] — async STA + SoftAP Wi-Fi via `esp-radio 1.0.0-beta.1` (pre-release, exact-pinned)
 //!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
+//! - [`mqtt`] — async MQTT 5 client over the Wi-Fi `embassy-net` stack (`minimq`, ADR 019)
+//!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
 //! - [`lora`] — synchronous LoRa stub via embedded-hal SPI + GPIO
 //!   (all chips; `esp32s3` uses hardware integration)
 //! - [`ota`] — async OTA download + verify + swap
@@ -17,6 +19,7 @@
 //! | Flag | Description |
 //! |:-----|:------------|
 //! | `wifi` | Wi-Fi STA + SoftAP (implies `embassy`) |
+//! | `mqtt` | MQTT 5 client (implies `wifi` + `embassy`) |
 //! | `lora` | LoRa radio stub |
 //! | `ota` | OTA manager (implies `embassy`) |
 //! | `provisioning` | SoftAP captive portal (implies `wifi` + `embassy`) |
@@ -51,6 +54,9 @@ pub use pennant::{NoLed, SimpleLed, StatusLed};
 
 #[cfg(any(feature = "wifi", test))]
 pub mod wifi;
+
+#[cfg(any(feature = "mqtt", test))]
+pub mod mqtt;
 
 #[cfg(any(feature = "lora", test))]
 pub mod lora;

@@ -133,6 +133,23 @@ Every pinned crate (`esp-radio =1.0.0-beta.1`, `esp-storage 0.10`, `esp-bootload
 The promised `compile_error!` never existed: S3 + `ota` + `embassy` silently compiled the stub `EspHalOtaManager`.
 Fix: before trusting a "by design" chip restriction, grep the registry `Cargo.toml` of each pinned dep for the chip feature (`~/.cargo/registry/src/*/<crate>-<ver>/Cargo.toml`); the `esp32` Wi-Fi gap is the same story (`esp-radio` supports it, the `esp32` feature forwards no chip).
 
+**`minimq 0.13`'s default feature is `defmt`; declare it `default-features = false` or every binary needs a defmt global logger.**
+With the default on, `heapless/defmt`, `embedded-io-async/defmt` and `embassy-time/defmt` come along and the link fails on the missing `_defmt_*` symbols.
+With it off, minimq's log macros expand to no-ops (`src/lib.rs` `discard_log`), and the crate still type-checks for `riscv32imc` / `xtensa-esp32s3`.
+Found 2026-10-14 while resolving ADR 019 on `tmp/adr-mqtt-resolve`; `cargo tree -e features -p minimq` shows what a default pulls in.
+
+**Hand `minimq::Session::connect` a `&mut TcpSocket`, never the socket by value — a failed or cancelled handshake drops the transport.**
+`Session::connect(io)` takes ownership and drops `io` on failure; with a `TcpSocket<'static>` built on `StaticCell` buffers that leaks the buffers for the rest of the boot.
+`embedded-io-async` has blanket `Read`/`Write` impls for `&mut T`, so `session.connect(&mut socket)` satisfies minimq's `Io` bound and the socket survives; `socket.abort()` then `socket.flush().await` returns it to CLOSED for the next attempt (embassy-net `tcp.rs` `abort()` docs).
+The runner in `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs` is the reference.
+
+**`riscv32imc` (ESP32-C3) has no atomic read-modify-write: `AtomicU32::fetch_add` is `E0599: no method named fetch_add` on the C3 target only, while the C6 (`imac`) build passes.**
+`core::sync::atomic` only exposes `load`/`store` there; use load + store for advisory counters, a `critical_section` block for anything that must be exact, or `portable-atomic`.
+Always run the C3 line of `just clippy-hal`, not just the C6 one.
+
+**Bare-metal MQTT (`minimq`) costs ~150 B of heap on the ESP32-S3: free heap 25 928 B with Wi-Fi + MQTT connected versus 26 076 B with Wi-Fi alone, flat over a 10-minute soak with a broker restart (2026-10-14, CrowPanel).**
+All client memory is `StaticCell` `.bss` (~8 KiB: minimq 1 KiB RX + 2 KiB TX, TCP 2 × 1536 B, two 4-deep queues), so the knob's "does it fit beside Wi-Fi" question is answered by construction; see `docs/runbooks/esp-hal-mqtt-hardware-test.md` for the measurement procedure.
+
 **ESP32-S3 bare-metal Wi-Fi runs on the same single 72 KiB internal heap as the C3 — no PSRAM region needed.**
 `esp-radio` and `esp-rtos` allocate only via `malloc_internal` / `InternalMemory`, so a PSRAM `esp-alloc` region could never serve Wi-Fi buffers anyway; add PSRAM only for application data.
 Validated 2026-10-14 on CrowPanel 1.28" ESP32-S3: `hal_esp32s3_connect_async` got a DHCP lease with ~26 KB heap free.

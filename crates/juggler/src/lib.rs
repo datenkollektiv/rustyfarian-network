@@ -84,8 +84,8 @@
 #[cfg(any(test, feature = "ota-wire"))]
 extern crate alloc;
 
-// Shared test fixtures; every user sits under `wifi` (provisioning implies it).
-#[cfg(all(test, feature = "wifi"))]
+// Shared test fixtures; every user sits under `wifi` or `mqtt` (provisioning implies both).
+#[cfg(all(test, any(feature = "wifi", feature = "mqtt")))]
 pub(crate) mod test_support;
 
 // ── Always-available (no feature gate) ──────────────────────────────────────

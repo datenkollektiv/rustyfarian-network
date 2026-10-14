@@ -58,11 +58,11 @@ For OTA-enabled firmware using the runtime loop, see [`docs/runbooks/ota-hardwar
 
 Register subscriptions on the builder; publish retained status from `on_connect` using its `client` argument.
 Never call `MqttHandle` methods from any callback.
+`QoS`, `MqttConfig` and `LwtConfig` come from `juggler` and are shared with the bare-metal tier; the raw `client` passed to `on_connect` is an `EspMqttClient`, so convert with `to_esp_qos`.
 
 ```rust
 use rustyfarian_esp_idf_network::wifi::{WiFiManager, WiFiConfig};
-use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig};
-use esp_idf_svc::mqtt::client::QoS;
+use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, MqttBuilder, MqttConfig, QoS};
 
 let wifi_config = WiFiConfig::new("MyNetwork", "password123");
 let wifi = WiFiManager::new(
@@ -81,7 +81,7 @@ let mqtt_config = MqttConfig::new("mqtt.example.com", 1883, "my-device");
 let mqtt = MqttBuilder::new(mqtt_config)
     .subscribe("commands/#", QoS::AtMostOnce)
     .on_connect(|client, _clean_session| {
-        client.enqueue("status", QoS::AtLeastOnce, true, b"online")?;
+        client.enqueue("status", to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
         Ok(())
     })
     .on_message(|topic, data| {

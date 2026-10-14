@@ -37,10 +37,10 @@
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{gpio::PinDriver, peripherals::Peripherals},
-    mqtt::client::{EspMqttClient, QoS},
+    mqtt::client::EspMqttClient,
     nvs::EspDefaultNvsPartition,
 };
-use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
+use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 use std::{
     sync::{

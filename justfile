@@ -234,7 +234,11 @@ check-wifi-hal-embassy:
 
 # check all HAL domains of the consolidated network crate
 [group('build')]
-check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy
+check-mqtt-hal-embassy:
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+
+check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy check-mqtt-hal-embassy
 
 # check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
 [group('build')]
@@ -257,6 +261,9 @@ clippy-hal:
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32s3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32s3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32s3,unstable,rt,embassy -- -D warnings
 
 # ── test & lint ───────────────────────────────────────────────────────────
 
@@ -414,6 +421,21 @@ erase-flash:
 [group('examples')]
 monitor:
     scripts/espflash.sh monitor --non-interactive
+
+# watch every topic under the bare-metal MQTT examples' prefix (MQTT_* from the dotenv file)
+[group('examples')]
+mqtt-watch:
+    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/#" -v
+
+# publish one message to <prefix>/<topic> on the dotenv broker, e.g. `just mqtt-pub cmd hello`
+[group('examples')]
+mqtt-pub topic message:
+    mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/{{ topic }}" -m "{{ message }}"
+
+# print the retained <prefix>/status value once (expects `online` while the device is up)
+[group('examples')]
+mqtt-status:
+    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/status" -C 1 -W 5
 
 # ── maintenance ───────────────────────────────────────────────────────────
 

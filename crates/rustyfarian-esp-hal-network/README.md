@@ -16,6 +16,7 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 | Feature        | What it gates                                             | Requires `embassy` | Notes                                              |
 |:---------------|:----------------------------------------------------------|:-------------------|:---------------------------------------------------|
 | `wifi`         | Async Wi-Fi STA/AP via `esp-radio 1.0.0-beta.1`           | Yes                | Implies `embassy`; auto-enables it.                |
+| `mqtt`         | Async MQTT 5 client via `minimq 0.13.5` (ADR 019)         | Yes                | Implies `wifi` + `embassy`; IPv4 broker literal.   |
 | `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.        |
 | `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.   |
 | `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V). |
@@ -65,6 +66,9 @@ rustyfarian-esp-hal-network = { version = "0.5", features = ["lora", "esp32s3", 
 
 # Wi-Fi on ESP32-S3
 rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32s3", "embassy", "rt"] }
+
+# MQTT (with Wi-Fi) on ESP32-S3
+rustyfarian-esp-hal-network = { version = "0.5", features = ["mqtt", "esp32s3", "embassy", "rt"] }
 
 # Wi-Fi + OTA on ESP32-C6
 rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "ota", "esp32c6", "embassy", "rt"] }
@@ -126,6 +130,45 @@ async fn net_task(mut runner: embassy_net::Runner<'static, Interface>) -> ! {
 ```
 
 The ESP32-C6 needs two heap regions (a 64 KiB `#[esp_hal::ram(reclaimed)]` region for the radio plus 36 KiB of DRAM); see `examples/hal_c6_connect_async_led.rs`.
+
+## Example: MQTT with LWT
+
+Condensed from `examples/hal_c6_mqtt_lwt.rs` (`hal_esp32s3_mqtt_lwt` is the S3 twin).
+The runner owns the `minimq` session and reconnects by itself; the handle is `Copy` and never blocks unless you call an `async` method.
+`MqttConfig`, `LwtConfig` and `QoS` are the same types as on the ESP-IDF tier (`juggler::mqtt`).
+
+```rust
+use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttConfig, MqttRunner, QoS, TryPublishError};
+
+let lwt = LwtConfig::new("knob/status", b"offline", QoS::AtLeastOnce, true);
+let config = MqttConfig::new("192.168.1.10", 1883, "knob-01").with_lwt(lwt);
+let (mqtt, runner) = MqttBuilder::new(config)
+    .with_startup_message("knob/status", b"online", QoS::AtLeastOnce, true)
+    .subscribe("knob/cmd", QoS::AtLeastOnce)
+    .build(stack)?;
+spawner.spawn(mqtt_task(runner).unwrap());
+
+loop {
+    match mqtt.try_publish("knob/pos", b"42") {
+        Ok(()) => {}
+        Err(TryPublishError::WouldBlock) => {}
+        Err(TryPublishError::Other(e)) => log::warn!("publish rejected: {}", e),
+    }
+    if let Some(msg) = mqtt.try_receive() {
+        log::info!("rx {} ({} bytes)", msg.topic, msg.payload.len());
+    }
+    Timer::after(Duration::from_secs(5)).await;
+}
+
+#[embassy_executor::task]
+async fn mqtt_task(runner: MqttRunner) -> ! {
+    runner.run().await
+}
+```
+
+Everything the builder keeps must be `'static`; the example builds its topics into `StaticCell`s.
+The broker host is an IPv4 literal (no DNS in v1), payloads are capped at 256 bytes, and all buffers are static — no heap use.
+The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md`.
 
 ## Example: Async SoftAP + Provisioning
 
