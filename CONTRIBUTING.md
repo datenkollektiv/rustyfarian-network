@@ -1,6 +1,6 @@
 # Contributing to rustyfarian-network
 
-Thanks for your interest in contributing!  
+Thanks for your interest in contributing!
 This project is maintained by the *rustyfarians* (Rust enthusiasts around datenkollektiv)
 and is meant to be **fun, practical, and hackable**.
 

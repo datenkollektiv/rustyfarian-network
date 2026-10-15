@@ -23,7 +23,7 @@
 
 After implementation, the diceroller firmware migrates from inline protocol handling to shared `CommandFrame` parsing.
 System commands are handled uniformly; module-specific commands use the same `CommandFrame` but only match tags `0x01–0xEF`.
-See `review-queue/espnow-peripheral-command-framework.md` "Consumer usage" section for the full code example.
+The full code example was part of the upstream request from the diceroller consumer and is not reproduced here.
 
 ## Motivation
 

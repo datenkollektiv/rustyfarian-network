@@ -5,7 +5,7 @@ desk-work: available
 
 # Feature: ESP32-S3 Wi-Fi, provisioning and OTA on the esp-hal tier v1
 
-Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (`review-queue/feature-request-esp-hal-network-esp32s3-wifi.md`).
+Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (filed 2026-10-13, contribution offered with CrowPanel validation hardware).
 
 ## Decisions
 

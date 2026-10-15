@@ -26,7 +26,7 @@ Verified against source, not a hunch.
 
 ## Linked Artefact
 - `crates/rustyfarian-esp-idf-network/src/mqtt/mod.rs` — `MqttBuilder::build` event loop, `Connected` arm.
-- Found by a downstream consumer and filed in `review-queue/rustyfarian-network-on-connect-enqueue-deadlock-v1.md`.
+- Found by a downstream consumer and filed as an upstream bug report (on-connect enqueue deadlock, 2026-09-27).
 
 ## Reproduction Confidence
 high
@@ -93,11 +93,11 @@ Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), 
 - Hardware re-check pending: `idf_c3_mqtt` (retained status now published from `on_connect`), `idf_c3_mqtt_button_oled`, one `with_startup_message()` user.
 
 ## Links
-- Source report: `review-queue/rustyfarian-network-on-connect-enqueue-deadlock-v1.md`.
+- Source report: upstream bug report from the downstream consumer (on-connect enqueue deadlock).
 - Related feature doc: `docs/features/archive/mqtt-publish-acked-v1.md` (introduced the `WrongThread` guard).
 
 ## Session Log
-- 2026-09-27 — Captured as a defect from the review-queue report, with the root cause checked against esp-idf-svc 0.53.0 and IDF v5.3.3 source.
+- 2026-09-27 — Captured as a defect from the upstream report, with the root cause checked against esp-idf-svc 0.53.0 and IDF v5.3.3 source.
 - 2026-09-27 — 0.5.x fix landed on `fix/mqtt-on-connect-deadlock` (helper-thread startup publish, `WrongThread` guard on all `MqttHandle` publish/subscribe methods, docs/examples/README/CHANGELOG/lore); review found the connect-time mutex cycle (documented, deferred); `just verify` and both MQTT example builds green; hardware checks pending, not closed.
 - 2026-09-27 — Second review found the connect-time mutex cycle reachable from any unguarded publish; `on_connect` moved onto the helper thread, `ConnectionEpoch` + `CallbackScope` added to juggler, examples publish the retained status from `on_connect` again; hardware checks still pending, not closed.
 - 2026-09-27 — Second code review round: `spawn_connect_thread` reports spawn failure so the event loop still confirms the epoch, `CallbackScope` made `!Send` / `#[must_use]` / depth-counted, stale helpers skip the prelude via `ConnectionEpoch::is_current`, stale rustdoc corrected; `just verify`, `just test-mqtt` (103 passed), and all four MQTT example builds green; hardware checks pending.

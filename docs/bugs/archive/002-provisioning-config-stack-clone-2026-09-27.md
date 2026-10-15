@@ -34,7 +34,7 @@ Verified against source, not a hunch.
 - `crates/rustyfarian-esp-idf-network/src/provisioning/mod.rs` — `wait_committed`, `wait_outcome`, `set_committed`.
 - `crates/rustyfarian-esp-idf-network/src/provisioning/boot.rs` — `run_wifi_mqtt_portal`.
 - `crates/juggler/src/provisioning/config.rs` — `ProvisioningConfig` layout.
-- Filed by a downstream consumer in `review-queue/rustyfarian-network-wait-committed-stack-clone.md` (now under `review-queue/archive/`).
+- Filed by a downstream consumer as an upstream bug report (`wait_committed` stack clone, 2026-09-27).
 
 ## Reproduction Confidence
 high
@@ -76,13 +76,13 @@ high
 Unassigned.
 
 ## Links
-- Source report: `review-queue/archive/rustyfarian-network-wait-committed-stack-clone.md`.
+- Source report: upstream bug report from the downstream consumer (`wait_committed` stack clone).
 - Related lore: `docs/project-lore.md` "SoftAP Provisioning".
 - Related ADR: `docs/adr/014-wifi-mqtt-provisioning-profile.md` (the profile whose optional groups and extras set the struct size).
 - Follow-up: `docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md` (secret scrubbing on drop, split out of this report).
 
 ## Session Log
-- 2026-09-27 — Captured as a defect from the review-queue report; both clone sites and the `run_wifi_mqtt_portal` call path verified against source, struct size estimated from the `heapless` bounds.
+- 2026-09-27 — Captured as a defect from the upstream report; both clone sites and the `run_wifi_mqtt_portal` call path verified against source, struct size estimated from the `heapless` bounds.
 - 2026-09-27 — Fix implemented on `scouting-2026-09-27`: `SessionWait::Committed` carries no payload, `wait_committed` moves the config out with `take()`, `set_committed` applies `ProvisioningState::Committed`, and `juggler::provisioning::resolve_wait` keys on the state alone (host test added first, red then green). Caller stack budget documented on `run_wifi_mqtt_portal` and `wait_committed`. Left open: hardware re-check on an 8 KB main task, and the separate `zeroize` follow-up.
 - 2026-09-27 — Secret-hygiene follow-up filed as bug 003; this report now covers the stack clone only. Still open pending the hardware re-check.
 - 2026-09-28 — Bench on an ESP32-C3 Super Mini with `idf_c3_provision_mqtt` and `CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000`: the pre-fix build (`4962f6a`) committed and restarted cleanly, so the example's shallow `main` cannot reproduce the overflow; a 6144-byte attempt was abandoned after the sdkconfig overlay was lost between terminal tabs.

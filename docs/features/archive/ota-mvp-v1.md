@@ -6,7 +6,7 @@ The feature is requested by `rustyfarian-ferriswheel-demo` (sibling repo) and al
 All public APIs are explicitly marked experimental; API stabilization is owned by the future `ota-library` feature.
 
 **Locked by:**
-- `review-queue/ota-mvp-three-crates.md` (feature request, submitted 2026-05-01)
+- Upstream "OTA MVP in three crates" feature request from `rustyfarian-ferriswheel-demo` (submitted 2026-05-01)
 - `docs/adr/011-ota-crate-hosting-and-transport.md` (Accepted; defines four critical decisions: in-workspace hosting, hand-rolled HTTP as internal transport, 1 MiB slots, rollback enabled + 30 s health criterion)
 
 **Also see:**
@@ -519,6 +519,6 @@ The four ADR 011 decisions fully constrain the design; consumer feature doc and 
 
 ## Session Log
 
-**2026-05-01** — Feature design doc created from `review-queue/ota-mvp-three-crates.md`, locked by ADR 011, beekeeper lift inventory completed. Four crates' public surface, Cargo.toml patterns, lift sources, HTTP strictness constraint, stage gates, and workspace integration all specified. Ready for Stage 1 implementation.
+**2026-05-01** — Feature design doc created from the upstream "OTA MVP in three crates" request, locked by ADR 011, beekeeper lift inventory completed. Four crates' public surface, Cargo.toml patterns, lift sources, HTTP strictness constraint, stage gates, and workspace integration all specified. Ready for Stage 1 implementation.
 
 **2026-05-05** — All three stages delivered on the `ota-mvp` branch (commits `b5a2445`, `9a55c0c`, plus PR-review follow-ups). Public surface matches the design above with two additions surfaced during implementation: `EspHalOtaManager::new(config, FLASH<'d>)` takes the FLASH peripheral (`esp-storage 0.9` consumes it at construction) instead of the zero-arg shape originally sketched, and `OtaError::DownloadFailed { status: 0 }` is reserved as a sentinel for protocol-shape rejections from the bare-metal HTTP client. PR-review follow-ups also tightened error-mapping (read-error → `ServerUnreachable`, early-EOF → `DownloadFailed { status: 0 }`, rollback-failure → `FlashWriteFailed`), added an internal `log::warn!` at the `HttpError` → `OtaError` boundary, and tagged all three crates as **experimental API** in CHANGELOG and README. `just verify`, `just test-ota` (37/37), `just test-ota-hal` (33/33) all green. Archived.
