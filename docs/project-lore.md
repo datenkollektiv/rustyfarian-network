@@ -106,12 +106,12 @@ Verify a config override actually took by grepping `out/sdkconfig` for the targe
 Switching sdkconfig variants needs a full CMake reconfigured; the release-only `rm -rf` is a no-op for the debug profile, so a `cargo check` after `just clean-idf` reuses the stale (wrong-variant) esp-idf-sys and can silently test the previous config.
 Fix for variant-switching check recipes: clean the package outright with `cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}` (profile-agnostic) before and after, rather than `just clean-idf`.
 A dedicated per-variant `--target-dir` looks cleaner (no cleans, cached re-runs) but each one carries a full ~1-2 GB esp-idf build tree, so a second IDF target dir overflows the sized RAM disk (`/Volumes/RustBuilds`, 8 GB) — the clean-in-place approach is what actually fits.
-Context: all three points here were found while building the STA-only `just check-sta-only` gate (see `docs/features/wifi-softap-cfg-gate-v1.md`).
+Context: all three points here were found while building the STA-only `just check-sta-only` gate (see `docs/features/archive/wifi-softap-cfg-gate-v1.md`).
 
 **A doctest in a `#[cfg(any(feature = "X", test))]`-gated module is silently NOT collected under `cargo test --no-default-features` — rustdoc does not set `cfg(test)`, so the module is invisible to the doc build.**
 Symptom: `Doc-tests <crate> … running 0 tests` even though you just added a `///`/`//!` example to that module, so a doctest "regression guard" never actually runs.
 Several tier modules are gated `#[cfg(any(feature = "<domain>", test))]` so their host-compilable parts run under `just test-<domain>-hal` (`cargo test --no-default-features`, which sets `cfg(test)`); the unit-test build sees the module but the separate rustdoc pass does not.
-Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test] fn … }` (present under `cfg(test)`), not a doctest — see the `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs` and `docs/features/ota-domain-reexport-parity-v1.md`.
+Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test] fn … }` (present under `cfg(test)`), not a doctest — see the `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs` and `docs/features/archive/ota-domain-reexport-parity-v1.md`.
 (A bare `pub use` also does not catch an *omitted* re-export: the tier crate still compiles; only a consumer-style `use` of the missing name fails, which is what the guard test provides.)
 
 **A shell export (e.g. a direnv `.envrc`) silently overrides the same key in `.env` for every `just` build.**
@@ -165,13 +165,10 @@ Fix: enable `features = ["embedded-storage"]` on `esp-storage` for provisioning 
 Symptom: `E0599 no method named set_color` on a `Ws2812Rmt` from `pennant 0.6` when a consumer imports `pennant 0.7::StatusLed`.
 Fix: keep tier crates on matching `pennant` versions; diagnose with `cargo tree -i pennant`.
 
-
 **`esp-radio 0.18` deleted the `smoltcp` feature and the `smoltcp::phy::Device` impl on `WifiDevice` — the bare-metal Wi-Fi controller is now async-only and tied to `embassy-net`.**
 The 0.17 `smoltcp` Cargo feature is gone; the `wifi` feature now pulls `embassy-net-driver` instead.
 Any blocking poll loop that drove `smoltcp::iface::Interface` directly off `WifiDevice` (the `WiFiManager::wait_connected` + DHCP path used in the network workspace before the upgrade) has no equivalent in 0.18 — the option is to drop the sync surface and route everything through `embassy-net`.
 Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 'smoltcp' has been removed (#4870)`) and verified by grep against the unpacked source: zero `smoltcp` references in `wifi/mod.rs`, only `impl Driver for Interface<'_>` (`embassy_net_driver::Driver`) remains.
-
-**The `esp-radio 0.18` STA + AP-mode API rename maps live in `docs/features/archive/esp-hal-stack-upgrade-april-2026-v1.md`** ("esp-radio 0.18 API rename reference") — the 0.17→0.18 migration is complete, so they are historical reference, not active lore.
 
 **`embassy-sync = =0.8.0` is a workspace-wide lock set by `esp-rtos 0.3.0`; many published async networking crates (incl. the `edge-net 0.7.x` family) still target `embassy-sync 0.7.2` and cannot coexist.**
 Cargo only allows one version of `embassy-sync` in the graph because the trait surface (`Mutex`, `Signal`, `CriticalSection`) is API-incompatible across the 0.7 → 0.8 boundary, and downgrading the workspace pin would break every other embassy-using crate.
@@ -251,10 +248,13 @@ Fix: normalise the directory before globbing (absolute stays as-is, relative get
 The re-check is fatal only on `xtensa-*` targets, where the bundled bootloader is genuinely incompatible; on RISC-V it warns and lets `flash.sh` fall through, matching the `c6` path that has always relied on the bundled bootloader.
 
 **The IDF-built v5.3.3 bootloader successfully boots bare-metal esp-hal images — verified 2026-09-26 on both RISC-V and Xtensa.**
-With the `$PWD/`-prefix cache fix in place, `just run hal_c3_connect_async_led` flashed an esp-hal 1.2.2 bare-metal binary together with the IDF v5.3.3 bootloader (harvested from an IDF example build) and it booted cleanly on ESP32-C3 (RISC-V): serial output shows `boot: ESP-IDF v5.3.3 2nd stage bootloader`, followed by Wi-Fi and DHCP coming up normally. The same workaround (`espflash flash --bootloader <path> --ignore-app-descriptor`) boots an `esp-bootloader-esp-idf 0.6` bare-metal image on Heltec WiFi LoRa 32 V3 (Xtensa ESP32-S3), validating the app-descriptor compat fix on both architecture families. This upgrades a previously-stated assumption ("the v5.3.3 bootloader is believed to work for both IDF and bare-metal binaries") into a tested fact across targets.
+With the `$PWD/`-prefix cache fix in place, `just run hal_c3_connect_async_led` flashed an esp-hal 1.2.2 bare-metal binary together with the IDF v5.3.3 bootloader (harvested from an IDF example build) and it booted cleanly on ESP32-C3 (RISC-V): serial output shows `boot: ESP-IDF v5.3.3 2nd stage bootloader`, followed by Wi-Fi and DHCP coming up normally.
+The same workaround (`espflash flash --bootloader <path> --ignore-app-descriptor`) boots an `esp-bootloader-esp-idf 0.6` bare-metal image on Heltec WiFi LoRa 32 V3 (Xtensa ESP32-S3), validating the app-descriptor compat fix on both architecture families.
 
 **The harvested bootloader is cached inside the RAM-disk target dir and does not survive reboot or detach — first bare-metal flash afterwards rebuilds the full IDF example (~1m26s) just to re-harvest the ~26 KB `bootloader.bin`.**
-The bottleneck is not the harvest operation itself (~12 s warm cache), but the full ESP-IDF CMake build that precedes it when the cache is cold. A future improvement (not yet implemented) would copy the harvested `bootloader.bin` to a persistent cache outside the RAM disk, keyed by chip and IDF version, so a reboot or `just ramdisk detach` followed by another bare-metal flash would reuse the file instead of triggering a full rebuild. Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
+The bottleneck is not the harvest operation itself (~12 s warm cache), but the full ESP-IDF CMake build that precedes it when the cache is cold.
+A future improvement (not yet implemented) would copy the harvested `bootloader.bin` to a persistent cache outside the RAM disk, keyed by chip and IDF version, so a reboot or `just ramdisk detach` followed by another bare-metal flash would reuse the file instead of triggering a full rebuild.
+Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
 
 ---
 
@@ -326,6 +326,7 @@ visible to the polling loop, `nb_device::Event::RadioEvent` is never generated.
 Symptom: radio operations appear to hang; no downlinks are ever processed even with strong RF signal.
 Fix: configure DIO1 as an input with a rising-edge interrupt; store a flag (e.g. `AtomicBool`)
 that the `process()` loop checks on every tick.
+On ESP-IDF, `PinDriver` interrupts are one-shot, so poll `get_irq_status()` instead — see "LoRaWAN OTAA Join" below.
 
 **BUSY pin isn’t handled → all SX1262 SPI commands time out.**
 The SX1262 asserts BUSY high during internal processing, and any SPI command issued while BUSY is high
@@ -411,7 +412,6 @@ Both sites in this workspace use a `OnceLock<String>` filled from `std::collecti
 **A test that compares the fixture against a request body is not a blocker** — build the body at runtime too.
 The `nonce_matches` test formats both bodies with `alloc::format!("_nonce={}&...")`, and `test_nonce_mismatch()` returns the bitwise complement so the mismatch assertion cannot flake on an unlucky draw.
 What such a test verifies is match-versus-mismatch behaviour, not any particular value, so nothing is lost.
-An earlier revision of this entry claimed this case required dismissal; that was too pessimistic.
 
 Dismissal ("Used in tests" in the code scanning UI) remains valid where a fixture genuinely pins an externally-fixed value, but prefer generation.
 Path-based exclusion via a CodeQL config is not an option for fixtures in inline `#[cfg(test)]` modules, since ignoring the file would also drop the production code in it from analysis.
@@ -429,6 +429,8 @@ Two further mechanics that wasted time:
 alerts on `/security/code-scanning` are per-branch and reflect the **default branch**, so nothing closes until the change merges to `main` and the push-triggered scan reruns;
 and the alert list is not public — reading it needs repo write access plus `security-events`, so a fix cannot be targeted from a clone alone.
 Always read the real alert locations before editing; both failed attempts guessed at them.
+
+---
 
 ## OTA MVP — Three-Crate Triad
 
@@ -448,10 +450,6 @@ Any wrapper crate must expose this peripheral in its public constructor or store
 Calling `FlashStorage::new()` more than once per boot panics.
 Surface: `crates/rustyfarian-esp-hal-network/src/ota/manager.rs`.
 
-**`embassy-net::TcpSocket` does not implement `embedded_io_async::Write`.**
-Use the inherent `socket.write(&buf).await` method directly in a partial-write-safe loop.
-Trying to import `embedded_io_async::Write` and call `.write_all()` on a `TcpSocket` fails to compile with "trait not implemented".
-
 **Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon.**
 `u64::from_str` accepts a leading `+`, but RFC 7230 §3.3.2 requires `1*DIGIT` (no sign).
 A permissive parser paired with a stricter upstream cache becomes a request-smuggling primitive.
@@ -463,6 +461,8 @@ Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS 
 Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
 The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
 See `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs::url_for_log`.
+
+---
 
 ## OTA Consumer Runtime
 
@@ -495,6 +495,8 @@ Lesson: never let an id that is still referenced (in any stored record) be reiss
 The partition erase after `downloading` stalls the chip for about 6.5 s (until `OTA write session started`), so a status published just before it is resent and the broker forwards the duplicate.
 Found in runbook P12 (2026-10-07): six `repair` commands during the erase gave six `busy` plus one dropped rejection; the same burst after the erase gave exactly six plus none, and a probe showed the broker does not upgrade QoS 0 publishes.
 Consequence: count rejections only outside the erase window, and treat every status as at-least-once — deduplicate `rolled_back` by `epoch` and `attempt_id`; see `docs/runbooks/ota-hardware-test.md` P12.
+
+---
 
 ## ESP-NOW
 
@@ -616,7 +618,11 @@ Em-dashes (`—`), `×`, `==`, `..`, `/`, and parentheses render fine.
 Fix: catch these locally via `just lint-docs`, which runs `scripts/lint-docs.sh` to parse every fenced ```mermaid block in every `*.md` file through `mermaid-cli` (`mmdc` via `npx`).
 The check is not folded into `just verify` or `just ci` because it pulls a Node toolchain on first run — invoke it explicitly when touching `docs/ROADMAP.md` or any other diagram-bearing markdown.
 
-**`mmdc`-vs-IDE renderer divergence.** `mmdc` (the `mermaid-cli` `just lint-docs` invokes) has been observed accepting bare `:` strings (e.g. `store.rs:141`) that the IDE's Mermaid preview renderer rejects with the same `'INVALID'` parse error documented above. The IDE typically ships a newer Mermaid runtime than `npx mermaid-cli` resolves, and its parser is stricter on the colon rule. Treat a clean `just lint-docs` as a necessary but not sufficient signal — always visually verify the rendered diagram in the IDE after editing any `timeline` / `gantt` event text. The `technical-writer` agent in `.claude/agents/technical-writer.md` encodes this divergence and is the mandated delegate for any non-trivial `docs/ROADMAP.md` edit.
+**`mmdc`-vs-IDE renderer divergence.**
+`mmdc` (the `mermaid-cli` `just lint-docs` invokes) has been observed accepting bare `:` strings (e.g. `store.rs:141`) that the IDE's Mermaid preview renderer rejects with the same `'INVALID'` parse error documented above.
+The IDE typically ships a newer Mermaid runtime than `npx mermaid-cli` resolves, and its parser is stricter on the colon rule.
+Treat a clean `just lint-docs` as a necessary but not sufficient signal — always visually verify the rendered diagram in the IDE after editing any `timeline` / `gantt` event text.
+The `technical-writer` agent in `.claude/agents/technical-writer.md` encodes this divergence and is the mandated delegate for any non-trivial `docs/ROADMAP.md` edit.
 
 ---
 

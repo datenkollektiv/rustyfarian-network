@@ -22,7 +22,7 @@ Domain features are feature-gated per crate:
 
 - `juggler` is the consolidated platform-independent crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`, plus `mock` and `std`.
 - `rustyfarian-esp-idf-network` is the consolidated ESP-IDF crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`.
-- `rustyfarian-esp-hal-network` is the consolidated bare-metal crate with feature-gated domains `wifi`, `lora`, `ota`, and `provisioning`.
+- `rustyfarian-esp-hal-network` is the consolidated bare-metal crate with feature-gated domains `wifi`, `mqtt`, `lora`, `ota`, and `provisioning`.
 - `rustyfarian-esp-hal-network` also carries chip features: `esp32`, `esp32c3`, `esp32c6`, `esp32s3`.
 
 The pure tier (`juggler`) contains validation, types, traits, state machines, and timing math — all host-testable, no hardware dependencies.
@@ -36,7 +36,7 @@ All build, test, lint, and flash operations go through `just` recipes — never 
 just setup                 # idempotent: create .cargo/config.toml if missing, install ESP toolchain via espup, run doctor
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
-just clippy-hal            # clippy the bare-metal crate on its own C3/C6 targets (not in verify)
+just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets (not in verify)
 just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
 just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
 just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify)
@@ -49,7 +49,7 @@ just run <name>            # flash + serial monitor
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.
 `just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
-`just verify` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac` before committing changes to it.
+`just verify` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac`/`xtensa-esp32s3` before committing changes to it.
 The pure tier (`juggler`) iterates fast without the ESP toolchain — see `just test` (all tests), or target specific domains via `-p juggler --features wifi,mock` etc.
 Bare-metal and ESP-IDF builds are isolated into `target/hal` and `target/idf` (host/IDE builds use `target/ide`); this routing is automatic.
 On macOS, `just ramdisk attach` optionally backs those directories with a RAM disk for faster builds, and `just doctor` reports the resolved target dirs and RAM disk status.

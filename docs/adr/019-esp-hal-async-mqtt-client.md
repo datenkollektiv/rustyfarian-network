@@ -117,7 +117,7 @@ Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, pe
 ## References
 
 - `docs/features/esp-hal-mqtt-v1.md` — feature doc and sign-off anchor.
-- `review-queue/feature-request-esp-hal-mqtt-esp32s3.md` — knob request U2b (S3 as first-class chip).
+- Upstream request U2b from the `rustyfarian-knob` esp-hal parity quest (filed 2026-10-14, S3 as a first-class chip, knob as a consumer).
 - [ADR 015](015-esp-hal-provisioning.md) — bare-metal estate constraints and the hand-rolled fallback rule.
 - [ADR 017](017-mqtt-callback-threading-contract.md) — IDF-tier callback contract this ADR deliberately does not port.
 - `docs/project-lore.md` § "esp-hal Bare-Metal Stack", § "MQTT Event Loop".
