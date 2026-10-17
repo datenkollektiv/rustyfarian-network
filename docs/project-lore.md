@@ -141,6 +141,7 @@ Found 2026-10-14 while resolving ADR 019 on `tmp/adr-mqtt-resolve`; `cargo tree 
 **Hand `minimq::Session::connect` a `&mut TcpSocket`, never the socket by value — a failed or cancelled handshake drops the transport.**
 `Session::connect(io)` takes ownership and drops `io` on failure; with a `TcpSocket<'static>` built on `StaticCell` buffers that leaks the buffers for the rest of the boot.
 `embedded-io-async` has blanket `Read`/`Write` impls for `&mut T`, so `session.connect(&mut socket)` satisfies minimq's `Io` bound and the socket survives; `socket.abort()` then `socket.flush().await` returns it to CLOSED for the next attempt (embassy-net `tcp.rs` `abort()` docs).
+That post-abort `flush()` only completes once the RST is emitted, so skip it while the network is down and bound it while up (see the Wi-Fi-outage entry below).
 The runner in `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs` is the reference.
 
 **`riscv32imc` (ESP32-C3) has no atomic read-modify-write: `AtomicU32::fetch_add` is `E0599: no method named fetch_add` on the C3 target only, while the C6 (`imac`) build passes.**
@@ -149,6 +150,12 @@ Always run the C3 line of `just clippy-hal`, not just the C6 one.
 
 **Bare-metal MQTT (`minimq`) costs ~150 B of heap on the ESP32-S3: free heap 25 928 B with Wi-Fi + MQTT connected versus 26 076 B with Wi-Fi alone, flat over a 10-minute soak with a broker restart (2026-10-14, CrowPanel).**
 All client memory is `StaticCell` `.bss` (~8 KiB: minimq 1 KiB RX + 2 KiB TX, TCP 2 × 1536 B, two 4-deep queues), so the knob's "does it fit beside Wi-Fi" question is answered by construction; see `docs/runbooks/esp-hal-mqtt-hardware-test.md` for the measurement procedure.
+
+**A bare-metal `minimq` session stays `Connected` through a whole Wi-Fi outage because `embassy-net` `TcpSocket::flush()` waits for the peer's ACK, which never comes on a dead path.**
+Every `poll()`/`publish()`/PINGREQ path in `minimq 0.13.5` ends in a socket write plus flush, and its 5 s PINGRESP timeout is checked only around socket reads (`session/drive.rs`), so the runner parks inside `flush()` and never updates the state; smoltcp retransmits without a cap unless `TcpSocket::set_timeout` is set, and even then it clears the socket tuple only after the RST is emitted, so a post-abort `flush()` hangs too while the link is down.
+Seen on the CrowPanel S3 2026-10-16 (request in `review-queue/feature-request-esp-hal-mqtt-wifi-loss-findings.md`): state `Connected` for 3 min 7 s, five `try_publish` calls accepted after the drop, recovery 22 s after link-up via `Transport(ConnectionReset)`.
+Fix in `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs`: a polled `is_link_up() && is_config_up()` watch (500 ms, never `Stack::wait_*` — the stack has one state waker and consumer tasks use it) races `serve()`, `set_timeout(1.5 × keep-alive)` on the socket, and a `with_deadline` stall bound of socket timeout + keep-alive around every session await; `try_publish` `Ok` means queued, not delivered.
+Hardware re-run (runbook T5a/T5b) by the knob maintainer still pending as of 2026-10-17; ADR 019 amendment 2026-10-16 has the details.
 
 **ESP32-S3 bare-metal Wi-Fi runs on the same single 72 KiB internal heap as the C3 — no PSRAM region needed.**
 `esp-radio` and `esp-rtos` allocate only via `malloc_internal` / `InternalMemory`, so a PSRAM `esp-alloc` region could never serve Wi-Fi buffers anyway; add PSRAM only for application data.

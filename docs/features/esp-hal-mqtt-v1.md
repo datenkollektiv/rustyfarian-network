@@ -51,6 +51,7 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 |                 `minimq =0.13.5` (ADR 019) | Managed session, no alloc, binds the pinned `embassy-time`/`embedded-io-async`         | `rust-mqtt` (no connection mgmt), hand-roll |
 | `esp32s3` in every `mqtt` arm from day one | Knob (U2b) ships S3 in lockstep; S3 Wi-Fi is validated on `main`                       | Add S3 after C6 validation                  |
 |     Static `StaticCell` buffers, zero heap | S3 keeps ~26 KB heap after Wi-Fi; esp-radio allocates internal-only                    | Heap-allocated queues                       |
+| Network watch (polled 500 ms) + socket timeout 1.5 × keep-alive + stall deadline of socket timeout + keep-alive; queue kept across reconnect (2026-10-16) | T5 found the runner parked in `TcpSocket::flush`; one `Stack` waker slot forbids `wait_*` in the runner | Socket timeout only; `Stack::wait_link_down`; drain the queue on session end |
 
 ## Constraints
 - `embassy-sync` is locked at `=0.8.0` (`docs/project-lore.md:150`); most published async networking crates target 0.7.x.
@@ -65,18 +66,21 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 - [x] Event delivery: `embassy-sync` channels plus an atomic state (ADR 019 §3).
 - [x] Does the client allocate? No — caller-provided buffers, all `StaticCell` (knob question).
 - [x] S3 main-task stack needs no tuning: 13-minute run with broker restart, heap flat at 25 928 B (2026-10-14).
-- [ ] T3 (USB power cut → LWT) and T5 (AP off → `WouldBlock`, no panic) still to run by hand on the CrowPanel.
+- [x] T3 (USB power cut → LWT): pass on the CrowPanel 2026-10-16, `status offline` 45–51 s after the cut.
+- [ ] T5 (Wi-Fi loss): the 2026-10-16 run exposed three findings (state stayed `Connected`, `queued` publishes lost, 22 s TCP-reset recovery); fixed (unreleased), re-run by the knob maintainer pending (T5a AP off + T5b router pause).
 - [ ] Should this land after `esp-hal-espnow-v1.md` so STA + ESP-NOW + MQTT coexistence is validated once?
 
 ## State
 - [x] Design approved (ADR 019 accepted 2026-10-14)
 - [x] Core implementation (`mqtt` feature, `minimq` runner, C3/C6/S3 arms, two examples)
-- [x] Tests passing (`just test-hal` 189 host tests, `just clippy-hal` 14 targets)
+- [x] Tests passing (`just test-hal` 192 host tests, `just clippy-hal` 14 targets)
 - [x] Documentation updated (ADR 019, README, CHANGELOG, runbook `docs/runbooks/esp-hal-mqtt-hardware-test.md`)
-- [x] S3 hardware: T1, T2, T4, T6 pass (CrowPanel, 2026-10-14); T3/T5 pending
+- [x] S3 hardware: T1, T2, T3, T4, T6 pass (CrowPanel, 2026-10-14/16); T5 re-run with the network-loss fix pending
+- [ ] Knob maintainer re-run of T5a/T5b with timestamped serial and broker logs against the fix
 - [ ] C6 hardware: build + clippy only; validation with the rgb-puzzle consumer
 
 ## Session Log
 - 2026-10-12 — Feature doc created from the rgb-puzzle brain esp-hal variant gap analysis; expands the long-term roadmap line into a request.
 - 2026-10-14 — Folded knob request U2b (third consumer, `esp32s3`, S3 example); ADR 019 drafted, awaiting approval.
 - 2026-10-14 — ADR 019 accepted (minimq, IPv4-only); feature implemented; S3 T1/T2/T4/T6 pass, heap 25 928 B after connect and after a 10-min soak.
+- 2026-10-16 — Knob maintainer ran T1/T3/T5 on the CrowPanel (`d9e3b62`); T5 found the client stuck `Connected` through a 3 min Wi-Fi outage because `TcpSocket::flush` waits for a peer ACK that never comes and minimq's ping timeout never runs inside a flush; fix: a polled network watch (link + IP config, 500 ms) races the session, `Disconnected` is set before the socket abort, the post-abort flush is bounded, the network-lost path waits for the network instead of the 10 s pause, the socket gets a 1.5 × keep-alive timeout, and every session await is bounded by a stall deadline of socket timeout + keep-alive (outcome `transport stalled`) for a dead host whose TCP reset cannot be routed; `try_publish` now documents queued-not-delivered (unacknowledged in-flight messages are lost, one at most on a network drop); runbook T5 split into AP-off and router-pause variants.
