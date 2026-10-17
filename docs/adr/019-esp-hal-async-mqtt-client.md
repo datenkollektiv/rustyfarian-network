@@ -51,10 +51,14 @@ Enabling it later is additive (`Stack::dns_query` already short-circuits literal
 
 A single `mqtt_runner` task owns the `minimq::Session`, the socket and all buffers.
 It loops: resolve → TCP connect (bounded by `connection_timeout_ms`) → `Session::connect` → on `ConnectEvent::Connected` publish the configured startup message and every builder subscription → drive `Connection::poll()` in a `select` with the publish queue → on any error drop the connection, mark disconnected, wait `reconnect_timeout_ms` (default 10 s, matching the IDF tier), repeat.
+A network watch polls `Stack::is_link_up() && is_config_up()` every 500 ms and races the whole session; when it fires the runner marks disconnected at once, aborts the socket and waits for the network instead of the pause.
+The runner cannot rely on minimq's own 5 s ping timeout: it is checked only around socket reads, and a `TcpSocket::flush` that waits for a peer ACK on a dead path parks `poll()` for good (hardware finding 2026-10-16); the socket therefore carries a transport timeout of 1.5 × keep-alive.
+Because `embassy-net` `flush()` pends on the RST and smoltcp keeps the tuple until it is emitted, every session await is also bounded by a runner-side stall deadline of socket timeout + keep-alive (75 s by default), ending with outcome `transport stalled`.
 Sessions use the default clean start (`session_expiry_interval = 0`), so every connect is `Connected` and resubscribes; broker-side session resumption is out of scope.
 
 Application code talks to the runner through `embassy-sync 0.8` primitives on a `'static` state block:
-- `MqttHandle::try_publish*` pushes onto a bounded publish `Channel`; a full queue or a disconnected session returns `TryPublishError::WouldBlock`.
+- `MqttHandle::try_publish*` pushes onto a bounded publish `Channel`; a full queue or a session that is not `Connected` returns `TryPublishError::WouldBlock`.
+  `Ok(())` is queue acceptance, not delivery; the 2026-10-16 amendment below states the delivery rule once.
 - `MqttHandle::publish*` awaits queue space; `MqttHandle::receive().await` / `try_receive()` take owned inbound messages from a bounded channel that drops the oldest on overflow.
 - `MqttHandle::state()` reads an atomic `MqttConnectionState`; `wait_connected().await` uses a `Signal`.
 
@@ -92,6 +96,17 @@ Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, pe
 - `minimq 0.13` is young; each patch bump needs a re-run of the hardware script until a 1.0 lands.
 - Fixed queue sizes mean large payloads (> 256 B) are rejected with `TryPublishError::Other` in v1.
 - IPv4-literal broker addresses only; a consumer that ships a hostname in `MQTT_HOST` must resolve it elsewhere or wait for the DNS follow-up.
+- `try_publish` is best-effort across a connection loss (clean start, `session_expiry_interval = 0`); the amendment below states which messages survive.
+- The runner's network watch polls every 500 ms instead of awaiting the stack, because `embassy-net` keeps a single state waker; the watch costs one timer wake per 500 ms for the whole uptime, which a battery consumer must weigh against the 0.5 s detection bound; after an unflushed `abort()` the net task busy-polls cooperatively until the RST can be routed or the next `connect()` resets the socket.
+- The stall deadline assumes the broker does not assign a CONNACK Server Keep Alive above the configured keep-alive (or 0, which disables the ping); `minimq` adopts that value without exposing it, so such a broker causes periodic `transport stalled` reconnects with an LWT on a working link, while mosquitto only ever lowers it.
+
+## Amendment 2026-10-16 — Network loss and delivery semantics
+
+Hardware test T5 on the CrowPanel S3 (`d9e3b62`) kept the client `Connected` through a 3 min 7 s Wi-Fi outage, accepted five `try_publish` calls after the drop, lost three of them (ticks 46–48), and recovered 32 s after link-up only through a `Transport(ConnectionReset)`.
+Root cause: every `minimq 0.13.5` poll or publish ends in `TcpSocket::flush`, which waits for a peer ACK; no socket timeout was set and nothing watched the network.
+Change: a polled network watch (link and IP configuration, 500 ms) races the session, `Disconnected` is published before the socket abort, the post-abort flush is skipped while the network is down and bounded by 1 s while it is up, the network-lost path waits for the network instead of `reconnect_timeout_ms`, the socket carries a transport timeout of `max(1.5 × keep-alive, keep-alive + 5 s)`, and every session await is bounded by a stall deadline of socket timeout + keep-alive (outcome `transport stalled`).
+The socket timeout (45 s by default) covers a silent broker whose TCP reset can be routed, the stall deadline (75 s by default) a dead LAN host whose reset cannot; either way the session ends within roughly 2.5 × keep-alive of the broker's last packet, and a network loss ends it within about 0.5 s of esp-radio reporting the station down.
+Non-goal: the HAL tier does not replay unacknowledged in-flight QoS 1 publishes across a clean-start reconnect (one at most is lost when the network drops, more if the broker itself dies); queue entries are kept and sent in order after the next connect.
 
 ## Alternatives Considered
 
@@ -106,10 +121,11 @@ Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, pe
 - `tmp/adr-mqtt-resolve/Cargo.lock`: `minimq 0.13.5` and `rust-mqtt 0.6.0` lock next to `esp-hal 1.2.2`, `esp-radio 1.0.0-beta.1`, `esp-rtos 0.4.0`, `embassy-net 0.8.0` (`dns` on), `embassy-sync 0.8.0`; `cargo check --target riscv32imc-unknown-none-elf -Zbuild-std=core,alloc` type-checks both clients.
 - `minimq-0.13.5/Cargo.toml`: deps `embassy-time ^0.5.1`, `embedded-io-async ^0.7`, `heapless ^0.9.1`, `num_enum`, `serde`, `thiserror 2`; `license = "MIT"`; `rust-version = 1.88`.
 - `minimq-0.13.5/src`: no `alloc::`/`Box`/`Vec` outside `heapless` (`grep`); `README.md` "no_std, no-alloc, async MQTT 5 client".
-- `minimq-0.13.5/src/mqtt_client/session/drive.rs:139`: `poll()` is cancel-safe given a cancel-safe transport; `operations.rs:160`: QoS 1/2 publishes cancel-safe, QoS 0 is not — the runner finishes each publish before re-entering `select`.
+- `minimq-0.13.5/src/mqtt_client/session/drive.rs:139`: `poll()` is cancel-safe given a cancel-safe transport; `operations.rs:160`: QoS 1/2 publishes cancel-safe, QoS 0 is not — the runner finishes each publish before re-entering `select`; the network watch and the stall deadline are the only places a publish may be cancelled — the transport is aborted next and `Session::connect` resets the outbound state (handshake.rs:34-38).
 - `minimq-0.13.5/src/lib.rs:176`: `Error::NotReady` when the TX arena is full; `src/will.rs:34-58`: `Will::new(topic, data, props).retained().qos(..)`; `src/config.rs:112,132`: `auth`, `keepalive_interval`.
 - `rust-mqtt-0.6.0/README.md`: "does not implement opinionated connection management — automatic reconnects, keepalive loops, retry policies, or background tasks are intentionally left to the user"; "only MQTT version 5.0 is supported".
 - `embassy-net-0.8.0/Cargo.toml:462-467`: `embassy-sync 0.7.2`, `embedded-io-async 0.7.0`; `src/tcp.rs:712,724`: `Read`/`Write` impls for `TcpSocket`.
+- `embassy-net-0.8.0/src/tcp.rs:336-340`: `flush()` waits for the remote ACK; `src/lib.rs:275,493`: one `state_waker` shared by every `Stack::wait_*`; `smoltcp-0.12.0/src/socket/tcp.rs:1170-1175, 2258-2267`: the timeout counts from the first send into an empty TX buffer.
 - `esp-radio-1.0.0-beta.1/src/compat/malloc.rs`, `esp-rtos-0.4.0/src/lib.rs:172`: radio and scheduler allocate via `malloc_internal` / `InternalMemory` only.
 
 </details>

@@ -13,9 +13,24 @@
 //! * A startup message (typically a retained `online` flag) published on every
 //!   (re)connect via [`MqttBuilder::with_startup_message`].
 //! * Builder subscriptions re-issued after every reconnect.
-//! * Auto-reconnect at [`MqttConfig::reconnect_timeout_ms`] (default 10 s).
+//! * Auto-reconnect at [`MqttConfig::reconnect_timeout_ms`] (default 10 s) after a
+//!   session error. A network watch polls the stack every 500 ms and ends the session
+//!   as soon as the Wi-Fi link or the IP configuration is gone; the runner then waits
+//!   for the network instead of the reconnect pause (the ESP-IDF tier retries on the
+//!   pause regardless of link state). While the network is up, a transport timeout of
+//!   1.5 × keep-alive (45 s by default) covers a silent broker whose TCP reset can be
+//!   routed, and a runner-side stall deadline of socket timeout + keep-alive (75 s by
+//!   default) covers a dead LAN host whose reset cannot; either way a silent broker
+//!   ends the session within roughly 2.5 × keep-alive of its last packet.
 //! * [`MqttHandle::try_publish`] never blocks and reports
-//!   [`TryPublishError::WouldBlock`] while the session is down or the queue is full.
+//!   [`TryPublishError::WouldBlock`] while the session is not `Connected` or the
+//!   queue is full. `Ok(())` means accepted into the [`PUBLISH_QUEUE_DEPTH`]-slot
+//!   runner queue; queue entries survive a reconnect and go out in order, messages
+//!   already handed to the session but not yet acknowledged by the broker do not (one
+//!   at most when the network drops, more if the broker itself dies) — QoS 1 is
+//!   at-least-once within one broker session only. [`MqttHandle::publish_with`]
+//!   skips the state check, so it can enqueue while disconnected; those messages go
+//!   out after the next connect.
 //!
 //! Limitations in v1: the broker host must be an IPv4 literal, publishes are
 //! QoS 0/1, subscriptions are fixed at build time, and payloads are capped at
@@ -110,6 +125,7 @@ impl core::error::Error for MqttError {}
 ///
 /// `WouldBlock` means "retry next tick": the session is not connected or the
 /// publish queue is full. `Other` carries a [`MqttError`] that retrying will not fix.
+/// A successful call only means the message entered the runner queue; see the module docs for the delivery rule.
 pub type TryPublishError = juggler::mqtt::TryPublishError<MqttError>;
 
 /// An inbound publish, copied out of the client's packet buffer.
@@ -194,6 +210,38 @@ pub(crate) fn validate_config(config: &MqttConfig<'_>) -> Result<(), MqttError> 
         ));
     }
     Ok(())
+}
+
+/// Transport timeout handed to `TcpSocket::set_timeout`, derived from the keep-alive.
+///
+/// 1.5 × keep-alive mirrors the broker's LWT rule, floored at keep-alive + 5 s so a
+/// short keep-alive still leaves `minimq` its own 5 s PINGRESP tolerance.
+/// smoltcp counts it from the peer's last packet, or from the first send into an
+/// empty TX buffer; TCP ACKs and PINGRESPs refresh it, so a live path never trips it.
+pub(crate) const fn socket_timeout_ms(keep_alive_secs: u64) -> u64 {
+    let scaled = keep_alive_secs.saturating_mul(1_500);
+    let floor = keep_alive_secs.saturating_mul(1_000).saturating_add(5_000);
+    if scaled > floor {
+        scaled
+    } else {
+        floor
+    }
+}
+
+/// Runner-side deadline for one session await (`poll`, `publish`, `subscribe`).
+///
+/// The socket timeout alone cannot end a session whose TCP RST has no route (a dead
+/// LAN host whose ARP entry expired): smoltcp keeps the socket tuple until the RST is
+/// emitted, and `embassy-net`'s `flush()` pends on it, so `minimq` never returns.
+/// A healthy session returns from `poll()` at least every keep-alive (a queued
+/// PINGREQ counts as progress), so socket timeout + keep-alive never fires on a live path.
+///
+/// This assumes the broker does not assign a CONNACK Server Keep Alive above the
+/// configured keep-alive (or 0, which disables the ping): `minimq` adopts that value
+/// and the runner cannot read it, so such a broker causes periodic `transport stalled`
+/// reconnects with an LWT on a working link; mosquitto only ever lowers it.
+pub(crate) const fn stall_timeout_ms(keep_alive_secs: u64) -> u64 {
+    socket_timeout_ms(keep_alive_secs).saturating_add(keep_alive_secs.saturating_mul(1_000))
 }
 
 /// Connection state as a `u8` for the runner's atomic, and back.
@@ -328,5 +376,29 @@ mod tests {
         ));
         let w: TryPublishError = TryPublishError::WouldBlock;
         assert!(matches!(w, TryPublishError::WouldBlock));
+    }
+
+    #[test]
+    fn socket_timeout_is_one_and_a_half_keep_alive() {
+        assert_eq!(socket_timeout_ms(30), 45_000);
+        assert_eq!(socket_timeout_ms(60), 90_000);
+        assert_eq!(socket_timeout_ms(DEFAULT_KEEP_ALIVE_SECS), 45_000);
+    }
+
+    #[test]
+    fn socket_timeout_floors_at_keep_alive_plus_ping_tolerance() {
+        assert_eq!(socket_timeout_ms(1), 6_000);
+        assert_eq!(socket_timeout_ms(9), 14_000);
+        assert_eq!(socket_timeout_ms(10), 15_000);
+        assert_eq!(socket_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn stall_timeout_is_socket_timeout_plus_keep_alive() {
+        assert_eq!(stall_timeout_ms(30), 75_000);
+        assert_eq!(stall_timeout_ms(60), 150_000);
+        assert_eq!(stall_timeout_ms(1), 7_000);
+        assert_eq!(stall_timeout_ms(DEFAULT_KEEP_ALIVE_SECS), 75_000);
+        assert_eq!(stall_timeout_ms(u64::MAX), u64::MAX);
     }
 }

@@ -137,6 +137,9 @@ Condensed from `examples/hal_c6_mqtt_lwt.rs` (`hal_esp32s3_mqtt_lwt` is the S3 t
 The runner owns the `minimq` session and reconnects by itself; the handle is `Copy` and never blocks unless you call an `async` method.
 `MqttConfig`, `LwtConfig` and `QoS` are the same types as on the ESP-IDF tier (`juggler::mqtt`).
 
+When the Wi-Fi link or the IP configuration drops, the runner ends the session within about 0.5 s, `state()` leaves `Connected`, and `try_publish` returns `WouldBlock` until the next connect; while the network is up, the socket timeout (1.5 × keep-alive, 45 s by default) covers a silent broker whose TCP reset can be routed and a runner-side stall deadline (socket timeout + keep-alive, 75 s by default) one whose reset cannot, so a silent broker ends the session within roughly 2.5 × keep-alive of its last packet.
+`Ok(())` means accepted into the 4-slot runner queue; queue entries survive a reconnect and go out in order, messages already handed to the session but not yet acknowledged by the broker do not (one at most when the network drops, more if the broker itself dies) — QoS 1 is at-least-once within one broker session only.
+
 ```rust
 use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttConfig, MqttRunner, QoS, TryPublishError};
 
@@ -168,7 +171,7 @@ async fn mqtt_task(runner: MqttRunner) -> ! {
 
 Everything the builder keeps must be `'static`; the example builds its topics into `StaticCell`s.
 The broker host is an IPv4 literal (no DNS in v1), payloads are capped at 256 bytes, and all buffers are static — no heap use.
-The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md`.
+The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md` (T5 covers Wi-Fi loss with an AP power-off and a router-pause variant).
 
 ## Example: Async SoftAP + Provisioning
 

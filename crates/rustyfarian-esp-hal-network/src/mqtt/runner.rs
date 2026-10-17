@@ -1,6 +1,10 @@
 //! Real MQTT implementation: builder, handle and the background runner.
 //!
 //! Compiled only with `embassy` plus a chip feature (`esp32c3`, `esp32c6`, `esp32s3`).
+//!
+//! Delivery contract: see the `mqtt` module docs — a handle `Ok(())` is queue
+//! acceptance, and in-flight QoS 1 replay does not survive the clean-start reconnect
+//! (minimq resets in-flight state when the broker reports no session).
 
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
@@ -10,7 +14,7 @@ use embassy_net::{IpAddress, IpEndpoint, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, PubError, Publication,
     Session, SubscriptionOptions, TopicFilter, Will,
@@ -18,15 +22,27 @@ use minimq::{
 use static_cell::StaticCell;
 
 use super::{
-    parse_broker_ipv4, state_from_u8, state_to_u8, validate_config, InboundMessage, MqttConfig,
-    MqttConnectionState, MqttError, PublishRequest, QoS, TryPublishError,
-    DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS, DEFAULT_RECONNECT_TIMEOUT_MS,
-    INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER, MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH,
-    TCP_RX_BUFFER, TCP_TX_BUFFER,
+    parse_broker_ipv4, socket_timeout_ms, stall_timeout_ms, state_from_u8, state_to_u8,
+    validate_config, InboundMessage, MqttConfig, MqttConnectionState, MqttError, PublishRequest,
+    QoS, TryPublishError, DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS,
+    DEFAULT_RECONNECT_TIMEOUT_MS, INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER,
+    MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH, TCP_RX_BUFFER, TCP_TX_BUFFER,
 };
 
 /// Attempts to publish one queued message before dropping it when the TX arena is full.
 const PUBLISH_ATTEMPTS: usize = 3;
+/// How often the runner re-checks that the Wi-Fi link and the IP configuration are up.
+///
+/// Polled on purpose: `embassy-net` keeps one state waker, and a consumer task may
+/// await `wait_for_ip()` / `wait_config_up()` concurrently; two waiters would
+/// displace each other's waker and spin. The runner never awaits `Stack::wait_*`.
+const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Upper bound for pushing the RST out after `abort()` while the network is up.
+const RST_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// Outcome string for a session ended by the network watch.
+const NETWORK_LOST: &str = "network lost";
+/// Outcome string for a session await that outlived the stall deadline.
+const TRANSPORT_STALLED: &str = "transport stalled";
 
 type Socket = TcpSocket<'static>;
 type Conn<'a> = Connection<'a, 'static, &'a mut Socket>;
@@ -89,6 +105,17 @@ pub struct MqttHandle {
 
 impl MqttHandle {
     /// Current connection state, as the runner last reported it.
+    ///
+    /// `Connected` means the broker acknowledged the CONNECT and the session has not
+    /// ended since. The session ends within about 0.5 s of esp-radio reporting the
+    /// station down or the IP configuration gone (a silent AP loss adds the driver's
+    /// beacon timeout first); while the network is up, the socket timeout
+    /// (1.5 × keep-alive, 45 s by default) and the runner's stall deadline (socket
+    /// timeout + keep-alive, 75 s by default) end it within roughly 2.5 × keep-alive of
+    /// the broker's last packet, whether or not the TCP reset can be routed.
+    /// `Connected` therefore says the runner still considers the session healthy, not
+    /// that the last publish was acknowledged or that the broker is reachable right now;
+    /// `is_connected()` is this cached flag, not a probe.
     pub fn state(&self) -> MqttConnectionState {
         self.shared.state()
     }
@@ -124,13 +151,21 @@ impl MqttHandle {
 
     /// Publishes with QoS 1 and no retain flag, never blocking.
     ///
-    /// Returns [`TryPublishError::WouldBlock`] while disconnected or when the
-    /// publish queue is full; the caller skips this tick and retries later.
+    /// `Ok(())` means accepted into the [`PUBLISH_QUEUE_DEPTH`]-slot runner queue;
+    /// queue entries survive a reconnect and go out in order, messages already handed
+    /// to the session but not yet acknowledged by the broker do not (one at most when
+    /// the network drops, more if the broker itself dies) — QoS 1 is at-least-once
+    /// within one broker session only.
+    ///
+    /// Returns [`TryPublishError::WouldBlock`] while [`state`](Self::state) is not
+    /// `Connected` or the queue is full; the caller skips this tick and retries later.
     pub fn try_publish(&self, topic: &str, payload: &[u8]) -> Result<(), TryPublishError> {
         self.try_publish_with(topic, payload, QoS::AtLeastOnce, false)
     }
 
     /// Publishes a retained message with QoS 1, never blocking.
+    ///
+    /// Acceptance and delivery rules are those of [`try_publish`](Self::try_publish).
     pub fn try_publish_retained(&self, topic: &str, payload: &[u8]) -> Result<(), TryPublishError> {
         self.try_publish_with(topic, payload, QoS::AtLeastOnce, true)
     }
@@ -138,6 +173,7 @@ impl MqttHandle {
     /// Publishes with explicit QoS and retain flag, never blocking.
     ///
     /// QoS 2 is downgraded to QoS 1 on this tier.
+    /// Acceptance and delivery rules are those of [`try_publish`](Self::try_publish).
     pub fn try_publish_with(
         &self,
         topic: &str,
@@ -161,6 +197,9 @@ impl MqttHandle {
     /// Unlike [`try_publish_with`](Self::try_publish_with) this does not check
     /// the connection: a message queued while disconnected goes out after the
     /// next successful connect.
+    /// `Ok(())` means accepted into the queue, not delivered; the per-session rule of
+    /// [`try_publish`](Self::try_publish) applies once the runner has handed the
+    /// message to the session.
     pub async fn publish_with(
         &self,
         topic: &str,
@@ -280,16 +319,22 @@ impl MqttBuilder {
         let mqtt_tx = MQTT_TX.init([0u8; MQTT_TX_BUFFER]);
 
         let session = build_session(&self.config, Buffers::new(mqtt_rx, mqtt_tx))?;
-        let socket = TcpSocket::new(stack, tcp_rx, tcp_tx);
+        let keep_alive = self
+            .config
+            .keep_alive_secs
+            .unwrap_or(DEFAULT_KEEP_ALIVE_SECS);
+        let mut socket = TcpSocket::new(stack, tcp_rx, tcp_tx);
+        // Bounds a flush/read on a dead path while the network is up; smoltcp keeps the
+        // value across abort()/connect(), so once is enough. MQTT keep-alive traffic
+        // (PINGRESP, PUBACK, TCP ACKs) refreshes it, so no TCP keep-alive is needed.
+        socket.set_timeout(Some(Duration::from_millis(socket_timeout_ms(keep_alive))));
 
         log::info!(
             "[mqtt] configured broker {}:{} client_id={} keep_alive={}s lwt={}",
             self.config.host,
             self.config.port,
             self.config.client_id,
-            self.config
-                .keep_alive_secs
-                .unwrap_or(DEFAULT_KEEP_ALIVE_SECS),
+            keep_alive,
             self.config.lwt().map_or("none", |l| l.topic())
         );
 
@@ -306,6 +351,7 @@ impl MqttBuilder {
                     .connection_timeout_ms
                     .unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS),
             ),
+            stall: Duration::from_millis(stall_timeout_ms(keep_alive)),
             reconnect_timeout: Duration::from_millis(
                 self.config
                     .reconnect_timeout_ms
@@ -358,6 +404,7 @@ pub struct MqttRunner {
     subscriptions: heapless::Vec<(&'static str, QoS), MAX_SUBSCRIPTIONS>,
     startup: Option<StartupMessage>,
     connection_timeout: Duration,
+    stall: Duration,
     reconnect_timeout: Duration,
 }
 
@@ -366,38 +413,67 @@ impl MqttRunner {
     pub async fn run(mut self) -> ! {
         loop {
             self.shared.set_state(MqttConnectionState::Connecting);
-            if !self.stack.is_config_up() {
+            if !network_up(&self.stack) {
                 log::info!("[mqtt] waiting for network");
-                self.stack.wait_config_up().await;
+                while !network_up(&self.stack) {
+                    Timer::after(NETWORK_POLL_INTERVAL).await;
+                }
             }
 
-            let outcome = serve(
-                &mut self.session,
-                &mut self.socket,
-                self.shared,
-                self.broker,
-                &self.subscriptions,
-                self.startup,
-                self.connection_timeout,
+            let (outcome, lost_network) = match select(
+                serve(
+                    &mut self.session,
+                    &mut self.socket,
+                    self.shared,
+                    self.broker,
+                    &self.subscriptions,
+                    self.startup,
+                    self.connection_timeout,
+                    self.stall,
+                ),
+                network_lost(self.stack),
             )
-            .await;
+            .await
+            {
+                Either::First(outcome) => (outcome, false),
+                Either::Second(()) => (NETWORK_LOST, true),
+            };
 
-            // Return the socket to CLOSED and push the RST out before reusing it.
-            self.socket.abort();
-            let _ = self.socket.flush().await;
             self.shared.set_state(MqttConnectionState::Disconnected);
-            log::warn!(
-                "[mqtt] disconnected ({}), reconnecting in {} ms",
-                outcome,
-                self.reconnect_timeout.as_millis()
-            );
-            Timer::after(self.reconnect_timeout).await;
+            // Return the socket to CLOSED. The RST can only leave while the network is
+            // up (smoltcp clears the tuple after emitting it); the next connect() resets
+            // the socket either way, so the flush is skipped or bounded.
+            self.socket.abort();
+            if network_up(&self.stack) {
+                let _ = with_timeout(RST_FLUSH_TIMEOUT, self.socket.flush()).await;
+            }
+            if lost_network {
+                log::warn!("[mqtt] disconnected ({}), waiting for network", outcome);
+                while !network_up(&self.stack) {
+                    Timer::after(NETWORK_POLL_INTERVAL).await;
+                }
+            } else {
+                log::warn!(
+                    "[mqtt] disconnected ({}), reconnecting in {} ms",
+                    outcome,
+                    self.reconnect_timeout.as_millis()
+                );
+                Timer::after(self.reconnect_timeout).await;
+            }
         }
     }
 }
 
 /// One connection lifetime: TCP connect, MQTT handshake, startup work, then the
 /// poll/publish loop until the session drops. Returns the reason it ended.
+///
+/// Every session await is bounded by a stall deadline, re-armed before each
+/// `poll`/`publish` of the session loop (the post-connect subscribes and the startup
+/// message share one); it is the only way out of a `flush()` whose RST has no route
+/// (see `stall_timeout_ms`). `minimq` documents `poll()` and QoS 1 `publish()`
+/// as cancel-safe, and `Session::connect` resets the outbound state regardless of how
+/// the previous connection ended.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     session: &mut Session<'static>,
     socket: &mut Socket,
@@ -406,6 +482,7 @@ async fn serve(
     subscriptions: &[(&'static str, QoS)],
     startup: Option<StartupMessage>,
     connection_timeout: Duration,
+    stall: Duration,
 ) -> &'static str {
     match with_timeout(connection_timeout, socket.connect(broker)).await {
         Ok(Ok(())) => {}
@@ -425,14 +502,22 @@ async fn serve(
         Err(_) => return "mqtt connect timed out",
     };
 
+    let mut deadline = Instant::now() + stall;
     let event = conn.connect_event();
     if event == ConnectEvent::Connected {
         for (topic, qos) in subscriptions {
             let filter = TopicFilter::new(topic)
                 .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(*qos)));
-            if let Err(e) = conn.subscribe(&[filter], &[]).await {
-                log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
-                return "subscribe failed";
+            match with_deadline(deadline, conn.subscribe(&[filter], &[])).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
+                    return "subscribe failed";
+                }
+                Err(_) => {
+                    log::warn!("[mqtt] subscribe {} stalled", topic);
+                    return TRANSPORT_STALLED;
+                }
             }
         }
     }
@@ -443,7 +528,7 @@ async fn serve(
             qos: msg.qos,
             retain: msg.retain,
         };
-        if let Err(reason) = publish_queued(&mut conn, shared, &request).await {
+        if let Err(reason) = publish_queued(&mut conn, shared, &request, deadline).await {
             return reason;
         }
     }
@@ -457,8 +542,14 @@ async fn serve(
     );
 
     loop {
-        match select(conn.poll(), shared.publish_q.receive()).await {
-            Either::First(Ok(Some(inbound))) => {
+        deadline = Instant::now() + stall;
+        match select(
+            with_deadline(deadline, conn.poll()),
+            shared.publish_q.receive(),
+        )
+        .await
+        {
+            Either::First(Ok(Ok(Some(inbound)))) => {
                 match InboundMessage::copy_from(
                     inbound.topic(),
                     inbound.payload(),
@@ -472,13 +563,17 @@ async fn serve(
                     }
                 }
             }
-            Either::First(Ok(None)) => {}
-            Either::First(Err(e)) => {
+            Either::First(Ok(Ok(None))) => {}
+            Either::First(Ok(Err(e))) => {
                 log::warn!("[mqtt] session error: {:?}", e);
                 return "session error";
             }
+            Either::First(Err(_)) => {
+                log::warn!("[mqtt] session stalled for {} ms", stall.as_millis());
+                return TRANSPORT_STALLED;
+            }
             Either::Second(request) => {
-                if let Err(reason) = publish_queued(&mut conn, shared, &request).await {
+                if let Err(reason) = publish_queued(&mut conn, shared, &request, deadline).await {
                     return reason;
                 }
             }
@@ -488,11 +583,13 @@ async fn serve(
 
 /// Publishes one queued request, retrying a full TX arena a few times.
 ///
-/// `Ok(())` also covers a dropped message (counted); `Err` means the session is dead.
+/// `Ok(())` also covers a dropped message (counted); `Err` means the session is dead
+/// or the transport stalled past `deadline`.
 async fn publish_queued(
     conn: &mut Conn<'_>,
     shared: &Shared,
     request: &PublishRequest,
+    deadline: Instant,
 ) -> Result<(), &'static str> {
     for attempt in 1..=PUBLISH_ATTEMPTS {
         let mut publication =
@@ -501,13 +598,24 @@ async fn publish_queued(
         if request.retain {
             publication = publication.retain();
         }
-        match conn.publish(publication).await {
+        let Ok(published) = with_deadline(deadline, conn.publish(publication)).await else {
+            log::warn!("[mqtt] publish on {} stalled", request.topic.as_str());
+            return Err(TRANSPORT_STALLED);
+        };
+        match published {
             Ok(_) => return Ok(()),
             Err(PubError::Session(MinimqError::NotReady)) if attempt < PUBLISH_ATTEMPTS => {
                 // Let acknowledgements drain, then retry.
-                if let Err(e) = conn.drive().await {
-                    log::warn!("[mqtt] drive failed: {:?}", e);
-                    return Err("session error");
+                match with_deadline(deadline, conn.drive()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        log::warn!("[mqtt] drive failed: {:?}", e);
+                        return Err("session error");
+                    }
+                    Err(_) => {
+                        log::warn!("[mqtt] drive on {} stalled", request.topic.as_str());
+                        return Err(TRANSPORT_STALLED);
+                    }
                 }
             }
             Err(PubError::Session(MinimqError::NotReady))
@@ -535,6 +643,22 @@ fn bump(counter: &AtomicU32) {
         counter.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
+}
+
+/// `true` while the Wi-Fi link and the IP configuration are both up.
+fn network_up(stack: &Stack<'static>) -> bool {
+    stack.is_link_up() && stack.is_config_up()
+}
+
+/// Resolves once the Wi-Fi link or the IP configuration is gone.
+///
+/// Dropping the racing `serve()` future drops the `minimq` connection; the transport is
+/// aborted next and `Session::connect` resets the outbound state, so a publish cancelled
+/// here is lost (documented) but the session stays reusable.
+async fn network_lost(stack: Stack<'static>) {
+    while network_up(&stack) {
+        Timer::after(NETWORK_POLL_INTERVAL).await;
+    }
 }
 
 fn clamp_qos(qos: QoS) -> QoS {

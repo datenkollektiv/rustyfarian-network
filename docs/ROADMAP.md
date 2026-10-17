@@ -171,7 +171,7 @@ All steps use TTN v3 EU868.
 
 | # | Item                                                                                                                       |
 |--:|:---------------------------------------------------------------------------------------------------------------------------|
-| 1 | Evaluate ESP-IDF v5.5.2 — contains fix for "ESP-NOW send failure when coexistence is enabled"; track for next ESP-IDF bump |
+| 1 | Evaluate ESP-IDF v5.5.5 — contains the v5.5.2 fix for "ESP-NOW send failure when coexistence is enabled"; requested by a downstream project, see `docs/features/esp-idf-v5-5-upgrade-v1.md` |
 
 ### LoRa post-adoption backlog
 
