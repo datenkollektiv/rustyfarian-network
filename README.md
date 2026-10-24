@@ -128,21 +128,21 @@ Choose one of the three crates based on your target platform and add it with the
 
 ```toml
 [dependencies]
-rustyfarian-esp-idf-network = { version = "0.5", features = ["wifi", "mqtt"] }
+rustyfarian-esp-idf-network = { version = "0.6", features = ["wifi", "mqtt"] }
 ```
 
 **Bare-metal (no_std, async with esp-hal):**
 
 ```toml
 [dependencies]
-rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32c6", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "esp32c6", "embassy", "rt"] }
 ```
 
 **Pure logic only (host-testable):**
 
 ```toml
 [dependencies]
-juggler = { version = "0.5", features = ["wifi", "mqtt"] }
+juggler = { version = "0.6", features = ["wifi", "mqtt"] }
 ```
 
 ## Example
