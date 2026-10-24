@@ -52,29 +52,29 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32c6", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "esp32c6", "embassy", "rt"] }
 ```
 
 **Chip + domain matrix examples:**
 
 ```toml
 # Wi-Fi on ESP32-C3
-rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32c3", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "esp32c3", "embassy", "rt"] }
 
 # LoRa on ESP32-S3 (no async needed)
-rustyfarian-esp-hal-network = { version = "0.5", features = ["lora", "esp32s3", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["lora", "esp32s3", "rt"] }
 
 # Wi-Fi on ESP32-S3
-rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "esp32s3", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "esp32s3", "embassy", "rt"] }
 
 # MQTT (with Wi-Fi) on ESP32-S3
-rustyfarian-esp-hal-network = { version = "0.5", features = ["mqtt", "esp32s3", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["mqtt", "esp32s3", "embassy", "rt"] }
 
 # Wi-Fi + OTA on ESP32-C6
-rustyfarian-esp-hal-network = { version = "0.5", features = ["wifi", "ota", "esp32c6", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "ota", "esp32c6", "embassy", "rt"] }
 
 # SoftAP provisioning on ESP32-C3
-rustyfarian-esp-hal-network = { version = "0.5", features = ["provisioning", "esp32c3", "embassy", "rt"] }
+rustyfarian-esp-hal-network = { version = "0.6", features = ["provisioning", "esp32c3", "embassy", "rt"] }
 ```
 
 ## Example: Async Wi-Fi Connect
