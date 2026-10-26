@@ -222,11 +222,11 @@ minimq                  = { workspace = true, optional = true }
 embassy-executor = { workspace = true }
 embassy-time     = { workspace = true }
 # Activate juggler sub-features needed by the host-side unit tests embedded in
-# the ota, provisioning, and session module files.  These are unified with the
+# the ota, provisioning, session, and lora module files.  These are unified with the
 # [dependencies] entry so that `cfg(test)` compilation with --no-default-features
-# can reach juggler::ota, juggler::provisioning, juggler::wifi, and juggler::mqtt
-# without pulling in any chip-specific hardware crate.
-juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt"] }
+# can reach juggler::ota, juggler::provisioning, juggler::wifi, juggler::mqtt, and
+# juggler::lora without pulling in any chip-specific hardware crate.
+juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt", "lora"] }
 
 [[example]]
 name = "hal_c3_connect_async"

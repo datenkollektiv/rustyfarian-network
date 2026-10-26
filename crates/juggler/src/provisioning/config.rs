@@ -284,6 +284,7 @@ mod tests {
         assert!(rendered.contains("hive"));
     }
 
+    #[cfg(feature = "lora")]
     #[test]
     fn to_lora_config_round_trips_validated_credentials() {
         let cfg = parsed_config();
