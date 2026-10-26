@@ -357,6 +357,7 @@ test-ota:
 [group('test & lint')]
 test-provisioning:
     cargo test --target {{ host_target }} -p juggler --features provisioning,std
+    cargo test --target {{ host_target }} -p juggler --features provisioning,std,lora
 
 # run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]

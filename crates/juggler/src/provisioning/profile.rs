@@ -146,6 +146,7 @@ impl LoraFields {
     /// `expect` below is therefore unreachable for any value this type can
     /// hold; it would only fire if the parse-time and `from_hex_strings`
     /// validation rules drifted apart, which the host tests guard against.
+    #[cfg(feature = "lora")]
     pub fn to_lora_config(&self, region: crate::lora::Region) -> crate::lora::LoraConfig {
         crate::lora::LoraConfig::from_hex_strings(
             region,

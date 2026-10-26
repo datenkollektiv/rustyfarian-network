@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (IDF tier):** `rustyfarian_esp_idf_network::mqtt` now takes `juggler::mqtt::QoS` everywhere (`MqttBuilder::subscribe`, `LwtConfig::new`, `publish_with`, `try_publish_with`, `publish_acked`, …) and re-exports it as `mqtt::QoS`; `MqttConfig`, `LwtConfig` and `TryPublishError` are re-exports/aliases of the `juggler` types.
   Migration: import `QoS` from `rustyfarian_esp_idf_network::mqtt` instead of `esp_idf_svc::mqtt::client`, and convert with `mqtt::to_esp_qos(..)` where an `on_connect` closure calls the raw `EspMqttClient::enqueue`.
 - Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).
+- The `juggler` `provisioning` feature no longer implies `lora`, so a Wi-Fi + MQTT device that enables provisioning no longer pulls `lorawan-device` (and with it `heapless 0.7` / `atomic-polyfill`, `RUSTSEC-2023-0089`).
+  `LoraFields::to_lora_config` now requires the `lora` feature; consumers enabling both `provisioning` and `lora` on either tier crate are unaffected.
 
 ### Fixed
 

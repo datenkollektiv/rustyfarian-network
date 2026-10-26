@@ -30,7 +30,9 @@ espnow = []
 ota = ["dep:heapless", "dep:sha2"]
 # OTA wire contract (command, manifest, status JSON, reason codes). Needs alloc; the base `ota` feature stays alloc-free.
 ota-wire = ["ota", "dep:serde", "dep:serde_json"]
-provisioning = ["wifi", "mqtt", "lora", "dep:heapless", "dep:zeroize"]
+# `lora` is not implied: a Wi-Fi + MQTT device must not pull lorawan-device.
+# Enable `lora` alongside for `LoraFields::to_lora_config`.
+provisioning = ["wifi", "mqtt", "dep:heapless", "dep:zeroize"]
 
 # Mock feature — test doubles for radio and ESP-NOW drivers
 # A single shared mock feature is used because only two domains have mocks with
