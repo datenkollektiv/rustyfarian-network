@@ -158,6 +158,29 @@ impl LoraFields {
     }
 }
 
+impl LoraFields {
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Construct `LoraFields` directly from validated values.
+    ///
+    /// Intended for storage adapters that have just decoded a previously-stored
+    /// record and CRC-verified its integrity. The constructor itself performs
+    /// no validation; the values must have originated from a previous
+    /// `parse_form` and been round-tripped through a checked encode / decode
+    /// pair.
+    pub fn from_storage_parts(
+        dev_eui_hex: heapless::String<EUI_HEX_LEN>,
+        join_eui_hex: heapless::String<EUI_HEX_LEN>,
+        app_key_hex: heapless::String<APP_KEY_HEX_LEN>,
+    ) -> Self {
+        Self {
+            dev_eui_hex,
+            join_eui_hex,
+            app_key_hex,
+        }
+    }
+}
+
 impl fmt::Debug for LoraFields {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoraFields")

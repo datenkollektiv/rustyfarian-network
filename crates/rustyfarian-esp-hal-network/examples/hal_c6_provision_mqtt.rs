@@ -12,11 +12,12 @@
 //!
 //! # INTEGRATOR: HTTP task stack requirement
 //!
-//! The HTTP portal task requires at least **14 KiB** of stack.
+//! The HTTP portal task requires at least **24 KiB** of stack.
 //! The steady-state frame is ~8.3 KiB (`req_buf` 2048 B + `resp_buf` 6144 B
-//! + executor overhead); a `POST /save` request transiently adds ~4.6 KiB for
-//! `ProvisioningStore::save`'s encode and read buffers, raising the peak to
-//! ~13 KiB.
+//! + executor overhead); a `POST /save` request transiently adds ~12.5 KiB
+//! (analytic upper bound, not measured) for `ProvisioningStore::save`'s
+//! encode and read buffers plus the portal's parsed config, raising the peak
+//! to ~20.5 KiB.
 //! The `esp-rtos` 0.3.0 thread-mode embassy executor runs **all** async tasks
 //! on a single shared stack — there is no per-task stack size knob exposed by
 //! `#[embassy_executor::task]` or `#[esp_rtos::main]`.
@@ -150,14 +151,14 @@ async fn main(spawner: Spawner) {
 
     println!("hal_c6_provision_mqtt starting");
 
-    // INTEGRATOR: the HTTP portal task (http_task) peaks at ~13 KiB during a
-    // POST /save request (steady-state 8.3 KiB + ProvisioningStore::save 4.6 KiB
-    // transient).  esp-rtos 0.3.0 thread-mode embassy shares a single stack for
+    // INTEGRATOR: the HTTP portal task (http_task) peaks at ~20.5 KiB during a
+    // POST /save request (steady-state 8.3 KiB + ~12.5 KiB transient for
+    // ProvisioningStore::save and the parsed config).  esp-rtos 0.3.0 thread-mode embassy shares a single stack for
     // all async tasks; there is no per-task stack size knob.  Size the
-    // main-thread stack to at least 14 KiB via the linker script (_stack_size
+    // main-thread stack to at least 24 KiB via the linker script (_stack_size
     // symbol) or CONFIG_ESP_MAIN_TASK_STACK_SIZE (IDF-paired build).
     log::warn!(
-        "HTTP portal requires >=14 KiB main-thread stack (POST /save peak ~13 KiB). \
+        "HTTP portal requires >=24 KiB main-thread stack (POST /save peak <=~20.5 KiB, analytic bound). \
          Size via linker _stack_size or CONFIG_ESP_MAIN_TASK_STACK_SIZE."
     );
 
@@ -175,10 +176,11 @@ async fn main(spawner: Spawner) {
         match store.load() {
             Ok(Some(cfg)) => {
                 log::info!(
-                    "Already provisioned — ssid len={}, device_name={}, profile={:?}",
+                    "Already provisioned — ssid len={}, device_name={}, profile={:?}, extras={}",
                     cfg.wifi_ssid().len(),
                     cfg.device_name(),
                     cfg.profile(),
+                    cfg.extras().len(),
                 );
                 if let Some(mqtt) = cfg.mqtt() {
                     log::info!(

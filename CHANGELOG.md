@@ -14,9 +14,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared MQTT configuration in `juggler::mqtt` (no `std` needed): `QoS`, `MqttConfig`, `LwtConfig`, `DEFAULT_MQTT_TASK_STACK_SIZE` and the generic `TryPublishError<E>`, used by both tier crates.
 - ESP32-S3 support for `wifi`, `provisioning` and `ota` in `rustyfarian-esp-hal-network`: the `esp32s3` feature now selects the chip on `esp-radio`, `esp-rtos`, `esp-alloc`, `esp-storage` and `esp-backtrace`, and `ota::TARGET_CHIP` is `"esp32s3"`.
 - Example `hal_esp32s3_connect_async` (Wi-Fi station join plus DHCP), and S3 Wi-Fi, OTA and provisioning lines in `just clippy-hal`.
+- IDF tier: `WifiMqttBoot::{device_name, ota_url, config}`, so a consumer reads the stored device name and OTA URL without a second store read; `idf_c3_provision` and `idf_c3_provision_mqtt` log them, and `just clippy-provisioning-mqtt-tests` runs in `just verify`.
+- HAL tier: portal extras are now persisted through a repeatable `TAG_EXTRA` (`0x0A`) record tag, and `MAX_RECORD_LEN` grows from 512 to 1280 B (ADR 015 amendment 2026-10-27).
+- `juggler::provisioning::LoraFields::from_storage_parts`, and public `EUI_HEX_LEN` and `APP_KEY_HEX_LEN`.
+- `juggler::provisioning::{ProvisioningKv, KvProvisioningStore}` (feature `std`): the provisioning NVS key layout over a key-value trait, with host tests that load a 0.6.x-shaped record; the IDF tier's `ProvisioningStore` now delegates to it over NVS, with no public API change.
+- Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot on ESP32-C3 and ESP32-C6) is still open.
+  Requested by the spookhouse review-queue item `rustyfarian-network-boot-device-name-v1`; see `docs/features/provisioning-boot-identity-v1.md`.
 
 ### Changed
 
+- **Breaking (`juggler`):** `ProvisioningConfig::ota_url()` returns `Option<&str>` (`None` when no OTA URL is stored, replacing the empty string), `ProvisioningConfig::from_storage_parts` takes a trailing `extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>`, and `ExtraField`'s `Debug` redacts the value.
+  Migration: replace `cfg.ota_url().is_empty()` with `cfg.ota_url().is_none()`, use `cfg.ota_url().unwrap_or("")` where a string is needed, and pass `heapless::Vec::new()` as the new `extras` argument when there are none.
+  `device_name()` still returns `&str`.
+- **Breaking (IDF tier):** `ProvisioningStore::load()` returns `Option<juggler::provisioning::ProvisioningConfig>` and the closure of `WifiMqttBoot::load_with` takes `&ProvisioningConfig`.
+  The record is heap-allocated once and scrubbed on drop, and `WifiMqttBoot`'s `Debug` prints secrets as `<redacted>` without a length (it was `<redacted, len=N>`) and shows the MQTT username in clear.
+  `StoredConfig` is removed (its derived `Debug` printed secrets); read every field through the `ProvisioningConfig` accessors.
+  `load()` now errors naming the NVS key when a stored value exceeds its field cap or more than 8 extras are indexed; a portal-written record cannot trigger this.
+  Migration: `cfg.profile` becomes `cfg.profile()`, `cfg.mqtt_host` becomes `cfg.mqtt().map(|m| m.host())`, `cfg.mqtt_port` becomes `cfg.mqtt().map(|m| m.port())`, the LoRa fields (`dev_eui_hex`, `join_eui_hex`, `app_key_hex`) come from `cfg.lora()`, `cfg.device_name` becomes `cfg.device_name()`, `cfg.ota_url` becomes `cfg.ota_url().unwrap_or("")`, and extras come from `cfg.extras()`.
+  The NVS key layout (ADR 014 §4) is unchanged, and 0.6.x records load unchanged.
+- **Breaking (HAL tier):** `StoreError::ExtrasNotSupported` is removed and `StoreError::MalformedField { tag }` is added (empty or duplicate extra key, bad key length, over-cap key or value, a ninth extra).
+  A record with extras can exceed 512 B, and 0.6.x firmware caps its read at 512 B, so such a record reads as unprovisioned there (the device falls back to the other sector or reports unprovisioned); records without extras are byte-identical to 0.6.x.
+  The documented provisioning task stack guidance was re-derived as an analytic upper bound (about 12.5 KiB transient including the portal's parsed config, about 20.5 KiB peak, recommended minimum 24 KiB), not measured.
 - **Breaking (IDF tier):** `rustyfarian_esp_idf_network::mqtt` now takes `juggler::mqtt::QoS` everywhere (`MqttBuilder::subscribe`, `LwtConfig::new`, `publish_with`, `try_publish_with`, `publish_acked`, …) and re-exports it as `mqtt::QoS`; `MqttConfig`, `LwtConfig` and `TryPublishError` are re-exports/aliases of the `juggler` types.
   Migration: import `QoS` from `rustyfarian_esp_idf_network::mqtt` instead of `esp_idf_svc::mqtt::client`, and convert with `mqtt::to_esp_qos(..)` where an `on_connect` closure calls the raw `EspMqttClient::enqueue`.
 - Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).

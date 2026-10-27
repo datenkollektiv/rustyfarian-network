@@ -374,14 +374,18 @@ fn set_form_error(slot: &mut Option<ValidationError>, error: ValidationError) {
     }
 }
 
-/// Inserts an extra field, folding duplicate-key and capacity problems into a
-/// single body-level error.
+/// Inserts an extra field, folding empty-key, duplicate-key and capacity
+/// problems into a single body-level error.
 fn insert_extra(
     extras: &mut heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>,
     form_error: &mut Option<ValidationError>,
     key: &str,
     value: &str,
 ) {
+    if key.is_empty() {
+        set_form_error(form_error, ValidationError::MalformedBody);
+        return;
+    }
     if extras.iter().any(|e| e.key == key) {
         set_form_error(form_error, ValidationError::Duplicate);
         return;
@@ -897,7 +901,7 @@ mod tests {
         assert_eq!(lora.dev_eui_hex(), TEST_DEV_EUI);
         assert_eq!(lora.join_eui_hex(), TEST_JOIN_EUI);
         assert_eq!(lora.app_key_hex(), TEST_APP_KEY_HEX);
-        assert_eq!(cfg.ota_url(), TEST_URL);
+        assert_eq!(cfg.ota_url(), Some(TEST_URL));
         assert_eq!(cfg.device_name(), TEST_NAME);
         assert!(cfg.mqtt().is_none());
         assert!(cfg.extras().is_empty());
@@ -1217,19 +1221,19 @@ mod tests {
         let body = mqtt_body_without_ota();
         assert!(!body.contains("ota_url"));
         let cfg = parse_form(&body, WIFI_MQTT).expect("ota_url is optional");
-        assert_eq!(cfg.ota_url(), "");
+        assert_eq!(cfg.ota_url(), None);
     }
 
     #[test]
     fn wifi_mqtt_empty_ota_url_accepted_as_empty() {
         let cfg = parse_form(&mqtt_body_with("ota_url", ""), WIFI_MQTT).expect("empty ota_url");
-        assert_eq!(cfg.ota_url(), "");
+        assert_eq!(cfg.ota_url(), None);
     }
 
     #[test]
     fn wifi_mqtt_valid_ota_url_kept() {
         let cfg = parse_form(&mqtt_body_with("ota_url", TEST_URL), WIFI_MQTT).expect("valid");
-        assert_eq!(cfg.ota_url(), TEST_URL);
+        assert_eq!(cfg.ota_url(), Some(TEST_URL));
     }
 
     #[test]
@@ -1368,6 +1372,18 @@ mod tests {
         assert_eq!(too_many, 1);
         let form_count = errors.iter().filter(|e| e.field == Field::Form).count();
         assert_eq!(form_count, 1);
+    }
+
+    #[test]
+    fn empty_extra_key_is_single_form_malformed_body() {
+        let mut body = valid_body().to_string();
+        body.push_str("&=foo");
+        let errors = parse_form(&body, LORAWAN).expect_err("empty extra key");
+        let malformed = errors
+            .iter()
+            .filter(|e| e.field == Field::Form && e.error == ValidationError::MalformedBody)
+            .count();
+        assert_eq!(malformed, 1);
     }
 
     #[test]

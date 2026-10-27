@@ -61,7 +61,7 @@ mod dns;
 mod portal;
 mod store;
 
-pub use store::{ProvisioningStore, StoredConfig};
+pub use store::ProvisioningStore;
 
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
 pub use boot::{

@@ -23,6 +23,8 @@ pub mod defaults;
 pub mod error;
 pub mod form;
 pub mod html_json_escape;
+#[cfg(feature = "std")]
+pub mod kv_store;
 pub mod profile;
 pub(crate) mod secret;
 #[cfg(feature = "std")]
@@ -32,13 +34,15 @@ pub mod state;
 pub mod templates;
 
 pub use config::{
-    ProvisioningConfig, DEVICE_NAME_MAX_LEN, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN,
-    EXTRA_VALUE_MAX_LEN, MAX_FIELD_ERRORS, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN,
-    OTA_URL_MAX_LEN,
+    ProvisioningConfig, APP_KEY_HEX_LEN, DEVICE_NAME_MAX_LEN, EUI_HEX_LEN, EXTRA_FIELDS_MAX,
+    EXTRA_KEY_MAX_LEN, EXTRA_VALUE_MAX_LEN, MAX_FIELD_ERRORS, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN,
+    MQTT_USER_MAX_LEN, OTA_URL_MAX_LEN,
 };
 pub use defaults::PortalDefaults;
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
+#[cfg(feature = "std")]
+pub use kv_store::{KvProvisioningStore, ProvisioningKv};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};
 #[cfg(feature = "std")]
 pub use session::{SessionOutcome, SessionState};

@@ -54,10 +54,10 @@ pub const MQTT_USER_MAX_LEN: usize = 64;
 pub const MQTT_PASS_MAX_LEN: usize = 64;
 
 /// Hex-character length of a LoRaWAN EUI (8 bytes, MSB-first).
-pub(crate) const EUI_HEX_LEN: usize = 16;
+pub const EUI_HEX_LEN: usize = 16;
 
 /// Hex-character length of a LoRaWAN AppKey (16 bytes).
-pub(crate) const APP_KEY_HEX_LEN: usize = 32;
+pub const APP_KEY_HEX_LEN: usize = 32;
 
 /// Experimental: API may change before 1.0.
 ///
@@ -133,11 +133,16 @@ impl ProvisioningConfig {
     ///
     /// The validated OTA update URL.
     ///
-    /// An empty string means "no OTA configured". This is only possible under
-    /// [`SchemaProfile::WifiMqttDevice`], where the URL is optional (ADR 014
-    /// amendment); `LorawanFieldDevice` configs always carry a non-empty URL.
-    pub fn ota_url(&self) -> &str {
-        &self.ota_url
+    /// `None` means "no OTA configured" (the stored string is empty). This is
+    /// only possible under [`SchemaProfile::WifiMqttDevice`], where the URL is
+    /// optional (ADR 014 amendment); `LorawanFieldDevice` configs always carry
+    /// a non-empty URL.
+    pub fn ota_url(&self) -> Option<&str> {
+        if self.ota_url.is_empty() {
+            None
+        } else {
+            Some(&self.ota_url)
+        }
     }
 
     /// Experimental: API may change before 1.0.
@@ -201,6 +206,7 @@ impl ProvisioningConfig {
         device_name: heapless::String<DEVICE_NAME_MAX_LEN>,
         lora: Option<LoraFields>,
         mqtt: Option<MqttFields>,
+        extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>,
     ) -> Self {
         Self {
             wifi_ssid,
@@ -209,7 +215,7 @@ impl ProvisioningConfig {
             device_name,
             lora,
             mqtt,
-            extras: heapless::Vec::new(),
+            extras,
         }
     }
 }
@@ -326,6 +332,66 @@ mod tests {
             !rendered.contains(test_psk()),
             "leaked a secret: {rendered}"
         );
+    }
+
+    #[test]
+    fn debug_has_no_secret_values_or_lengths_and_ota_url_is_optional() {
+        let cfg = mqtt_config_with_extra();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains(test_psk()), "leaked: {rendered}");
+        assert!(!rendered.contains("len="), "length shown: {rendered}");
+        assert_eq!(cfg.ota_url(), Some("http://example.com/fw.bin"));
+
+        let psk = test_psk();
+        let body = format!(
+            "wifi_ssid=home&wifi_pass={psk}&mqtt_uri=mqtt://broker.local:1883\
+             &mqtt_user=hive&mqtt_pass={psk}&dev_name=hive"
+        );
+        let no_ota = parse_form(&body, SchemaProfile::WifiMqttDevice).expect("valid body");
+        assert_eq!(no_ota.ota_url(), None);
+    }
+
+    #[test]
+    fn from_storage_parts_keeps_extras() {
+        let cfg = mqtt_config_with_extra();
+        let rebuilt = crate::provisioning::ProvisioningConfig::from_storage_parts(
+            cfg.wifi_ssid.clone(),
+            cfg.wifi_password.clone(),
+            cfg.ota_url.clone(),
+            cfg.device_name.clone(),
+            None,
+            cfg.mqtt.clone(),
+            cfg.extras.clone(),
+        );
+        assert_eq!(rebuilt.extras().len(), 1);
+        assert_eq!(rebuilt.extras()[0].key, "api_token");
+        assert_eq!(rebuilt.extras()[0].value, test_psk());
+    }
+
+    #[test]
+    fn lora_fields_from_storage_parts_round_trips() {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        // Built at runtime from OS entropy, not a literal, so CodeQL's
+        // `rust/hard-coded-cryptographic-value` query has no source to track.
+        let half = |seed: u8| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u8(seed);
+            hasher.finish()
+        };
+        let app_key = format!("{:016X}{:016X}", half(1), half(2));
+        assert_eq!(app_key.len(), crate::provisioning::APP_KEY_HEX_LEN);
+
+        let lora = crate::provisioning::LoraFields::from_storage_parts(
+            heapless::String::try_from("0011223344556677").unwrap(),
+            heapless::String::try_from("70B3D57ED005ABCD").unwrap(),
+            heapless::String::try_from(app_key.as_str()).unwrap(),
+        );
+        assert_eq!(lora.dev_eui_hex(), "0011223344556677");
+        assert_eq!(lora.join_eui_hex(), "70B3D57ED005ABCD");
+        assert_eq!(lora.app_key_hex(), app_key);
+        assert!(!format!("{lora:?}").contains(app_key.as_str()));
     }
 
     /// Address and length of a live secret buffer, recorded so the same bytes

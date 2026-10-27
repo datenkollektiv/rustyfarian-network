@@ -29,7 +29,7 @@ use juggler::provisioning::{
         OTA_URL_MAX_LEN,
     },
     profile::{MqttFields, SchemaProfile},
-    ProvisioningConfig,
+    ExtraField, ProvisioningConfig, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN, EXTRA_VALUE_MAX_LEN,
 };
 
 use super::store::StoreError;
@@ -62,6 +62,9 @@ pub(crate) const TAG_MQTT_PASS: u8 = 0x06;
 pub(crate) const TAG_MQTT_CLIENT: u8 = 0x07;
 pub(crate) const TAG_OTA_URL: u8 = 0x08;
 pub(crate) const TAG_DEVICE_NAME: u8 = 0x09;
+/// Repeatable: one TLV per opaque extra, in config order.
+/// Value layout: `key_len (1 B) | key bytes | value bytes` (<= 78 B).
+pub(crate) const TAG_EXTRA: u8 = 0x0A;
 
 // ── Header overhead ───────────────────────────────────────────────────────────
 
@@ -160,9 +163,9 @@ impl fmt::Debug for DecodedRecord {
 /// hold the tag byte, the length byte, and the value bytes. Callers must
 /// pass a `value` no longer than 255 bytes; this is enforced at the
 /// `ProvisioningConfig` field-cap level today (every shipped field is
-/// `<= 128` bytes), and the `debug_assert!` here is a tripwire in case a
-/// future field cap is raised past 255 — a `len as u8` truncation would
-/// silently corrupt the record.
+/// `<= 128` bytes, an extra's TLV value `<= 78`), and the `debug_assert!`
+/// here is a tripwire in case a future field cap is raised past 255 — a
+/// `len as u8` truncation would silently corrupt the record.
 fn write_tlv(buf: &mut [u8], pos: &mut usize, tag: u8, value: &[u8]) -> Result<(), StoreError> {
     debug_assert!(
         value.len() <= u8::MAX as usize,
@@ -194,15 +197,6 @@ pub(crate) fn encode_record(
     seq: u32,
     buf: &mut [u8],
 ) -> Result<usize, StoreError> {
-    // v1 record layout does not allocate TLV tags for opaque extras; a silent
-    // drop would lose user data on `save → load`. Reject explicitly until a
-    // future layout revision allocates extras tags.
-    if !config.extras().is_empty() {
-        return Err(StoreError::ExtrasNotSupported {
-            count: config.extras().len(),
-        });
-    }
-
     let profile = config.profile();
     let profile_str = profile.as_str();
     let profile_bytes = profile_str.as_bytes();
@@ -259,7 +253,12 @@ pub(crate) fn encode_record(
         TAG_WIFI_PASS,
         config.wifi_password().as_bytes(),
     )?;
-    write_tlv(buf, &mut pos, TAG_OTA_URL, config.ota_url().as_bytes())?;
+    write_tlv(
+        buf,
+        &mut pos,
+        TAG_OTA_URL,
+        config.ota_url().unwrap_or("").as_bytes(),
+    )?;
     write_tlv(
         buf,
         &mut pos,
@@ -292,6 +291,29 @@ pub(crate) fn encode_record(
             // future layout revision. For now encode an empty TLV section so decode
             // round-trips the profile correctly.
         }
+    }
+
+    // Opaque extras, one repeatable TLV each, in config order. The value is
+    // `key_len | key | value`; `ExtraField` caps keep it far below 255 B.
+    let extras = config.extras();
+    for (i, extra) in extras.iter().enumerate() {
+        let key = extra.key.as_bytes();
+        // The decoder rejects an empty or duplicate key, so writing one would
+        // lose the record at the next load. O(n²) over at most 8 extras.
+        if key.is_empty() || extras[..i].iter().any(|e| e.key == extra.key) {
+            return Err(StoreError::MalformedField { tag: TAG_EXTRA });
+        }
+        let value = extra.value.as_bytes();
+        let mut entry = [0u8; 1 + EXTRA_KEY_MAX_LEN + EXTRA_VALUE_MAX_LEN];
+        entry[0] = key.len() as u8;
+        entry[1..1 + key.len()].copy_from_slice(key);
+        entry[1 + key.len()..1 + key.len() + value.len()].copy_from_slice(value);
+        write_tlv(
+            buf,
+            &mut pos,
+            TAG_EXTRA,
+            &entry[..1 + key.len() + value.len()],
+        )?;
     }
 
     // Patch in record_len now that the full payload-before-CRC is known.
@@ -405,6 +427,7 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<DecodedRecord, StoreError> {
     let mut mqtt_user_bytes: Option<&[u8]> = None;
     let mut mqtt_pass_bytes: Option<&[u8]> = None;
     let mut mqtt_client_bytes: Option<&[u8]> = None;
+    let mut extra_values: heapless::Vec<&[u8], EXTRA_FIELDS_MAX> = heapless::Vec::new();
 
     /// Helper: assign `value` to `*slot`, returning `DuplicateTag` if the
     /// slot is already filled.
@@ -449,6 +472,9 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<DecodedRecord, StoreError> {
             TAG_MQTT_USER => set_once(&mut mqtt_user_bytes, tag, value)?,
             TAG_MQTT_PASS => set_once(&mut mqtt_pass_bytes, tag, value)?,
             TAG_MQTT_CLIENT => set_once(&mut mqtt_client_bytes, tag, value)?,
+            TAG_EXTRA => extra_values
+                .push(value)
+                .map_err(|_| StoreError::MalformedField { tag })?,
             // Unknown tags: skip silently (forward-compatibility).
             _ => {}
         }
@@ -487,6 +513,7 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<DecodedRecord, StoreError> {
         mqtt_user_bytes,
         mqtt_pass_bytes,
         mqtt_client_bytes,
+        &extra_values,
     )?;
 
     Ok(DecodedRecord {
@@ -494,6 +521,34 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<DecodedRecord, StoreError> {
         profile,
         config,
     })
+}
+
+/// Decode one `TAG_EXTRA` TLV value (`key_len | key | value`).
+///
+/// Fails closed: an empty entry, a zero, overlong or duplicate key, an
+/// overlong value, or invalid UTF-8 is an error, never a truncation or a skip.
+/// `earlier` holds the extras already decoded from this record.
+fn decode_extra(value: &[u8], earlier: &[ExtraField]) -> Result<ExtraField, StoreError> {
+    let malformed = StoreError::MalformedField { tag: TAG_EXTRA };
+    let (&key_len, rest) = value.split_first().ok_or(malformed.clone())?;
+    let key_len = key_len as usize;
+    if key_len == 0 || key_len > rest.len() || key_len > EXTRA_KEY_MAX_LEN {
+        return Err(malformed);
+    }
+    let (key_bytes, value_bytes) = rest.split_at(key_len);
+    if value_bytes.len() > EXTRA_VALUE_MAX_LEN {
+        return Err(malformed);
+    }
+    let utf8 = |b| core::str::from_utf8(b).map_err(|_| StoreError::InvalidUtf8 { tag: TAG_EXTRA });
+    let key_str = utf8(key_bytes)?;
+    if earlier.iter().any(|e| e.key.as_str() == key_str) {
+        return Err(malformed);
+    }
+    let mut key = heapless::String::new();
+    let mut val = heapless::String::new();
+    key.push_str(key_str).map_err(|_| malformed.clone())?;
+    val.push_str(utf8(value_bytes)?).map_err(|_| malformed)?;
+    Ok(ExtraField { key, value: val })
 }
 
 /// Build a [`ProvisioningConfig`] from decoded byte slices.
@@ -521,6 +576,7 @@ fn build_config(
     mqtt_user_bytes: Option<&[u8]>,
     mqtt_pass_bytes: Option<&[u8]>,
     mqtt_client_bytes: Option<&[u8]>,
+    extra_values: &[&[u8]],
 ) -> Result<ProvisioningConfig, StoreError> {
     use heapless::String as HString;
 
@@ -545,6 +601,14 @@ fn build_config(
     let ota_url: HString<OTA_URL_MAX_LEN> = bytes_to_hstring(ota_url_bytes, TAG_OTA_URL)?;
     let device_name: HString<DEVICE_NAME_MAX_LEN> =
         bytes_to_hstring(device_name_bytes, TAG_DEVICE_NAME)?;
+
+    let mut extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX> = heapless::Vec::new();
+    for value in extra_values {
+        let extra = decode_extra(value, &extras)?;
+        extras
+            .push(extra)
+            .map_err(|_| StoreError::MalformedField { tag: TAG_EXTRA })?;
+    }
 
     let mqtt = match profile {
         SchemaProfile::WifiMqttDevice => {
@@ -571,6 +635,7 @@ fn build_config(
         device_name,
         None,
         mqtt,
+        extras,
     ))
 }
 
@@ -663,6 +728,7 @@ mod tests {
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
             Some(mqtt),
+            heapless::Vec::new(),
         )
     }
 
@@ -1004,11 +1070,11 @@ mod tests {
             juggler::provisioning::SchemaProfile::WifiMqttDevice,
         )
         .expect("ota_url is optional for WifiMqttDevice");
-        assert_eq!(config.ota_url(), "");
+        assert_eq!(config.ota_url(), None);
         let mut buf = [0u8; SECTOR_SIZE];
         let len = encode_record(&config, 1, &mut buf).unwrap();
         let decoded = decode_record(&buf[..len]).unwrap();
-        assert_eq!(decoded.config.ota_url(), "");
+        assert_eq!(decoded.config.ota_url(), None);
         assert_eq!(decoded.config.device_name(), "clock");
     }
 
@@ -1089,7 +1155,10 @@ mod tests {
         assert_eq!(decoded.seq, 42);
         assert_eq!(decoded.config.wifi_ssid(), "ssid-lock");
         assert_eq!(decoded.config.wifi_password(), test_wifi_psk());
-        assert_eq!(decoded.config.ota_url(), "http://ota.example.com/fw.bin");
+        assert_eq!(
+            decoded.config.ota_url(),
+            Some("http://ota.example.com/fw.bin")
+        );
         assert_eq!(decoded.config.device_name(), "test-device");
         let mqtt = decoded.config.mqtt().unwrap();
         assert_eq!(mqtt.host(), "host-lock.example.com");
@@ -1190,10 +1259,11 @@ mod tests {
         // by one of the cases above.
         //
         // `TooSmall`, `NotAligned`, `OffsetOutOfBounds`, `UnsupportedGeometry`,
-        // `ExtrasNotSupported`, and `Flash` are not produced by `decode_record`
-        // or by `encode_record` against the sample config — they are exercised
-        // by the `store::tests::store_open_*` and `extras_rejected_at_encode`
-        // tests instead, which also assert no input bytes leak.
+        // and `Flash` are not produced by `decode_record` or by
+        // `encode_record` against the sample config — they are exercised by
+        // the `store::tests::store_open_*` tests instead, which also assert no
+        // input bytes leak. `MalformedField` is produced by `decode_record` and
+        // covered by `malformed_extras_are_rejected`.
         fn _exhaustiveness_lock(err: StoreError) {
             match err {
                 StoreError::TooSmall { .. }
@@ -1206,7 +1276,7 @@ mod tests {
                 | StoreError::ShortRecord { .. }
                 | StoreError::UnknownProfile { .. }
                 | StoreError::BufferTooSmall { .. }
-                | StoreError::ExtrasNotSupported { .. }
+                | StoreError::MalformedField { .. }
                 | StoreError::MissingRequiredField { .. }
                 | StoreError::DuplicateTag { .. }
                 | StoreError::InvalidUtf8 { .. }
@@ -1415,31 +1485,278 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extras_rejected_at_encode() {
-        // Build a config carrying one opaque extra via `parse_form`, then
-        // assert the encoder rejects it rather than silently dropping it.
-        use juggler::provisioning::parse_form;
-        let body = "wifi_ssid=open-sesame&wifi_pass=secret-pass\
-                    &mqtt_uri=mqtt://broker.example.com:1883\
-                    &ota_url=http://example.com/fw.bin&dev_name=hive\
-                    &custom_field=custom-value";
-        let cfg = parse_form(body, SchemaProfile::WifiMqttDevice).expect("valid fixture body");
-        assert_eq!(cfg.extras().len(), 1, "fixture should produce one extra");
+    /// Fill a `heapless::String` to its cap with a repeating `seed`.
+    fn fill<const N: usize>(seed: &str) -> heapless::String<N> {
+        let mut h = heapless::String::new();
+        while h.len() < N {
+            let take = (N - h.len()).min(seed.len());
+            h.push_str(&seed[..take]).unwrap();
+        }
+        h
+    }
 
-        let mut buf = [0u8; SECTOR_SIZE];
-        let result = encode_record(&cfg, 1, &mut buf);
-        assert_eq!(
-            result,
-            Err(StoreError::ExtrasNotSupported { count: 1 }),
-            "encoder must refuse non-empty extras until a future layout adds tags"
+    /// `n` extras with 13-byte keys and 64-byte values, distinct per index.
+    fn make_extras(n: usize) -> heapless::Vec<ExtraField, EXTRA_FIELDS_MAX> {
+        let mut v = heapless::Vec::new();
+        for i in 0..n {
+            let key_seed = alloc::format!("k{i}-");
+            let value_seed = alloc::format!("{}{i}", test_mqtt_psk());
+            let _ = v.push(ExtraField {
+                key: fill::<EXTRA_KEY_MAX_LEN>(&key_seed),
+                value: fill::<EXTRA_VALUE_MAX_LEN>(&value_seed),
+            });
+        }
+        v
+    }
+
+    /// A `WifiMqttDevice` config with every field at its cap plus `n` extras.
+    fn make_full_config(n_extras: usize) -> ProvisioningConfig {
+        let mqtt = MqttFields::from_storage_parts(
+            fill::<MQTT_HOST_MAX_LEN>("h"),
+            1883,
+            Some(fill::<MQTT_USER_MAX_LEN>("u")),
+            Some(fill::<MQTT_PASS_MAX_LEN>(test_mqtt_psk())),
+            Some(fill::<CLIENT_ID_MAX_LEN>("c")),
         );
+        ProvisioningConfig::from_storage_parts(
+            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<OTA_URL_MAX_LEN>("o"),
+            fill::<DEVICE_NAME_MAX_LEN>("d"),
+            None,
+            Some(mqtt),
+            make_extras(n_extras),
+        )
+    }
 
-        // Error variant must not leak the extra's key or value.
-        let err = result.err().unwrap();
-        let debug_str = format!("{err:?}");
-        assert!(!debug_str.contains("custom_field"));
-        assert!(!debug_str.contains("custom-value"));
+    /// Standard Core + MQTT TLVs of a valid `wifi_mqtt` record.
+    fn base_tlvs() -> [(u8, &'static [u8]); 6] {
+        [
+            (TAG_WIFI_SSID, b"ssid"),
+            (TAG_WIFI_PASS, b"pass"),
+            (TAG_OTA_URL, b"http://o/fw"),
+            (TAG_DEVICE_NAME, b"dev"),
+            (TAG_MQTT_HOST, b"b.local"),
+            (TAG_MQTT_PORT, &[0x5B, 0x07]),
+        ]
+    }
+
+    #[test]
+    fn extras_round_trip_at_every_cap() {
+        let cfg = make_full_config(EXTRA_FIELDS_MAX);
+        assert_eq!(cfg.extras().len(), EXTRA_FIELDS_MAX);
+
+        let mut buf = [0u8; 2048];
+        let len = encode_record(&cfg, 7, &mut buf).expect("worst-case record encodes");
+        assert_eq!(len, 508 + 640, "worst-case record is 1148 B");
+        assert!(len <= super::super::store::MAX_RECORD_LEN);
+
+        let decoded = decode_record(&buf[..len]).expect("worst-case record decodes");
+        assert_eq!(decoded.config, cfg);
+        assert_eq!(decoded.config.extras(), cfg.extras());
+    }
+
+    #[test]
+    fn record_without_extras_emits_no_extra_tlv() {
+        let cfg = make_full_config(0);
+        let mut buf = [0u8; 2048];
+        let len = encode_record(&cfg, 1, &mut buf).unwrap();
+        assert_eq!(len, 508);
+
+        let mut pos = HEADER_FIXED + buf[PROFILE_LEN_OFFSET] as usize;
+        while pos < len - CRC_LEN {
+            assert_ne!(
+                buf[pos], TAG_EXTRA,
+                "no TAG_EXTRA in a record without extras"
+            );
+            pos += 2 + buf[pos + 1] as usize;
+        }
+    }
+
+    /// A `wifi_mqtt` record as 0.6.x firmware wrote it, captured byte for byte
+    /// from the encoder (whose output without extras is unchanged since 0.6.x,
+    /// see `record_without_extras_emits_no_extra_tlv`).
+    ///
+    /// Fields: seq 3, SSID `legacy-ssid`, empty Wi-Fi password (open network),
+    /// OTA URL `http://ota.example.com/fw.bin`, device name `test-device`,
+    /// MQTT host `192.168.1.10`, port 1883, no MQTT username, password or
+    /// client id, no extras. No secret-shaped value appears in the bytes.
+    const LEGACY_0_6_RECORD: &[u8] = &[
+        0x52, 0x50, 0x46, 0x52, 0x01, 0x03, 0x00, 0x00, 0x00, 0x66, 0x00, 0x09, //
+        0x77, 0x69, 0x66, 0x69, 0x5F, 0x6D, 0x71, 0x74, 0x74, 0x01, 0x0B, 0x6C, //
+        0x65, 0x67, 0x61, 0x63, 0x79, 0x2D, 0x73, 0x73, 0x69, 0x64, 0x02, 0x00, //
+        0x08, 0x1D, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x6F, 0x74, 0x61, //
+        0x2E, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x2E, 0x63, 0x6F, 0x6D, //
+        0x2F, 0x66, 0x77, 0x2E, 0x62, 0x69, 0x6E, 0x09, 0x0B, 0x74, 0x65, 0x73, //
+        0x74, 0x2D, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x03, 0x0C, 0x31, 0x39, //
+        0x32, 0x2E, 0x31, 0x36, 0x38, 0x2E, 0x31, 0x2E, 0x31, 0x30, 0x04, 0x02, //
+        0x5B, 0x07, 0x30, 0x74, 0xDB, 0xFE,
+    ];
+
+    /// The config [`LEGACY_0_6_RECORD`] holds.
+    fn legacy_fixture_config() -> ProvisioningConfig {
+        make_wifi_mqtt_config("legacy-ssid", "", "192.168.1.10", 1883, None, None, None)
+    }
+
+    #[test]
+    fn legacy_record_decodes_with_empty_extras() {
+        let expected = legacy_fixture_config();
+        let decoded = decode_record(LEGACY_0_6_RECORD).expect("0.6.x record decodes");
+        assert_eq!(decoded.seq, 3);
+        assert!(decoded.config.extras().is_empty());
+        assert_eq!(decoded.config, expected);
+
+        // The current encoder still emits the 0.6.x bytes for this config.
+        let mut buf = [0u8; 2048];
+        let len = encode_record(&expected, 3, &mut buf).unwrap();
+        assert_eq!(&buf[..len], LEGACY_0_6_RECORD);
+    }
+
+    #[test]
+    fn unknown_tag_between_known_tags_is_skipped() {
+        let base = base_tlvs();
+        let mut tlvs = alloc::vec::Vec::new();
+        tlvs.push(base[0]);
+        tlvs.push((0x7E, b"future" as &[u8]));
+        tlvs.extend_from_slice(&base[1..]);
+        let (buf, len) = build_record_with_tlvs(SchemaProfile::WifiMqttDevice, 1, &tlvs);
+        let decoded = decode_record(&buf[..len]).expect("unknown tag skipped");
+        assert_eq!(decoded.config.wifi_ssid(), "ssid");
+        assert!(decoded.config.extras().is_empty());
+    }
+
+    fn decode_with_extras(extras: &[alloc::vec::Vec<u8>]) -> Result<DecodedRecord, StoreError> {
+        let mut tlvs: alloc::vec::Vec<(u8, &[u8])> = base_tlvs().to_vec();
+        for e in extras {
+            tlvs.push((TAG_EXTRA, e.as_slice()));
+        }
+        let (buf, len) = build_record_with_tlvs(SchemaProfile::WifiMqttDevice, 1, &tlvs);
+        decode_record(&buf[..len])
+    }
+
+    fn extra_entry(key: &[u8], value: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![key.len() as u8];
+        v.extend_from_slice(key);
+        v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn eight_extras_decode_and_nine_are_rejected() {
+        let ok: alloc::vec::Vec<_> = (0..8).map(|i| extra_entry(&[b'a' + i], b"v")).collect();
+        let decoded = decode_with_extras(&ok).expect("eight extras decode");
+        assert_eq!(decoded.config.extras().len(), 8);
+
+        let nine: alloc::vec::Vec<_> = (0..9).map(|i| extra_entry(&[b'a' + i], b"v")).collect();
+        assert_eq!(
+            decode_with_extras(&nine),
+            Err(StoreError::MalformedField { tag: TAG_EXTRA })
+        );
+    }
+
+    #[test]
+    fn malformed_extras_are_rejected() {
+        let malformed = Err(StoreError::MalformedField { tag: TAG_EXTRA });
+        // key_len of zero
+        assert_eq!(decode_with_extras(&[alloc::vec![0u8, b'v']]), malformed);
+        // key_len past the TLV end
+        assert_eq!(
+            decode_with_extras(&[alloc::vec![5u8, b'k', b'v']]),
+            malformed
+        );
+        // empty TLV value
+        assert_eq!(decode_with_extras(&[alloc::vec![]]), malformed);
+        // key longer than EXTRA_KEY_MAX_LEN
+        assert_eq!(
+            decode_with_extras(&[extra_entry(&[b'k'; EXTRA_KEY_MAX_LEN + 1], b"v")]),
+            malformed
+        );
+        // value longer than EXTRA_VALUE_MAX_LEN
+        assert_eq!(
+            decode_with_extras(&[extra_entry(b"k", &[b'v'; EXTRA_VALUE_MAX_LEN + 1])]),
+            malformed
+        );
+        // invalid UTF-8 in key
+        assert_eq!(
+            decode_with_extras(&[extra_entry(&[0xFF, 0xFE], b"v")]),
+            Err(StoreError::InvalidUtf8 { tag: TAG_EXTRA })
+        );
+    }
+
+    #[test]
+    fn duplicate_extra_key_is_rejected() {
+        assert_eq!(
+            decode_with_extras(&[extra_entry(b"k", b"1"), extra_entry(b"k", b"2")]),
+            Err(StoreError::MalformedField { tag: TAG_EXTRA })
+        );
+    }
+
+    #[test]
+    fn encode_rejects_extra_with_empty_key() {
+        let mut cfg = make_full_config(0);
+        let mut extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX> = heapless::Vec::new();
+        let _ = extras.push(ExtraField {
+            key: heapless::String::new(),
+            value: fill::<EXTRA_VALUE_MAX_LEN>(test_wifi_psk()),
+        });
+        cfg = ProvisioningConfig::from_storage_parts(
+            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<OTA_URL_MAX_LEN>("o"),
+            fill::<DEVICE_NAME_MAX_LEN>("d"),
+            None,
+            cfg.mqtt().cloned(),
+            extras,
+        );
+        let mut buf = [0u8; 2048];
+        assert_eq!(
+            encode_record(&cfg, 1, &mut buf),
+            Err(StoreError::MalformedField { tag: TAG_EXTRA })
+        );
+    }
+
+    #[test]
+    fn encode_rejects_duplicate_extra_keys() {
+        let base = make_full_config(0);
+        let mut extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX> = heapless::Vec::new();
+        for value in ["1", "2"] {
+            let _ = extras.push(ExtraField {
+                key: fill::<EXTRA_KEY_MAX_LEN>("zone"),
+                value: fill::<EXTRA_VALUE_MAX_LEN>(value),
+            });
+        }
+        let cfg = ProvisioningConfig::from_storage_parts(
+            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<OTA_URL_MAX_LEN>("o"),
+            fill::<DEVICE_NAME_MAX_LEN>("d"),
+            None,
+            base.mqtt().cloned(),
+            extras,
+        );
+        let mut buf = [0u8; 2048];
+        assert_eq!(
+            encode_record(&cfg, 1, &mut buf),
+            Err(StoreError::MalformedField { tag: TAG_EXTRA })
+        );
+    }
+
+    /// Host sizes are upper bounds for the riscv32 target (host `usize` is
+    /// 8 B, target 4 B). The stack figures in `store.rs`, `portal.rs` and the
+    /// HAL provision examples are derived from these numbers: update them if
+    /// this test has to be loosened.
+    #[test]
+    fn provisioning_type_sizes_stay_within_documented_bounds() {
+        use core::mem::size_of;
+        assert!(size_of::<ProvisioningConfig>() <= 1432);
+        assert!(size_of::<DecodedRecord>() <= 1440);
+        assert!(size_of::<heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>>() <= 776);
+    }
+
+    #[test]
+    fn extras_errors_do_not_leak_key_or_value() {
+        let err = decode_with_extras(&[extra_entry(b"", LEAK_SENTINEL.as_bytes())]).unwrap_err();
+        assert!(!format!("{err:?}").contains(LEAK_SENTINEL));
     }
 
     #[test]

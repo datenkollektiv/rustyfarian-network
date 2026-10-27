@@ -204,6 +204,13 @@ A non-empty value is still validated (plain `http://` with a non-empty host, max
 Motivation: `rustyfarian-rgb-clock` uses `WifiMqttDevice` but implements no OTA; users previously had to invent a placeholder URL.
 NVS/flash layout unchanged — both stores already round-trip empty strings.
 
+## Amendment 2026-10-27 — IDF in-memory type is `ProvisioningConfig`
+
+The IDF tier now loads the stored record as `juggler::provisioning::ProvisioningConfig`, the same type the HAL tier and the portal commit use; `StoredConfig` is removed.
+`ProvisioningConfig::ota_url()` returns `Option<&str>`, with `None` replacing the empty string described in the 2026-09-26 amendment.
+The NVS key layout in §4 is unchanged, and records written by 0.6.x firmware load unchanged.
+See `docs/features/provisioning-boot-identity-v1.md`.
+
 ## References
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; locks the four-field schema and the extras escape hatch this ADR builds on and generalises.
