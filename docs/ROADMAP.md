@@ -34,7 +34,7 @@ timeline
     title rustyfarian-network Roadmap
 
     Ready     : esp-hal SoftAP bring-up for ssid_override parity with esp-idf — start takes AP peripherals, resolves SSID via shared resolver against real AP MAC, broadcasts either verbatim override or prefix-plus-MAC default, completes hal half of ssid-override (feature-doc)
-              : Provisioning boot identity on one juggler type — WifiMqttBoot and the IDF store hand out ProvisioningConfig, device_name and ota_url accessors on both tiers, secret-free Debug, extras persisted on esp-hal too, subsumes StoredConfig Debug redaction (feature-doc)
+              : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
@@ -44,7 +44,8 @@ timeline
               : MQTT subscribe-during-shutdown race fix — detached subscriber thread spawned on Connected can block forever in esp_mqtt_client_subscribe if last MqttHandle is dropped before SUBACK, track in-flight subscriptions via a shared atomic counter, gate event-loop exit on count==0 so the loop keeps pumping events until SubscribeAck arrives, also close the window where is_connected() reads true before the subscriber thread has sent SUBSCRIBE
               : LED/timeout dedup — extract the shared status-LED pulse + timeout-poll loop duplicated between rustyfarian-esp-idf-network (blocking vs LED paths) and MqttBuilder.build_and_wait into one helper
               : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
-              : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap              : OTA runtime Watchtower v2 second-device validation — adopt the runtime on second consumer (Watchtower C3-DevKitM-1), validate against reference runbook
+              : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
+              : OTA runtime Watchtower v2 second-device validation — adopt the runtime on second consumer (Watchtower C3-DevKitM-1), validate against reference runbook
               : cargo semver-checks recipe — add a just recipe that checks for breaking changes before the 0.6.0 release
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence

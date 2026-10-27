@@ -33,10 +33,11 @@ use esp_idf_svc::http::Method;
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
 use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, RESUBMIT_HINT, WIFI_MQTT_PORTAL_HTML};
 use juggler::provisioning::{
-    parse_form, Field, FieldErrors, PortalDefaults, ProvisioningInput, SchemaProfile,
+    parse_form, Field, FieldErrors, PortalDefaults, ProvisioningConfig, ProvisioningInput,
+    SchemaProfile,
 };
 
-use crate::provisioning::store::{ProvisioningStore, StoredConfig};
+use crate::provisioning::store::ProvisioningStore;
 use crate::provisioning::{ProvisioningEvent, SharedState};
 
 /// Selects the shared template for `profile`.
@@ -566,25 +567,31 @@ fn load_prefill(
 /// A stored record under the *other* profile must not pre-fill this form (its
 /// fields do not map), so it is treated like an empty store.
 fn prefill_for(
-    stored: Option<StoredConfig>,
+    stored: Option<ProvisioningConfig>,
     profile: SchemaProfile,
     defaults: &PortalDefaultsOwned,
     device_name: &str,
 ) -> Prefill {
     match stored {
-        Some(cfg) if cfg.profile == profile => {
+        Some(cfg) if cfg.profile() == profile => {
+            let lora = cfg.lora();
+            let mqtt = cfg.mqtt();
             let mut prefill = Prefill {
-                wifi_ssid: cfg.wifi_ssid,
-                dev_eui: cfg.dev_eui_hex,
-                join_eui: cfg.join_eui_hex,
+                wifi_ssid: cfg.wifi_ssid().to_owned(),
+                dev_eui: lora.map(|l| l.dev_eui_hex().to_owned()).unwrap_or_default(),
+                join_eui: lora
+                    .map(|l| l.join_eui_hex().to_owned())
+                    .unwrap_or_default(),
                 mqtt_uri: String::new(),
-                mqtt_user: cfg.mqtt_user.unwrap_or_default(),
-                mqtt_client: cfg.mqtt_client.unwrap_or_default(),
-                ota_url: cfg.ota_url,
-                dev_name: cfg.device_name,
+                mqtt_user: mqtt.and_then(|m| m.username()).unwrap_or("").to_owned(),
+                mqtt_client: mqtt.and_then(|m| m.client_id()).unwrap_or("").to_owned(),
+                ota_url: cfg.ota_url().unwrap_or("").to_owned(),
+                dev_name: cfg.device_name().to_owned(),
             };
             if profile == SchemaProfile::WifiMqttDevice {
-                prefill.mqtt_uri = compose_mqtt_uri(&cfg.mqtt_host, &cfg.mqtt_port.to_string());
+                if let Some(m) = mqtt {
+                    prefill.mqtt_uri = compose_mqtt_uri(m.host(), &m.port().to_string());
+                }
             }
             prefill
         }
@@ -792,7 +799,7 @@ const SESSION_FINISHED_BODY: &[u8] =
       another submission; nothing was changed. Wait for the device to restart.";
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -922,7 +929,7 @@ mod tests {
     /// Runtime-generated secret fixture (16 hex digits from a fresh
     /// `RandomState`), so no string literal flows into a password field — see
     /// `test_psk()` in `juggler::wifi` for why.
-    fn test_secret() -> String {
+    pub(crate) fn test_secret() -> String {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
 
@@ -946,23 +953,26 @@ mod tests {
         format!("{:08x}", hasher.finish() as u32)
     }
 
-    fn stored_wifi_mqtt(device_name: &str) -> StoredConfig {
-        StoredConfig {
-            profile: SchemaProfile::WifiMqttDevice,
-            wifi_ssid: "StoredNet".to_string(),
-            wifi_password: test_secret(),
-            dev_eui_hex: String::new(),
-            join_eui_hex: String::new(),
-            app_key_hex: String::new(),
-            mqtt_host: "stored.local".to_string(),
-            mqtt_port: 8883,
-            mqtt_user: Some("stored-user".to_string()),
-            mqtt_pass: Some(test_secret()),
-            mqtt_client: None,
-            ota_url: String::new(),
-            device_name: device_name.to_string(),
-            extras: Vec::new(),
-        }
+    /// A `WifiMqttDevice` record with runtime-generated secrets, built the
+    /// way [`ProvisioningStore::load`] builds one; shared with the `store` and
+    /// `boot` redaction tests.
+    pub(crate) fn stored_wifi_mqtt(device_name: &str) -> ProvisioningConfig {
+        let mqtt = juggler::provisioning::MqttFields::from_storage_parts(
+            "stored.local".try_into().unwrap(),
+            8883,
+            Some("stored-user".try_into().unwrap()),
+            Some(test_secret().as_str().try_into().unwrap()),
+            None,
+        );
+        ProvisioningConfig::from_storage_parts(
+            "StoredNet".try_into().unwrap(),
+            test_secret().as_str().try_into().unwrap(),
+            "".try_into().unwrap(),
+            device_name.try_into().unwrap(),
+            None,
+            Some(mqtt),
+            Default::default(),
+        )
     }
 
     #[test]
@@ -1010,8 +1020,12 @@ mod tests {
     fn stored_prefill_never_renders_secrets() {
         let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
         let stored = stored_wifi_mqtt("dev");
-        let wifi_password = stored.wifi_password.clone();
-        let mqtt_pass = stored.mqtt_pass.clone().unwrap_or_default();
+        let wifi_password = stored.wifi_password().to_owned();
+        let mqtt_pass = stored
+            .mqtt()
+            .and_then(|m| m.password())
+            .unwrap_or_default()
+            .to_owned();
         let p = prefill_for(
             Some(stored),
             SchemaProfile::WifiMqttDevice,

@@ -243,6 +243,17 @@ fn main() -> anyhow::Result<()> {
         wifi_pass_state,
     );
 
+    // The device identity comes from the same load — no second store read.
+    log::info!(
+        "Device identity: device_name={}, ota_url={}",
+        boot.device_name(),
+        if boot.ota_url().is_some() {
+            "set"
+        } else {
+            "not set"
+        },
+    );
+
     log::info!("A real application would now proceed to normal STA + MQTT boot.");
     // WiFiManager::new_without_led(modem, sys_loop, Some(nvs), wifi_cfg)?;
     // MqttBuilder::new(mqtt_cfg).build()?;

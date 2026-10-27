@@ -142,6 +142,11 @@ check-provisioning:
 clippy-provisioning-tests:
     cargo clippy -p rustyfarian-esp-idf-network --features provisioning --tests --target-dir {{ idf_dir }} -- -D warnings
 
+# type-check (clippy) the esp-idf provisioning + mqtt unit tests, incl. the WifiMqttBoot boot helper (they cannot run on the host)
+[group('build')]
+clippy-provisioning-mqtt-tests:
+    cargo clippy -p rustyfarian-esp-idf-network --features provisioning,mqtt --tests --target-dir {{ idf_dir }} -- -D warnings
+
 # check the esp-idf espnow domain of the consolidated ESP-IDF network crate
 [group('build')]
 check-espnow:
@@ -438,6 +443,11 @@ mqtt-pub topic message:
 mqtt-status:
     mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/status" -C 1 -W 5
 
+# submit the provisioning form with x_* extras to a running SoftAP portal (WIFI_*, MQTT_*, OTA_URL, DEVICE_NAME from the dotenv file); positional args, e.g. `just portal-save 192.168.4.1 8 13 64`; extras 9, key_len 14 or value_len 65 exceed the caps and return 400; key_len must be at least 5
+[group('examples')]
+portal-save host="192.168.4.1" extras="2" key_len="6" value_len="8":
+    scripts/portal-save.sh "{{ host }}" "{{ extras }}" "{{ key_len }}" "{{ value_len }}"
+
 # ── maintenance ───────────────────────────────────────────────────────────
 
 # clean build artifacts (target/ide, hal and idf target dirs)
@@ -570,6 +580,7 @@ verify:
     just ci
     just check-idf
     just clippy-provisioning-tests
+    just clippy-provisioning-mqtt-tests
     just clippy-ota-pure
     just clippy-ota-mqtt-idf
     just check-hal

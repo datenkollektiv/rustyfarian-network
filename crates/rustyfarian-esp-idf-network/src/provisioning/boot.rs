@@ -29,67 +29,50 @@ mod inner {
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
     use juggler::mqtt::resolve_client_id;
-    use juggler::provisioning::SchemaProfile;
+    use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
     use crate::mqtt::MqttConfig;
-    use crate::provisioning::store::{ProvisioningStore, StoredConfig};
+    use crate::provisioning::store::ProvisioningStore;
     use crate::provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningEvent, SessionWait};
     use crate::wifi::WiFiConfig;
 
     /// Experimental: API may change before 1.0.
     ///
-    /// An owned bundle of resolved Wi-Fi and MQTT configuration strings read
-    /// from the NVS provisioning store.
+    /// The provisioned `WifiMqttDevice` record read from the NVS provisioning
+    /// store, plus the resolved MQTT client ID.
     ///
     /// Construct via [`WifiMqttBoot::load`] or [`WifiMqttBoot::load_with`];
     /// borrow configs via [`wifi_config`](Self::wifi_config) and
     /// [`mqtt_config`](Self::mqtt_config).  The borrowed configs are valid for
     /// as long as this struct is alive — no `Box::leak`, no `'static`
-    /// gymnastics required in the consumer.
+    /// gymnastics required in the consumer.  The device identity is available
+    /// without a second store read via [`device_name`](Self::device_name),
+    /// [`ota_url`](Self::ota_url), and [`config`](Self::config) (extras and
+    /// every other stored field).
+    ///
+    /// The stored record is a [`ProvisioningConfig`] moved out of the store,
+    /// never cloned, and heap-allocated exactly once (in `load_with`), so the
+    /// roughly 1.3 KB record is boxed for its lifetime; one by-value copy still
+    /// crosses the boot task's stack during `load` and the `Box::new` (bug 002).
+    /// Its secrets are scrubbed on drop through the `Box`.
     ///
     /// # Debug output
     ///
-    /// The `Debug` impl redacts credential fields (`wifi_password`, `mqtt_pass`,
-    /// `mqtt_user`) by length only, e.g. `wifi_password: "<redacted, len=8>"`.
-    /// Non-secret fields (`wifi_ssid`, `mqtt_host`, `mqtt_port`,
-    /// `mqtt_client_id`) are shown as-is.
+    /// The `Debug` impl prints `config` through [`ProvisioningConfig`]'s
+    /// redacting `Debug`: `wifi_password`, `mqtt_pass`, and every extra value
+    /// show as `"<redacted>"` with no length; the MQTT username, host, port,
+    /// SSID, device name, and OTA URL are shown as-is.  `mqtt_client_id` is
+    /// shown as-is.
     pub struct WifiMqttBoot {
-        // Wi-Fi
-        wifi_ssid: String,
-        wifi_password: String,
-        // MQTT
-        mqtt_host: String,
-        mqtt_port: u16,
+        config: Box<ProvisioningConfig>,
         mqtt_client_id: String,
-        mqtt_user: Option<String>,
-        mqtt_pass: Option<String>,
     }
 
     impl std::fmt::Debug for WifiMqttBoot {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("WifiMqttBoot")
-                .field("wifi_ssid", &self.wifi_ssid)
-                .field(
-                    "wifi_password",
-                    &format_args!("<redacted, len={}>", self.wifi_password.len()),
-                )
-                .field("mqtt_host", &self.mqtt_host)
-                .field("mqtt_port", &self.mqtt_port)
+                .field("config", &self.config)
                 .field("mqtt_client_id", &self.mqtt_client_id)
-                .field(
-                    "mqtt_user",
-                    &self
-                        .mqtt_user
-                        .as_deref()
-                        .map(|u| format!("<redacted, len={}>", u.len())),
-                )
-                .field(
-                    "mqtt_pass",
-                    &self
-                        .mqtt_pass
-                        .as_deref()
-                        .map(|p| format!("<redacted, len={}>", p.len())),
-                )
                 .finish()
         }
     }
@@ -112,9 +95,9 @@ mod inner {
         /// [`WifiMqttLoadOutcome::OtherProfile`].
         pub fn load(nvs: EspDefaultNvsPartition) -> anyhow::Result<WifiMqttLoadOutcome> {
             Self::load_with(nvs, |cfg| {
-                let chosen =
-                    resolve_client_id(cfg.mqtt_client.as_deref(), &cfg.device_name, "rustyfarian")
-                        .map_err(|e| anyhow::anyhow!("client-id resolution failed: {}", e))?;
+                let operator_id = cfg.mqtt().and_then(|m| m.client_id());
+                let chosen = resolve_client_id(operator_id, cfg.device_name(), "rustyfarian")
+                    .map_err(|e| anyhow::anyhow!("client-id resolution failed: {}", e))?;
                 Ok(chosen.to_owned())
             })
         }
@@ -124,8 +107,8 @@ mod inner {
         /// Like [`load`](Self::load) but uses `client_id_fn` to derive the MQTT
         /// client ID instead of the built-in policy.
         ///
-        /// `client_id_fn` receives the full [`StoredConfig`] (for access to any
-        /// field, including extras) and returns an owned `String`.  The returned
+        /// `client_id_fn` receives the full [`ProvisioningConfig`] (for access
+        /// to any field, including extras) and returns an owned `String`.  The returned
         /// ID is validated via [`juggler::mqtt::validate_client_id`]; an invalid
         /// ID is surfaced as `Err`.
         ///
@@ -133,12 +116,12 @@ mod inner {
         ///
         /// ```ignore
         /// WifiMqttBoot::load_with(nvs, |cfg| {
-        ///     Ok(format!("my-{}", cfg.device_name.chars().take(8).collect::<String>()))
+        ///     Ok(format!("my-{}", cfg.device_name().chars().take(8).collect::<String>()))
         /// })?;
         /// ```
         pub fn load_with(
             nvs: EspDefaultNvsPartition,
-            client_id_fn: impl FnOnce(&StoredConfig) -> anyhow::Result<String>,
+            client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
         ) -> anyhow::Result<WifiMqttLoadOutcome> {
             let store = ProvisioningStore::open(nvs)?;
             let cfg = match store.load()? {
@@ -146,8 +129,8 @@ mod inner {
                 Some(c) => c,
             };
 
-            if cfg.profile != SchemaProfile::WifiMqttDevice {
-                return Ok(WifiMqttLoadOutcome::OtherProfile(cfg.profile));
+            if cfg.mqtt().is_none() {
+                return Ok(WifiMqttLoadOutcome::OtherProfile(cfg.profile()));
             }
 
             let client_id = client_id_fn(&cfg)?;
@@ -156,22 +139,53 @@ mod inner {
             juggler::mqtt::validate_client_id(&client_id)
                 .map_err(|e| anyhow::anyhow!("client-id validation failed: {}", e))?;
 
+            // `cfg` is moved, never cloned, and boxed exactly once here so the
+            // ~1.3 KB record leaves the stack (bug 002).
             Ok(WifiMqttLoadOutcome::Ready(WifiMqttBoot {
-                wifi_ssid: cfg.wifi_ssid,
-                wifi_password: cfg.wifi_password,
-                mqtt_host: cfg.mqtt_host,
-                mqtt_port: cfg.mqtt_port,
+                config: Box::new(cfg),
                 mqtt_client_id: client_id,
-                mqtt_user: cfg.mqtt_user,
-                mqtt_pass: cfg.mqtt_pass,
             }))
+        }
+
+        /// Test-only constructor that bypasses NVS.
+        #[cfg(test)]
+        pub(super) fn from_parts_for_test(
+            config: ProvisioningConfig,
+            mqtt_client_id: String,
+        ) -> Self {
+            Self {
+                config: Box::new(config),
+                mqtt_client_id,
+            }
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// The stored device name.
+        pub fn device_name(&self) -> &str {
+            self.config.device_name()
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// The stored OTA update URL, or `None` when no OTA URL is configured.
+        pub fn ota_url(&self) -> Option<&str> {
+            self.config.ota_url()
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// The full stored record, for extras and any field without a
+        /// dedicated accessor here.
+        pub fn config(&self) -> &ProvisioningConfig {
+            &self.config
         }
 
         /// Experimental: API may change before 1.0.
         ///
         /// Returns a borrowed [`WiFiConfig`] backed by strings owned by this struct.
         pub fn wifi_config(&self) -> WiFiConfig<'_> {
-            WiFiConfig::new(&self.wifi_ssid, &self.wifi_password)
+            WiFiConfig::new(self.config.wifi_ssid(), self.config.wifi_password())
         }
 
         /// Experimental: API may change before 1.0.
@@ -183,7 +197,13 @@ mod inner {
         /// - `user` only → [`with_username_only`](MqttConfig::with_username_only)
         /// - neither → anonymous
         pub fn mqtt_config(&self) -> MqttConfig<'_> {
-            let config = MqttConfig::new(&self.mqtt_host, self.mqtt_port, &self.mqtt_client_id);
+            // `load_with` only constructs a `WifiMqttBoot` from a record whose
+            // MQTT group is present, so the `None` arm is unreachable.
+            let Some(mqtt) = self.config.mqtt() else {
+                debug_assert!(false, "WifiMqttBoot holds a record without an MQTT group");
+                return MqttConfig::new("", 0, &self.mqtt_client_id);
+            };
+            let config = MqttConfig::new(mqtt.host(), mqtt.port(), &self.mqtt_client_id);
             // Every auth shape is matched explicitly — nothing is folded into a
             // catch-all — so a malformed `(None, Some(pass))` cannot silently become
             // anonymous. That shape is in fact unreachable: a password without a
@@ -191,7 +211,7 @@ mod inner {
             // `juggler::provisioning::parse_form` (test
             // `auth_password_without_user_rejected_on_mqtt_pass`), and MQTT 3.1.1
             // forbids a password field without a username.
-            match (self.mqtt_user.as_deref(), self.mqtt_pass.as_deref()) {
+            match (mqtt.username(), mqtt.password()) {
                 (Some(user), Some(pass)) => config.with_auth(user, pass),
                 (Some(user), None) => config.with_username_only(user),
                 (None, None) => config,
@@ -338,6 +358,32 @@ mod inner {
                 Ok(PortalOutcome::PortalExitedWithoutCommit)
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "provisioning", feature = "mqtt"))]
+mod tests {
+    use super::inner::WifiMqttBoot;
+    use crate::provisioning::portal::tests::stored_wifi_mqtt;
+
+    #[test]
+    fn debug_redacts_secrets_without_length() {
+        let config = stored_wifi_mqtt("dev-01");
+        let wifi_password = config.wifi_password().to_owned();
+        let mqtt_pass = config
+            .mqtt()
+            .and_then(|m| m.password())
+            .unwrap_or_default()
+            .to_owned();
+        let boot = WifiMqttBoot::from_parts_for_test(config, "dev-01".to_owned());
+
+        let debug = format!("{boot:?}");
+        assert!(!debug.contains(&wifi_password));
+        assert!(!debug.contains(&mqtt_pass));
+        assert!(!debug.contains("len="));
+        assert!(debug.contains("dev-01"));
+        assert_eq!(boot.device_name(), "dev-01");
+        assert_eq!(boot.ota_url(), None);
     }
 }
 

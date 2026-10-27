@@ -71,15 +71,18 @@ fn main() -> anyhow::Result<()> {
         if let Some(cfg) = store.load()? {
             // Never log anything derived from a secret — not even its length.
             // Fresh literals keep the secrets out of the log's data flow.
-            let app_key_state = presence(cfg.app_key_hex.is_empty());
-            let wifi_pass_state = presence(cfg.wifi_password.is_empty());
+            let lora = cfg.lora();
+            let app_key_state = presence(lora.is_none_or(|l| l.app_key_hex().is_empty()));
+            let wifi_pass_state = presence(cfg.wifi_password().is_empty());
+            let ssid_state = presence(cfg.wifi_ssid().is_empty());
+            let ota_url_state = presence(cfg.ota_url().is_none());
             log::info!(
-                "Already provisioned: ssid len={}, dev_eui={}, ota_url len={}, name={}, \
+                "Already provisioned: ssid={}, dev_eui={}, ota_url={}, name={}, \
                  app_key={}, wifi_pass={}",
-                cfg.wifi_ssid.len(),
-                cfg.dev_eui_hex,
-                cfg.ota_url.len(),
-                cfg.device_name,
+                ssid_state,
+                lora.map_or("", |l| l.dev_eui_hex()),
+                ota_url_state,
+                cfg.device_name(),
                 app_key_state,
                 wifi_pass_state,
             );

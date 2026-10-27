@@ -38,6 +38,7 @@ just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
 just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets (not in verify)
 just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
+just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests with the mqtt feature (in verify)
 just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
 just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify)
 just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify)
@@ -45,6 +46,7 @@ just test                  # all platform-independent unit tests (no ESP toolcha
 just build-example <name>  # build a hardware example with auto-detected chip + target
 just flash <name>          # build + flash to a connected board
 just run <name>            # flash + serial monitor
+just portal-save <host> <extras> <key_len> <value_len>  # post the provisioning form with x_* extras to a running SoftAP portal (positional args)
 ```
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.

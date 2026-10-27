@@ -34,8 +34,10 @@ use super::record::{
 /// - TLV mqtt_client:  25 B (2+23)
 /// - CRC32:             4 B
 ///
-/// Sum: 508 B. `512` is the next power-of-two ceiling.
-const MAX_RECORD_LEN: usize = 512;
+/// Sum: 508 B. Up to 8 extras add 8 x (2 + 1 + 13 + 64) = 640 B, so the
+/// worst case with extras at every cap is 1148 B. `1280` (1 KiB + 256 B)
+/// leaves headroom for one more small field without another layout bump.
+pub(crate) const MAX_RECORD_LEN: usize = 1280;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -108,13 +110,12 @@ pub enum StoreError {
         /// Bytes available.
         have: usize,
     },
-    /// The `ProvisioningConfig` carries non-empty `extras`. The v1 record
-    /// layout does not allocate TLV tags for opaque extras, so a silent drop
-    /// would lose user data on `save → load`. Reject explicitly until a future
-    /// layout revision adds extras support.
-    ExtrasNotSupported {
-        /// Number of extras present on the config.
-        count: usize,
+    /// A TLV's value is structurally invalid for its tag (for example an
+    /// extra with a zero or overlong key, an overlong value, or a ninth
+    /// extra). Refused rather than truncated or skipped.
+    MalformedField {
+        /// The TLV tag of the malformed field.
+        tag: u8,
     },
     /// A required TLV field was absent from a CRC-valid record — refuse
     /// rather than synthesise an empty string or a default value, since a
@@ -186,10 +187,9 @@ impl fmt::Debug for StoreError {
                 .field("need", need)
                 .field("have", have)
                 .finish(),
-            StoreError::ExtrasNotSupported { count } => f
-                .debug_struct("ExtrasNotSupported")
-                .field("count", count)
-                .finish(),
+            StoreError::MalformedField { tag } => {
+                f.debug_struct("MalformedField").field("tag", tag).finish()
+            }
             StoreError::MissingRequiredField { tag } => f
                 .debug_struct("MissingRequiredField")
                 .field("tag", tag)
@@ -290,7 +290,7 @@ impl<F: NorFlash> ProvisioningStore<F> {
     ///    `decode_record`.
     ///
     /// This cuts the transient stack contribution of each `try_read_sector`
-    /// call from 4 KiB to ≤ 512 B (`MAX_RECORD_LEN`).
+    /// call from 4 KiB to ≤ 1280 B (`MAX_RECORD_LEN`).
     fn try_read_sector(&mut self, sector_index: u32) -> Result<Option<DecodedRecord>, StoreError> {
         let base = self.sector_offset(sector_index);
 
@@ -350,24 +350,35 @@ impl<F: NorFlash> ProvisioningStore<F> {
     /// function's frame.
     /// `try_read_sector` (called twice by `plan_save`) uses a two-step
     /// bounded read — a 12-byte header read followed by a read of exactly
-    /// `record_len` bytes (≤ `MAX_RECORD_LEN` = 512 B) — so the transient
-    /// read-buffer contribution is ~512 B, not the 4 KiB it was before the
+    /// `record_len` bytes (≤ `MAX_RECORD_LEN` = 1280 B) — so the transient
+    /// read-buffer contribution is ~1280 B, not the 4 KiB it was before the
     /// Phase 2B optimisation.
     ///
-    /// The total transient stack contribution of `save` (encode buffer + read
-    /// buffer + locals) is approximately **4.6 KiB**.
+    /// `plan_save` also holds two `Option<DecodedRecord>` and `decode_record`
+    /// builds an extras vector, so the buffers are not the whole story.
+    /// Analytic upper bound (host `size_of`, which exceeds the riscv32 sizes;
+    /// not measured): 4096 B encode buffer, 1280 B read buffer,
+    /// 2 x 1440 B `DecodedRecord`, 776 B extras vector,
+    /// 1432 B returned `ProvisioningConfig`, 128 B extras slices
+    /// and ~512 B locals, about 11 100 B for `save` itself.
+    /// The portal's `dispatch_request` holds the parsed 1432 B
+    /// `ProvisioningConfig` across the call, so a `POST /save` adds about
+    /// 12 530 B, approximately **12.5 KiB** (rounded up).
+    /// These figures are not measured; runbook H2 only checks for overflow at
+    /// the default stack.
     ///
     /// Combined with the HTTP task's steady-state frame (~8.3 KiB: `req_buf`
     /// 2048 + `resp_buf` 6144 + executor overhead), the worst-case stack peak
-    /// during a `POST /save` request is approximately **13 KiB**.
-    /// The recommended integrator HTTP-task stack is **14 KiB minimum**,
-    /// leaving headroom for ISR frames and stack canary.
+    /// during a `POST /save` request is at most approximately **20.5 KiB**.
+    /// The recommended integrator HTTP-task stack is **24 KiB minimum**,
+    /// leaving at least 2 KiB of margin over the peak for ISR frames and stack canary.
     ///
     /// The steady-state HTTP frame is ~8 KiB (`req_buf` 2048 + `resp_buf`
     /// 6144 + executor overhead); `POST /save` transiently adds another
-    /// ~4.6 KiB for `ProvisioningStore::save`'s encode + read buffers,
-    /// raising the worst-case peak to ~13 KiB.
-    /// Integrators should size the spawned HTTP task with at least 14 KiB of
+    /// ~12.5 KiB (analytic upper bound, not measured) for
+    /// `ProvisioningStore::save`'s buffers and decoded records plus the
+    /// portal's held `config_to_save`, raising the worst-case peak to ~20.5 KiB.
+    /// Integrators should size the spawned HTTP task with at least 24 KiB of
     /// stack to leave headroom for ISR frames and stack canary.
     ///
     /// See `docs/features/archive/esp-hal-provisioning-v1.md` Decisions
@@ -775,6 +786,7 @@ mod tests {
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
             Some(mqtt),
+            heapless::Vec::new(),
         )
     }
 
@@ -893,6 +905,43 @@ mod tests {
     }
 
     #[test]
+    fn store_round_trips_config_with_extras_beyond_512_bytes() {
+        let mut extras: heapless::Vec<_, { juggler::provisioning::EXTRA_FIELDS_MAX }> =
+            heapless::Vec::new();
+        for i in 0..8u8 {
+            let mut key = HS::new();
+            let mut value = HS::new();
+            key.push_str("key-").unwrap();
+            key.push((b'a' + i) as char).unwrap();
+            while value.len() < 64 {
+                value.push((b'0' + i) as char).unwrap();
+            }
+            extras
+                .push(juggler::provisioning::ExtraField { key, value })
+                .unwrap();
+        }
+        let base = sample_config();
+        let cfg = ProvisioningConfig::from_storage_parts(
+            hs::<{ juggler::wifi::SSID_MAX_LEN }>(base.wifi_ssid()),
+            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>(base.wifi_password()),
+            hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
+            hs::<DEVICE_NAME_MAX_LEN>(base.device_name()),
+            None,
+            base.mqtt().cloned(),
+            extras,
+        );
+
+        let mut staging = [0u8; SECTOR_SIZE];
+        let len = super::super::record::encode_record(&cfg, 1, &mut staging).unwrap();
+        assert!(len > 512 && len <= MAX_RECORD_LEN, "record is {len} B");
+
+        let mut store = ProvisioningStore::open(MockFlash::new(), 0, 8192).unwrap();
+        store.save(&cfg).unwrap();
+        let loaded = store.load().unwrap().expect("record present");
+        assert_eq!(loaded, cfg);
+    }
+
+    #[test]
     fn store_save_writes_only_target_sector() {
         // Save once (→ sector A), take back the flash, snapshot A, re-open,
         // save again (→ sector B), confirm sector A is byte-identical.
@@ -963,7 +1012,7 @@ mod tests {
         //
         // Sector 0 base = 0; sector 1 base = 4096.
         // Blank sector 1: header read returns 0xFF bytes → record_len decodes
-        // to 0xFFFF (65535), clamped to MAX_RECORD_LEN (512).
+        // to 0xFFFF (65535), clamped to MAX_RECORD_LEN (1280).
         assert_eq!(log.len(), 4, "expected exactly 4 flash reads, got {log:?}");
 
         // Sector 0, read 1: 12-byte header.
@@ -987,7 +1036,7 @@ mod tests {
             "sector 1 header read mismatch"
         );
 
-        // Sector 1, read 2: clamped to MAX_RECORD_LEN (0xFFFF → 512).
+        // Sector 1, read 2: clamped to MAX_RECORD_LEN (0xFFFF → 1280).
         assert_eq!(
             log[3],
             (4096, MAX_RECORD_LEN),

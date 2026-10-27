@@ -225,6 +225,19 @@ These are follow-through items, actioned at acceptance, not in this ADR:
 - The stale `vendor/esp-radio` row in the local `CLAUDE.md` *Common Resolution Failures* table should be corrected when this work lands — `vendor/esp-radio` does not exist; the TX-power workaround is the inline `extern "C" esp_wifi_set_max_tx_power` clamp in `rustyfarian-esp-hal-wifi`.
   This is noted here only; the correction is a developer-local edit, not part of this public ADR.
 
+## Amendment 2026-10-27 — Extras persisted via `TAG_EXTRA`
+
+The HAL record store now persists portal extras with a new repeatable TLV tag `TAG_EXTRA` (`0x0A`).
+The value layout is `key_len` (1 byte), then the key, then the value.
+`MAX_RECORD_LEN` grows from 512 B to 1280 B: a worst-case `wifi_mqtt` record is 508 B, and 8 extras at 80 B each (1 + 13 + 64 plus the 2-byte TLV header) add 640 B, giving 1148 B.
+Sector size, `STORE_SIZE` and `LAYOUT_VER` are unchanged, because the decoder skips unknown tags: records without extras are byte-identical to 0.6.x, and new firmware reads 0.6.x records with empty extras.
+`StoreError::ExtrasNotSupported` is removed, and `StoreError::MalformedField { tag }` reports an empty or duplicate extra key, a bad key length, an over-cap key or value, or a ninth extra.
+Downgrade caveat: 0.6.x firmware caps its read at 512 B, so a record with extras that exceeds 512 B fails decode there.
+`pick_active` then falls back to the other sector, so the device quietly boots the previous credentials, or reports unprovisioned if the other sector is empty.
+The portal's 2048 B request cap (security-checklist item 3) is unchanged: a maximum configuration with 8 extras fits it only when the values need no percent-encoding, and a fully percent-encoded one is answered with 413 rather than stored (host test `max_config_with_eight_extras_fits_cap_only_when_unencoded`).
+The provisioning task stack guidance was re-derived as an analytic upper bound (about 12.5 KiB transient including the portal's parsed config, about 20.5 KiB peak, recommended minimum 24 KiB); the figures are not measured.
+See `docs/features/provisioning-boot-identity-v1.md` and `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`.
+
 ## References
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; reserves the `rustyfarian-esp-hal-provisioning` name (§2) and locks the no-parallel-Wi-Fi-stack and private-HTTP positions this ADR builds on.

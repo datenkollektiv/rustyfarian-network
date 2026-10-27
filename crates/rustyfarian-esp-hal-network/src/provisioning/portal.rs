@@ -36,24 +36,29 @@
 //!
 //! During a `POST /save` request, `dispatch_request` calls
 //! `ProvisioningStore::save`, which transiently allocates a
-//! `heapless::Vec<u8, 4096>` encode buffer plus a `[u8; 512]` read buffer
-//! on its own frame, adding approximately 4.6 KiB to the peak.
-//! This raises the worst-case stack depth to approximately **13 KiB**.
+//! `heapless::Vec<u8, 4096>` encode buffer, a `[u8; 1280]` read buffer and
+//! two decoded `ProvisioningConfig` records (about 1.4 KiB each) on its own
+//! frames, about 11 KiB; `dispatch_request` itself holds the parsed
+//! `config_to_save` (about 1.4 KiB) across the call, so a `POST /save` adds
+//! approximately 12.5 KiB to the peak.
+//! This raises the worst-case stack depth to at most approximately **20.5 KiB**.
+//! These figures are an analytic upper bound from host `size_of`, not
+//! measured; runbook H2 only checks for overflow at the default stack.
 //!
-//! **Recommended integrator HTTP-task stack: 14 KiB minimum.**
+//! **Recommended integrator HTTP-task stack: 24 KiB minimum.**
 //!
 //! The steady-state HTTP frame is ~8 KiB (`req_buf` 2048 + `resp_buf` 6144
-//! + executor overhead); `POST /save` transiently adds another ~4.6 KiB for
-//! `ProvisioningStore::save`'s encode + read buffers, raising the worst-case
-//! peak to ~13 KiB.
-//! Integrators should size the spawned HTTP task with at least 14 KiB of
+//! + executor overhead); `POST /save` transiently adds another ~12.5 KiB for
+//! `ProvisioningStore::save`'s encode + read buffers and the held
+//! `config_to_save`, raising the worst-case peak to ~20.5 KiB.
+//! Integrators should size the spawned HTTP task with at least 24 KiB of
 //! stack to leave headroom for ISR frames and stack canary.
 //!
 //! In bare-metal embassy (`esp-rtos` thread-mode executor) all async tasks
 //! share the main thread's stack, which is sized at link time via
 //! `CONFIG_ESP_MAIN_TASK_STACK_SIZE` (IDF-paired build) or the linker
 //! script stack symbol.
-//! Ensure the main-thread stack is at least **14 KiB** before spawning the
+//! Ensure the main-thread stack is at least **24 KiB** before spawning the
 //! HTTP task.
 
 // When building without the embassy + chip features the async `run_portal_dyn`
@@ -863,9 +868,8 @@ fn load_prefill(
             let _ = prefill
                 .wifi_ssid
                 .push_str(&cfg.wifi_ssid()[..cfg.wifi_ssid().len().min(32)]);
-            let _ = prefill
-                .ota_url
-                .push_str(&cfg.ota_url()[..cfg.ota_url().len().min(128)]);
+            let ota_url = cfg.ota_url().unwrap_or("");
+            let _ = prefill.ota_url.push_str(&ota_url[..ota_url.len().min(128)]);
             let _ = prefill
                 .dev_name
                 .push_str(&cfg.device_name()[..cfg.device_name().len().min(24)]);
@@ -2498,6 +2502,85 @@ mod tests {
         let resp = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
         assert!(resp.contains("Cache-Control: no-store\r\n"));
+    }
+
+    /// Extras and the request cap: a `WifiMqttDevice` form with every field
+    /// and all 8 extras at their caps fits `DEFAULT_REQUEST_SIZE_CAP` as long
+    /// as the values need no percent-encoding, even with a 400 B allowance
+    /// for a browser's headers. The same form with every value byte
+    /// percent-encoded (`%XX`, three times the length) does not fit, and the
+    /// portal answers it with 413 instead of truncating. The cap is a
+    /// security-checklist lock (item 3); this test pins the decision that
+    /// such otherwise-valid configurations are rejected rather than stored.
+    #[test]
+    fn max_config_with_eight_extras_fits_cap_only_when_unencoded() {
+        use juggler::mqtt::CLIENT_ID_MAX_LEN;
+        use juggler::provisioning::{
+            DEVICE_NAME_MAX_LEN, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN, EXTRA_VALUE_MAX_LEN,
+            MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN, OTA_URL_MAX_LEN,
+        };
+        use juggler::wifi::{PASSWORD_MAX_LEN, SSID_MAX_LEN};
+
+        const BROWSER_HEADER_ALLOWANCE: usize = 400;
+        // `mqtt://` + host + `:65535`
+        const MQTT_URI_MAX_LEN: usize = 7 + MQTT_HOST_MAX_LEN + 6;
+
+        fn body(bytes_per_value_byte: usize) -> alloc::string::String {
+            let filler = |n: usize| "a".repeat(n * bytes_per_value_byte);
+            let mut b = alloc::format!(
+                "_nonce={}&wifi_ssid={}&wifi_pass={}&mqtt_uri={}&mqtt_user={}\
+                 &mqtt_pass={}&mqtt_client={}&ota_url={}&dev_name={}",
+                test_nonce(),
+                filler(SSID_MAX_LEN),
+                filler(PASSWORD_MAX_LEN),
+                filler(MQTT_URI_MAX_LEN),
+                filler(MQTT_USER_MAX_LEN),
+                filler(MQTT_PASS_MAX_LEN),
+                filler(CLIENT_ID_MAX_LEN),
+                filler(OTA_URL_MAX_LEN),
+                filler(DEVICE_NAME_MAX_LEN),
+            );
+            for i in 0..EXTRA_FIELDS_MAX {
+                let key = alloc::format!("x_{i:a>width$}", width = EXTRA_KEY_MAX_LEN - 2);
+                b.push_str(&alloc::format!("&{key}={}", filler(EXTRA_VALUE_MAX_LEN)));
+            }
+            b
+        }
+
+        fn request(body: &str) -> alloc::string::String {
+            alloc::format!(
+                "POST /save HTTP/1.1\r\n\
+                 Host: 192.168.4.1\r\n\
+                 Content-Length: {}\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 \r\n{body}",
+                body.len()
+            )
+        }
+
+        let plain = request(&body(1));
+        assert!(
+            plain.len() + BROWSER_HEADER_ALLOWANCE <= DEFAULT_REQUEST_SIZE_CAP,
+            "plain-ASCII max config ({} B) plus a {BROWSER_HEADER_ALLOWANCE} B header allowance must fit the {DEFAULT_REQUEST_SIZE_CAP} B cap",
+            plain.len()
+        );
+        let parsed = parse_request(plain.as_bytes(), DEFAULT_REQUEST_SIZE_CAP);
+        assert!(
+            parsed.is_ok(),
+            "plain max config must parse (got {parsed:?})"
+        );
+
+        let encoded = request(&body(3));
+        assert!(
+            encoded.len() > DEFAULT_REQUEST_SIZE_CAP,
+            "fully percent-encoded max config ({} B) is expected to exceed the cap",
+            encoded.len()
+        );
+        assert_eq!(
+            parse_request(encoded.as_bytes(), DEFAULT_REQUEST_SIZE_CAP),
+            Err(ParseError::RequestTooLarge),
+            "an over-cap max config must be answered 413, never truncated"
+        );
     }
 
     // ── Security-checklist item 4: no credential logging ─────────────────────
