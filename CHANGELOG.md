@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::provisioning::{ProvisioningKv, KvProvisioningStore}` (feature `std`): the provisioning NVS key layout over a key-value trait, with host tests that load a 0.6.x-shaped record; the IDF tier's `ProvisioningStore` now delegates to it over NVS, with no public API change.
 - Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot on ESP32-C3 and ESP32-C6) is still open.
   Requested by the spookhouse review-queue item `rustyfarian-network-boot-device-name-v1`; see `docs/features/provisioning-boot-identity-v1.md`.
+- Provisioning re-entry hook: `juggler::provisioning::ReentryRequest { None, Portal, FactoryReset }` (`#[non_exhaustive]`), re-exported from the IDF tier's `provisioning` module.
+- `juggler::provisioning::{gate_reentry, ReentryGate}`: the host-tested ordering primitive that asks the hook once and opens the store only on `None`.
+- IDF tier: `WifiMqttBoot::load_with_reentry(nvs, reentry, client_id_fn)` asks the hook once, before the store is read, and never claims the modem; `None` behaves like `load_with`.
+- IDF tier: `WifiMqttBoot::default_client_id`, the client-ID policy of `WifiMqttBoot::load`, for `load_with_reentry` callers.
+- IDF tier: `WifiMqttLoadOutcome::{PortalRequested, FactoryResetRequested}`; the library never erases or restarts, so the consumer erases via `ProvisioningStore::erase_all`.
+- `idf_c3_provision_mqtt` samples BOOT (GPIO9) after boot: a short hold reopens the portal, a hold of 3 s or more erases in example code and continues into the portal; see `docs/features/provisioning-reentry-hook-v1.md`.
 
 ### Changed
 

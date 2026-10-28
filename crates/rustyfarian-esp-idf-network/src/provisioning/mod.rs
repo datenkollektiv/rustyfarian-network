@@ -26,6 +26,11 @@
 //! erasure are the host's decisions — call [`ProvisioningStore::erase_all`] and
 //! `esp_idf_svc::hal::reset::restart()` from the host as appropriate.
 //!
+//! The same holds for the boot-time re-entry hook: `WifiMqttBoot::load_with_reentry`
+//! asks the host's hook once, before the store is read, and reports a
+//! [`ReentryRequest`] answer as `PortalRequested` or `FactoryResetRequested`.
+//! The host then erases (for a factory reset) and runs the portal.
+//!
 //! # Quick start
 //!
 //! ```ignore
@@ -70,7 +75,8 @@ pub use boot::{
 
 pub use juggler::provisioning::{
     derive_softap_ssid, resolve_softap_ssid, Field, FieldError, LoraFields, MqttFields,
-    PortalDefaults, ProvisioningConfig, ProvisioningState, SchemaProfile, ValidationError,
+    PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryRequest, SchemaProfile,
+    ValidationError,
 };
 
 use std::sync::{Arc, Mutex};

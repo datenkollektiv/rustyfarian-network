@@ -7,6 +7,9 @@
 //!
 //! 1. [`WifiMqttBoot::load`] — read the NVS store (modem-free) and return
 //!    ready-to-borrow [`WiFiConfig`] / [`MqttConfig`] when provisioned.
+//!    [`WifiMqttBoot::load_with_reentry`] first asks the consumer's re-entry
+//!    hook, before the store is read, and reports a portal or factory-reset
+//!    request as an outcome.
 //! 2. [`run_wifi_mqtt_portal`] — start the SoftAP captive portal (consumes
 //!    the modem) and return a [`PortalOutcome`] when it terminates.
 //!
@@ -29,6 +32,7 @@ mod inner {
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
     use juggler::mqtt::resolve_client_id;
+    use juggler::provisioning::{gate_reentry, ReentryGate, ReentryRequest};
     use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
     use crate::mqtt::MqttConfig;
@@ -94,12 +98,27 @@ mod inner {
         /// is **not** an error; it yields
         /// [`WifiMqttLoadOutcome::OtherProfile`].
         pub fn load(nvs: EspDefaultNvsPartition) -> anyhow::Result<WifiMqttLoadOutcome> {
-            Self::load_with(nvs, |cfg| {
-                let operator_id = cfg.mqtt().and_then(|m| m.client_id());
-                let chosen = resolve_client_id(operator_id, cfg.device_name(), "rustyfarian")
-                    .map_err(|e| anyhow::anyhow!("client-id resolution failed: {}", e))?;
-                Ok(chosen.to_owned())
-            })
+            Self::load_with(nvs, Self::default_client_id)
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// The built-in client-ID policy used by [`load`](Self::load), for
+        /// callers of [`load_with_reentry`](Self::load_with_reentry) that want
+        /// the same policy.
+        ///
+        /// Resolves via [`juggler::mqtt::resolve_client_id`] with the
+        /// operator-supplied `mqtt_client`, the stored `device_name`, and the
+        /// hard-coded fallback `"rustyfarian"`.
+        ///
+        /// # Errors
+        ///
+        /// Returns `Err` when no valid client-ID can be derived.
+        pub fn default_client_id(cfg: &ProvisioningConfig) -> anyhow::Result<String> {
+            let operator_id = cfg.mqtt().and_then(|m| m.client_id());
+            let chosen = resolve_client_id(operator_id, cfg.device_name(), "rustyfarian")
+                .map_err(|e| anyhow::anyhow!("client-id resolution failed: {}", e))?;
+            Ok(chosen.to_owned())
         }
 
         /// Experimental: API may change before 1.0.
@@ -124,6 +143,44 @@ mod inner {
             client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
         ) -> anyhow::Result<WifiMqttLoadOutcome> {
             let store = ProvisioningStore::open(nvs)?;
+            Self::classify(&store, client_id_fn)
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// Like [`load_with`](Self::load_with), but asks `reentry` first,
+        /// exactly once, before the store is opened.
+        ///
+        /// - [`ReentryRequest::None`] reproduces [`load_with`](Self::load_with).
+        /// - [`ReentryRequest::Portal`] returns
+        ///   [`WifiMqttLoadOutcome::PortalRequested`]; the store is neither
+        ///   opened nor read.
+        /// - [`ReentryRequest::FactoryReset`] returns
+        ///   [`WifiMqttLoadOutcome::FactoryResetRequested`]; the store is
+        ///   neither opened nor read.
+        ///
+        /// The library never erases and never restarts, and this call never
+        /// claims the modem; the consumer acts on the outcome.
+        ///
+        /// # Errors
+        ///
+        /// As [`load_with`](Self::load_with).  The hook itself cannot fail.
+        pub fn load_with_reentry(
+            nvs: EspDefaultNvsPartition,
+            reentry: impl FnOnce() -> ReentryRequest,
+            client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
+        ) -> anyhow::Result<WifiMqttLoadOutcome> {
+            match gate_reentry(reentry, || ProvisioningStore::open(nvs))? {
+                ReentryGate::Portal => Ok(WifiMqttLoadOutcome::PortalRequested),
+                ReentryGate::FactoryReset => Ok(WifiMqttLoadOutcome::FactoryResetRequested),
+                ReentryGate::Proceed(store) => Self::classify(&store, client_id_fn),
+            }
+        }
+
+        fn classify(
+            store: &ProvisioningStore,
+            client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
+        ) -> anyhow::Result<WifiMqttLoadOutcome> {
             let cfg = match store.load()? {
                 None => return Ok(WifiMqttLoadOutcome::NotProvisioned),
                 Some(c) => c,
@@ -231,7 +288,8 @@ mod inner {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// The outcome of [`WifiMqttBoot::load`] / [`WifiMqttBoot::load_with`].
+    /// The outcome of [`WifiMqttBoot::load`] / [`WifiMqttBoot::load_with`] /
+    /// [`WifiMqttBoot::load_with_reentry`].
     ///
     /// `Debug` output for the `Ready` variant redacts credential fields via
     /// [`WifiMqttBoot`]'s manual `Debug` impl.
@@ -244,6 +302,17 @@ mod inner {
         NotProvisioned,
         /// A record was found but was provisioned under a different profile.
         OtherProfile(SchemaProfile),
+        /// The re-entry hook answered [`ReentryRequest::Portal`].
+        ///
+        /// The store was not read.  The consumer runs [`run_wifi_mqtt_portal`];
+        /// the stored record is kept and the portal prefills from it.
+        PortalRequested,
+        /// The re-entry hook answered [`ReentryRequest::FactoryReset`].
+        ///
+        /// The store was not read and nothing was erased: the library never
+        /// erases.  The consumer erases (via [`ProvisioningStore::erase_all`])
+        /// and then decides whether to run the portal or restart.
+        FactoryResetRequested,
     }
 
     /// Experimental: API may change before 1.0.
