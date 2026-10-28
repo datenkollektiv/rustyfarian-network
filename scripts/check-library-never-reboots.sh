@@ -23,6 +23,25 @@ if grep -Hn 'erase_all' crates/rustyfarian-esp-hal-network/src/provisioning/port
   fi
 fi
 
+idf_prov_files=$(find crates/rustyfarian-esp-idf-network/src/provisioning -name '*.rs' ! -name store.rs)
+if grep -HnE '^[[:space:]]*[^[:space:]/]' $idf_prov_files \
+  | grep -E 'erase_all' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' > tmp/idf-erase.txt 2>&1; then
+  if [ -s tmp/idf-erase.txt ]; then
+    cat tmp/idf-erase.txt
+    echo "ERROR: Found erase_all call in IDF provisioning code (outside store.rs)"
+    exit_code=1
+  fi
+fi
+
+if grep -rHnE '^[[:space:]]*[^[:space:]/]' crates/rustyfarian-esp-idf-network/src/provisioning crates/juggler/src/provisioning --include='*.rs' \
+  | grep -E 'esp_restart|reset::restart|\brestart\(' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' > tmp/prov-restarts.txt 2>&1; then
+  if [ -s tmp/prov-restarts.txt ]; then
+    cat tmp/prov-restarts.txt
+    echo "ERROR: Found a restart call in IDF or juggler provisioning code"
+    exit_code=1
+  fi
+fi
+
 if find crates/rustyfarian-esp-idf-network/src/ota crates/juggler/src/ota/persist -name '*.rs' \
   \( -name store.rs -o -name boot_facts.rs -o -path '*/persist/*' \) -exec \
   grep -HnE 'esp_restart|\brestart\(|esp_ota_set_boot_partition|set_boot_slot|initiate_update|\.complete\(|mark_running_slot_invalid_and_reboot|mark_running_slot_valid|esp_ota_mark_app_valid|esp_ota_mark_app_invalid_rollback_and_reboot|\.rollback\(' {} \; > tmp/ota-reboots.txt 2>&1; then

@@ -450,12 +450,13 @@ portal-save host="192.168.4.1" extras="2" key_len="6" value_len="8":
 
 # ── maintenance ───────────────────────────────────────────────────────────
 
-# clean build artifacts (target/ide, hal and idf target dirs)
+# clean build artifacts (target/ide, hal and idf target dirs) and scratch output in tmp/
 [group('maintenance')]
 clean:
     cargo clean --target-dir target/ide
     cargo clean --target-dir {{ hal_dir }}
     cargo clean --target-dir {{ idf_dir }}
+    find tmp -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 [group('maintenance')]

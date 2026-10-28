@@ -26,6 +26,7 @@ pub mod html_json_escape;
 #[cfg(feature = "std")]
 pub mod kv_store;
 pub mod profile;
+pub mod reentry;
 pub(crate) mod secret;
 #[cfg(feature = "std")]
 pub mod session;
@@ -44,6 +45,7 @@ pub use form::{parse_form, ExtraField};
 #[cfg(feature = "std")]
 pub use kv_store::{KvProvisioningStore, ProvisioningKv};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};
+pub use reentry::{gate_reentry, ReentryGate, ReentryRequest};
 #[cfg(feature = "std")]
 pub use session::{SessionOutcome, SessionState};
 pub use ssid::{derive_softap_ssid, resolve_softap_ssid};
