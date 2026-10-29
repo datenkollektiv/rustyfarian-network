@@ -465,6 +465,11 @@ clean-idf:
     rm -rf {{ idf_dir }}/riscv32imac-esp-espidf/release/build/esp-idf-sys-*/
     rm -rf {{ idf_dir }}/riscv32imc-esp-espidf/release/build/esp-idf-sys-*/
 
+# clean only the bare-metal (esp-hal) target dir — frees the shared RAM disk without forcing an ESP-IDF rebuild
+[group('maintenance')]
+clean-hal:
+    cargo clean --target-dir {{ hal_dir }}
+
 # check that provisioning library logs never interpolate credential field names
 [group('maintenance')]
 check-no-credential-logging:

@@ -47,6 +47,12 @@
 //! ```sh
 //! PORTAL_SSID_PREFIX="MyDevice" just build-example hal_c6_provision_mqtt
 //! ```
+//!
+//! Replace the whole SSID (no MAC suffix) at build time:
+//!
+//! ```sh
+//! PORTAL_SSID_OVERRIDE="MyClock" just build-example hal_c6_provision_mqtt
+//! ```
 
 #![no_std]
 #![no_main]
@@ -61,17 +67,21 @@ use rustyfarian_esp_hal_network::provisioning::{
     PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningEvent, ProvisioningOutcome,
     ProvisioningStore, SchemaProfile,
 };
-use rustyfarian_esp_hal_network::wifi::{ApConfig, ApConfigExt, WiFiManager};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// SoftAP SSID prefix.
-/// The last two bytes of the AP MAC address are appended to form the full SSID.
+/// Unless `PORTAL_SSID_OVERRIDE` is set, the portal appends the last two bytes
+/// of the AP MAC address, giving the full SSID `{prefix}-{MAC}`.
 /// Override at build time: `PORTAL_SSID_PREFIX="MyDevice" just build-example hal_c6_provision_mqtt`
 const PORTAL_SSID_PREFIX: &str = match option_env!("PORTAL_SSID_PREFIX") {
     Some(s) => s,
     None => "RustyFarian",
 };
+
+/// Optional full SoftAP SSID that replaces `{prefix}-{MAC}` when set.
+/// Override at build time: `PORTAL_SSID_OVERRIDE="MyClock" just build-example hal_c6_provision_mqtt`
+const PORTAL_SSID_OVERRIDE: Option<&str> = option_env!("PORTAL_SSID_OVERRIDE");
 
 /// Human-readable device name shown in the portal header.
 const DEVICE_NAME: &str = match option_env!("DEVICE_NAME") {
@@ -213,18 +223,10 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // Not yet provisioned — bring up the SoftAP captive portal.
-    // The AP is open (no WPA2 password); the nonce in the form is the access
-    // control mechanism.
-    let ap_config = ApConfig::open(PORTAL_SSID_PREFIX)
-        .with_channel(1)
-        .with_ap_peripherals(
-            peripherals.TIMG0,
-            peripherals.FROM_CPU_INTR0,
-            peripherals.WIFI,
-        );
-
-    let softap = WiFiManager::init_softap_async(ap_config).expect("SoftAP init");
+    // Not yet provisioned — start the SoftAP captive portal.
+    // `start` owns the AP bring-up: it derives the SSID from the AP MAC, brings
+    // up the open AP (no WPA2 password; the nonce in the form is the access
+    // control mechanism) and spawns the portal tasks.
 
     // The `store` declared above is still owned here (we only enter this branch
     // when `is_provisioned()` returned false, so no move occurred).
@@ -251,7 +253,7 @@ async fn main(spawner: Spawner) {
 
     let portal_config = PortalConfig {
         ssid_prefix: PORTAL_SSID_PREFIX,
-        ssid_override: None,
+        ssid_override: PORTAL_SSID_OVERRIDE,
         ap_password: None,
         channel: 1,
         device_name: DEVICE_NAME,
@@ -262,9 +264,18 @@ async fn main(spawner: Spawner) {
 
     let session = ProvisioningBuilder::new(portal_config)
         .on_event(on_event)
-        .start(spawner, softap, store, rng)
+        .start(
+            spawner,
+            peripherals.TIMG0,
+            peripherals.FROM_CPU_INTR0,
+            peripherals.WIFI,
+            store,
+            rng,
+        )
         .expect("provisioning start");
 
+    let mac = session.ap_mac();
+    println!("Provisioning AP MAC suffix: {:02X}{:02X}", mac[4], mac[5]);
     let ip = session.ap_ip();
     println!(
         "Provisioning AP up — open http://{}.{}.{}.{}/ to configure",

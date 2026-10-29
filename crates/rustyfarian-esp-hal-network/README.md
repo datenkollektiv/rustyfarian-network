@@ -176,7 +176,7 @@ The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md` (T
 ## Example: Async SoftAP + Provisioning
 
 Condensed from `examples/hal_c3_provision_mqtt.rs`.
-The SoftAP is brought up through `init_softap_async`, the credential store lives in a dedicated flash partition, and `ProvisioningBuilder::start` spawns the DHCP, DNS and HTTP tasks.
+`ProvisioningBuilder::start` brings the SoftAP up itself from `PortalConfig` (SSID `{prefix}-{MAC}` or `ssid_override`, channel, password) and spawns the DHCP, DNS and HTTP tasks; the credential store lives in a dedicated flash partition.
 The library never reboots or erases on its own; the host acts on the `ProvisioningOutcome`.
 
 ```rust
@@ -185,7 +185,6 @@ use rustyfarian_esp_hal_network::provisioning::{
     PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningOutcome, ProvisioningStore,
     SchemaProfile,
 };
-use rustyfarian_esp_hal_network::wifi::{ApConfig, ApConfigExt, WiFiManager};
 
 const FLASH_PARTITION_OFFSET: u32 = 0x300000;
 const FLASH_PARTITION_SIZE: u32 = 8192;
@@ -199,12 +198,6 @@ async fn main(spawner: Spawner) {
     let store = ProvisioningStore::open(flash, FLASH_PARTITION_OFFSET, FLASH_PARTITION_SIZE)
         .expect("provisioning store open");
 
-    let ap_config = ApConfig::open("rustyfarian").with_channel(1).with_ap_peripherals(
-        peripherals.TIMG0,
-        peripherals.FROM_CPU_INTR0,
-        peripherals.WIFI,
-    );
-    let softap = WiFiManager::init_softap_async(ap_config).expect("SoftAP init");
     let rng = esp_hal::rng::Rng::new();
 
     let portal_config = PortalConfig {
@@ -219,7 +212,14 @@ async fn main(spawner: Spawner) {
     };
 
     let session = ProvisioningBuilder::new(portal_config)
-        .start(spawner, softap, store, rng)
+        .start(
+            spawner,
+            peripherals.TIMG0,
+            peripherals.FROM_CPU_INTR0,
+            peripherals.WIFI,
+            store,
+            rng,
+        )
         .expect("provisioning start");
 
     match session.wait_outcome().await {
