@@ -731,6 +731,24 @@ pub use driver::{
     WiFiManager, WifiError, AP_IP,
 };
 
+/// Returns the MAC address the SoftAP broadcasts.
+///
+/// This is an efuse read of the access-point interface MAC, so it is
+/// infallible and safe to call before the radio starts.
+/// The value matches the BSSID the SoftAP uses once
+/// [`WiFiManager::init_softap_async`] has brought it up.
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+))]
+pub fn softap_mac() -> [u8; 6] {
+    let mac =
+        esp_hal::efuse::interface_mac_address(esp_hal::efuse::InterfaceMacAddress::AccessPoint);
+    let mut out = [0u8; 6];
+    out.copy_from_slice(mac.as_bytes());
+    out
+}
+
 // ─── Stub fallback (no chip feature — host / doc / test builds) ─────────────
 //
 // The chip-without-embassy combination is rejected by the `compile_error!`

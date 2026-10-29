@@ -238,6 +238,17 @@ The portal's 2048 B request cap (security-checklist item 3) is unchanged: a maxi
 The provisioning task stack guidance was re-derived as an analytic upper bound (about 12.5 KiB transient including the portal's parsed config, about 20.5 KiB peak, recommended minimum 24 KiB); the figures are not measured.
 See `docs/features/provisioning-boot-identity-v1.md` and `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`.
 
+## Amendment 2026-10-29 — Provisioning owns SoftAP bring-up (SSID parity)
+
+`ProvisioningBuilder::start` now takes the AP peripherals (`timg0`, `sw_int`, `wifi`) and brings the SoftAP up itself, so the caller no longer builds an `ApConfig` or calls `init_softap_async` for provisioning.
+`PortalConfig` is the single SSID, channel and password source on both tiers.
+The hal default SSID is now `{prefix}-{MAC}`, derived through the shared `juggler::provisioning::resolve_softap_ssid` and the new `softap_mac()` efuse read, and `ssid_override` is used verbatim when set.
+The `SoftApHandle` parameter and the validation-only zero-MAC check in `start()` are removed.
+`init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
+The session keeps the AP MAC for the per-device-name pre-fill feature instead of discarding it.
+Both changes are breaking (the `start()` signature and the default SSID rename) and are documented in `CHANGELOG.md` with migration notes.
+See [hal-provisioning-ap-ownership-v1](../features/hal-provisioning-ap-ownership-v1.md) and [ssid-override-v1](../features/ssid-override-v1.md) for the full contract.
+
 ## References
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; reserves the `rustyfarian-esp-hal-provisioning` name (§2) and locks the no-parallel-Wi-Fi-stack and private-HTTP positions this ADR builds on.

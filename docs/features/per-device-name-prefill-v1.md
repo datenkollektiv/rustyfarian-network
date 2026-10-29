@@ -11,14 +11,14 @@ Today `PortalConfig::device_name` is one fixed string per firmware, so every dev
 Done when two devices running one firmware, saved without touching `dev_name`, store different names and connect with different client IDs.
 
 ## Decisions
-| Decision | Reason | Rejected Alternative |
-|:---------|:-------|:---------------------|
-| Pure `juggler::provisioning::derive_device_name(prefix, &mac)` | One host-tested derivation shared by both tiers | Per-tier derivation (drifts) |
-| Return `heapless::String<DEVICE_NAME_MAX_LEN>` (24 bytes) | Matches the stored-name limit, alloc-free | `String` (needs alloc) |
-| Truncate the prefix on a char boundary, keep `-xxxx` | Same contract as `derive_softap_ssid` | Truncating the suffix (loses uniqueness) |
-| Suffix from AP MAC bytes 4..5, lowercase hex | Reads well in topics; same digits as the SSID `-1A2B` | Uppercase (byte-identical to SSID) |
-| `device_name: DeviceName::{Fixed, MacSuffixed}` on both `PortalConfig`s | Explicit intent at the call site | `device_name_mac_suffix: bool`; helper-only first step |
-| Ship both tiers together | Same `PortalConfig` API on idf and hal in one release | IDF first; hal fallback to STA MAC (suffix ≠ SSID) |
+| Decision                                                                | Reason                                                | Rejected Alternative                                   |
+|:------------------------------------------------------------------------|:------------------------------------------------------|:-------------------------------------------------------|
+| Pure `juggler::provisioning::derive_device_name(prefix, &mac)`          | One host-tested derivation shared by both tiers       | Per-tier derivation (drifts)                           |
+| Return `heapless::String<DEVICE_NAME_MAX_LEN>` (24 bytes)               | Matches the stored-name limit, alloc-free             | `String` (needs alloc)                                 |
+| Truncate the prefix on a char boundary, keep `-xxxx`                    | Same contract as `derive_softap_ssid`                 | Truncating the suffix (loses uniqueness)               |
+| Suffix from AP MAC bytes 4..5, lowercase hex                            | Reads well in topics; same digits as the SSID `-1A2B` | Uppercase (byte-identical to SSID)                     |
+| `device_name: DeviceName::{Fixed, MacSuffixed}` on both `PortalConfig`s | Explicit intent at the call site                      | `device_name_mac_suffix: bool`; helper-only first step |
+| Ship both tiers together                                                | Same `PortalConfig` API on idf and hal in one release | IDF first; hal fallback to STA MAC (suffix ≠ SSID)     |
 
 ## Constraints
 - The derived name is only the pre-fill; the user can edit it before saving.

@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IDF tier: `WifiMqttBoot::default_client_id`, the client-ID policy of `WifiMqttBoot::load`, for `load_with_reentry` callers.
 - IDF tier: `WifiMqttLoadOutcome::{PortalRequested, FactoryResetRequested}`; the library never erases or restarts, so the consumer erases via `ProvisioningStore::erase_all`.
 - `idf_c3_provision_mqtt` samples BOOT (GPIO9) after boot: a short hold reopens the portal, a hold of 3 s or more erases in example code and continues into the portal; see `docs/features/provisioning-reentry-hook-v1.md`.
+- `rustyfarian-esp-hal-network`: `wifi::softap_mac()` reads the SoftAP MAC from efuse without radio init, and `ProvisioningSession::ap_mac()` returns the MAC the session was started with.
+- `rustyfarian-esp-hal-network`: `ProvisioningError::SoftApInit { reason: &'static str }` reports a failed SoftAP bring-up, with the reason `SoftAP configuration rejected` or `radio driver error`.
 
 ### Changed
 
@@ -46,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).
 - The `juggler` `provisioning` feature no longer implies `lora`, so a Wi-Fi + MQTT device that enables provisioning no longer pulls `lorawan-device` (and with it `heapless 0.7` / `atomic-polyfill`, `RUSTSEC-2023-0089`).
   `LoraFields::to_lora_config` now requires the `lora` feature; consumers enabling both `provisioning` and `lora` on either tier crate are unaffected.
+- **Breaking (HAL tier):** `rustyfarian-esp-hal-network` `ProvisioningBuilder::start` now takes the AP peripherals `(spawner, timg0, sw_int, wifi, store, rng)` instead of a `SoftApHandle`, and brings the SoftAP up itself from `PortalConfig` (SSID, channel and password).
+  Migration: delete the caller's `ApConfig::open(..).with_ap_peripherals(..)` and `WiFiManager::init_softap_async(..)` calls, and pass `peripherals.TIMG0`, `peripherals.FROM_CPU_INTR0` and `peripherals.WIFI` to `start`.
+  `ProvisioningError` gains the `SoftApInit` variant, so an exhaustive `match` on it needs a new arm.
+  `WiFiManager::init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
+  See `docs/features/hal-provisioning-ap-ownership-v1.md`.
+- **Breaking (HAL tier):** the default provisioning AP SSID on `rustyfarian-esp-hal-network` changes from the bare `{prefix}` to `{prefix}-{MAC}`, using the last two AP-MAC bytes in uppercase hex, matching ESP-IDF.
+  Migration: existing hal APs are renamed; consumers that want the bare name set `ssid_override: Some("name")` on `PortalConfig`.
+- `rustyfarian-esp-hal-network`: `PortalConfig.ssid_override` is applied end-to-end on esp-hal as well as ESP-IDF, so the AP broadcasts the override verbatim and the derived default applies on both tiers.
 
 ### Fixed
 

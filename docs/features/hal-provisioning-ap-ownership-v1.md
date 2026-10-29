@@ -1,98 +1,62 @@
+---
+gate: hardware
+gate-note: on-device SSID check on a C3 or C6 board (acceptance 8) — default shows a -XXXX suffix, override shows verbatim
+desk-work: available
+---
+
 # Feature: hal provisioning owns SoftAP bring-up (SSID parity) v1
 
-Make the bare-metal (`rustyfarian-esp-hal-network`) provisioning `start()` own SoftAP
-bring-up, so `PortalConfig.ssid_override` (and the derived default) actually drive the
-radio SSID — reaching parity with the esp-idf path. This completes the hal half of
-[`ssid-override-v1.md`](./ssid-override-v1.md), whose hal field is currently
-**validation-only** (it checks the string but does not set the radio SSID).
-
-## Why this exists (the gap that forced it)
-
-On esp-idf, `ProvisioningBuilder::start` owns AP bring-up (it calls `SoftApManager::start`
-internally with the resolved SSID), so `PortalConfig.ssid_override` is the only way to set
-the SSID and it works end-to-end.
-
-On esp-hal today, the **caller** brings the AP up *before* `start()`:
-`ApConfig::open(PORTAL_SSID_PREFIX)` → `WiFiManager::init_softap_async(..)` →
-`builder.start(spawner, softap, store, rng)`. So:
-- `start()` never sets the radio SSID; the implemented `ssid_override` is validated against a
-  dummy zero MAC and discarded — a "works but wrong" footgun.
-- `init_softap_async` uses the SSID **verbatim** (`with_ssid(config.ap.ssid)`, `wifi/mod.rs:569`)
-  — hal has **no MAC suffix at all** today (its default AP name is the bare `{prefix}`, unlike
-  idf's `{prefix}-{MAC}`). The hal example's "last two MAC bytes appended" comment is stale.
-- hal has **no `softap_mac()`** — there is no AP-MAC read in the crate.
-
-## Scope and end state
-
-When done:
-- The `embassy`-gated hal `ProvisioningBuilder::start` takes the **AP peripherals directly**
-  (`TIMG0`, `SW_INTERRUPT`, `WIFI`) instead of a pre-built `SoftApHandle`, and brings the
-  SoftAP up itself.
-- `start()` resolves the SSID via the shared `juggler::provisioning::resolve_softap_ssid(
-  ssid_override, ssid_prefix, mac)` using the **real AP MAC** (new hal `softap_mac()`), builds
-  `ApConfig` internally from `PortalConfig` (resolved SSID + `channel` + `ap_password`), calls
-  `init_softap_async`, then runs the portal as today.
-- `ssid_override: Some("MyClock")` → the hal AP **broadcasts exactly `MyClock`** (parity with
-  idf; acceptance criterion #1 of `ssid-override-v1` now holds on both paths).
-- `ssid_override: None` → hal AP broadcasts `{prefix}-{MAC}` (new default, matches idf).
-- The caller no longer builds `ApConfig` or calls `init_softap_async` for provisioning.
-- The interim validation-only hal `ssid_override` code is replaced by real wiring.
-- esp-idf path is unchanged.
+Makes the bare-metal `rustyfarian-esp-hal-network` provisioning `start()` own SoftAP bring-up, so `PortalConfig.ssid_override` and the derived default drive the radio SSID, as on esp-idf.
+Completes the hal half of [`ssid-override-v1.md`](./ssid-override-v1.md), whose hal field is validation-only today.
+Today the caller runs `ApConfig::open(PORTAL_SSID_PREFIX)` → `WiFiManager::init_softap_async(..)` → `builder.start(spawner, softap, store, rng)`; hal uses the SSID verbatim with no MAC suffix, has no AP-MAC read, and its example's "last two MAC bytes appended" comment is stale.
 
 ## Decisions
-
-|                                                                                                      Decision | Reason                                                                                                                                                                    | Rejected Alternative                                                                                                                                                                  |
-|--------------------------------------------------------------------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|             **`start()` takes individual AP peripherals** — `start(spawner, timg0, sw_int, wifi, store, rng)` | Matches the existing `with_ap_peripherals(TIMG0, SW_INTERRUPT, WIFI)` convention; conventional esp-hal style; the caller stops building `ApConfig` entirely.              | A `ApPeripherals { .. }` bundle struct (extra public type for little gain). Or a deferred-SSID `ApConfig` (splits AP config across two structs; keeps an SSID-less `ApConfig` shape). |
-| **`start()` owns AP bring-up** (builds `ApConfig` + calls `init_softap_async` internally from `PortalConfig`) | Makes `PortalConfig` the single source of SSID/channel/password truth on hal, mirroring idf where `start()` owns `SoftApManager`. Eliminates the validation-only footgun. | Keep caller-owned bring-up + validation-only `ssid_override` (the footgun this feature exists to remove).                                                                             |
-|                                **hal default SSID becomes `{prefix}-{MAC}`** (parity with idf) — **breaking** | One cross-HAL default; `resolve_softap_ssid`'s `None` path already derives it. Without this, the two HALs keep diverging defaults.                                        | Keep hal's verbatim-`{prefix}` default (defeats parity; leaves a surprising cross-HAL inconsistency).                                                                                 |
-|                                               **Add a hal `softap_mac()`** to read the AP MAC before bring-up | Needed to bake `{prefix}-{MAC}` into `ApConfig` before the AP starts; mirrors idf's `softap_mac()`.                                                                       | Support only the override on hal with no derived default (hal would have no SSID without an explicit override — worse UX, still divergent).                                           |
-|                                                                    **Reuse the shared `resolve_softap_ssid`** | Same pure, host-tested resolver both HALs use — no drift. The `None` path now receives the real hal MAC.                                                                  | A hal-local SSID resolver (drift; duplicates the policy).                                                                                                                             |
+| Decision                                                               | Reason                                                                      | Rejected Alternative                                            |
+|:-----------------------------------------------------------------------|:----------------------------------------------------------------------------|:----------------------------------------------------------------|
+| `start(spawner, timg0, sw_int, wifi, store, rng)` takes AP peripherals | Matches the `with_ap_peripherals` convention; no caller-built `ApConfig`    | `ApPeripherals` bundle struct; deferred-SSID `ApConfig`         |
+| `start()` owns AP bring-up from `PortalConfig`                         | `PortalConfig` is the single SSID/channel/password source, as on idf        | Caller-owned bring-up + validation-only override (the footgun)  |
+| hal default SSID becomes `{prefix}-{MAC}` (breaking)                   | One cross-HAL default; without it the HALs keep diverging                   | Keep verbatim `{prefix}` default                                |
+| Add hal `softap_mac()`                                                 | Bakes the MAC suffix into `ApConfig` before AP start, as on idf             | Override-only, no derived default (no SSID without an override) |
+| Reuse shared `juggler::provisioning::resolve_softap_ssid`              | Same pure, host-tested resolver as idf: `(ssid_override, ssid_prefix, mac)` | hal-local resolver (drift)                                      |
 
 ## Constraints
-
-- **BREAKING API change.** `start()`'s signature changes (AP peripherals instead of `SoftApHandle`); both hal examples and any downstream consumer update their call sites.
-  Bare-metal + pre-1.0 ("API may change before 1.0") → acceptable with a CHANGELOG migration note and an appropriate version bump.
-- **BREAKING behavior change.** hal's default AP SSID changes from `{prefix}` to `{prefix}-{MAC}`; existing hal APs are renamed.
-  Document the rename and the migration (consumers wanting the bare name set `ssid_override: Some("name")`).
-- **MAC must be readable before the AP is up** so the SSID can be baked into `ApConfig`.
-  Confirm the esp-radio/esp-hal path (e.g. `esp_wifi_get_mac` / efuse read) and whether it requires the radio/controller to be initialised first — if the MAC is only available after radio init, the bring-up order must be: init radio → read MAC → resolve SSID → start AP (may mean splitting `init_softap_async`).
-  See Open Questions.
-- **Stays within the existing gate** `#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6")))]`.
-- **AP channel + password come from `PortalConfig`** (`channel`, `ap_password`) — the internally-built `ApConfig` honours them; the existing AP-password length check in `start()` still applies.
-- **Everything else is preserved** — portal HTML, DHCP, DNS catch-all, nonce, factory-reset, `ProvisioningError` surface (plus the `InvalidSsid` variant from `ssid-override-v1`).
-- **esp-idf path untouched** (already correct).
-- The general-purpose `WiFiManager::init_softap_async` / `ApConfig` / `ApConfigExt` stay public for non-provisioning SoftAP users; only the provisioning `start()` stops requiring a pre-built handle.
+- **BREAKING API:** `start()` takes AP peripherals instead of `SoftApHandle`; pre-1.0, so it needs a CHANGELOG migration note and a version bump.
+- **BREAKING behaviour:** hal's default AP SSID changes from `{prefix}` to `{prefix}-{MAC}`, so existing hal APs are renamed; consumers wanting the bare name set `ssid_override: Some("name")`.
+- Bring-up order is read MAC → `resolve_softap_ssid` → build `ApConfig` → `init_softap_async`; no split of `init_softap_async` is needed.
+- `init_softap_async`'s `with_ssid` call takes the SSID verbatim, so the derived name must be baked into `ApConfig` upstream.
+- Gate: `#[cfg(all(feature = "embassy", any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")))]`; the new `start()` and `softap_mac()` keep all three chips.
+- AP `channel` and `ap_password` come from `PortalConfig`; the existing AP-password length check in `start()` stays.
+- Portal HTML, DHCP, DNS catch-all, nonce, factory reset and the `ProvisioningError` surface (incl. `InvalidSsid`) are preserved.
+- esp-idf path untouched.
+- `WiFiManager::init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
+- The session keeps the AP MAC rather than reading and discarding it, because [`per-device-name-prefill-v1.md`](./per-device-name-prefill-v1.md) derives its hal `dev_name` pre-fill from it.
 
 ## Open Questions
-
-- [ ] Exact esp-radio/esp-hal API to read the AP MAC before bring-up, and whether it needs radio init first.
-      If MAC is only readable post-init, decide how `start()` orders init → MAC → SSID → AP-start (possibly splitting `init_softap_async` into an init step + a start-with-ssid step).
-- [ ] Is `softap_mac()` purely platform (esp-radio FFI) with nothing host-testable, or can the derive be exercised via the existing `resolve_softap_ssid` juggler tests + an on-hardware MAC-suffix check?
-      (Likely the latter — the derivation is already host-tested; only the MAC *read* is platform.)
-- [ ] Does the breaking "PortalConfig is the SSID source of truth on both HALs" precedent warrant a short ADR?
+- [x] Which API reads the AP MAC before bring-up, and does it need radio init? Resolved: `esp_hal::efuse::interface_mac_address(InterfaceMacAddress::AccessPoint)` (esp-hal 1.2.2) is an efuse read needing no radio init; esp-radio 1.0.0-beta.1 `mac_address()` calls it; `MacAddress::as_bytes()` returns `&[u8]`; confirm on target that the MAC shown matches the broadcast AP.
+- [x] Is `softap_mac()` host-testable? Resolved: the derivation is host-tested via `resolve_softap_ssid`; only the MAC read is platform code, covered by acceptance 8.
+- [x] Does the breaking "PortalConfig is the SSID source of truth on both HALs" precedent warrant a short ADR? Resolved: amend ADR 015 (dated 2026-10-29) rather than a new ADR; the contract is recorded in the Decisions table and ssid-override-v1.
 
 ## State
-
 - [x] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Acceptance criteria
-
 1. hal `start(spawner, timg0, sw_int, wifi, store, rng)` brings up the SoftAP itself; the caller no longer builds `ApConfig` or calls `init_softap_async` for provisioning.
-2. `ssid_override: Some("MyClock")` → the hal AP **broadcasts exactly `MyClock`** (verified on the radio, not merely validated) — `ssid-override-v1` acceptance criterion #1 now holds on both HALs.
-3. `ssid_override: None` → the hal AP broadcasts `{prefix}-{MAC}` using the real AP MAC from the new `softap_mac()` (new default; matches idf).
-4. The interim validation-only hal `ssid_override` code (dummy zero-MAC `resolve_softap_ssid` call) is removed and replaced by the real wiring.
-5. Both hal examples (`hal_c3_provision_mqtt`, `hal_c6_provision_mqtt`) updated to the new `start()` signature and build clean (`just build-example`).
-6. CHANGELOG documents BOTH breaking changes (the `start()` signature and the default-SSID rename) with explicit migration guidance.
-7. `just verify` green; esp-idf provisioning behavior unchanged.
-8. On-hardware check: a hal device with `ssid_override: None` shows a `-XXXX` MAC suffix; with `ssid_override: Some(..)` shows the verbatim name.
+2. `ssid_override: Some("MyClock")` makes the hal AP broadcast exactly `MyClock`, verified on the radio and not merely validated; `ssid-override-v1` criterion 1 then holds on both HALs.
+3. `ssid_override: None` makes the hal AP broadcast `{prefix}-{MAC}` using the real MAC from `softap_mac()` (new default, matches idf).
+4. The validation-only call (`resolve_softap_ssid(..., &[0u8; 6])`, step 0b of `session.rs` `start()`) is removed and replaced by real wiring.
+5. Both hal examples (`hal_c3_provision_mqtt`, `hal_c6_provision_mqtt`) use the new `start()` signature and build clean via `just build-example`.
+6. CHANGELOG documents both breaking changes (`start()` signature and default-SSID rename) with explicit migration guidance.
+7. `just verify` is green and esp-idf provisioning behaviour is unchanged.
+8. On hardware (C3 or C6), `ssid_override: None` shows a `-XXXX` MAC suffix and `ssid_override: Some(..)` shows the verbatim name.
 
 ## Relationship to other features
-- Completes the hal half of [`ssid-override-v1.md`](./ssid-override-v1.md) (idf already ships there; hal was validation-only pending this re-architecture).
-- Reuses `juggler::provisioning::resolve_softap_ssid` and the `ProvisioningError::InvalidSsid` variant introduced by `ssid-override-v1`.
+- Completes the hal half of [`ssid-override-v1.md`](./ssid-override-v1.md) and reuses its `juggler::provisioning::resolve_softap_ssid` and `ProvisioningError::InvalidSsid`.
+- Blocks [`per-device-name-prefill-v1.md`](./per-device-name-prefill-v1.md), whose hal pre-fill derives from the same AP MAC; that feature is out of scope here.
 
 ## Session Log
-- 2026-06-23 — Feature doc created via /feature dialog after implementing `ssid-override-v1` surfaced that the hal `ssid_override` was validation-only (hal's caller owns AP bring-up; hal uses the SSID verbatim with no MAC suffix; hal has no `softap_mac`). Decided: re-architect hal `start()` to own bring-up taking individual AP peripherals (`timg0, sw_int, wifi`); hal default SSID becomes `{prefix}-{MAC}` (breaking, for parity); add hal `softap_mac()`; reuse the shared `resolve_softap_ssid`. Open: exact MAC-read API + ordering vs radio init; host-testability of the MAC read; possible ADR.
+- 2026-06-23 — Feature doc created after `ssid-override-v1` exposed the validation-only hal `ssid_override`; re-architecture chosen.
+- 2026-10-29 — Updated: frontmatter added, MAC-read question resolved (efuse), esp32s3 in gate, per-device-name dependency noted
+- 2026-10-29 — Implementation landed: `start()` owns AP bring-up from `PortalConfig`, `softap_mac()` added, examples, README and CHANGELOG updated, ADR 015 amended; acceptance 8 (on-device SSID check on C3 or C6) is still open for the user.

@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WIFI_PASS");
     // Portal identity overrides used by the provisioning examples.
     println!("cargo:rerun-if-env-changed=PORTAL_SSID_PREFIX");
+    println!("cargo:rerun-if-env-changed=PORTAL_SSID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=DEVICE_NAME");
     // Non-secret portal pre-fill defaults read via `option_env!` in the
     // provisioning examples (see `.env.example`).

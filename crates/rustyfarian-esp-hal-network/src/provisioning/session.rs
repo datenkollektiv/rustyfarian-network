@@ -50,30 +50,12 @@ pub struct PortalConfig<'a> {
     /// [`juggler::provisioning::derive_softap_ssid`] to form the full
     /// `{prefix}-{MAC}` SSID.  Ignored when
     /// [`ssid_override`](Self::ssid_override) is `Some`.
-    ///
-    /// **esp-hal interim limitation (current release):** this is the intended
-    /// prefix consumed by the shared resolution logic — it does **not** yet drive
-    /// the radio SSID on the bare-metal path.  `start()` only *validates* the
-    /// resolved name; the actual AP name still comes from the `ApConfig` you pass
-    /// to `WiFiManager::init_softap_async(..)` before `start()`.  Driving the
-    /// radio SSID from this prefix (and the MAC-derived suffix) lands with the AP
-    /// bring-up ownership redesign — see
-    /// `docs/features/hal-provisioning-ap-ownership-v1.md`.
     pub ssid_prefix: &'a str,
     /// When `Some`, used verbatim as the complete SoftAP SSID; `ssid_prefix` and the
     /// MAC-derived suffix are ignored. Must be 1..=32 UTF-8 bytes and not
     /// whitespace-only, or `start()` fails. Using an override disables the default
     /// per-device MAC uniqueness, so distinct devices given the same override share
     /// an SSID.
-    ///
-    /// **esp-hal interim limitation (current release):** on the bare-metal path
-    /// `start()` only *validates* this value — it does **not** yet set the radio
-    /// SSID. The caller still controls the AP name via `ApConfig::open(..)` /
-    /// `WiFiManager::init_softap_async(..)` before `start()`. Driving the radio
-    /// SSID from `ssid_override` (and the `{prefix}-{MAC}` default) lands with the
-    /// AP bring-up ownership redesign — see
-    /// `docs/features/hal-provisioning-ap-ownership-v1.md`. Until then, set the
-    /// AP name you want directly on the `ApConfig` you pass to `init_softap_async`.
     pub ssid_override: Option<&'a str>,
     /// Optional WPA2 password for the AP.  `None` opens an unprotected AP and
     /// emits a `warn!` log; `Some(pw)` where `pw.len() <
@@ -179,6 +161,16 @@ pub enum ProvisioningError {
         /// The reason the SSID was rejected, as a `&'static str` message.
         reason: &'static str,
     },
+    /// SoftAP bring-up inside `start()` failed.
+    ///
+    /// `WiFiManager::init_softap_async` returned an error (invalid SSID or
+    /// password for the radio, or an `esp-radio` driver failure).
+    /// The underlying error is logged at `error` level; this variant carries a
+    /// static summary so the enum stays `Copy + Eq`.
+    SoftApInit {
+        /// Short static description of the failure class.
+        reason: &'static str,
+    },
     /// Reserved for future embassy versions where `spawner.spawn()` may become
     /// fallible again (precedent: embassy 0.7's `SpawnError`).  Currently
     /// unreachable — embassy 0.10 panics on pool exhaustion rather than
@@ -214,6 +206,9 @@ impl core::fmt::Display for ProvisioningError {
             }
             ProvisioningError::InvalidSsid { reason } => {
                 write!(f, "invalid SoftAP SSID override: {reason}")
+            }
+            ProvisioningError::SoftApInit { reason } => {
+                write!(f, "SoftAP bring-up failed: {reason}")
             }
             ProvisioningError::SpawnFailed => write!(f, "embassy task spawn failed"),
             ProvisioningError::AlreadyStarted => {
@@ -310,6 +305,7 @@ pub(crate) struct SharedState {
 pub struct ProvisioningSession {
     shared: &'static SharedState,
     ap_ip: [u8; 4],
+    ap_mac: [u8; 6],
 }
 
 impl ProvisioningSession {
@@ -328,6 +324,15 @@ impl ProvisioningSession {
     /// default.
     pub fn ap_ip(&self) -> [u8; 4] {
         self.ap_ip
+    }
+
+    /// The SoftAP interface MAC address, read once at session start.
+    ///
+    /// This is the MAC the provisioning SSID was derived from.
+    /// `docs/features/per-device-name-prefill-v1.md` will derive the hal
+    /// `dev_name` pre-fill from it.
+    pub fn ap_mac(&self) -> [u8; 6] {
+        self.ap_mac
     }
 
     /// Waits for the provisioning session to reach a terminal outcome.
@@ -393,17 +398,16 @@ impl ProvisioningSession {
 ///     defaults: juggler::provisioning::PortalDefaults::default(),
 /// })
 /// .on_event(|e| log::info!("event: {:?}", e))
-/// .start(spawner, ap_handle, store, rng)?;
+/// .start(spawner, peripherals.TIMG0, peripherals.FROM_CPU_INTR0, peripherals.WIFI, store, rng)?;
 /// ```
 ///
-/// **AP name ownership (current esp-hal release):** the portal's actual SoftAP
-/// name still comes from `WiFiManager::init_softap_async(..)`, which the caller
-/// invokes to obtain the `SoftApHandle` passed to [`start`](Self::start).  The
-/// [`ssid_prefix`](PortalConfig::ssid_prefix) and
-/// [`ssid_override`](PortalConfig::ssid_override) fields are *validated* by
-/// `start()` but do not yet drive the radio SSID — that unification lands with
-/// the AP bring-up ownership redesign
-/// (`docs/features/hal-provisioning-ap-ownership-v1.md`).
+/// **AP ownership:** `start()` brings the SoftAP up itself.
+/// It reads the AP MAC, resolves the SSID from
+/// [`ssid_override`](PortalConfig::ssid_override) or
+/// [`ssid_prefix`](PortalConfig::ssid_prefix), builds the `ApConfig` from
+/// [`PortalConfig`], and calls `WiFiManager::init_softap_async` with the
+/// peripherals passed to [`start`](Self::start).
+/// The caller no longer builds an `ApConfig` for provisioning.
 // `config` is only read inside the embassy+chip-gated `start` method.
 #[cfg_attr(
     not(all(
@@ -441,25 +445,28 @@ impl<'a> ProvisioningBuilder<'a> {
     /// # Parameters
     ///
     /// - `spawner` — the embassy task spawner for the current executor.
-    /// - `ap` — [`SoftApHandle`](crate::wifi::SoftApHandle) from
-    ///   `WiFiManager::init_softap_async`.
+    /// - `timg0`, `sw_int`, `wifi` — the `TIMG0`, `FROM_CPU_INTR0` and `WIFI`
+    ///   peripherals; `start()` uses them to bring the SoftAP up.
     /// - `store` — opened [`ProvisioningStore`] for credential persistence.
     /// - `rng` — hardware RNG used to generate the per-session CSRF nonce (8 hex
     ///   chars) on every `start()`.  The TRNG entropy depends on the radio being
-    ///   active, so `start()` must be called AFTER
-    ///   `WiFiManager::init_softap_async` has brought the SoftAP up (the
-    ///   `SoftApHandle` parameter already implies this).
+    ///   active, so `start()` draws the nonce only after it has brought the
+    ///   SoftAP up.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the AP password is too short, if a task spawn fails,
-    /// or if `start` was already called this boot.
+    /// Returns `Err` if the profile is unsupported, if the resolved SSID is
+    /// invalid ([`ProvisioningError::InvalidSsid`]), if the AP password is too
+    /// short, if SoftAP bring-up fails ([`ProvisioningError::SoftApInit`]), or if
+    /// `start` was already called this boot.
     ///
     /// # Panics
     ///
-    /// Panics if `start` is called a second time in the same boot and the
-    /// `StaticCell::try_init` path is unavailable.  Prefer checking
-    /// [`ProvisioningError::AlreadyStarted`] at runtime.
+    /// Taking the AP peripherals by value makes a second `start()` in one boot
+    /// impossible in safe code, so the [`ProvisioningError::AlreadyStarted`]
+    /// guard is defensive: a caller that re-obtains the peripherals through
+    /// `unsafe` re-enters the radio bring-up and panics there before the guard
+    /// is reached.
     #[cfg(all(
         feature = "embassy",
         any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
@@ -467,7 +474,9 @@ impl<'a> ProvisioningBuilder<'a> {
     pub fn start<F>(
         self,
         spawner: embassy_executor::Spawner,
-        ap: crate::wifi::SoftApHandle,
+        timg0: esp_hal::peripherals::TIMG0<'static>,
+        sw_int: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
+        wifi: esp_hal::peripherals::WIFI<'static>,
         store: ProvisioningStore<F>,
         rng: esp_hal::rng::Rng,
     ) -> Result<ProvisioningSession, ProvisioningError>
@@ -483,21 +492,11 @@ impl<'a> ProvisioningBuilder<'a> {
         // without any side effects.
         validate_profile(self.config.profile)?;
 
-        // ── Step 0b: validate ssid_override if present ─────────────────────
-        // The bare-metal SoftAP is brought up externally (via
-        // `WiFiManager::init_softap_async`) before `start()` is called, so
-        // `start()` does not set the radio SSID.  However, `ssid_override`
-        // must still be validated early so callers receive a clean error
-        // rather than silently running a portal with an invalid SSID name.
-        // A zero MAC is used here because the MAC suffix is only appended on
-        // the `None` path (infallible, derives a harmless string we discard),
-        // and the `Some` path only inspects the override string itself.
-        resolve_softap_ssid(
-            self.config.ssid_override,
-            self.config.ssid_prefix,
-            &[0u8; 6],
-        )
-        .map_err(|reason| ProvisioningError::InvalidSsid { reason })?;
+        // ── Step 0b: resolve the SoftAP SSID from the AP MAC ───────────────
+        let ap_mac = crate::wifi::softap_mac();
+        let ssid = resolve_softap_ssid(self.config.ssid_override, self.config.ssid_prefix, &ap_mac)
+            .map_err(|reason| ProvisioningError::InvalidSsid { reason })?;
+        log::info!("Provisioning SSID resolved (len={})", ssid.len());
 
         // ── Step 1: validate AP password ───────────────────────────────────
         if let Some(pw) = self.config.ap_password {
@@ -510,7 +509,25 @@ impl<'a> ProvisioningBuilder<'a> {
             warn_if_open_ap(self.config.ap_password);
         }
 
-        // ── Step 2: generate per-session nonce ─────────────────────────────
+        // ── Step 1b: bring the SoftAP up ───────────────────────────────────
+        use crate::wifi::ApConfigExt;
+        let ap_config = match self.config.ap_password {
+            Some(pw) => juggler::wifi::ApConfig::wpa2(ssid.as_str(), pw),
+            None => juggler::wifi::ApConfig::open(ssid.as_str()),
+        }
+        .with_channel(self.config.channel)
+        .with_ap_peripherals(timg0, sw_int, wifi);
+        let ap = crate::wifi::WiFiManager::init_softap_async(ap_config).map_err(|e| {
+            log::error!("SoftAP init failed: {}", e);
+            ProvisioningError::SoftApInit {
+                reason: match e {
+                    crate::wifi::WifiError::ConfigureFailed => "SoftAP configuration rejected",
+                    crate::wifi::WifiError::Driver(_) => "radio driver error",
+                },
+            }
+        })?;
+
+        // ── Step 2: generate per-session nonce (radio is active now) ───────
         let nonce = generate_nonce(rng);
 
         // ── Step 3: initialise SharedState in a StaticCell ─────────────────
@@ -593,6 +610,7 @@ impl<'a> ProvisioningBuilder<'a> {
         Ok(ProvisioningSession {
             shared,
             ap_ip: AP_IP,
+            ap_mac,
         })
     }
 }
