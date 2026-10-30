@@ -55,10 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See `docs/features/hal-provisioning-ap-ownership-v1.md`.
 - **Breaking (HAL tier):** the default provisioning AP SSID on `rustyfarian-esp-hal-network` changes from the bare `{prefix}` to `{prefix}-{MAC}`, using the last two AP-MAC bytes in uppercase hex, matching ESP-IDF.
   Migration: existing hal APs are renamed; consumers that want the bare name set `ssid_override: Some("name")` on `PortalConfig`.
+  The suffix is each stack's own AP MAC, and ESP-IDF (base MAC plus one in the last byte) and esp-hal (locally-administered bit in the first byte) derive it differently, so one board shows `-C4F5` under ESP-IDF and `-C4F4` under esp-hal.
 - `rustyfarian-esp-hal-network`: `PortalConfig.ssid_override` is applied end-to-end on esp-hal as well as ESP-IDF, so the AP broadcasts the override verbatim and the derived default applies on both tiers.
+- The hal provisioning examples' default `PORTAL_SSID_PREFIX` is now `Rustyfarian`, the spelling the IDF examples use.
+- The hal provisioning examples read `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE` at build time (WPA2 portal password and verbatim SSID), as the IDF example already does for the password.
+- The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
 
 ### Fixed
 
+- esp-hal `ProvisioningStore` never read a committed record back: `try_read_sector` read exactly `record_len` bytes, and esp-storage 0.10 rejects a read length that is not a multiple of its 4-byte `READ_SIZE`, so every provisioned boot reopened the portal with `StoreError::Flash` (bug 006, found on an ESP32-C3 Mini-1).
+  The read is now rounded up to `READ_SIZE`, a host mock with word-aligned reads covers it, and the hal provisioning examples log a store error instead of silently re-provisioning.
 - The esp-hal docs no longer call the ESP32-S3 LoRa-only: every pinned dependency supports it, and the claimed `compile_error!` for S3 with `wifi`/`ota` never existed (S3 with `ota` silently compiled the stub manager).
 
 ## [0.6.0] - 2026-10-09

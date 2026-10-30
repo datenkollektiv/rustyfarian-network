@@ -57,6 +57,12 @@
 //! ```sh
 //! PORTAL_SSID_OVERRIDE="MyClock" just build-example hal_c3_provision_mqtt
 //! ```
+//!
+//! Protect the portal AP with WPA2 at build time (8 to 63 bytes):
+//!
+//! ```sh
+//! PROVISION_AP_PSK="provision-me" just build-example hal_c3_provision_mqtt
+//! ```
 
 #![no_std]
 #![no_main]
@@ -80,12 +86,20 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Override at build time: `PORTAL_SSID_PREFIX="MyDevice" just build-example hal_c3_provision_mqtt`
 const PORTAL_SSID_PREFIX: &str = match option_env!("PORTAL_SSID_PREFIX") {
     Some(s) => s,
-    None => "RustyFarian",
+    None => "Rustyfarian",
 };
 
 /// Optional full SoftAP SSID that replaces `{prefix}-{MAC}` when set.
 /// Override at build time: `PORTAL_SSID_OVERRIDE="MyClock" just build-example hal_c3_provision_mqtt`
 const PORTAL_SSID_OVERRIDE: Option<&str> = option_env!("PORTAL_SSID_OVERRIDE");
+
+/// Optional WPA2 password for the portal AP; unset runs an open AP.
+/// Set at build time: `PROVISION_AP_PSK="provision-me" just build-example hal_c3_provision_mqtt`.
+/// A `fn` rather than a `const`, like `mqtt_password()` in the MQTT examples:
+/// CodeQL reports a `const` holding a credential as a hard-coded value.
+fn ap_psk() -> Option<&'static str> {
+    option_env!("PROVISION_AP_PSK")
+}
 
 /// Human-readable device name shown in the portal header.
 const DEVICE_NAME: &str = match option_env!("DEVICE_NAME") {
@@ -184,7 +198,11 @@ async fn main(spawner: Spawner) {
     // Check whether the device is already provisioned.
     // If so, log the stored config and idle — a real application would reboot
     // into its normal STA + MQTT boot path here.
-    if store.is_provisioned().unwrap_or(false) {
+    let provisioned = store.is_provisioned().unwrap_or_else(|e| {
+        log::warn!("Store is_provisioned error: {:?}; re-provisioning", e);
+        false
+    });
+    if provisioned {
         match store.load() {
             Ok(Some(cfg)) => {
                 log::info!(
@@ -227,8 +245,8 @@ async fn main(spawner: Spawner) {
 
     // Not yet provisioned — start the SoftAP captive portal.
     // `start` owns the AP bring-up: it derives the SSID from the AP MAC, brings
-    // up the open AP (no WPA2 password; the nonce in the form is the access
-    // control mechanism) and spawns the portal tasks.
+    // up the AP (open unless `PROVISION_AP_PSK` is set; the nonce in the form
+    // is the access control mechanism) and spawns the portal tasks.
 
     // The `store` declared above is still owned here (we only enter this branch
     // when `is_provisioned()` returned false, so no move occurred).
@@ -256,7 +274,7 @@ async fn main(spawner: Spawner) {
     let portal_config = PortalConfig {
         ssid_prefix: PORTAL_SSID_PREFIX,
         ssid_override: PORTAL_SSID_OVERRIDE,
-        ap_password: None,
+        ap_password: ap_psk(),
         channel: 1,
         device_name: DEVICE_NAME,
         firmware_version: FIRMWARE_VERSION,
