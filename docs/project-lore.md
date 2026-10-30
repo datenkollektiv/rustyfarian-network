@@ -119,6 +119,12 @@ Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test]
 The compile-time `Config — ... mqtt_host=... mqtt_port=...` log line printed by `examples/common/env.rs` is the source of truth for what was baked in; compare it against `.env` before debugging the network.
 Fix: keep build-time keys in `.env` only, remove them from `.envrc`, then `direnv reload` and rebuild (`build.rs` has `rerun-if-env-changed` for each key).
 
+**`ubuntu-latest` moved to Ubuntu 26.04, whose libxml2 2.14 ships `libxml2.so.16`, so ESP-IDF v5.3.3's prebuilt `esp-clang` 16 fails its install-time version check with `libxml2.so.2: cannot open shared object file` and every `esp-idf-sys` build on CI dies after 2-3 minutes.**
+The failing step is `idf_tools.py install` inside the `esp-idf-sys` build script, so `just check`, `just clippy`, `just check-sta-only` and `just build-example idf_*` all fail identically while `just fmt`, `cargo audit` and `lint-docs` stay green; the runner's `idf5.3_py3.14_env` venv name is the tell that the image changed.
+Nothing in the repository changed between the green and red runs; `just act <job>` reproduced green because act's image is still an older Ubuntu.
+Fix: pin the ESP-IDF-building jobs to `runs-on: ubuntu-24.04` (rust.yml, clippy.yml); `just act` maps that label to `catthehacker/ubuntu:act-24.04` (with `--pull=false`, the GHCR pull is denied without a login) because act has no default image for it.
+An ESP-IDF upgrade (`docs/features/esp-idf-v5-5-upgrade-v1.md`) is the only path back to `ubuntu-latest`, and only if its esp-clang links against the new libxml2 soname.
+
 ---
 
 ## esp-hal Bare-Metal Stack (esp-radio / esp-hal waves)

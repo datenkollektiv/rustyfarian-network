@@ -19,7 +19,10 @@ env:
 
 jobs:
   clippy:
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: `ubuntu-latest` moved to 26.04 (libxml2 2.14, soname libxml2.so.16),
+    # where ESP-IDF v5.3.3's prebuilt esp-clang 16 fails to load libxml2.so.2 during
+    # `idf_tools.py install`, so every esp-idf-sys build dies (CI breakage 2026-10-30).
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout

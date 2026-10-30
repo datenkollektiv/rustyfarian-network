@@ -598,7 +598,7 @@ verify:
 [group('ci')]
 ci: fmt-check deny check clippy check-ota-pure check-ota-wire-pure
 
-# run all CI workflows locally via act (requires Docker + act)
+# run all CI workflows locally via act (requires Docker + act); the ESP-IDF jobs are pinned to ubuntu-24.04, which act has no default image for
 [group('ci')]
 act *job:
     #!/usr/bin/env bash
@@ -606,7 +606,7 @@ act *job:
     if [ -z "{{ job }}" ]; then
         just act fmt && just act clippy && just act check-and-test && just act audit
     else
-        act -j "{{ job }}"
+        act -j "{{ job }}" --pull=false -P ubuntu-24.04=catthehacker/ubuntu:act-24.04
     fi
 
 # ── release ───────────────────────────────────────────────────────────────
