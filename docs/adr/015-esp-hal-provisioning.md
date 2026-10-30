@@ -247,7 +247,7 @@ The `SoftApHandle` parameter and the validation-only zero-MAC check in `start()`
 `init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
 The session keeps the AP MAC for the per-device-name pre-fill feature instead of discarding it.
 Both changes are breaking (the `start()` signature and the default SSID rename) and are documented in `CHANGELOG.md` with migration notes.
-See [hal-provisioning-ap-ownership-v1](../features/hal-provisioning-ap-ownership-v1.md) and [ssid-override-v1](../features/ssid-override-v1.md) for the full contract.
+See [hal-provisioning-ap-ownership-v1](../features/archive/hal-provisioning-ap-ownership-v1.md) and [ssid-override-v1](../features/ssid-override-v1.md) for the full contract.
 
 ## References
 

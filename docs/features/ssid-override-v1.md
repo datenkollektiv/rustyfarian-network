@@ -5,8 +5,8 @@ being limited to the auto-derived `{prefix}-{MAC}` name. Sourced from the rgb-cl
 bring-up: the AP currently shows as `Rustyfarian-DBBD` (prefix `Rustyfarian` +
 last two MAC bytes), and the consumer wants a bare custom name (e.g. `MyClock`).
 
-**Status:** esp-idf lands end-to-end in this release (the override drives the actual SoftAP SSID).
-esp-hal lands the `ssid_override` field + validation only — full radio-SSID parity (override actually sets the AP name, and the `{prefix}-{MAC}` default) is **deferred** to [`hal-provisioning-ap-ownership-v1.md`](./hal-provisioning-ap-ownership-v1.md).
+**Status:** both tiers apply the override and the derived `{prefix}-{MAC}` default end-to-end (the override drives the actual SoftAP SSID).
+esp-idf applies it directly; esp-hal radio parity was delivered by [`hal-provisioning-ap-ownership-v1.md`](./archive/hal-provisioning-ap-ownership-v1.md).
 
 ## Scope and end state
 
@@ -15,13 +15,13 @@ always appends `-{MAC[4]:02X}{MAC[5]:02X}` (`ssid.rs`). When done:
 
 - `PortalConfig` (on **both** `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`)
   gains `ssid_override: Option<&str>`.
-- `Some(name)` → (esp-idf) the AP SSID broadcasts exactly `name`, with no transformation, suffixing, or truncation; (esp-hal) the override is validated but does not yet drive the radio SSID — radio parity is deferred to `hal-provisioning-ap-ownership-v1.md`.
+- `Some(name)` → (esp-idf) the AP SSID broadcasts exactly `name`, with no transformation, suffixing, or truncation; (esp-hal) the same verbatim broadcast, with radio parity delivered by `hal-provisioning-ap-ownership-v1.md`.
   Invalid values are rejected on both (never silently altered).
 - `None` → today's `{prefix}-{MAC}` behavior, byte-for-byte unchanged.
 - The resolution + validation logic lives once in `juggler` (pure, host-tested), called by
   both HAL paths — so the validation and error-handling cannot drift. The runtime radio-SSID
-  behavior differs: esp-idf applies the override end-to-end; esp-hal validates but defers
-  radio ownership to `hal-provisioning-ap-ownership-v1.md`.
+  behavior is the same on both tiers: each applies the override end-to-end, and esp-hal
+  radio ownership was delivered by `hal-provisioning-ap-ownership-v1.md`.
 - An invalid override (empty or `> 32` bytes) makes `start()` return an error — never a
   silent truncation, never a panic.
 
@@ -68,16 +68,19 @@ portal: PortalConfig {
 // ssid_override: None    → "Rustyfarian-DBBD" (unchanged default)
 ```
 
+The `{prefix}-{MAC}` suffix comes from each stack's own AP MAC, and ESP-IDF and esp-hal derive that MAC differently.
+One board therefore shows `-C4F5` under ESP-IDF and `-C4F4` under esp-hal; the format is identical, the bytes are not.
+
 
 ## Decisions
 
-|                                                                                                                                                         Decision | Reason                                                                                                                                                                                                            | Rejected Alternative                                                                                                                                                                                                               |
-|-----------------------------------------------------------------------------------------------------------------------------------------------------------------:|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|                   **Full verbatim override** — `ssid_override: Option<&str>` on `PortalConfig`; `Some` is used as the entire SSID, `None` keeps `{prefix}-{MAC}` | Gives a bare custom name (`MyClock`) — exactly what the consumer asked for — while leaving the default path untouched. Smallest additive surface.                                                                 | `append_mac_suffix: bool` (keeps prefix, only drops the suffix — can't produce arbitrary names). Or an `Ssid { Literal \| Prefixed }` enum (most expressive but a breaking replacement of `ssid_prefix` and larger surface).       |
-|                  **Resolution in `juggler` (`resolve_softap_ssid`); both HALs call it; reuse existing `validate_ssid`** | One pure, host-tested place; validation and error semantics can't diverge across HALs — directly applying the lesson from the DHCP-DNS bug. Runtime radio-SSID behavior differs (esp-idf end-to-end vs. esp-hal deferred), but the *validation contract* is unified. No second validator needed.      | Per-HAL duplication of the override/validation logic (the exact drift we are trying to design out).                                                                                                                                |
-|                                                              **Reject an invalid override via `Err`** (empty, whitespace-only, or `> 32` bytes); `start()` fails | Mirrors the established validate-then-reject philosophy (client-id policy, `ap_password` length). A silently truncated or blank SSID is a confusing field bug and provisioning footgun.                           | Silent truncation to 32 bytes, or `debug_assert`/panic.                                                                                                                                                                            |
-|                                                                      **Keep `derive_softap_ssid` unchanged; `resolve_softap_ssid` wraps it for the `None` path** | Backward compatible; existing `ssid.rs` tests stay green; the derived branch stays infallible.                                                                                                                    | Folding the MAC-derivation into `resolve_softap_ssid` and deleting `derive_softap_ssid` (needless churn, breaks existing callers/tests).                                                                                           |
-| **Additive field: `ssid_prefix` becomes required-but-ignored when `ssid_override: Some`** | Deliberate v1 tradeoff: the field remains in struct literals for backward compatibility and to keep the derived path unambiguous. The alternative (an `Ssid` enum unifying the model) is the noted Future direction. | Removing `ssid_prefix` entirely and using an `Ssid` enum now (forces a major breaking change and blocks v1 release).                                                                                                |
+|                                                                                                                                       Decision | Reason                                                                                                                                                                                                                                                                                                                                         | Rejected Alternative                                                                                                                                                                                                         |
+|-----------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Full verbatim override** — `ssid_override: Option<&str>` on `PortalConfig`; `Some` is used as the entire SSID, `None` keeps `{prefix}-{MAC}` | Gives a bare custom name (`MyClock`) — exactly what the consumer asked for — while leaving the default path untouched. Smallest additive surface.                                                                                                                                                                                              | `append_mac_suffix: bool` (keeps prefix, only drops the suffix — can't produce arbitrary names). Or an `Ssid { Literal \| Prefixed }` enum (most expressive but a breaking replacement of `ssid_prefix` and larger surface). |
+|                                         **Resolution in `juggler` (`resolve_softap_ssid`); both HALs call it; reuse existing `validate_ssid`** | One pure, host-tested place; validation and error semantics can't diverge across HALs — directly applying the lesson from the DHCP-DNS bug. Runtime radio-SSID behavior is end-to-end on both tiers (esp-hal parity delivered by `hal-provisioning-ap-ownership-v1.md`), but the *validation contract* is unified. No second validator needed. | Per-HAL duplication of the override/validation logic (the exact drift we are trying to design out).                                                                                                                          |
+|                                            **Reject an invalid override via `Err`** (empty, whitespace-only, or `> 32` bytes); `start()` fails | Mirrors the established validate-then-reject philosophy (client-id policy, `ap_password` length). A silently truncated or blank SSID is a confusing field bug and provisioning footgun.                                                                                                                                                        | Silent truncation to 32 bytes, or `debug_assert`/panic.                                                                                                                                                                      |
+|                                                    **Keep `derive_softap_ssid` unchanged; `resolve_softap_ssid` wraps it for the `None` path** | Backward compatible; existing `ssid.rs` tests stay green; the derived branch stays infallible.                                                                                                                                                                                                                                                 | Folding the MAC-derivation into `resolve_softap_ssid` and deleting `derive_softap_ssid` (needless churn, breaks existing callers/tests).                                                                                     |
+|                                                      **Additive field: `ssid_prefix` becomes required-but-ignored when `ssid_override: Some`** | Deliberate v1 tradeoff: the field remains in struct literals for backward compatibility and to keep the derived path unambiguous. The alternative (an `Ssid` enum unifying the model) is the noted Future direction.                                                                                                                           | Removing `ssid_prefix` entirely and using an `Ssid` enum now (forces a major breaking change and blocks v1 release).                                                                                                         |
 
 ## Constraints
 
@@ -91,7 +94,7 @@ portal: PortalConfig {
 - **Source-breaking for struct-literal construction.** Adding a field means every `PortalConfig { .. }` literal must add `ssid_override: None`.
   Acceptable pre-1.0 (the items are already marked "Experimental: API may change before 1.0"); ship as a minor bump with a one-line migration note in the CHANGELOG.
   (Mitigation deferred — see Open Questions.)
-- **Lands on BOTH `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`.** Shared validation logic in `juggler`; no per-HAL copies. esp-idf applies the override end-to-end; esp-hal validates only (radio application deferred to `hal-provisioning-ap-ownership-v1.md`).
+- **Lands on BOTH `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`.** Shared validation logic in `juggler`; no per-HAL copies. both tiers apply the override end-to-end; esp-hal radio application was delivered by `hal-provisioning-ap-ownership-v1.md`.
 - **`juggler` stays `no_std` / alloc-free.** `resolve_softap_ssid` returns `heapless::String<32>`; the error is `&'static str` (no `anyhow`, no `alloc`).
   The esp-idf `start()` maps the `Err` to `anyhow`; esp-hal maps it to a new `ProvisioningError::InvalidSsid` variant (mirroring `PasswordTooShort`).
 - **Public-surface intent.** `juggler::wifi::validate_ssid` is pre-existing public (reused, not newly exposed).
@@ -112,22 +115,22 @@ portal: PortalConfig {
 ## State
 
 - [x] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Acceptance criteria
 
 1a. **esp-idf (met in this release):** `ssid_override: Some("MyClock")` causes the AP to broadcast exactly `MyClock` (no prefix, no MAC suffix) end-to-end.
 1b.
-**esp-hal (validation only; radio-SSID parity deferred):** `start()` accepts and validates the override (rejects invalid values with `ProvisioningError::InvalidSsid`), but does NOT yet apply it to the radio.
-Full override-to-broadcast parity is deferred to `hal-provisioning-ap-ownership-v1.md`.
+**esp-hal (met; radio-SSID parity delivered by `hal-provisioning-ap-ownership-v1.md`):** `start()` accepts and validates the override (rejects invalid values with `ProvisioningError::InvalidSsid`) and applies it to the radio, so the AP broadcasts exactly `MyClock`.
+Verified on an ESP32-C3 Mini-1 with the default `Rustyfarian-C4F4` and the override `MyClock`.
 2. **Both HALs:** `ssid_override: None` yields byte-identical output to today's `derive_softap_ssid({prefix}, mac)` (unchanged default path).
 3. **Both HALs (validation contract met):** An empty, whitespace-only, or `> 32`-byte override makes `start()` return `Err` (esp-idf: `anyhow`; esp-hal: `ProvisioningError::InvalidSsid`) — never truncated, never a panic.
 4. **Pure function validation:** `resolve_softap_ssid` in `juggler` is host-tested with explicit cases: `"A"` accepted; exactly 32 ASCII bytes accepted; 33 ASCII bytes rejected; a multibyte string under 32 chars but over 32 bytes rejected; whitespace-only (`"   "`) rejected; a 31-byte prefix with derived suffix accepted (existing behavior unchanged); empty-prefix derived behavior unchanged; an override containing hyphens is treated as an ordinary literal (no special-casing of `-`); duplicate override names across devices are allowed by design (ties to collision caveat); and the `None` path equals `derive_softap_ssid` (covering existing multibyte-prefix and empty-prefix cases).
 5. `resolve_softap_ssid` reuses the existing `juggler::wifi::validate_ssid` — no second SSID-length validator added.
 6. `ssid_override` field docs explicitly state that using an override disables per-device MAC uniqueness and may cause SSID collisions across devices.
-7. **Build + release:** `just verify` green; `just build-example idf_c3_provision_mqtt` builds; esp-hal provisioning example builds (validation only); CHANGELOG entry added, including the `ssid_override: None` migration line for existing `PortalConfig` literals, plus a note linking to `hal-provisioning-ap-ownership-v1.md` for full esp-hal radio parity.
+7. **Build + release:** `just verify` green; `just build-example idf_c3_provision_mqtt` builds; esp-hal provisioning example builds; CHANGELOG entry added, including the `ssid_override: None` migration line for existing `PortalConfig` literals, plus a note linking to `hal-provisioning-ap-ownership-v1.md` for the esp-hal radio parity.
 
 ## Implementation notes
 
@@ -150,3 +153,4 @@ Explicitly out of scope for v1.
 - 2026-06-23 — Design review polish. Reuse existing `validate_ssid` (don't re-add); new resolver renamed `resolve_softap_ssid`; whitespace-only rejected; UTF-8-byte semantics documented; `&'static str` error for v1 with esp-hal `ProvisioningError::InvalidSsid` (not `SsidInvalid`); typed `SsidError` and builder/`Default` deferred as follow-ups; collision caveat promoted to acceptance criterion; explicit validation test cases enumerated; future `Ssid` enum noted as non-goal.
 - 2026-06-23 — Final review polish (contract clarity). Named the `ssid_prefix`+`ssid_override` ignored-field tradeoff as intentional (Decision row added); made the content/char validation scope explicit (length + non-empty + non-whitespace only; no content/control-char/NUL restriction in v1); split the juggler-only architectural goal out of acceptance criteria into new Implementation notes section; stated public-surface intent (`validate_ssid` pre-existing public, `resolve_softap_ssid` public for cross-crate use); made the resolver failure domain explicit (None path infallible, Some path is only error source); documented semantic-vocabulary parity across HALs (meaning preserved via `&'static str` reasons, deferred typed `SsidError` is ergonomics-only); tightened the verbatim promise (no transformation/truncation/silencing); enumerated edge cases (32-byte multibyte, 31-byte prefix unchanged, empty-prefix unchanged, hyphens literal, duplicates allowed, derived-path `None` unchanged).
 - 2026-06-23 — Truthfulness fix: rescoped to reflect as-built split. Added Status line: esp-idf end-to-end; esp-hal field+validation only with radio-SSID parity deferred to `hal-provisioning-ap-ownership-v1.md`. Split Acceptance criterion 1 into 1a (esp-idf, met) and 1b (esp-hal, validation-only/deferred). Qualified Scope line 15 (runtime split), Scope line 17-19 (validation logic shared, runtime behavior differs), and Decisions table (validation contract unified, runtime may differ). Clarified criteria 2 and 3 (both HALs), criterion 4 (pure function), and criterion 7 (build, plus CHANGELOG link). Updated Constraints to clarify esp-idf end-to-end vs. esp-hal validate-only. Cross-linked `hal-provisioning-ap-ownership-v1.md` throughout.
+- 2026-10-30 — esp-hal radio parity landed via `hal-provisioning-ap-ownership-v1.md` (PR #112); the deferred wording was removed and both tiers now apply the override and the `{prefix}-{MAC}` default end-to-end.

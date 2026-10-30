@@ -16,7 +16,7 @@ After a successful portal save ("credentials committed to flash"), the next boot
 `ProvisioningStore::try_read_sector` reads exactly `record_len` bytes (146 for the saved `wifi_mqtt` record), and esp-storage 0.10 `ReadNorFlash::read` rejects any length that is not a multiple of `READ_SIZE` (4 bytes without the `bytewise-read` feature), so every real record fails with `NotAligned` while blank flash passes because the clamped 1280-byte read is aligned.
 
 ## Linked Artefact
-`crates/rustyfarian-esp-hal-network/src/provisioning/store.rs` `try_read_sector`; esp-storage `=0.10.0` `src/nor_flash.rs` `read_nor`; found during `docs/features/hal-provisioning-ap-ownership-v1.md` hardware test 5.
+`crates/rustyfarian-esp-hal-network/src/provisioning/store.rs` `try_read_sector`; esp-storage `=0.10.0` `src/nor_flash.rs` `read_nor`; found during `docs/features/archive/hal-provisioning-ap-ownership-v1.md` hardware test 5.
 
 ## Reproduction Confidence
 high
@@ -46,7 +46,7 @@ Round the second read in `try_read_sector` up to a multiple of `F::READ_SIZE` (c
 Claude Code (fix in progress during the hardware session, user commits).
 
 ## Links
-`docs/features/hal-provisioning-ap-ownership-v1.md`; `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md` (H1, never run before today); `docs/features/provisioning-boot-identity-v1.md` (open hardware gate).
+`docs/features/archive/hal-provisioning-ap-ownership-v1.md`; `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md` (H1, never run before today); `docs/features/provisioning-boot-identity-v1.md` (open hardware gate).
 
 ## Session Log
 - 2026-10-29 — Defect captured directly from the hardware session (flash dump decodes on host, device reports `StoreError::Flash`)

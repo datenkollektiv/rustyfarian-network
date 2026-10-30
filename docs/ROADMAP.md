@@ -11,6 +11,7 @@ Hardware validated 2026-09-26: bare-metal C3 STA join, C6 SoftAP provisioning, S
 Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `smoltcp` integration.
 The TTN OTAA join and first uplink were validated 2026-06-17.
 OTA consumer runtime was hardware-validated end to end on 2026-10-08 (library runbook 21/21 on ESP32-C3) and adoption tests passed on 2026-10-09 (rgb-clock); MQTT auto-reconnect is fixed for 0.6.0 (bug 005, broken since 0.4.0).
+esp-hal provisioning now owns the SoftAP bring-up, so `ssid_override` and the `{prefix}-{MAC}` default apply on both tiers; validated on an ESP32-C3 Mini-1 on 2026-10-30, which also surfaced and fixed bug 006 (the esp-hal store never read a record back on hardware).
 See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
 
 ## Forward plan
@@ -33,10 +34,9 @@ See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHAN
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : esp-hal SoftAP bring-up for ssid_override parity with esp-idf — start takes AP peripherals, resolves SSID via shared resolver against real AP MAC, broadcasts either verbatim override or prefix-plus-MAC default, completes hal half of ssid-override (feature-doc)
-              : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
+    Ready     : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
               : Provisioning re-entry hook — optional pre-load hook answers None, Portal or FactoryReset once per boot, the library reports it as a WifiMqttLoadOutcome and never erases, the consumer owns GPIO, hold time and erase, IDF tier first, part 6 of the Wi-Fi portal fallback (feature-doc)
-              : Per-device name pre-fill — portal pre-fills dev_name as prefix plus lowercase AP-MAC suffix via a new juggler derive_device_name helper and a DeviceName Fixed or MacSuffixed choice on both PortalConfig types (breaking, next minor), so devices of one firmware get distinct names and MQTT client IDs, hal half waits on the esp-hal SoftAP bring-up item above, requested by spookhouse bug 009 and rgb-clock (feature-doc)
+              : Per-device name pre-fill — portal pre-fills dev_name as prefix plus lowercase AP-MAC suffix via a new juggler derive_device_name helper and a DeviceName Fixed or MacSuffixed choice on both PortalConfig types (breaking, next minor), so devices of one firmware get distinct names and MQTT client IDs, requested by spookhouse bug 009 and rgb-clock (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
@@ -48,7 +48,6 @@ timeline
               : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
               : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
               : OTA runtime Watchtower v2 second-device validation — adopt the runtime on second consumer (Watchtower C3-DevKitM-1), validate against reference runbook
-              : cargo semver-checks recipe — add a just recipe that checks for breaking changes before the 0.6.0 release
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
               : OTA security model doc — threat model, signed-manifest question (rollback policy covered by the OTA decision core)
@@ -58,7 +57,6 @@ timeline
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
               : Async ESP-IDF MQTT decision ADR — thin ESP-IDF wrapper vs async-first design choice
-              : bare-metal MQTT domain in rustyfarian-esp-hal-network — minimq-based (after async MQTT ADR)
 ```
 
 ---
