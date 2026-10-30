@@ -11,23 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bare-metal MQTT: new `mqtt` feature on `rustyfarian-esp-hal-network` (ADR 019) — an async MQTT 5 client over `minimq =0.13.5` and the Wi-Fi `embassy-net` stack, with LWT, a startup message republished on every (re)connect, builder subscriptions re-issued after reconnect, auto-reconnect, a polled network watch, a transport timeout of 1.5 × keep-alive and a stall deadline of socket timeout + keep-alive (a dead link ends the session within about 0.5 s, a silent broker within roughly 2.5 × keep-alive), a non-blocking `try_publish*` family returning `TryPublishError::WouldBlock` (`Ok` means queued, not delivered; the crate README states the delivery rule), an inbound message queue, and all buffers static.
   Chips `esp32c3`, `esp32c6`, `esp32s3`; examples `hal_c6_mqtt_lwt` and `hal_esp32s3_mqtt_lwt`; runbook `docs/runbooks/esp-hal-mqtt-hardware-test.md`; `just clippy-hal` and `just check-hal` cover the feature.
-- Shared MQTT configuration in `juggler::mqtt` (no `std` needed): `QoS`, `MqttConfig`, `LwtConfig`, `DEFAULT_MQTT_TASK_STACK_SIZE` and the generic `TryPublishError<E>`, used by both tier crates.
+  Shared MQTT configuration in `juggler::mqtt` (no `std` needed): `QoS`, `MqttConfig`, `LwtConfig`, `DEFAULT_MQTT_TASK_STACK_SIZE` and the generic `TryPublishError<E>`, used by both tier crates.
+  Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).
 - ESP32-S3 support for `wifi`, `provisioning` and `ota` in `rustyfarian-esp-hal-network`: the `esp32s3` feature now selects the chip on `esp-radio`, `esp-rtos`, `esp-alloc`, `esp-storage` and `esp-backtrace`, and `ota::TARGET_CHIP` is `"esp32s3"`.
-- Example `hal_esp32s3_connect_async` (Wi-Fi station join plus DHCP), and S3 Wi-Fi, OTA and provisioning lines in `just clippy-hal`.
+  Example `hal_esp32s3_connect_async` (Wi-Fi station join plus DHCP), and S3 Wi-Fi, OTA and provisioning lines in `just clippy-hal`.
 - IDF tier: `WifiMqttBoot::{device_name, ota_url, config}`, so a consumer reads the stored device name and OTA URL without a second store read; `idf_c3_provision` and `idf_c3_provision_mqtt` log them, and `just clippy-provisioning-mqtt-tests` runs in `just verify`.
-- HAL tier: portal extras are now persisted through a repeatable `TAG_EXTRA` (`0x0A`) record tag, and `MAX_RECORD_LEN` grows from 512 to 1280 B (ADR 015 amendment 2026-10-27).
-- `juggler::provisioning::LoraFields::from_storage_parts`, and public `EUI_HEX_LEN` and `APP_KEY_HEX_LEN`.
-- `juggler::provisioning::{ProvisioningKv, KvProvisioningStore}` (feature `std`): the provisioning NVS key layout over a key-value trait, with host tests that load a 0.6.x-shaped record; the IDF tier's `ProvisioningStore` now delegates to it over NVS, with no public API change.
-- Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot on ESP32-C3 and ESP32-C6) is still open.
+  HAL tier: portal extras are now persisted through a repeatable `TAG_EXTRA` (`0x0A`) record tag, and `MAX_RECORD_LEN` grows from 512 to 1280 B (ADR 015 amendment 2026-10-27).
+  `juggler::provisioning::LoraFields::from_storage_parts`, and public `EUI_HEX_LEN` and `APP_KEY_HEX_LEN`.
+  `juggler::provisioning::{ProvisioningKv, KvProvisioningStore}` (feature `std`): the provisioning NVS key layout over a key-value trait, with host tests that load a 0.6.x-shaped record; the IDF tier's `ProvisioningStore` now delegates to it over NVS, with no public API change.
+  Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot on ESP32-C3 and ESP32-C6) is still open.
   Requested by the spookhouse review-queue item `rustyfarian-network-boot-device-name-v1`; see `docs/features/provisioning-boot-identity-v1.md`.
 - Provisioning re-entry hook: `juggler::provisioning::ReentryRequest { None, Portal, FactoryReset }` (`#[non_exhaustive]`), re-exported from the IDF tier's `provisioning` module.
-- `juggler::provisioning::{gate_reentry, ReentryGate}`: the host-tested ordering primitive that asks the hook once and opens the store only on `None`.
-- IDF tier: `WifiMqttBoot::load_with_reentry(nvs, reentry, client_id_fn)` asks the hook once, before the store is read, and never claims the modem; `None` behaves like `load_with`.
-- IDF tier: `WifiMqttBoot::default_client_id`, the client-ID policy of `WifiMqttBoot::load`, for `load_with_reentry` callers.
-- IDF tier: `WifiMqttLoadOutcome::{PortalRequested, FactoryResetRequested}`; the library never erases or restarts, so the consumer erases via `ProvisioningStore::erase_all`.
-- `idf_c3_provision_mqtt` samples BOOT (GPIO9) after boot: a short hold reopens the portal, a hold of 3 s or more erases in example code and continues into the portal; see `docs/features/provisioning-reentry-hook-v1.md`.
+  `juggler::provisioning::{gate_reentry, ReentryGate}`: the host-tested ordering primitive that asks the hook once and opens the store only on `None`.
+  IDF tier: `WifiMqttBoot::load_with_reentry(nvs, reentry, client_id_fn)` asks the hook once, before the store is read, and never claims the modem; `None` behaves like `load_with`.
+  IDF tier: `WifiMqttBoot::default_client_id`, the client-ID policy of `WifiMqttBoot::load`, for `load_with_reentry` callers.
+  IDF tier: `WifiMqttLoadOutcome::{PortalRequested, FactoryResetRequested}`; the library never erases or restarts, so the consumer erases via `ProvisioningStore::erase_all`.
+  `idf_c3_provision_mqtt` samples BOOT (GPIO9) after boot: a short hold reopens the portal, a hold of 3 s or more erases in example code and continues into the portal; see `docs/features/provisioning-reentry-hook-v1.md`.
 - `rustyfarian-esp-hal-network`: `wifi::softap_mac()` reads the SoftAP MAC from efuse without radio init, and `ProvisioningSession::ap_mac()` returns the MAC the session was started with.
-- `rustyfarian-esp-hal-network`: `ProvisioningError::SoftApInit { reason: &'static str }` reports a failed SoftAP bring-up, with the reason `SoftAP configuration rejected` or `radio driver error`.
+  `ProvisioningError::SoftApInit { reason: &'static str }` reports a failed SoftAP bring-up, with the reason `SoftAP configuration rejected` or `radio driver error`.
 
 ### Changed
 
@@ -45,21 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The documented provisioning task stack guidance was re-derived as an analytic upper bound (about 12.5 KiB transient including the portal's parsed config, about 20.5 KiB peak, recommended minimum 24 KiB), not measured.
 - **Breaking (IDF tier):** `rustyfarian_esp_idf_network::mqtt` now takes `juggler::mqtt::QoS` everywhere (`MqttBuilder::subscribe`, `LwtConfig::new`, `publish_with`, `try_publish_with`, `publish_acked`, …) and re-exports it as `mqtt::QoS`; `MqttConfig`, `LwtConfig` and `TryPublishError` are re-exports/aliases of the `juggler` types.
   Migration: import `QoS` from `rustyfarian_esp_idf_network::mqtt` instead of `esp_idf_svc::mqtt::client`, and convert with `mqtt::to_esp_qos(..)` where an `on_connect` closure calls the raw `EspMqttClient::enqueue`.
-- Bare-metal `MqttConfig::host` must be an IPv4 literal; the esp-hal tier has no DNS yet (ADR 019 §2).
 - The `juggler` `provisioning` feature no longer implies `lora`, so a Wi-Fi + MQTT device that enables provisioning no longer pulls `lorawan-device` (and with it `heapless 0.7` / `atomic-polyfill`, `RUSTSEC-2023-0089`).
   `LoraFields::to_lora_config` now requires the `lora` feature; consumers enabling both `provisioning` and `lora` on either tier crate are unaffected.
 - **Breaking (HAL tier):** `rustyfarian-esp-hal-network` `ProvisioningBuilder::start` now takes the AP peripherals `(spawner, timg0, sw_int, wifi, store, rng)` instead of a `SoftApHandle`, and brings the SoftAP up itself from `PortalConfig` (SSID, channel and password).
   Migration: delete the caller's `ApConfig::open(..).with_ap_peripherals(..)` and `WiFiManager::init_softap_async(..)` calls, and pass `peripherals.TIMG0`, `peripherals.FROM_CPU_INTR0` and `peripherals.WIFI` to `start`.
   `ProvisioningError` gains the `SoftApInit` variant, so an exhaustive `match` on it needs a new arm.
   `WiFiManager::init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
-  See `docs/features/hal-provisioning-ap-ownership-v1.md`.
+  See `docs/features/archive/hal-provisioning-ap-ownership-v1.md`.
 - **Breaking (HAL tier):** the default provisioning AP SSID on `rustyfarian-esp-hal-network` changes from the bare `{prefix}` to `{prefix}-{MAC}`, using the last two AP-MAC bytes in uppercase hex, matching ESP-IDF.
   Migration: existing hal APs are renamed; consumers that want the bare name set `ssid_override: Some("name")` on `PortalConfig`.
   The suffix is each stack's own AP MAC, and ESP-IDF (base MAC plus one in the last byte) and esp-hal (locally-administered bit in the first byte) derive it differently, so one board shows `-C4F5` under ESP-IDF and `-C4F4` under esp-hal.
 - `rustyfarian-esp-hal-network`: `PortalConfig.ssid_override` is applied end-to-end on esp-hal as well as ESP-IDF, so the AP broadcasts the override verbatim and the derived default applies on both tiers.
-- The hal provisioning examples' default `PORTAL_SSID_PREFIX` is now `Rustyfarian`, the spelling the IDF examples use.
-- The hal provisioning examples read `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE` at build time (WPA2 portal password and verbatim SSID), as the IDF example already does for the password.
-- The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
+  The hal provisioning examples' default `PORTAL_SSID_PREFIX` is now `Rustyfarian`, the spelling the IDF examples use.
+  The hal provisioning examples read `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE` at build time (WPA2 portal password and verbatim SSID), as the IDF example already does for the password.
+  The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
 
 ### Fixed
 

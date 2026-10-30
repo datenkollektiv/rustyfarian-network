@@ -1,6 +1,6 @@
 ---
-gate: upstream
-gate-note: hal-provisioning-ap-ownership-v1 must land so the esp-hal portal holds the real AP MAC
+gate: none
+gate-note: upstream cleared 2026-10-30 — hal-provisioning-ap-ownership-v1 merged, the esp-hal portal holds the AP MAC in `ProvisioningSession::ap_mac()`
 desk-work: available
 ---
 
@@ -26,7 +26,7 @@ Done when two devices running one firmware, saved without touching `dev_name`, s
 - The suffix must equal the SSID suffix of the same device, case aside.
 - `DeviceName` breaks consumer struct literals, so it ships in the next minor with a CHANGELOG migration note.
 - The portal supplies the AP MAC itself; consumers never read it.
-- The esp-hal portal has no AP MAC until `hal-provisioning-ap-ownership-v1` lands.
+- The esp-hal portal holds the AP MAC since `hal-provisioning-ap-ownership-v1` (`ProvisioningSession::ap_mac()`, read via `wifi::softap_mac()` before bring-up).
 
 ## Open Questions
 - [ ] Does `DeviceName::Fixed` stay the default, or should the examples' fixed names all move to `MacSuffixed`?
@@ -43,3 +43,4 @@ Done when two devices running one firmware, saved without touching `dev_name`, s
 
 ## Session Log
 - 2026-10-29 — Feature doc created via /feature dialog from the review-queue request
+- 2026-10-30 — Upstream gate cleared: hal-provisioning-ap-ownership-v1 merged (PR #112), the esp-hal session exposes the AP MAC

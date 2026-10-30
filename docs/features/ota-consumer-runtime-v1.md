@@ -313,7 +313,7 @@ Pending: clock adoption on real NVS + full runbook + power-loss scenarios + Watc
 - [x] A hardware check (ESP32-C3 runbook: P10/P11, 2026-10-08).
 - [x] C + D hardware validation: library runbook 21/21 on ESP32-C3 (`2a3ac3f`, 2026-10-08) and rgb-clock adoption tests passed (2026-10-09).
 - [ ] Watchtower v2 hardware validation on second device.
-- [ ] `cargo semver-checks` recipe added and run against v0.5.0 before 0.6.0 release.
+- [x] `cargo semver-checks` recipe added and run against v0.5.0 before 0.6.0 release (`just release-semver-check`).
 
 ## Session Log
 
