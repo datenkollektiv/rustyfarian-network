@@ -59,6 +59,11 @@ pub struct PortalDefaults<'a> {
     /// MQTT username default (`WifiMqttDevice`).
     pub mqtt_user: &'a str,
     /// MQTT client-ID default (`WifiMqttDevice`).
+    ///
+    /// A non-empty value (e.g. `MQTT_CLIENT_ID` from a shared .env) is copied
+    /// into the form and, if left in place, becomes the client ID on every
+    /// device regardless of `DeviceName::MacSuffixed`.
+    /// Leave it blank to derive the ID from the device name.
     pub mqtt_client: &'a str,
     /// OTA update URL default (both profiles).
     pub ota_url: &'a str,

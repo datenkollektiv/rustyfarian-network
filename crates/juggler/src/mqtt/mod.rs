@@ -171,6 +171,21 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
 /// Returns a `&str` borrowed from whichever of the three inputs was selected —
 /// no allocation, no `String`.
 ///
+/// # Uniqueness
+///
+/// When `device_name` comes from a fixed portal pre-fill
+/// ([`DeviceName::Fixed`](crate::provisioning::DeviceName::Fixed)), every device
+/// of one firmware derives the same client ID, and the broker drops whichever
+/// connected first.  Use
+/// [`DeviceName::MacSuffixed`](crate::provisioning::DeviceName::MacSuffixed)
+/// to get a per-device name.
+///
+/// An explicit client ID still collides: a non-empty `mqtt_client` default
+/// (e.g. `MQTT_CLIENT_ID` from a shared .env) is copied into the form and, if
+/// left in place, becomes the client ID on every device regardless of
+/// `MacSuffixed`.
+/// Leave it blank to derive the ID from the device name.
+///
 /// # Errors
 ///
 /// Returns `Err(&'static str)` when the operator-supplied ID is invalid, or

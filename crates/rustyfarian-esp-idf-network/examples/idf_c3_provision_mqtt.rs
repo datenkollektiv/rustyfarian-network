@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 use rustyfarian_esp_idf_network::provisioning::{
-    run_wifi_mqtt_portal, BootConfig, PortalConfig, PortalDefaults, PortalOutcome,
+    run_wifi_mqtt_portal, BootConfig, DeviceName, PortalConfig, PortalDefaults, PortalOutcome,
     ProvisioningEvent, ProvisioningStore, ReentryRequest, SchemaProfile, WifiMqttBoot,
     WifiMqttLoadOutcome,
 };
@@ -238,7 +238,8 @@ fn main() -> anyhow::Result<()> {
                 mqtt_host: option_env!("MQTT_HOST").unwrap_or(""),
                 mqtt_port: option_env!("MQTT_PORT").unwrap_or(""),
                 mqtt_user: option_env!("MQTT_USER").unwrap_or(""),
-                mqtt_client: option_env!("MQTT_CLIENT_ID").unwrap_or(""),
+                // `mqtt_client` stays blank so the client ID derives from the per-device
+                // name; an operator can still type one into the portal.
                 ota_url: option_env!("OTA_URL").unwrap_or(""),
                 ..PortalDefaults::default()
             };
@@ -249,7 +250,9 @@ fn main() -> anyhow::Result<()> {
                     ssid_override: None,
                     ap_password,
                     channel: 1,
-                    device_name: "c3-mqtt-demo",
+                    // The portal pre-fills dev_name with the AP-MAC suffix, so two boards
+                    // get distinct names and MQTT client IDs.
+                    device_name: DeviceName::MacSuffixed("c3-mqtt-demo"),
                     firmware_version: env!("CARGO_PKG_VERSION"),
                     profile: SchemaProfile::WifiMqttDevice,
                     defaults,

@@ -182,8 +182,8 @@ The library never reboots or erases on its own; the host acts on the `Provisioni
 ```rust
 use embassy_executor::Spawner;
 use rustyfarian_esp_hal_network::provisioning::{
-    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningOutcome, ProvisioningStore,
-    SchemaProfile,
+    DeviceName, PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningOutcome,
+    ProvisioningStore, SchemaProfile,
 };
 
 const FLASH_PARTITION_OFFSET: u32 = 0x300000;
@@ -205,7 +205,7 @@ async fn main(spawner: Spawner) {
         ssid_override: None,
         ap_password: None,
         channel: 1,
-        device_name: "field-device",
+        device_name: DeviceName::MacSuffixed("field-device"),
         firmware_version: env!("CARGO_PKG_VERSION"),
         profile: SchemaProfile::WifiMqttDevice,
         defaults: PortalDefaults::default(),

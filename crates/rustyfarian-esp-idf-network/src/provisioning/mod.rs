@@ -35,7 +35,7 @@
 //!
 //! ```ignore
 //! use rustyfarian_esp_idf_network::provisioning::{
-//!     PortalConfig, PortalDefaults, ProvisioningBuilder, SchemaProfile,
+//!     DeviceName, PortalConfig, PortalDefaults, ProvisioningBuilder, SchemaProfile,
 //! };
 //!
 //! let config = PortalConfig {
@@ -43,7 +43,7 @@
 //!     ssid_override: None,
 //!     ap_password: Some("provision-me"),
 //!     channel: 1,
-//!     device_name: "hive-01",
+//!     device_name: DeviceName::MacSuffixed("hive-01"),
 //!     firmware_version: env!("CARGO_PKG_VERSION"),
 //!     profile: SchemaProfile::LorawanFieldDevice,
 //!     // Optional: seed the form on a fresh device (e.g. from `option_env!`).
@@ -74,9 +74,9 @@ pub use boot::{
 };
 
 pub use juggler::provisioning::{
-    derive_softap_ssid, resolve_softap_ssid, Field, FieldError, LoraFields, MqttFields,
-    PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryRequest, SchemaProfile,
-    ValidationError,
+    derive_device_name, derive_softap_ssid, resolve_softap_ssid, DeviceName, Field, FieldError,
+    LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryRequest,
+    SchemaProfile, ValidationError,
 };
 
 use std::sync::{Arc, Mutex};
@@ -121,8 +121,18 @@ pub struct PortalConfig<'a> {
     pub ap_password: Option<&'a str>,
     /// 2.4 GHz channel (1–13).
     pub channel: u8,
-    /// Human-readable device name surfaced on `/status`.
-    pub device_name: &'a str,
+    /// Device name used to pre-fill the portal's `dev_name` field and surfaced as
+    /// `device_name` on `/status`.
+    ///
+    /// [`DeviceName::Fixed`] gives every device the same name (and therefore the same
+    /// MQTT client ID).
+    /// [`DeviceName::MacSuffixed`] appends `-xxxx`, the lowercase hex of the last two
+    /// SoftAP MAC bytes, which the portal reads itself, so two boards get distinct names.
+    /// Names are distinct only for devices whose last two AP-MAC bytes differ (four hex
+    /// digits), and the suffix equals the suffix of the *derived* SSID; an `ssid_override`
+    /// removes that relation.
+    /// A name already stored on the device always wins on re-provisioning.
+    pub device_name: DeviceName<'a>,
     /// Firmware version surfaced on `/status`.
     pub firmware_version: &'a str,
     /// The provisioning schema profile this portal serves.
@@ -280,7 +290,17 @@ impl<'a> ProvisioningBuilder<'a> {
         ));
         let state = SharedState::new();
         let nonce = Arc::new(generate_nonce());
-        let device_name = Arc::new(self.config.device_name.to_string());
+        let device_name = self.config.device_name.resolve(&mac).as_str().to_string();
+        if matches!(self.config.device_name, DeviceName::MacSuffixed(_))
+            && !self.config.defaults.mqtt_client.is_empty()
+        {
+            log::warn!("Device name is MAC-suffixed but a default MQTT client ID is set; it overrides the per-device client ID unless cleared in the portal");
+        }
+        log::info!(
+            "Provisioning device-name pre-fill resolved (len={})",
+            device_name.len()
+        );
+        let device_name = Arc::new(device_name);
         let firmware_version = Arc::new(self.config.firmware_version.to_string());
         let status_entries = Arc::new(self.status_entries);
         let profile = self.config.profile;
