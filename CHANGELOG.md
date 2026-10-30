@@ -29,9 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idf_c3_provision_mqtt` samples BOOT (GPIO9) after boot: a short hold reopens the portal, a hold of 3 s or more erases in example code and continues into the portal; see `docs/features/provisioning-reentry-hook-v1.md`.
 - `rustyfarian-esp-hal-network`: `wifi::softap_mac()` reads the SoftAP MAC from efuse without radio init, and `ProvisioningSession::ap_mac()` returns the MAC the session was started with.
   `ProvisioningError::SoftApInit { reason: &'static str }` reports a failed SoftAP bring-up, with the reason `SoftAP configuration rejected` or `radio driver error`.
+- `juggler::provisioning::{derive_device_name, DeviceName}`: `derive_device_name(prefix, &mac)` returns `{prefix}-{xxxx}` as a `heapless::String<DEVICE_NAME_MAX_LEN>` (24 bytes), where `xxxx` is the lowercase hex of the last two MAC bytes.
+  The trimmed prefix is truncated on a char boundary so the `-xxxx` suffix always fits.
+  An empty prefix after trimming yields the bare four hex digits with no leading dash, and the function is infallible, mirroring `derive_softap_ssid`.
+  `DeviceName::resolve(&mac)` is the shared resolution used by both tiers.
+  Requested by the spookhouse review-queue item `rustyfarian-network-per-device-name-prefill-v1` (bug 009); see `docs/features/per-device-name-prefill-v1.md`.
 
 ### Changed
 
+- **Breaking (both tiers):** `PortalConfig::device_name` is now `juggler::provisioning::DeviceName` instead of `&str`, re-exported from both tiers' `provisioning` modules.
+  Migration: `device_name: "name"` becomes `device_name: DeviceName::Fixed("name")` for the old behaviour, or `device_name: DeviceName::MacSuffixed("name")` to pre-fill `name-xxxx` from the AP MAC.
+  The `xxxx` suffix is the lowercase hex of the last two AP-MAC bytes, so devices whose last two AP-MAC bytes differ get different names.
+  The suffix equals the suffix of the derived SSID of the same device, case aside; an `ssid_override` removes that relation.
+  The pre-fill stays editable in the portal, and a stored name always wins on re-provisioning.
+  A `Fixed` name longer than 24 bytes is truncated on a char boundary on both tiers; the ESP-IDF tier previously passed it through, and the esp-hal tier already truncated.
+  A non-empty `PortalDefaults::mqtt_client` (for example `MQTT_CLIENT_ID` from a shared `.env`) is copied into the form and becomes the client ID on every device unless cleared.
+  Leave it blank to derive the client ID from the device name; both tiers log a warning for this combination.
+  Devices already provisioned keep their stored name after upgrading, because a stored name always wins; to change it, edit and save the name once through the portal (re-entry), or factory-reset the device.
+  A `Fixed` name gives every device of one firmware the same MQTT client ID via `resolve_client_id`, so use `MacSuffixed` unless the firmware owns uniqueness.
+  The four provisioning examples (`idf_c3_provision`, `idf_c3_provision_mqtt`, `hal_c3_provision_mqtt`, `hal_c6_provision_mqtt`) use `MacSuffixed`.
+  The three provisioning MQTT examples no longer pre-fill `mqtt_client` from `MQTT_CLIENT_ID`, so a dotenv file shared with the plain MQTT examples cannot override the per-device client ID.
 - **Breaking (`juggler`):** `ProvisioningConfig::ota_url()` returns `Option<&str>` (`None` when no OTA URL is stored, replacing the empty string), `ProvisioningConfig::from_storage_parts` takes a trailing `extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX>`, and `ExtraField`'s `Debug` redacts the value.
   Migration: replace `cfg.ota_url().is_empty()` with `cfg.ota_url().is_none()`, use `cfg.ota_url().unwrap_or("")` where a string is needed, and pass `heapless::Vec::new()` as the new `extras` argument when there are none.
   `device_name()` still returns `&str`.
@@ -60,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The hal provisioning examples' default `PORTAL_SSID_PREFIX` is now `Rustyfarian`, the spelling the IDF examples use.
   The hal provisioning examples read `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE` at build time (WPA2 portal password and verbatim SSID), as the IDF example already does for the password.
   The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
+- `rustyfarian-esp-hal-network`: the hal examples `hal_c3_provision_mqtt` and `hal_c6_provision_mqtt` restart via `esp_hal::system::software_reset()` 200 ms after a committed submission, like the IDF provisioning examples, instead of idling until a manual reset; the library itself still never reboots.
 
 ### Fixed
 

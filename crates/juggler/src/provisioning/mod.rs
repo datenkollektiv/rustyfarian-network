@@ -20,6 +20,7 @@
 
 pub mod config;
 pub mod defaults;
+pub mod device_name;
 pub mod error;
 pub mod form;
 pub mod html_json_escape;
@@ -40,6 +41,7 @@ pub use config::{
     MQTT_USER_MAX_LEN, OTA_URL_MAX_LEN,
 };
 pub use defaults::PortalDefaults;
+pub use device_name::{derive_device_name, DeviceName};
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
 pub use form::{parse_form, ExtraField};
 #[cfg(feature = "std")]

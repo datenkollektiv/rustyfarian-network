@@ -20,7 +20,7 @@
 
 use heapless::String as HS;
 
-use juggler::provisioning::{PortalDefaults, ProvisioningConfig, SchemaProfile};
+use juggler::provisioning::{DeviceName, PortalDefaults, ProvisioningConfig, SchemaProfile};
 
 #[cfg(all(
     feature = "embassy",
@@ -64,8 +64,21 @@ pub struct PortalConfig<'a> {
     pub ap_password: Option<&'a str>,
     /// 2.4 GHz channel (1–13).
     pub channel: u8,
-    /// Human-readable device name surfaced in the portal header.
-    pub device_name: &'a str,
+    /// Device name pre-filled into the portal header and the `dev_name` form
+    /// field on a fresh device.
+    ///
+    /// [`DeviceName::Fixed`] gives every device the same name (and therefore
+    /// the same default MQTT client ID).
+    /// [`DeviceName::MacSuffixed`] treats the string as a prefix and appends
+    /// `-xxxx`, the lowercase hex of the last two bytes of the SoftAP MAC read
+    /// by the session itself, so two boards get distinct names; the digits
+    /// equal the SSID suffix case-insensitively.
+    /// Names are distinct only for devices whose last two AP-MAC bytes differ
+    /// (four hex digits), and the suffix equals the suffix of the *derived*
+    /// SSID; an `ssid_override` removes that relation.
+    /// A name already stored by a previous provisioning always wins over this
+    /// pre-fill.
+    pub device_name: DeviceName<'a>,
     /// Firmware version string surfaced in the portal header.
     pub firmware_version: &'a str,
     /// Provisioning schema profile — selects the form template and the
@@ -391,7 +404,7 @@ impl ProvisioningSession {
 ///     ssid_override: None,
 ///     ap_password: Some("provision-me"),
 ///     channel: 1,
-///     device_name: "hive-01",
+///     device_name: DeviceName::MacSuffixed("hive-01"),
 ///     firmware_version: env!("CARGO_PKG_VERSION"),
 ///     profile: SchemaProfile::WifiMqttDevice,
 ///     // Optional: seed the form on a fresh device (e.g. from `option_env!`).
@@ -564,12 +577,16 @@ impl<'a> ProvisioningBuilder<'a> {
             .min(portal::RENDER_FW_VERSION_MAX)];
         let _ = fw_ver.push_str(fw_src);
         let mut dev_name = HS::<{ portal::RENDER_DEVICE_NAME_MAX }>::new();
-        let dn_src = &self.config.device_name[..self
-            .config
-            .device_name
-            .len()
-            .min(portal::RENDER_DEVICE_NAME_MAX)];
-        let _ = dev_name.push_str(dn_src);
+        let _ = dev_name.push_str(self.config.device_name.resolve(&ap_mac).as_str());
+        if matches!(self.config.device_name, DeviceName::MacSuffixed(_))
+            && !self.config.defaults.mqtt_client.is_empty()
+        {
+            log::warn!("Device name is MAC-suffixed but a default MQTT client ID is set; it overrides the per-device client ID unless cleared in the portal");
+        }
+        log::info!(
+            "Provisioning device-name pre-fill resolved (len={})",
+            dev_name.len()
+        );
         let portal_config = portal::PortalRenderConfig {
             firmware_version: fw_ver,
             device_name: dev_name,

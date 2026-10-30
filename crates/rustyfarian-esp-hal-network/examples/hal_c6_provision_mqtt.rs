@@ -70,8 +70,8 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
 use rustyfarian_esp_hal_network::provisioning::{
-    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningEvent, ProvisioningOutcome,
-    ProvisioningStore, SchemaProfile,
+    DeviceName, PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningEvent,
+    ProvisioningOutcome, ProvisioningStore, SchemaProfile,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -97,7 +97,9 @@ fn ap_psk() -> Option<&'static str> {
     option_env!("PROVISION_AP_PSK")
 }
 
-/// Human-readable device name shown in the portal header.
+/// Device-name prefix.
+/// The portal appends the AP-MAC suffix (`-xxxx`), so two boards get distinct
+/// names and MQTT client IDs.
 const DEVICE_NAME: &str = match option_env!("DEVICE_NAME") {
     Some(s) => s,
     None => "c6-provision-demo",
@@ -264,7 +266,8 @@ async fn main(spawner: Spawner) {
         mqtt_host: option_env!("MQTT_HOST").unwrap_or(""),
         mqtt_port: option_env!("MQTT_PORT").unwrap_or(""),
         mqtt_user: option_env!("MQTT_USER").unwrap_or(""),
-        mqtt_client: option_env!("MQTT_CLIENT_ID").unwrap_or(""),
+        // `mqtt_client` stays blank so the client ID derives from the per-device
+        // name; an operator can still type one into the portal.
         ota_url: option_env!("OTA_URL").unwrap_or(""),
         ..PortalDefaults::default()
     };
@@ -274,7 +277,7 @@ async fn main(spawner: Spawner) {
         ssid_override: PORTAL_SSID_OVERRIDE,
         ap_password: ap_psk(),
         channel: 1,
-        device_name: DEVICE_NAME,
+        device_name: DeviceName::MacSuffixed(DEVICE_NAME),
         firmware_version: FIRMWARE_VERSION,
         profile: SchemaProfile::WifiMqttDevice,
         defaults,
@@ -308,12 +311,11 @@ async fn main(spawner: Spawner) {
                 cfg.wifi_ssid().len(),
                 cfg.profile(),
             );
-            // The library never reboots; the host decides.
-            // A real application calls `esp_hal::reset::software_reset()` here.
-            println!("Committed — idling (real app would reboot into normal STA + MQTT mode)");
-            loop {
-                Timer::after(Duration::from_secs(10)).await;
-            }
+            // The library never reboots; the host decides. Give the log a
+            // moment to drain, then restart into the normal STA + MQTT boot.
+            println!("Committed — restarting into normal boot");
+            Timer::after(Duration::from_millis(200)).await;
+            esp_hal::system::software_reset();
         }
         ProvisioningOutcome::FactoryResetRequested => {
             log::warn!("Factory reset requested — host should erase the store and reboot");

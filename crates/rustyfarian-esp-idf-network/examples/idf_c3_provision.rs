@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use rustyfarian_esp_idf_network::provisioning::{
-    PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningStore, SchemaProfile,
+    DeviceName, PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningStore, SchemaProfile,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -129,7 +129,8 @@ fn main() -> anyhow::Result<()> {
         ssid_override: None,
         ap_password,
         channel: 1,
-        device_name: "c3-provision-demo",
+        // The portal pre-fills dev_name with the AP-MAC suffix, so two boards get distinct names.
+        device_name: DeviceName::MacSuffixed("c3-provision-demo"),
         firmware_version: env!("CARGO_PKG_VERSION"),
         profile: SchemaProfile::LorawanFieldDevice,
         defaults,
