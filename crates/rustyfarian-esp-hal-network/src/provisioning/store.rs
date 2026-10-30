@@ -310,15 +310,27 @@ impl<F: NorFlash> ProvisioningStore<F> {
 
         // Clamp to a sensible maximum so a corrupt `record_len` field cannot
         // request a read larger than our stack buffer.
-        let read_len = record_len.min(MAX_RECORD_LEN);
+        let record_len = record_len.min(MAX_RECORD_LEN);
 
-        // Step 2 — read exactly `read_len` bytes from the sector head.
+        // Round the flash read up to the device's `READ_SIZE`: esp-storage
+        // rejects a read whose length is not a multiple of it (4 B without
+        // its `bytewise-read` feature), and a real record is rarely
+        // word-sized, so reading exactly `record_len` bytes failed on every
+        // provisioned boot (bug 006). `MAX_RECORD_LEN` is a multiple of every
+        // `READ_SIZE` in use, so the cap keeps the read aligned.
+        debug_assert!(MAX_RECORD_LEN.is_multiple_of(F::READ_SIZE));
+        let read_len = record_len
+            .next_multiple_of(F::READ_SIZE)
+            .min(MAX_RECORD_LEN);
+
+        // Step 2 — read `read_len` bytes from the sector head and decode the
+        // `record_len` prefix.
         let mut buf = [0u8; MAX_RECORD_LEN];
         self.flash
             .read(base, &mut buf[..read_len])
             .map_err(|_| StoreError::Flash)?;
 
-        Ok(decode_record(&buf[..read_len]).ok())
+        Ok(decode_record(&buf[..record_len]).ok())
     }
 
     /// Returns `true` if either sector contains a valid record.
@@ -616,6 +628,46 @@ mod test_flash {
         }
     }
 
+    /// [`MockFlash`] behind the esp-storage read contract: `READ_SIZE = 4`,
+    /// and a read whose offset or length is not word-aligned is rejected with
+    /// `NotAligned`, exactly as `esp_storage::FlashStorage` does without its
+    /// `bytewise-read` feature (bug 006).
+    pub(super) struct MockFlashWordRead(pub(super) MockFlash);
+
+    impl ErrorType for MockFlashWordRead {
+        type Error = MockError;
+    }
+
+    impl ReadNorFlash for MockFlashWordRead {
+        const READ_SIZE: usize = 4;
+
+        fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+            if !(offset as usize).is_multiple_of(Self::READ_SIZE)
+                || !bytes.len().is_multiple_of(Self::READ_SIZE)
+            {
+                return Err(MockError(NorFlashErrorKind::NotAligned));
+            }
+            self.0.read(offset, bytes)
+        }
+
+        fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+    }
+
+    impl NorFlash for MockFlashWordRead {
+        const WRITE_SIZE: usize = MockFlash::WRITE_SIZE;
+        const ERASE_SIZE: usize = MockFlash::ERASE_SIZE;
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            self.0.erase(from, to)
+        }
+
+        fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.0.write(offset, bytes)
+        }
+    }
+
     #[derive(Debug)]
     pub(super) struct MockError(pub(super) NorFlashErrorKind);
 
@@ -756,7 +808,7 @@ mod test_flash {
 
 #[cfg(test)]
 mod tests {
-    use super::test_flash::{MockFlash, MockFlash8KiB};
+    use super::test_flash::{MockFlash, MockFlash8KiB, MockFlashWordRead};
     use super::test_flash_instrumented::InstrumentedFlash;
     use super::*;
     use heapless::String as HS;
@@ -876,6 +928,47 @@ mod tests {
         let mqtt = loaded.mqtt().expect("MQTT group present");
         assert_eq!(mqtt.host(), "broker.example.com");
         assert_eq!(mqtt.port(), 1883);
+    }
+
+    /// Bug 006: esp-storage rejects a read whose length is not a multiple of
+    /// `READ_SIZE`, and a saved record is rarely word-sized, so the store must
+    /// round its read up instead of reading exactly `record_len` bytes.
+    #[test]
+    fn store_reads_back_record_through_word_aligned_flash() {
+        let mut store =
+            ProvisioningStore::open(MockFlashWordRead(MockFlash::new()), 0, 8192).unwrap();
+        // `sample_config()` encodes to 112 B, which is word-sized; one more
+        // SSID byte makes the record 113 B so the read must be rounded up.
+        let cfg = ProvisioningConfig::from_storage_parts(
+            hs::<{ juggler::wifi::SSID_MAX_LEN }>("my-net1"),
+            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
+            hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
+            hs::<DEVICE_NAME_MAX_LEN>("test-device"),
+            None,
+            Some(MqttFields::from_storage_parts(
+                hs::<MQTT_HOST_MAX_LEN>("broker.example.com"),
+                1883,
+                None,
+                None,
+                None,
+            )),
+            heapless::Vec::new(),
+        );
+        store.save(&cfg).unwrap();
+        let record_len = u16::from_le_bytes([
+            store.flash.0.data[RECORD_LEN_OFFSET],
+            store.flash.0.data[RECORD_LEN_OFFSET + 1],
+        ]) as usize;
+        assert!(
+            !record_len.is_multiple_of(4),
+            "fixture must exercise the unaligned path (record_len={record_len})"
+        );
+        assert!(store.is_provisioned().unwrap());
+        let loaded = store
+            .load()
+            .unwrap()
+            .expect("record readable through aligned reads");
+        assert_eq!(loaded.wifi_ssid(), "my-net1");
     }
 
     #[test]

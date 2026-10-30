@@ -517,14 +517,15 @@ impl<'a> ProvisioningBuilder<'a> {
         }
         .with_channel(self.config.channel)
         .with_ap_peripherals(timg0, sw_int, wifi);
+        // The error value is tainted by `ap_config` (it carries the AP
+        // password), so only the static reason is logged — never `e` itself.
         let ap = crate::wifi::WiFiManager::init_softap_async(ap_config).map_err(|e| {
-            log::error!("SoftAP init failed: {}", e);
-            ProvisioningError::SoftApInit {
-                reason: match e {
-                    crate::wifi::WifiError::ConfigureFailed => "SoftAP configuration rejected",
-                    crate::wifi::WifiError::Driver(_) => "radio driver error",
-                },
-            }
+            let reason = match e {
+                crate::wifi::WifiError::ConfigureFailed => "SoftAP configuration rejected",
+                crate::wifi::WifiError::Driver(_) => "radio driver error",
+            };
+            log::error!("SoftAP init failed: {}", reason);
+            ProvisioningError::SoftApInit { reason }
         })?;
 
         // ── Step 2: generate per-session nonce (radio is active now) ───────

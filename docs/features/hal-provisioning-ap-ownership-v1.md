@@ -1,6 +1,6 @@
 ---
 gate: hardware
-gate-note: on-device SSID check on a C3 or C6 board (acceptance 8) — default shows a -XXXX suffix, override shows verbatim
+gate-note: closed 2026-10-29 on an ESP32-C3 Mini-1 — default showed `Rustyfarian-C4F4`, override showed `MyClock`
 desk-work: available
 ---
 
@@ -60,3 +60,5 @@ Today the caller runs `ApConfig::open(PORTAL_SSID_PREFIX)` → `WiFiManager::ini
 - 2026-06-23 — Feature doc created after `ssid-override-v1` exposed the validation-only hal `ssid_override`; re-architecture chosen.
 - 2026-10-29 — Updated: frontmatter added, MAC-read question resolved (efuse), esp32s3 in gate, per-device-name dependency noted
 - 2026-10-29 — Implementation landed: `start()` owns AP bring-up from `PortalConfig`, `softap_mac()` added, examples, README and CHANGELOG updated, ADR 015 amended; acceptance 8 (on-device SSID check on C3 or C6) is still open for the user.
+- 2026-10-29 — Hardware (C3 Mini-1): default `Rustyfarian-C4F4`, override `MyClock`, 33-byte override rejected before the radio starts, portal round trip passes after bug 006 (store read alignment) was fixed in the same session; acceptance 8 met, IDF scan on the same board shows `-C4F5` because esp-hal and ESP-IDF derive the AP MAC differently.
+- 2026-10-30 — Bench session finished on the C3 Mini-1: WPA2 portal (`PROVISION_AP_PSK`) joins with the password and serves the portal, IDF scan read `Rustyfarian-C4F5` cleanly; all six hardware checks pass, bug 006 closed.

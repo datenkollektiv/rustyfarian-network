@@ -437,6 +437,14 @@ alerts on `/security/code-scanning` are per-branch and reflect the **default bra
 and the alert list is not public — reading it needs repo write access plus `security-events`, so a fix cannot be targeted from a clone alone.
 Always read the real alert locations before editing; both failed attempts guessed at them.
 
+**`rust/hard-coded-cryptographic-value` fires on a `const` item holding an `option_env!` credential, but not on the same `option_env!` returned from a `fn`.**
+`const AP_PSK: Option<&str> = option_env!("PROVISION_AP_PSK")` passed to `ap_password` was reported Critical on PR #112 (2026-10-30); `fn ap_psk() -> Option<&'static str> { option_env!("PROVISION_AP_PSK") }` cleared it, the same shape as `mqtt_password()` in the MQTT examples.
+The bot's suggested fix was `const AP_PSK: Option<&str> = None`, which would have removed the WPA2 portal path from the examples; the `fn` keeps the knob.
+
+**`rust/cleartext-logging` taints every value read through a struct that carries a credential, so `log::info!("... channel={}", config.ap.channel)` is reported even though the channel is not secret.**
+The `SoftAP configured` line in `init_softap_async` was flagged twice on PR #112: first for an auth label derived from `config.ap.password.is_some()`, then again with only `ssid.len()`, `channel` and `max_connections` interpolated.
+Fix: log only values that never passed through the credential-bearing struct (the provisioning layer logs the SSID length from the resolver output), or a fixed message; the CHANGELOG notes the fixed message (2026-10-30).
+
 ---
 
 ## OTA MVP — Three-Crate Triad
@@ -600,6 +608,15 @@ interpretations numerically coincide — it surfaced on the first on-hardware ru
 enshrine a wrong invariant when they never exercise a realistic parameter.
 Fix: check that the declared region `[base_offset, base_offset + total_bytes)` fits
 `flash.capacity()`; regression-guarded by `store_open_accepts_region_at_high_offset_within_capacity`.
+
+**esp-storage 0.10 `ReadNorFlash::read` rejects any read whose length is not a multiple of `READ_SIZE` (4 B without the `bytewise-read` feature), so `ProvisioningStore` never read a committed record back on hardware.**
+`try_read_sector` read exactly `record_len` bytes (146 B for a `wifi_mqtt` record), which fails with `NotAligned` and surfaces as `StoreError::Flash`, while blank flash passes because the clamped 1280 B read is aligned.
+The host mocks declare `READ_SIZE = 1`, so 204 tests passed; the hal store had never been read back across a reboot on a device until 2026-10-29 (ESP32-C3 Mini-1).
+Fix: round the read up to `F::READ_SIZE` and decode the `record_len` prefix; `MockFlashWordRead` enforces the contract in `store_reads_back_record_through_word_aligned_flash`; see `docs/bugs/006-hal-store-unaligned-read-2026-10-29.md`.
+
+**One board broadcasts a different `{prefix}-{MAC}` provisioning SSID under esp-hal and ESP-IDF, because the two stacks derive the AP MAC differently.**
+ESP-IDF `esp_read_mac(ESP_MAC_WIFI_SOFTAP)` adds one to the last base-MAC byte (`a0:..:c4:f5`), while `esp_hal::efuse::interface_mac_address(AccessPoint)` sets the locally-administered bit in the first byte (`a2:..:c4:f4`), and esp-radio uses the same esp-hal function for the AP it brings up.
+Each suffix matches its own stack's real BSSID, so this is parity of format, not of bytes; do not "fix" the hal side to mimic ESP-IDF or the suffix stops matching the broadcast MAC.
 
 ---
 

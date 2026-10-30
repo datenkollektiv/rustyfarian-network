@@ -647,17 +647,12 @@ mod driver {
             // [8, 78], within the SDK-documented valid range [8, 84].
             set_tx_power_or_log(config.ap.tx_power.to_quarter_dbm());
 
-            log::info!(
-                "SoftAP configured (ssid len={}, auth={}, channel={}, max_conn={})",
-                config.ap.ssid.len(),
-                if config.ap.password.is_some() {
-                    "WPA2"
-                } else {
-                    "open"
-                },
-                config.ap.channel,
-                config.ap.max_connections,
-            );
+            // Nothing from `config.ap` is interpolated here: the struct carries
+            // the AP password, so CodeQL reports any value read through it
+            // (even the channel or the SSID length) as cleartext credential
+            // logging. The provisioning layer logs the SSID length from the
+            // resolver output, and an open AP emits its own warning above.
+            log::info!("SoftAP configured");
 
             // 5. Build the embassy-net stack with a static AP IP.
             //    The capacity is `SUBSTRATE_SOCKET_COUNT` (DHCP UDP + DNS UDP +
