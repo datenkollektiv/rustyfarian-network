@@ -74,6 +74,9 @@ wifi = ["juggler/wifi", "dep:pennant", "dep:rgb"]
 mqtt = ["juggler/mqtt", "juggler/std", "dep:pennant", "dep:rgb"]
 
 # lora: SX1262 radio driver + LoRaWAN adapter for lorawan-device 0.12.
+# sx126x needs a `critical-section` provider; the final binary selects exactly
+# one (esp-idf-hal's `critical-section` feature or rustyfarian-esp-idf-power's
+# `critical-section-impl`), so this feature does not pick it (bug 007).
 lora = [
     "juggler/lora",
     "dep:sx126x",
@@ -82,7 +85,6 @@ lora = [
     "dep:rand_core",
     "dep:nb",
     "dep:embedded-hal",
-    "esp-idf-hal/critical-section",
 ]
 
 # espnow: ESP-NOW peer-to-peer driver.
@@ -95,6 +97,8 @@ ota = ["juggler/ota", "juggler/ota-wire", "dep:embedded-svc"]
 provisioning = ["wifi", "juggler/provisioning", "juggler/std", "dep:embedded-svc"]
 
 [dev-dependencies]
+# The LoRa examples are final binaries, so they select the critical-section provider.
+esp-idf-hal                = { workspace = true, features = ["critical-section"] }
 rustyfarian-esp-idf-ws2812 = { workspace = true }
 ssd1306                    = { workspace = true }
 embedded-graphics          = { workspace = true }

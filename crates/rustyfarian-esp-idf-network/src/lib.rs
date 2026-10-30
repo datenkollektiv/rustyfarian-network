@@ -33,6 +33,9 @@
 //! - **`lora`** — SX1262 radio driver and LoRaWAN Class A adapter. Implements
 //!   [`lora::sx1262_driver::EspIdfLoraRadio`] for use with `lorawan-device 0.12`.
 //!   Provides full initialization, RX/TX, and LoRaWAN protocol bindings.
+//!   The firmware must enable exactly one `critical-section` provider — `esp-idf-hal`'s
+//!   `critical-section` feature or `rustyfarian-esp-idf-power`'s `critical-section-impl`;
+//!   this feature selects none.
 //!
 //! - **`espnow`** — ESP-NOW peer driver with automatic channel scanning. Provides
 //!   [`espnow::EspIdfEspNow`] for point-to-point frame exchange.
