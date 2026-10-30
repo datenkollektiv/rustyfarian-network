@@ -87,7 +87,7 @@ graph TB
 
     idfnet["rustyfarian-esp-idf-network (ESP-IDF tier)<br/>wifi, mqtt, lora, espnow, ota, provisioning<br/>(std, FreeRTOS)"]
 
-    halnet["rustyfarian-esp-hal-network (Bare-metal tier)<br/>wifi, lora, ota, provisioning<br/>(no_std, async+embassy)"]
+    halnet["rustyfarian-esp-hal-network (Bare-metal tier)<br/>wifi, mqtt, lora, espnow, ota, provisioning<br/>(no_std, async+embassy)"]
 
     espidf["esp-idf-svc<br/>esp-idf-hal"]
 
@@ -228,6 +228,18 @@ just flash idf_c3_connect
 ```
 
 See `crates/*/examples/` for the full set, including Wi-Fi, MQTT, and LoRaWAN OTAA join demos.
+
+Bare-metal ESP-NOW (feature `espnow`, ESP32-C3 and ESP32-C6) has two examples that talk to each other.
+The C6 coordinator is an associated station with ESP-NOW alongside, and it echoes frames.
+The C3 peer uses an owned radio, scans for the coordinator, and sends a frame every 100 ms.
+
+```bash
+just build-example hal_c6_espnow_sta_coordinator
+ESPNOW_PEER_MAC="aa:bb:cc:dd:ee:ff" just build-example hal_c3_espnow_peer
+```
+
+The coordinator prints its station MAC at boot; pass it to the peer as `ESPNOW_PEER_MAC`.
+The Wi-Fi credentials of the coordinator are compile-time only (`WIFI_SSID`, `WIFI_PASS`) and are never logged.
 
 ## Development Setup
 

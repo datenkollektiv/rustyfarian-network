@@ -780,3 +780,41 @@ fn provisioning_public_paths() {
     fn _uses_lora_fields(_: &LoraFields) {}
     fn _uses_mqtt_fields(_: &MqttFields) {}
 }
+
+// ── espnow::scan ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "espnow")]
+#[test]
+fn espnow_scan_public_paths() {
+    use core::time::Duration;
+    use juggler::espnow::{
+        ScanAction, ScanConfig, ScanError, ScanInput, ScanMachine, ScanResult, SendOutcome,
+    };
+
+    let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let mut machine = ScanMachine::new(mac, ScanConfig::new(b"probe").with_channels(&[6]), None);
+    assert_eq!(machine.mac(), &mac);
+    assert_eq!(machine.probe_data(), b"probe");
+
+    let t = Duration::ZERO;
+    assert_eq!(machine.poll(t, ScanInput::Start), ScanAction::RemovePeer);
+    machine.poll(t, ScanInput::Completed);
+    assert_eq!(
+        machine.poll(t, ScanInput::Completed),
+        ScanAction::BoostTxPower
+    );
+    assert_eq!(
+        machine.poll(t, ScanInput::Completed),
+        ScanAction::SetChannel { channel: 6 }
+    );
+    assert!(matches!(
+        machine.poll(t, ScanInput::Completed),
+        ScanAction::SendProbe { .. }
+    ));
+    let _: ScanError = ScanError::UnexpectedInput;
+    let _: Option<ScanResult> = None;
+    assert!(matches!(
+        machine.poll(t, ScanInput::Sent(SendOutcome::NoAck)),
+        ScanAction::RestoreTxPower
+    ));
+}

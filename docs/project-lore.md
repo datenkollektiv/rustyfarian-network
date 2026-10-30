@@ -530,12 +530,12 @@ the rustdoc on `EspIdfEspNow`, not this section.
 **Unassociated STA radio drifts off `esp_wifi_set_channel` within ms.**
 Symptom: coordinator (AP-locked) receives every scan probe but zero data frames; scout's
 send callback fires `FAIL` ~30 ms after each TX (7 × 802.11 short-retry).
-Fix: use `init_with_radio` (SoftAP) so the beacon schedule holds the channel. See ADR 012.
+Fix (ESP-IDF tier): use `init_with_radio` (SoftAP) so the beacon schedule holds the channel. See ADR 012.
 
 **Promiscuous-bracket per-send re-pin is fundamentally racy — and protects TX but not ACK reception.**
 `set_promiscuous(false)` is a FreeRTOS task-switch trigger; the Wi-Fi driver task can preempt before `esp_now_send` and return `ESP_ERR_ESPNOW_CHAN` (0x3069) on a meaningful fraction of sends.
 Even when TX succeeds, the background scanner can hop off-channel before the coordinator's 802.11 ACK arrives — the frame is delivered but `send_and_wait` sees `FAIL` (~10–20 % `"scout-probe"` retries in `init_with_radio_sta` despite ~99 % end-to-end delivery).
-Fix: prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
+Fix (ESP-IDF tier): prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
 
 **Roaming peers cause false-positive channel detection in `scan_for_peer`.**
 A peer's STA briefly visits every channel during an AP roam scan and hardware-ACKs unicast
@@ -550,6 +550,21 @@ A failed re-scan removed the peer entry and left the radio on (e.g.) ch 11, so t
 before recovery.
 Fix: the `Err` branch of `scan_for_peer` restores both the peer registration and the
 radio channel from `pinned_channel`. See `crates/rustyfarian-esp-idf-network/src/espnow/mod.rs`.
+
+**esp-hal ESP-NOW: never hold a critical section across a send.**
+`esp-radio`'s `SendWaiter::wait` and `Drop` busy-spin on a flag that the send callback sets from an interrupt; a lock that masks interrupts makes the wait spin forever.
+`EspHalEspNow` therefore takes the sender out of a cell, sends with the lock released and returns it through a drop guard; a concurrent sync send gets `Busy`.
+`esp-radio` has one global send-callback flag and no sequence number, so a dropped `SendFuture` can be attributed to the next send; only a never-dropped runner fixes it, which is why `EspHalEspNow::run_sender` polls every async transmission to completion.
+See `crates/rustyfarian-esp-hal-network/src/espnow/` and ADR 020.
+
+**Host tests need a test-only `critical-section` implementation, not `critical-section/std`.**
+`critical-section/std` selects `restore-state-bool`, which cannot coexist with the `restore-state-none` that `esp-idf-hal/critical-section` selects in a workspace-wide clippy run.
+`src/lib.rs` therefore defines `host_critical_section` (`#[cfg(test)]`, `()` restore state), which exists only in the lib unit-test binary; integration tests and doctests that touch the ESP-NOW cells do not link.
+
+**ESP32-C3 log output over USB needs `esp-println/auto`, not `uart`.**
+Super Mini boards have no UART bridge, only the USB-Serial-JTAG port; the `uart` printer writes to UART0 pins and the USB monitor stays empty.
+`auto` checks the USB SOF flag at runtime and falls back to UART0.
+`auto` excludes `uart` and `jtag-serial` (duplicate `PrinterImpl` alias), so the C3 chip feature enables only `auto`.
 
 ---
 

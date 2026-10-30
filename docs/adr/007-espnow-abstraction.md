@@ -4,6 +4,10 @@
 
 Accepted
 
+> **Amendment (2026-10-30):** the "no bare-metal ESP-NOW use case" premise no longer holds; a downstream project is building esp-hal twins of three ESP32 firmwares.
+> The bare-metal design lives in [esp-hal-espnow-v1.md](../features/esp-hal-espnow-v1.md) and [ADR 020](020-esp-hal-espnow-owned-radio-and-sync-shim.md).
+> It ships as an `espnow` feature of `rustyfarian-esp-hal-network` (per ADR 016 consolidation) rather than the `rustyfarian-esp-hal-espnow` crate sketched in the Key design choices below; the trait contract here is unchanged.
+
 ## Context
 
 Three firmware crates in a downstream project (`firmware-rgb-puzzle-brain`, `firmware-rgb-matrix`, `firmware-rgb-nunchuck`) each contain ~155 lines of nearly identical ESP-NOW wrapper code:

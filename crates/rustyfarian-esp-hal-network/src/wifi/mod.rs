@@ -146,9 +146,24 @@ mod driver {
         password: &'a str,
         power_save: WifiPowerSave,
         tx_power: TxPowerLevel,
+        ampdu: bool,
         timg0: esp_hal::peripherals::TIMG0<'static>,
         from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
         wifi: esp_hal::peripherals::WIFI<'static>,
+    }
+
+    impl HalWifiConfig<'_> {
+        /// Enables or disables 802.11n A-MPDU aggregation (RX and TX); enabled by default.
+        ///
+        /// Disable it when ESP-NOW runs next to the associated station: Block-Ack
+        /// set-up exchanges (ADDBA/DELBA) with the access point starve ESP-NOW
+        /// reception.
+        /// The ESP-IDF brain firmware ships with both flags off, and the
+        /// `espnow` constructors of this crate do the same on a radio they own.
+        pub fn with_ampdu(mut self, enabled: bool) -> Self {
+            self.ampdu = enabled;
+            self
+        }
     }
 
     /// Extension trait that adds [`with_peripherals`][WiFiConfigExt::with_peripherals]
@@ -177,6 +192,7 @@ mod driver {
                 password: self.password,
                 power_save: self.power_save,
                 tx_power: self.tx_power,
+                ampdu: true,
                 timg0,
                 from_cpu_intr0,
                 wifi,
@@ -339,8 +355,11 @@ mod driver {
             // 2. Construct the Wi-Fi controller with a default ControllerConfig
             //    (empty station config).  Credentials are applied via an explicit
             //    `set_config` call immediately after construction (step 3).
-            let mut controller = WifiController::new(config.wifi, ControllerConfig::default())
-                .map_err(WifiError::Driver)?;
+            let controller_config = ControllerConfig::default()
+                .with_ampdu_rx_enable(config.ampdu)
+                .with_ampdu_tx_enable(config.ampdu);
+            let mut controller =
+                WifiController::new(config.wifi, controller_config).map_err(WifiError::Driver)?;
 
             // 3. Apply station credentials.  `WifiController::new` already applied
             //    an empty StationConfig (which starts the radio driver via

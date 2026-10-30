@@ -52,6 +52,8 @@ esp-alloc = { version = "=0.11.0" }
 esp-bootloader-esp-idf = { version = "=0.6.0", default-features = false }
 esp-storage = { version = "=0.10.0", default-features = false }
 embedded-storage = { version = "0.3" }
+# Cross-core-safe cells for the ESP-NOW handle; the implementation is provided by esp-hal.
+critical-section = "1"
 embedded-hal-bus = { version = "0.3", default-features = false }
 esp-println = { version = "=0.18.0", default-features = false }
 # `smoltcp` was dropped from the workspace dependency table when `esp-radio 0.18`

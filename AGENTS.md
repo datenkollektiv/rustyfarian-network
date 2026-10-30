@@ -22,8 +22,33 @@ Domain features are feature-gated per crate:
 
 - `juggler` is the consolidated platform-independent crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`, plus `mock` and `std`.
 - `rustyfarian-esp-idf-network` is the consolidated ESP-IDF crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`.
-- `rustyfarian-esp-hal-network` is the consolidated bare-metal crate with feature-gated domains `wifi`, `mqtt`, `lora`, `ota`, and `provisioning`.
+- `rustyfarian-esp-hal-network` is the consolidated bare-metal crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`.
 - `rustyfarian-esp-hal-network` also carries chip features: `esp32`, `esp32c3`, `esp32c6`, `esp32s3`.
+
+### Bare-metal ESP-NOW module map (`espnow` feature, ADR 020)
+
+| Path | Role |
+|:-----|:-----|
+| `crates/rustyfarian-esp-hal-network/src/espnow/mod.rs` | `EspNowConfig`, `EspHalEspNowError`, `RadioError`, pure validation and frame mapping (host-tested); re-exports the `juggler::espnow` contract |
+| `crates/rustyfarian-esp-hal-network/src/espnow/cell.rs` | critical-section take-out cell (`TakeCell`/`Lease`), `SharedCopy`, process-wide `Singleton` (host-tested; the C3 has no atomic CAS) |
+| `crates/rustyfarian-esp-hal-network/src/espnow/driver.rs` | `EspHalEspNow` over `esp-radio` `esp_now`, chip-gated to `esp32c3`/`esp32c6`; `from_controller` and `new_owned`, async send/recv/`scan_for_peer`, the sender runner `run_sender` |
+| `crates/juggler/src/espnow/scan.rs` | `ScanMachine`, the clock-injected scan state machine shared by both tiers |
+| `crates/rustyfarian-esp-hal-network/examples/hal_c6_espnow_sta_coordinator.rs`, `crates/rustyfarian-esp-hal-network/examples/hal_c3_espnow_peer.rs` | hardware examples (build with `just build-example`) |
+
+`esp-radio` ESP-NOW pitfalls to keep in mind when touching this module:
+
+- `SendWaiter::wait` and its `Drop` busy-spin on a flag set by the send callback from an interrupt.
+  Never hold a critical section (or any interrupt-masking lock) across a send; the sender is taken out of its cell and returned by a drop guard, and a sync send gets `Busy` while the runner holds it.
+  `esp-radio` has one global send-callback flag and no sequence number, so a dropped `SendFuture` lets the next send read a stale completion.
+  Spawn `EspHalEspNow::run_sender` once in a task that is never cancelled; a second concurrent runner is rejected (it logs an error and idles).
+  Async sends and scan probes queue their frames there, the runner polls every send to completion, and without it they fail with `NoSenderRunner`.
+  If the radio never fires the send callback, the runner waits forever, like `esp-radio`'s own send waiter.
+- The receive queue is a static of 10 frames that drops the oldest and cannot be resized, and a received frame can be 1470 B (ESP-NOW v2).
+  `EspNowEvent` holds 250 B, so oversize frames are dropped and counted (`oversize_dropped`), never truncated.
+  Consumers must drain at the rate of the busiest peer.
+- The owned radio (`new_owned`) needs no SSID and no `embassy-net`, but does need `esp_rtos::start` and a heap; `WiFiManager::init_async` does the former for the associated brain.
+- `esp-radio` starts at 5 dBm; `new_owned` sets the TX power (default 13 dBm = 52 quarter-dBm), while `from_controller` leaves the caller's level unless the config sets one.
+- Host tests get `critical-section` from `host_critical_section` in `src/lib.rs` (test-only, `()` restore state), not from `critical-section/std`: that feature selects `restore-state-bool`, which cannot coexist with the `restore-state-none` that `esp-idf-hal/critical-section` selects in a workspace-wide clippy run.
 
 The pure tier (`juggler`) contains validation, types, traits, state machines, and timing math — all host-testable, no hardware dependencies.
 The ESP-IDF and esp-hal tiers implement the traits and hardware lifecycle; they remain separate per ADR 005 (HAL tiering is mutually exclusive).
@@ -36,7 +61,7 @@ All build, test, lint, and flash operations go through `just` recipes — never 
 just setup                 # idempotent: create .cargo/config.toml if missing, install ESP toolchain via espup, run doctor
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
-just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets (not in verify)
+just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets, incl. the two ESP-NOW examples (not in verify)
 just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
 just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests with the mqtt feature (in verify)
 just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
