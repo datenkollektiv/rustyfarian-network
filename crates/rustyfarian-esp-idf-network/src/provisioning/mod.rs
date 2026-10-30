@@ -74,9 +74,9 @@ pub use boot::{
 };
 
 pub use juggler::provisioning::{
-    derive_device_name, derive_softap_ssid, resolve_softap_ssid, DeviceName, Field, FieldError,
-    LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryRequest,
-    SchemaProfile, ValidationError,
+    derive_device_name, derive_softap_ssid, gate_reentry, resolve_softap_ssid, DeviceName, Field,
+    FieldError, LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState,
+    ReentryGate, ReentryRequest, SchemaProfile, ValidationError,
 };
 
 use std::sync::{Arc, Mutex};
