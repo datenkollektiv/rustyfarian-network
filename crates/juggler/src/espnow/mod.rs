@@ -6,6 +6,7 @@
 //! - [`EspNowEvent`] — received frame (fixed-size, no heap)
 //! - [`PeerConfig`] — peer registration parameters
 //! - [`PeerTracker`] — heartbeat-based peer liveness tracking
+//! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers
 //! - [`mock::MockEspNowDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -18,12 +19,14 @@
 pub mod command;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+pub mod scan;
 pub mod tracker;
 
 pub use command::{
     parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
     TAG_SELF_TEST,
 };
+pub use scan::{ScanAction, ScanError, ScanInput, ScanMachine, SendOutcome};
 pub use tracker::PeerTracker;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -213,7 +216,7 @@ impl PeerConfig {
 /// Controls which channels to probe, what payload to send as the probe
 /// frame, and how long to wait for the MAC-layer ACK on each channel.
 /// The peer ACKs at the MAC layer regardless of payload content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ScanConfig<'a> {
     /// Channels to scan, in order (default: [`DEFAULT_SCAN_CHANNELS`]).
     pub channels: &'a [u8],

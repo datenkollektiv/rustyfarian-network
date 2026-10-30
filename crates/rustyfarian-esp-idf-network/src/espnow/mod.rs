@@ -55,10 +55,12 @@ use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, Configuration, EspWifi};
 pub use juggler::espnow::{
-    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanResult, WifiInterface,
-    BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP, DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT,
-    DEFAULT_RX_CHANNEL_CAPACITY, DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
+    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
+    SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
+    DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT, DEFAULT_RX_CHANNEL_CAPACITY,
+    DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
 };
+use juggler::espnow::{ScanAction, ScanInput, ScanMachine};
 
 /// Radio-management mode the driver is operating in.
 ///
@@ -337,99 +339,26 @@ impl EspIdfEspNow {
              would break any active AP association the caller relies on"
         );
 
-        let temp_peer = PeerConfig {
-            mac: *mac,
-            channel: 0,
-            encrypt: false,
-            interface: self.default_interface(),
-        };
+        // The pin is read before the scan: the machine restores the radio to it on failure.
+        let mut machine = ScanMachine::new(*mac, *config, self.pinned_channel_opt());
+        let result = self.drive_scan(&mut machine, config.burst_timeout);
 
-        // A previous successful scan leaves the peer registered on its
-        // discovered channel.  esp_now_add_peer returns ESP_ERR_ESPNOW_EXIST
-        // if the peer is already present, which would abort the scan before any
-        // channel is probed.  Remove any stale registration so every scan
-        // attempt starts from a clean slate.
-        let _ = self.remove_peer(mac);
-
-        self.add_peer(&temp_peer)
-            .context("failed to register temporary peer for scanning")?;
-
-        let result = self.scan_channels(mac, config);
-
-        match &result {
+        // Publish the pinned channel only for a successful scan; a failed scan
+        // leaves the previous pin untouched (the machine restores the radio to it).
+        match result {
             Ok(scan_result) => {
-                let _ = self.remove_peer(mac);
-                let final_peer = PeerConfig {
-                    channel: scan_result.channel,
-                    ..temp_peer
-                };
-                self.add_peer(&final_peer)
-                    .context("failed to re-register peer on discovered channel")?;
                 self.pinned_channel
                     .store(scan_result.channel, Ordering::Relaxed);
                 log::info!("Peer {:02X?} found on channel {}", mac, scan_result.channel);
+                Ok(scan_result)
             }
-            Err(_) => {
-                let _ = self.remove_peer(mac);
-                log::warn!("Peer {:02X?} not found on any scanned channel", mac);
-
-                // If a channel was discovered in a previous successful scan,
-                // restore the peer registration and radio channel so the next
-                // send_and_wait can attempt delivery without failing immediately
-                // with "peer not found" or ESP_ERR_ESPNOW_CHAN.
-                //
-                // Without this, a failed re-scan removes the peer entry and
-                // leaves the radio on the last-probed channel (e.g. ch 11),
-                // causing the next send to fail before the frame is ever
-                // transmitted — adding an extra failure round-trip before the
-                // following re-scan can recover.
-                let ch = self.pinned_channel.load(Ordering::Relaxed);
-                if ch != u8::MAX {
-                    let fallback = PeerConfig {
-                        mac: *mac,
-                        channel: ch,
-                        encrypt: false,
-                        interface: self.default_interface(),
-                    };
-                    // Restore the radio channel first so the peer registration is
-                    // consistent with the physical channel.
-                    // SAFETY: scan_for_peer is gated to owned-radio modes, so the
-                    // radio is owned and running. ch is a valid 2.4 GHz channel
-                    // written by a previous successful scan.
-                    let set_ch_ret = unsafe {
-                        esp_idf_svc::sys::esp_wifi_set_channel(
-                            ch,
-                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-                        )
-                    };
-                    if set_ch_ret != esp_idf_svc::sys::ESP_OK {
-                        log::warn!(
-                            "Failed to restore radio to last known channel {}: {:#x} \
-                             (next send may target an inconsistent channel)",
-                            ch,
-                            set_ch_ret
-                        );
-                    }
-                    if let Err(e) = self.add_peer(&fallback) {
-                        log::warn!(
-                            "Failed to fallback-register peer {:02X?} on channel {}: {:#} \
-                             (next send_and_wait will fail until the next successful scan)",
-                            mac,
-                            ch,
-                            e
-                        );
-                    } else {
-                        log::debug!(
-                            "Peer {:02X?} fallback-registered on last known channel {}",
-                            mac,
-                            ch
-                        );
-                    }
+            Err(e) => {
+                if matches!(e.kind, ScanError::NotFound { .. }) {
+                    log::warn!("Peer {:02X?} not found on any scanned channel", mac);
                 }
+                Err(e.into_anyhow())
             }
         }
-
-        result
     }
 
     /// Initialise ESP-NOW, start the radio, and scan for a peer.
@@ -450,7 +379,17 @@ impl EspIdfEspNow {
         Ok((driver, result))
     }
 
-    /// Scan the channels in `config` for the peer at `mac`.
+    fn pinned_channel_opt(&self) -> Option<u8> {
+        match self.pinned_channel.load(Ordering::Relaxed) {
+            u8::MAX => None,
+            ch => Some(ch),
+        }
+    }
+
+    /// Drive a [`ScanMachine`] synchronously against the ESP-IDF radio.
+    ///
+    /// The machine owns the algorithm (ADR 009, ADR 012); this function only
+    /// performs the requested I/O and reports the outcome.
     ///
     /// Note on radio side-effects: TX power is a global radio setting.
     /// While the burst is active, any concurrent Wi-Fi or ESP-NOW
@@ -458,150 +397,248 @@ impl EspIdfEspNow {
     /// On dual-radio (Wi-Fi + ESP-NOW on the same chip) deployments,
     /// schedule scans during quiet periods if predictable per-frame
     /// power matters.
-    fn scan_channels(
+    fn drive_scan(
         &self,
-        mac: &MacAddress,
-        config: &ScanConfig<'_>,
-    ) -> anyhow::Result<ScanResult> {
+        machine: &mut ScanMachine<'_>,
+        burst_timeout: Duration,
+    ) -> Result<ScanResult, ScanFailure> {
+        let mac = *machine.mac();
+        let probe_data = machine.probe_data();
+        let epoch = Instant::now();
+
+        let temp_peer = PeerConfig {
+            mac,
+            channel: 0,
+            encrypt: false,
+            interface: self.default_interface(),
+        };
+
         let ack_status = AckStatus::new();
-
-        let _cb = self.register_ack_cb(&ack_status, "scanning")?;
-
-        // Auto-burst: boost TX power to maximum during channel scanning
-        // to maximise discovery range, then restore the previous level.
+        // Held from the TX power boost until the burst ends, like the send-callback scope.
+        let mut cb: Option<SendCbScope<'_>> = None;
+        // Set when the callback could not be registered: the scan is aborted and the
+        // machine unwinds through its normal teardown path.
+        let mut cb_error: Option<anyhow::Error> = None;
         let mut saved_tx_power: i8 = 0;
-        // SAFETY: esp_wifi_get_max_tx_power is an FFI call into the ESP-IDF
-        // Wi-Fi subsystem, which is initialised by init_with_radio().
-        // It writes the current TX power to the &mut i8 we pass in.
-        let have_saved_power =
-            unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power) }
-                == esp_idf_svc::sys::ESP_OK;
+        let mut have_saved_power = false;
+        let mut last_register_error: Option<anyhow::Error> = None;
 
-        let burst_power = juggler::wifi::TxPowerLevel::Max.to_quarter_dbm();
-        // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
-        // Wi-Fi subsystem, which is initialised by init_with_radio().
-        // burst_power comes from TxPowerLevel::Max which is within the
-        // valid [8, 84] quarter-dBm range required by the API.
-        if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
-            != esp_idf_svc::sys::ESP_OK
-        {
-            log::warn!("Failed to boost TX power for scanning — continuing at current level");
-        }
-
-        let scan_result = (|| -> anyhow::Result<ScanResult> {
-            let burst_start = Instant::now();
-            let mut probed = 0usize;
-
-            for &channel in config.channels {
-                if burst_start.elapsed() >= config.burst_timeout {
-                    log::debug!(
-                        "Burst timeout {:?} reached after {} channels; stopping scan",
-                        config.burst_timeout,
-                        probed
-                    );
-                    break;
+        let mut input = ScanInput::Start;
+        loop {
+            let action = machine.poll(epoch.elapsed(), input);
+            input = match action {
+                ScanAction::RemovePeer => {
+                    // Best effort: removes a stale registration, or the scan peer.
+                    let _ = self.remove_peer(&mac);
+                    ScanInput::Completed
                 }
-
-                log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
-
-                // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
-                // Wi-Fi subsystem, which is initialised by init_with_radio().
-                // In SoftAP mode the channel change is a CSA with no connected
-                // stations, so it takes effect immediately. channel is 1-13.
-                let ret = unsafe {
-                    esp_idf_svc::sys::esp_wifi_set_channel(
+                ScanAction::RegisterPeer { channel } => {
+                    let peer = PeerConfig {
                         channel,
-                        esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-                    )
-                };
-                if ret != esp_idf_svc::sys::ESP_OK {
-                    log::warn!("Failed to set channel {}: error code {}", channel, ret);
-                    continue;
+                        ..temp_peer
+                    };
+                    match self.add_peer(&peer) {
+                        Ok(()) => ScanInput::Completed,
+                        Err(e) => {
+                            last_register_error = Some(e);
+                            ScanInput::Failed
+                        }
+                    }
                 }
-
-                ack_status.reset();
-
-                if self.send(mac, config.probe_data).is_err() {
-                    continue;
+                ScanAction::RegisterFallbackPeer { channel } => {
+                    let peer = PeerConfig {
+                        channel,
+                        ..temp_peer
+                    };
+                    match self.add_peer(&peer) {
+                        Ok(()) => log::debug!(
+                            "Peer {:02X?} fallback-registered on last known channel {}",
+                            mac,
+                            channel
+                        ),
+                        Err(e) => log::warn!(
+                            "Failed to fallback-register peer {:02X?} on channel {}: {:#} \
+                             (next send_and_wait will fail until the next successful scan)",
+                            mac,
+                            channel,
+                            e
+                        ),
+                    }
+                    ScanInput::Completed
                 }
+                ScanAction::BoostTxPower => {
+                    match self.register_ack_cb(&ack_status, "scanning") {
+                        Ok(scope) => {
+                            cb.replace(scope);
+                            // Auto-burst: boost TX power to maximum during channel scanning
+                            // to maximise discovery range, then restore the previous level.
+                            // SAFETY: esp_wifi_get_max_tx_power is an FFI call into the
+                            // ESP-IDF Wi-Fi subsystem, which is initialised by
+                            // init_with_radio().  It writes the current TX power to the
+                            // &mut i8 we pass in.
+                            have_saved_power = unsafe {
+                                esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power)
+                            } == esp_idf_svc::sys::ESP_OK;
 
-                probed += 1;
-
-                match ack_status.wait(config.probe_timeout) {
-                    Some(true) => {
-                        // First probe ACKed.  One ACK alone may be a roaming
-                        // peer transiently visiting this channel — require
-                        // probe_confirmations additional ACKs spaced longer
-                        // than a typical 802.11 scan dwell (observed at
-                        // roughly 100 ms) to verify the peer has actually
-                        // settled here.
-                        let mut confirmed = true;
-                        for confirmation in 0..config.probe_confirmations {
-                            std::thread::sleep(config.confirmation_gap);
-                            ack_status.reset();
-                            if self.send(mac, config.probe_data).is_err() {
-                                confirmed = false;
-                                log::debug!(
-                                    "Channel {} confirmation probe {} send failed",
-                                    channel,
-                                    confirmation + 1
+                            let burst_power = juggler::wifi::TxPowerLevel::Max.to_quarter_dbm();
+                            // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the
+                            // ESP-IDF Wi-Fi subsystem, which is initialised by
+                            // init_with_radio().  burst_power comes from
+                            // TxPowerLevel::Max which is within the valid [8, 84]
+                            // quarter-dBm range required by the API.
+                            if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
+                                != esp_idf_svc::sys::ESP_OK
+                            {
+                                log::warn!(
+                                    "Failed to boost TX power for scanning — \
+                                     continuing at current level"
                                 );
-                                break;
                             }
-                            match ack_status.wait(config.probe_timeout) {
-                                Some(true) => continue,
-                                Some(false) => {
+                            ScanInput::Completed
+                        }
+                        Err(e) => {
+                            cb_error = Some(e);
+                            ScanInput::Abort
+                        }
+                    }
+                }
+                ScanAction::RestoreChannel { channel } => {
+                    // Fallback: restore the radio to the last pinned channel so the
+                    // peer registration is consistent with the physical channel.
+                    // SAFETY: scan_for_peer is gated to owned-radio modes, so the
+                    // radio is owned and running. channel is a valid 2.4 GHz channel
+                    // written by a previous successful scan.
+                    let set_ch_ret = unsafe {
+                        esp_idf_svc::sys::esp_wifi_set_channel(
+                            channel,
+                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                        )
+                    };
+                    if set_ch_ret != esp_idf_svc::sys::ESP_OK {
+                        log::warn!(
+                            "Failed to restore radio to last known channel {}: {:#x} \
+                             (next send may target an inconsistent channel)",
+                            channel,
+                            set_ch_ret
+                        );
+                    }
+                    ScanInput::Completed
+                }
+                ScanAction::SetChannel { channel } => {
+                    log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
+                    // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
+                    // Wi-Fi subsystem, which is initialised by init_with_radio().
+                    // In SoftAP mode the channel change is a CSA with no connected
+                    // stations, so it takes effect immediately. channel is 1-13.
+                    let ret = unsafe {
+                        esp_idf_svc::sys::esp_wifi_set_channel(
+                            channel,
+                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                        )
+                    };
+                    if ret != esp_idf_svc::sys::ESP_OK {
+                        log::warn!("Failed to set channel {}: error code {}", channel, ret);
+                        ScanInput::Failed
+                    } else {
+                        ScanInput::Completed
+                    }
+                }
+                ScanAction::SendProbe {
+                    channel,
+                    confirmation,
+                    timeout,
+                } => {
+                    ack_status.reset();
+                    if self.send(&mac, probe_data).is_err() {
+                        // A failed first probe is silent, like the pre-machine driver.
+                        if confirmation > 0 {
+                            log::debug!(
+                                "Channel {} confirmation probe {} send failed",
+                                channel,
+                                confirmation
+                            );
+                        }
+                        ScanInput::Sent(SendOutcome::Error)
+                    } else {
+                        match ack_status.wait(timeout) {
+                            Some(true) => ScanInput::Sent(SendOutcome::Acked),
+                            Some(false) => {
+                                if confirmation == 0 {
+                                    log::debug!("No ACK on channel {}", channel);
+                                } else {
                                     log::debug!(
                                         "Channel {} unconfirmed: probe {} not ACKed \
                                          (likely roaming peer)",
                                         channel,
-                                        confirmation + 1
+                                        confirmation
                                     );
-                                    confirmed = false;
-                                    break;
                                 }
-                                None => {
+                                ScanInput::Sent(SendOutcome::NoAck)
+                            }
+                            None => {
+                                if confirmation == 0 {
+                                    log::debug!("Send timeout on channel {}", channel);
+                                } else {
                                     log::debug!(
                                         "Channel {} unconfirmed: probe {} timed out",
                                         channel,
-                                        confirmation + 1
+                                        confirmation
                                     );
-                                    confirmed = false;
-                                    break;
                                 }
+                                ScanInput::Sent(SendOutcome::NoAck)
                             }
                         }
-                        if confirmed {
-                            return Ok(ScanResult { channel });
-                        }
-                        // Confirmation failed: continue to the next channel.
                     }
-                    Some(false) => log::debug!("No ACK on channel {}", channel),
-                    None => log::debug!("Send timeout on channel {}", channel),
                 }
-            }
-
-            anyhow::bail!(
-                "peer not found after probing {} of {} configured channels",
-                probed,
-                config.channels.len()
-            )
-        })();
-
-        // Restore TX power after scanning regardless of outcome.
-        // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
-        // Wi-Fi subsystem, which is initialised by init_with_radio().
-        // saved_tx_power was previously read from esp_wifi_get_max_tx_power
-        // (and only used here when have_saved_power is true), so the value
-        // is guaranteed to be in the valid range the API itself produced.
-        if have_saved_power
-            && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
-                != esp_idf_svc::sys::ESP_OK
-        {
-            log::warn!("Failed to restore TX power after scanning");
+                ScanAction::WaitUntil(deadline) => {
+                    // FreeRTOS delay via std::thread::sleep (esp-idf pthread/usleep shim).
+                    let now = epoch.elapsed();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
+                    }
+                    ScanInput::Completed
+                }
+                ScanAction::RestoreTxPower => {
+                    // Restore TX power after scanning regardless of outcome.
+                    // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
+                    // Wi-Fi subsystem, which is initialised by init_with_radio().
+                    // saved_tx_power was previously read from esp_wifi_get_max_tx_power
+                    // (and only used here when have_saved_power is true), so the value
+                    // is guaranteed to be in the valid range the API itself produced.
+                    if have_saved_power
+                        && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
+                            != esp_idf_svc::sys::ESP_OK
+                    {
+                        log::warn!("Failed to restore TX power after scanning");
+                    }
+                    // The burst is over: release the send callback and its guard.
+                    drop(cb.take());
+                    ScanInput::Completed
+                }
+                ScanAction::Done(result) => {
+                    if machine.burst_expired() {
+                        log::debug!(
+                            "Burst timeout {:?} reached after {} channels; stopping scan",
+                            burst_timeout,
+                            machine.probed()
+                        );
+                    }
+                    return result.map_err(|kind| match (kind, cb_error.take()) {
+                        (ScanError::Aborted, Some(e)) => ScanFailure {
+                            kind,
+                            cause: Some(e),
+                        },
+                        (ScanError::RegisterTempPeer | ScanError::RegisterFoundPeer { .. }, _) => {
+                            ScanFailure {
+                                kind,
+                                cause: last_register_error.take(),
+                            }
+                        }
+                        _ => ScanFailure { kind, cause: None },
+                    });
+                }
+            };
         }
-
-        scan_result
     }
 
     /// Send data and wait for the MAC-layer ACK.
@@ -781,6 +818,30 @@ impl EspIdfEspNow {
             mode,
             pinned_channel: AtomicU8::new(u8::MAX),
         })
+    }
+}
+
+/// A failed scan: the machine's verdict plus the driver error that caused it, if any.
+struct ScanFailure {
+    kind: ScanError,
+    cause: Option<anyhow::Error>,
+}
+
+impl ScanFailure {
+    /// Reproduce the error shapes of the pre-state-machine implementation:
+    /// a context message over the driver error for registration failures,
+    /// the plain verdict otherwise.
+    fn into_anyhow(self) -> anyhow::Error {
+        match (self.kind, self.cause) {
+            (ScanError::RegisterTempPeer, Some(cause)) => {
+                cause.context("failed to register temporary peer for scanning")
+            }
+            (ScanError::RegisterFoundPeer { .. }, Some(cause)) => {
+                cause.context("failed to re-register peer on discovered channel")
+            }
+            (ScanError::Aborted, Some(cause)) => cause,
+            (kind, _) => anyhow::Error::new(kind),
+        }
     }
 }
 

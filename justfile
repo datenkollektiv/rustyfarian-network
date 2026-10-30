@@ -122,6 +122,11 @@ clippy-ota-tests:
 clippy-ota-pure:
     cargo clippy -p juggler --features ota-wire --all-targets --target {{ host_target }} -- -D warnings
 
+# lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
+[group('build')]
+clippy-pure:
+    cargo clippy -p juggler --features mock,std,provisioning,ota-wire,espnow --all-targets --target {{ host_target }} -- -D warnings
+
 # check the esp-idf ota runtime (features wifi,mqtt,ota) and its hardware example
 [group('build')]
 check-ota-mqtt-idf:
@@ -243,7 +248,13 @@ check-mqtt-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
-check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy check-mqtt-hal-embassy
+# check the esp-hal ESP-NOW driver cross-compiles for ESP32-C6 and ESP32-C3 (ADR 020)
+[group('build')]
+check-espnow-hal:
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+
+check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy check-mqtt-hal-embassy check-espnow-hal
 
 # check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
 [group('build')]
@@ -268,6 +279,10 @@ clippy-hal:
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32s3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c6,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c6,unstable,rt,embassy --example hal_c6_espnow_sta_coordinator -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --example hal_c3_espnow_peer -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32s3,unstable,rt,embassy -- -D warnings
 
 # ── test & lint ───────────────────────────────────────────────────────────
@@ -588,6 +603,7 @@ verify:
     just clippy-provisioning-tests
     just clippy-provisioning-mqtt-tests
     just clippy-ota-pure
+    just clippy-pure
     just clippy-ota-mqtt-idf
     just check-hal
     just check-no-credential-logging

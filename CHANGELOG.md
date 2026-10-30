@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::espnow::{ScanMachine, ScanInput, ScanAction, ScanError, SendOutcome}`: a pure, clock-injected state machine for `scan_for_peer`, shared by both tiers; the caller feeds `ScanInput` (`Start`, `Completed`, `Failed`, `Abort`, `Sent`) and performs each `ScanAction`, and `ScanError::Aborted` reports an abort. A failed peer registration restores the previously pinned channel and peer (best effort) before reporting the original `ScanError`.
+  See ADR 020 and `docs/features/esp-hal-espnow-v1.md`; ADR 007 is amended.
+- Bare-metal ESP-NOW: new `espnow` feature on `rustyfarian-esp-hal-network` (ADR 020, `esp32c3` and `esp32c6`); `espnow::EspHalEspNow` implements `juggler::espnow::EspNowDriver` with `&self` and adds `send_and_wait`, `send_async`, `send_async_timeout`, `recv_async`, `set_channel`, `set_max_tx_power`, `tx_power_quarter_dbm`, `sta_mac`, `peer_exists` and `oversize_dropped`.
+  `from_controller(&mut WifiController, EspNowConfig)` keeps the caller's TX power and A-MPDU unless configured; `new_owned(WIFI, EspNowConfig)` starts an unassociated station (no SSID, no `embassy-net`) at 13 dBm with A-MPDU off.
+  See `docs/features/esp-hal-espnow-v1.md` for the send, receive and channel semantics.
+  Async sends and scan probes run through `EspHalEspNow::run_sender`, a runner task the firmware spawns once (a second runner is rejected, and `NoSenderRunner` without one), so a cancelled or timed-out caller never orphans a send completion; a request whose deadline passed before its transmission started is never sent, an in-flight transmission is waited out and its real result returned, a scan probe uses one absolute deadline, a cancelled `scan_for_peer` restores channel, peer registration and TX power, and concurrent scans return `Busy`.
+- `EspHalEspNow::scan_for_peer(&mac, &ScanConfig, &mut Option<u8>)`: async peer scan on the esp-hal tier, driven by `juggler::espnow::ScanMachine` with the ESP-IDF tier's semantics; the caller keeps the pinned channel in the `&mut Option<u8>`, and failures are `EspHalEspNowError::Scan(ScanError)`.
+  The TX-power boost to `Max` is restored on every exit, including a cancelled future; a `from_controller` handle cannot boost and scans at the caller's level, but it still moves an associated station across channels and drops its access-point link, so use the scan on the owned radio.
+- Bare-metal ESP-NOW examples `hal_c6_espnow_sta_coordinator` (ESP32-C6, associated station, echoes frames) and `hal_c3_espnow_peer` (ESP32-C3, owned radio, scan and 100 ms sends for hardware gate G-E1).
+  Build with `just build-example`; `just clippy-hal` lints both, `just check-espnow-hal` runs under `check-hal`, and `just clippy-pure` lints the `juggler` `espnow` feature.
+  Build-time credentials and the peer MAC are `option_env!` values and are never logged.
+- `EspHalEspNow::scan_for_peer(&mac, &ScanConfig, &mut Option<u8>)`: async peer scan on the esp-hal tier, driven by the shared `juggler::espnow::ScanMachine` (same semantics as the ESP-IDF tier).
+  Probes use `send_async_timeout` with `probe_timeout` as the deadline for queueing and the start of transmission — a probe already on the air is waited out (ACK = `Acked`, `SendFailed` or timeout = `NoAck`, enqueue error = `Error`), confirmation gaps use `embassy_time::Timer::at` against the scan start, a refused channel switch is reported to the machine as `Failed`, and the TX-power boost to `Max` is restored by a drop guard on every exit including a cancelled future (owned radio only; a `from_controller` handle scans at the caller's level).
+  The caller keeps the pinned channel through the `&mut Option<u8>` and the failure is `EspHalEspNowError::Scan(ScanError)`; no lock is held across an await.
+- Bare-metal ESP-NOW examples: `hal_c6_espnow_sta_coordinator` (ESP32-C6, station associated first, `EspHalEspNow::from_controller`, A-MPDU off, receives, registers senders and echoes frames, logs counters and the oversize-drop count) and `hal_c3_espnow_peer` (ESP32-C3, `new_owned` at 13 dBm = 52 quarter-dBm, `scan_for_peer` with the pinned channel kept across rescans, a frame every 100 ms with ACK and failure-rate logging for hardware gate G-E1).
+  Build with `just build-example`; `just clippy-hal` lints both.
+  Wi-Fi credentials and the peer MAC are compile-time `option_env!` values and are never logged.
 - Bare-metal MQTT: new `mqtt` feature on `rustyfarian-esp-hal-network` (ADR 019) — an async MQTT 5 client over `minimq =0.13.5` and the Wi-Fi `embassy-net` stack, with LWT, a startup message republished on every (re)connect, builder subscriptions re-issued after reconnect, auto-reconnect, a polled network watch, a transport timeout of 1.5 × keep-alive and a stall deadline of socket timeout + keep-alive (a dead link ends the session within about 0.5 s, a silent broker within roughly 2.5 × keep-alive), a non-blocking `try_publish*` family returning `TryPublishError::WouldBlock` (`Ok` means queued, not delivered; the crate README states the delivery rule), an inbound message queue, and all buffers static.
   Chips `esp32c3`, `esp32c6`, `esp32s3`; examples `hal_c6_mqtt_lwt` and `hal_esp32s3_mqtt_lwt`; runbook `docs/runbooks/esp-hal-mqtt-hardware-test.md`; `just clippy-hal` and `just check-hal` cover the feature.
   Shared MQTT configuration in `juggler::mqtt` (no `std` needed): `QoS`, `MqttConfig`, `LwtConfig`, `DEFAULT_MQTT_TASK_STACK_SIZE` and the generic `TryPublishError<E>`, used by both tier crates.
@@ -39,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `EspIdfEspNow::scan_for_peer` now drives the shared `juggler::espnow::ScanMachine` (blocking `send` plus ACK wait per probe, `std::thread::sleep` for confirmation gaps) instead of its own channel loop, so both tiers run one algorithm.
+  The public API, error messages (including the `anyhow` context on registration failures), TX-power boost and restore order and the failed-scan fallback to the last pinned channel are unchanged; log lines are unchanged, except that the burst-timeout line is now emitted after teardown.
+  The `espnow` module re-exports `ScanError` and `SendOutcome`.
+  Not exercised on hardware: an IDF re-check of scan (nunchuk on channels 1, 6 and 11) is covered by the consumer's manual G0/G2 gates.
+- `rustyfarian-esp-hal-network` `esp32c3` feature: `esp-println` now uses `auto` (USB-Serial-JTAG when a USB host is attached, else UART0) instead of `uart`, so log output reaches the USB port of Super Mini boards.
 - **Breaking (both tiers):** `PortalConfig::device_name` is now `juggler::provisioning::DeviceName` instead of `&str`, re-exported from both tiers' `provisioning` modules.
   Migration: `device_name: "name"` becomes `device_name: DeviceName::Fixed("name")` for the old behaviour, or `device_name: DeviceName::MacSuffixed("name")` to pre-fill `name-xxxx` from the AP MAC.
   The `xxxx` suffix is the lowercase hex of the last two AP-MAC bytes, so devices whose last two AP-MAC bytes differ get different names.

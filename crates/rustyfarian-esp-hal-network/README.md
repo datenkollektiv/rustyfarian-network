@@ -13,13 +13,14 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 
 ### Domain Features
 
-| Feature        | What it gates                                             | Requires `embassy` | Notes                                              |
-|:---------------|:----------------------------------------------------------|:-------------------|:---------------------------------------------------|
-| `wifi`         | Async Wi-Fi STA/AP via `esp-radio 1.0.0-beta.1`           | Yes                | Implies `embassy`; auto-enables it.                |
-| `mqtt`         | Async MQTT 5 client via `minimq 0.13.5` (ADR 019)         | Yes                | Implies `wifi` + `embassy`; IPv4 broker literal.   |
-| `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.        |
-| `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.   |
-| `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V). |
+| Feature        | What it gates                                             | Requires `embassy` | Notes                                                 |
+|:---------------|:----------------------------------------------------------|:-------------------|:------------------------------------------------------|
+| `wifi`         | Async Wi-Fi STA/AP via `esp-radio 1.0.0-beta.1`           | Yes                | Implies `embassy`; auto-enables it.                   |
+| `mqtt`         | Async MQTT 5 client via `minimq 0.13.5` (ADR 019)         | Yes                | Implies `wifi` + `embassy`; IPv4 broker literal.      |
+| `espnow`       | ESP-NOW driver `EspHalEspNow` (ADR 020)                   | Yes                | Implies `wifi` + `embassy`; `esp32c3`/`esp32c6` only. |
+| `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.           |
+| `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.      |
+| `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V).    |
 
 ### Dependency pins and MSRV
 
@@ -173,6 +174,27 @@ Everything the builder keeps must be `'static`; the example builds its topics in
 The broker host is an IPv4 literal (no DNS in v1), payloads are capped at 256 bytes, and all buffers are static — no heap use.
 The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md` (T5 covers Wi-Fi loss with an AP power-off and a router-pause variant).
 
+## Example: ESP-NOW (coordinator and peer)
+
+Two examples form a pair (feature `espnow`, ESP32-C3 and ESP32-C6; ADR 020):
+
+* `examples/hal_c6_espnow_sta_coordinator.rs` (C6): the station associates and gets a DHCP lease first, then `EspHalEspNow::from_controller(&mut controller, EspNowConfig::default())` starts ESP-NOW on the settled channel (A-MPDU off in the Wi-Fi config).
+  Each received frame registers its sender as a peer and is echoed back; counters (including `oversize_dropped`) are logged every 10 s, and the station MAC is printed once at boot.
+* `examples/hal_c3_espnow_peer.rs` (C3): `EspHalEspNow::new_owned(WIFI, EspNowConfig::default().with_tx_power(TxPowerLevel::Medium))` starts an unassociated station at 13 dBm (52 quarter-dBm) after `esp_rtos::start`.
+  `scan_for_peer` finds the coordinator (`ESPNOW_PEER_MAC`, optional `ESPNOW_CHANNEL` as first pin), then a frame goes out every 100 ms with the ACK counted and the failure rate logged every 10 s; 20 consecutive unacknowledged sends trigger a rescan.
+  This is the traffic pattern of hardware gate G-E1 (see `docs/ROADMAP.md`).
+
+Async sends and scan probes need the sender runner: spawn `espnow.run_sender()` once in an `embassy_executor::task` (both examples do) before the first `send_async*` or `scan_for_peer`.
+Without it they return `NoSenderRunner`; the sync `send` / `send_and_wait` work without it.
+
+```sh
+WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example hal_c6_espnow_sta_coordinator
+ESPNOW_PEER_MAC="aa:bb:cc:dd:ee:ff" just build-example hal_c3_espnow_peer
+```
+
+Credentials are read with `option_env!` at build time and never logged.
+The receive queue of `esp-radio` holds 10 frames and drops the oldest, and frames above 250 B are dropped and counted, so drain with `recv_async` in a dedicated task.
+
 ## Example: Async SoftAP + Provisioning
 
 Condensed from `examples/hal_c3_provision_mqtt.rs`.
@@ -249,7 +271,8 @@ use rustyfarian_esp_hal_network::lora::LoraConfig;
 - **ESP32** (Xtensa LX6): LoRa and OTA; Wi-Fi and provisioning are not wired in this crate yet.
 - `esp-radio 1.0.0-beta.1` does support the ESP32, but the `esp32` feature does not forward a chip to `esp-radio`, `esp-rtos` or `esp-alloc`.
 - **ESP32-S3** (Xtensa LX7): Full support for Wi-Fi, LoRa, OTA, and provisioning; flash with the IDF-built bootloader (`just flash` does this).
-- **ESP32-C3 and ESP32-C6** (RISC-V): Full support for Wi-Fi, LoRa, OTA, and provisioning.
+- **ESP32-C3 and ESP32-C6** (RISC-V): Full support for Wi-Fi, LoRa, OTA, provisioning, and ESP-NOW (`espnow`).
+- On `esp32c3`, `esp-println` uses its `auto` printer: USB-Serial-JTAG when a USB host is attached (Super Mini boards), UART0 otherwise.
 
 ## docs.rs Build Note
 

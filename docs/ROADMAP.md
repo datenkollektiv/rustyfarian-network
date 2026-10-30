@@ -12,6 +12,7 @@ Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `s
 The TTN OTAA join and first uplink were validated 2026-06-17.
 OTA consumer runtime was hardware-validated end to end on 2026-10-08 (library runbook 21/21 on ESP32-C3) and adoption tests passed on 2026-10-09 (rgb-clock); MQTT auto-reconnect is fixed for 0.6.0 (bug 005, broken since 0.4.0).
 esp-hal provisioning now owns the SoftAP bring-up, so `ssid_override` and the `{prefix}-{MAC}` default apply on both tiers; validated on an ESP32-C3 Mini-1 on 2026-10-30, which also surfaced and fixed bug 006 (the esp-hal store never read a record back on hardware).
+Bare-metal ESP-NOW (`espnow` feature, ADR 020) is implemented for ESP32-C3 and ESP32-C6 with the two examples `hal_c6_espnow_sta_coordinator` and `hal_c3_espnow_peer`; it is hardware-pending until gates G-E1 and G-E2 pass.
 See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
 
 ## Forward plan
@@ -34,7 +35,8 @@ See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHAN
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
+    Ready     : Bare-metal ESP-NOW hardware gates — implemented, hardware pending — G-E1 unassociated STA channel drift, G-E2 C6 coex-off recv loss, plus mixed IDF/hal fleet and IDF scan re-checks (feature-doc)
+              : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
               : Provisioning re-entry hook — optional pre-load hook answers None, Portal or FactoryReset once per boot, the library reports it as a WifiMqttLoadOutcome and never erases, the consumer owns GPIO, hold time and erase, IDF tier first, part 6 of the Wi-Fi portal fallback (feature-doc)
               : Per-device name pre-fill — portal pre-fills dev_name as prefix plus lowercase AP-MAC suffix via a new juggler derive_device_name helper and a DeviceName Fixed or MacSuffixed choice on both PortalConfig types (breaking, next minor), so devices of one firmware get distinct names and MQTT client IDs, requested by spookhouse bug 009 and rgb-clock (feature-doc)
 

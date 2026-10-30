@@ -51,6 +51,16 @@ mqtt = [
     "embassy",
 ]
 
+# espnow: ESP-NOW over esp-radio `esp_now` (ADR 020). Implies `wifi` (the radio, `esp_rtos`,
+# the heap and embassy-time come with it) and enables the `espnow` domain of juggler.
+# Supported on `esp32c3` and `esp32c6`. `esp-radio/coex` stays off (BLE/802.15.4 only).
+espnow = [
+    "wifi",
+    "juggler/espnow",
+    "esp-radio?/esp-now",
+    "embassy",
+]
+
 # lora: synchronous LoRa stub using embedded-hal SPI + GPIO.
 # No embassy requirement; lora is nb-based and blocking.
 lora = [
@@ -122,7 +132,9 @@ ws2812 = [
 # by any domain feature — no-op when dep absent.
 
 # ESP32-C3: RISC-V, riscv32imc-unknown-none-elf
-# Supports: wifi, lora, ota, provisioning
+# Supports: wifi, lora, ota, provisioning, espnow
+# Log output: `auto` picks USB-Serial-JTAG when a USB host is present (Super Mini boards have no
+# UART bridge, `uart` alone prints nothing on the USB port) and falls back to UART0 otherwise.
 esp32c3 = [
     "esp-hal?/esp32c3",
     "esp-radio?/esp32c3",
@@ -131,12 +143,12 @@ esp32c3 = [
     "esp-bootloader-esp-idf?/esp32c3",
     "esp-storage?/esp32c3",
     "esp-backtrace?/esp32c3",
-    "esp-println?/esp32c3", "esp-println?/uart", "esp-println?/log-04",
+    "esp-println?/esp32c3", "esp-println?/auto", "esp-println?/log-04",
     "rustyfarian-esp-hal-ws2812?/esp32c3",
 ]
 
 # ESP32-C6: RISC-V, riscv32imac-unknown-none-elf
-# Supports: wifi, lora, ota, provisioning
+# Supports: wifi, lora, ota, provisioning, espnow
 esp32c6 = [
     "esp-hal?/esp32c6",
     "esp-radio?/esp32c6",
@@ -194,6 +206,10 @@ heapless         = { workspace = true }
 # and compile on any target.
 embedded-storage = { workspace = true }
 nb               = { workspace = true }
+# `critical-section` is always-on: the ESP-NOW take-out cells and singleton guard are host-tested.
+# The implementation comes from esp-hal on target and from `mod host_critical_section` in
+# `src/lib.rs` (lib unit-test binary only) on the host.
+critical-section = { workspace = true }
 
 # ── Optional — activated by domain or chip features ──────────────────────────
 esp-hal                 = { workspace = true, features = ["unstable"], optional = true }
@@ -218,6 +234,10 @@ rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
 
 minimq                  = { workspace = true, optional = true }
 
+# Host tests get their critical-section implementation from `host_critical_section` in lib.rs,
+# not from `critical-section/std`: that feature selects `restore-state-bool`, which cannot
+# coexist with the `restore-state-none` that `esp-idf-hal/critical-section` (a dev-dependency
+# of the IDF crate) selects when the whole workspace is linted in one cargo invocation.
 [dev-dependencies]
 embassy-executor = { workspace = true }
 embassy-time     = { workspace = true }
@@ -226,7 +246,7 @@ embassy-time     = { workspace = true }
 # [dependencies] entry so that `cfg(test)` compilation with --no-default-features
 # can reach juggler::ota, juggler::provisioning, juggler::wifi, juggler::mqtt, and
 # juggler::lora without pulling in any chip-specific hardware crate.
-juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt", "lora"] }
+juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt", "lora", "espnow"] }
 
 [[example]]
 name = "hal_c3_connect_async"
@@ -263,3 +283,11 @@ required-features = ["mqtt", "esp32s3", "rt", "embassy"]
 [[example]]
 name = "hal_esp32s3_join"
 required-features = ["lora", "esp32s3", "rt"]
+
+[[example]]
+name = "hal_c6_espnow_sta_coordinator"
+required-features = ["espnow", "esp32c6", "rt", "embassy"]
+
+[[example]]
+name = "hal_c3_espnow_peer"
+required-features = ["espnow", "esp32c3", "rt", "embassy"]
