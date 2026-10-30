@@ -56,7 +56,7 @@ use embedded_hal::{
     spi::{ErrorType, Operation, SpiDevice},
 };
 use esp_idf_hal::{
-    delay::FreeRtos,
+    delay::{Ets, FreeRtos},
     gpio::{GpioError, Input, Output, PinDriver},
     spi::{SpiDeviceDriver, SpiDriver},
 };
@@ -133,12 +133,12 @@ impl<SPI: SpiDevice> SpiDevice for FullDuplexDevice<SPI> {
         // Fast path: if no Operation::Read is present, forward the original slice
         // directly without any heap allocation.
         //
-        // This path is critical for correctness: sx126x::reset() calls
-        // spi.transaction(&mut [Operation::DelayNs(200_000)]) inside
-        // critical_section::with (interrupts disabled, FreeRTOS scheduler
-        // suspended).  Heap allocation (Vec) inside an ESP-IDF critical section
-        // deadlocks the main task — the heap lock is held by the allocator, and
-        // no other task can release it while the scheduler is suspended.
+        // No transaction reaches this wrapper from inside critical_section::with:
+        // the only critical section in sx126x 0.3 is reset(), which this driver
+        // never calls (see `pulse_nrst`).  The firmware picks the provider —
+        // esp-idf-hal's is a recursive FreeRTOS mutex, others mask interrupts —
+        // and under a masking provider neither the blocking SPI bus acquire nor
+        // the slow path's allocation is allowed, so SPI stays outside them.
         //
         // All Write, TransferInPlace, and DelayNs operations take this path and
         // pay zero allocation cost.
@@ -148,8 +148,8 @@ impl<SPI: SpiDevice> SpiDevice for FullDuplexDevice<SPI> {
 
         // Slow path: at least one Read is present.  All Read call sites in
         // sx126x 0.3 (read_register, read_buffer, get_irq_status,
-        // get_packet_status, get_rx_buffer_status, get_device_errors) are NOT
-        // wrapped in critical_section::with, so Vec allocation here is safe.
+        // get_packet_status, get_rx_buffer_status, get_device_errors) run
+        // outside critical_section::with, so Vec allocation here is safe.
         //
         // Allocate a single zeroed scratch buffer sized to the largest Read in
         // this transaction.  Every Read borrows this buffer immutably (it is
@@ -307,7 +307,7 @@ where
     /// - `_config` — LoRaWAN credentials (used by the LoRaWAN layer, not the radio driver).
     pub fn new(
         spi: SpiDeviceDriver<'d, SpiDriver<'d>>,
-        rst: RstPin<'d>,
+        mut rst: RstPin<'d>,
         busy: BusyPin<'d>,
         ant: ANT,
         dio1: Dio1Pin<'d>,
@@ -317,6 +317,7 @@ where
         // to sx126x.  See `FullDuplexDevice` for a detailed explanation of why this
         // is required.
         let spi = FullDuplexDevice::new(spi);
+        pulse_nrst(&mut rst)?;
         let mut radio = SX126x::new(spi, (rst, busy, ant, dio1));
 
         init_sx1262(&mut radio)?;
@@ -375,6 +376,20 @@ where
             .map(|irq| irq.rx_done() || irq.tx_done() || irq.timeout() || irq.crc_err())
             .unwrap_or(false)
     }
+}
+
+// ─── Hardware reset ──────────────────────────────────────────────────────────
+
+/// Reset the SX1262 by pulling NRST low for 200 µs (datasheet §8.1: typically 100 µs).
+///
+/// Replaces `sx126x::reset()`, which wraps an SPI `DelayNs` transaction in
+/// `critical_section::with`.  The esp-idf-hal SPI transaction blocks on
+/// `spi_device_acquire_bus`, which must not run inside an interrupt-masking
+/// critical section, so the pulse is driven here without one (bug 007).
+fn pulse_nrst(rst: &mut RstPin<'_>) -> Result<(), LoraError> {
+    rst.set_low().map_err(|_| LoraError::RadioInitFailed)?;
+    Ets::delay_us(200);
+    rst.set_high().map_err(|_| LoraError::RadioInitFailed)
 }
 
 // ─── Bounded busy-wait ───────────────────────────────────────────────────────
@@ -490,10 +505,9 @@ fn init_sx1262<ANT>(
 where
     ANT: OutputPin<Error = GpioError>,
 {
-    // ── Step 1: hardware reset ────────────────────────────────────────────────
-    log::debug!("sx1262_init: step 1 — hardware reset");
-    radio.reset().map_err(|_| LoraError::RadioInitFailed)?;
-    log::debug!("sx1262_init: waiting busy after reset");
+    // ── Step 1: wait out the hardware reset ───────────────────────────────────
+    // `EspIdfLoraRadio::new` pulsed NRST via `pulse_nrst` before building `radio`.
+    log::debug!("sx1262_init: step 1 — waiting busy after hardware reset");
     wait_busy_spi("reset", radio)?;
 
     // ── Step 2: enter STDBY_RC ────────────────────────────────────────────────

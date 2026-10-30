@@ -68,12 +68,13 @@ Placing the file in a crate subdirectory (e.g. `crates/rustyfarian-esp-idf-netwo
 Fix: place `sdkconfig.defaults` at the workspace root and declare it in `build.rs` as `cargo:rerun-if-changed=../../sdkconfig.defaults`.
 The main task stack is commonly the first setting needed: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` is sufficient for full LoRaWAN OTAA crypto on ESP-IDF.
 
-**`sx126x 0.3` requires `esp-idf-hal` with `features = ["critical-section"]` when used in an ESP-IDF std build.**
-`sx126x` unconditionally depends on the `critical-section` crate and calls `critical_section::with()` internally.
-The backend (`_critical_section_1_0_acquire` / `_critical_section_1_0_release` symbols) must be provided by the HAL.
-`esp-idf-hal` (0.45+) provides a FreeRTOS-backed implementation in `src/task.rs`, but only when the `critical-section` feature is enabled.
-Without it, the linker fails with `undefined reference to '_critical_section_1_0_acquire'` even though `esp-idf-hal` is already in the dependency tree.
-Fix: in any ESP-IDF crate that uses `sx126x`, declare `esp-idf-hal = { workspace = true, features = ["critical-section"] }`.
+**`sx126x 0.3` needs exactly one `critical-section` provider, and only the final binary may select it.**
+`sx126x` unconditionally depends on the `critical-section` crate, so the `_critical_section_1_0_acquire` / `_release` symbols must come from somewhere.
+`esp-idf-hal` (0.45+) provides them behind its `critical-section` feature, as a recursive FreeRTOS mutex (`xQueueTakeMutexRecursive`, `src/task.rs`) — it masks no interrupts and suspends no scheduler.
+`rustyfarian-esp-idf-power`'s `critical-section-impl` is an interrupt-masking alternative; enabling both fails with `multiple definition of '_critical_section_1_0_acquire'`.
+None at all fails with `undefined reference to '_critical_section_1_0_acquire'`.
+Fix: a library feature never enables a provider (the `lora` feature did until bug 007); the firmware, or the crate's examples via a dev-dependency, enables `esp-idf-hal/critical-section` or the power provider.
+`sx126x::reset()` runs an SPI transaction inside `critical_section::with`, and esp-idf-hal's SPI blocks on `spi_device_acquire_bus`, which is unsafe with interrupts masked; `EspIdfLoraRadio` therefore pulses NRST itself and never calls it.
 
 **`just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`) — Xtensa IDF and bare-metal targets are never exercised.**
 A missing `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"` passes verify clean but `just build-example idf_esp32s3_*` panics with `Cannot locate argument '--ldproxy-linker <linker>'`.
