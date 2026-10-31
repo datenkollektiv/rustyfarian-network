@@ -102,26 +102,21 @@ pub struct PortalConfig<'a> {
 pub enum ProvisioningEvent {
     /// A station (phone) associated with the provisioning AP.
     ///
-    /// `mac` is `Option<[u8; 6]>` rather than `[u8; 6]` because v1 does not
-    /// yet extract the MAC from the `esp-radio 0.18`
-    /// `AccessPointStationEventInfo` payload (the field name has not been
-    /// confirmed and the placeholder zero-bytes would otherwise look like a
-    /// real address).  The event itself fires reliably on every association;
-    /// `mac` will become `Some(_)` in a follow-up once the upstream field is
-    /// verified.
+    /// Since the `esp-radio 1.0.0-beta.1` pin the radio reports the station
+    /// MAC with the event, so `mac` is `Some(_)` on hardware; the `Option`
+    /// stays in the public surface for integrators who construct the event
+    /// themselves.
     ClientConnected {
-        /// Client hardware (MAC) address, or `None` if not yet extractable in
-        /// the current `esp-radio` surface (v1 behaviour).
+        /// Client hardware (MAC) address as reported by the radio.
         mac: Option<[u8; 6]>,
     },
     /// A station disassociated from the provisioning AP.
     ///
-    /// **Reserved for a follow-up release.**  v1 does not subscribe to the
-    /// disassociation event from `esp-radio 0.18`, so this variant is part
-    /// of the public surface for forward compatibility but is never
-    /// constructed by the current `wifi_task`.
+    /// Fired by `wifi_task` since bug 008: the esp-radio wait method yields
+    /// both directions, and before the fix a leaving station was reported as
+    /// `ClientConnected { mac: None }`.
     ClientDisconnected {
-        /// Client hardware (MAC) address, or `None` if not yet extractable.
+        /// Client hardware (MAC) address as reported by the radio.
         mac: Option<[u8; 6]>,
     },
     /// A `POST /save` passed nonce and form validation.
@@ -132,6 +127,40 @@ pub enum ProvisioningEvent {
     Committed,
     /// The factory-reset button was pressed in the portal; the caller must act.
     FactoryResetRequested,
+}
+
+/// Direction of an access-point station event, as reported by the radio.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StationEvent {
+    /// A station associated with the AP.
+    Joined,
+    /// A station disassociated from the AP.
+    Left,
+}
+
+/// Map a radio station event to the session callback event (bug 008).
+///
+/// `Joined` is `ClientConnected`, `Left` is `ClientDisconnected`; both carry
+/// the station MAC the radio reported.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
+))]
+pub(crate) fn station_event(kind: StationEvent, mac: [u8; 6]) -> ProvisioningEvent {
+    match kind {
+        StationEvent::Joined => ProvisioningEvent::ClientConnected { mac: Some(mac) },
+        StationEvent::Left => ProvisioningEvent::ClientDisconnected { mac: Some(mac) },
+    }
 }
 
 /// Outcome of a provisioning session as returned by
@@ -868,7 +897,7 @@ pub(crate) mod tasks {
     use super::super::portal::run_portal_dyn;
 
     use super::portal::PortalRenderConfig;
-    use super::{PortalStore, ProvisioningEvent, SharedState};
+    use super::{station_event, PortalStore, SharedState, StationEvent};
 
     /// Drives the embassy-net stack — must be polled continuously.
     #[embassy_executor::task]
@@ -881,34 +910,41 @@ pub(crate) mod tasks {
     ///
     /// In SoftAP mode the radio is already started when `init_softap_async`
     /// returns.  This task loops on
-    /// `wait_for_access_point_connected_event_async` and fires the
-    /// `on_event(ClientConnected)` callback.
-    ///
-    /// Note: `WifiController` in `esp-radio 0.18` does not expose a
-    /// `wait_for_access_point_disconnected_event_async` method; only the
-    /// connect event is observable via this API.  `ClientDisconnected` events
-    /// are therefore not fired in v1.
+    /// `wait_for_access_point_connected_event_async`, which despite its name
+    /// resolves on both `ap::EventInfo::Connected` and `::Disconnected`
+    /// (`esp-radio 1.0.0-beta.1`), and maps each through `station_event`
+    /// to `ClientConnected` / `ClientDisconnected` with the station MAC.
     #[embassy_executor::task]
     pub(crate) async fn wifi_task(
         controller: WifiController<'static>,
         shared: &'static SharedState,
     ) {
+        use esp_radio::wifi::ap::EventInfo;
         loop {
-            // Wait for a station to connect.
             match controller
                 .wait_for_access_point_connected_event_async()
                 .await
             {
-                Ok(_info) => {
-                    // `AccessPointStationEventInfo` — the MAC field name has
-                    // not been verified for esp-radio 0.18, so the event
-                    // carries `None` rather than a synthetic zero-bytes
-                    // placeholder that callers might mistake for a real
-                    // address.  When the field name is confirmed in a
-                    // follow-up, pass `Some(_info.<field>)` here.
-                    log::info!("AP: station connected");
+                Ok(info) => {
+                    let (kind, mac) = match info {
+                        EventInfo::Connected(c) => (StationEvent::Joined, c.mac),
+                        EventInfo::Disconnected(d) => (StationEvent::Left, d.mac),
+                    };
+                    log::info!(
+                        "AP: station {} ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                        match kind {
+                            StationEvent::Joined => "connected",
+                            StationEvent::Left => "disconnected",
+                        },
+                        mac[0],
+                        mac[1],
+                        mac[2],
+                        mac[3],
+                        mac[4],
+                        mac[5]
+                    );
                     if let Some(cb) = shared.on_event {
-                        (cb)(ProvisioningEvent::ClientConnected { mac: None });
+                        (cb)(station_event(kind, mac));
                     }
                 }
                 Err(e) => {
@@ -1146,6 +1182,29 @@ mod tests {
         assert!(
             !display_str.contains(SENTINEL),
             "ProfileNotSupported Display must not contain credential sentinel: {display_str}"
+        );
+    }
+
+    // ── Bug 008: AP station event → ProvisioningEvent mapping ─────────────────
+
+    /// A station joining the AP maps to `ClientConnected` carrying its MAC.
+    #[test]
+    fn station_event_joined_is_client_connected_with_mac() {
+        let mac = [0xa2, 0x00, 0x11, 0x22, 0xc4, 0xf4];
+        assert_eq!(
+            station_event(StationEvent::Joined, mac),
+            ProvisioningEvent::ClientConnected { mac: Some(mac) }
+        );
+    }
+
+    /// A station leaving the AP maps to `ClientDisconnected`, never to
+    /// `ClientConnected` (bug 008 fired the wrong variant on every leave).
+    #[test]
+    fn station_event_left_is_client_disconnected_with_mac() {
+        let mac = [0xa2, 0x00, 0x11, 0x22, 0xc4, 0xf4];
+        assert_eq!(
+            station_event(StationEvent::Left, mac),
+            ProvisioningEvent::ClientDisconnected { mac: Some(mac) }
         );
     }
 }
