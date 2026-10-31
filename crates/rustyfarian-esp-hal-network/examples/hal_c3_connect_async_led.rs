@@ -34,13 +34,14 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_println::println;
-use esp_radio::wifi::{Interface, WifiController};
-use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+use esp_radio::wifi::Interface;
+use rustyfarian_esp_hal_network::wifi::{
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const RECONNECT_DELAY_MS: u64 = 500;
-const CONNECT_BACKOFF_MS: u64 = 5000;
+static LINK: WifiLink = WifiLink::new();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -92,7 +93,7 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(led_task(led).unwrap());
     spawner.spawn(link_status_task(stack).unwrap());
@@ -134,7 +135,7 @@ async fn link_status_task(stack: embassy_net::Stack<'static>) {
 /// Blink rate is ~2 Hz (250 ms on, 250 ms off) for clear visibility.
 ///
 /// When `CONNECTED` transitions back to `false` (e.g. after a disconnect
-/// detected by `wifi_task`), the LED resumes blinking automatically.
+/// detected by the library's `link_task`), the LED resumes blinking automatically.
 #[embassy_executor::task]
 async fn led_task(mut led: Output<'static>) {
     loop {
@@ -148,29 +149,6 @@ async fn led_task(mut led: Output<'static>) {
             Timer::after(Duration::from_millis(250)).await;
             led.set_high();
             Timer::after(Duration::from_millis(250)).await;
-        }
-    }
-}
-
-// Handles both the initial association and subsequent reconnects.
-// Credentials were configured in `WiFiManager::init_async`; calling
-// `connect_async` directly reuses those settings without resetting driver state.
-// The LED `CONNECTED` flag is owned by `link_status_task` watching
-// `embassy_net::Stack` config-up/config-down edges — not toggled here,
-// because a successful L2 reconnect does not yet imply a new DHCP lease.
-#[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
-    loop {
-        match controller.connect_async().await {
-            Ok(_) => {
-                let _ = controller.wait_for_disconnect_async().await;
-                println!("Wi-Fi disconnected — reconnecting...");
-                Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
-            }
-            Err(e) => {
-                println!("connect failed: {:?}", e);
-                Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
-            }
         }
     }
 }

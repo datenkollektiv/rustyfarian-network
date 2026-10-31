@@ -91,13 +91,17 @@ rustyfarian-esp-hal-network = { version = "0.6", features = ["provisioning", "es
 Condensed from `examples/hal_c3_connect_async.rs`.
 `init_async` is synchronous: with `with_peripherals` it starts the `esp-rtos` scheduler, then it configures the radio and builds the `embassy-net` stack, but does not associate.
 A firmware that already started the scheduler builds the config with `with_wifi_scheduler_running(peripherals.WIFI)` instead of `with_peripherals`, and `init_async` then starts nothing (see `examples/hal_esp32s3_mqtt_lwt.rs`).
-The caller spawns one task that owns the `WifiController` (association and reconnects) and one that drives the network `Runner`; `stack` is `Copy` and is used for sockets.
+The caller spawns one task that hands the `WifiController` to `link_task` and one that drives the network `Runner`; `stack` is `Copy` and is used for sockets.
+`LINK` performs the initial association and reconnects after any link loss with a 1 s back-off doubling to 30 s; `LINK.is_connected()` and `LINK.connect_count()` are readable from any task.
 
 ```rust
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use esp_radio::wifi::{Interface, WifiController};
-use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+use esp_radio::wifi::Interface;
+use rustyfarian_esp_hal_network::wifi::{
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+};
+
+static LINK: WifiLink = WifiLink::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -112,25 +116,12 @@ async fn main(spawner: Spawner) {
     let AsyncWifiHandle { controller, stack, runner } =
         WiFiManager::init_async(config).expect("Wi-Fi init failed");
 
-    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
     stack.wait_config_up().await;
     let v4 = stack.config_v4().expect("no IPv4 config");
     esp_println::println!("connected, IP {}", v4.address);
-}
-
-#[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
-    loop {
-        match controller.connect_async().await {
-            Ok(_) => {
-                let _ = controller.wait_for_disconnect_async().await;
-                Timer::after(Duration::from_millis(500)).await;
-            }
-            Err(_) => Timer::after(Duration::from_secs(5)).await,
-        }
-    }
 }
 
 #[embassy_executor::task]

@@ -136,6 +136,10 @@ name = "idf_c3_mqtt_callback_guard"
 required-features = ["wifi", "mqtt"]
 
 [[example]]
+name = "idf_esp32s3_mqtt_lwt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
 name = "idf_esp32s3_join"
 required-features = ["lora"]
 

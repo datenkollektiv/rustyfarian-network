@@ -30,11 +30,18 @@
 //!     .connect_nonblocking();
 //! let wifi = WiFiManager::new_without_led(modem, sys_loop, Some(nvs), config)?;
 //!
-//! // new_without_led() returns immediately; association proceeds in the background.
+//! // init() returns immediately; the manager connects and reconnects in the background.
 //! if let Some(ip) = wifi.get_ip(10000)? {
 //!     println!("Connected with IP: {}", ip);
 //! }
 //! ```
+//!
+//! # Reconnect
+//!
+//! Both modes connect and reconnect through one worker (1 s back-off doubling to 30 s,
+//! shared with the esp-hal tier through `juggler::wifi::LinkMachine`); the blocking
+//! modes also retry a failed first association within their timeout, and
+//! `is_connected()` is `false` for the whole outage.
 //!
 //! # Using a Simple GPIO LED
 //!
@@ -52,8 +59,9 @@
 //! ```
 
 use std::net::Ipv4Addr;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
@@ -71,14 +79,19 @@ use rgb::RGB8;
 // Re-export all pure types from juggler::wifi
 pub use juggler::wifi::{
     validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig,
-    ConnectMode, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
-    AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
+    ConnectMode, LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig,
+    WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN,
+    DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
+    RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
 pub use pennant::{SimpleLed, StatusLed};
 
 use juggler::status_colors;
+
+/// Stack of the link worker: it only calls `esp_wifi_connect` and formats log lines.
+const LINK_WORKER_STACK_SIZE: usize = 4096;
 
 /// ESP-IDF Wi-Fi configuration bundled with the hardware peripherals needed for init.
 ///
@@ -139,10 +152,23 @@ impl StatusLed for NoLed {
 }
 
 /// Wi-Fi connection manager with optional LED status feedback.
+///
+/// # Reconnect
+///
+/// In every [`ConnectMode`] a [`LinkMachine`] on a small worker thread issues the
+/// first `esp_wifi_connect` and every reconnect: each `StaDisconnected` event is
+/// logged with its reason and answered with a 1 s back-off that doubles up to
+/// 30 s and resets on `StaConnected`. The blocking modes only wait for the link
+/// until their timeout, so a failed first association is retried within it.
+/// [`is_connected`](Self::is_connected) keeps reporting the driver's
+/// event-tracked state, so it is `false` for the whole outage.
+///
+/// Dropping the manager stops and joins the worker before the driver goes away.
 pub struct WiFiManager {
+    // Declared before `wifi`: fields drop in order, and the worker must be joined
+    // before the driver it calls into is destroyed.
+    _link: LinkWorker,
     wifi: BlockingWifi<EspWifi<'static>>,
-    /// Kept alive to receive disconnect-reason log events in non-blocking mode.
-    _disconnect_subscription: Option<EspSystemSubscription<'static>>,
 }
 
 impl WiFiManager {
@@ -254,34 +280,11 @@ impl WiFiManager {
             ),
         }
 
-        // In non-blocking mode, subscribe to disconnect events so failures such as
-        // WIFI_REASON_NO_AP_FOUND are visible at WARN level without enabling debug logs.
-        let disconnect_subscription = if matches!(config.connect_mode, ConnectMode::NonBlocking) {
-            Some(
-                sys_loop_sub
-                    .subscribe::<WifiEvent, _>(|event: WifiEvent<'_>| {
-                        if let WifiEvent::StaDisconnected(info) = event {
-                            let reason = info.reason();
-                            match wifi_disconnect_reason_name(reason) {
-                                Some(name) => log::warn!(
-                                    "WiFi disconnected — reason {} ({}) — \
-                                     check SSID/password and network availability",
-                                    reason,
-                                    name,
-                                ),
-                                None => log::warn!(
-                                    "WiFi disconnected — reason {} (unmapped) — \
-                                     check SSID/password and network availability",
-                                    reason,
-                                ),
-                            }
-                        }
-                    })
-                    .map_err(|e| anyhow::anyhow!("WiFi disconnect subscription failed: {:?}", e))?,
-            )
-        } else {
-            None
-        };
+        // Reconnect supervision: the worker owns the `LinkMachine` and issues every
+        // connect, the first one included, in all modes. Declared after `wifi`, so
+        // on an early return it is joined before the driver is dropped.
+        let link = LinkWorker::start(&sys_loop_sub)?;
+        link.send(LinkInput::Start)?;
 
         if let Some(led_driver) = led {
             let timeout_secs = match config.connect_mode {
@@ -302,18 +305,12 @@ impl WiFiManager {
                     Self::wait_for_connection(&mut wifi, timeout_secs)?;
                 }
                 ConnectMode::NonBlocking => {
-                    wifi.wifi_mut()
-                        .connect()
-                        .context("WiFi connect initiation failed")?;
-                    log::info!("WiFi connect initiated (non-blocking)");
+                    log::info!("WiFi connect requested (non-blocking)");
                 }
             }
         }
 
-        Ok(Self {
-            wifi,
-            _disconnect_subscription: disconnect_subscription,
-        })
+        Ok(Self { _link: link, wifi })
     }
 
     /// Creates a new Wi-Fi manager without an LED driver.
@@ -339,12 +336,12 @@ impl WiFiManager {
         L::Error: std::fmt::Debug,
     {
         let mut pulse_effect = PulseEffect::new();
-        let mut connect_started = false;
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
         log::info!("WiFi connecting...");
 
+        // The link worker issues (and retries) the connect; this loop only waits.
         loop {
             // Check for timeout
             if start_time.elapsed() >= timeout {
@@ -363,34 +360,13 @@ impl WiFiManager {
                 ));
             }
 
-            // Try to start a connection if not already started
-            if !connect_started {
-                match wifi.wifi_mut().connect() {
-                    Ok(_) => {
-                        connect_started = true;
-                        log::info!("Connection attempt initiated");
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to start connection: {:?}, will retry", e);
-                    }
+            match wifi.is_connected() {
+                Ok(true) => {
+                    log::info!("WiFi connected");
+                    break;
                 }
-            }
-
-            // Check if connected
-            if connect_started {
-                match wifi.is_connected() {
-                    Ok(true) => {
-                        log::info!("WiFi connected");
-                        break;
-                    }
-                    Ok(false) => {
-                        // Not connected yet, keep pulsing
-                    }
-                    Err(e) => {
-                        log::error!("WiFi connection error: {:?}", e);
-                        connect_started = false;
-                    }
-                }
+                Ok(false) => {}
+                Err(e) => log::debug!("is_connected transient error: {}", e),
             }
 
             // Pulse blue light
@@ -416,10 +392,10 @@ impl WiFiManager {
     ) -> anyhow::Result<()> {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
-        let mut connect_started = false;
 
         log::info!("WiFi connecting (timeout: {}s)...", timeout_secs);
 
+        // The link worker issues (and retries) the connect; this loop only waits.
         loop {
             if start_time.elapsed() >= timeout {
                 return Err(anyhow::anyhow!(
@@ -428,20 +404,10 @@ impl WiFiManager {
                 ));
             }
 
-            if !connect_started {
-                match wifi.wifi_mut().connect() {
-                    Ok(_) => {
-                        connect_started = true;
-                        log::info!("Connection attempt initiated");
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to start connection: {:?}, will retry", e);
-                    }
-                }
-            }
-
-            if connect_started && wifi.is_connected()? {
-                break;
+            match wifi.is_connected() {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) => log::debug!("is_connected transient error: {}", e),
             }
 
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
@@ -509,6 +475,140 @@ impl WiFiManager {
     pub fn is_connected(&self) -> anyhow::Result<bool> {
         Ok(self.wifi.is_connected()?)
     }
+}
+
+/// The reconnect worker thread plus the event subscription that feeds it.
+///
+/// Dropping it unregisters the subscription, closes the channel and joins the
+/// thread, so no `esp_wifi_connect` runs after the supervised driver is gone.
+/// The join is bounded: the worker blocks only in `recv`/`recv_timeout`, which
+/// return as soon as the last sender is dropped.
+struct LinkWorker {
+    subscription: Option<EspSystemSubscription<'static>>,
+    tx: Option<Sender<LinkInput>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LinkWorker {
+    /// Spawns the worker and subscribes it to the station link events.
+    fn start(sys_loop: &EspSystemEventLoop) -> anyhow::Result<Self> {
+        let (tx, rx) = mpsc::channel::<LinkInput>();
+        let handle = thread::Builder::new()
+            .name("wifi-link".into())
+            .stack_size(LINK_WORKER_STACK_SIZE)
+            .spawn(move || run_link_worker(rx))
+            .context("failed to spawn the Wi-Fi link worker")?;
+        let event_tx = tx.clone();
+        // Built before the subscription so a subscribe error still joins the thread.
+        let mut worker = Self {
+            subscription: None,
+            tx: Some(tx),
+            handle: Some(handle),
+        };
+        let subscription = sys_loop
+            .subscribe::<WifiEvent, _>(move |event: WifiEvent<'_>| match event {
+                WifiEvent::StaConnected(_) => {
+                    let _ = event_tx.send(LinkInput::Connected);
+                }
+                WifiEvent::StaDisconnected(info) => {
+                    let reason = info.reason();
+                    match wifi_disconnect_reason_name(reason) {
+                        Some(name) => log::warn!(
+                            "WiFi disconnected — reason {} ({}) — \
+                             check SSID/password and network availability",
+                            reason,
+                            name,
+                        ),
+                        None => log::warn!(
+                            "WiFi disconnected — reason {} (unmapped) — \
+                             check SSID/password and network availability",
+                            reason,
+                        ),
+                    }
+                    let _ = event_tx.send(LinkInput::Disconnected);
+                }
+                _ => {}
+            })
+            .map_err(|e| anyhow::anyhow!("WiFi link subscription failed: {:?}", e))?;
+        worker.subscription = Some(subscription);
+        Ok(worker)
+    }
+
+    /// Feeds one input to the worker's machine.
+    fn send(&self, input: LinkInput) -> anyhow::Result<()> {
+        self.tx
+            .as_ref()
+            .and_then(|tx| tx.send(input).ok())
+            .ok_or_else(|| anyhow::anyhow!("WiFi link worker is not running"))
+    }
+}
+
+impl Drop for LinkWorker {
+    fn drop(&mut self) {
+        // The subscription's closure owns a sender; drop it before our own.
+        drop(self.subscription.take());
+        drop(self.tx.take());
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                log::warn!("WiFi link worker panicked");
+            }
+        }
+    }
+}
+
+/// Owns the [`LinkMachine`]; exits when every [`Sender`] is dropped
+/// (see [`LinkWorker`]'s `Drop`).
+fn run_link_worker(rx: Receiver<LinkInput>) {
+    let mut machine = LinkMachine::new();
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let input = match deadline {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(input) => input,
+                Err(RecvTimeoutError::Timeout) => {
+                    deadline = None;
+                    LinkInput::BackoffElapsed
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            },
+        };
+        let mut action = machine.poll(input);
+        loop {
+            match action {
+                LinkAction::None => break,
+                LinkAction::Connect => {
+                    deadline = None;
+                    match esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_connect() }) {
+                        Ok(()) => {
+                            log::info!("WiFi connect requested");
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("WiFi connect request failed: {:?}", e);
+                            action = machine.poll(LinkInput::Disconnected);
+                        }
+                    }
+                }
+                LinkAction::Wait { ms } => {
+                    log::info!(
+                        "WiFi reconnect in {} ms (attempt {})",
+                        ms,
+                        machine.failed_attempts()
+                    );
+                    deadline = Some(Instant::now() + Duration::from_millis(ms));
+                    break;
+                }
+            }
+        }
+        if machine.state() == LinkState::Connected {
+            deadline = None;
+        }
+    }
+    log::debug!("WiFi link worker exited");
 }
 
 /// Reads the SoftAP factory MAC address from efuse.

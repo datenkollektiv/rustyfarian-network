@@ -42,16 +42,19 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_radio::wifi::{Interface, WifiController};
+use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::espnow::{
     EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, PeerConfig,
 };
-use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+use rustyfarian_esp_hal_network::wifi::{
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+};
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const RECONNECT_DELAY_MS: u64 = 500;
+static LINK: WifiLink = WifiLink::new();
+
 const CONNECT_BACKOFF_MS: u64 = 5000;
 const STATS_SECS: u64 = 10;
 
@@ -134,7 +137,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(sender_task(espnow).unwrap());
     spawner.spawn(rx_task(espnow).unwrap());
-    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller).unwrap());
 
     loop {
         Timer::after(Duration::from_secs(STATS_SECS)).await;
@@ -191,28 +194,6 @@ async fn rx_task(espnow: &'static EspHalEspNow) {
                 TX_FAILED.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => println!("[espnow] reply error: {}", e),
-        }
-    }
-}
-
-// Reconnects after link loss; the first association happened in `main`.
-#[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
-    loop {
-        let _ = controller.wait_for_disconnect_async().await;
-        println!("Wi-Fi disconnected - reconnecting...");
-        loop {
-            Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
-            match controller.connect_async().await {
-                Ok(_) => {
-                    println!("Wi-Fi link up again");
-                    break;
-                }
-                Err(e) => {
-                    println!("connect failed: {:?}", e);
-                    Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
-                }
-            }
         }
     }
 }

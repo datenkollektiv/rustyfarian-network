@@ -17,6 +17,7 @@
 /// assert_eq!(backoff.next(), Some(200));
 /// assert_eq!(backoff.next(), Some(400));
 /// ```
+#[derive(Debug)]
 pub struct ExponentialBackoff {
     base_ms: u64,
     max_ms: u64,
@@ -28,7 +29,7 @@ impl ExponentialBackoff {
     ///
     /// - `base_ms`: The delay for the first attempt (in milliseconds).
     /// - `max_ms`: The maximum delay to return (in milliseconds).
-    pub fn new(base_ms: u64, max_ms: u64) -> Self {
+    pub const fn new(base_ms: u64, max_ms: u64) -> Self {
         Self {
             base_ms,
             max_ms,

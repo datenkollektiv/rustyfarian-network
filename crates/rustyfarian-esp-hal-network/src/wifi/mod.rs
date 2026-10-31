@@ -15,7 +15,9 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiManager, WiFiConfig, WiFiConfigExt};
+//! use rustyfarian_esp_hal_network::wifi::{
+//!     link_task, AsyncWifiHandle, WiFiManager, WiFiConfig, WiFiConfigExt, WifiLink,
+//! };
 //!
 //! let peripherals = esp_hal::init(esp_hal::Config::default());
 //! esp_alloc::heap_allocator!(size: 72 * 1024);
@@ -23,7 +25,9 @@
 //! let config = WiFiConfig::new("MyNetwork", "password123")
 //!     .with_peripherals(peripherals.TIMG0, peripherals.FROM_CPU_INTR0, peripherals.WIFI);
 //! let AsyncWifiHandle { controller, stack, runner } = WiFiManager::init_async(config)?;
-//! // spawn `runner.run().await` and a task that owns `controller`
+//! static LINK: WifiLink = WifiLink::new();
+//! spawner.spawn(link_task(&LINK, controller).unwrap());
+//! // spawn `runner.run().await` in a second task; LINK reconnects forever
 //! ```
 //!
 //! A firmware that already called `esp_rtos::start` itself (for example because it
@@ -34,8 +38,9 @@
 
 pub use juggler::wifi::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
-    TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
-    POLL_INTERVAL_MS, SSID_MAX_LEN,
+    LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver,
+    WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
+    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
 
 /// `embassy-net` `StackResources<N>` size for the SoftAP scaffold.
@@ -295,8 +300,8 @@ mod driver {
     /// Handle returned by [`WiFiManager::init_async`] carrying the components
     /// needed to drive Wi-Fi from async tasks.
     ///
-    /// The caller spawns two tasks: one that owns the [`WifiController`] and
-    /// runs reconnection logic, and one that owns the [`embassy_net::Runner`]
+    /// The caller spawns two tasks: one that hands the [`WifiController`] to
+    /// [`link_task`], and one that owns the [`embassy_net::Runner`]
     /// and calls `runner.run().await`.  The [`embassy_net::Stack`] is `Copy`
     /// and can be shared with any number of socket tasks.
     pub struct AsyncWifiHandle {
@@ -328,11 +333,9 @@ mod driver {
         ///
         /// This function returns as soon as the controller has been configured
         /// and the `embassy-net` stack has been built.  No connection attempt
-        /// has been made yet.  The caller is responsible for both the initial
-        /// association and all subsequent reconnects: spawn a `wifi_task` that
-        /// calls `controller.connect_async()` in a loop, then
-        /// `controller.wait_for_disconnect_async()` to block until the link
-        /// drops.  Callers that need to know when DHCP has completed must
+        /// has been made yet.  Spawn [`link_task`] with the controller (or call
+        /// [`WifiLink::run`] from your own task): it performs the initial
+        /// association and every reconnect with the shared back-off.  Callers that need to know when DHCP has completed must
         /// `await` [`AsyncWifiHandle::wait_for_ip`] (or poll
         /// `Stack::wait_config_up` directly).
         ///
@@ -458,7 +461,7 @@ mod driver {
             // 3. Apply station credentials.  `WifiController::new` already applied
             //    an empty StationConfig (which starts the radio driver via
             //    esp_wifi_start).  This call updates the SSID/password so
-            //    wifi_task's first connect_async uses the real credentials.
+            //    the first `connect_async` in `WifiLink::run` uses the real credentials.
             //    `Ssid`/`Password` reject oversized values instead of truncating;
             //    `validate_ssid`/`validate_password` above already enforce the
             //    same limits, so a failure here is a driver-level surprise.
@@ -883,6 +886,18 @@ pub use driver::{
     ApConfigExt, AsyncWifiHandle, HalApConfig, HalWifiConfig, SoftApHandle, WiFiConfigExt,
     WiFiManager, WifiError, AP_IP,
 };
+
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+))]
+mod link;
+
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+))]
+pub use link::{link_task, WifiLink};
 
 /// Returns the MAC address the SoftAP broadcasts.
 ///
