@@ -1,12 +1,13 @@
 //! Bare-metal SoftAP captive-portal provisioning example for ESP32-C6.
 //!
-//! Functionally identical to `hal_c3_provision_mqtt` with two C6-specific
-//! differences:
+//! Functionally identical to `hal_c3_provision_mqtt` with one C6-specific
+//! difference:
 //!
 //! - **Two-region heap**: ESP32-C6 requires a 64 KiB region in reclaimed IRAM
 //!   (for Wi-Fi DMA buffers) plus a 36 KiB DRAM region.
-//! - **esp-println transport**: the C6 variant uses `jtag-serial` (enabled via
-//!   the `esp32c6` chip feature in `Cargo.toml`) instead of UART.
+//!
+//! Console output uses `esp-println/auto` like every example of this crate
+//! (USB-Serial-JTAG when a USB host is attached, UART0 otherwise).
 //!
 //! See `hal_c3_provision_mqtt.rs` for the full host-contract description.
 //!

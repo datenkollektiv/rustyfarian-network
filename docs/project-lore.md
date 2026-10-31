@@ -564,7 +564,8 @@ See `crates/rustyfarian-esp-hal-network/src/espnow/` and ADR 020.
 **ESP32-C3 log output over USB needs `esp-println/auto`, not `uart`.**
 Super Mini boards have no UART bridge, only the USB-Serial-JTAG port; the `uart` printer writes to UART0 pins and the USB monitor stays empty.
 `auto` checks the USB SOF flag at runtime and falls back to UART0.
-`auto` excludes `uart` and `jtag-serial` (duplicate `PrinterImpl` alias), so the C3 chip feature enables only `auto`.
+`auto` excludes `uart` and `jtag-serial`, and zero consoles is rejected too (`assert_unique_used_features!` panics with `Currently enabled: none`); the knob's own `auto` collided with the `esp32s3` feature's `uart`, so since 2026-10-31 `rustyfarian-esp-hal-network` depends on neither `esp-println` nor `esp-backtrace` (ADR 021): the firmware selects the console and the panic handler, the examples take both crates from per-target-triple dev-dependencies (only a target triple can carry the chip), and lib-only checks never compile them.
+A day-long interim that kept both crates as optional deps of `wifi` and `lora` and passed the console on the command line (`--features ...,esp-println/auto` in `just check-hal` / `clippy-hal` and the docs.rs metadata, plus a `cfg(target_os = "none")` dev-dependency for the examples) was reverted the same day, because it still forced `esp-backtrace`'s panic handler into every `wifi` firmware.
 
 ---
 

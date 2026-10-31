@@ -12,6 +12,15 @@ ignore = [
     # separate transitive dep on heapless 0.7, which is why both versions coexist.
     # Resolves when lorawan-device upgrades to heapless 0.8 (not yet in 0.12).
     "RUSTSEC-2023-0089",
+    # paste (RUSTSEC-2024-0436) and unsafe-libyaml (RUSTSEC-2024-0449) are unmaintained;
+    # both reach the graph only through the per-target-triple dev-dependency on
+    # esp-backtrace 0.20.0 that the hal examples use (ADR 021).  Exact chains:
+    #   rustyfarian-esp-hal-network (dev) → esp-backtrace 0.20.0 → riscv 0.15.0 → paste 1.0.15
+    #   rustyfarian-esp-hal-network (dev) → esp-backtrace 0.20.0 → esp-config 0.8.0 → serde_yaml 0.9.34 → unsafe-libyaml 0.2.11
+    # Dev-only: the published library does not depend on esp-backtrace.  No safe
+    # upgrade exists until esp-backtrace moves off riscv 0.15 / esp-config 0.8.
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]

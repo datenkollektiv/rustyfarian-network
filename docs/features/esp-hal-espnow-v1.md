@@ -117,6 +117,7 @@ The 5 dBm default is not trusted for room-scale props: the consumer's idf firmwa
 - `recv_async` and `try_recv` share one receiver; while a `recv_async` is pending `try_recv` returns `None`, and a second `recv_async` returns `Busy` (the RX waker holds a single waker).
 - `HalWifiConfig::with_ampdu(bool)` was added so the associated brain, whose controller `WiFiManager::init_async` builds, can match the IDF sdkconfig (A-MPDU off).
 - `esp32c3` now enables `esp-println/auto` instead of `uart`: Super Mini boards print over USB-Serial-JTAG, so `uart` alone showed no log output; `auto` falls back to UART0 when no USB host is seen.
+  Superseded 2026-10-31: no chip feature selects a console any more, the firmware (and the examples' dev-dependency) does.
 - `just clippy-pure` (new) lints `juggler` with `mock,std,provisioning,ota-wire,espnow`; `crates/juggler/src/espnow/scan.rs` was clean, no change needed.
 
 </details>

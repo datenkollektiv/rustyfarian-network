@@ -24,6 +24,7 @@ Domain features are feature-gated per crate:
 - `rustyfarian-esp-idf-network` is the consolidated ESP-IDF crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`.
 - `rustyfarian-esp-hal-network` is the consolidated bare-metal crate with feature-gated domains `wifi`, `mqtt`, `lora`, `espnow`, `ota`, and `provisioning`.
 - `rustyfarian-esp-hal-network` also carries chip features: `esp32`, `esp32c3`, `esp32c6`, `esp32s3`.
+  The crate depends on neither `esp-println` nor `esp-backtrace`; the firmware adds both and picks exactly one console (`auto`, `jtag-serial`, `uart`, `no-op`) and the panic handler (ADR 021).
 
 ### Bare-metal ESP-NOW module map (`espnow` feature, ADR 020)
 
