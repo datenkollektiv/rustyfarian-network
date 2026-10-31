@@ -443,6 +443,17 @@ erase-flash:
 monitor:
     scripts/espflash.sh monitor --non-interactive
 
+# show the USB serial port espflash would pick and identify the attached chip
+[group('examples')]
+ports:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    port="$(scripts/detect-port.sh)"
+    if [ -n "$port" ]; then
+        printf 'Port: %s\n' "$port"
+        scripts/espflash.sh board-info
+    fi
+
 # watch every topic under the bare-metal MQTT examples' prefix (MQTT_* from the dotenv file)
 [group('examples')]
 mqtt-watch:

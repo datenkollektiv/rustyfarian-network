@@ -108,6 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- esp-hal provisioning reported a station leaving the SoftAP as `ClientConnected { mac: None }` and never fired `ClientDisconnected`: the esp-radio wait method resolves on both directions since the `1.0.0-beta.1` pin and `wifi_task` ignored the variant (bug 008).
+  Both events now carry the station MAC, the log line names the direction, and the mapping is a pure `station_event` function with host tests.
 - esp-hal provisioning logged the open-AP warning twice per bring-up (once from `ProvisioningBuilder::start`, once from `WiFiManager::init_softap_async`); it is now logged once, from the Wi-Fi layer, and the host test for it moved with the helper.
 - esp-hal provisioning docs: the stack guidance in `hal_c3_provision_mqtt`, `hal_c6_provision_mqtt` and the portal module named knobs the tier does not have (`_stack_size`, `CONFIG_ESP_MAIN_TASK_STACK_SIZE`); they now explain that the main stack is the RAM left after `.data`, `.bss` and the heap and point to `ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM` as the link-time floor.
   The `0x300000` store offset in the examples and README is now labelled as lying inside the `factory` partition of espflash's default table, with the instruction to add a dedicated `data` partition; stale `esp-rtos 0.3.0` / `esp-radio 0.18` mentions in the examples are refreshed.
