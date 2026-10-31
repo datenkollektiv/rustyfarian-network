@@ -18,22 +18,30 @@
 //! (analytic upper bound, not measured) for `ProvisioningStore::save`'s
 //! encode and read buffers plus the portal's parsed config, raising the peak
 //! to ~20.5 KiB.
-//! The `esp-rtos` 0.3.0 thread-mode embassy executor runs **all** async tasks
+//! The `esp-rtos` 0.4.0 thread-mode embassy executor runs **all** async tasks
 //! on a single shared stack — there is no per-task stack size knob exposed by
 //! `#[embassy_executor::task]` or `#[esp_rtos::main]`.
-//! Size the main-thread stack via the linker script stack symbol
-//! (`_stack_size`) or via `CONFIG_ESP_MAIN_TASK_STACK_SIZE` when using an
-//! IDF-paired build system.
+//! esp-hal has no stack-size setting either: the main stack is the RAM left
+//! after `.data`, `.bss` and the heap, so grow it by trimming the heap
+//! (`heap_allocator!`) and static buffers.
+//! Enforce the floor at link time with
+//! `ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM = "24576"` in the `[env]` table
+//! of `.cargo/config.toml`; the link fails when less than 24 KiB remains.
+//! `CONFIG_ESP_MAIN_TASK_STACK_SIZE` is an ESP-IDF setting and has no effect
+//! on this tier.
 //! A runtime `log::warn!` below confirms this requirement at startup.
 //!
 //! # Flash-partition offset
 //!
-//! `FLASH_PARTITION_OFFSET` is set to `0x300000` (3 MiB).
-//! You **must** align this to a 4 KiB boundary in your partition table.
-//! The store occupies two adjacent 4 KiB sectors (8 KiB total).
-//! A safe default for an ESP32-C6 with 4 MiB flash and the standard IDF
-//! single-app partition layout is anywhere in the `storage` region —
-//! check your `partitions.csv` before flashing.
+//! `FLASH_PARTITION_OFFSET` is set to `0x300000` (3 MiB) as a placeholder,
+//! and `just flash` installs no partition table of its own.
+//! In espflash's default 4 MiB table the `factory` app partition spans
+//! `0x10000`–`0x400000`, so this offset lies inside the running firmware's
+//! partition; nothing keeps the app image and the store apart.
+//! Before copying this example, add a dedicated `data` partition for the
+//! store to your `partitions.csv` (ADR 015: 4 KiB aligned, two sectors =
+//! 8 KiB), flash it with `espflash --partition-table`, and point the offset
+//! there.
 //!
 //! # Build and flash
 //!
@@ -110,10 +118,10 @@ const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Flash offset for the provisioning store (two 4 KiB sectors = 8 KiB total).
 ///
-/// Set to `0x300000` (3 MiB) as a documented placeholder.
-/// INTEGRATOR: align this to a 4 KiB boundary in your `partitions.csv`.
-/// Ensure that `FLASH_PARTITION_OFFSET + 8192` does not cross a partition
-/// boundary and that no other firmware region overlaps this area.
+/// Set to `0x300000` (3 MiB) as a documented placeholder; in espflash's
+/// default 4 MiB table this falls inside the `factory` app partition.
+/// INTEGRATOR: give the store its own 4 KiB-aligned `data` partition in
+/// `partitions.csv` and point this constant at it (see the module docs).
 const FLASH_PARTITION_OFFSET: u32 = 0x0030_0000;
 
 /// Total size passed to `ProvisioningStore::open`.
@@ -134,7 +142,7 @@ fn on_event(event: ProvisioningEvent) {
                 m[4],
                 m[5]
             ),
-            None => log::info!("Portal: phone joined AP (mac not yet exposed by esp-radio 0.18)"),
+            None => log::info!("Portal: phone joined AP (mac unavailable)"),
         },
         ProvisioningEvent::ClientDisconnected { mac } => match mac {
             Some(m) => log::info!(
@@ -146,7 +154,7 @@ fn on_event(event: ProvisioningEvent) {
                 m[4],
                 m[5]
             ),
-            None => log::info!("Portal: phone left AP (mac not yet exposed by esp-radio 0.18)"),
+            None => log::info!("Portal: phone left AP (mac unavailable)"),
         },
         ProvisioningEvent::SubmissionAccepted => {
             log::info!("Portal: submission accepted");
@@ -179,18 +187,19 @@ async fn main(spawner: Spawner) {
 
     // INTEGRATOR: the HTTP portal task (http_task) peaks at ~20.5 KiB during a
     // POST /save request (steady-state 8.3 KiB + ~12.5 KiB transient for
-    // ProvisioningStore::save and the parsed config).  esp-rtos 0.3.0 thread-mode embassy shares a single stack for
-    // all async tasks; there is no per-task stack size knob.  Size the
-    // main-thread stack to at least 24 KiB via the linker script (_stack_size
-    // symbol) or CONFIG_ESP_MAIN_TASK_STACK_SIZE (IDF-paired build).
+    // ProvisioningStore::save and the parsed config).  esp-rtos 0.4.0 thread-mode
+    // embassy shares a single stack for all async tasks; there is no per-task
+    // stack size knob.  The main stack is the RAM left after .data, .bss and the
+    // heap: keep at least 24 KiB free and enforce it at link time with
+    // ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM=24576 (see the module docs).
     log::warn!(
         "HTTP portal requires >=24 KiB main-thread stack (POST /save peak <=~20.5 KiB, analytic bound). \
-         Size via linker _stack_size or CONFIG_ESP_MAIN_TASK_STACK_SIZE."
+         Enforce with ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM=24576."
     );
 
     // Open the flash store — `esp_storage::FlashStorage` implements `NorFlash`
     // with a 4 KiB erase size.  The `FLASH` peripheral token is required by
-    // esp-storage 0.9.0 for singleton ownership; it is not used at runtime.
+    // esp-storage since 0.9.0 for singleton ownership; it is not used at runtime.
     let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     let mut store = ProvisioningStore::open(flash, FLASH_PARTITION_OFFSET, FLASH_PARTITION_SIZE)
         .expect("provisioning store open");
@@ -254,7 +263,7 @@ async fn main(spawner: Spawner) {
     // flash type behind a trait object and takes ownership.
 
     // Obtain a hardware RNG for the per-session CSRF nonce.
-    // In esp-hal 1.1.0, `Rng::new()` takes no peripheral argument.
+    // Since esp-hal 1.1.0, `Rng::new()` takes no peripheral argument.
     let rng = esp_hal::rng::Rng::new();
 
     // Non-secret defaults seed the portal form on a fresh / factory-reset

@@ -618,12 +618,7 @@ mod driver {
         pub fn init_softap_async(config: HalApConfig<'_>) -> Result<SoftApHandle, WifiError> {
             validate_ap_config(&config.ap).map_err(|_| WifiError::ConfigureFailed)?;
 
-            if config.ap.password.is_none() {
-                log::warn!(
-                    "SoftAP is open (no WPA2 password) — anyone in radio range can reach \
-                     the portal endpoints; set a password for any deployment outside a lab"
-                );
-            }
+            super::warn_if_open_ap(config.ap.password);
 
             // 1. Start the scheduler.
             let timg = TimerGroup::new(config.timg0);
@@ -761,6 +756,30 @@ pub fn softap_mac() -> [u8; 6] {
     let mut out = [0u8; 6];
     out.copy_from_slice(mac.as_bytes());
     out
+}
+
+/// Emit a `warn!` log when a SoftAP is brought up with no WPA2 password.
+///
+/// Called once from [`WiFiManager::init_softap_async`], which every SoftAP
+/// bring-up — including `ProvisioningBuilder::start` — goes through, so the
+/// warning is logged exactly once per bring-up and the integrator cannot
+/// silence it by mistake (provisioning security-checklist item 8).
+/// Extracted as a pure function so the host test `open_ap_emits_warning`
+/// can capture the log without the embassy + chip feature flags.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    )
+))]
+pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
+    if ap_password.is_none() {
+        log::warn!(
+            "SoftAP is open (no WPA2 password) — anyone in radio range can reach \
+             the portal endpoints; set a password for any deployment outside a lab"
+        );
+    }
 }
 
 // ─── Stub fallback (no chip feature — host / doc / test builds) ─────────────

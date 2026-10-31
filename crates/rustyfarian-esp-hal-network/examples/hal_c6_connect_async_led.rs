@@ -84,7 +84,7 @@ async fn main(spawner: Spawner) {
         .with_idle_output_level(Level::Low)
         .with_idle_output(true)
         .with_carrier_modulation(false);
-    // esp-hal 1.1.0 split RMT TX setup: `configure_tx(pin, config)` is gone —
+    // Since esp-hal 1.1.0 the RMT TX setup is split: `configure_tx(pin, config)` is gone —
     // the new pattern is `configure_tx(&config).unwrap().with_pin(pin)`.
     let channel = rmt
         .channel0

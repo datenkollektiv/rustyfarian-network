@@ -55,11 +55,11 @@
 //! stack to leave headroom for ISR frames and stack canary.
 //!
 //! In bare-metal embassy (`esp-rtos` thread-mode executor) all async tasks
-//! share the main thread's stack, which is sized at link time via
-//! `CONFIG_ESP_MAIN_TASK_STACK_SIZE` (IDF-paired build) or the linker
-//! script stack symbol.
-//! Ensure the main-thread stack is at least **24 KiB** before spawning the
-//! HTTP task.
+//! share the main thread's stack, which esp-hal sizes at link time as the
+//! RAM left after `.data`, `.bss` and the heap; there is no size setting.
+//! Keep at least **24 KiB** free before spawning the HTTP task and enforce
+//! it with `ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM = "24576"` (a link-time
+//! assertion); `CONFIG_ESP_MAIN_TASK_STACK_SIZE` is ESP-IDF only.
 
 // When building without the embassy + chip features the async `run_portal_dyn`
 // function and its TcpSocket usage are compiled away.  Allow dead-code on the
