@@ -80,6 +80,7 @@ extern crate alloc;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use rustyfarian_esp_hal_network::provisioning::{
     DeviceName, PortalConfig, PortalDefaults, ProvisioningBuilder, ProvisioningEvent,
@@ -187,6 +188,13 @@ async fn main(spawner: Spawner) {
 
     println!("hal_c3_provision_mqtt starting");
 
+    // The firmware owns the scheduler (ADR 021): start it once, here, before
+    // deciding between the captive portal and the normal station boot.  Both
+    // branches below may then `.await`, and the portal is started with
+    // `start_scheduler_running`, which takes only the `WIFI` peripheral.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
     // INTEGRATOR: the HTTP portal task (http_task) peaks at ~20.5 KiB during a
     // POST /save request (steady-state 8.3 KiB + ~12.5 KiB transient for
     // ProvisioningStore::save and the parsed config).  esp-rtos 0.4.0 thread-mode
@@ -238,31 +246,27 @@ async fn main(spawner: Spawner) {
                 log::warn!("Store load error: {:?}; re-provisioning", e);
             }
         }
-        // A real application reboots into its normal STA + MQTT boot here.
-        // That normal path brings up Wi-Fi via `WiFiManager::init_async`, which
-        // calls `esp_rtos::start` and installs the scheduler's time driver.
-        // This provisioned branch performs no Wi-Fi bring-up, so the scheduler
-        // is never started — and the esp-rtos async executor panics the moment
-        // any task `.await`s and it tries to park on the absent time driver
-        // (`Timer::after` and even `core::future::pending().await` both trip it).
-        // We therefore halt with a non-async spin loop rather than awaiting.
-        println!(
-            "Already provisioned — halting (real app would reboot into normal STA + MQTT mode)"
-        );
+        // A real application brings Wi-Fi up here with
+        // `WiFiConfig::new(..).with_wifi_scheduler_running(peripherals.WIFI)` and
+        // continues into its STA + MQTT boot.  Because `main` already started
+        // the scheduler, this branch can idle on an embassy timer; before the
+        // scheduler moved into `main`, it had to spin without awaiting.
+        println!("Already provisioned — idling (real app would continue into STA + MQTT mode)");
         loop {
-            core::hint::spin_loop();
+            Timer::after(Duration::from_secs(60)).await;
         }
     }
 
     // Not yet provisioned — start the SoftAP captive portal.
-    // `start` owns the AP bring-up: it derives the SSID from the AP MAC, brings
-    // up the AP (open unless `PROVISION_AP_PSK` is set; the nonce in the form
-    // is the access control mechanism) and spawns the portal tasks.
+    // `start_scheduler_running` owns the AP bring-up: it derives the SSID from
+    // the AP MAC, brings up the AP (open unless `PROVISION_AP_PSK` is set; the
+    // nonce in the form is the access control mechanism) and spawns the portal
+    // tasks.  It starts no scheduler: `main` did that above.
 
     // The `store` declared above is still owned here (we only enter this branch
     // when `is_provisioned()` returned false, so no move occurred).
-    // Pass it directly to `ProvisioningBuilder::start`; the builder erases the
-    // flash type behind a trait object and takes ownership.
+    // Pass it directly to `ProvisioningBuilder::start_scheduler_running`; the
+    // builder erases the flash type behind a trait object and takes ownership.
 
     // Obtain a hardware RNG for the per-session CSRF nonce.
     // Since esp-hal 1.1.0, `Rng::new()` takes no peripheral argument.
@@ -296,14 +300,7 @@ async fn main(spawner: Spawner) {
 
     let session = ProvisioningBuilder::new(portal_config)
         .on_event(on_event)
-        .start(
-            spawner,
-            peripherals.TIMG0,
-            peripherals.FROM_CPU_INTR0,
-            peripherals.WIFI,
-            store,
-            rng,
-        )
+        .start_scheduler_running(spawner, peripherals.WIFI, store, rng)
         .expect("provisioning start");
 
     let mac = session.ap_mac();

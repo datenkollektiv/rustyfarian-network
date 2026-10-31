@@ -25,6 +25,12 @@
 //! let AsyncWifiHandle { controller, stack, runner } = WiFiManager::init_async(config)?;
 //! // spawn `runner.run().await` and a task that owns `controller`
 //! ```
+//!
+//! A firmware that already called `esp_rtos::start` itself (for example because it
+//! must boot without Wi-Fi when no credentials are configured) passes only the
+//! `WIFI` peripheral via
+//! [`with_wifi_scheduler_running`][WiFiConfigExt::with_wifi_scheduler_running]; see
+//! [`WiFiManager::init_async`] "Scheduler".
 
 pub use juggler::wifi::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
@@ -137,22 +143,68 @@ mod driver {
     };
     use static_cell::StaticCell;
 
+    /// Who starts the `esp-rtos` scheduler that `esp-radio` requires.
+    ///
+    /// The scheduler is the firmware's (ADR 021): the library starts it only when the
+    /// caller hands over the timer peripherals, and always before it validates the
+    /// configuration, so a configuration error never leaves the system without one.
+    pub(crate) enum Scheduler {
+        /// `init_*` calls `esp_rtos::start` from these peripherals.
+        Start {
+            timg0: esp_hal::peripherals::TIMG0<'static>,
+            from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
+        },
+        /// The firmware already called `esp_rtos::start` (once per boot).
+        Running,
+    }
+
+    impl Scheduler {
+        /// Starts the scheduler if this is the `Start` variant; a no-op for `Running`.
+        pub(crate) fn ensure_started(self) {
+            if let Self::Start {
+                timg0,
+                from_cpu_intr0,
+            } = self
+            {
+                let timg = TimerGroup::new(timg0);
+                esp_rtos::start(timg.timer0, from_cpu_intr0);
+            }
+        }
+    }
+
     /// Wi-Fi configuration bundled with the hardware peripherals needed for init.
     ///
-    /// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfigExt::with_peripherals],
-    /// then passed to [`WiFiManager::init_async`].
+    /// Built from a [`WiFiConfig`] via [`with_peripherals`][WiFiConfigExt::with_peripherals]
+    /// (the library starts the scheduler) or
+    /// [`with_wifi_scheduler_running`][WiFiConfigExt::with_wifi_scheduler_running]
+    /// (the firmware already did), then passed to [`WiFiManager::init_async`].
     pub struct HalWifiConfig<'a> {
         ssid: &'a str,
         password: &'a str,
         power_save: WifiPowerSave,
         tx_power: TxPowerLevel,
         ampdu: bool,
-        timg0: esp_hal::peripherals::TIMG0<'static>,
-        from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
+        scheduler: Scheduler,
         wifi: esp_hal::peripherals::WIFI<'static>,
     }
 
-    impl HalWifiConfig<'_> {
+    impl<'a> HalWifiConfig<'a> {
+        fn from_parts(
+            config: WiFiConfig<'a>,
+            scheduler: Scheduler,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> Self {
+            HalWifiConfig {
+                ssid: config.ssid,
+                password: config.password,
+                power_save: config.power_save,
+                tx_power: config.tx_power,
+                ampdu: true,
+                scheduler,
+                wifi,
+            }
+        }
+
         /// Enables or disables 802.11n A-MPDU aggregation (RX and TX); enabled by default.
         ///
         /// Disable it when ESP-NOW runs next to the associated station: Block-Ack
@@ -171,11 +223,20 @@ mod driver {
     /// [`WiFiManager::init_async`].
     pub trait WiFiConfigExt<'a> {
         /// Bundles this configuration with the ESP32 peripherals required for
-        /// bare-metal Wi-Fi.
+        /// bare-metal Wi-Fi; [`WiFiManager::init_async`] starts the `esp-rtos`
+        /// scheduler from `timg0` and `from_cpu_intr0`.
         fn with_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
             from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalWifiConfig<'a>;
+
+        /// Bundles this configuration with the `WIFI` peripheral only; the firmware
+        /// has already called `esp_rtos::start` and [`WiFiManager::init_async`]
+        /// will not start the scheduler.
+        fn with_wifi_scheduler_running(
+            self,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalWifiConfig<'a>;
     }
@@ -187,16 +248,21 @@ mod driver {
             from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalWifiConfig<'a> {
-            HalWifiConfig {
-                ssid: self.ssid,
-                password: self.password,
-                power_save: self.power_save,
-                tx_power: self.tx_power,
-                ampdu: true,
-                timg0,
-                from_cpu_intr0,
+            HalWifiConfig::from_parts(
+                self,
+                Scheduler::Start {
+                    timg0,
+                    from_cpu_intr0,
+                },
                 wifi,
-            }
+            )
+        }
+
+        fn with_wifi_scheduler_running(
+            self,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalWifiConfig<'a> {
+            HalWifiConfig::from_parts(self, Scheduler::Running, wifi)
         }
     }
 
@@ -252,7 +318,8 @@ mod driver {
     pub struct WiFiManager;
 
     impl WiFiManager {
-        /// Initialises the scheduler and the Wi-Fi radio, applies the station
+        /// Initialises the Wi-Fi radio (and the `esp-rtos` scheduler when built via
+        /// [`with_peripherals`][WiFiConfigExt::with_peripherals]), applies the station
         /// credentials immediately after controller construction (which is what
         /// starts the radio), and builds the `embassy-net` stack — but does
         /// **not** initiate association.
@@ -339,18 +406,45 @@ mod driver {
         /// Note that an explicit [`TxPowerLevel::Medium`] is indistinguishable
         /// from the unset default and is therefore *not* applied.
         ///
+        /// # Scheduler
+        ///
+        /// `esp-radio` needs the `esp-rtos` scheduler, and the scheduler belongs
+        /// to the firmware (ADR 021).  Two ways to build the config:
+        ///
+        /// * [`with_peripherals`][WiFiConfigExt::with_peripherals] hands over
+        ///   `TIMG0` and `FROM_CPU_INTR0`, and this function calls
+        ///   `esp_rtos::start` — **before** validating the credentials, so a
+        ///   [`WifiError::ConfigureFailed`] never leaves the system without a
+        ///   scheduler (every `embassy_time` await would hang).
+        /// * [`with_wifi_scheduler_running`][WiFiConfigExt::with_wifi_scheduler_running]
+        ///   passes only `WIFI`; the firmware called `esp_rtos::start` itself,
+        ///   for example because it must also boot without Wi-Fi.  Nothing is
+        ///   started here.
+        ///
+        /// `esp_rtos::start` runs once per boot in either case; starting it twice
+        /// is a panic in `esp-rtos`.
+        ///
+        /// The `WIFI` peripheral (and, with `with_peripherals`, `TIMG0` and
+        /// `FROM_CPU_INTR0`) is consumed even when validation fails, so a
+        /// firmware that needs a fallback (SoftAP, ESP-NOW) on a rejected config
+        /// validates with [`validate_ssid`][juggler::wifi::validate_ssid] and
+        /// [`validate_password`][juggler::wifi::validate_password] before building
+        /// the config.
+        ///
         /// # One-shot
         ///
         /// Call at most once per boot — a `static` `StackResources` is
         /// initialised via [`StaticCell`] and the station [`Interface`] is a
         /// singleton; a second call will panic.
         pub fn init_async(config: HalWifiConfig<'_>) -> Result<AsyncWifiHandle, WifiError> {
+            // 1. Start the scheduler if the caller handed over the timer peripherals
+            //    (esp-radio requires a running scheduler).  This precedes validation
+            //    on purpose: a rejected config must not strand the firmware without
+            //    a scheduler after it has given up TIMG0 and FROM_CPU_INTR0.
+            config.scheduler.ensure_started();
+
             validate_ssid(config.ssid).map_err(|_| WifiError::ConfigureFailed)?;
             validate_password(config.password).map_err(|_| WifiError::ConfigureFailed)?;
-
-            // 1. Start the scheduler (esp-radio requires a running scheduler).
-            let timg = TimerGroup::new(config.timg0);
-            esp_rtos::start(timg.timer0, config.from_cpu_intr0);
 
             // 2. Construct the Wi-Fi controller with a default ControllerConfig
             //    (empty station config).  Credentials are applied via an explicit
@@ -498,28 +592,54 @@ mod driver {
     /// SoftAP configuration bundled with the hardware peripherals needed for init.
     ///
     /// Built from an [`ApConfig`] via
-    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals], then passed to
-    /// [`WiFiManager::init_softap_async`].
+    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals] (the library starts
+    /// the scheduler) or
+    /// [`with_ap_wifi_scheduler_running`][ApConfigExt::with_ap_wifi_scheduler_running]
+    /// (the firmware already did), then passed to [`WiFiManager::init_softap_async`].
     pub struct HalApConfig<'a> {
         ap: ApConfig<'a>,
-        timg0: esp_hal::peripherals::TIMG0<'static>,
-        from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
+        scheduler: Scheduler,
         wifi: esp_hal::peripherals::WIFI<'static>,
     }
 
     /// Extension trait that adds
-    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals] to [`ApConfig`],
-    /// producing a [`HalApConfig`] ready for
+    /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals] and
+    /// [`with_ap_wifi_scheduler_running`][ApConfigExt::with_ap_wifi_scheduler_running]
+    /// to [`ApConfig`], producing a [`HalApConfig`] ready for
     /// [`WiFiManager::init_softap_async`].
     pub trait ApConfigExt<'a> {
         /// Bundles this AP configuration with the ESP32 peripherals required for
-        /// bare-metal Wi-Fi.
+        /// bare-metal Wi-Fi; [`WiFiManager::init_softap_async`] starts the
+        /// `esp-rtos` scheduler from `timg0` and `from_cpu_intr0`.
         fn with_ap_peripherals(
             self,
             timg0: esp_hal::peripherals::TIMG0<'static>,
             from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalApConfig<'a>;
+
+        /// Bundles this AP configuration with the `WIFI` peripheral only; the
+        /// firmware has already called `esp_rtos::start`.
+        fn with_ap_wifi_scheduler_running(
+            self,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalApConfig<'a>;
+    }
+
+    impl<'a> HalApConfig<'a> {
+        /// Crate-internal constructor shared with `ProvisioningBuilder`, which
+        /// threads the caller's scheduler choice through to `init_softap_async`.
+        pub(crate) fn from_ap(
+            ap: ApConfig<'a>,
+            scheduler: Scheduler,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> Self {
+            HalApConfig {
+                ap,
+                scheduler,
+                wifi,
+            }
+        }
     }
 
     impl<'a> ApConfigExt<'a> for ApConfig<'a> {
@@ -529,12 +649,21 @@ mod driver {
             from_cpu_intr0: esp_hal::peripherals::FROM_CPU_INTR0<'static>,
             wifi: esp_hal::peripherals::WIFI<'static>,
         ) -> HalApConfig<'a> {
-            HalApConfig {
-                ap: self,
-                timg0,
-                from_cpu_intr0,
+            HalApConfig::from_ap(
+                self,
+                Scheduler::Start {
+                    timg0,
+                    from_cpu_intr0,
+                },
                 wifi,
-            }
+            )
+        }
+
+        fn with_ap_wifi_scheduler_running(
+            self,
+            wifi: esp_hal::peripherals::WIFI<'static>,
+        ) -> HalApConfig<'a> {
+            HalApConfig::from_ap(self, Scheduler::Running, wifi)
         }
     }
 
@@ -570,7 +699,8 @@ mod driver {
         StaticCell::new();
 
     impl WiFiManager {
-        /// Initialises the scheduler and the Wi-Fi radio in SoftAP mode, applies
+        /// Initialises the Wi-Fi radio in SoftAP mode (and the `esp-rtos` scheduler when
+        /// built via [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals]), applies
         /// the AP configuration, sets TX power, and builds the `embassy-net`
         /// stack with a static IPv4 address (`192.168.4.1/24`).
         ///
@@ -612,17 +742,24 @@ mod driver {
         /// initialised via [`StaticCell`] and the access-point [`Interface`]
         /// is a singleton; a second call will panic.
         /// STA and AP in one firmware are not supported through these two
-        /// entry points: each consumes `TIMG0`, `FROM_CPU_INTR0` and `WIFI`,
-        /// and a second `set_config` would switch the radio out of the first
-        /// mode.  Pick one per boot.
+        /// entry points: each consumes `WIFI`, and a second `set_config` would
+        /// switch the radio out of the first mode.  Pick one per boot.
+        ///
+        /// # Scheduler
+        ///
+        /// As for [`init_async`][WiFiManager::init_async]:
+        /// [`with_ap_peripherals`][ApConfigExt::with_ap_peripherals] makes this
+        /// function call `esp_rtos::start` before validating the AP config;
+        /// [`with_ap_wifi_scheduler_running`][ApConfigExt::with_ap_wifi_scheduler_running]
+        /// leaves the scheduler to the firmware.
         pub fn init_softap_async(config: HalApConfig<'_>) -> Result<SoftApHandle, WifiError> {
+            // 1. Start the scheduler if the caller handed over the timer peripherals,
+            //    before validation (see `init_async`).
+            config.scheduler.ensure_started();
+
             validate_ap_config(&config.ap).map_err(|_| WifiError::ConfigureFailed)?;
 
             super::warn_if_open_ap(config.ap.password);
-
-            // 1. Start the scheduler.
-            let timg = TimerGroup::new(config.timg0);
-            esp_rtos::start(timg.timer0, config.from_cpu_intr0);
 
             // 2. Construct the Wi-Fi controller with default ControllerConfig.
             //    `WifiController::new` starts the radio driver; AP credentials
@@ -731,6 +868,13 @@ mod driver {
     }
 }
 
+// Only `ProvisioningBuilder` consumes the scheduler choice outside this module.
+#[cfg(all(
+    feature = "embassy",
+    feature = "provisioning",
+    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+))]
+pub(crate) use driver::Scheduler;
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")

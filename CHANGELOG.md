@@ -53,9 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An empty prefix after trimming yields the bare four hex digits with no leading dash, and the function is infallible, mirroring `derive_softap_ssid`.
   `DeviceName::resolve(&mac)` is the shared resolution used by both tiers.
   Requested by the spookhouse review-queue item `rustyfarian-network-per-device-name-prefill-v1` (bug 009); see `docs/features/per-device-name-prefill-v1.md`.
+- `rustyfarian-esp-hal-network`: `WiFiConfigExt::with_wifi_scheduler_running(wifi)` and `ApConfigExt::with_ap_wifi_scheduler_running(wifi)` build a `HalWifiConfig` or `HalApConfig` from the `WIFI` peripheral alone, for a firmware that already called `esp_rtos::start` in `main`, for example to boot without Wi-Fi when no credentials exist; `init_async` and `init_softap_async` then start nothing.
+  Use them instead of `with_peripherals` / `with_ap_peripherals`, which keep handing over `TIMG0` and `FROM_CPU_INTR0`.
+  The example `hal_esp32s3_mqtt_lwt` starts the scheduler in `main` and uses `with_wifi_scheduler_running`; validated on a CrowPanel ESP32-S3 on 2026-10-31 (record in `docs/runbooks/esp-hal-mqtt-hardware-test.md`).
+  `ProvisioningBuilder::start_scheduler_running(spawner, wifi, store, rng)` is the captive-portal counterpart of `start` and takes only `WIFI`, for a firmware that starts the scheduler in `main` and then decides between the portal and a station join.
+  The example `hal_c3_provision_mqtt` starts the scheduler in `main`, uses `start_scheduler_running`, and its already-provisioned branch now awaits an embassy timer instead of spinning.
+  Requested by `rustyfarian-knob` (U2e); see ADR 021 and `docs/features/esp-hal-wifi-init-with-running-scheduler-v1.md`.
 
 ### Changed
 
+- `rustyfarian-esp-hal-network`: `WiFiManager::init_async`, `WiFiManager::init_softap_async` and `ProvisioningBuilder::start` now start the `esp-rtos` scheduler before they validate the profile, SSID, password or AP configuration, so a `WifiError::ConfigureFailed` no longer leaves the firmware without a scheduler (every embassy timer await used to hang); callers of `with_peripherals` and `with_ap_peripherals` see no API change.
 - `EspIdfEspNow::scan_for_peer` now drives the shared `juggler::espnow::ScanMachine` (blocking `send` plus ACK wait per probe, `std::thread::sleep` for confirmation gaps) instead of its own channel loop, so both tiers run one algorithm.
   The public API, error messages (including the `anyhow` context on registration failures), TX-power boost and restore order and the failed-scan fallback to the last pinned channel are unchanged; log lines are unchanged, except that the burst-timeout line is now emitted after teardown.
   The `espnow` module re-exports `ScanError` and `SendOutcome`.

@@ -450,6 +450,14 @@ impl ProvisioningSession {
 /// [`PortalConfig`], and calls `WiFiManager::init_softap_async` with the
 /// peripherals passed to [`start`](Self::start).
 /// The caller no longer builds an `ApConfig` for provisioning.
+///
+/// **Scheduler:** [`start`](Self::start) takes `TIMG0` and `FROM_CPU_INTR0` and
+/// starts the `esp-rtos` scheduler before anything else, including its own
+/// validation; a firmware that already
+/// called `esp_rtos::start` in `main` (for example one that decides between the
+/// portal and a station join after booting) uses
+/// [`start_scheduler_running`](Self::start_scheduler_running), which takes only
+/// `WIFI`.  `esp_rtos::start` runs once per boot either way (ADR 021).
 // `config` is only read inside the embassy+chip-gated `start` method.
 #[cfg_attr(
     not(all(
@@ -502,6 +510,16 @@ impl<'a> ProvisioningBuilder<'a> {
     /// short, if SoftAP bring-up fails ([`ProvisioningError::SoftApInit`]), or if
     /// `start` was already called this boot.
     ///
+    /// # Scheduler
+    ///
+    /// This variant starts the `esp-rtos` scheduler from `timg0` and `sw_int`
+    /// as its first step, before the profile, SSID and password checks, so an
+    /// `Err` from this function never leaves the firmware without a scheduler
+    /// (the peripherals are consumed either way).  A firmware that already
+    /// called `esp_rtos::start` uses
+    /// [`start_scheduler_running`](Self::start_scheduler_running) instead;
+    /// starting the scheduler twice panics in `esp-rtos`.
+    ///
     /// # Panics
     ///
     /// Taking the AP peripherals by value makes a second `start()` in one boot
@@ -525,13 +543,74 @@ impl<'a> ProvisioningBuilder<'a> {
     where
         F: embedded_storage::nor_flash::NorFlash + Send + Sync + 'static,
     {
+        self.start_with(
+            spawner,
+            crate::wifi::Scheduler::Start {
+                timg0,
+                from_cpu_intr0: sw_int,
+            },
+            wifi,
+            store,
+            rng,
+        )
+    }
+
+    /// Like [`start`](Self::start), for a firmware that already called
+    /// `esp_rtos::start` this boot: takes only the `WIFI` peripheral and starts
+    /// no scheduler.
+    ///
+    /// This is the captive-portal entry point for a firmware that starts the
+    /// scheduler in `main` and only then decides between the portal and a
+    /// station join (`WiFiConfigExt::with_wifi_scheduler_running` on the other
+    /// branch).  Errors and the once-per-boot guard are those of
+    /// [`start`](Self::start).
+    #[cfg(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ))]
+    pub fn start_scheduler_running<F>(
+        self,
+        spawner: embassy_executor::Spawner,
+        wifi: esp_hal::peripherals::WIFI<'static>,
+        store: ProvisioningStore<F>,
+        rng: esp_hal::rng::Rng,
+    ) -> Result<ProvisioningSession, ProvisioningError>
+    where
+        F: embedded_storage::nor_flash::NorFlash + Send + Sync + 'static,
+    {
+        self.start_with(spawner, crate::wifi::Scheduler::Running, wifi, store, rng)
+    }
+
+    #[cfg(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ))]
+    fn start_with<F>(
+        self,
+        spawner: embassy_executor::Spawner,
+        scheduler: crate::wifi::Scheduler,
+        wifi: esp_hal::peripherals::WIFI<'static>,
+        store: ProvisioningStore<F>,
+        rng: esp_hal::rng::Rng,
+    ) -> Result<ProvisioningSession, ProvisioningError>
+    where
+        F: embedded_storage::nor_flash::NorFlash + Send + Sync + 'static,
+    {
         use static_cell::StaticCell;
+
+        // ── Step -1: start the scheduler (if it is ours) before any check ────
+        // `start` took TIMG0 and FROM_CPU_INTR0 by value, so a validation error
+        // below must not leave the firmware without a scheduler and without the
+        // peripherals to start one.  From here on the scheduler is running
+        // whichever entry point was used, and `init_softap_async` is told so.
+        scheduler.ensure_started();
+        let scheduler = crate::wifi::Scheduler::Running;
 
         // ── Step 0: reject unsupported profiles before consuming any resource ─
         // Profile check must come first — before the AP password check, before
         // the nonce is generated, and before the StaticCell is initialised — so
         // that a caller selecting an unsupported profile gets a clean error
-        // without any side effects.
+        // without any side effects beyond the scheduler start above.
         validate_profile(self.config.profile)?;
 
         // ── Step 0b: resolve the SoftAP SSID from the AP MAC ───────────────
@@ -552,13 +631,15 @@ impl<'a> ProvisioningBuilder<'a> {
         // `WiFiManager::init_softap_async` (security-checklist item 8).
 
         // ── Step 1b: bring the SoftAP up ───────────────────────────────────
-        use crate::wifi::ApConfigExt;
+        // The scheduler is already running (step -1), so `init_softap_async`
+        // starts nothing; `WIFI` is consumed here even if the AP config is
+        // rejected, as with `WiFiManager::init_async`.
         let ap_config = match self.config.ap_password {
             Some(pw) => juggler::wifi::ApConfig::wpa2(ssid.as_str(), pw),
             None => juggler::wifi::ApConfig::open(ssid.as_str()),
         }
-        .with_channel(self.config.channel)
-        .with_ap_peripherals(timg0, sw_int, wifi);
+        .with_channel(self.config.channel);
+        let ap_config = crate::wifi::HalApConfig::from_ap(ap_config, scheduler, wifi);
         // The error value is tainted by `ap_config` (it carries the AP
         // password), so only the static reason is logged — never `e` itself.
         let ap = crate::wifi::WiFiManager::init_softap_async(ap_config).map_err(|e| {
