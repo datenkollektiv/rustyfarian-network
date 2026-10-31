@@ -1,6 +1,7 @@
 //! Bare-metal MQTT example for ESP32-S3 (CrowPanel 1.28" HMI): LWT, retained online flag, reconnect.
 //!
-//! Console output goes to UART0 (the CH340 bridge on the CrowPanel).
+//! Console output goes to the USB-Serial-JTAG port (the CrowPanel has no UART bridge);
+//! the example build selects `esp-println/auto` through the crate's dev-dependency.
 //! Joins Wi-Fi, then drives the [`MqttRunner`] from its own task and uses the
 //! [`MqttHandle`] from the main loop:
 //!

@@ -14,7 +14,8 @@
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build
 //! time**. The example requires the `embassy` Cargo feature.
-//! Console output goes to UART0 (the CH340 bridge on the CrowPanel).
+//! Console output goes to the USB-Serial-JTAG port (the CrowPanel has no UART bridge);
+//! the example build selects `esp-println/auto` through the crate's dev-dependency.
 //!
 //! # Build and flash
 //!

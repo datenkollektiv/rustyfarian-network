@@ -35,9 +35,7 @@ wifi = [
     "dep:esp-radio", "esp-radio?/wifi", "esp-radio?/esp-alloc", "esp-radio?/unstable", "esp-radio?/log-04",
     "dep:esp-rtos", "esp-rtos?/esp-radio", "esp-rtos?/esp-alloc",
     "dep:esp-alloc",
-    "dep:esp-backtrace",
     "dep:esp-bootloader-esp-idf",
-    "dep:esp-println",
     "embassy",
 ]
 
@@ -67,7 +65,6 @@ lora = [
     "juggler/lora",
     "dep:esp-hal",
     "dep:esp-bootloader-esp-idf",
-    "dep:esp-println",
     "dep:embedded-hal-bus",
 ]
 
@@ -130,11 +127,13 @@ ws2812 = [
 # Each chip feature selects the chip on all optional deps that are present.
 # The `dep?/feature` syntax is a no-op when the optional dep is not yet activated
 # by any domain feature — no-op when dep absent.
+#
+# The crate depends on neither `esp-println` nor `esp-backtrace`: the firmware adds both
+# and selects exactly one console and the panic handler itself, like the `critical-section`
+# provider (ADR 021). The examples get them from the per-target dev-dependencies below.
 
 # ESP32-C3: RISC-V, riscv32imc-unknown-none-elf
 # Supports: wifi, lora, ota, provisioning, espnow
-# Log output: `auto` picks USB-Serial-JTAG when a USB host is present (Super Mini boards have no
-# UART bridge, `uart` alone prints nothing on the USB port) and falls back to UART0 otherwise.
 esp32c3 = [
     "esp-hal?/esp32c3",
     "esp-radio?/esp32c3",
@@ -142,8 +141,6 @@ esp32c3 = [
     "esp-alloc?/esp32c3",
     "esp-bootloader-esp-idf?/esp32c3",
     "esp-storage?/esp32c3",
-    "esp-backtrace?/esp32c3",
-    "esp-println?/esp32c3", "esp-println?/auto", "esp-println?/log-04",
     "rustyfarian-esp-hal-ws2812?/esp32c3",
 ]
 
@@ -156,8 +153,6 @@ esp32c6 = [
     "esp-alloc?/esp32c6",
     "esp-bootloader-esp-idf?/esp32c6",
     "esp-storage?/esp32c6",
-    "esp-backtrace?/esp32c6",
-    "esp-println?/esp32c6", "esp-println?/jtag-serial", "esp-println?/log-04",
     "rustyfarian-esp-hal-ws2812?/esp32c6",
 ]
 
@@ -169,9 +164,8 @@ esp32 = [
     "esp-hal?/esp32",
     "esp-bootloader-esp-idf?/esp32",
     "esp-storage?/esp32",
-    "esp-println?/esp32", "esp-println?/uart", "esp-println?/log-04",
 ]
-# esp-radio, esp-rtos, esp-alloc, esp-backtrace intentionally NOT listed for esp32.
+# esp-radio, esp-rtos, esp-alloc intentionally NOT listed for esp32.
 
 # ESP32-S3: Xtensa LX7, xtensa-esp32s3-none-elf
 # Supports: wifi, lora, ota, provisioning
@@ -182,8 +176,6 @@ esp32s3 = [
     "esp-alloc?/esp32s3",
     "esp-bootloader-esp-idf?/esp32s3",
     "esp-storage?/esp32s3",
-    "esp-backtrace?/esp32s3",
-    "esp-println?/esp32s3", "esp-println?/uart", "esp-println?/log-04",
 ]
 
 [dependencies]
@@ -216,11 +208,9 @@ esp-hal                 = { workspace = true, features = ["unstable"], optional 
 esp-radio               = { workspace = true, optional = true }
 esp-rtos                = { workspace = true, optional = true }
 esp-alloc               = { workspace = true, optional = true }
-esp-backtrace           = { workspace = true, optional = true }
 esp-bootloader-esp-idf  = { workspace = true, optional = true }
 # `embedded-storage`: the `NorFlash` impls the provisioning store needs are opt-in since esp-storage 0.10.
 esp-storage             = { workspace = true, optional = true, features = ["critical-section", "embedded-storage"] }
-esp-println             = { workspace = true, optional = true }
 
 embedded-hal-bus        = { workspace = true, optional = true }
 
@@ -247,6 +237,30 @@ embassy-time     = { workspace = true }
 # can reach juggler::ota, juggler::provisioning, juggler::wifi, juggler::mqtt, and
 # juggler::lora without pulling in any chip-specific hardware crate.
 juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt", "lora", "espnow"] }
+
+# The examples are the firmware: they carry `esp-println` (console) and `esp-backtrace`
+# (panic handler) themselves. The target triple is the only place that can carry the chip
+# feature now that the library forwards none; the host test build never sees these crates.
+
+# ESP32-C3
+[target.riscv32imc-unknown-none-elf.dev-dependencies]
+esp-println   = { workspace = true, features = ["esp32c3", "auto", "log-04"] }
+esp-backtrace = { workspace = true, features = ["esp32c3"] }
+
+# ESP32-C6
+[target.riscv32imac-unknown-none-elf.dev-dependencies]
+esp-println   = { workspace = true, features = ["esp32c6", "auto", "log-04"] }
+esp-backtrace = { workspace = true, features = ["esp32c6"] }
+
+# ESP32-S3
+[target.xtensa-esp32s3-none-elf.dev-dependencies]
+esp-println   = { workspace = true, features = ["esp32s3", "auto", "log-04"] }
+esp-backtrace = { workspace = true, features = ["esp32s3"] }
+
+# ESP32 (classic)
+[target.xtensa-esp32-none-elf.dev-dependencies]
+esp-println   = { workspace = true, features = ["esp32", "auto", "log-04"] }
+esp-backtrace = { workspace = true, features = ["esp32"] }
 
 [[example]]
 name = "hal_c3_connect_async"

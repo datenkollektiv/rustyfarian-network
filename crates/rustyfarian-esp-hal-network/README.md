@@ -24,7 +24,7 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 
 ### Dependency pins and MSRV
 
-Exact pins are public API: `esp-hal =1.2.2`, `esp-rtos =0.4.0`, `esp-radio =1.0.0-beta.1` (pre-release; re-pins to `1.0.0` on release), `esp-alloc =0.11.0`, `esp-bootloader-esp-idf =0.6.0`, `esp-storage =0.10.0`, `esp-println =0.18.0`, `esp-backtrace =0.20.0`, Embassy `0.10`/`0.8.0`/`0.8.0`/`0.5.1`.
+Exact pins are public API: `esp-hal =1.2.2`, `esp-rtos =0.4.0`, `esp-radio =1.0.0-beta.1` (pre-release; re-pins to `1.0.0` on release), `esp-alloc =0.11.0`, `esp-bootloader-esp-idf =0.6.0`, `esp-storage =0.10.0`, Embassy `0.10`/`0.8.0`/`0.8.0`/`0.5.1`.
 Minimum Rust is 1.95.
 
 ### Chip Features
@@ -38,6 +38,9 @@ Select **exactly one** of the following:
 | `esp32s3` | ESP32-S3 (Xtensa) | All domains ✓                          |
 | `esp32`   | ESP32 (Xtensa)    | `lora` and `ota` only (Wi-Fi not wired) |
 
+The chip features touch neither `esp-println` nor `esp-backtrace`; this crate depends on neither.
+The firmware adds both and selects exactly one console (`auto`, `jtag-serial`, `uart`, `no-op`) and the panic handler itself (ADR 021).
+
 ### Support Features
 
 | Feature    | What it gates                                      | Notes                                                   |
@@ -49,12 +52,17 @@ Select **exactly one** of the following:
 
 ## Cargo.toml
 
-Add to your `Cargo.toml`:
+Add to your `Cargo.toml`; the firmware adds `esp-println` (with the chip and exactly one console) and `esp-backtrace` (with the chip and the panic handler) itself, because this crate depends on neither.
+`auto` prints over USB-Serial-JTAG when a USB host is attached, else UART0; the binary links the panic handler with `use esp_backtrace as _;`.
 
 ```toml
 [dependencies]
 rustyfarian-esp-hal-network = { version = "0.6", features = ["wifi", "esp32c6", "embassy", "rt"] }
+esp-println = { version = "=0.18.0", default-features = false, features = ["esp32c6", "auto", "log-04"] }
+esp-backtrace = { version = "=0.20.0", default-features = false, features = ["esp32c6", "panic-handler", "println"] }
 ```
+
+The published `0.6.0` still selects a console in its chip features (`jtag-serial` for `esp32c6`, `uart` elsewhere); this snippet applies from the next release, which is what the `=0.18.0` / `=0.20.0` lines assume.
 
 **Chip + domain matrix examples:**
 
@@ -273,7 +281,8 @@ use rustyfarian_esp_hal_network::lora::LoraConfig;
 - `esp-radio 1.0.0-beta.1` does support the ESP32, but the `esp32` feature does not forward a chip to `esp-radio`, `esp-rtos` or `esp-alloc`.
 - **ESP32-S3** (Xtensa LX7): Full support for Wi-Fi, LoRa, OTA, and provisioning; flash with the IDF-built bootloader (`just flash` does this).
 - **ESP32-C3 and ESP32-C6** (RISC-V): Full support for Wi-Fi, LoRa, OTA, provisioning, and ESP-NOW (`espnow`).
-- On `esp32c3`, `esp-println` uses its `auto` printer: USB-Serial-JTAG when a USB host is attached (Super Mini boards), UART0 otherwise.
+- The firmware selects the `esp-println` console and the panic handler (`esp-backtrace` or its own `#[panic_handler]`); this crate depends on neither crate.
+  `auto` is the right choice for USB-only boards (Super Mini, CrowPanel): USB-Serial-JTAG when a USB host is attached, UART0 otherwise (on the classic ESP32 `auto` is the UART printer).
 
 ## docs.rs Build Note
 
