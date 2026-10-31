@@ -89,7 +89,8 @@ rustyfarian-esp-hal-network = { version = "0.6", features = ["provisioning", "es
 ## Example: Async Wi-Fi Connect
 
 Condensed from `examples/hal_c3_connect_async.rs`.
-`init_async` is synchronous: it starts the `esp-rtos` scheduler, configures the radio, and builds the `embassy-net` stack, but does not associate.
+`init_async` is synchronous: with `with_peripherals` it starts the `esp-rtos` scheduler, then it configures the radio and builds the `embassy-net` stack, but does not associate.
+A firmware that already started the scheduler builds the config with `with_wifi_scheduler_running(peripherals.WIFI)` instead of `with_peripherals`, and `init_async` then starts nothing (see `examples/hal_esp32s3_mqtt_lwt.rs`).
 The caller spawns one task that owns the `WifiController` (association and reconnects) and one that drives the network `Runner`; `stack` is `Copy` and is used for sockets.
 
 ```rust
@@ -205,7 +206,7 @@ The receive queue of `esp-radio` holds 10 frames and drops the oldest, and frame
 
 ## Example: Async SoftAP + Provisioning
 
-Condensed from `examples/hal_c3_provision_mqtt.rs`.
+Condensed from `examples/hal_c6_provision_mqtt.rs`.
 `ProvisioningBuilder::start` brings the SoftAP up itself from `PortalConfig` (SSID `{prefix}-{MAC}` or `ssid_override`, channel, password) and spawns the DHCP, DNS and HTTP tasks; the credential store lives in a dedicated flash partition.
 The library never reboots or erases on its own; the host acts on the `ProvisioningOutcome`.
 `FLASH_PARTITION_OFFSET` below is a placeholder that falls inside the `factory` app partition of espflash's default 4 MiB table; give the store its own 4 KiB-aligned `data` partition in `partitions.csv` and point the offset there.
@@ -263,7 +264,9 @@ async fn main(spawner: Spawner) {
 }
 ```
 
-The already-provisioned boot path must not `.await` before Wi-Fi is up: `esp_rtos::start` runs inside `init_async` / `init_softap_async`, and the executor panics on its first park without it.
+The already-provisioned boot path must not `.await` before Wi-Fi is up when it builds its config with `with_peripherals` / `with_ap_peripherals`: `esp_rtos::start` runs inside `init_async` / `init_softap_async`, and the executor panics on its first park without it.
+A firmware that calls `esp_rtos::start` itself in `main` may await freely and passes only `WIFI` through `with_wifi_scheduler_running` / `with_ap_wifi_scheduler_running`.
+With the scheduler started in `main`, the portal is started with `ProvisioningBuilder::start_scheduler_running(spawner, peripherals.WIFI, store, rng)`, as `examples/hal_c3_provision_mqtt.rs` does.
 The full example shows the `is_provisioned()` branch, the `on_event` hook, and the build-time-seeded `PortalDefaults`.
 
 ## Integration with juggler

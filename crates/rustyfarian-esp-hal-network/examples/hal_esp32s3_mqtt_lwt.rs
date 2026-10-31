@@ -2,6 +2,9 @@
 //!
 //! Console output goes to the USB-Serial-JTAG port (the CrowPanel has no UART bridge);
 //! the example build selects `esp-println/auto` through the crate's dev-dependency.
+//! The firmware starts the `esp-rtos` scheduler itself in `main` and hands Wi-Fi only
+//! the `WIFI` peripheral (`with_wifi_scheduler_running`), the boot shape of a firmware
+//! that must also run without Wi-Fi (rustyfarian-knob, request U2e).
 //! Joins Wi-Fi, then drives the [`MqttRunner`] from its own task and uses the
 //! [`MqttHandle`] from the main loop:
 //!
@@ -40,6 +43,7 @@ extern crate alloc;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use esp_radio::wifi::{Interface, WifiController};
 use rustyfarian_esp_hal_network::mqtt::{
@@ -125,12 +129,15 @@ async fn main(spawner: Spawner) {
     // adds no heap traffic (all its buffers are static).
     esp_alloc::heap_allocator!(size: 72 * 1024);
 
-    println!("Initializing Wi-Fi (async)...");
-    let config = WiFiConfig::new(SSID, wifi_password()).with_peripherals(
-        peripherals.TIMG0,
-        peripherals.FROM_CPU_INTR0,
-        peripherals.WIFI,
-    );
+    // The firmware owns the scheduler (ADR 021): start it here, once per boot,
+    // as a firmware that may boot without Wi-Fi would, so its embassy timers
+    // work whether or not Wi-Fi comes up afterwards.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+    println!("Initializing Wi-Fi (async, scheduler already running)...");
+    let config =
+        WiFiConfig::new(SSID, wifi_password()).with_wifi_scheduler_running(peripherals.WIFI);
     let handle = match WiFiManager::init_async(config) {
         Ok(h) => h,
         Err(e) => {
