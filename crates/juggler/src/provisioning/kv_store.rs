@@ -19,7 +19,7 @@
 //! discriminator (`"lorawan"` / `"wifi_mqtt"`), and a `schema_ver` (`u8`, value
 //! `2`) guard. Opaque extras are stored as `x_{name}` with `name` capped at 13
 //! bytes so the `x_` prefix keeps the total under the 15-byte NVS key limit.
-//! Because `EspNvs` on `esp-idf-svc 0.52` cannot enumerate keys portably, an
+//! Because `EspNvs` on `esp-idf-svc` (0.52 and 0.53) cannot enumerate keys portably, an
 //! `extras_idx` key holds the comma-joined extra names so
 //! [`erase_all`](KvProvisioningStore::erase_all) can find and remove them. This
 //! deviates from the feature-doc sketch's pure one-key-per-field layout — the

@@ -200,6 +200,7 @@ The receive queue of `esp-radio` holds 10 frames and drops the oldest, and frame
 Condensed from `examples/hal_c3_provision_mqtt.rs`.
 `ProvisioningBuilder::start` brings the SoftAP up itself from `PortalConfig` (SSID `{prefix}-{MAC}` or `ssid_override`, channel, password) and spawns the DHCP, DNS and HTTP tasks; the credential store lives in a dedicated flash partition.
 The library never reboots or erases on its own; the host acts on the `ProvisioningOutcome`.
+`FLASH_PARTITION_OFFSET` below is a placeholder that falls inside the `factory` app partition of espflash's default 4 MiB table; give the store its own 4 KiB-aligned `data` partition in `partitions.csv` and point the offset there.
 
 ```rust
 use embassy_executor::Spawner;

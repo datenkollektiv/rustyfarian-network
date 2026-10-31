@@ -325,7 +325,7 @@ impl<'d> EspHalOtaManager<'d> {
         })?;
 
         // 8. Activate the new slot, with nothing between the permit and this call.
-        //    API mapping (esp-bootloader-esp-idf 0.5.0):
+        //    API mapping (esp-bootloader-esp-idf 0.6.0, unchanged since 0.5.0):
         //      activate_next_partition() = commit / finalize — writes the OTA data
         //        partition so the bootloader boots the new slot on next reset.
         //      set_current_ota_state(OtaImageState::Valid)   = mark_valid / cancel rollback

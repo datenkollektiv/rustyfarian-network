@@ -518,9 +518,9 @@ impl<'a> ProvisioningBuilder<'a> {
                     min: juggler::wifi::AP_PASSWORD_MIN_LEN,
                 });
             }
-        } else {
-            warn_if_open_ap(self.config.ap_password);
         }
+        // An open AP (no password) is warned about once, inside
+        // `WiFiManager::init_softap_async` (security-checklist item 8).
 
         // ── Step 1b: bring the SoftAP up ───────────────────────────────────
         use crate::wifi::ApConfigExt;
@@ -630,33 +630,6 @@ impl<'a> ProvisioningBuilder<'a> {
             ap_ip: AP_IP,
             ap_mac,
         })
-    }
-}
-
-/// Emit a `warn!` log when the provisioning AP has no WPA2 password.
-///
-/// Extracted as a pure, always-compiled function so the security-checklist
-/// item 8 host test (`open_ap_emits_warning`) can capture the log without
-/// requiring the embassy + chip feature flags.
-///
-/// # Security — item 8
-///
-/// An open AP lets any device in radio range reach the portal.  The warning
-/// is emitted unconditionally every time `start` is called with no password,
-/// so the integrator cannot accidentally silence it by mistake.
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
-    if ap_password.is_none() {
-        log::warn!(
-            "Provisioning AP is open — no WPA2 password set. \
-             Anyone in radio range can reach the portal endpoints."
-        );
     }
 }
 
@@ -1045,9 +1018,12 @@ mod tests {
     /// password, a `Warn`-level log message containing "open" must be emitted.
     ///
     /// The library never silences this warning — an integrator who accidentally
-    /// opens the AP cannot miss it.
+    /// opens the AP cannot miss it.  Since `start()` brings the SoftAP up
+    /// itself, the single warning lives in `crate::wifi::warn_if_open_ap`,
+    /// called from `WiFiManager::init_softap_async`.
     #[test]
     fn open_ap_emits_warning() {
+        use crate::wifi::warn_if_open_ap;
         install_test_logger();
         // Clear any messages from previous tests in the same process run.
         let _ = drain_log_messages();

@@ -108,6 +108,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- esp-hal provisioning logged the open-AP warning twice per bring-up (once from `ProvisioningBuilder::start`, once from `WiFiManager::init_softap_async`); it is now logged once, from the Wi-Fi layer, and the host test for it moved with the helper.
+- esp-hal provisioning docs: the stack guidance in `hal_c3_provision_mqtt`, `hal_c6_provision_mqtt` and the portal module named knobs the tier does not have (`_stack_size`, `CONFIG_ESP_MAIN_TASK_STACK_SIZE`); they now explain that the main stack is the RAM left after `.data`, `.bss` and the heap and point to `ESP_HAL_CONFIG_ENSURE_MAIN_STACK_MINIMUM` as the link-time floor.
+  The `0x300000` store offset in the examples and README is now labelled as lying inside the `factory` partition of espflash's default table, with the instruction to add a dedicated `data` partition; stale `esp-rtos 0.3.0` / `esp-radio 0.18` mentions in the examples are refreshed.
+  Reported by rgb-clock (`review-queue/rustyfarian-network-esp-hal-docs-defects.md`).
 - esp-hal `ProvisioningStore` never read a committed record back: `try_read_sector` read exactly `record_len` bytes, and esp-storage 0.10 rejects a read length that is not a multiple of its 4-byte `READ_SIZE`, so every provisioned boot reopened the portal with `StoreError::Flash` (bug 006, found on an ESP32-C3 Mini-1).
   The read is now rounded up to `READ_SIZE`, a host mock with word-aligned reads covers it, and the hal provisioning examples log a store error instead of silently re-provisioning.
 - The esp-hal docs no longer call the ESP32-S3 LoRa-only: every pinned dependency supports it, and the claimed `compile_error!` for S3 with `wifi`/`ota` never existed (S3 with `ota` silently compiled the stub manager).
