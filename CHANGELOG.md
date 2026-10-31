@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::wifi::{LinkMachine, LinkInput, LinkAction, LinkState, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS}`: the pure station reconnect policy both tiers run (1 s back-off doubling to 30 s, reset on connect, stale-input tolerant), host-tested and re-exported from both tiers' `wifi` modules.
+  Requested by `rustyfarian-knob` (U2f); see `docs/features/wifi-reconnect-and-suspend-v1.md` and bug 009.
+- `rustyfarian-esp-hal-network::wifi::{WifiLink, link_task}`: a library-owned station supervisor; the firmware declares `static LINK: WifiLink = WifiLink::new();` and spawns `link_task(&LINK, controller)` instead of writing a reconnect loop.
+  `is_connected()`, `state()` and `connect_count()` are readable from any task.
+- `idf_esp32s3_mqtt_lwt`: ESP-IDF twin of `hal_esp32s3_mqtt_lwt` (same env keys, LWT `offline` and retained `online` on `<prefix>/status`, a tick every 5 s, default client id `idf-s3-mqtt`, prefix `rustyfarian/idf-mqtt`).
+  Runbook `docs/runbooks/wifi-reconnect-hardware-test.md` covers the router-outage protocol for both tiers.
 - `juggler::espnow::{ScanMachine, ScanInput, ScanAction, ScanError, SendOutcome}`: a pure, clock-injected state machine for `scan_for_peer`, shared by both tiers; the caller feeds `ScanInput` (`Start`, `Completed`, `Failed`, `Abort`, `Sent`) and performs each `ScanAction`, and `ScanError::Aborted` reports an abort. A failed peer registration restores the previously pinned channel and peer (best effort) before reporting the original `ScanError`.
   See ADR 020 and `docs/features/esp-hal-espnow-v1.md`; ADR 007 is amended.
 - Bare-metal ESP-NOW: new `espnow` feature on `rustyfarian-esp-hal-network` (ADR 020, `esp32c3` and `esp32c6`); `espnow::EspHalEspNow` implements `juggler::espnow::EspNowDriver` with `&self` and adds `send_and_wait`, `send_async`, `send_async_timeout`, `recv_async`, `set_channel`, `set_max_tx_power`, `tx_power_quarter_dbm`, `sta_mac`, `peer_exists` and `oversize_dropped`.
@@ -62,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- All seven bare-metal station examples spawn `link_task` instead of their own `wifi_task`; the reconnect delay after a link loss is now 1 s doubling to 30 s (was 500 ms / 5 s), and the link log lines are `[wifi] link up #<n>`, `[wifi] disconnected — <reason>` and `[wifi] reconnecting in <ms> ms`.
+- `rustyfarian-esp-idf-network` `MqttHandle::try_publish`, `try_publish_retained` and `try_publish_with` return `TryPublishError::WouldBlock` while `is_connected()` is `false`, matching the esp-hal tier; the check is best effort, so a publish accepted just before esp-mqtt notices a dead transport can still sit in the outbox and go out after the next connect at QoS 1.
+  Callers that relied on queueing before the first connect must wait for `is_connected()` (every example already does); the OTA runtime's status publish already treats `WouldBlock` as retry-then-drop.
+- `rustyfarian-esp-idf-network` `WiFiManager`: the link worker issues the first `esp_wifi_connect` in every connect mode, so a transient driver error or a failed first association is retried with back-off; the blocking and LED modes only wait for the link until their timeout (before, a failed first association waited out the whole timeout without a retry).
+  Dropping the manager, or an error inside `new`, stops and joins the worker before the driver is destroyed.
 - `rustyfarian-esp-hal-network`: `WiFiManager::init_async`, `WiFiManager::init_softap_async` and `ProvisioningBuilder::start` now start the `esp-rtos` scheduler before they validate the profile, SSID, password or AP configuration, so a `WifiError::ConfigureFailed` no longer leaves the firmware without a scheduler (every embassy timer await used to hang); callers of `with_peripherals` and `with_ap_peripherals` see no API change.
 - `EspIdfEspNow::scan_for_peer` now drives the shared `juggler::espnow::ScanMachine` (blocking `send` plus ACK wait per probe, `std::thread::sleep` for confirmation gaps) instead of its own channel loop, so both tiers run one algorithm.
   The public API, error messages (including the `anyhow` context on registration failures), TX-power boost and restore order and the failed-scan fallback to the last pinned channel are unchanged; log lines are unchanged, except that the burst-timeout line is now emitted after teardown.
@@ -121,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rustyfarian-esp-idf-network` `MqttBuilder::build` logged the broker URL and client id read from an `MqttConfig` that can carry credentials, which CodeQL reports as `rust/cleartext-logging`; it now logs the fixed message `[mqtt] creating client`, and callers log host and client id from their own values.
+- `rustyfarian-esp-idf-network` `WiFiManager` never reconnected after a link loss in either connect mode (bug 009): the `StaDisconnected` subscription only logged, so a router outage left the station down until reboot.
+  Both modes now reconnect through `juggler::wifi::LinkMachine` on a worker thread; `is_connected()` stays `false` for the whole outage and esp-mqtt reconnects on its own once the link is back.
 - esp-hal provisioning reported a station leaving the SoftAP as `ClientConnected { mac: None }` and never fired `ClientDisconnected`: the esp-radio wait method resolves on both directions since the `1.0.0-beta.1` pin and `wifi_task` ignored the variant (bug 008).
   Both events now carry the station MAC, the log line names the direction, and the mapping is a pure `station_event` function with host tests.
 - esp-hal provisioning logged the open-AP warning twice per bring-up (once from `ProvisioningBuilder::start`, once from `WiFiManager::init_softap_async`); it is now logged once, from the Wi-Fi layer, and the host test for it moved with the helper.

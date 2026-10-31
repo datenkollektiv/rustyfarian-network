@@ -851,7 +851,10 @@ impl<'a> MqttBuilder<'a> {
         // No Box::leak required.
         let url = format_broker_url(config.host, config.port);
         let client_id = config.client_id.to_string();
-        log::info!("[mqtt] broker {} (client_id={})", url, client_id);
+        // Fixed message: CodeQL's rust/cleartext-logging taints every field read
+        // through a config that carries credentials, so the broker URL and client id
+        // are logged by the caller from its own values (see the examples' env.rs).
+        log::info!("[mqtt] creating client");
         // codeql[rust/cleartext-logging] - credentials are passed to the MQTT
         // broker via EspMqttClient::new(); this is required for authentication
         // and is not a logging operation.  esp_mqtt_client_init() strdup()'s
@@ -1396,8 +1399,11 @@ impl MqttHandle {
     /// Non-blocking publish with QoS 1 and no retain flag — non-blocking only
     /// when called outside the MQTT callbacks.
     ///
-    /// Returns [`TryPublishError::WouldBlock`] if the MQTT client mutex is
-    /// held by the connect helper thread or another blocked publisher (see
+    /// Returns [`TryPublishError::WouldBlock`] while
+    /// [`is_connected`](Self::is_connected) is `false` (same contract as the
+    /// esp-hal tier, best effort as described in
+    /// [`try_publish_with`](Self::try_publish_with)), or while the MQTT client mutex is held by the connect
+    /// helper thread or another blocked publisher (see
     /// [`TryPublishError::WouldBlock`]). From inside `on_message`,
     /// `on_disconnect`, or `on_connect` it returns [`TryPublishError::Other`]
     /// wrapping [`PublishAckError::WrongThread`] (see
@@ -1409,7 +1415,10 @@ impl MqttHandle {
     /// Non-blocking retained publish with QoS 1 — non-blocking only when
     /// called outside the MQTT callbacks.
     ///
-    /// Returns [`TryPublishError::WouldBlock`] if the mutex is held, and
+    /// Returns [`TryPublishError::WouldBlock`] while
+    /// [`is_connected`](Self::is_connected) is `false` (same contract as the
+    /// esp-hal tier, best effort as described in
+    /// [`try_publish_with`](Self::try_publish_with)), or while the mutex is held, and
     /// [`TryPublishError::Other`] wrapping [`PublishAckError::WrongThread`]
     /// from inside any callback.
     pub fn try_publish_retained(&self, topic: &str, payload: &str) -> Result<(), TryPublishError> {
@@ -1426,7 +1435,18 @@ impl MqttHandle {
     ///
     /// # Message loss
     ///
-    /// Messages are **silently dropped** when `WouldBlock` is returned.
+    /// Messages are **silently dropped** when `WouldBlock` is returned:
+    ///
+    /// * while `is_connected()` is `false` — before the first connect, during
+    ///   a reconnect, and for the whole of a Wi-Fi outage
+    /// * while the client mutex is held (see above)
+    ///
+    /// The connection check is best effort, not a guarantee: `is_connected()`
+    /// reflects the last MQTT event the event loop processed, and esp-mqtt only
+    /// reports a dead transport after a read error or a missed keep-alive. A
+    /// publish accepted in that window, or racing a disconnect, sits in the
+    /// esp-mqtt outbox and, at QoS 1, can still go out after the next connect.
+    ///
     /// During prolonged reconnects (tens of seconds on poor WiFi) every
     /// call will return `WouldBlock`, so the caller must decide whether to
     /// discard, buffer, or count missed publishes at the application layer.
@@ -1450,8 +1470,8 @@ impl MqttHandle {
     /// Must not be called from inside any callback (`on_connect`,
     /// `on_message`, `on_disconnect`). Such a call returns
     /// [`TryPublishError::Other`] wrapping [`PublishAckError::WrongThread`]
-    /// instead of hanging. Safe to call from any other thread at any time,
-    /// including before the first connect.
+    /// instead of hanging. Safe to call from any other thread at any time;
+    /// the call before the first connect returns `WouldBlock`.
     pub fn try_publish_with(
         &self,
         topic: &str,
@@ -1464,6 +1484,9 @@ impl MqttHandle {
             .map_err(TryPublishError::Other)?;
         validate_publish_topic(topic)
             .map_err(|e| TryPublishError::Other(anyhow::anyhow!("invalid publish topic: {}", e)))?;
+        if !self.is_connected() {
+            return Err(TryPublishError::WouldBlock);
+        }
         log::debug!("[mqtt] try_publish to '{}': {} bytes", topic, payload.len());
         let mut guard = self.client.try_lock().map_err(|e| match e {
             std::sync::TryLockError::WouldBlock => TryPublishError::WouldBlock,

@@ -5,6 +5,7 @@
 //! - [`WifiDriver`] — hardware-agnostic Wi-Fi driver interface
 //! - [`WiFiConfig`] — connection configuration (SSID, password, connect mode)
 //! - [`ConnectMode`] — blocking vs. non-blocking association strategy
+//! - [`LinkMachine`] — pure reconnect policy shared by both tiers (see [`link`])
 //! - [`mock::MockWifiDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -16,6 +17,13 @@
 
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+
+pub mod link;
+
+pub use link::{
+    LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
+    RECONNECT_BACKOFF_MAX_MS,
+};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 

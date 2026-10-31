@@ -94,3 +94,19 @@ pub fn log_config(client_id: &str) {
         client_id
     );
 }
+
+/// Returns `MQTT_TOPIC_PREFIX` if set at build time, otherwise the caller-supplied default.
+#[allow(dead_code)]
+pub fn mqtt_topic_prefix(default: &'static str) -> &'static str {
+    option_env!("MQTT_TOPIC_PREFIX").unwrap_or(default)
+}
+
+/// Optional MQTT username (`MQTT_USER`).
+#[allow(dead_code)]
+pub const MQTT_USER: Option<&str> = option_env!("MQTT_USER");
+
+/// Optional MQTT password (`MQTT_PASS`); no literal fallback, so CodeQL sees no source.
+#[allow(dead_code)]
+pub fn mqtt_pass() -> Option<&'static str> {
+    option_env!("MQTT_PASS")
+}

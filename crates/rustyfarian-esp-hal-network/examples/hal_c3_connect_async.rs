@@ -7,8 +7,9 @@
 //!
 //! Two tasks are spawned alongside the main task:
 //!
-//! * `wifi_task` — owns the [`WifiController`] and reconnects after any
-//!   `StaDisconnected` event. Credentials are applied once in
+//! * `link_task` — the library's supervisor; owns the [`WifiController`] and
+//!   reconnects after any `StaDisconnected` event with a 1 s back-off doubling
+//!   to 30 s. Credentials are applied once in
 //!   [`WiFiManager::init_async`]; `connect_async` reuses them on every attempt.
 //! * `net_task` — drives the `embassy-net` stack by calling `runner.run()`.
 //!
@@ -31,13 +32,14 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_radio::wifi::{Interface, WifiController};
-use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+use esp_radio::wifi::Interface;
+use rustyfarian_esp_hal_network::wifi::{
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const RECONNECT_DELAY_MS: u64 = 500;
-const CONNECT_BACKOFF_MS: u64 = 5000;
+static LINK: WifiLink = WifiLink::new();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -83,7 +85,7 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
     println!("Waiting for DHCPv4 lease...");
@@ -99,41 +101,11 @@ async fn main(spawner: Spawner) {
     // Idle loop — real applications would open sockets here.
     loop {
         Timer::after(Duration::from_secs(10)).await;
-    }
-}
-
-// Handles both the initial association and any subsequent reconnects.
-// Credentials were configured in `WiFiManager::init_async`; calling
-// `connect_async` directly reuses those settings without resetting driver state.
-#[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
-    // Connection cycle counter — tags the link-up / disconnect log pair so heap
-    // readings can be correlated across reconnects during long manual test runs.
-    let mut cycle: u32 = 0;
-    loop {
-        match controller.connect_async().await {
-            Ok(_) => {
-                // Connected — log free heap so reconnect cycles can be compared
-                // for leaks, then block until the link drops.
-                cycle += 1;
-                println!(
-                    "Wi-Fi link up #{cycle} (free heap: {} B)",
-                    esp_alloc::HEAP.free()
-                );
-                let _ = controller.wait_for_disconnect_async().await;
-                println!(
-                    "Wi-Fi disconnected #{cycle} — reconnecting... (free heap: {} B)",
-                    esp_alloc::HEAP.free()
-                );
-                // Short delay: we know the AP exists, reconnect promptly.
-                Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
-            }
-            Err(e) => {
-                println!("connect failed: {:?}", e);
-                // Longer backoff: AP may be unreachable or credentials wrong.
-                Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
-            }
-        }
+        println!(
+            "Wi-Fi link ups: {} (free heap: {} B)",
+            LINK.connect_count(),
+            esp_alloc::HEAP.free()
+        );
     }
 }
 

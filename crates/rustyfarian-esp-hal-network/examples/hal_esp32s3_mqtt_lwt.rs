@@ -45,17 +45,19 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
-use esp_radio::wifi::{Interface, WifiController};
+use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::mqtt::{
     LwtConfig, MqttBuilder, MqttConfig, MqttHandle, MqttRunner, QoS, TryPublishError,
 };
-use rustyfarian_esp_hal_network::wifi::{AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager};
+use rustyfarian_esp_hal_network::wifi::{
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+};
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const RECONNECT_DELAY_MS: u64 = 500;
-const CONNECT_BACKOFF_MS: u64 = 5000;
+static LINK: WifiLink = WifiLink::new();
+
 const TICK_SECS: u64 = 5;
 const HEAP_LOG_SECS: u64 = 60;
 
@@ -150,7 +152,7 @@ async fn main(spawner: Spawner) {
         stack,
         runner,
     } = handle;
-    spawner.spawn(wifi_task(controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
     println!("Waiting for DHCPv4 lease...");
@@ -274,27 +276,6 @@ async fn rx_task(mqtt: MqttHandle) {
                 msg.topic.as_str(),
                 msg.payload.len()
             ),
-        }
-    }
-}
-
-// Handles both the initial association and any subsequent reconnects.
-#[embassy_executor::task]
-async fn wifi_task(mut controller: WifiController<'static>) {
-    let mut cycle: u32 = 0;
-    loop {
-        match controller.connect_async().await {
-            Ok(_) => {
-                cycle += 1;
-                println!("Wi-Fi link up #{cycle}");
-                let _ = controller.wait_for_disconnect_async().await;
-                println!("Wi-Fi disconnected #{cycle} — reconnecting...");
-                Timer::after(Duration::from_millis(RECONNECT_DELAY_MS)).await;
-            }
-            Err(e) => {
-                println!("connect failed: {:?}", e);
-                Timer::after(Duration::from_millis(CONNECT_BACKOFF_MS)).await;
-            }
         }
     }
 }

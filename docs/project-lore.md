@@ -453,6 +453,7 @@ The bot's suggested fix was `const AP_PSK: Option<&str> = None`, which would hav
 **`rust/cleartext-logging` taints every value read through a struct that carries a credential, so `log::info!("... channel={}", config.ap.channel)` is reported even though the channel is not secret.**
 The `SoftAP configured` line in `init_softap_async` was flagged twice on PR #112: first for an auth label derived from `config.ap.password.is_some()`, then again with only `ssid.len()`, `channel` and `max_connections` interpolated.
 Fix: log only values that never passed through the credential-bearing struct (the provisioning layer logs the SSID length from the resolver output), or a fixed message; the CHANGELOG notes the fixed message (2026-10-30).
+Recurred 2026-11-01 in `MqttBuilder::build` (broker URL and client id): a library log line can be clean for months and turn tainted the day an example first calls `with_auth`/`with_username_only`, so grep library `log::` calls for any read from a config type that has a credential builder.
 
 ---
 
