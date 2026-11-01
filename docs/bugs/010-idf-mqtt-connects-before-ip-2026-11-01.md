@@ -61,3 +61,4 @@ Claude (tier-parity work)
 ## Session Log
 - 2026-11-01 — Captured as a defect via /bug dialog from the Step 2 spike run on a C3
 - 2026-11-01 — Updated: outage evidence from the variant A run (retries during the outage, reconnect 14 s after the IP)
+- 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)

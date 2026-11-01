@@ -3,8 +3,10 @@
 mod client;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+pub mod session;
 
 pub use client::{MqttClient, MqttMessage};
+pub use session::{SessionAction, SessionInput, SessionMachine, SessionToken, SESSION_RETRY_MS};
 
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.
 ///
