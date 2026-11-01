@@ -144,8 +144,10 @@ Split into two reviewable chunks; the CrowPanel S3 rerun covers both after 7b.
 
 #### Step 7b: MQTT runner on the session machine
 
-- [ ] The MQTT runner becomes a thin runner of `SessionMachine` and `MqttHandle` implements `MqttClient`; the extracted branches are deleted from the tier.
-- [ ] Static parity check for `MqttClient`, compiled by `just clippy-hal`.
+- [x] `Shared` holds a `SessionMachine` (built with the configured `reconnect_timeout`); state, publish gate and `connect_count` come from it; the tier's `u8` state encoding and its counter are gone.
+- [x] `run` performs the machine's actions: wait for the network (gate), connect, close, retry pause (now also ended early by a network loss); `serve` feeds `Connected`, then subscribes only if the machine asks, publishes the startup message and feeds `WorkDone` / `WorkFailed`.
+- [x] Kept as tier I/O: socket timeout, stall deadline, network watch, RST flush, publish retries, inbound drop-oldest queue.
+- [x] `impl MqttClient for MqttHandle`, `impl MqttMessage for InboundMessage`, compile-time parity check; log formats unchanged except `connected (…, n subscriptions kept)` for a kept session.
 - Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the runner's host tests move to `juggler` or still pass.
 - Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved.
 

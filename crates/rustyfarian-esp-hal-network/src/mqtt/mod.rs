@@ -154,6 +154,24 @@ pub struct InboundMessage {
     pub qos: QoS,
 }
 
+impl juggler::mqtt::MqttMessage for InboundMessage {
+    fn topic(&self) -> &str {
+        self.topic.as_str()
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    fn retained(&self) -> bool {
+        self.retained
+    }
+
+    fn qos(&self) -> QoS {
+        self.qos
+    }
+}
+
 impl InboundMessage {
     /// Copies topic and payload into the fixed-capacity fields.
     ///
@@ -257,25 +275,6 @@ pub(crate) const fn stall_timeout_ms(keep_alive_secs: u64) -> u64 {
     socket_timeout_ms(keep_alive_secs).saturating_add(keep_alive_secs.saturating_mul(1_000))
 }
 
-/// Connection state as a `u8` for the runner's atomic, and back.
-pub(crate) fn state_to_u8(state: MqttConnectionState) -> u8 {
-    match state {
-        MqttConnectionState::Connecting => 0,
-        MqttConnectionState::Connected => 1,
-        MqttConnectionState::Disconnected => 2,
-        MqttConnectionState::ShuttingDown => 3,
-    }
-}
-
-pub(crate) fn state_from_u8(raw: u8) -> MqttConnectionState {
-    match raw {
-        1 => MqttConnectionState::Connected,
-        2 => MqttConnectionState::Disconnected,
-        3 => MqttConnectionState::ShuttingDown,
-        _ => MqttConnectionState::Connecting,
-    }
-}
-
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
@@ -366,18 +365,6 @@ mod tests {
         assert!(InboundMessage::copy_from("a/b", b"1", true, QoS::AtMostOnce).is_some());
         let big = [0u8; MAX_PAYLOAD_LEN + 1];
         assert!(InboundMessage::copy_from("a/b", &big, false, QoS::AtMostOnce).is_none());
-    }
-
-    #[test]
-    fn connection_state_round_trips_through_u8() {
-        for state in [
-            MqttConnectionState::Connecting,
-            MqttConnectionState::Connected,
-            MqttConnectionState::Disconnected,
-            MqttConnectionState::ShuttingDown,
-        ] {
-            assert_eq!(state_from_u8(state_to_u8(state)), state);
-        }
     }
 
     #[test]

@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The esp-hal MQTT runner is driven by `juggler::mqtt::SessionMachine` and `MqttHandle` implements `juggler::mqtt::MqttClient` (tier-parity Step 7b).
+  While it waits for the network after a loss, `state()` now reports `Disconnected` instead of `Connecting`, as on ESP-IDF.
+  The retry pause also ends early when the network drops.
+  The first session after boot subscribes even if the broker kept a session.
 - `rustyfarian-esp-hal-network::wifi::{link_task, WifiLink::run}` take the embassy-net `Stack` as well: while associated the supervisor checks the IPv4 configuration every `NETWORK_POLL_MS` (500 ms), so the new `WifiLink::{is_ready, wait_connected}` mean associated with an IP, as on ESP-IDF; `connect_count` now comes from the shared link machine, and `WifiLink` implements `juggler::wifi::NetworkLink` (tier-parity Step 7a).
 - `hal_esp32s3_mqtt_lwt` reads its build-time configuration through a new `no_std` `examples/common/env.rs` with the same names as the IDF one, checks the broker host and client-id length at start-up like its IDF twin, and logs through `log`; both S3 LWT examples now print the same `would block (mqtt <state>)` and inbound (`rx`, binary-aware) lines.
 - `rustyfarian-esp-hal-network`: the `embassy` feature now enables the optional `embassy-futures` dependency (already used by `mqtt`) for the `WifiLink` select.
