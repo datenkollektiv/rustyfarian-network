@@ -168,6 +168,7 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - [x] Bug 014: the helper thread runs the shared order (subscribe if the machine asks, startup message, `on_connect`, `WorkDone`); a failed subscribe or startup message reports `WorkFailed` and closes the transport from the helper thread (never from the event loop, ADR 017), so esp-mqtt reconnects and repeats the work.
 - [x] `MqttHandle::{wait_connected, receive, try_receive, dropped_inbound}`, `InboundMessage` (retain flag and QoS are not reported by esp-idf-svc 0.53); messages reach the queue only without an `on_message` callback.
 - [x] `impl MqttClient for MqttHandle` and a compile-time parity check; the waits use the new host-tested `juggler::wait_list::WaitList`.
+- [x] The receive queue gets whole messages: esp-mqtt's chunks are joined by the host-tested `juggler::mqtt::chunks::ChunkAssembler` (cap 16 KiB, broken sequences dropped and counted once); `on_message` keeps its contract and still sees only the first chunk of a long message (review of 3117e31).
 - [x] The `on_connect` flag is esp-idf-svc's session-present flag: docs and four examples no longer call it `is_clean` (three logged the opposite of the truth).
 
 #### Step 8b-2: network gate (bug 010)

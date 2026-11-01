@@ -1,5 +1,7 @@
 //! Pure MQTT primitives — no I/O, no ESP-IDF.
 
+#[cfg(feature = "std")]
+pub mod chunks;
 mod client;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
