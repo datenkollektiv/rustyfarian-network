@@ -149,7 +149,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── MQTT (non-blocking) ───────────────────────────────────────────────
     let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
-        .on_connect(|_client, _is_clean| {
+        .on_connect(|_client, _session_present| {
             log::info!("[mqtt] connected");
             Ok(())
         })

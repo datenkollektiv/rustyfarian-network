@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
 
     let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
         .subscribe(SUBSCRIBE_TOPIC, QoS::AtLeastOnce)
-        .on_connect(|_client: &mut EspMqttClient<'_>, _is_clean: bool| {
+        .on_connect(|_client: &mut EspMqttClient<'_>, _session_present: bool| {
             log::info!("[mqtt] connected");
             Ok(())
         })

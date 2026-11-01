@@ -100,9 +100,9 @@ fn main() -> anyhow::Result<()> {
     let handle = MqttBuilder::new(mqtt_config)
         .subscribe(&echo_topic, QoS::AtLeastOnce)
         .with_startup_message()
-        .on_connect(move |client: &mut EspMqttClient<'_>, is_clean: bool| {
+        .on_connect(move |client: &mut EspMqttClient<'_>, session_present: bool| {
             client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-            log::info!("[guard] on_connect published status=online (clean={is_clean})");
+            log::info!("[guard] on_connect published status=online (session_present={session_present})");
             Ok(())
         })
         .on_disconnect(|| log::warn!("[guard] disconnected — will reconnect"))

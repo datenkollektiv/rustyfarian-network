@@ -131,7 +131,7 @@
 use anyhow::Context as _;
 use pennant::PulseEffect;
 use rgb::RGB8;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -141,9 +141,13 @@ pub use pennant::{SimpleLed, StatusLed};
 use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, in_callback, next_state, spawn_connect_thread,
     validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
-    validate_subscribe_filter, AckOutcome, CallbackScope, ConnectionEpoch, MqttEvent, PendingAcks,
-    SessionPhase, SubscribeClient,
+    validate_subscribe_filter, AckOutcome, CallbackScope, MqttClient, MqttEvent, PendingAcks,
+    SessionAction, SessionInput, SessionToken, SubscribeClient,
 };
+
+mod session;
+use session::Session;
+pub use session::{InboundMessage, INBOUND_QUEUE_DEPTH};
 
 // Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
@@ -650,8 +654,8 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 ///
 /// let handle = MqttBuilder::new(config)
 ///     .subscribe("commands/#", QoS::AtLeastOnce)
-///     .on_connect(|client, is_clean| {
-///         log::info!("connected (clean={})", is_clean);
+///     .on_connect(|client, session_present| {
+///         log::info!("connected (session_present={})", session_present);
 ///         client.enqueue("device/status", to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
 ///         Ok(())
 ///     })
@@ -697,17 +701,18 @@ impl<'a> MqttBuilder<'a> {
     ///   (initial connect and every automatic reconnect) when at least one
     ///   topic is registered, [`with_startup_message()`](Self::with_startup_message)
     ///   is enabled, or [`on_connect`](Self::on_connect) is set.
-    /// - **`is_connected()`**: flips to `true` immediately when `on_connect`
-    ///   returns, which is *before* the helper thread has sent the SUBSCRIBE
-    ///   packets.  Do not assume subscriptions are active the instant
-    ///   `is_connected()` returns `true`.
-    /// - **Failures**: subscribe errors are logged as warnings and not
-    ///   propagated.  Failed subscriptions are retried automatically on the
-    ///   next reconnect. If the per-connect helper thread itself cannot be
-    ///   spawned, no subscription is sent for that connection at all, an
-    ///   `error!` is logged, and [`is_connected()`](MqttHandle::is_connected)
-    ///   stays `false` for that connection until the next reconnect retries
-    ///   the whole sequence.
+    /// - **Order**: the helper thread sends the SUBSCRIBE packets first, then
+    ///   the startup message, then runs `on_connect`; only then does
+    ///   [`is_connected()`](MqttHandle::is_connected) turn `true` (the order
+    ///   both tiers share, ADR 022). A kept session whose subscriptions all
+    ///   completed earlier is not subscribed again.
+    /// - **Failures**: a failed subscribe is logged, the session is closed, and
+    ///   esp-mqtt's reconnect runs the whole sequence again, so a session never
+    ///   reports ready with a subscription missing. If the per-connect helper
+    ///   thread itself cannot be spawned, no subscription is sent for that
+    ///   connection at all, an `error!` is logged, and `is_connected()` stays
+    ///   `false` for that connection until the next reconnect retries the
+    ///   whole sequence.
     /// - **Duplicates**: registering the same `(topic, qos)` pair more than
     ///   once is intentionally preserved — duplicate SUBSCRIBE packets are
     ///   handled safely by brokers per MQTT §3.8.
@@ -727,9 +732,9 @@ impl<'a> MqttBuilder<'a> {
 
     /// Registers a callback invoked on every (re)connect.
     ///
-    /// Runs on a per-connect helper thread, after the startup message (if
-    /// [`with_startup_message()`](Self::with_startup_message) is enabled) and
-    /// before the builder's [`subscribe`](Self::subscribe) topics are sent.
+    /// Runs on a per-connect helper thread, after the builder's
+    /// [`subscribe`](Self::subscribe) topics and the startup message (if
+    /// [`with_startup_message()`](Self::with_startup_message) is enabled).
     /// The `client` parameter may be used for `enqueue()` — e.g. a retained
     /// "online" status — and `subscribe()`; do **not** call any
     /// [`MqttHandle`] method from it, such a call returns
@@ -737,14 +742,15 @@ impl<'a> MqttBuilder<'a> {
     /// [`is_connected()`](MqttHandle::is_connected) flips to `true` only
     /// after the callback returns.
     ///
-    /// For a resumed session (`is_clean_session == false`), the broker may
+    /// For a resumed session (`session_present == true`), the broker may
     /// redeliver queued messages while `on_connect` is still running; those
     /// trigger [`on_message`](Self::on_message) on the event-loop thread
     /// concurrently with the helper thread running `on_connect`.
     ///
-    /// The `is_clean_session` parameter is `true` when the broker reports a clean
-    /// session (no retained state from a previous session), and `false` when the
-    /// previous session was resumed.
+    /// The `bool` parameter is the broker's session-present flag: `true` when the
+    /// broker resumed the previous session, `false` for a fresh one. (Earlier docs
+    /// called it `is_clean_session` with the opposite meaning; the value itself is
+    /// unchanged.)
     ///
     /// If the callback returns `Err`, the error is logged with `warn!` and the event
     /// loop continues. The next automatic reconnection will invoke the callback
@@ -764,8 +770,8 @@ impl<'a> MqttBuilder<'a> {
     /// same connection this callback is still handling, or an `on_connect`
     /// for a *later* connection racing ahead of it. Application state
     /// touched by more than one of these callbacks must be synchronized by
-    /// the application; the epoch only protects the library's internal
-    /// connected flag, not caller state. A stale `on_connect` for a
+    /// the application; the session machine's token only protects the
+    /// library's own readiness, not caller state. A stale `on_connect` for a
     /// connection already superseded by a newer `Connected`/`Disconnected`
     /// is skipped before it starts, but one that has already started runs
     /// to completion rather than being cancelled mid-flight.
@@ -930,15 +936,12 @@ impl<'a> MqttBuilder<'a> {
         let shared_client = Arc::new(Mutex::new(SubscribableClient(client)));
         let client_for_thread = Arc::clone(&shared_client);
 
-        let epoch = Arc::new(ConnectionEpoch::new());
-        let epoch_for_thread = Arc::clone(&epoch);
-        let epoch_for_handle = Arc::clone(&epoch);
-        // Sessions confirmed since boot; bumped right after each successful confirm.
-        let connects = Arc::new(AtomicU32::new(0));
-        let connects_for_thread = Arc::clone(&connects);
-        // Last lifecycle event, read by `MqttHandle::state` together with the epoch.
-        let phase = Arc::new(SessionPhase::new());
-        let phase_for_thread = Arc::clone(&phase);
+        // The shared session machine: state, readiness, publish gate, connect count.
+        // esp-mqtt starts connecting on its own right away and retries on its own, so
+        // the network counts as up from the start (the network gate is bug 010).
+        let session = Arc::new(Session::new());
+        session.poll(SessionInput::NetworkUp);
+        let session_for_thread = Arc::clone(&session);
 
         // Acknowledged-publish correlation, shared between the event loop (which
         // resolves PUBACKs) and the handle (which registers and waits).
@@ -1004,140 +1007,87 @@ impl<'a> MqttBuilder<'a> {
                     }
 
                     match event.payload() {
-                        EventPayload::Connected(is_clean) => {
+                        EventPayload::Connected(session_present) => {
                             if let Some(next) = next_state(state, MqttEvent::Connected) {
                                 state = next;
-                                log::info!("[mqtt] connected (clean_session={})", is_clean);
-                                // The event-loop thread must never take the client mutex: esp-mqtt
-                                // holds its recursive api_lock for the whole connect handshake, and
-                                // esp-idf-svc parks the mqtt task until this thread calls next()
-                                // again — a mutex held here while another thread blocks on api_lock
-                                // closes a three-way cycle. The helper thread spawned below runs the
-                                // startup publish, then on_connect, then the subscriptions, all under
-                                // one lock of the client; confirm(token) guards against a stale
-                                // helper (from a since-superseded connection) marking us connected.
-                                let token = epoch_for_thread.advance();
-                                if startup_topic.is_none()
-                                    && on_connect.is_none()
-                                    && subscribe_topics.is_empty()
-                                {
-                                    // Nothing to run off-thread — confirm immediately. No
-                                    // advance() can have raced between the one above and
-                                    // here (there is no thread hand-off on this path), so
-                                    // this must succeed.
-                                    let confirmed = epoch_for_thread.confirm(token);
-                                    debug_assert!(
-                                        confirmed,
-                                        "fast path: confirm(token) must succeed right after advance()"
-                                    );
-                                    if confirmed {
-                                        connects_for_thread.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                } else {
-                                    let epoch = Arc::clone(&epoch_for_thread);
-                                    let connects = Arc::clone(&connects_for_thread);
-                                    let startup_topic = startup_topic.clone();
-                                    let on_connect = on_connect.clone();
-                                    let prelude = move |client: &mut SubscribableClient| {
-                                        if !epoch.is_current(token) {
-                                            // A newer Connected/Disconnected already advanced
-                                            // the epoch before this helper even started its
-                                            // prelude — the caller-side guard documented on
-                                            // `spawn_connect_thread` ("Stale-thread safety"):
-                                            // a helper that has not yet started is expected to
-                                            // skip its work here. The subscribe topics passed
-                                            // to `spawn_connect_thread` are not gated by this
-                                            // check and still run against the client below;
-                                            // that is fine, brokers accept a duplicate
-                                            // SUBSCRIBE per MQTT §3.8.
-                                            log::debug!(
-                                                "[mqtt] connect helper: stale connection, \
-                                                 skipping startup publish and on_connect"
-                                            );
-                                            return;
-                                        }
-                                        if let Some(topic) = &startup_topic {
-                                            if let Err(e) = client.enqueue(
-                                                topic,
-                                                EspQoS::AtLeastOnce,
-                                                false,
-                                                b"1",
-                                            ) {
-                                                log::warn!(
-                                                    "[mqtt] startup-message publish to '{}' failed: {:?}",
-                                                    topic, e
-                                                );
-                                            }
-                                        }
-                                        if let Some(cb) = &on_connect {
-                                            let _scope = CallbackScope::enter();
-                                            match cb.lock() {
-                                                Ok(f) => {
-                                                    if let Err(e) = f(&mut *client, is_clean) {
-                                                        log::warn!(
-                                                            "[mqtt] on_connect callback failed: {:#}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                                Err(_) => log::warn!(
-                                                    "[mqtt] on_connect callback mutex poisoned"
-                                                ),
-                                            }
-                                        }
-                                        if epoch.confirm(token) {
-                                            connects.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            log::debug!(
-                                                "[mqtt] connect helper: connection state changed \
-                                                 before on_connect finished; not marking connected"
-                                            );
-                                        }
-                                    };
-                                    let spawned = spawn_connect_thread(
-                                        Arc::clone(&client_for_thread),
-                                        Some(prelude),
-                                        subscribe_topics.clone(),
-                                        CONNECT_THREAD_STACK_SIZE,
-                                    );
-                                    if !spawned {
-                                        // The connect helper thread could not be started.
-                                        // Running the prelude inline here, on the
-                                        // event-loop thread, would reintroduce the
-                                        // deadlock this module exists to avoid (see the
-                                        // module docs): esp-mqtt holds its recursive
-                                        // api_lock for the whole connect handshake, and
-                                        // this thread must return to next() promptly.
-                                        //
-                                        // Confirming the epoch here would also violate the
-                                        // `is_connected()` contract, which promises that
-                                        // `on_connect` has already completed — it has not
-                                        // run at all. So the epoch is left unconfirmed:
-                                        // `MqttHandle::publish*` still enqueue (they do not
-                                        // check readiness), any consumer gating on
-                                        // `is_connected()` keeps waiting, and the next
-                                        // `Connected` event retries the whole sequence.
-                                        log::error!(
-                                            "[mqtt] could not spawn the connect helper thread; \
-                                             on_connect and subscriptions skipped, connection \
-                                             NOT marked ready until the next reconnect"
+                                log::info!(
+                                    "[mqtt] connected (session_present={})",
+                                    session_present
+                                );
+                            }
+                            // The shared session machine decides the connect work: subscribe
+                            // (unless a kept session's subscriptions completed), startup
+                            // message, `on_connect`, and only then ready (bug 014).
+                            match session_for_thread
+                                .poll(SessionInput::Connected { session_present })
+                            {
+                                SessionAction::ConnectWork { token, subscribe } => {
+                                    let subscribe = subscribe && !subscribe_topics.is_empty();
+                                    if !subscribe && startup_topic.is_none() && on_connect.is_none()
+                                    {
+                                        // Nothing to run off-thread.
+                                        session_for_thread.poll(SessionInput::WorkDone(token));
+                                    } else {
+                                        // The event-loop thread must never take the client
+                                        // mutex: esp-mqtt holds its recursive api_lock for the
+                                        // whole connect handshake, and esp-idf-svc parks the
+                                        // mqtt task until this thread calls next() again — a
+                                        // mutex held here while another thread blocks on
+                                        // api_lock closes a three-way cycle (ADR 017). The
+                                        // helper thread does the connect work under one lock of
+                                        // the client.
+                                        let session = Arc::clone(&session_for_thread);
+                                        let topics = subscribe_topics.clone();
+                                        let startup_topic = startup_topic.clone();
+                                        let on_connect = on_connect.clone();
+                                        let work = move |client: &mut SubscribableClient| {
+                                            connect_work(
+                                                client,
+                                                &session,
+                                                token,
+                                                subscribe.then_some(topics.as_slice()),
+                                                startup_topic.as_deref(),
+                                                on_connect.as_deref(),
+                                                session_present,
+                                            )
+                                        };
+                                        let spawned = spawn_connect_thread(
+                                            Arc::clone(&client_for_thread),
+                                            Some(work),
+                                            Vec::new(),
+                                            CONNECT_THREAD_STACK_SIZE,
                                         );
+                                        if !spawned {
+                                            // Running the work inline, or closing the transport,
+                                            // on this thread would reintroduce the deadlock above:
+                                            // esp-mqtt holds api_lock during this dispatch. The
+                                            // session stays not ready until esp-mqtt's next
+                                            // reconnect, as before the session machine.
+                                            log::error!(
+                                                "[mqtt] could not spawn the connect helper thread; \
+                                                 session NOT marked ready until the next reconnect"
+                                            );
+                                            session_for_thread
+                                                .poll(SessionInput::WorkFailed(token));
+                                        }
                                     }
                                 }
+                                other => log::debug!(
+                                    "[mqtt] CONNACK while the session expects {:?}",
+                                    other
+                                ),
                             }
                         }
                         EventPayload::BeforeConnect => {
-                            phase_for_thread.attempt_started();
+                            session_for_thread.poll(SessionInput::AttemptStarted);
                         }
                         EventPayload::Disconnected => {
-                            // Every attempt that fails ends in `Disconnected` too, which
-                            // `next_state` ignores; the phase records it regardless.
-                            // Recorded before `advance()` clears the ready bit, so
-                            // `state()` never reports `Connecting` for a dropped session.
-                            phase_for_thread.session_lost();
+                            // Every attempt that fails ends in `Disconnected` too; the machine
+                            // records it regardless of `next_state`. Its retry pause is
+                            // esp-mqtt's own `reconnect_timeout`, so no timer runs here.
+                            session_for_thread.poll(SessionInput::Disconnected);
                             if let Some(next) = next_state(state, MqttEvent::Disconnected) {
                                 state = next;
-                                epoch_for_thread.advance();
                                 log::info!("[mqtt] disconnected");
                                 // Fail every in-flight acked publish: a dropped
                                 // session must never masquerade as a PUBACK, and a
@@ -1152,11 +1102,10 @@ impl<'a> MqttBuilder<'a> {
                             data,
                             topic: Some(topic_str),
                             ..
-                        } => {
-                            if let Some(ref f) = on_message {
-                                f(topic_str, data);
-                            }
-                        }
+                        } => match on_message {
+                            Some(ref f) => f(topic_str, data),
+                            None => session_for_thread.push_inbound(topic_str, data),
+                        },
                         EventPayload::Subscribed(id) => {
                             log::info!("[mqtt] subscription confirmed (id: {})", id);
                         }
@@ -1180,9 +1129,7 @@ impl<'a> MqttBuilder<'a> {
 
         Ok(MqttHandle {
             client: shared_client,
-            epoch: epoch_for_handle,
-            connects,
-            phase,
+            session,
             pending,
             _alive: alive,
         })
@@ -1280,9 +1227,7 @@ impl<'a> MqttBuilder<'a> {
 #[derive(Clone)]
 pub struct MqttHandle {
     client: Arc<Mutex<SubscribableClient>>,
-    epoch: Arc<ConnectionEpoch>,
-    connects: Arc<AtomicU32>,
-    phase: Arc<SessionPhase>,
+    session: Arc<Session>,
     // Registry correlating in-flight acked publishes to their PUBACK; shared
     // with the event-loop thread, which resolves entries on `Published`.
     pending: PendingAcks,
@@ -1588,10 +1533,10 @@ impl MqttHandle {
     ///
     /// # Mutex contention during subscription handshake
     ///
-    /// The startup message (if enabled), `on_connect`, and every topic
-    /// registered via [`MqttBuilder::subscribe`] are all run, in that order,
-    /// by a single per-connect helper thread — the same thread whose
-    /// completion flips this flag to `true`.  That thread holds the client
+    /// Every topic registered via [`MqttBuilder::subscribe`] (when the session
+    /// needs it), the startup message (if enabled) and `on_connect` are all run,
+    /// in that order, by a single per-connect helper thread — the same thread
+    /// whose completion flips this flag to `true`.  That thread holds the client
     /// mutex for the whole sequence (it does not wait for a SUBACK), so for
     /// the brief window while it holds the mutex:
     ///
@@ -1605,8 +1550,8 @@ impl MqttHandle {
     ///
     /// A stale helper thread — left over from a connection that a fast
     /// disconnect/reconnect has since superseded — cannot flip this flag for
-    /// the newer connection: the underlying [`ConnectionEpoch`] rejects its
-    /// `confirm` once the generation has moved on.
+    /// the newer connection: the shared `SessionMachine` ignores work reported
+    /// for an older session's token.
     ///
     /// # Helper-spawn failure
     ///
@@ -1619,7 +1564,7 @@ impl MqttHandle {
     /// registered on the builder and `on_connect` itself are skipped for
     /// this connection and are retried on the next reconnect.
     pub fn is_connected(&self) -> bool {
-        self.epoch.is_connected()
+        self.session.can_publish()
     }
 
     /// Number of broker sessions established since boot, like the esp-hal
@@ -1629,7 +1574,7 @@ impl MqttHandle {
     /// the startup message, `on_connect` and the subscriptions), so a firmware
     /// that sees it change can republish retained state for the new session.
     pub fn connect_count(&self) -> u32 {
-        self.connects.load(Ordering::Relaxed)
+        self.session.connect_count()
     }
 
     /// Connection state of the session, like the esp-hal handle's `state`.
@@ -1647,6 +1592,157 @@ impl MqttHandle {
     /// [`ShuttingDown`](MqttConnectionState::ShuttingDown) is never returned:
     /// the session ends when the last handle is dropped.
     pub fn state(&self) -> MqttConnectionState {
-        self.phase.state(self.epoch.is_connected())
+        self.session.state()
+    }
+
+    /// Completes once the session is connected, like the esp-hal handle's
+    /// `wait_connected`; cancelling the wait leaves nothing behind.
+    pub async fn wait_connected(&self) {
+        self.session.wait_connected().await
+    }
+
+    /// Waits for the next message on a builder subscription.
+    ///
+    /// Messages reach this queue only when the builder has no
+    /// [`on_message`](MqttBuilder::on_message) callback; with one, the callback
+    /// receives them and this never completes. The queue holds
+    /// [`INBOUND_QUEUE_DEPTH`] messages and drops the oldest when full (see
+    /// [`dropped_inbound`](Self::dropped_inbound)), as on esp-hal.
+    pub async fn receive(&self) -> InboundMessage {
+        self.session.receive().await
+    }
+
+    /// Takes the next queued message, if any (see [`receive`](Self::receive)).
+    pub fn try_receive(&self) -> Option<InboundMessage> {
+        self.session.try_receive()
+    }
+
+    /// Received messages dropped because the queue was full.
+    pub fn dropped_inbound(&self) -> u32 {
+        self.session.dropped_inbound()
+    }
+}
+
+impl MqttClient for MqttHandle {
+    type Error = anyhow::Error;
+    type Message = InboundMessage;
+
+    fn state(&self) -> MqttConnectionState {
+        MqttHandle::state(self)
+    }
+
+    fn connect_count(&self) -> u32 {
+        MqttHandle::connect_count(self)
+    }
+
+    fn try_publish_with(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), TryPublishError> {
+        MqttHandle::try_publish_with(self, topic, payload, qos, retain)
+    }
+
+    /// Hands the message to esp-mqtt's outbox; this tier never waits for space.
+    async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> anyhow::Result<()> {
+        self.publish_with(topic, payload, qos, retain)
+    }
+
+    async fn wait_connected(&self) {
+        MqttHandle::wait_connected(self).await
+    }
+
+    async fn receive(&self) -> InboundMessage {
+        MqttHandle::receive(self).await
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `MqttHandle` stops implementing `MqttClient`.
+const _: fn() = || {
+    fn implements<T: MqttClient>() {}
+    implements::<MqttHandle>();
+};
+
+/// One session's connect work on the helper thread, in the order both tiers share:
+/// subscriptions (when the machine asks), startup message, `on_connect`, then
+/// `WorkDone`. Skips everything if the session already ended; on a failed
+/// subscribe or startup message it reports `WorkFailed` and closes the transport,
+/// so esp-mqtt reconnects and the work runs again.
+#[allow(clippy::too_many_arguments)]
+fn connect_work(
+    client: &mut SubscribableClient,
+    session: &Session,
+    token: SessionToken,
+    topics: Option<&[(String, QoS)]>,
+    startup_topic: Option<&str>,
+    on_connect: Option<&Mutex<OnConnectCallback>>,
+    session_present: bool,
+) {
+    if !session.is_current(token) {
+        log::debug!("[mqtt] connect helper: stale session, skipping its connect work");
+        return;
+    }
+    let mut done = true;
+    for (topic, qos) in topics.unwrap_or_default() {
+        match client.subscribe_topic(topic, *qos) {
+            Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
+            Err(e) => {
+                log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e);
+                done = false;
+                break;
+            }
+        }
+    }
+    if let (true, Some(topic)) = (done, startup_topic) {
+        if let Err(e) = client.enqueue(topic, EspQoS::AtLeastOnce, false, b"1") {
+            log::warn!(
+                "[mqtt] startup-message publish to '{}' failed: {:?}",
+                topic,
+                e
+            );
+            done = false;
+        }
+    }
+    if let (true, Some(callback)) = (done, on_connect) {
+        let _scope = CallbackScope::enter();
+        match callback.lock() {
+            Ok(f) => {
+                if let Err(e) = f(&mut *client, session_present) {
+                    log::warn!("[mqtt] on_connect callback failed: {:#}", e);
+                }
+            }
+            Err(_) => log::warn!("[mqtt] on_connect callback mutex poisoned"),
+        }
+    }
+    let input = if done {
+        SessionInput::WorkDone(token)
+    } else {
+        SessionInput::WorkFailed(token)
+    };
+    if session.poll(input) == SessionAction::Close {
+        close_transport(client);
+    }
+}
+
+/// Drops the broker connection so esp-mqtt reconnects after its `reconnect_timeout`.
+///
+/// Only from the connect helper thread: on the event-loop thread esp-mqtt holds
+/// its `api_lock` during dispatch (ADR 017).
+fn close_transport(client: &SubscribableClient) {
+    use esp_idf_svc::handle::RawHandle;
+
+    // SAFETY: the handle belongs to a live client (we hold it); the call takes
+    // esp-mqtt's api_lock, which is free outside event dispatch.
+    let result = unsafe { esp_idf_svc::sys::esp_mqtt_client_disconnect(client.0.handle()) };
+    if result != esp_idf_svc::sys::ESP_OK {
+        log::warn!("[mqtt] closing the session failed: {}", result);
     }
 }

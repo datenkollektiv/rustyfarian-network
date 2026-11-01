@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rustyfarian-esp-idf-network` `MqttHandle::{wait_connected, receive, try_receive, dropped_inbound}` and `mqtt::InboundMessage`: without an `on_message` callback, received messages go to an 8-slot queue that drops the oldest, as on esp-hal; `MqttHandle` implements `juggler::mqtt::MqttClient` (tier-parity Step 8b-1).
+- `juggler::wait_list::{WaitList, Wait}` (`std`): async waits on a condition another thread changes; a dropped wait unregisters itself and a repolled one replaces its waker.
 - `rustyfarian-esp-idf-network` `WiFiManager::{state, is_ready, is_suspended, connect_count, wait_ready}`: the link worker now also follows the station's IP events, so `is_ready()` and the async `wait_ready()` mean associated with an IP, as on esp-hal (IP events of other interfaces are ignored); `is_suspended()` turns `true` only once the radio is stopped; `WiFiManager` implements `juggler::wifi::NetworkLink` (tier-parity Step 8a).
 - `juggler::waker_slots::WakerSlots<N>` (`no_std`): a fixed set of wakers that refuses a registration when full instead of waking everyone, so more waiters than slots never wake each other in a loop; hal's `WifiLink::wait_connected` uses it and lets extra waiters re-check every `NETWORK_POLL_MS`.
 - `juggler::mqtt::SessionMachine` (`no_std`, sans-IO) with `SessionInput`, `SessionAction`, `SessionToken` and `SESSION_RETRY_MS`: the MQTT session lifecycle both tiers will drive — no attempt without the network, subscriptions and startup message before the session reports ready, stale connect work ignored, a 5 s retry pause while the network is up (tier-parity Step 6).
@@ -87,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ESP-IDF MQTT session is driven by `juggler::mqtt::SessionMachine`: `is_connected()` turns `true` only after the subscriptions, the startup message and `on_connect`, in that order (bug 014); a subscribe or startup-message failure closes the session so esp-mqtt reconnects and repeats it; a kept session whose subscriptions completed is not subscribed again.
 - The esp-hal MQTT runner is driven by `juggler::mqtt::SessionMachine` and `MqttHandle` implements `juggler::mqtt::MqttClient` (tier-parity Step 7b).
   While it waits for the network after a loss, `state()` now reports `Disconnected` instead of `Connecting`, as on ESP-IDF.
   The retry pause also ends early when the network drops.
@@ -163,6 +166,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `bool` passed to the ESP-IDF `on_connect` callback is esp-idf-svc's session-present flag; the docs called it `is_clean_session` with the opposite meaning, and `idf_c3_mqtt`, `idf_esp32_mqtt` and `idf_esp32s3_mqtt_lwt` logged "clean session" for a resumed one. The value passed is unchanged.
 - `rustyfarian-esp-idf-network` `MqttBuilder::build` logged the broker URL and client id read from an `MqttConfig` that can carry credentials, which CodeQL reports as `rust/cleartext-logging`; it now logs the fixed message `[mqtt] creating client`, and callers log host and client id from their own values.
 - `rustyfarian-esp-idf-network` `WiFiManager` never reconnected after a link loss in either connect mode (bug 009): the `StaDisconnected` subscription only logged, so a router outage left the station down until reboot.
   Both modes now reconnect through `juggler::wifi::LinkMachine` on a worker thread; `is_connected()` stays `false` for the whole outage and esp-mqtt reconnects on its own once the link is back.

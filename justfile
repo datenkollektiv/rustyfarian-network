@@ -348,6 +348,7 @@ test-backoff:
 [group('test & lint')]
 test-mqtt:
     cargo test --target {{ host_target }} -p juggler --features std mqtt
+    cargo test --target {{ host_target }} -p juggler --features std wait_list
 
 # run subscriber-thread and connect-thread deadlock regression tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
