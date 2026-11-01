@@ -21,6 +21,10 @@ use juggler::wait_list::WaitList;
 /// the oldest is dropped.
 pub const INBOUND_QUEUE_DEPTH: usize = 8;
 
+/// Largest message body [`MqttHandle::receive`](super::MqttHandle::receive)
+/// reassembles from esp-mqtt's chunks; larger ones are dropped and counted.
+pub const MAX_INBOUND_PAYLOAD_LEN: usize = 16 * 1024;
+
 /// A message received on a builder subscription, for
 /// [`MqttHandle::receive`](super::MqttHandle::receive).
 ///
@@ -106,20 +110,24 @@ impl Session {
         lock(&self.machine).is_current(token)
     }
 
-    /// Queues a received message, dropping the oldest when full.
-    pub(crate) fn push_inbound(&self, topic: &str, payload: &[u8]) {
+    /// Queues a whole received message, dropping the oldest when full.
+    pub(crate) fn push_message(&self, message: InboundMessage) {
         {
             let mut inbound = lock(&self.inbound);
             if inbound.len() >= INBOUND_QUEUE_DEPTH {
                 inbound.pop_front();
-                self.dropped_inbound.fetch_add(1, Ordering::Relaxed);
+                self.count_dropped(1);
             }
-            inbound.push_back(InboundMessage {
-                topic: topic.to_string(),
-                payload: payload.to_vec(),
-            });
+            inbound.push_back(message);
         }
         self.arrivals.wake_all();
+    }
+
+    /// Counts received messages that never reached the queue.
+    pub(crate) fn count_dropped(&self, messages: u32) {
+        if messages > 0 {
+            self.dropped_inbound.fetch_add(messages, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn try_receive(&self) -> Option<InboundMessage> {

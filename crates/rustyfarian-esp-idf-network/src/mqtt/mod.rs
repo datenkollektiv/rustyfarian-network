@@ -146,8 +146,9 @@ use juggler::mqtt::{
 };
 
 mod session;
+use juggler::mqtt::chunks::{Assembled, Chunk, ChunkAssembler};
 use session::Session;
-pub use session::{InboundMessage, INBOUND_QUEUE_DEPTH};
+pub use session::{InboundMessage, INBOUND_QUEUE_DEPTH, MAX_INBOUND_PAYLOAD_LEN};
 
 // Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
@@ -232,7 +233,7 @@ pub const LED_POLL_INTERVAL_MS: u64 = 50;
 pub const ERROR_PULSE_FRAMES: u32 = 20;
 
 use esp_idf_svc::mqtt::client::{
-    EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS as EspQoS,
+    Details, EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS as EspQoS,
 };
 
 /// Error returned by [`MqttHandle::publish_acked`].
@@ -975,6 +976,8 @@ impl<'a> MqttBuilder<'a> {
                 // methods must refuse calls made from this thread.
                 let _callback_scope = CallbackScope::enter();
                 let mut state = MqttConnectionState::Connecting;
+                // Joins chunked messages for the receive queue; owned by this thread.
+                let mut assembler = ChunkAssembler::new(MAX_INBOUND_PAYLOAD_LEN);
 
                 loop {
                     // Exit when all MqttHandle clones have been dropped.
@@ -1100,11 +1103,70 @@ impl<'a> MqttBuilder<'a> {
                         }
                         EventPayload::Received {
                             data,
-                            topic: Some(topic_str),
+                            topic,
+                            details,
                             ..
                         } => match on_message {
-                            Some(ref f) => f(topic_str, data),
-                            None => session_for_thread.push_inbound(topic_str, data),
+                            // Unchanged contract: the callback sees each event that
+                            // carries a topic (the first chunk of a long message).
+                            Some(ref f) => {
+                                if let Some(topic_str) = topic {
+                                    f(topic_str, data);
+                                }
+                            }
+                            // The receive queue gets whole messages only: esp-mqtt
+                            // splits one that exceeds its buffer into chunks.
+                            None => {
+                                let chunk = match (details, topic) {
+                                    (Details::Complete, Some(topic)) => {
+                                        Some(Chunk::Complete { topic, data })
+                                    }
+                                    (Details::InitialChunk(first), Some(topic)) => {
+                                        Some(Chunk::First {
+                                            topic,
+                                            data,
+                                            total: first.total_data_size,
+                                        })
+                                    }
+                                    (Details::SubsequentChunk(next), _) => Some(Chunk::Next {
+                                        data,
+                                        offset: next.current_data_offset,
+                                        total: next.total_data_size,
+                                    }),
+                                    _ => None,
+                                };
+                                if let Some(chunk) = chunk {
+                                    let abandoned = assembler.abandoned();
+                                    let outcome = assembler.feed(chunk);
+                                    session_for_thread.count_dropped(
+                                        assembler.abandoned().wrapping_sub(abandoned),
+                                    );
+                                    match outcome {
+                                        Assembled::Message { topic, payload } => {
+                                            session_for_thread
+                                                .push_message(InboundMessage { topic, payload });
+                                        }
+                                        Assembled::Pending => {}
+                                        Assembled::TooLarge => {
+                                            session_for_thread.count_dropped(1);
+                                            log::warn!(
+                                                "[mqtt] dropped inbound message above {} bytes",
+                                                MAX_INBOUND_PAYLOAD_LEN
+                                            );
+                                        }
+                                        Assembled::OutOfOrder => {
+                                            // A message in progress was counted as
+                                            // abandoned above; a stray chunk counts once.
+                                            if assembler.abandoned() == abandoned {
+                                                session_for_thread.count_dropped(1);
+                                            }
+                                            log::warn!(
+                                                "[mqtt] dropped an out-of-order inbound chunk"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         },
                         EventPayload::Subscribed(id) => {
                             log::info!("[mqtt] subscription confirmed (id: {})", id);
@@ -1608,6 +1670,10 @@ impl MqttHandle {
     /// receives them and this never completes. The queue holds
     /// [`INBOUND_QUEUE_DEPTH`] messages and drops the oldest when full (see
     /// [`dropped_inbound`](Self::dropped_inbound)), as on esp-hal.
+    ///
+    /// A message that esp-mqtt delivers in chunks (larger than its receive
+    /// buffer) is queued once, whole; bodies above [`MAX_INBOUND_PAYLOAD_LEN`]
+    /// and broken chunk sequences are dropped and counted.
     pub async fn receive(&self) -> InboundMessage {
         self.session.receive().await
     }

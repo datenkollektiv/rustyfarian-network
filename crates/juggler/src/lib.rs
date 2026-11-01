@@ -81,7 +81,12 @@
 
 // alloc is needed in tests (provisioning + espnow mocks use alloc::format! etc.)
 // and by the `ota-wire` JSON types (String, serde_json).
-#[cfg(any(test, feature = "ota-wire", all(feature = "mock", feature = "mqtt")))]
+#[cfg(any(
+    test,
+    feature = "ota-wire",
+    feature = "std",
+    all(feature = "mock", feature = "mqtt")
+))]
 extern crate alloc;
 
 // Shared test fixtures; every user sits under `wifi` or `mqtt` (provisioning implies both).
