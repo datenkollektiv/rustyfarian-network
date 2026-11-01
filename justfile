@@ -358,6 +358,7 @@ test-subscriber-thread:
 [group('test & lint')]
 test-wifi:
     cargo test --target {{ host_target }} -p juggler --features mock
+    cargo test --target {{ host_target }} -p juggler --features wifi,std wifi::
 
 # run platform-independent LoRa unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]

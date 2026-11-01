@@ -32,6 +32,19 @@
 //!   skips the state check, so it can enqueue while disconnected; those messages go
 //!   out after the next connect.
 //!
+//! While Wi-Fi is suspended (`WifiLink::suspend`) the client has no call of its
+//! own; it sends no DISCONNECT, so the broker keeps the will armed:
+//!
+//! * **State:** the network watch sees the link down within 500 ms and ends the
+//!   session; [`MqttHandle::state`] leaves `Connected` and the runner waits for
+//!   the network, so there is no retry churn while suspended.
+//! * **Publishing:** [`MqttHandle::try_publish`] returns `WouldBlock`;
+//!   [`MqttHandle::publish_with`] still enqueues for the next session.
+//! * **Broker view:** the will goes out after 1.5 × keep-alive; a shorter suspend
+//!   ends in a client-id takeover on reconnect (will, then the startup message).
+//! * **After `resume`:** the runner connects as soon as the link and DHCP are up,
+//!   republishes the startup message and bumps [`MqttHandle::connect_count`].
+//!
 //! Limitations in v1: the broker host must be an IPv4 literal, publishes are
 //! QoS 0/1, subscriptions are fixed at build time, and payloads are capped at
 //! [`MAX_PAYLOAD_LEN`] bytes. All buffers are `static` — nothing is heap-allocated.

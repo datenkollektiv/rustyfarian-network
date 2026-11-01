@@ -22,6 +22,8 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 | Suspend is a state of the running stack: IDF `disconnect`+`stop` / `start`+`connect`; hal `disconnect_async` and park     | `Modem` cannot be re-created; esp-radio has no stop; deep sleep must stay abortable                         | Drop and re-create the managers                                         |
 | IDF `suspend()`/`resume()` run their IDF calls inline on the caller's thread                                              | Millisecond-bounded; the radio is stopped when `suspend()` returns, as deep sleep needs                     | Hand them to the worker (asynchronous, caller must poll)                |
 | MQTT during suspend: no new API; the dying transport sends no DISCONNECT, the broker fires the LWT after 1.5 × keep-alive | `esp_mqtt_client_stop`/`destroy` send DISCONNECT and block; stopping Wi-Fi is the only LWT-preserving pause | `MqttHandle::suspend()` wrapping `esp_mqtt_client_stop`                 |
+| hal `suspend()`/`resume()` set the state at once, `run` acts on a `Signal`                                                | state() is Suspended immediately; run reacts at every await (select)                                        | A command channel drained by run (state lags; queue can overflow)       |
+| IDF worker drops link events behind a stop; `resume()` never waits             | Stale pre-stop events cannot start a second connect, however late they arrive | A resume-side timeout that clears the fence (late events slip through)  |
 | IDF `try_publish*` returns `WouldBlock` while `is_connected()` is false, like the hal tier                                | One publish contract across tiers ("streamline the two solutions")                                          | Keep the esp-mqtt outbox behaviour and document the gap                 |
 | Graceful variant is a documented recipe: `publish_acked` offline, then `suspend()`                                        | The firmware holds the handle and the topic; nothing for the library to add                                 | `suspend_graceful(topic, payload)`                                      |
 | Twin example `idf_esp32s3_mqtt_lwt`, client id `idf-s3-mqtt`, prefix `rustyfarian/idf-mqtt`                               | Same env keys as `hal_esp32s3_mqtt_lwt`; distinguishable on one broker                                      | Reuse `idf_c3_mqtt` on the S3                                           |
@@ -36,20 +38,26 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 - Deep sleep: IDF calls `suspend()` (which runs `esp_wifi_stop`) before `esp_deep_sleep_start`; esp-hal needs only `suspend()`, the reset re-initialises the radio.
 - A suspend shorter than 1.5 × keep-alive ends with a client-id takeover on resume: the broker publishes the will, then the startup message; the 3-minute outage fires the will the normal way.
 - `just fmt`, `just verify`, `just test` and `just build-example` for all 7 converted hal examples plus the two S3 LWT examples stay green.
+- The aborted-sleep case is covered: a `resume()` within 50 ms of `suspend()` leaves exactly one connect in flight.
 
 ## Open Questions
 - [ ] Add jitter to the back-off once a fleet of devices behind one AP needs it (deterministic delays resynchronise after an AP outage)?
-- [ ] Does esp-mqtt's 10 s reconnect churn while Wi-Fi is stopped need a longer `reconnect_timeout` in the knob, or is the log noise acceptable?
+- [x] esp-mqtt's 10 s reconnect churn while Wi-Fi is stopped is documented as acceptable log noise; raise `reconnect_timeout` to quiet it, at the cost of a slower reconnect after resume.
+- [ ] Add a watchdog for a `Connecting` or fenced link that never sees its event, should a tier ever lose driver events (today both rely on in-order delivery)?
 
 ## State
 - [x] Design approved
 - [x] PR 1 (U2f-a): `LinkMachine` without suspend, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, publish parity
-- [ ] PR 2 (U2f-b): suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] PR 2 (U2f-b): suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
+- [x] Tests passing
+- [x] Documentation updated
 - [ ] Hardware gate: knob runs the outage and suspend protocols on the CrowPanel S3
 
 ## Session Log
 - 2026-10-31 — Feature doc created from request U2f after design review; reconnect policy moved into one pure machine at the maintainer's request
 - 2026-10-31 — PR 1 implemented on `reconnect-rework`: `LinkMachine` (8 host tests), IDF worker, `WifiLink` + `link_task`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, IDF `try_publish*` gate, bug 009, runbook `wifi-reconnect-hardware-test.md`; all 8 example builds green; hardware gate open
 - 2026-10-31 — PR 1 review applied: IDF first connect goes through the worker in every mode, `LinkWorker` joins before the driver drops, hal `run` resets on entry and counts an adopted link, machine adapter contract documented
+- 2026-11-01 — PR 2 implemented: suspend/resume on both tiers, IDF connect_count, MQTT_SUSPEND_DEMO, deep-sleep guide docs/wifi-suspend-and-deep-sleep.md, runbook R3; 14 machine tests; hardware gate open
+- 2026-11-01 — PR 2 review applied: hal handover published under the state lock, IDF stop fence moved into resume and the worker, adapters extracted to juggler `LinkHandover` / `LinkSupervisor` with host tests
+- 2026-11-01 — Second and third review applied: no fence timeout in resume (a lost `Stopped` expires after 5 s in the worker), back-off deadline kept under the core lock, failure-injection concurrency tests, radio difference between tiers made prominent
+- 2026-11-01 — Fourth review applied: the stop fence has no timeout, only `Stopped` re-admits link events; the in-order, no-loss event contract is documented and late-event tests cover delays beyond every timer

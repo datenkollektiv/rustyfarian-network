@@ -101,6 +101,7 @@ provisioning = [
 # Enabled automatically by `wifi`, `ota`, and `provisioning`.
 embassy = [
     "dep:embassy-executor",
+    "dep:embassy-futures",
     "dep:embassy-net",
     "embassy-net?/dhcpv4",
     "embassy-net?/proto-ipv4",

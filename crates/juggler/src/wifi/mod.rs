@@ -18,12 +18,18 @@
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
+pub mod handover;
 pub mod link;
+#[cfg(feature = "std")]
+pub mod supervisor;
 
+pub use handover::LinkHandover;
 pub use link::{
     LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
     RECONNECT_BACKOFF_MAX_MS,
 };
+#[cfg(feature = "std")]
+pub use supervisor::{LinkEvent, LinkEvents, LinkRadio, LinkSupervisor};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 

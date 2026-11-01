@@ -68,7 +68,7 @@ embedded-svc      = { workspace = true, optional = true }
 default = []
 
 # wifi: Wi-Fi STA connection manager + SoftAP lifecycle manager.
-wifi = ["juggler/wifi", "dep:pennant", "dep:rgb"]
+wifi = ["juggler/wifi", "juggler/std", "dep:pennant", "dep:rgb"]
 
 # mqtt: MQTT builder + handle, MqttManager (deprecated), background event loop.
 mqtt = ["juggler/mqtt", "juggler/std", "dep:pennant", "dep:rgb"]
