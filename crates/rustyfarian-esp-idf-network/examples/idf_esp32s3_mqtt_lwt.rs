@@ -119,9 +119,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         })
         .on_disconnect(|| log::warn!("[mqtt] disconnected — esp-mqtt reconnects on its own"))
-        .on_message(|topic, payload| {
-            let body = std::str::from_utf8(payload).unwrap_or("<non-utf8>");
-            log::info!("[example] rx topic={} payload={}", topic, body);
+        .on_message(|topic, payload| match std::str::from_utf8(payload) {
+            Ok(text) => log::info!("[example] rx topic={} payload={}", topic, text),
+            Err(_) => log::info!(
+                "[example] rx topic={} payload={} bytes (binary)",
+                topic,
+                payload.len()
+            ),
         })
         .build()?;
 
@@ -135,6 +139,7 @@ fn main() -> anyhow::Result<()> {
     let suspend_demo = env::mqtt_suspend_demo();
     let mut tick: u32 = 0;
     let mut last_link = wifi.link_state();
+    let mut last_state = mqtt.state();
     let mut mqtt_was_up = false;
     let mut secs_since_heap_log: u64 = 0;
     loop {
@@ -160,18 +165,20 @@ fn main() -> anyhow::Result<()> {
             log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
             last_link = link;
         }
-        let mqtt_up = mqtt.is_connected();
-        if mqtt_up != mqtt_was_up {
-            if mqtt_up {
-                log::info!(
-                    "[example] connect #{} free heap: {} B",
-                    mqtt.connect_count(),
-                    free_heap()
-                );
-            }
-            log::info!("[example] mqtt {} -> {}", mqtt_was_up, mqtt_up);
-            mqtt_was_up = mqtt_up;
+        let state = mqtt.state();
+        if state != last_state {
+            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
+            last_state = state;
         }
+        let mqtt_up = mqtt.is_connected();
+        if mqtt_up && !mqtt_was_up {
+            log::info!(
+                "[example] connect #{} free heap: {} B",
+                mqtt.connect_count(),
+                free_heap()
+            );
+        }
+        mqtt_was_up = mqtt_up;
 
         let payload = format!(
             "{{\"tick\":{},\"uptime_s\":{},\"free_heap\":{}}}",
@@ -181,12 +188,9 @@ fn main() -> anyhow::Result<()> {
         );
         match mqtt.try_publish(&tick_topic, &payload) {
             Ok(()) => log::info!("[example] tick #{} queued", tick),
-            Err(TryPublishError::WouldBlock) => log::info!(
-                "[example] tick #{} would block (wifi {:?} mqtt {})",
-                tick,
-                link,
-                mqtt_up
-            ),
+            Err(TryPublishError::WouldBlock) => {
+                log::info!("[example] tick #{} would block (mqtt {:?})", tick, state)
+            }
             Err(TryPublishError::Other(e)) => {
                 log::warn!("[example] tick #{} failed: {:#}", tick, e)
             }

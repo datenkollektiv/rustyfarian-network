@@ -141,14 +141,16 @@ pub use pennant::{SimpleLed, StatusLed};
 use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, in_callback, next_state, spawn_connect_thread,
     validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
-    validate_subscribe_filter, AckOutcome, CallbackScope, ConnectionEpoch, MqttConnectionState,
-    MqttEvent, PendingAcks, SubscribeClient,
+    validate_subscribe_filter, AckOutcome, CallbackScope, ConnectionEpoch, MqttEvent, PendingAcks,
+    SessionPhase, SubscribeClient,
 };
 
 // Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
 // negotiation error paths — corrupting the heap and crashing `pthread_exit`.
-pub use juggler::mqtt::{LwtConfig, MqttConfig, QoS, DEFAULT_MQTT_TASK_STACK_SIZE};
+pub use juggler::mqtt::{
+    LwtConfig, MqttConfig, MqttConnectionState, QoS, DEFAULT_MQTT_TASK_STACK_SIZE,
+};
 
 /// Error returned by the `try_publish*` family when the publish cannot
 /// complete without blocking.
@@ -934,6 +936,9 @@ impl<'a> MqttBuilder<'a> {
         // Sessions confirmed since boot; bumped right after each successful confirm.
         let connects = Arc::new(AtomicU32::new(0));
         let connects_for_thread = Arc::clone(&connects);
+        // Last lifecycle event, read by `MqttHandle::state` together with the epoch.
+        let phase = Arc::new(SessionPhase::new());
+        let phase_for_thread = Arc::clone(&phase);
 
         // Acknowledged-publish correlation, shared between the event loop (which
         // resolves PUBACKs) and the handle (which registers and waits).
@@ -1121,7 +1126,15 @@ impl<'a> MqttBuilder<'a> {
                                 }
                             }
                         }
+                        EventPayload::BeforeConnect => {
+                            phase_for_thread.attempt_started();
+                        }
                         EventPayload::Disconnected => {
+                            // Every attempt that fails ends in `Disconnected` too, which
+                            // `next_state` ignores; the phase records it regardless.
+                            // Recorded before `advance()` clears the ready bit, so
+                            // `state()` never reports `Connecting` for a dropped session.
+                            phase_for_thread.session_lost();
                             if let Some(next) = next_state(state, MqttEvent::Disconnected) {
                                 state = next;
                                 epoch_for_thread.advance();
@@ -1169,6 +1182,7 @@ impl<'a> MqttBuilder<'a> {
             client: shared_client,
             epoch: epoch_for_handle,
             connects,
+            phase,
             pending,
             _alive: alive,
         })
@@ -1268,6 +1282,7 @@ pub struct MqttHandle {
     client: Arc<Mutex<SubscribableClient>>,
     epoch: Arc<ConnectionEpoch>,
     connects: Arc<AtomicU32>,
+    phase: Arc<SessionPhase>,
     // Registry correlating in-flight acked publishes to their PUBACK; shared
     // with the event-loop thread, which resolves entries on `Published`.
     pending: PendingAcks,
@@ -1615,5 +1630,23 @@ impl MqttHandle {
     /// that sees it change can republish retained state for the new session.
     pub fn connect_count(&self) -> u32 {
         self.connects.load(Ordering::Relaxed)
+    }
+
+    /// Connection state of the session, like the esp-hal handle's `state`.
+    ///
+    /// - [`Connecting`](MqttConnectionState::Connecting): an attempt is in
+    ///   progress (esp-mqtt's `BeforeConnect`), including the time the connect
+    ///   helper runs the startup message, `on_connect` and the subscriptions.
+    /// - [`Connected`](MqttConnectionState::Connected): exactly when
+    ///   [`is_connected`](Self::is_connected) is `true`.
+    /// - [`Disconnected`](MqttConnectionState::Disconnected): the session or the
+    ///   last attempt failed; esp-mqtt retries after its `reconnect_timeout`.
+    ///
+    /// While the broker is unreachable the state alternates between
+    /// `Connecting` and `Disconnected` once per attempt.
+    /// [`ShuttingDown`](MqttConnectionState::ShuttingDown) is never returned:
+    /// the session ends when the last handle is dropped.
+    pub fn state(&self) -> MqttConnectionState {
+        self.phase.state(self.epoch.is_connected())
     }
 }

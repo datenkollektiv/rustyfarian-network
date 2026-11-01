@@ -22,6 +22,9 @@
 //! assert_eq!(driver.connect_count, 1);
 //! ```
 
+// Test double for the deprecated `WifiDriver`; it goes away with the trait.
+#![allow(deprecated)]
+
 use super::{WifiDriver, WifiPowerSave};
 
 /// Error type for [`MockWifiDriver`].

@@ -48,16 +48,18 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
-use esp_println::println;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::mqtt::{
-    LwtConfig, MqttBuilder, MqttConfig, MqttHandle, MqttRunner, QoS, TryPublishError,
+    LwtConfig, MqttBuilder, MqttHandle, MqttRunner, QoS, TryPublishError,
 };
 use rustyfarian_esp_hal_network::wifi::{
     link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
     SUSPEND_DISCONNECT_TIMEOUT_MS,
 };
 use static_cell::StaticCell;
+
+#[path = "common/env.rs"]
+mod env;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -67,65 +69,22 @@ const TICK_SECS: u64 = 5;
 const HEAP_LOG_SECS: u64 = 60;
 const SUSPEND_EVERY_SECS: u64 = 60;
 const SUSPEND_FOR_SECS: u64 = 20;
+const KEEP_ALIVE_SECS: u64 = 30;
 
-const SSID: &str = match option_env!("WIFI_SSID") {
-    Some(s) => s,
-    None => "",
-};
-// No literal fallback: an unset secret yields the `&str` type default (`""`),
-// keeping CodeQL's hard-coded-credential query source-free.
-fn wifi_password() -> &'static str {
-    option_env!("WIFI_PASS").unwrap_or_default()
-}
-fn mqtt_password() -> Option<&'static str> {
-    option_env!("MQTT_PASS")
-}
-fn suspend_demo() -> bool {
-    option_env!("MQTT_SUSPEND_DEMO") == Some("1")
-}
-
-const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
-    Some(s) => s,
-    None => "",
-};
-const MQTT_PORT: u16 = parse_port(match option_env!("MQTT_PORT") {
-    Some(s) => s,
-    None => "1883",
-});
-const MQTT_CLIENT_ID: &str = match option_env!("MQTT_CLIENT_ID") {
-    Some(s) => s,
-    None => "hal-s3-mqtt",
-};
-const MQTT_USER: Option<&str> = option_env!("MQTT_USER");
-const TOPIC_PREFIX: &str = match option_env!("MQTT_TOPIC_PREFIX") {
-    Some(s) => s,
-    None => "rustyfarian/hal-mqtt",
-};
-
-/// Parses a decimal port at compile time; a malformed value falls back to 1883.
-const fn parse_port(s: &str) -> u16 {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut value: u32 = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b < b'0' || b > b'9' || value > 6553 {
-            return 1883;
-        }
-        value = value * 10 + (b - b'0') as u32;
-        i += 1;
-    }
-    if value == 0 || value > 65535 {
-        1883
-    } else {
-        value as u16
-    }
+/// Logs a start-up failure and parks; an example has nothing to fall back to.
+fn fatal(what: &str, reason: &dyn core::fmt::Display) -> ! {
+    log::error!("FATAL: {}: {}", what, reason);
+    loop {}
 }
 
 /// Builds `<prefix>/<suffix>` once into static storage so the builder can keep it.
-fn static_topic(cell: &'static StaticCell<heapless::String<64>>, suffix: &str) -> &'static str {
+fn static_topic(
+    cell: &'static StaticCell<heapless::String<64>>,
+    prefix: &str,
+    suffix: &str,
+) -> &'static str {
     let mut topic = heapless::String::<64>::new();
-    let _ = topic.push_str(TOPIC_PREFIX);
+    let _ = topic.push_str(prefix);
     let _ = topic.push('/');
     let _ = topic.push_str(suffix);
     cell.init(topic).as_str()
@@ -134,6 +93,19 @@ fn static_topic(cell: &'static StaticCell<heapless::String<64>>, suffix: &str) -
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Info);
+
+    let client_id = env::mqtt_client_id("hal-s3-mqtt");
+    let prefix = env::mqtt_topic_prefix("rustyfarian/hal-mqtt");
+    env::log_config(client_id);
+    if let Err(e) = env::mqtt_host() {
+        fatal("configuration", &e);
+    }
+    if client_id.len() > 23 {
+        fatal(
+            "MQTT_CLIENT_ID is longer than the MQTT 3.1.1 maximum of 23 bytes",
+            &client_id,
+        );
+    }
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -147,15 +119,12 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    println!("Initializing Wi-Fi (async, scheduler already running)...");
-    let config =
-        WiFiConfig::new(SSID, wifi_password()).with_wifi_scheduler_running(peripherals.WIFI);
+    log::info!("Initializing Wi-Fi (async, scheduler already running)...");
+    let config = WiFiConfig::new(env::WIFI_SSID, env::wifi_pass())
+        .with_wifi_scheduler_running(peripherals.WIFI);
     let handle = match WiFiManager::init_async(config) {
         Ok(h) => h,
-        Err(e) => {
-            println!("FATAL: Wi-Fi init failed: {}", e);
-            loop {}
-        }
+        Err(e) => fatal("Wi-Fi init failed", &e),
     };
     let AsyncWifiHandle {
         controller,
@@ -165,29 +134,31 @@ async fn main(spawner: Spawner) {
     spawner.spawn(link_task(&LINK, controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    println!("Waiting for DHCPv4 lease...");
+    log::info!("Waiting for DHCPv4 lease...");
     stack.wait_config_up().await;
     let v4 = stack
         .config_v4()
         .expect("stack reports config up but has no IPv4 config");
-    println!(
+    log::info!(
         "Wi-Fi connected — IP: {}  gateway: {:?}",
-        v4.address, v4.gateway
+        v4.address,
+        v4.gateway
     );
 
     static STATUS_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
     static CMD_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
     static TICK_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
-    let status_topic = static_topic(&STATUS_TOPIC, "status");
-    let cmd_topic = static_topic(&CMD_TOPIC, "cmd");
-    let tick_topic = static_topic(&TICK_TOPIC, "tick");
+    let status_topic = static_topic(&STATUS_TOPIC, prefix, "status");
+    let cmd_topic = static_topic(&CMD_TOPIC, prefix, "cmd");
+    let tick_topic = static_topic(&TICK_TOPIC, prefix, "tick");
 
     let lwt = LwtConfig::new(status_topic, b"offline", QoS::AtLeastOnce, true);
-    let mut mqtt_config = MqttConfig::new(MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID)
-        .with_keep_alive(30)
-        .with_lwt(lwt);
-    if let Some(user) = MQTT_USER {
-        mqtt_config = match mqtt_password() {
+    let mut mqtt_config = match env::mqtt_config(client_id) {
+        Ok(c) => c.with_keep_alive(KEEP_ALIVE_SECS).with_lwt(lwt),
+        Err(e) => fatal("configuration", &e),
+    };
+    if let Some(user) = env::MQTT_USER {
+        mqtt_config = match env::mqtt_pass() {
             Some(pass) => mqtt_config.with_auth(user, pass),
             None => mqtt_config.with_username_only(user),
         };
@@ -198,19 +169,19 @@ async fn main(spawner: Spawner) {
         .build(stack)
     {
         Ok(pair) => pair,
-        Err(e) => {
-            println!("FATAL: MQTT build failed: {}", e);
-            loop {}
-        }
+        Err(e) => fatal("MQTT build failed", &e),
     };
     spawner.spawn(mqtt_task(mqtt_runner).unwrap());
     spawner.spawn(rx_task(mqtt).unwrap());
 
-    println!(
+    log::info!(
         "[example] topics: status={} cmd={} tick={}",
-        status_topic, cmd_topic, tick_topic
+        status_topic,
+        cmd_topic,
+        tick_topic
     );
 
+    let suspend_demo = env::mqtt_suspend_demo();
     let mut tick: u32 = 0;
     let mut last_link = LINK.state();
     let mut last_state = mqtt.state();
@@ -222,32 +193,32 @@ async fn main(spawner: Spawner) {
         secs_since_heap_log += TICK_SECS;
 
         let uptime = tick as u64 * TICK_SECS;
-        if suspend_demo() && uptime % SUSPEND_EVERY_SECS == 0 {
-            println!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
+        if suspend_demo && uptime % SUSPEND_EVERY_SECS == 0 {
+            log::info!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
             LINK.suspend();
             // The deep-sleep recipe: wait, bounded, until the station is down.
             let deadline = Instant::now() + Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS);
             while !LINK.is_suspended() && Instant::now() < deadline {
                 Timer::after(Duration::from_millis(10)).await;
             }
-            println!("[example] demo: is_suspended = {}", LINK.is_suspended());
-        } else if suspend_demo() && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
-            println!("[example] demo: resume");
+            log::info!("[example] demo: is_suspended = {}", LINK.is_suspended());
+        } else if suspend_demo && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
+            log::info!("[example] demo: resume");
             LINK.resume();
         }
 
         let link = LINK.state();
         if link != last_link {
-            println!("[example] wifi link {:?} -> {:?}", last_link, link);
+            log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
             last_link = link;
         }
         let state = mqtt.state();
         if state != last_state {
-            println!("[example] mqtt state {:?} -> {:?}", last_state, state);
+            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
             last_state = state;
         }
         if mqtt.is_connected() && !was_connected {
-            println!(
+            log::info!(
                 "[example] connect #{} free heap: {} B",
                 mqtt.connect_count(),
                 esp_alloc::HEAP.free()
@@ -266,16 +237,16 @@ async fn main(spawner: Spawner) {
             ),
         );
         match mqtt.try_publish(tick_topic, payload.as_bytes()) {
-            Ok(()) => println!("[example] tick #{} queued", tick),
+            Ok(()) => log::info!("[example] tick #{} queued", tick),
             Err(TryPublishError::WouldBlock) => {
-                println!("[example] tick #{} would block (mqtt {:?})", tick, state)
+                log::info!("[example] tick #{} would block (mqtt {:?})", tick, state)
             }
-            Err(TryPublishError::Other(e)) => println!("[example] tick #{} failed: {}", tick, e),
+            Err(TryPublishError::Other(e)) => log::warn!("[example] tick #{} failed: {}", tick, e),
         }
 
         if secs_since_heap_log >= HEAP_LOG_SECS {
             secs_since_heap_log = 0;
-            println!(
+            log::info!(
                 "[example] heap free: {} B, connects: {}, dropped rx/tx: {}/{}",
                 esp_alloc::HEAP.free(),
                 mqtt.connect_count(),
@@ -296,13 +267,13 @@ async fn rx_task(mqtt: MqttHandle) {
     loop {
         let msg = mqtt.receive().await;
         match core::str::from_utf8(msg.payload.as_slice()) {
-            Ok(text) => println!(
+            Ok(text) => log::info!(
                 "[example] rx topic={} payload={} retained={}",
                 msg.topic.as_str(),
                 text,
                 msg.retained
             ),
-            Err(_) => println!(
+            Err(_) => log::info!(
                 "[example] rx topic={} payload={} bytes (binary)",
                 msg.topic.as_str(),
                 msg.payload.len()

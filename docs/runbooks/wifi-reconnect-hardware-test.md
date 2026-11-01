@@ -36,6 +36,7 @@ Serial lines quoted below are prefixes; numbers vary.
 5. Un-pause after about 3 minutes; pass: the link comes back on the next attempt (`[wifi] link up #2` on hal, `WiFi connect requested` then an IP log on IDF) without a reboot.
 6. Pass: MQTT reconnects on its own (`[mqtt] connected` on both tiers, from esp-mqtt's own retry on IDF), `status online` is retained again and ticks are `queued` again.
    On IDF, at most the ticks `queued` between the pause and the `[mqtt] disconnected` line may arrive after the reconnect (esp-mqtt outbox, QoS 1); any tick logged `would block` must never reach the broker.
+   Pass on both tiers: `[example] mqtt state Connected -> Disconnected` after the pause, `Disconnected -> Connecting` and back once per retry while paused, and `Connecting -> Connected` after the un-pause.
 7. Record the time from un-pause to the first `queued` tick; expect under 45 s (back-off at most 30 s plus the MQTT connect).
 
 ### R2 — wrong credentials (optional)

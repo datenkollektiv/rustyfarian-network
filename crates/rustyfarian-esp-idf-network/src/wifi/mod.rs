@@ -87,6 +87,8 @@ use pennant::PulseEffect;
 use rgb::RGB8;
 
 // Re-export all pure types from juggler::wifi
+// `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
+#[allow(deprecated)]
 pub use juggler::wifi::{
     validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig,
     ConnectMode, LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig,
