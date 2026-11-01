@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
                 payload.len()
             ),
         })
-        .build()?;
+        .build(&wifi)?;
 
     log::info!(
         "[example] topics: status={} cmd={} tick={}",

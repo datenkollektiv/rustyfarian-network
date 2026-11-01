@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
                 other => log::error!("[guard] publish from on_message: {other:?}"),
             }
         })
-        .build()?;
+        .build(&wifi)?;
 
     if handle_slot.set(handle.clone()).is_err() {
         anyhow::bail!("handle slot already set");

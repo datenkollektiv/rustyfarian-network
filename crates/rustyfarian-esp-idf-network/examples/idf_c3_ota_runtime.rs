@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
         .on_message(move |topic, payload| {
             callback_submitter.handle(topic, payload);
         })
-        .build()?;
+        .build(&wifi)?;
 
     let ota = runtime.start(mqtt.clone(), records)?;
 

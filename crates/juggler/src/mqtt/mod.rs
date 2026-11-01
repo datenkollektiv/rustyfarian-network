@@ -3,11 +3,17 @@
 #[cfg(feature = "std")]
 pub mod chunks;
 mod client;
+mod gate;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+#[cfg(feature = "std")]
+pub mod outbox;
 pub mod session;
 
 pub use client::{MqttClient, MqttMessage};
+pub use gate::NetworkGate;
+#[cfg(feature = "std")]
+pub use outbox::{Outbox, PendingPublish};
 pub use session::{SessionAction, SessionInput, SessionMachine, SessionToken, SESSION_RETRY_MS};
 
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.

@@ -71,10 +71,9 @@ fn main() -> anyhow::Result<()> {
     let wifi_config = WiFiConfig::new(env::WIFI_SSID, env::wifi_pass());
     let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), wifi_config)?;
 
-    match wifi.get_ip(10_000)? {
-        Some(ip) => log::info!("Wi-Fi connected — IP: {}", ip),
-        None => log::warn!("Wi-Fi connected but IP not yet assigned"),
-    }
+    // No `get_ip` wait: the MQTT session is gated on the link, so it starts as
+    // soon as the station holds an IP and logs no failed attempt before that
+    // (bug 010).
 
     let lwt_topic = format!("{}/status", client_id);
     let lwt = LwtConfig::new(&lwt_topic, b"offline", QoS::AtLeastOnce, true);
@@ -110,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                 _ => log::warn!("[cmd] unknown command: {}", suffix),
             }
         })
-        .build()?;
+        .build(&wifi)?;
 
     log::info!("MQTT handle ready — waiting for broker connection...");
 

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::mqtt::NetworkGate` (`no_std`) and `juggler::mqtt::{Outbox, PendingPublish}` (`std`): the network gate turns link-readiness observations into exactly one `SessionInput::NetworkUp`/`NetworkDown` per transition (never a `NetworkDown` before the link was up), and the outbox holds up to four publishes that arrive before the client exists, dropping the oldest and counting it; both host-tested with mutation checks (tier-parity Step 8b-2).
+- `juggler::wifi::LinkSupervisor::subscribe_ready` and `rustyfarian-esp-idf-network` `WiFiManager::subscribe_ready`: the supervisor tells one sink per readiness transition and returns the readiness at registration, taken under the same lock, so the seed and the subscription are atomic and no transition can be lost between them; a consumer that must gate its work on the link therefore needs neither a poll nor a second IDF event subscription.
+- `juggler::mqtt::SessionMachine::driver_idle`: `true` while closing a session whose driver had already dropped its transport (it was in the retry pause), so the tier reports `Disconnected` itself instead of waiting for a driver event that never comes; closing an idle client also skips the disconnect call.
+- `rustyfarian-esp-idf-network` `MqttHandle::dropped_publish()`, `mqtt::PUBLISH_QUEUE_DEPTH` and `mqtt::DEFAULT_RECONNECT_TIMEOUT_MS`: the publish-queue counter matches esp-hal, the queue depth is esp-hal's four slots, and the default retry pause is the 10 s both tiers use.
+
+### Changed
+
+- `rustyfarian-esp-idf-network` MQTT is gated on the Wi-Fi link (bug 010, tier-parity Step 8b-2): the esp-mqtt client is created only once the station is associated with an IP — so a normal boot logs no `Error transport connect` — no attempt and no retry happens while the link is down or suspended, and the session reconnects as soon as the IP returns instead of up to `reconnect_timeout` later.
+  The shared `SessionMachine` drives it: esp-mqtt's own auto-reconnect is off, every attempt runs from a new `mqtt-net` runner thread and is paced by `MqttConfig::reconnect_timeout_ms`, the event-loop thread only translates esp-mqtt events into session inputs, and the connect helper reports its result to the runner, which performs the close (ADR 017 unchanged).
+  **Breaking:** `MqttBuilder::build` and `build_and_wait` take the link — `build(&wifi)` and `build_and_wait(&wifi, &mut led)`; the gate is mandatory, approved by the maintainer for 0.x.
+  A publish made before the station has an IP is queued instead of failing (`publish_acked` reports `PublishAckError::Disconnected` while no client exists).
+  `WiFiManager::suspend` no longer produces MQTT retry errors, and `idf_c3_mqtt` drops its pre-build `get_ip` wait.
+
 - `rustyfarian-esp-idf-network` `MqttHandle::{wait_connected, receive, try_receive, dropped_inbound}` and `mqtt::InboundMessage`: without an `on_message` callback, received messages go to an 8-slot queue that drops the oldest, as on esp-hal, and a message esp-mqtt delivers in chunks is reassembled (up to `MAX_INBOUND_PAYLOAD_LEN`, 16 KiB) before it is queued; `juggler::mqtt::chunks::ChunkAssembler` (`std`) does the joining; `MqttHandle` implements `juggler::mqtt::MqttClient` (tier-parity Step 8b-1).
 - `juggler::wait_list::{WaitList, Wait}` (`std`): async waits on a condition another thread changes; a dropped wait unregisters itself and a repolled one replaces its waker.
 - `rustyfarian-esp-idf-network` `WiFiManager::{state, is_ready, is_suspended, connect_count, wait_ready}`: the link worker now also follows the station's IP events, so `is_ready()` and the async `wait_ready()` mean associated with an IP, as on esp-hal (IP events of other interfaces are ignored); `is_suspended()` turns `true` only once the radio is stopped; `WiFiManager` implements `juggler::wifi::NetworkLink` (tier-parity Step 8a).

@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         })
         .on_disconnect(|| log::warn!("[mqtt] disconnected"))
-        .build()?;
+        .build(&wifi)?;
 
     log::info!(
         "ready — press GPIO4 button to publish to '{}'",

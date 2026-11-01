@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
                 _ => log::warn!("[cmd] unknown command: {}", suffix),
             }
         })
-        .build()?;
+        .build(&wifi)?;
 
     log::info!("MQTT handle ready — waiting for broker connection...");
 

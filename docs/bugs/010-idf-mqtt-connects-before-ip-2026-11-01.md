@@ -2,8 +2,8 @@
 id: 010
 title: IDF MQTT client starts connecting before Wi-Fi has an IP
 captured-on: 2026-11-01
-doc-version: 2
-status: open-defect
+doc-version: 3
+status: fixed-in-code
 kind: defect
 ---
 
@@ -50,6 +50,16 @@ A normal boot logs no MQTT error: the first attempt starts once the station has 
 - Library: start esp-mqtt only once the station has an IP, and stop or pause it while the link is down or suspended, driven by the Wi-Fi link state (IP events); a host-tested gate belongs in `juggler` (ADR 022 decision 10).
 - Interim example fix: wait for the IP before `build` in the spike examples (proper order: Wi-Fi up with IP, then MQTT).
 
+## Fix
+Implemented as tier-parity Step 8b-2 (2026-11-01); the bench run below still gates closing this bug.
+
+- `MqttBuilder::build(&wifi)` / `build_and_wait(&wifi, &mut led)` gate the session on the link (mandatory; the maintainer approved the break).
+- The esp-mqtt client is created at the first readiness instead of in `build`: `EspMqttClient::new` starts the client task, which was the attempt that failed before the IP.
+- `juggler::mqtt::NetworkGate` maps link readiness to exactly one `NetworkUp`/`NetworkDown` per transition; `LinkSupervisor::subscribe_ready` feeds it, so there is no poll and no second event source.
+- esp-mqtt auto-reconnect is off; a new `mqtt-net` runner thread performs every `SessionAction` (`Connect` → create once, later `esp_mqtt_client_reconnect`; `Close` → `esp_mqtt_client_disconnect`; `Wait` → its own deadline) and paces retries with `MqttConfig::reconnect_timeout_ms` (default 10 s).
+- Publishes made before the IP wait in `juggler::mqtt::Outbox` (four slots, oldest dropped and counted in `MqttHandle::dropped_publish`).
+- `idf_c3_mqtt` no longer waits for the IP before `build`, so the boot order that reproduced the bug is the example's default path.
+
 ## Owner
 Claude (tier-parity work)
 
@@ -62,3 +72,4 @@ Claude (tier-parity work)
 - 2026-11-01 — Captured as a defect via /bug dialog from the Step 2 spike run on a C3
 - 2026-11-01 — Updated: outage evidence from the variant A run (retries during the outage, reconnect 14 s after the IP)
 - 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)
+- 2026-11-01 — Fixed in code (Step 8b-2): link-gated client creation, `NetworkGate` + `subscribe_ready` feed, esp-mqtt auto-reconnect off with runner-paced attempts; status `fixed-in-code` until the bench run confirms the boot log has no transport error and the outage shows zero MQTT lines

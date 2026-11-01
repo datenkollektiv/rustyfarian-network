@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
             },
         )
         .on_message(spike::offer_inbound)
-        .build()?;
+        .build(&wifi)?;
     spike::name_next_threads(None);
 
     log::info!(

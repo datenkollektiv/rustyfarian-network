@@ -1,5 +1,6 @@
-//! Session state shared by the event-loop thread, the connect helper and every
-//! [`MqttHandle`](super::MqttHandle) clone (ADR 022, tier-parity Step 8b).
+//! Session state shared by the runner thread, the event-loop thread, the connect
+//! helper and every [`MqttHandle`](super::MqttHandle) clone (ADR 022,
+//! tier-parity Step 8b).
 //!
 //! The shared [`SessionMachine`] is the single source of state, readiness, the
 //! publish gate and the connect count. Its mutex is never held across a client
@@ -9,13 +10,17 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use juggler::mqtt::{
-    MqttConnectionState, MqttMessage, QoS, SessionAction, SessionInput, SessionMachine,
-    SessionToken,
+    MqttConnectionState, MqttMessage, Outbox, PendingPublish, QoS, SessionAction, SessionInput,
+    SessionMachine, SessionToken,
 };
 use juggler::wait_list::WaitList;
+
+use super::runner::Msg;
+use super::{to_esp_qos, SubscribableClient};
 
 /// Messages [`MqttHandle::receive`](super::MqttHandle::receive) can hold before
 /// the oldest is dropped.
@@ -24,6 +29,9 @@ pub const INBOUND_QUEUE_DEPTH: usize = 8;
 /// Largest message body [`MqttHandle::receive`](super::MqttHandle::receive)
 /// reassembles from esp-mqtt's chunks; larger ones are dropped and counted.
 pub const MAX_INBOUND_PAYLOAD_LEN: usize = 16 * 1024;
+
+/// Publishes held while the client does not exist yet (same depth as esp-hal).
+pub const PUBLISH_QUEUE_DEPTH: usize = 4;
 
 /// A message received on a builder subscription, for
 /// [`MqttHandle::receive`](super::MqttHandle::receive).
@@ -61,27 +69,43 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Everything the event loop, the connect helper and the handles share.
+/// Everything the runner, the event loop, the connect helper and the handles share.
 pub(crate) struct Session {
     machine: Mutex<SessionMachine>,
     ready: WaitList,
     inbound: Mutex<VecDeque<InboundMessage>>,
     arrivals: WaitList,
     dropped_inbound: AtomicU32,
+    /// The esp-mqtt client, once the station has an IP (bug 010), plus the
+    /// publishes that arrived before it.
+    outbox: Arc<Mutex<Outbox<SubscribableClient>>>,
+    /// Session inputs for the runner thread; the event loop and the connect
+    /// helper only report, they never act (ADR 017).
+    inputs: Sender<Msg>,
 }
 
 impl Session {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(retry_ms: u64, inputs: Sender<Msg>) -> Self {
         Self {
-            machine: Mutex::new(SessionMachine::new()),
+            machine: Mutex::new(SessionMachine::with_retry(retry_ms)),
             ready: WaitList::new(),
             inbound: Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_DEPTH)),
             arrivals: WaitList::new(),
             dropped_inbound: AtomicU32::new(0),
+            outbox: Arc::new(Mutex::new(Outbox::new(PUBLISH_QUEUE_DEPTH))),
+            inputs,
         }
     }
 
+    /// Hands `input` to the runner, which feeds the machine and performs the
+    /// action. Never blocks; a gone runner means the handle is being torn down.
+    pub(crate) fn send(&self, input: SessionInput) {
+        let _ = self.inputs.send(Msg::Input(input));
+    }
+
     /// Feeds the machine; wakes `wait_connected` once connect work made the session ready.
+    ///
+    /// Only the runner calls this: every action it returns is a driver call.
     pub(crate) fn poll(&self, input: SessionInput) -> SessionAction {
         let (action, ready) = {
             let mut machine = lock(&self.machine);
@@ -92,6 +116,33 @@ impl Session {
             self.ready.wake_all();
         }
         action
+    }
+
+    /// The shared outbox, for the connect helper and the runner.
+    pub(crate) fn outbox(&self) -> &Arc<Mutex<Outbox<SubscribableClient>>> {
+        &self.outbox
+    }
+
+    /// Hands the client to the outbox, which then takes every queued publish.
+    pub(crate) fn attach_client(&self, client: SubscribableClient) {
+        lock(&self.outbox).attach(client, send_pending);
+    }
+
+    /// Takes the client back out, for shutdown.
+    pub(crate) fn take_client(&self) -> Option<SubscribableClient> {
+        lock(&self.outbox).take_client()
+    }
+
+    /// Publishes through the outbox: straight out with a client attached,
+    /// queued while there is none (see [`Outbox`]).
+    pub(crate) fn publish(&self, message: PendingPublish) {
+        lock(&self.outbox).publish(message, send_pending);
+    }
+
+    /// Publishes the outbox had to drop (no client yet and all slots taken, or
+    /// a publish the client refused).
+    pub(crate) fn dropped_publish(&self) -> u32 {
+        lock(&self.outbox).dropped()
     }
 
     pub(crate) fn state(&self) -> MqttConnectionState {
@@ -108,6 +159,13 @@ impl Session {
 
     pub(crate) fn is_current(&self, token: SessionToken) -> bool {
         lock(&self.machine).is_current(token)
+    }
+
+    /// `true` while closing a session whose driver had already dropped its
+    /// transport, so the tier reports `Disconnected` itself (see
+    /// [`SessionMachine::driver_idle`]).
+    pub(crate) fn driver_idle(&self) -> bool {
+        lock(&self.machine).driver_idle()
     }
 
     /// Queues a whole received message, dropping the oldest when full.
@@ -144,5 +202,25 @@ impl Session {
 
     pub(crate) fn receive(&self) -> impl Future<Output = InboundMessage> + '_ {
         self.arrivals.wait(move || self.try_receive())
+    }
+}
+
+/// Hands one outbox message to esp-mqtt's outbox; `false` means it was refused.
+fn send_pending(client: &mut SubscribableClient, message: &PendingPublish) -> bool {
+    match client.enqueue(
+        message.topic(),
+        to_esp_qos(message.qos()),
+        message.retain(),
+        message.payload(),
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!(
+                "[mqtt] publish of a queued message to '{}' failed: {:?}",
+                message.topic(),
+                e
+            );
+            false
+        }
     }
 }
