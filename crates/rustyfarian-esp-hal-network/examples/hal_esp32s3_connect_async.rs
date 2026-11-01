@@ -88,7 +88,7 @@ async fn main(spawner: Spawner) {
         runner,
     } = handle;
 
-    spawner.spawn(link_task(&LINK, controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller, stack).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
     println!("Waiting for DHCPv4 lease...");

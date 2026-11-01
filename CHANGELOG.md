@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::waker_slots::WakerSlots<N>` (`no_std`): a fixed set of wakers that refuses a registration when full instead of waking everyone, so more waiters than slots never wake each other in a loop; hal's `WifiLink::wait_connected` uses it and lets extra waiters re-check every `NETWORK_POLL_MS`.
 - `juggler::mqtt::SessionMachine` (`no_std`, sans-IO) with `SessionInput`, `SessionAction`, `SessionToken` and `SESSION_RETRY_MS`: the MQTT session lifecycle both tiers will drive — no attempt without the network, subscriptions and startup message before the session reports ready, stale connect work ignored, a 5 s retry pause while the network is up (tier-parity Step 6).
 - `juggler::wifi::LinkMachine` tracks readiness and associations: `LinkInput::{NetworkUp, NetworkDown}`, `is_ready()` (associated with an IP), `connect_count()` and `restart()`; `LinkHandover` and `LinkSupervisor` expose both, and `LinkSupervisor::wait_ready` returns a `ReadyWait` future that its worker wakes, that unregisters itself when dropped and that replaces its waker when repolled (tier-parity Step 5).
 - `juggler::wifi::NetworkLink` and `juggler::mqtt::{MqttClient, MqttMessage}`: the shared `no_std` traits firmware can be generic over, so the same application code runs on both tiers (ADR 022, tier-parity Step 4); the tiers implement them in later steps.
@@ -85,6 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rustyfarian-esp-hal-network::wifi::{link_task, WifiLink::run}` take the embassy-net `Stack` as well: while associated the supervisor checks the IPv4 configuration every `NETWORK_POLL_MS` (500 ms), so the new `WifiLink::{is_ready, wait_connected}` mean associated with an IP, as on ESP-IDF; `connect_count` now comes from the shared link machine, and `WifiLink` implements `juggler::wifi::NetworkLink` (tier-parity Step 7a).
 - `hal_esp32s3_mqtt_lwt` reads its build-time configuration through a new `no_std` `examples/common/env.rs` with the same names as the IDF one, checks the broker host and client-id length at start-up like its IDF twin, and logs through `log`; both S3 LWT examples now print the same `would block (mqtt <state>)` and inbound (`rx`, binary-aware) lines.
 - `rustyfarian-esp-hal-network`: the `embassy` feature now enables the optional `embassy-futures` dependency (already used by `mqtt`) for the `WifiLink` select.
 - All seven bare-metal station examples spawn `link_task` instead of their own `wifi_task`; the reconnect delay after a link loss is now 1 s doubling to 30 s (was 500 ms / 5 s), and the link log lines are `[wifi] link up #<n>`, `[wifi] disconnected — <reason>` and `[wifi] reconnecting in <ms> ms`.

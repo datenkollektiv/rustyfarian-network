@@ -133,10 +133,21 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 7: esp-hal adopts the cores
 
-- [ ] `WifiLink` and the MQTT runner become thin runners of the link and session machines and implement `NetworkLink` / `MqttClient`; the extracted branches are deleted from the tier.
-- [ ] Static parity assertion in the crate (`const _: () = { fn check<T: NetworkLink>() {} ... }`), compiled by `just clippy-hal`.
-- Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the U2f supervisor and runner behaviour is unchanged (same host tests, now in `juggler`).
-- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because runner logic moved.
+Split into two reviewable chunks; the CrowPanel S3 rerun covers both after 7b.
+
+#### Step 7a: `WifiLink` on the link core
+
+- [x] `run` and `link_task` take the `Stack`; while associated, `run` checks `is_config_up` every `NETWORK_POLL_MS` (500 ms) and feeds `NetworkUp` / `NetworkDown` (embassy-net keeps one state waker, so it polls).
+- [x] `connect_count` comes from the machine (the tier's `AtomicU32` is gone); new `is_ready` and `wait_connected`, woken through `juggler::waker_slots::WakerSlots` (4 slots, refuses when full); further waiters re-check every `NETWORK_POLL_MS` instead of mass-waking (review of 36702ff).
+- [x] `impl NetworkLink for WifiLink` (`Error = Infallible`) and a compile-time parity check in the crate.
+- [x] All seven hal examples pass the stack; `hal_esp32s3_mqtt_lwt` and the crate README wait with `LINK.wait_connected()`.
+
+#### Step 7b: MQTT runner on the session machine
+
+- [ ] The MQTT runner becomes a thin runner of `SessionMachine` and `MqttHandle` implements `MqttClient`; the extracted branches are deleted from the tier.
+- [ ] Static parity check for `MqttClient`, compiled by `just clippy-hal`.
+- Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the runner's host tests move to `juggler` or still pass.
+- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved.
 
 ### Step 8: IDF adopts the cores
 
