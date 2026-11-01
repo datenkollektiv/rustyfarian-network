@@ -137,7 +137,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(sender_task(espnow).unwrap());
     spawner.spawn(rx_task(espnow).unwrap());
-    spawner.spawn(link_task(&LINK, controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller, stack).unwrap());
 
     loop {
         Timer::after(Duration::from_secs(STATS_SECS)).await;

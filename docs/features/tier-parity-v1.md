@@ -54,3 +54,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 ## Session Log
 - 2026-11-01 — Doc and plan created; Steps 0–5 done (roadmap, IDF MQTT state, C3 spike chose variant A, inventory, shared traits, link core); bugs 010–014 filed, 012 closed
 - 2026-11-01 — Step 6 done: `SessionMachine` with network gate, one connect work order, stale guard and retry pacing
+- 2026-11-01 — Step 7a done: hal `WifiLink` reports readiness from the stack, counts in the machine, implements `NetworkLink`

@@ -116,10 +116,10 @@ async fn main(spawner: Spawner) {
     let AsyncWifiHandle { controller, stack, runner } =
         WiFiManager::init_async(config).expect("Wi-Fi init failed");
 
-    spawner.spawn(link_task(&LINK, controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller, stack).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    stack.wait_config_up().await;
+    LINK.wait_connected().await;
     let v4 = stack.config_v4().expect("no IPv4 config");
     esp_println::println!("connected, IP {}", v4.address);
 }

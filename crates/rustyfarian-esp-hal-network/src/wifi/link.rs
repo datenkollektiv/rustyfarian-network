@@ -1,11 +1,20 @@
 //! Library-owned station supervision for the bare-metal tier.
 //!
 //! The firmware declares one `static LINK: WifiLink = WifiLink::new();`, spawns
-//! [`link_task`] with the [`WifiController`] from `AsyncWifiHandle`, and never
-//! writes a reconnect loop again. `WifiLink::run` drives the shared
+//! [`link_task`] with the [`WifiController`] and the `Stack` from
+//! `AsyncWifiHandle`, and never writes a reconnect loop again. `WifiLink::run` drives the shared
 //! [`LinkMachine`]: connect, wait for the link to drop, back off 1 s doubling to
 //! 30 s, reconnect. A controller that is already associated when `run` starts is
 //! adopted as connected and counted as an association.
+//!
+//! # Readiness
+//!
+//! While associated, `run` checks the stack's IPv4 configuration every
+//! [`NETWORK_POLL_MS`] and reports it to the machine, so [`WifiLink::is_ready`]
+//! and [`WifiLink::wait_connected`] mean "associated with an IP", the same as on
+//! the ESP-IDF tier. The stack is polled because embassy-net keeps only one state
+//! waker, which belongs to the firmware.
+//! `WifiLink` implements [`juggler::wifi::NetworkLink`] (ADR 022).
 //!
 //! # Suspend and resume
 //!
@@ -36,15 +45,17 @@
 
 use core::cell::RefCell;
 use core::pin::pin;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::task::Poll;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
 use esp_radio::wifi::WifiController;
-use juggler::wifi::{LinkAction, LinkHandover, LinkInput, LinkState};
+use juggler::waker_slots::WakerSlots;
+use juggler::wifi::{LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink};
 
 /// Upper bound on the disconnect that [`WifiLink::suspend`] triggers (milliseconds);
 /// [`WifiLink::is_suspended`] turns `true` when it finishes or this bound passes.
@@ -53,6 +64,13 @@ pub const SUSPEND_DISCONNECT_TIMEOUT_MS: u64 = 500;
 /// How often a parked or idle supervisor re-checks the controller (milliseconds).
 const RECHECK_MS: u64 = 1_000;
 
+/// How often `run` checks the stack's IPv4 configuration while associated (milliseconds).
+pub const NETWORK_POLL_MS: u64 = 500;
+
+/// Tasks that [`WifiLink::wait_connected`] wakes directly; more waiters re-check
+/// every [`NETWORK_POLL_MS`] instead.
+const READY_WAITERS: usize = 4;
+
 /// Station link supervisor; one per firmware, declared as a `static`.
 pub struct WifiLink {
     /// The machine and the action `suspend`/`resume` hand to `run`, changed
@@ -60,7 +78,8 @@ pub struct WifiLink {
     handover: Mutex<CriticalSectionRawMutex, RefCell<LinkHandover>>,
     /// Wakes `run` to take the handover; carries no data.
     wake: Signal<CriticalSectionRawMutex, ()>,
-    connects: AtomicU32,
+    /// Tasks in [`wait_connected`](Self::wait_connected); a full set refuses, never mass-wakes.
+    ready_wakers: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<READY_WAITERS>>>,
 }
 
 impl WifiLink {
@@ -69,7 +88,7 @@ impl WifiLink {
         Self {
             handover: Mutex::new(RefCell::new(LinkHandover::new())),
             wake: Signal::new(),
-            connects: AtomicU32::new(0),
+            ready_wakers: Mutex::new(RefCell::new(WakerSlots::new())),
         }
     }
 
@@ -93,7 +112,39 @@ impl WifiLink {
 
     /// Associations since boot, including one adopted when `run` starts.
     pub fn connect_count(&self) -> u32 {
-        self.connects.load(Ordering::Relaxed)
+        self.with(|h| h.connect_count())
+    }
+
+    /// `true` while associated with an IPv4 configuration.
+    pub fn is_ready(&self) -> bool {
+        self.with(|h| h.is_ready())
+    }
+
+    /// Completes once the station is associated and has its IPv4 configuration.
+    ///
+    /// Up to four waiting tasks are woken directly; further ones re-check every
+    /// [`NETWORK_POLL_MS`], so many waiters never wake each other in a loop.
+    pub async fn wait_connected(&self) {
+        loop {
+            let woken = core::future::poll_fn(|cx| {
+                // Register first, then check: a readiness change in between still wakes us.
+                let registered = self
+                    .ready_wakers
+                    .lock(|w| w.borrow_mut().register(cx.waker()));
+                if self.is_ready() {
+                    Poll::Ready(true)
+                } else if registered {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(false)
+                }
+            })
+            .await;
+            if woken {
+                return;
+            }
+            Timer::after_millis(NETWORK_POLL_MS).await;
+        }
     }
 
     /// Disconnects the station and pauses reconnects until [`resume`](Self::resume).
@@ -139,14 +190,28 @@ impl WifiLink {
         self.with(|h| h.take())
     }
 
-    /// Feeds an association to the machine; counts and logs it unless suspended.
+    /// Reports the stack's IPv4 configuration to the machine and wakes waiters once ready.
+    fn report_network(&self, stack: Stack<'static>) {
+        let up = stack.is_config_up();
+        if up == self.is_ready() {
+            return;
+        }
+        self.poll(if up {
+            LinkInput::NetworkUp
+        } else {
+            LinkInput::NetworkDown
+        });
+        if self.is_ready() {
+            log::info!("[wifi] network ready");
+            self.ready_wakers.lock(|w| w.borrow_mut().wake_all());
+        }
+    }
+
+    /// Feeds an association to the machine; logs it unless suspended.
     fn link_up(&self, how: &str) -> LinkAction {
         let action = self.poll(LinkInput::Connected);
         if self.state() == LinkState::Connected {
-            // load + store: riscv32imc has no fetch_add; `run` is the only writer.
-            let n = self.connects.load(Ordering::Relaxed).wrapping_add(1);
-            self.connects.store(n, Ordering::Relaxed);
-            log::info!("[wifi] link up #{}{}", n, how);
+            log::info!("[wifi] link up #{}{}", self.connect_count(), how);
         } else {
             log::info!("[wifi] associated while suspended, disconnecting again");
         }
@@ -155,7 +220,11 @@ impl WifiLink {
 
     /// Supervises the station forever: initial association, every reconnect,
     /// suspend and resume.
-    pub async fn run(&'static self, mut controller: WifiController<'static>) -> ! {
+    pub async fn run(
+        &'static self,
+        mut controller: WifiController<'static>,
+        stack: Stack<'static>,
+    ) -> ! {
         // A cancelled earlier `run` may have left the machine mid-attempt; keep a
         // suspend the firmware already asked for.
         self.wake.reset();
@@ -224,14 +293,25 @@ impl WifiLink {
                 }
                 LinkAction::None => match self.state() {
                     LinkState::Connected => {
+                        self.report_network(stack);
                         let mut gone = pin!(controller.wait_for_disconnect_async());
                         loop {
-                            match select(self.handed_over(), gone.as_mut()).await {
-                                Either::First(handed) => match handed {
+                            match select3(
+                                self.handed_over(),
+                                gone.as_mut(),
+                                Timer::after_millis(NETWORK_POLL_MS),
+                            )
+                            .await
+                            {
+                                Either3::First(handed) => match handed {
                                     LinkAction::None => continue,
                                     other => break other,
                                 },
-                                Either::Second(result) => {
+                                Either3::Third(()) => {
+                                    self.report_network(stack);
+                                    continue;
+                                }
+                                Either3::Second(result) => {
                                     match result {
                                         Ok(info) => {
                                             log::warn!("[wifi] disconnected — {:?}", info.reason)
@@ -277,6 +357,46 @@ impl Default for WifiLink {
 /// Embassy task wrapper around [`WifiLink::run`] so a firmware spawns the
 /// supervisor in one line.
 #[embassy_executor::task]
-pub async fn link_task(link: &'static WifiLink, controller: WifiController<'static>) -> ! {
-    link.run(controller).await
+pub async fn link_task(
+    link: &'static WifiLink,
+    controller: WifiController<'static>,
+    stack: Stack<'static>,
+) -> ! {
+    link.run(controller, stack).await
 }
+
+impl NetworkLink for WifiLink {
+    type Error = core::convert::Infallible;
+
+    fn state(&self) -> LinkState {
+        WifiLink::state(self)
+    }
+
+    fn is_suspended(&self) -> bool {
+        WifiLink::is_suspended(self)
+    }
+
+    fn connect_count(&self) -> u32 {
+        WifiLink::connect_count(self)
+    }
+
+    fn suspend(&self) -> Result<(), Self::Error> {
+        WifiLink::suspend(self);
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), Self::Error> {
+        WifiLink::resume(self);
+        Ok(())
+    }
+
+    async fn wait_connected(&self) {
+        WifiLink::wait_connected(self).await
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `WifiLink` stops implementing `NetworkLink`.
+const _: fn() = || {
+    fn implements<T: NetworkLink>() {}
+    implements::<WifiLink>();
+};

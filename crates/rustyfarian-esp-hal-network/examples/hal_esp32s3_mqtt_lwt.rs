@@ -131,11 +131,11 @@ async fn main(spawner: Spawner) {
         stack,
         runner,
     } = handle;
-    spawner.spawn(link_task(&LINK, controller).unwrap());
+    spawner.spawn(link_task(&LINK, controller, stack).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    log::info!("Waiting for DHCPv4 lease...");
-    stack.wait_config_up().await;
+    log::info!("Waiting for the link to be ready (associated with an IP)...");
+    LINK.wait_connected().await;
     let v4 = stack
         .config_v4()
         .expect("stack reports config up but has no IPv4 config");
