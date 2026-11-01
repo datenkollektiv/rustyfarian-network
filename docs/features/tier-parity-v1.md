@@ -42,7 +42,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 3 — extraction inventory ([inventory](tier-parity-v1-inventory.md))
 - [x] Step 4 — public traits and mocks
 - [x] Step 5 — link core
-- [ ] Step 6 — MQTT session core
+- [x] Step 6 — MQTT session core
 - [ ] Step 7 — esp-hal adopts the cores
 - [ ] Step 8 — IDF adopts the cores
 - [ ] Step 9 — one app, two tiers (hardware gate, release 0.7.0)
@@ -52,13 +52,5 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their own feature docs.
 
 ## Session Log
-- 2026-11-01 — Feature doc created from ADR 022 and the program plan via /feature
-- 2026-11-01 — Step 0 done: roadmap Ready entry added, WifiDriver ADR item dropped, contract-tests item retargeted
-- 2026-11-01 — Step 1 code done (IDF `MqttHandle::state()` via `juggler::mqtt::SessionPhase`, `WifiDriver` deprecated), R1 state check rides with the U2f hardware session
-- 2026-11-01 — Step 1 review applied (plan lifecycle text, sampled-log runbook check); Step 2 now spikes both IDF async foundations
-- 2026-11-01 — Step 2 spike built (variants A and B on the C3), desk findings in the plan, C3 hardware run pending
-- 2026-11-01 — Bug 010 filed (IDF MQTT starts before the IP); spike examples now start MQTT after the IP, library fix planned in Steps 6 and 8
-- 2026-11-01 — Step 2 done on the C3: variant A chosen, ADR 022 decision 2 amended, thread-memory fix (bug 013) planned in Step 8
-- 2026-11-01 — Step 3 inventory written; bug 014 filed (IDF reports ready before SUBSCRIBE); review point: cores as sans-IO machines
-- 2026-11-01 — Step 4 done: `NetworkLink`, `MqttClient`, `MqttMessage` and mocks in `juggler`; cores decided as sans-IO machines (ADR 022 decision 10 amended)
-- 2026-11-01 — Step 5 done: link machine gains readiness (IP) and connect counting; supervisor gets a woken `wait_ready`
+- 2026-11-01 — Doc and plan created; Steps 0–5 done (roadmap, IDF MQTT state, C3 spike chose variant A, inventory, shared traits, link core); bugs 010–014 filed, 012 closed
+- 2026-11-01 — Step 6 done: `SessionMachine` with network gate, one connect work order, stale guard and retry pacing

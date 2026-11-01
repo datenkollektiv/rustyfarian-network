@@ -122,8 +122,11 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 6: MQTT session core
 
-- [ ] MQTT session machine in `juggler` (sans-IO, no_std) behind both tiers' `MqttClient` handles: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, one connect work order for both tiers (subscribe, startup message, then ready; bug 014), and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
-- [ ] Host tests run the MQTT conformance suite plus the moved rules from the Step 3 inventory (stall deadline, epoch confirm) with injected time.
+- [x] `juggler::mqtt::SessionMachine` (sans-IO, no_std): network gate (no attempt without `NetworkUp`, `NetworkDown` closes the transport; bug 010), one connect work order for both tiers (`ConnectWork`: subscribe unless the broker kept the session, startup message, then `WorkDone`; bug 014), `SessionToken` stale-session guard, publish gate (`can_publish` only while ready), retry pacing (`SESSION_RETRY_MS` = 5 s while the network is up), connect count, shutdown.
+- [x] `Close` also stops a driver's own retries: answered on `NetworkDown` or `Shutdown` during the retry pause and on a driver attempt while offline (review of 67c2cb8).
+- [x] A kept session (`session_present`) skips subscribing only if the last subscribing connect work completed; after a failed or interrupted one, and on the first session after boot, it subscribes again (review of 3d2c054).
+- [x] 19 host tests; mutation checks on the token guard, the network gate, the retry-pause stop and the subscription recovery.
+- Moved to the tier runners (Steps 7 and 8): the bounded inbound queue and its drop policy (embassy channel on hal, callbacks on IDF), hal's socket and stall timing, IDF's acknowledged publish (`PendingAcks`).
 - Done when: `just test` passes; no tier code changed yet.
 
 ## Phase 3 — Tier adapters (thin by construction)

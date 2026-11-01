@@ -59,3 +59,4 @@ Claude (tier-parity work)
 
 ## Session Log
 - 2026-11-01 — Captured as a defect via /bug dialog from the tier-parity Step 3 inventory
+- 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)

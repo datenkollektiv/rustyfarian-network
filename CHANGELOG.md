@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::mqtt::SessionMachine` (`no_std`, sans-IO) with `SessionInput`, `SessionAction`, `SessionToken` and `SESSION_RETRY_MS`: the MQTT session lifecycle both tiers will drive — no attempt without the network, subscriptions and startup message before the session reports ready, stale connect work ignored, a 5 s retry pause while the network is up (tier-parity Step 6).
 - `juggler::wifi::LinkMachine` tracks readiness and associations: `LinkInput::{NetworkUp, NetworkDown}`, `is_ready()` (associated with an IP), `connect_count()` and `restart()`; `LinkHandover` and `LinkSupervisor` expose both, and `LinkSupervisor::wait_ready` returns a `ReadyWait` future that its worker wakes, that unregisters itself when dropped and that replaces its waker when repolled (tier-parity Step 5).
 - `juggler::wifi::NetworkLink` and `juggler::mqtt::{MqttClient, MqttMessage}`: the shared `no_std` traits firmware can be generic over, so the same application code runs on both tiers (ADR 022, tier-parity Step 4); the tiers implement them in later steps.
   `juggler::wifi::mock::MockLink` and `juggler::mqtt::mock::MockMqttClient` (feature `mock`) let firmware host-test that code.
