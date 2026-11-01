@@ -111,10 +111,12 @@ fn main() -> anyhow::Result<()> {
     spike::name_next_threads(Some(c"mqtt-events"));
     let mqtt = MqttBuilder::new(mqtt_config)
         .subscribe(&cmd_topic, QoS::AtLeastOnce)
-        .on_connect(move |client: &mut EspMqttClient<'_>, _is_clean: bool| {
-            client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-            Ok(())
-        })
+        .on_connect(
+            move |client: &mut EspMqttClient<'_>, _session_present: bool| {
+                client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
+                Ok(())
+            },
+        )
         .on_message(spike::offer_inbound)
         .build()?;
     spike::name_next_threads(None);

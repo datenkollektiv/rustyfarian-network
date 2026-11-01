@@ -162,11 +162,17 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - [x] `WiFiManager::{state, is_ready, is_suspended, connect_count, wait_ready}`; `link_state()` deprecated as an alias of `state()`.
 - [x] `impl NetworkLink for WiFiManager` (`Error = anyhow::Error`, `wait_connected` = `wait_ready`) and a compile-time parity check; the inherent blocking `wait_connected(timeout)` stays until Step 10.
 
-#### Step 8b: `MqttHandle` on the session machine
+#### Step 8b-1: `MqttHandle` on the session machine
 
-- [ ] `MqttHandle` runs `SessionMachine` on its event thread and implements `MqttClient` (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
-- [ ] Bug 014: one connect work order (subscribe, startup message, `on_connect`, then ready).
-- [ ] Bug 010: esp-mqtt starts only once the link is ready and stops while it is down or suspended, driven by the network gate; close the bug after the bench run.
+- [x] `mqtt/session.rs`: one `Arc<Session>` holds the `SessionMachine`; state, `is_connected`, the `try_publish` gate and `connect_count` come from it (the epoch, `SessionPhase` and the counter are gone from the IDF tier).
+- [x] Bug 014: the helper thread runs the shared order (subscribe if the machine asks, startup message, `on_connect`, `WorkDone`); a failed subscribe or startup message reports `WorkFailed` and closes the transport from the helper thread (never from the event loop, ADR 017), so esp-mqtt reconnects and repeats the work.
+- [x] `MqttHandle::{wait_connected, receive, try_receive, dropped_inbound}`, `InboundMessage` (retain flag and QoS are not reported by esp-idf-svc 0.53); messages reach the queue only without an `on_message` callback.
+- [x] `impl MqttClient for MqttHandle` and a compile-time parity check; the waits use the new host-tested `juggler::wait_list::WaitList`.
+- [x] The `on_connect` flag is esp-idf-svc's session-present flag: docs and four examples no longer call it `is_clean` (three logged the opposite of the truth).
+
+#### Step 8b-2: network gate (bug 010)
+
+- [ ] esp-mqtt starts only once the link is ready and stops while it is down or suspended, driven by the network gate; close the bug after the bench run.
 
 #### Step 8c: MQTT thread memory
 

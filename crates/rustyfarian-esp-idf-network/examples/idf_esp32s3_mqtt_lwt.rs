@@ -106,18 +106,20 @@ fn main() -> anyhow::Result<()> {
     let online_topic = status_topic.clone();
     let mqtt = MqttBuilder::new(mqtt_config)
         .subscribe(&cmd_topic, QoS::AtLeastOnce)
-        .on_connect(move |client: &mut EspMqttClient<'_>, is_clean: bool| {
-            client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-            log::info!(
-                "[mqtt] connected ({}) — published retained online",
-                if is_clean {
-                    "clean session"
-                } else {
-                    "session resumed"
-                }
-            );
-            Ok(())
-        })
+        .on_connect(
+            move |client: &mut EspMqttClient<'_>, session_present: bool| {
+                client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
+                log::info!(
+                    "[mqtt] connected ({}) — published retained online",
+                    if session_present {
+                        "session resumed"
+                    } else {
+                        "clean session"
+                    }
+                );
+                Ok(())
+            },
+        )
         .on_disconnect(|| log::warn!("[mqtt] disconnected — esp-mqtt reconnects on its own"))
         .on_message(|topic, payload| match std::str::from_utf8(payload) {
             Ok(text) => log::info!("[example] rx topic={} payload={}", topic, text),

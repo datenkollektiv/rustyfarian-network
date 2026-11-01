@@ -85,16 +85,18 @@ fn main() -> anyhow::Result<()> {
 
     let handle = MqttBuilder::new(mqtt_config)
         .subscribe(&commands_topic, QoS::AtLeastOnce)
-        .on_connect(move |client: &mut EspMqttClient<'_>, is_clean: bool| {
-            if is_clean {
-                log::info!("[mqtt] connected — clean session");
-            } else {
-                log::info!("[mqtt] connected — session resumed");
-            }
-            client.enqueue(&status_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-            log::info!("[mqtt] published retained status=online");
-            Ok(())
-        })
+        .on_connect(
+            move |client: &mut EspMqttClient<'_>, session_present: bool| {
+                if session_present {
+                    log::info!("[mqtt] connected — session resumed");
+                } else {
+                    log::info!("[mqtt] connected — clean session");
+                }
+                client.enqueue(&status_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
+                log::info!("[mqtt] published retained status=online");
+                Ok(())
+            },
+        )
         .on_disconnect(|| {
             log::warn!("[mqtt] disconnected — will reconnect automatically");
         })

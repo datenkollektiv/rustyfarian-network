@@ -165,6 +165,12 @@ impl SessionMachine {
         self.connects
     }
 
+    /// `true` while the connect work of `token` is still the current one, so a
+    /// worker can skip work for a session that has meanwhile ended.
+    pub fn is_current(&self, token: SessionToken) -> bool {
+        self.phase == Phase::Working(token)
+    }
+
     /// Pause before the next attempt while the network is up (milliseconds).
     pub fn retry_ms(&self) -> u64 {
         self.retry_ms
@@ -401,6 +407,22 @@ mod tests {
         assert_eq!(m.poll(I::WorkFailed(old)), A::None);
         assert_eq!(m.poll(I::WorkDone(current)), A::None);
         assert!(m.can_publish());
+    }
+
+    #[test]
+    fn only_the_running_connect_work_is_current() {
+        let mut m = SessionMachine::new();
+        m.poll(I::NetworkUp);
+        let old = working(&mut m, false);
+        assert!(m.is_current(old));
+        m.poll(I::Disconnected);
+        assert!(!m.is_current(old), "a dropped session's work is stale");
+        m.poll(I::RetryElapsed);
+        let current = working(&mut m, false);
+        assert!(!m.is_current(old));
+        assert!(m.is_current(current));
+        m.poll(I::WorkDone(current));
+        assert!(!m.is_current(current), "finished work is no longer running");
     }
 
     #[test]

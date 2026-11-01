@@ -60,3 +60,4 @@ Claude (tier-parity work)
 ## Session Log
 - 2026-11-01 — Captured as a defect via /bug dialog from the tier-parity Step 3 inventory
 - 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)
+- 2026-11-01 — Fixed in code (tier-parity Step 8b-1): the IDF helper thread subscribes, publishes the startup message and runs `on_connect` before the session reports ready; close after the bench run

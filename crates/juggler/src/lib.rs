@@ -92,6 +92,8 @@ pub(crate) mod test_support;
 // backoff and status_colors are used across wifi+mqtt and have zero external deps.
 pub mod backoff;
 pub mod status_colors;
+#[cfg(feature = "std")]
+pub mod wait_list;
 pub mod waker_slots;
 
 // ── Domain modules (feature-gated) ──────────────────────────────────────────
