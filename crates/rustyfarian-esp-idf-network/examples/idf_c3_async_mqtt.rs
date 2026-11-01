@@ -142,7 +142,7 @@ async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &
     log::info!("[example] mqtt up after {} ms", boot.elapsed().as_millis());
 
     let mut tick: u32 = 0;
-    let mut last_link = wifi.link_state();
+    let mut last_link = wifi.state();
     let mut last_state = mqtt.state();
     let mut secs_since_resource_log: u64 = 0;
     loop {
@@ -150,7 +150,7 @@ async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &
         tick += 1;
         secs_since_resource_log += TICK_SECS;
 
-        let link = wifi.link_state();
+        let link = wifi.state();
         if link != last_link {
             log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
             last_link = link;

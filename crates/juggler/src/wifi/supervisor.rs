@@ -181,6 +181,14 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         self.lock().machine.state()
     }
 
+    /// `true` once a suspend has taken effect: the state is
+    /// [`LinkState::Suspended`] and the radio is actually stopped. A failed stop
+    /// leaves it `false` until a later [`suspend`](Self::suspend) succeeds.
+    pub fn is_suspended(&self) -> bool {
+        let core = self.lock();
+        core.machine.state() == LinkState::Suspended && !core.radio_started
+    }
+
     /// `true` while associated with the IP configuration reported (see [`LinkMachine::is_ready`]).
     pub fn is_ready(&self) -> bool {
         self.lock().machine.is_ready()
@@ -785,9 +793,16 @@ mod tests {
         r.log.lock().unwrap().fail_stop = true;
         assert!(r.sup.suspend().is_err());
         assert_eq!(r.sup.state(), LinkState::Suspended);
+        assert!(
+            !r.sup.is_suspended(),
+            "a requested suspend whose stop failed has not taken effect"
+        );
         r.log.lock().unwrap().fail_stop = false;
         r.sup.suspend().unwrap();
         assert_eq!(r.log.lock().unwrap().stops, 1);
+        assert!(r.sup.is_suspended());
+        r.sup.resume().unwrap();
+        assert!(!r.sup.is_suspended());
     }
 
     #[test]

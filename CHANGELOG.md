@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rustyfarian-esp-idf-network` `WiFiManager::{state, is_ready, is_suspended, connect_count, wait_ready}`: the link worker now also follows the station's IP events, so `is_ready()` and the async `wait_ready()` mean associated with an IP, as on esp-hal (IP events of other interfaces are ignored); `is_suspended()` turns `true` only once the radio is stopped; `WiFiManager` implements `juggler::wifi::NetworkLink` (tier-parity Step 8a).
 - `juggler::waker_slots::WakerSlots<N>` (`no_std`): a fixed set of wakers that refuses a registration when full instead of waking everyone, so more waiters than slots never wake each other in a loop; hal's `WifiLink::wait_connected` uses it and lets extra waiters re-check every `NETWORK_POLL_MS`.
 - `juggler::mqtt::SessionMachine` (`no_std`, sans-IO) with `SessionInput`, `SessionAction`, `SessionToken` and `SESSION_RETRY_MS`: the MQTT session lifecycle both tiers will drive — no attempt without the network, subscriptions and startup message before the session reports ready, stale connect work ignored, a 5 s retry pause while the network is up (tier-parity Step 6).
 - `juggler::wifi::LinkMachine` tracks readiness and associations: `LinkInput::{NetworkUp, NetworkDown}`, `is_ready()` (associated with an IP), `connect_count()` and `restart()`; `LinkHandover` and `LinkSupervisor` expose both, and `LinkSupervisor::wait_ready` returns a `ReadyWait` future that its worker wakes, that unregisters itself when dropped and that replaces its waker when repolled (tier-parity Step 5).
@@ -157,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- `rustyfarian-esp-idf-network` `WiFiManager::link_state()`: use `state()`, the name both tiers share.
 - `juggler::wifi::WifiDriver`: no tier implements it; ADR 022's shared link traits replace it. Its docs no longer claim the ESP-IDF `WiFiManager` as an implementor, and `MqttConnectionState`'s docs now hold for both tiers.
 
 ### Fixed
