@@ -2,10 +2,11 @@
 
 ## North Star
 
-Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
+Any ESP32 project — on ESP-IDF or bare-metal esp-hal — adds Wi-Fi and MQTT in minutes, with confidence, and switches runtime without touching its application code.
 
 ## Long-Term Goals
 
+- **One API, two runtimes** — consumer code is exchangeable between the ESP-IDF and bare-metal tiers, with the same async API on both, so only the dependency and setup code change ([ADR 022](docs/adr/022-tier-parity-one-async-api.md)).
 - **Reliable, thin hardware wrappers** — the `wifi` and `mqtt` features of `rustyfarian-esp-idf-network`
   remain focused connective tissue: starting connections, managing subscriptions, and surfacing
   errors — nothing more.
@@ -25,19 +26,20 @@ Any ESP32-IDF project can add Wi-Fi and MQTT in minutes, with confidence.
 
 ## Target Beneficiaries
 
-ESP32-IDF Rust firmware developers — primarily the maintainer's own downstream projects,
-but with an API clean enough that any ESP32-IDF project can adopt it with confidence.
+ESP32 Rust firmware developers on either runtime, ESP-IDF or bare-metal esp-hal.
+The maintainer's own downstream projects come first.
+The API must be clean enough that any ESP32 project can adopt it with confidence.
 
 ## Non-Goals
 
 - **General-purpose application-layer clients** — HTTP, CoAP, WebSocket, and similar reusable clients are out of scope.
   Feature-specific private transports may exist behind crate APIs, such as OTA fetching, but are not exported as protocol libraries.
 - **BLE provisioning** — no BLE-based Wi-Fi setup flows; SoftAP captive-portal provisioning is in scope (see [ADR 013](docs/adr/013-softap-provisioning-acceptance.md)).
-- **Full `no_std` / `esp-hal` MQTT** — MQTT over bare-metal Wi-Fi (a future `mqtt` feature on `rustyfarian-esp-hal-network`) is a long-term goal but not an active workstream.
 
 ## Success Signals
 
 - A new firmware project can integrate Wi-Fi + MQTT in under 30 minutes with no surprises.
+- A firmware moves between tiers by changing its dependency and setup code only, and downstream projects carry no per-tier adapter.
 - `juggler` has enough coverage that most connection-logic bugs surface in
   host tests before touching hardware.
 - The CI pipeline is green on every push; `just verify` passes locally without friction.
@@ -65,3 +67,4 @@ _(none at this time)_
   `rustyfarian-network-pure` gains a `no_std`-safe surface so `provisioning-pure` can delegate MQTT validation without dragging in `std` (ADR 014).
 - 2026-06-20 — The 16 per-domain crates consolidated into three publishable crates — `juggler` (pure), `rustyfarian-esp-idf-network` (ESP-IDF), and `rustyfarian-esp-hal-network` (bare-metal `esp-hal`) — each feature-gated by domain, in preparation for the first crates.io release (0.4.0).
   Supersedes the per-domain granularity of ADR 005, keeping its HAL-split core (ADR 016).
+- 2026-11-01 — Tier parity (exchangeable consumer code, async API on both tiers) becomes the primary goal (ADR 022), and the stale esp-hal MQTT non-goal is removed because esp-hal MQTT shipped via ADR 019.
