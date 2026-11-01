@@ -2,7 +2,7 @@
 id: 001
 title: Client calls inside MqttBuilder on_connect deadlock the ESP-IDF MQTT event loop
 captured-on: 2026-09-27
-doc-version: 3
+doc-version: 4
 status: open-defect
 kind: defect
 ---
@@ -78,19 +78,20 @@ Proposed fix, in two steps:
 ## Owner
 Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), `5550775` (credential fallbacks), `2f2597a` (optional OLED); branch `fix/mqtt-on-connect-deadlock` deleted.
 
-## Fix Status (0.5.x patch, landed on the branch)
-- The event-loop thread never takes the client mutex any more; on every `Connected` one helper thread (`juggler::mqtt::spawn_connect_thread`) runs the `with_startup_message()` publish, then `on_connect`, then the builder subscriptions.
-- Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe()` inside it are safe again; the originally documented retained-status idiom works.
-- `is_connected()` still flips only after `on_connect` returns, via a generation-checked compare-and-swap (`juggler::mqtt::ConnectionEpoch`), so a stale helper after a fast reconnect cannot mark a dead connection connected.
+## Fix Status (0.5.x patch; plumbing refreshed by tier-parity Steps 6 and 8b)
+- The event-loop thread never takes the client mutex; since Step 8b-2 it only translates esp-mqtt events into session inputs, and the session runner performs `Close` with the raw handle (an event bit, no `api_lock`).
+- Since Step 8b-1 the connect work runs on the tier's own `mqtt-connect` worker, holding the client mutex once, in the order both tiers share: the builder subscriptions, then the `with_startup_message()` publish, then `on_connect`.
+- Because `on_connect` runs on that worker, `client.enqueue()` / `client.subscribe()` inside it are safe again; the originally documented retained-status idiom works.
+- `is_connected()` still flips only after `on_connect` returns: the shared `SessionMachine` reports ready only on the connect work's `WorkDone`, and a `SessionToken` makes a stale worker's report a no-op (`juggler::mqtt::ConnectionEpoch` is deprecated and unused since Step 8b-1).
 - `MqttHandle::publish*`, `try_publish*`, `subscribe`, `publish_acked` reject calls from inside any callback with `PublishAckError::WrongThread`, detected through a thread-local `juggler::mqtt::CallbackScope` (host-tested, lock-free); signatures unchanged.
 - Corrected during review: `EspMqttClient::subscribe` never waits for a SUBACK, the blocker was always `api_lock`; a second, three-way cycle (publisher holding the mutex on `api_lock` during the handshake, mqtt task parked, event loop blocked on the mutex for `on_connect`) is removed by the same change.
 - Rustdoc, both READMEs, CHANGELOG, `docs/project-lore.md` "MQTT Event Loop", and a CLAUDE.md failure row describe the final rule: use the `client` argument in `on_connect`, never `MqttHandle` from any callback, never the client from `on_message` / `on_disconnect`.
 
 ## Remaining Items
-- Helper-spawn failure (heap exhaustion): the epoch stays unconfirmed, so `is_connected()` is `false` while the transport is up; `MqttHandle` publishes still work, subscriptions and `on_connect` retry on the next reconnect; an injectable spawner would make this path host-testable.
+- Helper-spawn failure (heap exhaustion): the session never sees `WorkDone`, so `is_connected()` is `false` while the transport is up; `MqttHandle` publishes still reach the outbox, and subscriptions and `on_connect` retry on the next reconnect; an injectable spawner would make this path host-testable.
 - A running `on_connect` cannot be cancelled by a disconnect; it is documented as short-lived and idempotent, and a connection-aware callback API is a candidate for the next breaking release.
 - 0.6 (now optional): `on_connect` → `Fn(bool)` is no longer needed for safety; `with_connect_message(topic, payload, retain)` remains a convenience idea.
-- Hardware re-check pending: `idf_c3_mqtt` (retained status now published from `on_connect`), `idf_c3_mqtt_button_oled`, one `with_startup_message()` user.
+- Hardware re-check pending: `idf_c3_mqtt` (retained status now published from `on_connect`), `idf_c3_mqtt_button_oled`, one `with_startup_message()` user, and `idf_c3_mqtt_callback_guard` for the `on_message` path.
 
 ## Links
 - Source report: upstream bug report from the downstream consumer (on-connect enqueue deadlock).
@@ -105,3 +106,4 @@ Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), 
 - 2026-09-27 — Third review: helper-spawn failure no longer confirms the epoch (contract kept, documented), stale-helper limits documented precisely, host test for a disconnect/reconnect while `on_connect` is blocked; still open pending hardware checks.
 - 2026-09-27 — Merged to `main` as four commits (`511b37f`, `76d0d6e`, `5550775`, `2f2597a`) and pushed; `idf_c3_mqtt_button_oled` headless path confirmed on hardware, broker connection still blocked by a stale shell export; bug stays open until the MQTT paths are verified.
 - 2026-09-28 — rustyfarian-rgb-clock filed an upstream request (their bug 001): on 0.5.0, `try_publish` from `on_message` hung the client until reset on an ESP32-C3. This is field confirmation of the `on_message` path, which had been inferred here. Re-checked against IDF v5.3.3 and esp-idf-svc 0.53.0: `receiver.done()` runs only inside `next()`, so "release the event before `on_message`" is not a viable fix (ADR 017). The `idf_c3_mqtt_callback_guard` example was added as the pending hardware re-check for both the connect path and the message path; the `try_publish*` docs were corrected. Still open pending that hardware run.
+- 2026-11-02 — Re-checked against the post-Step-8b-2 code: the defect is still fixed and the hazard is unchanged, because esp-mqtt's `api_lock` scope and esp-idf-svc's park-until-`next()` are upstream and untouched; the plumbing references above were refreshed (tier-owned `mqtt-connect` worker, shared order subscriptions → startup → `on_connect`, `SessionToken` instead of `ConnectionEpoch`, `Close` performed by the lock-free runner), and `ConnectionEpoch`, `spawn_connect_thread` and `spawn_subscriber_thread` are deprecated; status stays `open-defect` pending the hardware run.

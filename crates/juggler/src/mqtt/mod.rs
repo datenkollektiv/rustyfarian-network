@@ -720,6 +720,11 @@ pub trait SubscribeClient {
 ///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
+#[deprecated(
+    note = "no tier spawns a connect helper through this since tier-parity Step 8b-2: \
+            the ESP-IDF session runs its connect work on its own worker and reports \
+            to `SessionMachine`; slated for removal in 1.0 (ADR 022)"
+)]
 pub fn spawn_connect_thread<C, F>(
     client: std::sync::Arc<std::sync::Mutex<C>>,
     prelude: Option<F>,
@@ -783,6 +788,10 @@ where
 ///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
+#[deprecated(
+    note = "no tier uses it since tier-parity Step 8b-2; the session machine's connect \
+            work covers subscriptions, and it is slated for removal in 1.0 (ADR 022)"
+)]
 pub fn spawn_subscriber_thread<C>(
     client: std::sync::Arc<std::sync::Mutex<C>>,
     topics: Vec<(String, QoS)>,
@@ -790,6 +799,7 @@ pub fn spawn_subscriber_thread<C>(
 ) where
     C: SubscribeClient + Send + 'static,
 {
+    #[allow(deprecated)]
     let _spawned = spawn_connect_thread(client, None::<fn(&mut C)>, topics, stack_size);
 }
 
@@ -1042,10 +1052,16 @@ pub struct EpochToken(u32);
 ///
 /// Requires the `std` feature.
 #[cfg(feature = "std")]
+#[deprecated(
+    note = "the shared `SessionMachine` guards stale sessions with `SessionToken` since \
+            tier-parity Step 8b-1, and no tier uses this epoch; slated for removal in \
+            1.0 (ADR 022)"
+)]
 #[derive(Default, Debug)]
 pub struct ConnectionEpoch(std::sync::atomic::AtomicU32);
 
 #[cfg(feature = "std")]
+#[allow(deprecated)] // the type's own methods necessarily name it
 impl ConnectionEpoch {
     /// Creates a fresh epoch: generation 0, not connected.
     pub fn new() -> Self {
@@ -1198,6 +1214,10 @@ impl Drop for CallbackScope {
 
 #[cfg(test)]
 mod tests {
+    // These tests are the regression coverage for the deprecated connect helper,
+    // epoch and subscriber spawner; they keep working until removal.
+    #![allow(deprecated)]
+
     // ── SessionPhase ────────────────────────────────────────────────────────
 
     #[test]
@@ -1719,6 +1739,7 @@ mod tests {
     // ── spawn_subscriber_thread ──────────────────────────────────────────────
 
     #[cfg(feature = "std")]
+    #[allow(deprecated)] // kept as the regression tests for the deprecated helpers
     use super::{spawn_connect_thread, spawn_subscriber_thread, QoS, SubscribeClient};
     #[cfg(feature = "std")]
     use std::sync::{Arc, Condvar, Mutex};

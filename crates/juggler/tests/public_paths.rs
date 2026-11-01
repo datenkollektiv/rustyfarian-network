@@ -1,3 +1,5 @@
+#![allow(deprecated)] // the public surface includes the deprecated MQTT helpers
+
 // public_paths.rs — downstream-style public-path smoke tests for `juggler`.
 //
 // Each `#[test]` fn imports and references the principal public items via the

@@ -174,6 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- `juggler::mqtt::{ConnectionEpoch, spawn_connect_thread, spawn_subscriber_thread}`: no tier uses them since tier-parity Steps 8b-1 and 8b-2 — `SessionMachine`'s `SessionToken` guards stale sessions and the ESP-IDF tier runs its connect work on its own worker — and they are slated for removal in 1.0; the regression tests and the public-path test still cover them until then.
 - `rustyfarian-esp-idf-network` `WiFiManager::link_state()`: use `state()`, the name both tiers share.
 - `juggler::wifi::WifiDriver`: no tier implements it; ADR 022's shared link traits replace it. Its docs no longer claim the ESP-IDF `WiFiManager` as an implementor, and `MqttConnectionState`'s docs now hold for both tiers.
 
