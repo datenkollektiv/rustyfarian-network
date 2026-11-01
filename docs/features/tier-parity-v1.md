@@ -39,7 +39,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 0 — feature doc and roadmap entry
 - [ ] Step 1 — IDF `MqttHandle::state()` and stale docs
 - [x] Step 2 — async IDF spike
-- [ ] Step 3 — extraction inventory
+- [x] Step 3 — extraction inventory ([inventory](tier-parity-v1-inventory.md))
 - [ ] Step 4 — public traits, ports and mocks
 - [ ] Step 5 — link core
 - [ ] Step 6 — MQTT session core
@@ -59,3 +59,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 2 spike built (variants A and B on the C3), desk findings in the plan, C3 hardware run pending
 - 2026-11-01 — Bug 010 filed (IDF MQTT starts before the IP); spike examples now start MQTT after the IP, library fix planned in Steps 6 and 8
 - 2026-11-01 — Step 2 done on the C3: variant A chosen, ADR 022 decision 2 amended, thread-memory fix (bug 013) planned in Step 8
+- 2026-11-01 — Step 3 inventory written; bug 014 filed (IDF reports ready before SUBSCRIBE); review point: cores as sans-IO machines

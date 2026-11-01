@@ -97,8 +97,8 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 3: Extraction inventory
 
-- [ ] Table in the feature doc: every branch in the Wi-Fi and MQTT tier code that is logic rather than mapping, with its target core and port method.
-- [ ] Known candidates: esp-hal MQTT runner (link watch, stall deadline, socket timeout, reconnect pacing), IDF MQTT (connection epoch confirm, `try_publish` refusal while disconnected, startup message), hal `WifiLink::run` select loop (park recheck, disconnect timeout).
+- [x] Table in `tier-parity-v1-inventory.md`: every branch in the Wi-Fi and MQTT tier code that is logic rather than mapping, with its target core and port method.
+- [x] Known candidates: esp-hal MQTT runner (link watch, stall deadline, socket timeout, reconnect pacing), IDF MQTT (connection epoch confirm, `try_publish` refusal while disconnected, startup message), hal `WifiLink::run` select loop (park recheck, disconnect timeout).
 - Done when: the maintainer has reviewed the table; it sets the scope of Steps 5 and 6.
 
 ### Step 4: Public traits, port traits and mocks in `juggler`
@@ -117,7 +117,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 6: MQTT session core
 
-- [ ] Generic `MqttSession<P: MqttPort>` in `juggler` implementing `MqttClient`: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, startup message, and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
+- [ ] Generic `MqttSession<P: MqttPort>` in `juggler` implementing `MqttClient`: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, one connect work order for both tiers (subscribe, startup message, then ready; bug 014), and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
 - [ ] Host tests run the MQTT conformance suite plus the moved rules from the Step 3 inventory (stall deadline, epoch confirm) with injected time.
 - Done when: `just test` passes; no tier code changed yet.
 
