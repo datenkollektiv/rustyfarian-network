@@ -4,6 +4,7 @@
 
 Accepted — 2026-09-28.
 Implemented on `main` (commit 511b37f..2f2597a); ships in v0.5.1.
+Amended 2026-11-02: §2's plumbing (helper thread, work order, stale-session guard) is superseded by ADR 022 Steps 6, 8b-1 and 8b-2; the contract itself is unchanged.
 
 ## Context
 
@@ -36,6 +37,10 @@ The event-loop thread never takes the client mutex directly.
 `on_connect` receives a mutable `&mut EspMqttClient<'_>` argument and may use it safely (`enqueue`, `subscribe`).
 
 `is_connected()` flips only after `on_connect` returns, via generation-checked `juggler::mqtt::ConnectionEpoch`, so stale reconnect helpers cannot mark a newer connection as connected if an older helper still runs.
+
+Amended 2026-11-02 (ADR 022 Steps 6, 8b-1 and 8b-2): the helper is now the tier's own worker thread, named `mqtt-connect` on the ESP-IDF tier, and it runs the builder subscriptions first, then the `with_startup_message()` publish, then `on_connect` — the order both tiers share.
+The stale-session guard is now `juggler::mqtt::SessionToken`: `is_connected()` turns true only when the shared `SessionMachine` sees `WorkDone` for the current token, and a stale worker's report is ignored.
+`juggler::mqtt::spawn_connect_thread`, `juggler::mqtt::spawn_subscriber_thread` and `juggler::mqtt::ConnectionEpoch` are deprecated, used by no tier, and stay until 1.0.
 
 ### 3. User contract for safe callback design
 
