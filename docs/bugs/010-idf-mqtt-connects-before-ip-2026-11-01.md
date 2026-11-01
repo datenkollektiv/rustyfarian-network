@@ -1,0 +1,63 @@
+---
+id: 010
+title: IDF MQTT client starts connecting before Wi-Fi has an IP
+captured-on: 2026-11-01
+doc-version: 2
+status: open-defect
+kind: defect
+---
+
+# Bug 010: IDF MQTT client starts connecting before Wi-Fi has an IP
+
+## Symptom
+On every boot with `ConnectMode::NonBlocking`, the first MQTT attempt fails with `esp-tls: connect() error: Host is unreachable`, `Error transport connect` and `[mqtt] error: ESP_FAIL`.
+
+## Suspected Cause
+`MqttBuilder::build` creates the esp-mqtt client, which starts its task and first attempt at once, whether or not the station has an IP.
+Nothing in the IDF tier gates MQTT attempts on the network, so esp-mqtt also retries every `reconnect_timeout` (10 s) while the link is down or suspended (runbook R3 calls this "expected noise").
+The esp-hal runner already waits for link-up and an IPv4 config before every attempt (`mqtt/runner.rs`, `is_link_up() && is_config_up()`), so this is also a tier-parity gap (ADR 022).
+
+## Linked Artefact
+- `crates/rustyfarian-esp-idf-network/src/mqtt/mod.rs` (`MqttBuilder::build`)
+- `crates/rustyfarian-esp-idf-network/examples/idf_c3_async_mqtt.rs` (no `get_ip` wait before `build`)
+- `docs/features/tier-parity-v1.md`, behaviour gap "IDF reconnect on link-up"
+
+## Reproduction Confidence
+high
+
+## Severity
+medium
+
+## Environment
+ESP32-C3, ESP-IDF v5.3.3, `esp-idf-svc 0.53`, branch `reconnect-rework`, example `idf_c3_async_mqtt` (tier-parity Step 2 spike).
+
+## Expected Behaviour
+A normal boot logs no MQTT error: the first attempt starts once the station has an IP, and attempts pause while the link is down or suspended, as on esp-hal.
+
+## Actual Behaviour
+- The first attempt runs about 30 ms after `build`, 3.5 s before the station gets its IP (`sta ip` at 4.2 s), and fails.
+- The session only comes up at esp-mqtt's next retry, 10 s later, so the first connect is delayed by up to `reconnect_timeout`.
+- The same happens after an outage: during a 2-minute router block esp-mqtt retried about every 15 s, each time with `Host is unreachable` and `[mqtt] error: ESP_FAIL`.
+- On recovery its last retry ran at 801.5 s, after association but 0.8 s before the IP (802.3 s), so the session came back only at the next retry (816.7 s), 14 s after the IP.
+- The other IDF examples hide this with `wifi.get_ip(10_000)` before `build`, which still fails the same way when the IP takes longer.
+
+## Reproduction Steps
+1. `just flash idf_c3_async_mqtt` on an ESP32-C3 with a reachable broker.
+2. `just monitor`.
+3. Observe `Error transport connect` and `[mqtt] error: ESP_FAIL` before `sta ip:`, and `mqtt up after` about 10 s later than the IP.
+
+## Suggested Fix Area
+- Library: start esp-mqtt only once the station has an IP, and stop or pause it while the link is down or suspended, driven by the Wi-Fi link state (IP events); a host-tested gate belongs in `juggler` (ADR 022 decision 10).
+- Interim example fix: wait for the IP before `build` in the spike examples (proper order: Wi-Fi up with IP, then MQTT).
+
+## Owner
+Claude (tier-parity work)
+
+## Links
+- `docs/adr/022-tier-parity-one-async-api.md`
+- `docs/features/tier-parity-v1-plan.md` (Step 2 spike, Phase 6 behaviour gaps)
+- `docs/runbooks/wifi-reconnect-hardware-test.md` (R3 expected-noise note)
+
+## Session Log
+- 2026-11-01 — Captured as a defect via /bug dialog from the Step 2 spike run on a C3
+- 2026-11-01 — Updated: outage evidence from the variant A run (retries during the outage, reconnect 14 s after the IP)

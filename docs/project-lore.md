@@ -292,6 +292,19 @@ Fix: store the subscription in the owning struct (e.g. as `Option<EspSystemSubsc
 
 ---
 
+## ESP-IDF FreeRTOS Tasks & Threads
+
+**`xTaskGetHandle` asserts and reboots the chip when the queried name is longer than 15 characters.**
+FreeRTOS stores task names cut to `configMAX_TASK_NAME_LEN - 1` (15) and asserts `strlen(pcNameToQuery) < 16` (`tasks.c:2855` in ESP-IDF v5.3.3), so querying a name as it was given at creation is not safe.
+`esp-idf-svc`'s `EspAsyncMqttClient` names its sender task `MQTT Sending task`, which FreeRTOS stores as `MQTT Sending ta`; querying the full name crashed the C3 spike `idf_c3_async_mqtt_native` once a minute (2026-11-01).
+Fix: query the stored 15-character name and skip longer names before calling `xTaskGetHandle` (see `MAX_TASK_NAME_LEN` in the IDF crate's `examples/common/spike.rs`).
+
+**Rust `std::thread::Builder::name` does not reach FreeRTOS on ESP-IDF; every spawned thread's task is called `pthread`.**
+The name stays a Rust-side label, so `xTaskGetHandle`, task lists and stack reports cannot tell library threads apart.
+Fix: set `esp_pthread_cfg_t::thread_name` with `esp_pthread_set_cfg` on the spawning thread right before the spawn, and reset it afterwards; Rust's own stack size still overrides the configured one (see `name_next_threads` in `examples/common/spike.rs`).
+
+---
+
 ## MQTT Event Loop (`esp-mqtt` / `esp-idf-svc`)
 
 **Any `esp_mqtt_client_*` call made from an `MqttBuilder` callback on the event-loop thread deadlocks the client for good.**

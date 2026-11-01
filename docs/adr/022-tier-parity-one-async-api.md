@@ -61,7 +61,9 @@ That feature lets embassy-time work on both tiers.
 
 1. Tier parity is the primary API goal: consumer application code is exchangeable between tiers, and only the dependency and the setup code differ.
 2. Async is the primary API on both tiers.
-   - The ESP-IDF tier gains an async surface built on the async types of `esp-idf-svc`.
+   - The ESP-IDF tier gains its async surface as async wrappers over its existing worker threads (amended 2026-11-01 after the tier-parity Step 2 spike on an ESP32-C3).
+   - The spike measured equal start-up, message load and outage recovery for both foundations; the native `esp-idf-svc` async types saved 15 to 25 KB of heap only by leaving out the library runtime.
+   - A port on the native types would have to rebuild reconnect, suspend, session confirmation, non-blocking publish and the ADR 017 guard, so the heap gap is closed in the library instead (bug 013).
    - The firmware owns the executor, following the ADR 021 rule that libraries never select a provider.
 3. The existing blocking ESP-IDF API stays during 0.x as an additive change.
    - New features land async-first on both tiers.
@@ -124,6 +126,7 @@ That feature lets embassy-time work on both tiers.
 - Does `embassy-time-driver 0.2.x` from `esp-idf-svc` unify with the workspace's `embassy-time`?
 - Is each of the three breaking items a break or a deprecation?
 - Does the blocking IDF API become thin wrappers over the async one?
+- Answered 2026-11-01: the IDF async foundation is async wrappers over the existing worker threads (decision 2).
 
 ## Alternatives Considered
 
