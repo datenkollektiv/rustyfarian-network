@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::wifi::LinkMachine` tracks readiness and associations: `LinkInput::{NetworkUp, NetworkDown}`, `is_ready()` (associated with an IP), `connect_count()` and `restart()`; `LinkHandover` and `LinkSupervisor` expose both, and `LinkSupervisor::wait_ready` returns a `ReadyWait` future that its worker wakes, that unregisters itself when dropped and that replaces its waker when repolled (tier-parity Step 5).
 - `juggler::wifi::NetworkLink` and `juggler::mqtt::{MqttClient, MqttMessage}`: the shared `no_std` traits firmware can be generic over, so the same application code runs on both tiers (ADR 022, tier-parity Step 4); the tiers implement them in later steps.
   `juggler::wifi::mock::MockLink` and `juggler::mqtt::mock::MockMqttClient` (feature `mock`) let firmware host-test that code.
 - Tier-parity spike examples (ADR 022, Step 2): `idf_c3_async_mqtt` runs an async app over the existing `WiFiManager` and `MqttHandle` threads, `idf_c3_async_mqtt_native` runs the same app on `esp-idf-svc`'s `AsyncWifi` and `EspAsyncMqttClient`; both use `block_on` with `embassy-time` on esp-idf-svc's time driver.

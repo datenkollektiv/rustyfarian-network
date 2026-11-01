@@ -33,7 +33,7 @@ pub use link::{
 };
 pub use network_link::NetworkLink;
 #[cfg(feature = "std")]
-pub use supervisor::{LinkEvent, LinkEvents, LinkRadio, LinkSupervisor};
+pub use supervisor::{LinkEvent, LinkEvents, LinkRadio, LinkSupervisor, ReadyWait};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 

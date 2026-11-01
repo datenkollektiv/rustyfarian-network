@@ -21,6 +21,14 @@
 //! What `Disconnect` does to the radio is tier-specific: the ESP-IDF tier stops
 //! it, the esp-hal tier only disconnects the station and the radio stays powered.
 //!
+//! # Readiness
+//!
+//! Association alone is not enough to use the network: [`LinkMachine::is_ready`]
+//! turns `true` only once the tier also reports the IP configuration with
+//! [`LinkInput::NetworkUp`], and `false` again on [`LinkInput::NetworkDown`],
+//! any link loss or a suspend. [`LinkMachine::connect_count`] counts every
+//! association since boot, except one that lands while suspended.
+//!
 //! # Adapter contract
 //!
 //! Inputs that do not fit the current state are ignored (a duplicate `Start`,
@@ -52,6 +60,10 @@ pub enum LinkInput {
     Suspend,
     /// Leave [`LinkState::Suspended`]; answered with [`LinkAction::Connect`].
     Resume,
+    /// The station has its IP configuration; ignored unless `Connected`.
+    NetworkUp,
+    /// The station lost its IP configuration while still associated.
+    NetworkDown,
 }
 
 /// Action the tier performs before polling again.
@@ -92,6 +104,10 @@ pub struct LinkMachine {
     backoff: ExponentialBackoff,
     max_ms: u64,
     failed_attempts: u32,
+    /// The tier reported the IP configuration for the current association.
+    network_up: bool,
+    /// Associations since boot, not counting one that lands while suspended.
+    connects: u32,
 }
 
 impl LinkMachine {
@@ -107,6 +123,8 @@ impl LinkMachine {
             backoff: ExponentialBackoff::new(base_ms, max_ms),
             max_ms,
             failed_attempts: 0,
+            network_up: false,
+            connects: 0,
         }
     }
 
@@ -120,13 +138,39 @@ impl LinkMachine {
         self.failed_attempts
     }
 
+    /// `true` while associated and the tier has reported the IP configuration.
+    pub fn is_ready(&self) -> bool {
+        self.state == LinkState::Connected && self.network_up
+    }
+
+    /// Associations since boot, not counting one that lands while suspended.
+    pub fn connect_count(&self) -> u32 {
+        self.connects
+    }
+
+    /// Returns to [`LinkState::Idle`] with a fresh back-off, keeping [`connect_count`](Self::connect_count).
+    pub fn restart(&mut self) {
+        self.state = LinkState::Idle;
+        self.backoff.reset();
+        self.failed_attempts = 0;
+        self.network_up = false;
+    }
+
     /// Advances the machine and returns what the tier must do next.
     pub fn poll(&mut self, input: LinkInput) -> LinkAction {
         use LinkAction as A;
         use LinkInput as I;
         use LinkState as S;
 
-        match (self.state, input) {
+        let action = match (self.state, input) {
+            (S::Connected, I::NetworkUp) => {
+                self.network_up = true;
+                A::None
+            }
+            (_, I::NetworkUp | I::NetworkDown) => {
+                self.network_up = false;
+                A::None
+            }
             (S::Suspended, I::Suspend | I::Disconnected | I::BackoffElapsed | I::Start) => A::None,
             (S::Suspended, I::Connected) => A::Disconnect,
             (S::Suspended, I::Resume) => {
@@ -145,6 +189,7 @@ impl LinkMachine {
             }
             (S::Idle | S::Connecting | S::Backoff, I::Connected) => {
                 self.state = S::Connected;
+                self.connects = self.connects.wrapping_add(1);
                 self.backoff.reset();
                 self.failed_attempts = 0;
                 A::None
@@ -157,7 +202,12 @@ impl LinkMachine {
                 }
             }
             _ => A::None,
+        };
+        // The IP belongs to one association; it never outlives `Connected`.
+        if self.state != S::Connected {
+            self.network_up = false;
         }
+        action
     }
 }
 
@@ -170,6 +220,101 @@ impl Default for LinkMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connected() -> LinkMachine {
+        let mut m = LinkMachine::new();
+        m.poll(LinkInput::Start);
+        m.poll(LinkInput::Connected);
+        m
+    }
+
+    #[test]
+    fn ready_needs_the_network_after_the_association() {
+        let mut m = LinkMachine::new();
+        m.poll(LinkInput::Start);
+        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::None);
+        assert!(!m.is_ready(), "an IP before the association is stale");
+        m.poll(LinkInput::Connected);
+        assert!(!m.is_ready());
+        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::None);
+        assert!(m.is_ready());
+    }
+
+    #[test]
+    fn losing_the_network_keeps_the_association() {
+        let mut m = connected();
+        m.poll(LinkInput::NetworkUp);
+        assert_eq!(m.poll(LinkInput::NetworkDown), LinkAction::None);
+        assert!(!m.is_ready());
+        assert_eq!(m.state(), LinkState::Connected);
+        m.poll(LinkInput::NetworkUp);
+        assert!(m.is_ready());
+    }
+
+    #[test]
+    fn a_link_loss_or_suspend_clears_readiness() {
+        let mut m = connected();
+        m.poll(LinkInput::NetworkUp);
+        m.poll(LinkInput::Disconnected);
+        assert!(!m.is_ready());
+        m.poll(LinkInput::BackoffElapsed);
+        m.poll(LinkInput::Connected);
+        assert!(!m.is_ready(), "a new association waits for its own IP");
+        m.poll(LinkInput::NetworkUp);
+        m.poll(LinkInput::Suspend);
+        assert!(!m.is_ready());
+        m.poll(LinkInput::NetworkUp);
+        assert!(!m.is_ready(), "no readiness while suspended");
+    }
+
+    #[test]
+    fn stray_inputs_while_connected_keep_readiness() {
+        let mut m = connected();
+        m.poll(LinkInput::NetworkUp);
+        for input in [
+            LinkInput::Start,
+            LinkInput::BackoffElapsed,
+            LinkInput::Resume,
+            LinkInput::Connected,
+        ] {
+            assert_eq!(m.poll(input), LinkAction::None);
+            assert!(m.is_ready(), "{:?} must not drop readiness", input);
+        }
+    }
+
+    #[test]
+    fn restart_returns_to_idle_and_keeps_the_count() {
+        let mut m = connected();
+        m.poll(LinkInput::NetworkUp);
+        m.restart();
+        assert_eq!(m.state(), LinkState::Idle);
+        assert!(!m.is_ready());
+        assert_eq!(m.connect_count(), 1);
+        assert_eq!(m.poll(LinkInput::Start), LinkAction::Connect);
+    }
+
+    #[test]
+    fn connect_count_counts_associations_but_not_while_suspended() {
+        let mut m = LinkMachine::new();
+        assert_eq!(m.poll(LinkInput::Connected), LinkAction::None);
+        assert_eq!(m.connect_count(), 1, "an adopted association counts");
+        m.poll(LinkInput::Connected);
+        assert_eq!(m.connect_count(), 1, "a duplicate does not");
+        m.poll(LinkInput::Disconnected);
+        m.poll(LinkInput::BackoffElapsed);
+        m.poll(LinkInput::Connected);
+        assert_eq!(m.connect_count(), 2);
+        m.poll(LinkInput::Suspend);
+        assert_eq!(m.poll(LinkInput::Connected), LinkAction::Disconnect);
+        assert_eq!(
+            m.connect_count(),
+            2,
+            "a late association while suspended does not"
+        );
+        m.poll(LinkInput::Resume);
+        m.poll(LinkInput::Connected);
+        assert_eq!(m.connect_count(), 3);
+    }
 
     fn drive_failure(m: &mut LinkMachine) -> u64 {
         match m.poll(LinkInput::Disconnected) {

@@ -76,7 +76,7 @@ impl LinkHandover {
     /// suspend that is in force; returns `true` if it is.
     pub fn restart(&mut self) -> bool {
         let suspended = self.machine.state() == LinkState::Suspended;
-        self.machine = LinkMachine::new();
+        self.machine.restart();
         self.pending = None;
         if suspended {
             self.machine.poll(LinkInput::Suspend);
@@ -98,6 +98,16 @@ impl LinkHandover {
     pub fn is_suspended(&self) -> bool {
         self.machine.state() == LinkState::Suspended && self.parked == self.suspends
     }
+
+    /// `true` while associated with the IP configuration reported (see [`LinkMachine::is_ready`]).
+    pub fn is_ready(&self) -> bool {
+        self.machine.is_ready()
+    }
+
+    /// Associations since boot (see [`LinkMachine::connect_count`]); survives [`restart`](Self::restart).
+    pub fn connect_count(&self) -> u32 {
+        self.machine.connect_count()
+    }
 }
 
 impl Default for LinkHandover {
@@ -109,6 +119,17 @@ impl Default for LinkHandover {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_keeps_the_connect_count_and_drops_readiness() {
+        let mut h = connected();
+        h.poll(LinkInput::NetworkUp);
+        assert!(h.is_ready());
+        assert_eq!(h.connect_count(), 1);
+        assert!(!h.restart());
+        assert!(!h.is_ready());
+        assert_eq!(h.connect_count(), 1);
+    }
 
     fn connected() -> LinkHandover {
         let mut h = LinkHandover::new();

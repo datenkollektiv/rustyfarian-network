@@ -41,7 +41,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 2 — async IDF spike
 - [x] Step 3 — extraction inventory ([inventory](tier-parity-v1-inventory.md))
 - [x] Step 4 — public traits and mocks
-- [ ] Step 5 — link core
+- [x] Step 5 — link core
 - [ ] Step 6 — MQTT session core
 - [ ] Step 7 — esp-hal adopts the cores
 - [ ] Step 8 — IDF adopts the cores
@@ -61,3 +61,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 2 done on the C3: variant A chosen, ADR 022 decision 2 amended, thread-memory fix (bug 013) planned in Step 8
 - 2026-11-01 — Step 3 inventory written; bug 014 filed (IDF reports ready before SUBSCRIBE); review point: cores as sans-IO machines
 - 2026-11-01 — Step 4 done: `NetworkLink`, `MqttClient`, `MqttMessage` and mocks in `juggler`; cores decided as sans-IO machines (ADR 022 decision 10 amended)
+- 2026-11-01 — Step 5 done: link machine gains readiness (IP) and connect counting; supervisor gets a woken `wait_ready`
