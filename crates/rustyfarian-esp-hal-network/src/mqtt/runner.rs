@@ -6,15 +6,18 @@
 //! acceptance, and in-flight QoS 1 replay does not survive the clean-start reconnect
 //! (minimq resets in-flight state when the broker reports no session).
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, IpEndpoint, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
+use juggler::mqtt::{MqttClient, SessionAction, SessionInput, SessionMachine};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, PubError, Publication,
     Session, SubscriptionOptions, TopicFilter, Will,
@@ -22,11 +25,11 @@ use minimq::{
 use static_cell::StaticCell;
 
 use super::{
-    parse_broker_ipv4, socket_timeout_ms, stall_timeout_ms, state_from_u8, state_to_u8,
-    validate_config, InboundMessage, MqttConfig, MqttConnectionState, MqttError, PublishRequest,
-    QoS, TryPublishError, DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS,
-    DEFAULT_RECONNECT_TIMEOUT_MS, INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER,
-    MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH, TCP_RX_BUFFER, TCP_TX_BUFFER,
+    parse_broker_ipv4, socket_timeout_ms, stall_timeout_ms, validate_config, InboundMessage,
+    MqttConfig, MqttConnectionState, MqttError, PublishRequest, QoS, TryPublishError,
+    DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS, DEFAULT_RECONNECT_TIMEOUT_MS,
+    INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER, MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH,
+    TCP_RX_BUFFER, TCP_TX_BUFFER,
 };
 
 /// Attempts to publish one queued message before dropping it when the TX arena is full.
@@ -52,35 +55,45 @@ type TransportError = embassy_net::tcp::Error;
 struct Shared {
     publish_q: Channel<CriticalSectionRawMutex, PublishRequest, PUBLISH_QUEUE_DEPTH>,
     inbound_q: Channel<CriticalSectionRawMutex, InboundMessage, INBOUND_QUEUE_DEPTH>,
-    state: AtomicU8,
+    /// The shared session lifecycle (ADR 022 decision 10); the runner feeds it,
+    /// the handle reads state, publish gate and connect count from it.
+    machine: Mutex<CriticalSectionRawMutex, RefCell<SessionMachine>>,
     connected: Signal<CriticalSectionRawMutex, ()>,
     dropped_inbound: AtomicU32,
     dropped_publish: AtomicU32,
-    connect_count: AtomicU32,
 }
 
 impl Shared {
-    const fn new() -> Self {
+    fn new(retry_ms: u64) -> Self {
         Self {
             publish_q: Channel::new(),
             inbound_q: Channel::new(),
-            state: AtomicU8::new(0),
+            machine: Mutex::new(RefCell::new(SessionMachine::with_retry(retry_ms))),
             connected: Signal::new(),
             dropped_inbound: AtomicU32::new(0),
             dropped_publish: AtomicU32::new(0),
-            connect_count: AtomicU32::new(0),
         }
     }
 
-    fn set_state(&self, state: MqttConnectionState) {
-        self.state.store(state_to_u8(state), Ordering::Release);
-        if state == MqttConnectionState::Connected {
+    /// Feeds the machine; wakes `wait_connected` when connect work made the session ready.
+    fn poll(&self, input: SessionInput) -> SessionAction {
+        let action = self.machine.lock(|m| m.borrow_mut().poll(input));
+        if matches!(input, SessionInput::WorkDone(_)) && self.can_publish() {
             self.connected.signal(());
         }
+        action
     }
 
     fn state(&self) -> MqttConnectionState {
-        state_from_u8(self.state.load(Ordering::Acquire))
+        self.machine.lock(|m| m.borrow().state())
+    }
+
+    fn can_publish(&self) -> bool {
+        self.machine.lock(|m| m.borrow().can_publish())
+    }
+
+    fn connect_count(&self) -> u32 {
+        self.machine.lock(|m| m.borrow().connect_count())
     }
 
     fn push_inbound(&self, msg: InboundMessage) {
@@ -136,7 +149,7 @@ impl MqttHandle {
 
     /// Number of broker sessions established since boot.
     pub fn connect_count(&self) -> u32 {
-        self.shared.connect_count.load(Ordering::Relaxed)
+        self.shared.connect_count()
     }
 
     /// Inbound messages dropped because nobody drained the queue in time.
@@ -183,7 +196,7 @@ impl MqttHandle {
     ) -> Result<(), TryPublishError> {
         let request = PublishRequest::new(topic, payload, clamp_qos(qos), retain)
             .map_err(TryPublishError::Other)?;
-        if !self.is_connected() {
+        if !self.shared.can_publish() {
             return Err(TryPublishError::WouldBlock);
         }
         self.shared
@@ -222,6 +235,53 @@ impl MqttHandle {
         self.shared.inbound_q.try_receive().ok()
     }
 }
+
+impl MqttClient for MqttHandle {
+    type Error = MqttError;
+    type Message = InboundMessage;
+
+    fn state(&self) -> MqttConnectionState {
+        MqttHandle::state(self)
+    }
+
+    fn connect_count(&self) -> u32 {
+        MqttHandle::connect_count(self)
+    }
+
+    fn try_publish_with(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), TryPublishError> {
+        MqttHandle::try_publish_with(self, topic, payload, qos, retain)
+    }
+
+    async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttError> {
+        self.publish_with(topic, payload, qos, retain).await
+    }
+
+    async fn wait_connected(&self) {
+        MqttHandle::wait_connected(self).await
+    }
+
+    async fn receive(&self) -> InboundMessage {
+        MqttHandle::receive(self).await
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `MqttHandle` stops implementing `MqttClient`.
+const _: fn() = || {
+    fn implements<T: MqttClient>() {}
+    implements::<MqttHandle>();
+};
 
 /// Message the runner publishes right after every successful connect.
 #[derive(Clone, Copy)]
@@ -310,8 +370,12 @@ impl MqttBuilder {
         static MQTT_RX: StaticCell<[u8; MQTT_RX_BUFFER]> = StaticCell::new();
         static MQTT_TX: StaticCell<[u8; MQTT_TX_BUFFER]> = StaticCell::new();
 
+        let reconnect_ms = self
+            .config
+            .reconnect_timeout_ms
+            .unwrap_or(DEFAULT_RECONNECT_TIMEOUT_MS);
         let shared: &'static Shared = SHARED
-            .try_init(Shared::new())
+            .try_init(Shared::new(reconnect_ms))
             .ok_or(MqttError::AlreadyBuilt)?;
         let tcp_rx = TCP_RX.init([0u8; TCP_RX_BUFFER]);
         let tcp_tx = TCP_TX.init([0u8; TCP_TX_BUFFER]);
@@ -352,11 +416,6 @@ impl MqttBuilder {
                     .unwrap_or(DEFAULT_CONNECTION_TIMEOUT_MS),
             ),
             stall: Duration::from_millis(stall_timeout_ms(keep_alive)),
-            reconnect_timeout: Duration::from_millis(
-                self.config
-                    .reconnect_timeout_ms
-                    .unwrap_or(DEFAULT_RECONNECT_TIMEOUT_MS),
-            ),
         };
         Ok((MqttHandle { shared }, runner))
     }
@@ -405,61 +464,106 @@ pub struct MqttRunner {
     startup: Option<StartupMessage>,
     connection_timeout: Duration,
     stall: Duration,
-    reconnect_timeout: Duration,
 }
 
 impl MqttRunner {
     /// Drives connect, serve and reconnect cycles forever.
+    ///
+    /// The shared [`SessionMachine`] decides when to connect, what to do after
+    /// CONNACK and how long to pause; this loop performs its actions.
     pub async fn run(mut self) -> ! {
+        let mut action = SessionAction::None;
+        // Log "waiting for network" once per wait; a disconnect line may already say it.
+        let mut announce_wait = true;
         loop {
-            self.shared.set_state(MqttConnectionState::Connecting);
-            if !network_up(&self.stack) {
-                log::info!("[mqtt] waiting for network");
-                while !network_up(&self.stack) {
-                    Timer::after(NETWORK_POLL_INTERVAL).await;
+            action = match action {
+                // Starting or offline: no attempt until the network is up (gate).
+                SessionAction::None => {
+                    if !network_up(&self.stack) {
+                        if announce_wait {
+                            log::info!("[mqtt] waiting for network");
+                        }
+                        while !network_up(&self.stack) {
+                            Timer::after(NETWORK_POLL_INTERVAL).await;
+                        }
+                    }
+                    announce_wait = true;
+                    let next = self.shared.poll(SessionInput::NetworkUp);
+                    if next == SessionAction::None {
+                        // Not reachable from this loop's own transitions; never spin.
+                        Timer::after(NETWORK_POLL_INTERVAL).await;
+                    }
+                    next
                 }
-            }
-
-            let (outcome, lost_network) = match select(
-                serve(
-                    &mut self.session,
-                    &mut self.socket,
-                    self.shared,
-                    self.broker,
-                    &self.subscriptions,
-                    self.startup,
-                    self.connection_timeout,
-                    self.stall,
-                ),
-                network_lost(self.stack),
-            )
-            .await
-            {
-                Either::First(outcome) => (outcome, false),
-                Either::Second(()) => (NETWORK_LOST, true),
+                SessionAction::Connect => {
+                    let (outcome, lost) = match select(
+                        serve(
+                            &mut self.session,
+                            &mut self.socket,
+                            self.shared,
+                            self.broker,
+                            &self.subscriptions,
+                            self.startup,
+                            self.connection_timeout,
+                            self.stall,
+                        ),
+                        network_lost(self.stack),
+                    )
+                    .await
+                    {
+                        Either::First(outcome) => (outcome, false),
+                        Either::Second(()) => (NETWORK_LOST, true),
+                    };
+                    if lost {
+                        // The machine answers with `Close`, which the teardown below performs.
+                        self.shared.poll(SessionInput::NetworkDown);
+                    }
+                    // Report the end before awaiting the cleanup, so `is_connected()` and
+                    // `try_publish` stop accepting at once; the teardown still finishes
+                    // before the next action runs.
+                    let next = self.shared.poll(SessionInput::Disconnected);
+                    self.close().await;
+                    match next {
+                        SessionAction::Wait { ms } => log::warn!(
+                            "[mqtt] disconnected ({}), reconnecting in {} ms",
+                            outcome,
+                            ms
+                        ),
+                        _ => {
+                            log::warn!("[mqtt] disconnected ({}), waiting for network", outcome);
+                            announce_wait = false;
+                        }
+                    }
+                    next
+                }
+                SessionAction::Wait { ms } => {
+                    match select(Timer::after_millis(ms), network_lost(self.stack)).await {
+                        Either::First(()) => self.shared.poll(SessionInput::RetryElapsed),
+                        Either::Second(()) => self.shared.poll(SessionInput::NetworkDown),
+                    }
+                }
+                SessionAction::Close => {
+                    self.close().await;
+                    self.shared.poll(SessionInput::Disconnected)
+                }
+                // Connect work runs inside `serve`; seeing it here means the machine
+                // and the runner disagree, so tear down and start over.
+                SessionAction::ConnectWork { .. } => {
+                    log::warn!("[mqtt] connect work outside a connection, restarting");
+                    self.close().await;
+                    self.shared.poll(SessionInput::Disconnected)
+                }
             };
+        }
+    }
 
-            self.shared.set_state(MqttConnectionState::Disconnected);
-            // Return the socket to CLOSED. The RST can only leave while the network is
-            // up (smoltcp clears the tuple after emitting it); the next connect() resets
-            // the socket either way, so the flush is skipped or bounded.
-            self.socket.abort();
-            if network_up(&self.stack) {
-                let _ = with_timeout(RST_FLUSH_TIMEOUT, self.socket.flush()).await;
-            }
-            if lost_network {
-                log::warn!("[mqtt] disconnected ({}), waiting for network", outcome);
-                while !network_up(&self.stack) {
-                    Timer::after(NETWORK_POLL_INTERVAL).await;
-                }
-            } else {
-                log::warn!(
-                    "[mqtt] disconnected ({}), reconnecting in {} ms",
-                    outcome,
-                    self.reconnect_timeout.as_millis()
-                );
-                Timer::after(self.reconnect_timeout).await;
-            }
+    /// Returns the socket to CLOSED. The RST can only leave while the network is up
+    /// (smoltcp clears the tuple after emitting it); the next `connect()` resets the
+    /// socket either way, so the flush is skipped or bounded.
+    async fn close(&mut self) {
+        self.socket.abort();
+        if network_up(&self.stack) {
+            let _ = with_timeout(RST_FLUSH_TIMEOUT, self.socket.flush()).await;
         }
     }
 }
@@ -504,7 +608,17 @@ async fn serve(
 
     let mut deadline = Instant::now() + stall;
     let event = conn.connect_event();
-    if event == ConnectEvent::Connected {
+    let (token, subscribe) = match shared.poll(SessionInput::Connected {
+        session_present: event != ConnectEvent::Connected,
+    }) {
+        SessionAction::ConnectWork { token, subscribe } => (token, subscribe),
+        other => {
+            log::warn!("[mqtt] CONNACK not expected by the session ({:?})", other);
+            return "unexpected connack";
+        }
+    };
+    // Connect work order shared with ESP-IDF: subscriptions, startup message, then ready.
+    if subscribe {
         for (topic, qos) in subscriptions {
             let filter = TopicFilter::new(topic)
                 .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(*qos)));
@@ -512,10 +626,12 @@ async fn serve(
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
+                    shared.poll(SessionInput::WorkFailed(token));
                     return "subscribe failed";
                 }
                 Err(_) => {
                     log::warn!("[mqtt] subscribe {} stalled", topic);
+                    shared.poll(SessionInput::WorkFailed(token));
                     return TRANSPORT_STALLED;
                 }
             }
@@ -529,16 +645,17 @@ async fn serve(
             retain: msg.retain,
         };
         if let Err(reason) = publish_queued(&mut conn, shared, &request, deadline).await {
+            shared.poll(SessionInput::WorkFailed(token));
             return reason;
         }
     }
 
-    bump(&shared.connect_count);
-    shared.set_state(MqttConnectionState::Connected);
+    shared.poll(SessionInput::WorkDone(token));
     log::info!(
-        "[mqtt] connected ({:?}, {} subscriptions)",
+        "[mqtt] connected ({:?}, {} subscriptions{})",
         event,
-        subscriptions.len()
+        subscriptions.len(),
+        if subscribe { "" } else { " kept" }
     );
 
     loop {

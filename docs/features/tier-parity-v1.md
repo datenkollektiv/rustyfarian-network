@@ -1,6 +1,6 @@
 ---
 gate: hardware
-gate-note: CrowPanel S3 runs runbook R1 and R3 on both tiers with the shared app module (plan Step 9)
+gate-note: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a and T5b for Step 7 (then Step 9's two-tier run)
 desk-work: available
 ---
 
@@ -43,7 +43,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 4 — public traits and mocks
 - [x] Step 5 — link core
 - [x] Step 6 — MQTT session core
-- [ ] Step 7 — esp-hal adopts the cores
+- [ ] Step 7 — esp-hal adopts the cores (desk work done, CrowPanel S3 rerun pending)
 - [ ] Step 8 — IDF adopts the cores
 - [ ] Step 9 — one app, two tiers (hardware gate, release 0.7.0)
 - [ ] Step 10 — Wi-Fi names and value types
@@ -55,3 +55,5 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Doc and plan created; Steps 0–5 done (roadmap, IDF MQTT state, C3 spike chose variant A, inventory, shared traits, link core); bugs 010–014 filed, 012 closed
 - 2026-11-01 — Step 6 done: `SessionMachine` with network gate, one connect work order, stale guard and retry pacing
 - 2026-11-01 — Step 7a done: hal `WifiLink` reports readiness from the stack, counts in the machine, implements `NetworkLink`
+- 2026-11-01 — Step 7b done at the desk: hal MQTT runner driven by `SessionMachine`, `MqttHandle` implements `MqttClient`; S3 rerun T5a/T5b pending
+- 2026-11-01 — Session end: next is the CrowPanel S3 T5a/T5b rerun for Step 7; Step 8 (IDF adopts the cores) is desk work that can start meanwhile
