@@ -113,8 +113,11 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 5: Link core
 
-- [ ] Link machine in `juggler` (sans-IO, no_std) covering the inventory's link rules: readiness as association plus IP, `connect_count`, park and recheck, back-off pre-emption, idle restart; `LinkHandover` and `LinkSupervisor` become its std and no_std drivers.
-- [ ] Host tests run the link conformance suite over the core with `MockRadio`, including concurrent suspend/resume while a `wait_connected` is pending (executor: `embassy-futures::block_on`, dev-dependency).
+- [x] `LinkMachine` (sans-IO, no_std): `LinkInput::{NetworkUp, NetworkDown}`, `is_ready()` (associated and IP, cleared whenever the state leaves `Connected`), `connect_count()` (not counting an association that lands while suspended), `restart()` keeping the count.
+- [x] `LinkHandover` passes `is_ready` and `connect_count` through and restarts with `LinkMachine::restart`, so a cancelled hal `run` keeps the count.
+- [x] `LinkSupervisor` (std): `LinkEvent::{NetworkUp, NetworkDown}` behind the stop fence, `is_ready`, `connect_count`, and `wait_ready` (a `ReadyWait` future) woken by the worker (no polling); a dropped wait unregisters itself, a repoll replaces its waker.
+- [x] Host tests: readiness, stray inputs, count rules, restart, worker wake-up (mutation-checked), suspend and resume around `wait_ready`; `just test-wifi` stable over 5 runs.
+- Left to the tier runners as adapter-contract steps (Steps 7 and 8): feed `NetworkUp` / `NetworkDown` from the driver, fast resume while still associated (feed `Connected` instead of connecting), the park recheck timer, the bounded hal disconnect.
 - Done when: `just test` and `just clippy-pure` pass.
 
 ### Step 6: MQTT session core

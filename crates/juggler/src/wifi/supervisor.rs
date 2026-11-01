@@ -29,6 +29,7 @@ use std::fmt::Debug;
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,10 @@ pub enum LinkEvent {
     Disconnected,
     /// The radio stopped.
     Stopped,
+    /// The station got its IP configuration.
+    NetworkUp,
+    /// The station lost its IP configuration while still associated.
+    NetworkDown,
 }
 
 enum Msg {
@@ -90,6 +95,10 @@ struct Core<R> {
     /// When the back-off ends; set and cleared only together with the state, so
     /// no timer outlives the `Backoff` it belongs to.
     backoff_at: Option<Instant>,
+    /// Pending [`ReadyWait`] futures by id, woken (and removed) when the link becomes ready.
+    ready_waiters: Vec<(u64, Waker)>,
+    /// Id for the next [`ReadyWait`] that registers.
+    next_waiter: u64,
 }
 
 impl<R: LinkRadio> Core<R> {
@@ -144,6 +153,8 @@ impl<R: LinkRadio> LinkSupervisor<R> {
             stops: 0,
             fenced: 0,
             backoff_at: None,
+            ready_waiters: Vec::new(),
+            next_waiter: 0,
         }));
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&core);
@@ -168,6 +179,32 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// Current link state, including [`LinkState::Suspended`].
     pub fn state(&self) -> LinkState {
         self.lock().machine.state()
+    }
+
+    /// `true` while associated with the IP configuration reported (see [`LinkMachine::is_ready`]).
+    pub fn is_ready(&self) -> bool {
+        self.lock().machine.is_ready()
+    }
+
+    /// Associations since boot (see [`LinkMachine::connect_count`]).
+    pub fn connect_count(&self) -> u32 {
+        self.lock().machine.connect_count()
+    }
+
+    /// Completes once the link is ready; the worker wakes it, nothing polls.
+    ///
+    /// Dropping the future before it completes removes its registration, so
+    /// cancelled waits (timeouts, `select`) leave nothing behind.
+    pub fn wait_ready(&self) -> ReadyWait<'_, R> {
+        ReadyWait {
+            core: &self.core,
+            id: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn ready_waiter_count(&self) -> usize {
+        self.lock().ready_waiters.len()
     }
 
     /// Disconnects and stops the radio on the caller's thread and pauses
@@ -218,6 +255,61 @@ impl<R: LinkRadio> LinkSupervisor<R> {
 
     fn lock(&self) -> MutexGuard<'_, Core<R>> {
         lock(&self.core)
+    }
+}
+
+/// Future returned by [`LinkSupervisor::wait_ready`].
+pub struct ReadyWait<'a, R: LinkRadio> {
+    core: &'a Mutex<Core<R>>,
+    /// Registration id, assigned on the first pending poll.
+    id: Option<u64>,
+}
+
+impl<R: LinkRadio> std::future::Future for ReadyWait<'_, R> {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let core_ref = self.core;
+        let mut core = lock(core_ref);
+        if core.machine.is_ready() {
+            if let Some(id) = self.id.take() {
+                core.ready_waiters.retain(|(waiter, _)| *waiter != id);
+            }
+            return Poll::Ready(());
+        }
+        let id = match self.id {
+            Some(id) => id,
+            None => {
+                let id = core.next_waiter;
+                core.next_waiter = core.next_waiter.wrapping_add(1);
+                self.id = Some(id);
+                id
+            }
+        };
+        match core
+            .ready_waiters
+            .iter_mut()
+            .find(|(waiter, _)| *waiter == id)
+        {
+            Some((_, waker)) => {
+                if !waker.will_wake(cx.waker()) {
+                    waker.clone_from(cx.waker());
+                }
+            }
+            // First poll, or the worker woke and removed this entry.
+            None => core.ready_waiters.push((id, cx.waker().clone())),
+        }
+        Poll::Pending
+    }
+}
+
+impl<R: LinkRadio> Drop for ReadyWait<'_, R> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            lock(self.core)
+                .ready_waiters
+                .retain(|(waiter, _)| *waiter != id);
+        }
     }
 }
 
@@ -272,9 +364,16 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>) {
             }
             Some(Msg::Event(LinkEvent::Connected)) => LinkInput::Connected,
             Some(Msg::Event(LinkEvent::Disconnected)) => LinkInput::Disconnected,
+            Some(Msg::Event(LinkEvent::NetworkUp)) => LinkInput::NetworkUp,
+            Some(Msg::Event(LinkEvent::NetworkDown)) => LinkInput::NetworkDown,
             Some(Msg::Input(input)) => input,
         };
         step(&mut core, input);
+        if core.machine.is_ready() {
+            for (_, waker) in core.ready_waiters.drain(..) {
+                waker.wake();
+            }
+        }
     }
     log::debug!("WiFi link worker exited");
 }
@@ -401,6 +500,7 @@ mod tests {
                 log.connects += 1;
             }
             self.post(LinkEvent::Connected);
+            self.post(LinkEvent::NetworkUp);
             self.leave();
             Ok(())
         }
@@ -493,6 +593,115 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(sup.state(), want);
+    }
+
+    /// A waker that records whether the worker woke it.
+    struct Flag(AtomicBool);
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cond() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    #[test]
+    fn wait_ready_is_woken_by_the_worker_once_the_network_is_up() {
+        use std::future::Future;
+        let rig = rig(true);
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut ready = std::pin::pin!(rig.sup.wait_ready());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+
+        assert!(rig.sup.start());
+        assert!(
+            eventually(|| flag.0.load(Ordering::SeqCst)),
+            "the worker must wake the waiter"
+        );
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+        assert!(rig.sup.is_ready());
+        assert_eq!(rig.sup.connect_count(), 1);
+    }
+
+    #[test]
+    fn a_dropped_wait_unregisters_itself() {
+        use std::future::Future;
+        let rig = rig(false);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        for _ in 0..3 {
+            let mut wait = std::pin::pin!(rig.sup.wait_ready());
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(rig.sup.ready_waiter_count(), 1);
+        }
+        assert_eq!(
+            rig.sup.ready_waiter_count(),
+            0,
+            "cancelled waits must leave nothing behind"
+        );
+    }
+
+    #[test]
+    fn a_repolled_wait_replaces_its_waker_and_the_latest_one_is_woken() {
+        use std::future::Future;
+        let rig = rig(true);
+        let first = Arc::new(Flag(AtomicBool::new(false)));
+        let latest = Arc::new(Flag(AtomicBool::new(false)));
+        let first_waker = Waker::from(Arc::clone(&first));
+        let latest_waker = Waker::from(Arc::clone(&latest));
+        let mut wait = std::pin::pin!(rig.sup.wait_ready());
+        assert!(wait
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&first_waker))
+            .is_pending());
+        assert!(wait
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&latest_waker))
+            .is_pending());
+        assert_eq!(rig.sup.ready_waiter_count(), 1, "a repoll must not append");
+
+        rig.sup.start();
+        assert!(eventually(|| latest.0.load(Ordering::SeqCst)));
+        assert!(
+            !first.0.load(Ordering::SeqCst),
+            "the replaced waker must not be woken"
+        );
+        assert!(wait
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&latest_waker))
+            .is_ready());
+        assert_eq!(rig.sup.ready_waiter_count(), 0);
+    }
+
+    #[test]
+    fn suspend_drops_readiness_and_resume_restores_it() {
+        use std::future::Future;
+        let rig = rig(true);
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+
+        rig.sup.suspend().unwrap();
+        assert!(!rig.sup.is_ready());
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut ready = std::pin::pin!(rig.sup.wait_ready());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+
+        rig.sup.resume().unwrap();
+        assert!(eventually(|| rig.sup.is_ready()));
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(rig.sup.connect_count(), 2);
+        assert!(rig.violations().is_empty());
     }
 
     #[test]
