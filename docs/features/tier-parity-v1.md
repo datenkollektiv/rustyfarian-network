@@ -57,3 +57,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 7a done: hal `WifiLink` reports readiness from the stack, counts in the machine, implements `NetworkLink`
 - 2026-11-01 — Step 7b done at the desk: hal MQTT runner driven by `SessionMachine`, `MqttHandle` implements `MqttClient`; S3 rerun T5a/T5b pending
 - 2026-11-01 — Session end: next is the CrowPanel S3 T5a/T5b rerun for Step 7; Step 8 (IDF adopts the cores) is desk work that can start meanwhile
+- 2026-11-01 — Step 8a done: IDF `WiFiManager` feeds IP events, gains `state`/`is_ready`/`wait_ready`, implements `NetworkLink`; bench runs for both tiers deferred by the maintainer

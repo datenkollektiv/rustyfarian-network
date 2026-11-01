@@ -153,11 +153,27 @@ Split into two reviewable chunks; the CrowPanel S3 rerun covers both after 7b.
 
 ### Step 8: IDF adopts the cores
 
-- [ ] `WiFiManager` gets `NetworkLink` through the link core (inherent `state()` added, `link_state()` deprecated); `MqttHandle` runs the session machine on its event thread and implements `MqttClient` (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
+Split into three reviewable chunks; the bench run for both tiers comes after Step 8.
+
+#### Step 8a: `WiFiManager` on the link core
+
+- [x] The link worker also subscribes to `IpEvent` (`DhcpIpAssigned` / `DhcpIpDeassigned` → `LinkEvent::NetworkUp` / `NetworkDown`), on the same event loop as the Wi-Fi events, so the order holds.
+- [x] Only IP events of the station's interface count (`IpEvent::handle` compared with the STA netif); `is_suspended` reports a completed suspend (`Suspended` and the radio stopped) through the new `LinkSupervisor::is_suspended` (review of b5fb0ae).
+- [x] `WiFiManager::{state, is_ready, is_suspended, connect_count, wait_ready}`; `link_state()` deprecated as an alias of `state()`.
+- [x] `impl NetworkLink for WiFiManager` (`Error = anyhow::Error`, `wait_connected` = `wait_ready`) and a compile-time parity check; the inherent blocking `wait_connected(timeout)` stays until Step 10.
+
+#### Step 8b: `MqttHandle` on the session machine
+
+- [ ] `MqttHandle` runs `SessionMachine` on its event thread and implements `MqttClient` (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
+- [ ] Bug 014: one connect work order (subscribe, startup message, `on_connect`, then ready).
+- [ ] Bug 010: esp-mqtt starts only once the link is ready and stops while it is down or suspended, driven by the network gate; close the bug after the bench run.
+
+#### Step 8c: MQTT thread memory
+
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
-- [ ] Bug 010: the IDF port starts esp-mqtt only once the station has an IP and stops it while the link is down or suspended, driven by the core's network gate; close the bug after the hardware run.
-- Done when: `just verify` (static assertion included) and `idf_esp32s3_mqtt_lwt` build pass.
-- Gate: rides with Step 9's hardware run.
+
+- Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
+- Gate: rides with the bench run for both tiers.
 
 ## Phase 4 — Proof and release checkpoint
 

@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
 
     let suspend_demo = env::mqtt_suspend_demo();
     let mut tick: u32 = 0;
-    let mut last_link = wifi.link_state();
+    let mut last_link = wifi.state();
     let mut last_state = mqtt.state();
     let mut mqtt_was_up = false;
     let mut secs_since_heap_log: u64 = 0;
@@ -160,7 +160,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        let link = wifi.link_state();
+        let link = wifi.state();
         if link != last_link {
             log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
             last_link = link;

@@ -75,10 +75,12 @@ use anyhow::Context as _;
 
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
+use esp_idf_svc::handle::RawHandle as _;
+use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{esp, EspError};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
-use juggler::wifi::{LinkEvent, LinkRadio, LinkSupervisor};
+use juggler::wifi::{LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
 // Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
 // (where `SoftApManager` is cfg'd out) does not warn on unused imports.
 #[cfg(esp_idf_esp_wifi_softap_support)]
@@ -298,7 +300,7 @@ impl WiFiManager {
         // Reconnect supervision: the worker owns the `LinkMachine` and issues every
         // connect, the first one included, in all modes. Declared after `wifi`, so
         // on an early return it is joined before the driver is dropped.
-        let link = LinkWorker::start(&sys_loop_sub)?;
+        let link = LinkWorker::start(&sys_loop_sub, wifi.wifi().sta_netif().handle())?;
         if !link.supervisor.start() {
             anyhow::bail!("WiFi link worker is not running");
         }
@@ -495,8 +497,42 @@ impl WiFiManager {
 
     /// The reconnect supervisor's view of the link, including
     /// [`LinkState::Suspended`]; infallible, for rendering a status.
-    pub fn link_state(&self) -> LinkState {
+    pub fn state(&self) -> LinkState {
         self.link.supervisor.state()
+    }
+
+    /// Former name of [`state`](Self::state).
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `state()`, the name both tiers share (ADR 022)"
+    )]
+    pub fn link_state(&self) -> LinkState {
+        self.state()
+    }
+
+    /// `true` while the station is associated and has its IP address.
+    pub fn is_ready(&self) -> bool {
+        self.link.supervisor.is_ready()
+    }
+
+    /// `true` once a [`suspend`](Self::suspend) has taken effect: the radio is
+    /// stopped. Stays `false` after a suspend whose stop failed.
+    pub fn is_suspended(&self) -> bool {
+        self.link.supervisor.is_suspended()
+    }
+
+    /// Associations since boot; a change means a new link session.
+    pub fn connect_count(&self) -> u32 {
+        self.link.supervisor.connect_count()
+    }
+
+    /// Completes once the station is associated and has its IP address, woken by
+    /// the reconnect worker; cancelling the wait leaves nothing behind.
+    ///
+    /// The async counterpart of the blocking [`wait_connected`](Self::wait_connected);
+    /// generic code reaches it as [`NetworkLink::wait_connected`].
+    pub fn wait_ready(&self) -> impl core::future::Future<Output = ()> + '_ {
+        self.link.supervisor.wait_ready()
     }
 
     /// Disconnects and stops the radio, and pauses reconnects until
@@ -551,13 +587,18 @@ impl WiFiManager {
 /// is gone.
 struct LinkWorker {
     _subscription: EspSystemSubscription<'static>,
+    _ip_subscription: EspSystemSubscription<'static>,
     supervisor: LinkSupervisor<IdfRadio>,
 }
 
 impl LinkWorker {
     /// Spawns the supervisor and subscribes it to the station events; the
-    /// radio must already be started.
-    fn start(sys_loop: &EspSystemEventLoop) -> anyhow::Result<Self> {
+    /// radio must already be started. `sta_netif` identifies the station's
+    /// interface, so IP events of any other interface are ignored.
+    fn start(
+        sys_loop: &EspSystemEventLoop,
+        sta_netif: *mut esp_idf_svc::sys::esp_netif_t,
+    ) -> anyhow::Result<Self> {
         let supervisor = LinkSupervisor::spawn(
             IdfRadio,
             LinkMachine::new(),
@@ -591,12 +632,65 @@ impl LinkWorker {
                 _ => {}
             })
             .map_err(|e| anyhow::anyhow!("WiFi link subscription failed: {:?}", e))?;
+        // Readiness: the station's IP. Same event loop as above, so `NetworkUp`
+        // reaches the worker after the `Connected` it belongs to. Only the station's
+        // interface counts; the handle is kept as an address because raw pointers
+        // are not `Send`.
+        let events = supervisor.events();
+        let sta_netif = sta_netif as usize;
+        let ip_subscription = sys_loop
+            .subscribe::<IpEvent, _>(move |event: IpEvent<'_>| {
+                if event.handle().map(|netif| netif as usize) != Some(sta_netif) {
+                    return;
+                }
+                match event {
+                    IpEvent::DhcpIpAssigned(_) => events.send(LinkEvent::NetworkUp),
+                    IpEvent::DhcpIpDeassigned(_) => events.send(LinkEvent::NetworkDown),
+                    _ => {}
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("WiFi IP subscription failed: {:?}", e))?;
         Ok(Self {
             _subscription: subscription,
+            _ip_subscription: ip_subscription,
             supervisor,
         })
     }
 }
+
+impl NetworkLink for WiFiManager {
+    type Error = anyhow::Error;
+
+    fn state(&self) -> LinkState {
+        WiFiManager::state(self)
+    }
+
+    fn is_suspended(&self) -> bool {
+        WiFiManager::is_suspended(self)
+    }
+
+    fn connect_count(&self) -> u32 {
+        WiFiManager::connect_count(self)
+    }
+
+    fn suspend(&self) -> anyhow::Result<()> {
+        WiFiManager::suspend(self)
+    }
+
+    fn resume(&self) -> anyhow::Result<()> {
+        WiFiManager::resume(self)
+    }
+
+    async fn wait_connected(&self) {
+        self.wait_ready().await
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `WiFiManager` stops implementing `NetworkLink`.
+const _: fn() = || {
+    fn implements<T: NetworkLink>() {}
+    implements::<WiFiManager>();
+};
 
 /// The station calls of the ESP-IDF driver; events arrive through the
 /// system event loop in the order the driver posts them.
