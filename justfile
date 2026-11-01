@@ -465,6 +465,11 @@ mqtt-watch:
 mqtt-pub topic message:
     mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/{{ topic }}" -m "{{ message }}"
 
+# publish <count> numbered messages (msg-1 … msg-N) to <prefix>/<topic> back to back, a message-load test, e.g. `just mqtt-burst cmd 50`
+[group('examples')]
+mqtt-burst topic count:
+    seq 1 {{ count }} | sed 's/^/msg-/' | mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/{{ topic }}" -l
+
 # print the retained <prefix>/status value once (expects `online` while the device is up)
 [group('examples')]
 mqtt-status:

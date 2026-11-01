@@ -39,7 +39,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 1: IDF `MqttHandle::state()` and stale docs
 
-- [x] IDF `MqttHandle::state() -> MqttConnectionState`, driven by the events that already maintain `is_connected()` and `connect_count()` (`Connecting` until the first CONNACK, `Disconnected` on loss, `ShuttingDown` on drop).
+- [x] IDF `MqttHandle::state() -> MqttConnectionState`, driven by the events that already maintain `is_connected()` and `connect_count()` (`Connecting` per attempt, `Connected` exactly when `is_connected()`, `Disconnected` after a lost session or failed attempt; never `ShuttingDown`, since the session ends when the last handle drops).
 - [x] Fix the `MqttConnectionState::Disconnected` doc so it holds for both tiers.
 - [x] Deprecate `juggler::wifi::WifiDriver` (`#[deprecated(note = "use the ADR 022 traits")]`), fix its implementor list; keep the re-exports with `#[allow(deprecated)]`.
 - [x] Log the state in `idf_esp32s3_mqtt_lwt` next to `connect #<n>`.
@@ -50,11 +50,48 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 2: Async IDF spike (`idf_c3_async_mqtt`)
 
-- [ ] New example: `embassy-executor` (`arch-std`) on the main task, `esp-idf-svc` `embassy-time-driver` feature enabled in the example's dev-dependencies, the existing `WiFiManager` and `MqttHandle` driven from async code, `Timer::after` ticks.
+- [x] Variant A, `idf_c3_async_mqtt`: `embassy-executor` (`arch-std`) on the main task, the `esp-idf-svc` `embassy-time-driver` feature in the example's dev-dependencies, the existing `WiFiManager` and `MqttHandle` driven from async code through minimal async waits over their worker threads, `Timer::after` ticks.
+- [x] Variant B, `idf_c3_async_mqtt_native`: the same app on `AsyncWifi` and `EspAsyncMqttClient` / `EspAsyncMqttConnection`, with reconnect and the online flag done by the example.
+- [x] Compare both: code a tier port would need, how each fits behind the decision 10 ports, reconnect and callback behaviour against ADR 017, stack and heap high-water marks; amend ADR 022 decision 2 with the winner.
 - [ ] Record in ADR 022's open questions: executor choice, lock unification (`embassy-time-driver 0.2.x`, `embassy-sync`), stack and heap high-water marks versus `idf_c3_mqtt_*`.
-- Done when: the example builds, `cargo tree -i embassy-time-driver` shows one version, and a C3 run publishes ticks.
-- **R:** adapter over the existing worker threads (async waits on top of `LinkSupervisor` and the MQTT event thread) versus a rewrite on `AsyncWifi` / `EspAsyncMqttClient`.
-  The plan assumes the adapter: smaller, keeps the hardware-validated reconnect logic, and still satisfies ADR 022 decision 2 because the surface is async; the spike confirms or refutes this.
+- Done when: both variants build, `cargo tree -i embassy-time-driver` shows one version, a C3 run publishes ticks with each, and the maintainer has accepted the ADR amendment.
+- Decided 2026-11-01 by the maintainer: spike both instead of assuming the adapter.
+- Decided 2026-11-01 by the maintainer after the hardware run: variant A, async wrappers over the existing worker threads (ADR 022 decision 2 amended).
+- Both variants create their MQTT client only after the station has an IP (bug 010 interim fix), so `wifi up after` means the IP on both.
+- Both variants share `examples/common/spike.rs`: one bounded inbound queue with a drop counter, one `rx` drain, and one resource report (heap, minimum heap, stack high-water of `main` and of each worker task).
+- Hardware run (C3), identical for both: `just flash <example>`, `just monitor`, `just mqtt-watch`; record `wifi up after`, `mqtt up after`, the 5-minute resource lines, one `cmd` round trip (`just mqtt-pub`), a 50-message burst (`just mqtt-burst cmd 50`, then `rx` and `dropped rx`), and a 2-minute router pause.
+
+#### Step 2 desk findings (2026-11-01)
+
+- Both variants build for the C3 without warnings; the IDF graph holds one `embassy-time-driver` (0.2.2, 1 MHz tick like esp-rtos) and no duplicate embassy crates.
+- Executor: `esp_idf_svc::hal::task::block_on` runs the app with no executor dependency, but then the esp-idf-svc time driver needs `embassy-time-queue-utils/generic-queue-N`; `embassy-executor` would bring the integrated queue instead.
+- The timer-queue choice is a binary-owned provider in the sense of ADR 021: the library must not select it.
+- `embassy-sync` channels with `CriticalSectionRawMutex` need the firmware's `critical-section` provider (the examples already select esp-idf-hal's).
+- Variant A leaves the library unchanged; its glue is a readiness wait and an inbound channel, and its code is 1.4 KB larger than the blocking `idf_c3_mqtt`.
+- Variant B's port would have to rebuild what the library already does: Wi-Fi reconnect and back-off, suspend and resume (not in the spike), session readiness and connect work, ack correlation, inbound buffering.
+- Variant B's port needs the library's connection-epoch pattern too: a session can drop while its subscribe or `online` publish is awaited, and only `ConnectionEpoch::confirm` keeps it from being reported ready.
+- esp-idf-svc 0.53's async client has no non-blocking publish: B's ticks await the send (logged as `published in N ms`), while A's `try_publish` hands the message to esp-mqtt's outbox (`queued`); a B port would need its own queue to offer `try_publish`.
+- Variant B reintroduces the ADR 017 hazard in a new form: `EspAsyncMqttConnection` releases an event only on the next `next()`, so the event pump must await nothing else and publishing needs its own future.
+- `juggler::mqtt::SessionPhase` drops into variant B unchanged, which supports decision 10: the cores work over either foundation.
+- Variant B's code is about 80 KB smaller, but it leaves out the library runtime, so the sizes are not like-for-like.
+- Preliminary lean: variant A, pending the hardware numbers (heap, stack, reconnect under an outage).
+
+#### Step 2 hardware results (C3, 2026-11-01)
+
+| Measure | A (library threads) | B (esp-idf-svc async) |
+|:--|:--|:--|
+| wifi up (IP) / mqtt up | 4 682 / 4 752 ms | 4 664 / 4 730 ms |
+| heap free / min free, steady | 145 156 / 130 324 B | 160 224 / 155 388 B |
+| worker stacks, unused | wifi-link 3 024, mqtt-events 11 180 of 12 KB | MQTT Sending ta 3 188 |
+| esp-mqtt task stack, unused | 6 360 B | 7 380 B |
+| burst of 50: received / dropped | 4 / 46 | 4 / 46 |
+| outage: IP to MQTT up | 14 s (esp-mqtt retry) | 10.7 s (esp-mqtt retry) |
+| min free drop across the outage | 9 060 B (bug 013) | 588 B |
+| tick publish | `queued`, never waits | `published in 3 ms`, awaits the send |
+
+- Start-up, message load and LWT behaviour are equal; both foundations recover through esp-mqtt's retry timer, so bug 010 applies to both.
+- B's 15 to 25 KB heap advantage is the library runtime it leaves out: the 12 KB MQTT event-loop thread uses about 1 KB of its stack, and a 12 KB helper thread starts on every connect (bug 013).
+- B gives up what the library already provides: reconnect and suspend, session confirmation, `try_publish` without waiting, disconnect reasons, and the ADR 017 guard.
 
 ## Phase 2 — The shared contract and host-tested cores
 
@@ -80,7 +117,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 6: MQTT session core
 
-- [ ] Generic `MqttSession<P: MqttPort>` in `juggler` implementing `MqttClient`: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, startup message.
+- [ ] Generic `MqttSession<P: MqttPort>` in `juggler` implementing `MqttClient`: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, startup message, and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
 - [ ] Host tests run the MQTT conformance suite plus the moved rules from the Step 3 inventory (stall deadline, epoch confirm) with injected time.
 - Done when: `just test` passes; no tier code changed yet.
 
@@ -96,6 +133,8 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 ### Step 8: IDF adopts the cores
 
 - [ ] `WiFiManager` gets `NetworkLink` through the link core (inherent `state()` added, `link_state()` deprecated); `MqttHandle` becomes `MqttSession<IdfMqttPort>`, the port wrapping the esp-mqtt client and event thread (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
+- [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
+- [ ] Bug 010: the IDF port starts esp-mqtt only once the station has an IP and stops it while the link is down or suspended, driven by the core's network gate; close the bug after the hardware run.
 - Done when: `just verify` (static assertion included) and `idf_esp32s3_mqtt_lwt` build pass.
 - Gate: rides with Step 9's hardware run.
 

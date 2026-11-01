@@ -102,6 +102,15 @@ esp-idf-hal                = { workspace = true, features = ["critical-section"]
 rustyfarian-esp-idf-ws2812 = { workspace = true }
 ssd1306                    = { workspace = true }
 embedded-graphics          = { workspace = true }
+# Tier-parity spike (ADR 022, Step 2): the async examples use embassy-time on
+# esp-idf-svc's time driver, embassy-futures for `join` and embassy-sync channels.
+esp-idf-svc                = { workspace = true, features = ["embassy-time-driver"] }
+embassy-time               = { workspace = true }
+embassy-futures            = { workspace = true }
+embassy-sync               = { workspace = true }
+# `block_on` has no integrated timer queue (embassy-executor provides that), so the
+# esp-idf-svc time driver needs the generic queue; 16 timers cover the spike.
+embassy-time-queue-utils   = { version = "=0.3.2", features = ["generic-queue-16"] }
 
 [[example]]
 name = "idf_c3_connect"
@@ -117,6 +126,14 @@ required-features = ["wifi"]
 
 [[example]]
 name = "idf_c3_mqtt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c3_async_mqtt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c3_async_mqtt_native"
 required-features = ["wifi", "mqtt"]
 
 [[example]]

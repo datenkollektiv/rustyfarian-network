@@ -10,14 +10,14 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 
 ## Decisions
 
-| Decision                                          | Reason                                                     | Rejected Alternative                            |
-|:--------------------------------------------------|:-----------------------------------------------------------|:------------------------------------------------|
-| Async API on both tiers                           | Consumer code exchangeable (ADR 022, decision 2)           | Blocking primary surface; per-consumer adapters |
-| Behaviour in `juggler` cores over narrow ports    | Host-tested, parity by construction (ADR 022, decision 10) | Logic duplicated per tier; `dyn` ports          |
-| IDF async as adapter over existing worker threads | Keeps the validated reconnect logic; Step 2 spike confirms | Rewrite on `AsyncWifi` / `EspAsyncMqttClient`   |
-| Blocking IDF API stays during 0.x                 | Additive change                                            | Removing it now                                 |
-| Per-tier type aliases over generic cores          | Consumers never spell the generics                         | Generic public types                            |
-| Wi-Fi and MQTT first                              | Upstream request U2g                                       | All domains at once                             |
+| Decision                                                       | Reason                                                         | Rejected Alternative                            |
+|:---------------------------------------------------------------|:---------------------------------------------------------------|:------------------------------------------------|
+| Async API on both tiers                                        | Consumer code exchangeable (ADR 022, decision 2)               | Blocking primary surface; per-consumer adapters |
+| Behaviour in `juggler` cores over narrow ports                 | Host-tested, parity by construction (ADR 022, decision 10)     | Logic duplicated per tier; `dyn` ports          |
+| IDF async as wrappers over the existing worker threads | Spike: equal behaviour, native types only saved the runtime they omit | `esp-idf-svc` `AsyncWifi` / `EspAsyncMqttClient` |
+| Blocking IDF API stays during 0.x                              | Additive change                                                | Removing it now                                 |
+| Per-tier type aliases over generic cores                       | Consumers never spell the generics                             | Generic public types                            |
+| Wi-Fi and MQTT first                                           | Upstream request U2g                                           | All domains at once                             |
 
 ## Constraints
 - ADR 021 holds: the firmware owns the executor and the providers, and libraries select none.
@@ -27,17 +27,18 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - Every step ends with `just fmt` and `just verify`, plus `just clippy-hal` and `just build-example` where touched.
 
 ## Open Questions
-- [ ] Which IDF executor do the examples use: embassy-executor with `arch-std`, or esp-idf-hal `block_on`?
-- [ ] Does the embassy crate set unify across tiers? `embassy-time-driver` is already a single 0.2.2 in the lock.
+- [ ] Which IDF executor do the examples use? `block_on` works with the generic timer queue; `embassy-executor` (`platform-std`) is untested.
+- [x] Does the embassy crate set unify across tiers? Yes for the IDF graph: one `embassy-time-driver` 0.2.2, no duplicate embassy crates (Step 2 spike).
 - [ ] Is each breaking item (IDF payload type, `is_connected` return type, `with_startup_message` signature) a break or a deprecation?
 - [ ] What are the trait names, where does `InboundMessage` live, and what does `wait_connected` return?
 - [ ] Does the blocking IDF API become thin wrappers over the async one?
+- [x] Which IDF async foundation wins the Step 2 spike? Wrappers over the worker threads (variant A).
 
 ## State
 - [ ] Design approved (ADR 022 accepted, plan reviewed)
 - [x] Step 0 — feature doc and roadmap entry
 - [ ] Step 1 — IDF `MqttHandle::state()` and stale docs
-- [ ] Step 2 — async IDF spike
+- [x] Step 2 — async IDF spike
 - [ ] Step 3 — extraction inventory
 - [ ] Step 4 — public traits, ports and mocks
 - [ ] Step 5 — link core
@@ -54,3 +55,7 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Feature doc created from ADR 022 and the program plan via /feature
 - 2026-11-01 — Step 0 done: roadmap Ready entry added, WifiDriver ADR item dropped, contract-tests item retargeted
 - 2026-11-01 — Step 1 code done (IDF `MqttHandle::state()` via `juggler::mqtt::SessionPhase`, `WifiDriver` deprecated), R1 state check rides with the U2f hardware session
+- 2026-11-01 — Step 1 review applied (plan lifecycle text, sampled-log runbook check); Step 2 now spikes both IDF async foundations
+- 2026-11-01 — Step 2 spike built (variants A and B on the C3), desk findings in the plan, C3 hardware run pending
+- 2026-11-01 — Bug 010 filed (IDF MQTT starts before the IP); spike examples now start MQTT after the IP, library fix planned in Steps 6 and 8
+- 2026-11-01 — Step 2 done on the C3: variant A chosen, ADR 022 decision 2 amended, thread-memory fix (bug 013) planned in Step 8
