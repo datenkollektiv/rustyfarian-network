@@ -9,6 +9,8 @@
 Three publishable crates consolidate the workspace: pure-tier `juggler`, ESP-IDF-tier `rustyfarian-esp-idf-network` (std-based), and bare-metal-tier `rustyfarian-esp-hal-network` (no_std).
 Both HAL tiers consume `juggler` — a consolidated, no_std-by-default crate with optional `std` feature — that compiles and unit-tests on any host without the ESP toolchain (per ADR 016).
 
+**Primary goal — tier parity:** consumer application code must be exchangeable between the ESP-IDF and bare-metal tiers, so only the dependency and setup code differ (see [ADR 022](docs/adr/022-tier-parity-one-async-api.md)).
+
 ## Architecture
 
 The workspace separates pure logic (host-testable) from hardware-specific implementations.
@@ -84,7 +86,18 @@ On macOS, `just ramdisk attach` optionally backs those directories with a RAM di
 
 ## Key Conventions
 
-- **Pure-first rule:** any logic testable without hardware belongs in a `*-pure` crate; the ESP-IDF / `esp-hal` crates are thin wrappers that delegate logic downward.
+- **Pure-first rule (ADR 022 decision 10):**
+  - Any logic testable without hardware belongs in `juggler`.
+  - Tier crates implement narrow port traits (strategy pattern) for generic cores in `juggler`, such as `LinkSupervisor<R: LinkRadio>`.
+  - A branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
+  - Inject time and wake-ups (clock parameters, `embassy-sync`) so cores run in host tests.
+- **Tier parity rule (ADR 022):**
+  - Every new or changed public API lands on both tiers.
+  - Both tiers use the same name, arguments and return type, and only the error type differs.
+  - The API is async-first on both tiers.
+  - Shared types live in `juggler`.
+  - A gap that cannot close yet is recorded in the feature doc and the capability table, never silently.
+  - Check both crates before adding a method to one.
 - **Example naming:** `idf_<chip>_<purpose>` for ESP-IDF examples (e.g. `idf_c3_connect`, `idf_esp32s3_join`); `hal_<chip>_<purpose>` for bare-metal examples (e.g. `hal_c6_connect`).
   `scripts/build-example.sh` and `scripts/flash.sh` extract the chip from the prefix and route to the correct target / MCU.
 - **One sentence per line in Markdown** for clean diffs.

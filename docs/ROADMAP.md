@@ -1,6 +1,6 @@
 # Roadmap
 
-*Last updated: October 2026*
+*Last updated: November 2026*
 
 ## Context & recent milestones
 
@@ -42,6 +42,7 @@ timeline
                : Binary-owned console and panic handler — rustyfarian-esp-hal-network drops esp-println and esp-backtrace from its wifi and lora features so the firmware owns the console and panic handler like the critical-section provider from bug 007, the 11 hal examples get both crates from per-target-triple dev-dependencies for C3, C6, S3 and ESP32, the 24 esp-println/auto command-line additions in the justfile are reverted, ADR 021 records the binary-owned-providers rule, follow-up to the 2026-10-31 U2d console fix requested by rustyfarian-knob, hardware gate passed on 2026-10-31 — CrowPanel S3 and C3 Super Mini both print over USB-Serial-JTAG, feature complete and awaiting roadmap hygiene (feature-doc)
               : esp-hal Wi-Fi init with a running scheduler — with_wifi_scheduler_running and with_ap_wifi_scheduler_running let a firmware that owns esp_rtos start pass only WIFI, both init paths start the scheduler before validating so a rejected config no longer hangs every timer, hal_esp32s3_mqtt_lwt starts the scheduler in main, ProvisioningBuilder start_scheduler_running covers the captive-portal fallback and hal_c3_provision_mqtt starts the scheduler in main, ADR 021 fourth provider, request U2e from rustyfarian-knob, hardware gate passed on 2026-10-31 — knob maintainer ran the S3 example on the CrowPanel with the firmware-owned scheduler, feature complete and awaiting roadmap hygiene (feature-doc)
               : Wi-Fi reconnect and radio suspend/resume on both tiers (PR 1 and PR 2 of request U2f from rustyfarian-knob, implemented) — one pure LinkMachine in juggler owns connect, reconnect with a 1 s to 30 s back-off and suspend, the IDF WiFiManager runs it on a worker thread in every connect mode, IDF suspend and resume stop and start the radio for deep sleep, the esp-hal WifiLink replaces the per-example loops, IDF try_publish refuses while disconnected, awaiting the CrowPanel S3 hardware gate by the knob maintainer on runbook R1 and R3 (feature-doc)
+              : Tier parity — consumer code exchangeable between the ESP-IDF and esp-hal tiers, async API on both tiers, behaviour in host-tested juggler cores behind narrow per-tier ports, Wi-Fi and MQTT first (request U2g from rustyfarian-knob), ADR 022 Proposed, 12-step plan in the tier-parity-v1 plan doc, next step is the IDF MqttHandle state getter (feature-doc)
 
     Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
@@ -56,8 +57,7 @@ timeline
 
     Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
               : OTA security model doc — threat model, signed-manifest question (rollback policy covered by the OTA decision core)
-              : WifiDriver async/sync trait ADR — document trait duality + first paragraph of the juggler wifi rustdoc
-              : Contract tests in juggler wifi — generic run_contract_tests() over any WifiDriver implementation, conformance pattern (prototype, then replicate to LoRa + ESP-NOW)
+              : Contract tests beyond Wi-Fi and MQTT — replicate the ADR 022 conformance suites (tier-parity Step 4) to LoRa and ESP-NOW
               : LoRa post-adoption backlog — PartialEq, heapless Deque FIFO, CRC-32, hardware driver, state machine
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
