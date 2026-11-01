@@ -13,13 +13,16 @@
 //!
 //! | Feature | What it enables                                              |
 //! |:--------|:-------------------------------------------------------------|
-//! | `mock`  | `MockWifiDriver` for downstream host-side tests              |
+//! | `mock`  | `MockWifiDriver` and `MockLink` for downstream host tests    |
 
+#[cfg(any(test, feature = "mock"))]
+mod link_mock;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
 pub mod handover;
 pub mod link;
+pub mod network_link;
 #[cfg(feature = "std")]
 pub mod supervisor;
 
@@ -28,6 +31,7 @@ pub use link::{
     LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
     RECONNECT_BACKOFF_MAX_MS,
 };
+pub use network_link::NetworkLink;
 #[cfg(feature = "std")]
 pub use supervisor::{LinkEvent, LinkEvents, LinkRadio, LinkSupervisor};
 

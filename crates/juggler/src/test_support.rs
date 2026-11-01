@@ -43,3 +43,18 @@ mod tests {
         assert_eq!(test_psk(), psk, "generated once per process");
     }
 }
+
+/// Polls `future` to completion on the current thread with a no-op waker.
+///
+/// Enough for the test doubles, which wake themselves while pending; a future
+/// that never becomes ready spins forever, so tests only await ready paths.
+#[cfg(feature = "mqtt")]
+pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    loop {
+        if let core::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+    }
+}
