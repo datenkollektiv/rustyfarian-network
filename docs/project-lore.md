@@ -290,6 +290,12 @@ If the subscription is bound to a local variable that goes out of scope (e.g. in
 the handler fires zero times.
 Fix: store the subscription in the owning struct (e.g. as `Option<EspSystemSubscription<'static>>`).
 
+**The station's "IP lost" event arrives only after the netif IP-lost timer, 120 s by default — it cannot signal an outage.**
+On `esp_wifi_stop`/disconnect, `esp_netif_down` zeroes the IP and arms `esp_netif_ip_lost_timer`, which posts `IP_EVENT_STA_LOST_IP` after `CONFIG_ESP_NETIF_IP_LOST_TIMER_INTERVAL` (Kconfig default 120, `0` disables it); `IP_EVENT_STA_DHCP_DEASSIGNED` is only posted by the DHCP client's own deinit path.
+`esp-idf-svc` 0.53 maps `STA_LOST_IP` to `IpEvent::DhcpIpDeassigned`, so that variant is delayed rather than absent, and a consumer that gates work on it keeps treating the link as up for two minutes.
+Fix: gate on the link supervisor's readiness (`WiFiManager::subscribe_ready` or `is_ready`), which combines association and IP and reacts in milliseconds; keep `DhcpIpDeassigned` only as a slow catch-all.
+This is why the MQTT gate in tier-parity Step 8b-2 is fed by `LinkSupervisor::subscribe_ready` rather than a second `IpEvent` subscription.
+
 ---
 
 ## ESP-IDF FreeRTOS Tasks & Threads

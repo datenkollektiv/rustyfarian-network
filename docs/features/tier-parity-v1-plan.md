@@ -173,11 +173,23 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 
 #### Step 8b-2: network gate (bug 010)
 
-- [ ] esp-mqtt starts only once the link is ready and stops while it is down or suspended, driven by the network gate; close the bug after the bench run.
+- [x] `MqttBuilder::build(&wifi)` and `build_and_wait(&wifi, &mut led)` take the `WiFiManager`, so the network gate is mandatory; an approved 0.x break.
+- [x] The gate is fed by `WiFiManager::subscribe_ready(sink)` (one call per readiness transition, and the call returns the readiness as of registration under the link lock, so the seed and the subscription are atomic) rather than by polling or a second `IpEvent` subscription, because the station's lost-IP event is posted only after the netif IP-lost timer (120 s by default) and cannot close the gate during an outage (review of 0154998).
+- [x] The esp-mqtt client is created lazily at the first readiness: `EspMqttClient::new` starts the client task, which attempted a connection before the station had an IP (bug 010).
+- [x] `mqtt/runner.rs` performs every `SessionAction` on one new runner thread (`mqtt-net`, 4 KiB stack): `Connect` creates the client once and later calls `esp_mqtt_client_reconnect`, and `Close` calls `esp_mqtt_client_disconnect`.
+- [x] A `Close` of a session whose driver already dropped its transport makes the runner report `Disconnected` itself and skip `esp_mqtt_client_disconnect`, because an idle esp-mqtt posts no event and the machine would otherwise stay in `Closing` for good (`SessionMachine::driver_idle`, review of 0154998).
+- [x] `Wait` arms a runner deadline instead of parking the event loop, and `Shutdown` nudges the reconnect, stops the client and drops it.
+- [x] esp-mqtt's own auto-reconnect is off (`reconnect_timeout: None`), so the machine paces every attempt with `MqttConfig::reconnect_timeout_ms` (default `DEFAULT_RECONNECT_TIMEOUT_MS`, 10 s).
+- [x] The IDF event-loop thread only translates esp-mqtt events into session inputs now (it never acts, never sleeps, never takes the client mutex, ADR 017 unchanged), and the connect helper thread only runs the connect work and reports `WorkDone` / `WorkFailed`, with the runner performing `Close`.
+- [x] `juggler::mqtt::{NetworkGate, Outbox, PendingPublish}`: `NetworkGate` turns readiness observations into exactly one `NetworkUp` / `NetworkDown` edge, and `Outbox` holds up to `PUBLISH_QUEUE_DEPTH` (4) publishes until the client exists, dropping and counting the oldest when full.
+- [x] `MqttHandle::dropped_publish()` reports the outbox drops (esp-hal parity).
+- [x] Host tests cover `NetworkGate`, `Outbox`, `subscribe_ready` (including the readiness seed it returns at registration) and `SessionMachine::driver_idle` for every source of a `Close`, with mutation checks on the gate edges, the drop-oldest policy and an unanswered `Close` that blocks the next network-up.
+- [ ] The bench run still gates the bug's closure (IDF runbook R1/R3, esp-hal T5a/T5b); `idf_c3_mqtt` dropped its pre-build IP wait, so the gate is the reproduction case.
 
 #### Step 8c: MQTT thread memory
 
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
+- [ ] The new `mqtt-net` runner thread (4 KiB) is part of the measuring scope.
 
 - Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
 - Gate: rides with the bench run for both tiers.

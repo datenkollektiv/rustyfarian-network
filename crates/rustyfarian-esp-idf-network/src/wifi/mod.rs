@@ -515,6 +515,25 @@ impl WiFiManager {
         self.link.supervisor.is_ready()
     }
 
+    /// Registers a sink told once whenever [`is_ready`](Self::is_ready) flips,
+    /// for a worker that must gate its own work on the link — the MQTT session
+    /// (bug 010) uses it instead of polling or a second event subscription.
+    ///
+    /// Returns the readiness at the moment of registration, taken under the same
+    /// lock as the registration, so no transition can slip between the two:
+    /// every change is either in the returned value or delivered to the sink.
+    /// Transitions that happened earlier are therefore not replayed.
+    /// The sink runs on the reconnect worker, or on the caller of
+    /// [`suspend`](Self::suspend), while the link state is locked — it must
+    /// return at once. Send to a channel; do not block or call back into this
+    /// manager, and expect the sink to stay registered for good.
+    pub fn subscribe_ready<F>(&self, sink: F) -> bool
+    where
+        F: Fn(bool) + Send + 'static,
+    {
+        self.link.supervisor.subscribe_ready(sink)
+    }
+
     /// `true` once a [`suspend`](Self::suspend) has taken effect: the radio is
     /// stopped. Stays `false` after a suspend whose stop failed.
     pub fn is_suspended(&self) -> bool {
@@ -546,8 +565,9 @@ impl WiFiManager {
     /// the reconnect worker and other callers, and bounded to a few milliseconds.
     /// The MQTT client
     /// sends no DISCONNECT, so the broker publishes its will after
-    /// 1.5 × keep-alive; esp-mqtt keeps retrying its transport every
-    /// `reconnect_timeout` meanwhile and logs each failure.
+    /// 1.5 × keep-alive; the suspend also removes the station's IP, which closes
+    /// the MQTT session with no attempt and no retry for the whole suspend (see
+    /// [`subscribe_ready`](Self::subscribe_ready)).
     ///
     /// # Errors
     ///

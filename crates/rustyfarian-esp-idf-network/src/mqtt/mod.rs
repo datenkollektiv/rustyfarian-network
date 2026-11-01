@@ -3,6 +3,16 @@
 //! Provides a persistent, auto-reconnecting MQTT client with lifecycle
 //! callbacks, thread-safe publishing, and pure connection-state validation.
 //!
+//! # Network gate
+//!
+//! The session is gated on the Wi-Fi link ([`MqttBuilder::build`] takes the
+//! [`WiFiManager`]): the esp-mqtt client is created at the first moment the
+//! station is associated *and* holds an IP, so a normal boot logs no failed
+//! attempt, and no attempt and no retry happens while the link is down or
+//! suspended. When the IP returns, the session reconnects at once instead of
+//! waiting for a retry timer. Both tiers share this behaviour through
+//! `juggler::mqtt::SessionMachine` (ADR 022, bug 010).
+//!
 //! # Quick start
 //!
 //! ```ignore
@@ -15,7 +25,7 @@
 //!     .with_startup_message()
 //!     .on_disconnect(|| log::warn!("MQTT disconnected"))
 //!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
-//!     .build()?;
+//!     .build(&wifi)?;
 //!
 //! handle.publish("status", "online")?;
 //! ```
@@ -106,22 +116,22 @@
 //! * **State:** the stop removes the station interface, which aborts the socket;
 //!   esp-mqtt reports `Disconnected` (expected within a second, at the latest on
 //!   the next keep-alive ping), `is_connected()` turns `false` and `on_disconnect`
-//!   fires once.
+//!   fires once. The link reports itself not ready, so the session closes and
+//!   waits.
+//! * **Retry cadence:** none. The session machine makes no attempt while the
+//!   link is not ready, and esp-mqtt does not retry on its own (`reconnect` is
+//!   off in favour of the gate), so a suspend logs no transport errors however
+//!   long it lasts.
 //! * **Publishing:** `try_publish*` returns `WouldBlock` from then on; a message
 //!   queued between `suspend()` and that event sits in the esp-mqtt outbox and
 //!   may go out after the reconnect (QoS 1). `publish*` keeps enqueuing.
-//! * **Retry cadence:** esp-mqtt keeps retrying its transport every
-//!   `reconnect_timeout` (10 s by default) and logs one transport error per
-//!   attempt; no callback fires for these. A longer
-//!   [`with_reconnect_timeout`](MqttConfig::with_reconnect_timeout) quiets the log
-//!   but also delays the reconnect after `resume()` by up to that value.
 //! * **Broker view:** the client sent no DISCONNECT, so the broker publishes the
 //!   will after 1.5 × keep-alive. A shorter suspend ends in a client-id takeover
 //!   on the reconnect: the broker publishes the will as it drops the old session,
 //!   then the new session publishes its startup or `on_connect` message, so a
 //!   retained `offline` is followed by `online` within the same second.
-//! * **After `resume()`:** the next esp-mqtt retry after the link is up
-//!   reconnects (up to `reconnect_timeout` later); builder subscriptions are
+//! * **After `resume()`:** the session reconnects as soon as the station holds
+//!   an IP again, without waiting for a retry timer; builder subscriptions are
 //!   re-issued and [`MqttHandle::connect_count`] bumps once `is_connected()` is
 //!   `true` again.
 //!
@@ -139,16 +149,21 @@ use std::time::Duration;
 pub use pennant::{SimpleLed, StatusLed};
 
 use juggler::mqtt::{
-    connection_wait_iterations, format_broker_url, in_callback, next_state, spawn_connect_thread,
-    validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
-    validate_subscribe_filter, AckOutcome, CallbackScope, MqttClient, MqttEvent, PendingAcks,
-    SessionAction, SessionInput, SessionToken, SubscribeClient,
+    connection_wait_iterations, format_broker_url, in_callback, next_state, validate_broker_host,
+    validate_broker_port, validate_client_id, validate_publish_topic, validate_subscribe_filter,
+    AckOutcome, CallbackScope, MqttClient, MqttEvent, Outbox, PendingAcks, PendingPublish,
+    SessionInput, SessionToken, SubscribeClient,
 };
 
+mod runner;
 mod session;
+use crate::wifi::WiFiManager;
 use juggler::mqtt::chunks::{Assembled, Chunk, ChunkAssembler};
+use runner::{ClientConfig, Msg, Runner};
 use session::Session;
-pub use session::{InboundMessage, INBOUND_QUEUE_DEPTH, MAX_INBOUND_PAYLOAD_LEN};
+pub use session::{
+    InboundMessage, INBOUND_QUEUE_DEPTH, MAX_INBOUND_PAYLOAD_LEN, PUBLISH_QUEUE_DEPTH,
+};
 
 // Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
@@ -178,6 +193,12 @@ pub type TryPublishError = juggler::mqtt::TryPublishError<anyhow::Error>;
 /// Must stay consistent with the 100 ms interval hard-coded in
 /// [`connection_wait_iterations`] — both express the same physical interval.
 const POLL_INTERVAL_MS: u64 = 100;
+
+/// Pause between attempts while the network is up, when
+/// [`MqttConfig::reconnect_timeout_ms`] is unset.
+///
+/// The same default as the esp-hal tier, so both pace reconnects alike (ADR 022).
+pub const DEFAULT_RECONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Stack size for the `MqttManager` (legacy) event loop thread.
 ///
@@ -233,7 +254,8 @@ pub const LED_POLL_INTERVAL_MS: u64 = 50;
 pub const ERROR_PULSE_FRAMES: u32 = 20;
 
 use esp_idf_svc::mqtt::client::{
-    Details, EspMqttClient, EventPayload, LwtConfiguration, MqttClientConfiguration, QoS as EspQoS,
+    Details, EspMqttClient, EspMqttConnection, EventPayload, LwtConfiguration,
+    MqttClientConfiguration, QoS as EspQoS,
 };
 
 /// Error returned by [`MqttHandle::publish_acked`].
@@ -247,8 +269,10 @@ pub enum PublishAckError {
     /// No PUBACK arrived within the timeout. A broker-timing outcome: the caller
     /// should keep its state (e.g. leave NVS untouched) and retry later.
     Timeout,
-    /// The MQTT session dropped before the PUBACK. Also broker-timing and
-    /// retry-eligible; never reported as a false `Ok`.
+    /// The MQTT session dropped before the PUBACK, or no session exists yet
+    /// because the station has no IP, so the publish could not be handed to a
+    /// client at all. Also broker-timing and retry-eligible; never reported as
+    /// a false `Ok`.
     Disconnected,
     /// Called from inside an MQTT callback — `on_connect`, `on_message`, or
     /// `on_disconnect` — where the call would deadlock: `on_message` and
@@ -574,7 +598,7 @@ where
 /// so neither crate can implement the trait for the other.  Wrapping the client
 /// in a local type makes the `impl` legal without changing runtime behaviour.
 /// `Deref`/`DerefMut` forward all other method calls transparently.
-struct SubscribableClient(EspMqttClient<'static>);
+pub(crate) struct SubscribableClient(EspMqttClient<'static>);
 
 impl std::ops::Deref for SubscribableClient {
     type Target = EspMqttClient<'static>;
@@ -598,6 +622,14 @@ impl SubscribeClient for SubscribableClient {
     }
 }
 
+/// The will configuration, owned so the client can be created later.
+pub(crate) struct LwtParts {
+    pub(crate) topic: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) qos: QoS,
+    pub(crate) retain: bool,
+}
+
 /// Converts the shared [`QoS`] into the `esp-idf-svc` QoS type.
 ///
 /// Every [`MqttBuilder`] / [`MqttHandle`] method takes the shared
@@ -616,21 +648,25 @@ pub fn to_esp_qos(qos: QoS) -> EspQoS {
 ///
 /// Receives `&mut EspMqttClient<'_>` for subscriptions and retained publishes,
 /// and a `bool` that is `true` for a clean session.
-type OnConnectCallback =
+pub(crate) type OnConnectCallback =
     Box<dyn Fn(&mut EspMqttClient<'_>, bool) -> anyhow::Result<()> + Send + 'static>;
 
 /// Callback invoked for each incoming message with `(topic, payload)`.
 type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 
-/// Builder for a persistent, auto-reconnecting MQTT manager.
+/// Builder for a persistent, gated MQTT manager.
 ///
 /// Use [`MqttBuilder::new`] to obtain a builder, configure callbacks, then
-/// call [`build`](MqttBuilder::build) to start the background event loop and
-/// receive an [`MqttHandle`].
+/// call [`build`](MqttBuilder::build) with the [`WiFiManager`] to start the
+/// background session and receive an [`MqttHandle`].
 ///
 /// # Reconnection
 ///
-/// The underlying `EspMqttClient` reconnects automatically.
+/// The session reconnects on its own, but only while the link is ready: the
+/// client is created at the first moment the station holds an IP, one attempt
+/// runs at a time, and a failed attempt or a lost session is retried after
+/// [`MqttConfig::reconnect_timeout_ms`] (default 10 s). While the link is down
+/// or suspended nothing is attempted.
 /// [`on_connect`](MqttBuilder::on_connect) fires on every (re)connect, on a
 /// per-connect helper thread, after the startup message (if enabled) and
 /// before the builder's [`subscribe`](MqttBuilder::subscribe) topics are
@@ -798,7 +834,7 @@ impl<'a> MqttBuilder<'a> {
     /// Registers a callback invoked immediately when the connection drops.
     ///
     /// The callback is invoked by the event loop thread and must return
-    /// quickly.  The ESP-IDF layer will attempt to reconnect automatically.
+    /// quickly.  The session runner reconnects afterwards, if the link is ready.
     /// It runs on the event-loop thread while esp-mqtt holds its recursive
     /// `api_lock`; do not call any [`MqttHandle`] method from it (such a call
     /// returns [`PublishAckError::WrongThread`]).
@@ -857,17 +893,24 @@ impl<'a> MqttBuilder<'a> {
         self
     }
 
-    /// Starts the background event loop and returns an [`MqttHandle`].
+    /// Starts the background session and returns an [`MqttHandle`].
     ///
-    /// Returns immediately — the initial broker connection happens in the
-    /// background.  The caller can start its main loop before the broker is
+    /// `network` is the Wi-Fi link the session is gated on: no broker attempt
+    /// happens until the station is associated and holds an IP, and none happens
+    /// while the link is down or suspended (bug 010). The esp-mqtt client is
+    /// created at that first readiness, so a normal boot logs no connection
+    /// error, and the reconnect after an outage starts as soon as the IP is back
+    /// instead of waiting for a retry timer.
+    ///
+    /// Returns immediately — connecting, and every later reconnect, happen in
+    /// the background. The caller can start its main loop before the broker is
     /// reachable.
     ///
     /// # Errors
     ///
-    /// Returns an error if the configuration is invalid or if the ESP-IDF
-    /// MQTT client cannot be initialised.
-    pub fn build(self) -> anyhow::Result<MqttHandle> {
+    /// Returns an error if the configuration is invalid, or if the event-loop or
+    /// the session-runner thread cannot be spawned.
+    pub fn build(self, network: &WiFiManager) -> anyhow::Result<MqttHandle> {
         let config = self.config;
 
         // Validate configuration fields eagerly so callers get clear errors.
@@ -882,16 +925,17 @@ impl<'a> MqttBuilder<'a> {
                 .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
         }
 
-        // Build owned copies of all string fields.
-        // esp_mqtt_client_init() calls strdup() on each of these immediately,
-        // so they only need to live through the EspMqttClient::new() call below.
-        // No Box::leak required.
+        // Owned copies of everything the client needs: it is created later, on
+        // the first readiness, so the values must outlive `build`.
+        // `ClientConfig::create` consumes them into the client, and
+        // `esp_mqtt_client_init()` strdup()'s what it needs, so nothing outlives
+        // the first connect. No Box::leak required.
         let url = format_broker_url(config.host, config.port);
         let client_id = config.client_id.to_string();
         // Fixed message: CodeQL's rust/cleartext-logging taints every field read
         // through a config that carries credentials, so the broker URL and client id
         // are logged by the caller from its own values (see the examples' env.rs).
-        log::info!("[mqtt] creating client");
+        log::info!("[mqtt] session created; the gate opens when the link is ready");
         // codeql[rust/cleartext-logging] - credentials are passed to the MQTT
         // broker via EspMqttClient::new(); this is required for authentication
         // and is not a logging operation.  esp_mqtt_client_init() strdup()'s
@@ -899,59 +943,49 @@ impl<'a> MqttBuilder<'a> {
         let username = config.username().map(|s| s.to_string());
         // codeql[rust/cleartext-logging]
         let password = config.password().map(|s| s.to_string());
-        let lwt_topic = config.lwt().map(|l| l.topic().to_string());
-        let lwt_payload = config.lwt().map(|l| l.payload().to_vec());
-
-        let lwt_cfg = lwt_topic
-            .as_ref()
-            .zip(config.lwt())
-            .map(|(topic, lwt)| LwtConfiguration {
-                topic: topic.as_str(),
-                payload: lwt_payload.as_deref().unwrap_or(&[]),
-                qos: to_esp_qos(lwt.qos()),
+        let client_config = ClientConfig {
+            url,
+            client_id: client_id.clone(),
+            keep_alive_secs: config.keep_alive_secs.unwrap_or(30),
+            task_stack_size: config.task_stack_size,
+            username,
+            password,
+            lwt: config.lwt().map(|lwt| LwtParts {
+                topic: lwt.topic().to_string(),
+                payload: lwt.payload().to_vec(),
+                qos: lwt.qos(),
                 retain: lwt.retain(),
-            });
-
-        let mqtt_cfg = MqttClientConfiguration {
-            client_id: Some(client_id.as_str()),
-            keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
-            // esp-idf-svc reads `None` as "auto-reconnect disabled"; `Some(ZERO)` keeps
-            // it on with esp-mqtt's 10 s default.
-            reconnect_timeout: Some(
-                config
-                    .reconnect_timeout_ms
-                    .map_or(Duration::ZERO, Duration::from_millis),
-            ),
-            task_stack: config.task_stack_size,
-            lwt: lwt_cfg,
-            username: username.as_deref(),
-            password: password.as_deref(),
-            ..Default::default()
+            }),
         };
 
-        let (client, mut connection) =
-            EspMqttClient::new(&url, &mqtt_cfg).context("failed to create EspMqttClient")?;
-        // url, client_id, username, password, lwt_topic, lwt_payload and mqtt_cfg
-        // are all dropped here — the C library has already strdup'd what it needs.
+        // Session inputs. The event loop, the connect helper and the link's
+        // readiness sink all report here; only the runner thread acts on them,
+        // so no esp-mqtt call ever runs on the event-loop thread (ADR 017).
+        let (inputs, inputs_rx) = std::sync::mpsc::channel::<Msg>();
+        let readiness = inputs.clone();
 
-        let shared_client = Arc::new(Mutex::new(SubscribableClient(client)));
-        let client_for_thread = Arc::clone(&shared_client);
-
-        // The shared session machine: state, readiness, publish gate, connect count.
-        // esp-mqtt starts connecting on its own right away and retries on its own, so
-        // the network counts as up from the start (the network gate is bug 010).
-        let session = Arc::new(Session::new());
-        session.poll(SessionInput::NetworkUp);
+        let retry_ms = config
+            .reconnect_timeout_ms
+            .unwrap_or(DEFAULT_RECONNECT_TIMEOUT_MS);
+        let session = Arc::new(Session::new(retry_ms, inputs));
         let session_for_thread = Arc::clone(&session);
+
+        // The link tells us once per readiness transition, and hands back the
+        // state it was in when we subscribed. Both happen under the link's lock,
+        // so no transition can land between them: it is either in `seed_ready`
+        // or already queued for the runner, which applies the seed first.
+        let seed_ready = network.subscribe_ready(move |ready| {
+            let _ = readiness.send(Msg::Ready(ready));
+        });
 
         // Acknowledged-publish correlation, shared between the event loop (which
         // resolves PUBACKs) and the handle (which registers and waits).
         let pending = PendingAcks::new();
         let pending_for_thread = pending.clone();
 
-        // Alive token: the thread holds a Weak reference; when the last
+        // Alive token: the threads hold a Weak reference; when the last
         // MqttHandle clone is dropped (taking the Arc<()> refcount to zero),
-        // upgrade() returns None and the event loop exits at the next event.
+        // the runner stops the session and the event loop exits.
         let alive = Arc::new(());
         let alive_weak = Arc::downgrade(&alive);
 
@@ -967,6 +1001,10 @@ impl<'a> MqttBuilder<'a> {
             .with_startup_message
             .then(|| format!("iot/{}/startup", client_id));
 
+        // The runner creates the client and hands its event connection over here,
+        // so this thread does nothing until the station has an IP (bug 010).
+        let (connection_tx, connection_rx) = std::sync::mpsc::channel::<EspMqttConnection>();
+
         std::thread::Builder::new()
             .stack_size(BUILDER_EVENT_LOOP_STACK_SIZE)
             .spawn(move || {
@@ -978,6 +1016,16 @@ impl<'a> MqttBuilder<'a> {
                 let mut state = MqttConnectionState::Connecting;
                 // Joins chunked messages for the receive queue; owned by this thread.
                 let mut assembler = ChunkAssembler::new(MAX_INBOUND_PAYLOAD_LEN);
+
+                // Nothing to pump until the client exists; the channel closing
+                // means the session is being torn down.
+                let mut connection = match connection_rx.recv() {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        log::info!("[mqtt] event loop: no client, exiting");
+                        return;
+                    }
+                };
 
                 loop {
                     // Exit when all MqttHandle clones have been dropped.
@@ -1018,77 +1066,20 @@ impl<'a> MqttBuilder<'a> {
                                     session_present
                                 );
                             }
-                            // The shared session machine decides the connect work: subscribe
-                            // (unless a kept session's subscriptions completed), startup
-                            // message, `on_connect`, and only then ready (bug 014).
-                            match session_for_thread
-                                .poll(SessionInput::Connected { session_present })
-                            {
-                                SessionAction::ConnectWork { token, subscribe } => {
-                                    let subscribe = subscribe && !subscribe_topics.is_empty();
-                                    if !subscribe && startup_topic.is_none() && on_connect.is_none()
-                                    {
-                                        // Nothing to run off-thread.
-                                        session_for_thread.poll(SessionInput::WorkDone(token));
-                                    } else {
-                                        // The event-loop thread must never take the client
-                                        // mutex: esp-mqtt holds its recursive api_lock for the
-                                        // whole connect handshake, and esp-idf-svc parks the
-                                        // mqtt task until this thread calls next() again — a
-                                        // mutex held here while another thread blocks on
-                                        // api_lock closes a three-way cycle (ADR 017). The
-                                        // helper thread does the connect work under one lock of
-                                        // the client.
-                                        let session = Arc::clone(&session_for_thread);
-                                        let topics = subscribe_topics.clone();
-                                        let startup_topic = startup_topic.clone();
-                                        let on_connect = on_connect.clone();
-                                        let work = move |client: &mut SubscribableClient| {
-                                            connect_work(
-                                                client,
-                                                &session,
-                                                token,
-                                                subscribe.then_some(topics.as_slice()),
-                                                startup_topic.as_deref(),
-                                                on_connect.as_deref(),
-                                                session_present,
-                                            )
-                                        };
-                                        let spawned = spawn_connect_thread(
-                                            Arc::clone(&client_for_thread),
-                                            Some(work),
-                                            Vec::new(),
-                                            CONNECT_THREAD_STACK_SIZE,
-                                        );
-                                        if !spawned {
-                                            // Running the work inline, or closing the transport,
-                                            // on this thread would reintroduce the deadlock above:
-                                            // esp-mqtt holds api_lock during this dispatch. The
-                                            // session stays not ready until esp-mqtt's next
-                                            // reconnect, as before the session machine.
-                                            log::error!(
-                                                "[mqtt] could not spawn the connect helper thread; \
-                                                 session NOT marked ready until the next reconnect"
-                                            );
-                                            session_for_thread
-                                                .poll(SessionInput::WorkFailed(token));
-                                        }
-                                    }
-                                }
-                                other => log::debug!(
-                                    "[mqtt] CONNACK while the session expects {:?}",
-                                    other
-                                ),
-                            }
+                            // The runner decides the connect work from this input:
+                            // subscriptions (unless a kept session's completed),
+                            // startup message, `on_connect`, and only then ready
+                            // (bug 014). This thread never acts on the session.
+                            session_for_thread.send(SessionInput::Connected { session_present });
                         }
                         EventPayload::BeforeConnect => {
-                            session_for_thread.poll(SessionInput::AttemptStarted);
+                            session_for_thread.send(SessionInput::AttemptStarted);
                         }
                         EventPayload::Disconnected => {
                             // Every attempt that fails ends in `Disconnected` too; the machine
-                            // records it regardless of `next_state`. Its retry pause is
-                            // esp-mqtt's own `reconnect_timeout`, so no timer runs here.
-                            session_for_thread.poll(SessionInput::Disconnected);
+                            // records it regardless of `next_state`. The runner keeps the retry
+                            // pause, since esp-mqtt does not retry on its own any more.
+                            session_for_thread.send(SessionInput::Disconnected);
                             if let Some(next) = next_state(state, MqttEvent::Disconnected) {
                                 state = next;
                                 log::info!("[mqtt] disconnected");
@@ -1189,23 +1180,38 @@ impl<'a> MqttBuilder<'a> {
             })
             .context("failed to spawn MQTT builder event loop thread")?;
 
+        Runner::spawn(Runner {
+            session: Arc::clone(&session),
+            inputs: inputs_rx,
+            connection: connection_tx,
+            alive: Arc::downgrade(&alive),
+            config: client_config,
+            handle: None,
+            seed_ready,
+            session_present: false,
+            subscribe_topics,
+            startup_topic,
+            on_connect,
+        })?;
+
         Ok(MqttHandle {
-            client: shared_client,
             session,
             pending,
             _alive: alive,
         })
     }
 
-    /// Starts the background event loop, waits for the initial broker
+    /// Starts the background session, waits for the initial broker
     /// connection with LED feedback, and returns an [`MqttHandle`].
     ///
-    /// This is the blocking counterpart to [`build`](Self::build).
+    /// This is the blocking counterpart to [`build`](Self::build), gated on
+    /// `network` the same way.
     /// While waiting, the LED pulses cyan; on success it turns steady green;
     /// on timeout it flashes red for one second before returning an error.
     ///
     /// Uses [`MqttConfig::connection_timeout_ms`] (default: 5000 ms) as the
-    /// connection deadline.
+    /// connection deadline, counted from this call: a build that runs before the
+    /// station has an IP needs the wait to cover association and DHCP as well.
     /// The LED borrow is released when this method returns.
     /// Success here does not guarantee the subscriptions were sent — see
     /// [`MqttHandle::is_connected`]. If the per-connect helper thread fails
@@ -1221,15 +1227,15 @@ impl<'a> MqttBuilder<'a> {
     ///
     /// let handle = MqttBuilder::new(config)
     ///     .subscribe("commands/#", QoS::AtLeastOnce)
-    ///     .build_and_wait(&mut status_led)?;
+    ///     .build_and_wait(&wifi, &mut status_led)?;
     /// ```
-    pub fn build_and_wait<L>(self, led: &mut L) -> anyhow::Result<MqttHandle>
+    pub fn build_and_wait<L>(self, network: &WiFiManager, led: &mut L) -> anyhow::Result<MqttHandle>
     where
         L: StatusLed,
         L::Error: std::fmt::Debug,
     {
         let timeout_ms = self.config.connection_timeout_ms.unwrap_or(5000);
-        let handle = self.build()?;
+        let handle = self.build(network)?;
 
         let mut pulse = PulseEffect::new();
         let start = std::time::Instant::now();
@@ -1275,8 +1281,8 @@ impl<'a> MqttBuilder<'a> {
 /// Cheaply cloneable MQTT handle returned by [`MqttBuilder::build`].
 ///
 /// Publish from any thread using `&self`.
-/// When the last clone is dropped the background event loop exits at the
-/// next MQTT event boundary (keepalive pings ensure this happens promptly).
+/// When the last clone is dropped the runner stops the client and the event
+/// loop exits.
 ///
 /// # Example
 ///
@@ -1288,14 +1294,13 @@ impl<'a> MqttBuilder<'a> {
 /// ```
 #[derive(Clone)]
 pub struct MqttHandle {
-    client: Arc<Mutex<SubscribableClient>>,
     session: Arc<Session>,
     // Registry correlating in-flight acked publishes to their PUBACK; shared
     // with the event-loop thread, which resolves entries on `Published`.
     pending: PendingAcks,
-    // Keeps the event loop alive.  When the last clone is dropped the
-    // Arc refcount reaches zero, and the thread's Weak::upgrade() returns
-    // None, causing the event loop to exit.
+    // Keeps the session alive.  When the last clone is dropped the Arc refcount
+    // reaches zero, and the runner's `Weak::upgrade()` returns None, so it stops
+    // the client and exits.
     _alive: Arc<()>,
 }
 
@@ -1350,6 +1355,14 @@ impl MqttHandle {
     /// * `qos`     - Quality of Service level
     /// * `retain`  - Whether the broker should retain this message
     ///
+    /// # Delivery
+    ///
+    /// `Ok(())` means the message was handed to the session, not that the
+    /// broker received it. A call made before the station has an IP is held in
+    /// [`PUBLISH_QUEUE_DEPTH`] slots and sent once the client exists (see
+    /// [`dropped_publish`](Self::dropped_publish)); after that, messages wait in
+    /// esp-mqtt's outbox and can still go out after a reconnect (QoS 1).
+    ///
     /// # Threading
     ///
     /// Must not be called from inside any callback (`on_connect`,
@@ -1368,11 +1381,8 @@ impl MqttHandle {
         validate_publish_topic(topic)
             .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
         log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
-        let mut guard = self
-            .client
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
-        guard.enqueue(topic, to_esp_qos(qos), retain, payload)?;
+        self.session
+            .publish(PendingPublish::new(topic, payload, qos, retain));
         Ok(())
     }
 
@@ -1434,10 +1444,11 @@ impl MqttHandle {
         // Enqueue under the client mutex to obtain the message id, then release
         // the mutex *before* waiting so the event loop can deliver the PUBACK.
         let msg_id = {
-            let mut guard = self.client.lock().map_err(|_| {
+            let mut guard = self.session.outbox().lock().map_err(|_| {
                 PublishAckError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
             })?;
-            guard
+            let client = guard.client_mut().ok_or(PublishAckError::Disconnected)?;
+            client
                 .enqueue(topic, EspQoS::AtLeastOnce, retained, payload)
                 .map_err(|e| PublishAckError::Other(e.into()))?
         };
@@ -1549,13 +1560,14 @@ impl MqttHandle {
             return Err(TryPublishError::WouldBlock);
         }
         log::debug!("[mqtt] try_publish to '{}': {} bytes", topic, payload.len());
-        let mut guard = self.client.try_lock().map_err(|e| match e {
+        let mut guard = self.session.outbox().try_lock().map_err(|e| match e {
             std::sync::TryLockError::WouldBlock => TryPublishError::WouldBlock,
             std::sync::TryLockError::Poisoned(_) => {
                 TryPublishError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
             }
         })?;
-        guard
+        let client = guard.client_mut().ok_or(TryPublishError::WouldBlock)?;
+        client
             .enqueue(topic, to_esp_qos(qos), retain, payload)
             .map_err(|e| TryPublishError::Other(e.into()))?;
         Ok(())
@@ -1580,10 +1592,14 @@ impl MqttHandle {
             .map_err(|e| anyhow::anyhow!("invalid subscribe filter: {}", e))?;
         log::debug!("[mqtt] subscribing to '{}'", topic);
         let mut guard = self
-            .client
+            .session
+            .outbox()
             .lock()
             .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
-        guard.subscribe(topic, to_esp_qos(qos))?;
+        let client = guard
+            .client_mut()
+            .ok_or_else(|| anyhow::anyhow!("MQTT client is not started yet (no network)"))?;
+        client.subscribe(topic, to_esp_qos(qos))?;
         Ok(())
     }
 
@@ -1643,11 +1659,14 @@ impl MqttHandle {
     ///
     /// - [`Connecting`](MqttConnectionState::Connecting): an attempt is in
     ///   progress (esp-mqtt's `BeforeConnect`), including the time the connect
-    ///   helper runs the startup message, `on_connect` and the subscriptions.
+    ///   helper runs the startup message, `on_connect` and the subscriptions,
+    ///   and the time spent waiting for the Wi-Fi link before the first attempt.
     /// - [`Connected`](MqttConnectionState::Connected): exactly when
     ///   [`is_connected`](Self::is_connected) is `true`.
     /// - [`Disconnected`](MqttConnectionState::Disconnected): the session or the
-    ///   last attempt failed; esp-mqtt retries after its `reconnect_timeout`.
+    ///   last attempt failed. While the link is down or suspended there is no
+    ///   attempt and no retry; while it is up, the runner retries after
+    ///   [`MqttConfig::reconnect_timeout_ms`] (default 10 s).
     ///
     /// While the broker is unreachable the state alternates between
     /// `Connecting` and `Disconnected` once per attempt.
@@ -1686,6 +1705,16 @@ impl MqttHandle {
     /// Received messages dropped because the queue was full.
     pub fn dropped_inbound(&self) -> u32 {
         self.session.dropped_inbound()
+    }
+
+    /// Publishes the session had to drop, like the esp-hal handle's
+    /// `dropped_publish`.
+    ///
+    /// A publish that arrives before the station has an IP waits in
+    /// [`PUBLISH_QUEUE_DEPTH`] slots; anything beyond that drops the oldest
+    /// entry here, as does a message esp-mqtt refuses.
+    pub fn dropped_publish(&self) -> u32 {
+        self.session.dropped_publish()
     }
 }
 
@@ -1740,11 +1769,11 @@ const _: fn() = || {
 /// One session's connect work on the helper thread, in the order both tiers share:
 /// subscriptions (when the machine asks), startup message, `on_connect`, then
 /// `WorkDone`. Skips everything if the session already ended; on a failed
-/// subscribe or startup message it reports `WorkFailed` and closes the transport,
-/// so esp-mqtt reconnects and the work runs again.
+/// subscribe or startup message it reports `WorkFailed` to the runner, which
+/// closes the transport, so esp-mqtt reconnects and the work runs again (bug 014).
 #[allow(clippy::too_many_arguments)]
 fn connect_work(
-    client: &mut SubscribableClient,
+    outbox: &mut Outbox<SubscribableClient>,
     session: &Session,
     token: SessionToken,
     topics: Option<&[(String, QoS)]>,
@@ -1756,6 +1785,11 @@ fn connect_work(
         log::debug!("[mqtt] connect helper: stale session, skipping its connect work");
         return;
     }
+    let Some(client) = outbox.client_mut() else {
+        log::error!("[mqtt] connect helper: no client attached to the session");
+        session.send(SessionInput::WorkFailed(token));
+        return;
+    };
     let mut done = true;
     for (topic, qos) in topics.unwrap_or_default() {
         match client.subscribe_topic(topic, *qos) {
@@ -1788,27 +1822,9 @@ fn connect_work(
             Err(_) => log::warn!("[mqtt] on_connect callback mutex poisoned"),
         }
     }
-    let input = if done {
+    session.send(if done {
         SessionInput::WorkDone(token)
     } else {
         SessionInput::WorkFailed(token)
-    };
-    if session.poll(input) == SessionAction::Close {
-        close_transport(client);
-    }
-}
-
-/// Drops the broker connection so esp-mqtt reconnects after its `reconnect_timeout`.
-///
-/// Only from the connect helper thread: on the event-loop thread esp-mqtt holds
-/// its `api_lock` during dispatch (ADR 017).
-fn close_transport(client: &SubscribableClient) {
-    use esp_idf_svc::handle::RawHandle;
-
-    // SAFETY: the handle belongs to a live client (we hold it); the call takes
-    // esp-mqtt's api_lock, which is free outside event dispatch.
-    let result = unsafe { esp_idf_svc::sys::esp_mqtt_client_disconnect(client.0.handle()) };
-    if result != esp_idf_svc::sys::ESP_OK {
-        log::warn!("[mqtt] closing the session failed: {}", result);
-    }
+    });
 }

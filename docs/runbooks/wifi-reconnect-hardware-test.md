@@ -34,11 +34,12 @@ Serial lines quoted below are prefixes; numbers vary.
 3. Pass: every tick while paused reports `would block`; no `tick #<n> failed:`, no panic, no reboot.
 4. Pass: `just mqtt-watch` shows `<prefix>/status offline` about 45 s after the pause (1.5 × keep-alive); the broker fires the will because the client sent no DISCONNECT.
 5. Un-pause after about 3 minutes; pass: the link comes back on the next attempt (`[wifi] link up #2` on hal, `WiFi connect requested` then an IP log on IDF) without a reboot.
-6. Pass: MQTT reconnects on its own (`[mqtt] connected` on both tiers, from esp-mqtt's own retry on IDF), `status online` is retained again and ticks are `queued` again.
+6. Pass: MQTT reconnects on its own (`[mqtt] connected` on both tiers), `status online` is retained again and ticks are `queued` again.
+   On IDF no `Error transport connect` or `[mqtt] error` line may appear while the link is paused (since Step 8b-2 the session is gated on the link and makes no attempt); the reconnect follows the `sta ip:` line within about a second.
    On IDF, at most the ticks `queued` between the pause and the `[mqtt] disconnected` line may arrive after the reconnect (esp-mqtt outbox, QoS 1); any tick logged `would block` must never reach the broker.
    Pass on both tiers: `[example] mqtt state Connected -> Disconnected` after the pause and `-> Connected` again after the un-pause.
-   The example samples the state every 5 s, so it may miss a short `Connecting` phase; check each retry by its per-attempt log instead (`Error transport connect` from esp-mqtt on IDF, `[mqtt] tcp connect failed` on hal).
-7. Record the time from un-pause to the first `queued` tick; expect under 45 s (back-off at most 30 s plus the MQTT connect).
+   The example samples the state every 5 s, so it may miss a short `Connecting` phase; check each retry by its per-attempt log instead (`[mqtt] tcp connect failed` on hal, `[mqtt] reconnecting in` plus `Transport connected` on IDF).
+7. Record the time from un-pause to the first `queued` tick; expect under 45 s on hal (back-off at most 30 s plus the MQTT connect) and under 5 s on IDF (at most one Wi-Fi back-off plus the connect, with no MQTT retry wait).
 
 ### R2 — wrong credentials (optional)
 
@@ -53,7 +54,7 @@ Watch at least three cycles per tier.
 1. Pass on suspend, hal: `[example] demo: suspend for 20 s`, `[wifi] suspend requested`, `[wifi] suspended —`, `[example] demo: is_suspended = true`, `[example] wifi link Connected -> Suspended`, then `[mqtt] disconnected (`…`), waiting for network` within about 0.5 s.
 2. Pass on suspend, IDF: `[example] demo: suspend for 20 s`, `WiFi suspending`, `WiFi disconnected — reason 8`, `WiFi suspended`, `[example] wifi link Connected -> Suspended`, then `[mqtt] disconnected` within about a second.
 3. Pass while suspended: no `[wifi] reconnecting in` or `WiFi reconnect in` line, no connect request, and every tick reports `would block`.
-   On IDF esp-mqtt logs one transport error about every 10 s (its `reconnect_timeout`); that is expected noise.
+   On IDF no MQTT line at all may appear while suspended (since Step 8b-2 the session is gated on the link, so esp-mqtt makes no attempt and logs no transport error); a `[mqtt] reconnecting in` or `[mqtt] error` line is a failure.
    On IDF a tick `queued` between the suspend and `[mqtt] disconnected` may still reach the broker after the resume; a `would block` tick never does.
 4. Pass on the broker: `just mqtt-watch` shows `<prefix>/status offline` once per cycle, right at the reconnect and immediately followed by `online` (client-id takeover: the 20 s suspend is shorter than the 45 s will timeout, so the broker publishes the will as it drops the old session).
 5. Pass on resume: `[example] demo: resume`, then `[wifi] resume requested` and `[wifi] link up #<n>` on hal, or `WiFi resumed, connect requested` and ESP-IDF's own `sta ip:` line on IDF.

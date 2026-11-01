@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
             let n = msg_count_cb.fetch_add(1, Ordering::Relaxed) + 1;
             log::info!("[mqtt] message #{} on '{}'", n, topic);
         })
-        .build()?;
+        .build(&wifi)?;
 
     log::info!("subscribed to '{}' — waiting for messages", SUBSCRIBE_TOPIC);
 

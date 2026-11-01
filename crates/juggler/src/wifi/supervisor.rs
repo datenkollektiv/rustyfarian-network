@@ -99,6 +99,10 @@ struct Core<R> {
     ready_waiters: Vec<(u64, Waker)>,
     /// Id for the next [`ReadyWait`] that registers.
     next_waiter: u64,
+    /// Sinks told once per readiness transition (see [`LinkSupervisor::subscribe_ready`]).
+    ready_sinks: Vec<Box<dyn Fn(bool) + Send + 'static>>,
+    /// Readiness as last handed to `ready_sinks`.
+    ready_reported: bool,
 }
 
 impl<R: LinkRadio> Core<R> {
@@ -129,6 +133,18 @@ impl<R: LinkRadio> Core<R> {
         self.stops = self.stops.wrapping_add(1);
         Ok(())
     }
+
+    /// Hands a readiness change to the sinks, once per transition.
+    fn report_ready(&mut self) {
+        let ready = self.machine.is_ready();
+        if ready == self.ready_reported {
+            return;
+        }
+        self.ready_reported = ready;
+        for sink in &self.ready_sinks {
+            sink(ready);
+        }
+    }
 }
 
 /// Station supervisor: a worker thread plus thread-safe `suspend`/`resume`.
@@ -155,6 +171,8 @@ impl<R: LinkRadio> LinkSupervisor<R> {
             backoff_at: None,
             ready_waiters: Vec::new(),
             next_waiter: 0,
+            ready_sinks: Vec::new(),
+            ready_reported: false,
         }));
         let (tx, rx) = mpsc::channel();
         let worker = Arc::clone(&core);
@@ -210,6 +228,30 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         }
     }
 
+    /// Registers a sink told once whenever the link becomes ready and once
+    /// whenever it stops being ready, and returns the readiness at the moment
+    /// of registration.
+    ///
+    /// Readiness is [`is_ready`](Self::is_ready), the same value the
+    /// `wait_ready` futures complete on, so a consumer that must gate work on
+    /// the link (the MQTT session, bug 010) needs neither a second event source
+    /// nor a poll.
+    ///
+    /// The seed and the registration happen under one lock, so no transition can
+    /// slip between them: every change is either already in the returned value or
+    /// delivered to the sink. A transition that happened before the call is
+    /// therefore covered exactly once, by the seed, and never replayed.
+    ///
+    /// The sink runs on the reconnect worker, or on the caller of
+    /// [`suspend`](Self::suspend), while the supervisor's lock is held. It must
+    /// return at once: hand the value to a channel, and never block or call back
+    /// into the supervisor.
+    pub fn subscribe_ready(&self, sink: impl Fn(bool) + Send + 'static) -> bool {
+        let mut core = self.lock();
+        core.ready_sinks.push(Box::new(sink));
+        core.machine.is_ready()
+    }
+
     #[cfg(test)]
     fn ready_waiter_count(&self) -> usize {
         self.lock().ready_waiters.len()
@@ -230,6 +272,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         log::info!("WiFi suspending");
         core.radio_down()?;
         log::info!("WiFi suspended");
+        core.report_ready();
         Ok(())
     }
 
@@ -248,6 +291,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         match core.connect() {
             Ok(()) => {
                 log::info!("WiFi resumed, connect requested");
+                core.report_ready();
                 Ok(())
             }
             Err(e) => {
@@ -255,6 +299,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
                 // Schedule the retry under the same lock, then let the worker
                 // pick up the new deadline.
                 step(&mut core, LinkInput::Disconnected);
+                core.report_ready();
                 let _ = self.tx.send(Msg::Wake);
                 Err(e)
             }
@@ -382,6 +427,7 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>) {
                 waker.wake();
             }
         }
+        core.report_ready();
     }
     log::debug!("WiFi link worker exited");
 }
@@ -641,6 +687,109 @@ mod tests {
         assert!(ready.as_mut().poll(&mut cx).is_ready());
         assert!(rig.sup.is_ready());
         assert_eq!(rig.sup.connect_count(), 1);
+    }
+
+    #[test]
+    fn a_ready_sink_sees_each_transition_once() {
+        let rig = rig(true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        rig.sup
+            .subscribe_ready(move |ready| sink.lock().unwrap().push(ready));
+
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        rig.sup.suspend().unwrap();
+        rig.sup.resume().unwrap();
+        wait_for_state(&rig.sup, LinkState::Connected);
+        settle();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [true, false, true],
+            "one notification per transition, in order"
+        );
+    }
+
+    #[test]
+    fn a_repeated_state_is_not_reported_again() {
+        let rig = rig(true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        rig.sup
+            .subscribe_ready(move |ready| sink.lock().unwrap().push(ready));
+
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        settle();
+        rig.sup.suspend().unwrap();
+        rig.sup.suspend().unwrap();
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
+    }
+
+    #[test]
+    fn every_ready_sink_is_told() {
+        let rig = rig(false);
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let (first_sink, second_sink) = (Arc::clone(&first), Arc::clone(&second));
+        rig.sup
+            .subscribe_ready(move |ready| first_sink.lock().unwrap().push(ready));
+        rig.sup
+            .subscribe_ready(move |ready| second_sink.lock().unwrap().push(ready));
+
+        rig.sup.events().send(LinkEvent::Connected);
+        rig.sup.events().send(LinkEvent::NetworkUp);
+        assert!(eventually(|| rig.sup.is_ready()));
+        settle();
+        assert_eq!(*first.lock().unwrap(), [true]);
+        assert_eq!(*second.lock().unwrap(), [true]);
+    }
+
+    #[test]
+    fn a_transition_before_the_subscription_is_not_replayed() {
+        let rig = rig(true);
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let seed = rig
+            .sup
+            .subscribe_ready(move |ready| sink.lock().unwrap().push(ready));
+        assert!(seed, "the seed is the readiness at registration");
+        rig.sup.suspend().unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [false],
+            "the seed covers the earlier transition; nothing is replayed"
+        );
+        assert!(!rig.sup.is_ready());
+    }
+
+    #[test]
+    fn the_seed_and_the_sink_together_cover_every_transition() {
+        let rig = rig(true);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let seed = rig
+            .sup
+            .subscribe_ready(move |ready| sink.lock().unwrap().push(ready));
+        assert!(
+            !seed,
+            "the link has not associated yet, so the session starts closed"
+        );
+
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        rig.sup.suspend().unwrap();
+        rig.sup.resume().unwrap();
+        wait_for_state(&rig.sup, LinkState::Connected);
+        settle();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [true, false, true],
+            "starting from the seed, the sink sees every later edge once"
+        );
     }
 
     #[test]

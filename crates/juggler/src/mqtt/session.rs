@@ -105,7 +105,14 @@ enum Phase {
     /// Waiting out the retry pause.
     Retrying,
     /// The transport is being closed; `Disconnected` is next.
-    Closing,
+    ///
+    /// `driver_idle` records whether the driver had already dropped the
+    /// transport when it asked for the close: an idle driver posts no event of
+    /// its own, so the tier has to report `Disconnected` itself.
+    Closing {
+        /// `true` when the driver was already disconnected (it was in the retry pause).
+        driver_idle: bool,
+    },
     /// Shut down for good.
     Shutdown,
 }
@@ -150,7 +157,9 @@ impl SessionMachine {
                 MqttConnectionState::Connecting
             }
             Phase::Ready => MqttConnectionState::Connected,
-            Phase::Offline | Phase::Retrying | Phase::Closing => MqttConnectionState::Disconnected,
+            Phase::Offline | Phase::Retrying | Phase::Closing { .. } => {
+                MqttConnectionState::Disconnected
+            }
             Phase::Shutdown => MqttConnectionState::ShuttingDown,
         }
     }
@@ -171,6 +180,16 @@ impl SessionMachine {
         self.phase == Phase::Working(token)
     }
 
+    /// `true` while the machine is closing and the driver had already dropped
+    /// its transport, so it will report no end of its own: the tier reports
+    /// [`SessionInput::Disconnected`] itself after performing the `Close`.
+    ///
+    /// `false` at every other time, including a close of a live transport — that
+    /// one ends in a driver event.
+    pub fn driver_idle(&self) -> bool {
+        matches!(self.phase, Phase::Closing { driver_idle: true })
+    }
+
     /// Pause before the next attempt while the network is up (milliseconds).
     pub fn retry_ms(&self) -> u64 {
         self.retry_ms
@@ -187,7 +206,8 @@ impl SessionMachine {
         }
         match (self.phase, input) {
             (_, I::Shutdown) => {
-                // `Retrying` counts: a driver that retries on its own is still active.
+                // `Retrying` counts: a driver that retries on its own is still active,
+                // but it holds no transport, so it reports no end of its own.
                 let busy = matches!(
                     self.phase,
                     P::Connecting | P::Working(_) | P::Ready | P::Retrying
@@ -210,13 +230,14 @@ impl SessionMachine {
             }
             (P::Connecting | P::Working(_) | P::Ready, I::NetworkDown) => {
                 self.network_up = false;
-                self.phase = P::Closing;
+                self.phase = P::Closing { driver_idle: false };
                 A::Close
             }
             (P::Retrying, I::NetworkDown) => {
-                // Stop a driver that would keep retrying on its own; `Disconnected` follows.
+                // The driver sits in its retry pause with no transport, so the
+                // tier stops it and reports `Disconnected` itself.
                 self.network_up = false;
-                self.phase = P::Closing;
+                self.phase = P::Closing { driver_idle: true };
                 A::Close
             }
             (_, I::NetworkDown) => {
@@ -229,7 +250,7 @@ impl SessionMachine {
             }
             (P::Starting | P::Offline, I::AttemptStarted) => {
                 // The driver retried although the gate is closed: stop it.
-                self.phase = P::Closing;
+                self.phase = P::Closing { driver_idle: false };
                 A::Close
             }
             (P::Connecting, I::Connected { session_present }) => {
@@ -251,10 +272,10 @@ impl SessionMachine {
                 A::None
             }
             (P::Working(current), I::WorkFailed(token)) if token == current => {
-                self.phase = P::Closing;
+                self.phase = P::Closing { driver_idle: false };
                 A::Close
             }
-            (P::Connecting | P::Working(_) | P::Ready | P::Closing, I::Disconnected) => {
+            (P::Connecting | P::Working(_) | P::Ready | P::Closing { .. }, I::Disconnected) => {
                 if self.network_up {
                     self.phase = P::Retrying;
                     A::Wait { ms: self.retry_ms }
@@ -535,6 +556,70 @@ mod tests {
         let token = working(&mut m, false);
         m.poll(I::WorkDone(token));
         assert_eq!(m.connect_count(), 2);
+    }
+
+    #[test]
+    fn a_close_of_a_live_transport_waits_for_the_driver_to_report_it() {
+        // Ready, Working, Connecting and a failed connect work all sit on a live
+        // transport: the driver ends it and posts `Disconnected`.
+        let mut ready = ready();
+        assert_eq!(ready.poll(I::NetworkDown), A::Close);
+        assert!(
+            !ready.driver_idle(),
+            "a connected client reports its own disconnect"
+        );
+
+        let mut connecting = SessionMachine::new();
+        connecting.poll(I::NetworkUp);
+        assert_eq!(connecting.poll(I::NetworkDown), A::Close);
+        assert!(!connecting.driver_idle());
+
+        let mut working_state = SessionMachine::new();
+        working_state.poll(I::NetworkUp);
+        let token = working(&mut working_state, false);
+        assert_eq!(working_state.poll(I::WorkFailed(token)), A::Close);
+        assert!(!working_state.driver_idle());
+    }
+
+    #[test]
+    fn a_close_from_the_retry_pause_is_reported_by_the_tier() {
+        // In `Retrying` the driver holds no transport, so no driver event will
+        // follow: the tier has to feed `Disconnected` itself, and needs to know.
+        let mut m = ready();
+        m.poll(I::Disconnected);
+        assert_eq!(m.poll(I::NetworkDown), A::Close);
+        assert!(
+            m.driver_idle(),
+            "an idle driver reports nothing, so the tier must"
+        );
+        assert_eq!(m.poll(I::Disconnected), A::None);
+        assert_eq!(m.state(), MqttConnectionState::Disconnected);
+        assert_eq!(m.poll(I::NetworkUp), A::Connect);
+    }
+
+    #[test]
+    fn the_idle_flag_lasts_only_while_closing() {
+        let mut m = ready();
+        m.poll(I::Disconnected);
+        assert!(!m.driver_idle(), "a retry pause is not a close yet");
+        m.poll(I::NetworkDown);
+        assert!(m.driver_idle());
+        m.poll(I::Disconnected);
+        assert!(!m.driver_idle(), "the close is over");
+    }
+
+    #[test]
+    fn a_close_that_is_never_answered_leaves_the_machine_stuck() {
+        // Why `driver_idle` exists: the contract is that the tier always feeds
+        // `Disconnected` after `Close`, from the driver or by itself.
+        let mut m = ready();
+        m.poll(I::NetworkDown);
+        assert_eq!(m.poll(I::RetryElapsed), A::None);
+        assert_eq!(
+            m.poll(I::NetworkUp),
+            A::None,
+            "an unanswered close blocks the next network up"
+        );
     }
 
     #[test]

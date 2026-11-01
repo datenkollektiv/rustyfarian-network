@@ -10,14 +10,15 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 
 ## Decisions
 
-| Decision                                               | Reason                                                                | Rejected Alternative                             |
-|:-------------------------------------------------------|:----------------------------------------------------------------------|:-------------------------------------------------|
-| Async API on both tiers                                | Consumer code exchangeable (ADR 022, decision 2)                      | Blocking primary surface; per-consumer adapters  |
-| Cores are sans-IO state machines in `juggler`          | One machine fits threads (IDF) and cancel-safe async (hal)            | Async code generic over one port; `dyn` ports    |
-| IDF async as wrappers over the existing worker threads | Spike: equal behaviour, native types only saved the runtime they omit | `esp-idf-svc` `AsyncWifi` / `EspAsyncMqttClient` |
-| Blocking IDF API stays during 0.x                      | Additive change                                                       | Removing it now                                  |
-| Per-tier type aliases over generic cores               | Consumers never spell the generics                                    | Generic public types                             |
-| Wi-Fi and MQTT first                                   | Upstream request U2g                                                  | All domains at once                              |
+| Decision                                               | Reason                                                                | Rejected Alternative                              |
+|:-------------------------------------------------------|:----------------------------------------------------------------------|:--------------------------------------------------|
+| Async API on both tiers                                | Consumer code exchangeable (ADR 022, decision 2)                      | Blocking primary surface; per-consumer adapters   |
+| Cores are sans-IO state machines in `juggler`          | One machine fits threads (IDF) and cancel-safe async (hal)            | Async code generic over one port; `dyn` ports     |
+| IDF async as wrappers over the existing worker threads | Spike: equal behaviour, native types only saved the runtime they omit | `esp-idf-svc` `AsyncWifi` / `EspAsyncMqttClient`  |
+| Blocking IDF API stays during 0.x                      | Additive change                                                       | Removing it now                                   |
+| Per-tier type aliases over generic cores               | Consumers never spell the generics                                    | Generic public types                              |
+| Wi-Fi and MQTT first                                   | Upstream request U2g                                                  | All domains at once                               |
+| MQTT gate fed by link readiness notifications          | Instant edges on one source of truth (IDF lost-IP is 120 s late)      | Polling `is_ready`; second `IpEvent` subscription |
 
 ## Constraints
 - ADR 021 holds: the firmware owns the executor and the providers, and libraries select none.
@@ -44,7 +45,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 5 — link core
 - [x] Step 6 — MQTT session core
 - [ ] Step 7 — esp-hal adopts the cores (desk work done, CrowPanel S3 rerun pending)
-- [ ] Step 8 — IDF adopts the cores
+- [ ] Step 8 — IDF adopts the cores (8a, 8b-1, 8b-2 done; bug 013 and the bench run open)
 - [ ] Step 9 — one app, two tiers (hardware gate, release 0.7.0)
 - [ ] Step 10 — Wi-Fi names and value types
 - [ ] Step 11 — MQTT shape
@@ -59,3 +60,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Session end: next is the CrowPanel S3 T5a/T5b rerun for Step 7; Step 8 (IDF adopts the cores) is desk work that can start meanwhile
 - 2026-11-01 — Step 8a done: IDF `WiFiManager` feeds IP events, gains `state`/`is_ready`/`wait_ready`, implements `NetworkLink`; bench runs for both tiers deferred by the maintainer
 - 2026-11-01 — Step 8b-1 done: IDF `MqttHandle` driven by `SessionMachine` (bug 014 order), implements `MqttClient` with a receive queue; network gate (8b-2) next
+- 2026-11-01 — Step 8b-2 done: IDF MQTT is gated on the link, `NetworkGate`/`Outbox`/`subscribe_ready` land in `juggler` with host tests and mutation checks, `MqttBuilder::build(&wifi)` is the approved 0.x break, bug 010 fixed in code (bench run pending); Step 8c and Steps 9–11 open
