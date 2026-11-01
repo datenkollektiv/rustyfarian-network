@@ -36,6 +36,8 @@
 //! [`with_wifi_scheduler_running`][WiFiConfigExt::with_wifi_scheduler_running]; see
 //! [`WiFiManager::init_async`] "Scheduler".
 
+// `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
+#[allow(deprecated)]
 pub use juggler::wifi::{
     validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode,
     LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver,

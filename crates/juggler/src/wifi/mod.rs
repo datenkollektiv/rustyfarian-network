@@ -429,15 +429,16 @@ pub fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
 
 /// Hardware-agnostic Wi-Fi driver interface.
 ///
-/// Provides the minimal surface that a Wi-Fi manager needs from the
-/// platform HAL. Each HAL backend (`esp-idf-svc`, `esp-hal`) implements
-/// this trait so that shared logic can be tested on the host.
+/// Deprecated: no tier implements it; ADR 022 replaces it with shared link
+/// traits that both tiers implement.
 ///
 /// # Implementors
 ///
-/// - `rustyfarian_esp_idf_network::wifi::WiFiManager` — ESP-IDF driver
-/// - `rustyfarian_esp_hal_network::wifi::EspHalWifiDriver` — bare-metal driver (future)
 /// - [`mock::MockWifiDriver`] — test double (behind `mock` feature / `#[cfg(test)]`)
+#[deprecated(
+    since = "0.7.0",
+    note = "no tier implements WifiDriver; ADR 022 replaces it with shared link traits"
+)]
 pub trait WifiDriver {
     /// Driver-specific error type.
     type Error: core::fmt::Debug;
@@ -580,6 +581,7 @@ mod tests {
     // ── MockWifiDriver tests ────────────────────────────────────────────
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated `WifiDriver` through its mock
     fn mock_driver_connect_disconnect_cycle() {
         let mut driver = mock::MockWifiDriver::new();
         assert!(!driver.is_connected().unwrap());
@@ -685,6 +687,7 @@ mod tests {
     // ── MockWifiDriver tests ────────────────────────────────────────────
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated `WifiDriver` through its mock
     fn mock_driver_fail_connect() {
         let mut driver = mock::MockWifiDriver::new();
         driver.fail_connect = true;

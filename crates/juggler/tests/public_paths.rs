@@ -53,6 +53,7 @@ fn test_psk() -> &'static str {
 
 #[cfg(feature = "wifi")]
 #[test]
+#[allow(deprecated)] // `WifiDriver` stays a public path until it is removed
 fn wifi_public_paths() {
     const TEST_WIFI_SSID: &str = "TestNet";
 
@@ -115,6 +116,7 @@ fn wifi_public_paths() {
 
 #[cfg(all(feature = "wifi", feature = "mock"))]
 #[test]
+#[allow(deprecated)] // `WifiDriver` stays a public path until it is removed
 fn wifi_mock_public_paths() {
     const TEST_WIFI_SSID: &str = "ssid";
 

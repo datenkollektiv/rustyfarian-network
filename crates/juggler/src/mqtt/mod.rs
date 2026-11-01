@@ -253,11 +253,12 @@ pub fn validate_broker_port(port: u16) -> Result<(), &'static str> {
 /// is silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MqttConnectionState {
-    /// `build()` was called; no connection has completed yet.
+    /// A connection attempt is in progress, or none has completed since `build()`.
     Connecting,
-    /// The broker acknowledged the CONNECT packet.
+    /// The session is up and ready: the broker acknowledged the CONNECT and the
+    /// tier finished its connect work (startup message, subscriptions).
     Connected,
-    /// The connection was lost; the ESP-IDF layer will attempt to reconnect.
+    /// The session or the last attempt failed; the tier retries on its own.
     Disconnected,
     /// Shutdown was requested; no further reconnections will be attempted.
     ShuttingDown,
@@ -298,6 +299,61 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
         (S::Disconnected, E::Disconnected) => None,
         (S::Disconnected, E::ShutdownRequested) => Some(S::ShuttingDown),
         (S::ShuttingDown, _) => None,
+    }
+}
+
+/// The last session lifecycle event a tier saw, shared lock-free between its
+/// event loop and its handle.
+///
+/// The event loop calls [`attempt_started`](Self::attempt_started) when a
+/// connection attempt begins and [`session_lost`](Self::session_lost) when a
+/// session or an attempt ends; the handle combines that with its own "ready"
+/// flag in [`state`](Self::state).
+/// "Ready" wins, so a session that is up reports
+/// [`Connected`](MqttConnectionState::Connected) even while the phase still
+/// says the attempt started.
+///
+/// Uses only atomic `load` and `store`, so it builds on targets without
+/// atomic read-modify-write (`riscv32imc`).
+#[derive(Debug)]
+pub struct SessionPhase(core::sync::atomic::AtomicU8);
+
+impl SessionPhase {
+    const ATTEMPTING: u8 = 0;
+    const LOST: u8 = 1;
+
+    /// Creates the phase of a fresh client: attempting its first connection.
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU8::new(Self::ATTEMPTING))
+    }
+
+    /// Records that a connection attempt began.
+    pub fn attempt_started(&self) {
+        self.0
+            .store(Self::ATTEMPTING, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Records that the session, or the attempt in progress, ended.
+    pub fn session_lost(&self) {
+        self.0
+            .store(Self::LOST, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The observable state, given whether the tier considers the session ready.
+    pub fn state(&self, ready: bool) -> MqttConnectionState {
+        if ready {
+            MqttConnectionState::Connected
+        } else if self.0.load(core::sync::atomic::Ordering::Acquire) == Self::LOST {
+            MqttConnectionState::Disconnected
+        } else {
+            MqttConnectionState::Connecting
+        }
+    }
+}
+
+impl Default for SessionPhase {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1126,12 +1182,50 @@ impl Drop for CallbackScope {
 
 #[cfg(test)]
 mod tests {
+    // ── SessionPhase ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_fresh_session_phase_reports_connecting() {
+        assert_eq!(
+            SessionPhase::new().state(false),
+            MqttConnectionState::Connecting
+        );
+    }
+
+    #[test]
+    fn a_ready_session_reports_connected_whatever_the_phase() {
+        let phase = SessionPhase::new();
+        assert_eq!(phase.state(true), MqttConnectionState::Connected);
+        phase.session_lost();
+        assert_eq!(phase.state(true), MqttConnectionState::Connected);
+    }
+
+    #[test]
+    fn a_lost_session_reports_disconnected_until_the_next_attempt() {
+        let phase = SessionPhase::new();
+        phase.session_lost();
+        assert_eq!(phase.state(false), MqttConnectionState::Disconnected);
+        phase.attempt_started();
+        assert_eq!(phase.state(false), MqttConnectionState::Connecting);
+    }
+
+    #[test]
+    fn a_failed_attempt_cycle_alternates_connecting_and_disconnected() {
+        let phase = SessionPhase::default();
+        for _ in 0..3 {
+            phase.attempt_started();
+            assert_eq!(phase.state(false), MqttConnectionState::Connecting);
+            phase.session_lost();
+            assert_eq!(phase.state(false), MqttConnectionState::Disconnected);
+        }
+    }
+
     #[cfg(feature = "std")]
     use super::format_broker_url;
     use super::{
         connection_wait_iterations, next_state, resolve_client_id, topic_matches_filter,
         validate_broker_host, validate_broker_port, validate_client_id, validate_publish_topic,
-        validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent,
+        validate_subscribe_filter, validate_topic, MqttConnectionState, MqttEvent, SessionPhase,
         CLIENT_ID_MAX_LEN, TOPIC_MAX_LEN,
     };
 

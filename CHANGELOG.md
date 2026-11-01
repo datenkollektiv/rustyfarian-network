@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The supervisor drops driver events queued before a stop however late they arrive, and only that stop's `Stopped` event re-admits link events (`resume()` never waits, no timeout); it requires the tier to deliver every driver event in order, which ESP-IDF's blocking event post provides. Every transition, including a failed resume's retry, is scheduled under one lock.
   `rustyfarian-esp-idf-network`'s `wifi` feature now enables `juggler/std`.
 - `rustyfarian-esp-idf-network` `MqttHandle::connect_count()`: broker sessions since boot, bumped when `is_connected()` turns `true`, like the esp-hal handle.
+- `rustyfarian-esp-idf-network` `MqttHandle::state()` returns `MqttConnectionState` like the esp-hal handle (ADR 022, tier parity step 1): `Connecting` per esp-mqtt attempt, `Connected` exactly when `is_connected()` is `true`, `Disconnected` after a lost session or failed attempt; `MqttConnectionState` is now re-exported from the IDF `mqtt` module.
+  The state comes from the new lock-free `juggler::mqtt::SessionPhase` (host-tested, `load`/`store` only); `idf_esp32s3_mqtt_lwt` logs `[example] mqtt state X -> Y` like its esp-hal twin.
 - `MQTT_SUSPEND_DEMO=1` makes `hal_esp32s3_mqtt_lwt` and `idf_esp32s3_mqtt_lwt` suspend Wi-Fi for 20 s every 60 s; both examples now log link-state changes.
 - `idf_esp32s3_mqtt_lwt`: ESP-IDF twin of `hal_esp32s3_mqtt_lwt` (same env keys, LWT `offline` and retained `online` on `<prefix>/status`, a tick every 5 s, default client id `idf-s3-mqtt`, prefix `rustyfarian/idf-mqtt`).
   Runbook `docs/runbooks/wifi-reconnect-hardware-test.md` covers the router-outage protocol for both tiers.
@@ -78,6 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `hal_esp32s3_mqtt_lwt` reads its build-time configuration through a new `no_std` `examples/common/env.rs` with the same names as the IDF one, checks the broker host and client-id length at start-up like its IDF twin, and logs through `log`; both S3 LWT examples now print the same `would block (mqtt <state>)` and inbound (`rx`, binary-aware) lines.
 - `rustyfarian-esp-hal-network`: the `embassy` feature now enables the optional `embassy-futures` dependency (already used by `mqtt`) for the `WifiLink` select.
 - All seven bare-metal station examples spawn `link_task` instead of their own `wifi_task`; the reconnect delay after a link loss is now 1 s doubling to 30 s (was 500 ms / 5 s), and the link log lines are `[wifi] link up #<n>`, `[wifi] disconnected — <reason>` and `[wifi] reconnecting in <ms> ms`.
 - `rustyfarian-esp-idf-network` `MqttHandle::try_publish`, `try_publish_retained` and `try_publish_with` return `TryPublishError::WouldBlock` while `is_connected()` is `false`, matching the esp-hal tier; the check is best effort, so a publish accepted just before esp-mqtt notices a dead transport can still sit in the outbox and go out after the next connect at QoS 1.
@@ -140,6 +143,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The hal provisioning examples read `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE` at build time (WPA2 portal password and verbatim SSID), as the IDF example already does for the password.
   The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
 - `rustyfarian-esp-hal-network`: the hal examples `hal_c3_provision_mqtt` and `hal_c6_provision_mqtt` restart via `esp_hal::system::software_reset()` 200 ms after a committed submission, like the IDF provisioning examples, instead of idling until a manual reset; the library itself still never reboots.
+
+### Deprecated
+
+- `juggler::wifi::WifiDriver`: no tier implements it; ADR 022's shared link traits replace it. Its docs no longer claim the ESP-IDF `WiFiManager` as an implementor, and `MqttConnectionState`'s docs now hold for both tiers.
 
 ### Fixed
 

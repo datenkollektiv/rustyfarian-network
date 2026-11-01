@@ -53,3 +53,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 ## Session Log
 - 2026-11-01 — Feature doc created from ADR 022 and the program plan via /feature
 - 2026-11-01 — Step 0 done: roadmap Ready entry added, WifiDriver ADR item dropped, contract-tests item retargeted
+- 2026-11-01 — Step 1 code done (IDF `MqttHandle::state()` via `juggler::mqtt::SessionPhase`, `WifiDriver` deprecated), R1 state check rides with the U2f hardware session

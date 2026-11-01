@@ -39,10 +39,10 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 1: IDF `MqttHandle::state()` and stale docs
 
-- [ ] IDF `MqttHandle::state() -> MqttConnectionState`, driven by the events that already maintain `is_connected()` and `connect_count()` (`Connecting` until the first CONNACK, `Disconnected` on loss, `ShuttingDown` on drop).
-- [ ] Fix the `MqttConnectionState::Disconnected` doc so it holds for both tiers.
-- [ ] Deprecate `juggler::wifi::WifiDriver` (`#[deprecated(note = "use the ADR 022 traits")]`), fix its implementor list; keep the re-exports with `#[allow(deprecated)]`.
-- [ ] Log the state in `idf_esp32s3_mqtt_lwt` next to `connect #<n>`.
+- [x] IDF `MqttHandle::state() -> MqttConnectionState`, driven by the events that already maintain `is_connected()` and `connect_count()` (`Connecting` until the first CONNACK, `Disconnected` on loss, `ShuttingDown` on drop).
+- [x] Fix the `MqttConnectionState::Disconnected` doc so it holds for both tiers.
+- [x] Deprecate `juggler::wifi::WifiDriver` (`#[deprecated(note = "use the ADR 022 traits")]`), fix its implementor list; keep the re-exports with `#[allow(deprecated)]`.
+- [x] Log the state in `idf_esp32s3_mqtt_lwt` next to `connect #<n>`.
 - Done when: host tests cover the state mapping; `idf_esp32s3_mqtt_lwt` builds.
 - Gate: rides along with the open U2f hardware session (runbook R1 shows `Connecting → Connected → Disconnected → Connected`).
 
