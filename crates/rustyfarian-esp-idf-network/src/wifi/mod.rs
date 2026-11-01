@@ -43,6 +43,15 @@
 //! modes also retry a failed first association within their timeout, and
 //! `is_connected()` is `false` for the whole outage.
 //!
+//! # Suspend and deep sleep
+//!
+//! `WiFiManager::suspend()` disconnects and stops the radio inline and pauses
+//! reconnects; `resume()` starts it and connects again with a fresh back-off.
+//! Both take `&self`, are idempotent and return within milliseconds. Call
+//! `suspend()` right before `esp_deep_sleep_start`; an aborted sleep simply calls
+//! `resume()`. The MQTT client is not told: it sends no DISCONNECT, so the broker
+//! publishes its will after 1.5 × keep-alive (see the `mqtt` module docs).
+//!
 //! # Using a Simple GPIO LED
 //!
 //! For boards with a simple on/off LED instead of an RGB LED, use `SimpleLed`:
@@ -59,16 +68,17 @@
 //! ```
 
 use std::net::Ipv4Addr;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
 
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys::{esp, EspError};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
+use juggler::wifi::{LinkEvent, LinkRadio, LinkSupervisor};
 // Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
 // (where `SoftApManager` is cfg'd out) does not warn on unused imports.
 #[cfg(esp_idf_esp_wifi_softap_support)]
@@ -163,11 +173,14 @@ impl StatusLed for NoLed {
 /// [`is_connected`](Self::is_connected) keeps reporting the driver's
 /// event-tracked state, so it is `false` for the whole outage.
 ///
+/// [`suspend`](Self::suspend) and [`resume`](Self::resume) park and restart the
+/// station within the same boot, for example around deep sleep.
+///
 /// Dropping the manager stops and joins the worker before the driver goes away.
 pub struct WiFiManager {
     // Declared before `wifi`: fields drop in order, and the worker must be joined
     // before the driver it calls into is destroyed.
-    _link: LinkWorker,
+    link: LinkWorker,
     wifi: BlockingWifi<EspWifi<'static>>,
 }
 
@@ -284,7 +297,9 @@ impl WiFiManager {
         // connect, the first one included, in all modes. Declared after `wifi`, so
         // on an early return it is joined before the driver is dropped.
         let link = LinkWorker::start(&sys_loop_sub)?;
-        link.send(LinkInput::Start)?;
+        if !link.supervisor.start() {
+            anyhow::bail!("WiFi link worker is not running");
+        }
 
         if let Some(led_driver) = led {
             let timeout_secs = match config.connect_mode {
@@ -310,7 +325,7 @@ impl WiFiManager {
             }
         }
 
-        Ok(Self { _link: link, wifi })
+        Ok(Self { link, wifi })
     }
 
     /// Creates a new Wi-Fi manager without an LED driver.
@@ -475,41 +490,85 @@ impl WiFiManager {
     pub fn is_connected(&self) -> anyhow::Result<bool> {
         Ok(self.wifi.is_connected()?)
     }
+
+    /// The reconnect supervisor's view of the link, including
+    /// [`LinkState::Suspended`]; infallible, for rendering a status.
+    pub fn link_state(&self) -> LinkState {
+        self.link.supervisor.state()
+    }
+
+    /// Disconnects and stops the radio, and pauses reconnects until
+    /// [`resume`](Self::resume).
+    ///
+    /// Unlike the esp-hal tier, where suspend only disconnects the station,
+    /// this powers the radio down.
+    ///
+    /// Runs the IDF calls on the caller's thread: the radio is stopped when this
+    /// returns, as `esp_deep_sleep_start` needs. Idempotent, thread-safe next to
+    /// the reconnect worker and other callers, and bounded to a few milliseconds.
+    /// The MQTT client
+    /// sends no DISCONNECT, so the broker publishes its will after
+    /// 1.5 × keep-alive; esp-mqtt keeps retrying its transport every
+    /// `reconnect_timeout` meanwhile and logs each failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `esp_wifi_stop` fails; reconnects stay paused and a
+    /// second call retries the stop.
+    pub fn suspend(&self) -> anyhow::Result<()> {
+        self.link
+            .supervisor
+            .suspend()
+            .map_err(|e| anyhow::Error::from(e).context("failed to stop WiFi for suspend"))
+    }
+
+    /// Starts the radio and connects again with a fresh back-off.
+    ///
+    /// A no-op unless suspended; idempotent and safe right after
+    /// [`suspend`](Self::suspend) (one connect in flight, never two): driver
+    /// events queued before the stop are dropped by the reconnect worker, so
+    /// this never waits for them. Returns once the connect is requested;
+    /// association follows asynchronously, like the initial non-blocking connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the radio does not start or the connect request fails;
+    /// the reconnect worker keeps retrying with its back-off either way.
+    pub fn resume(&self) -> anyhow::Result<()> {
+        self.link
+            .supervisor
+            .resume()
+            .map_err(|e| anyhow::Error::from(e).context("WiFi resume failed to request a connect"))
+    }
 }
 
-/// The reconnect worker thread plus the event subscription that feeds it.
+/// The shared [`LinkSupervisor`] plus the event subscription that feeds it.
 ///
-/// Dropping it unregisters the subscription, closes the channel and joins the
-/// thread, so no `esp_wifi_connect` runs after the supervised driver is gone.
-/// The join is bounded: the worker blocks only in `recv`/`recv_timeout`, which
-/// return as soon as the last sender is dropped.
+/// Fields drop in order: the subscription is unregistered first, then the
+/// supervisor joins its worker, so no `esp_wifi_connect` runs after the driver
+/// is gone.
 struct LinkWorker {
-    subscription: Option<EspSystemSubscription<'static>>,
-    tx: Option<Sender<LinkInput>>,
-    handle: Option<thread::JoinHandle<()>>,
+    _subscription: EspSystemSubscription<'static>,
+    supervisor: LinkSupervisor<IdfRadio>,
 }
 
 impl LinkWorker {
-    /// Spawns the worker and subscribes it to the station link events.
+    /// Spawns the supervisor and subscribes it to the station events; the
+    /// radio must already be started.
     fn start(sys_loop: &EspSystemEventLoop) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::channel::<LinkInput>();
-        let handle = thread::Builder::new()
-            .name("wifi-link".into())
-            .stack_size(LINK_WORKER_STACK_SIZE)
-            .spawn(move || run_link_worker(rx))
-            .context("failed to spawn the Wi-Fi link worker")?;
-        let event_tx = tx.clone();
-        // Built before the subscription so a subscribe error still joins the thread.
-        let mut worker = Self {
-            subscription: None,
-            tx: Some(tx),
-            handle: Some(handle),
-        };
+        let supervisor = LinkSupervisor::spawn(
+            IdfRadio,
+            LinkMachine::new(),
+            thread::Builder::new()
+                .name("wifi-link".into())
+                .stack_size(LINK_WORKER_STACK_SIZE),
+        )
+        .context("failed to spawn the Wi-Fi link worker")?;
+        let events = supervisor.events();
         let subscription = sys_loop
             .subscribe::<WifiEvent, _>(move |event: WifiEvent<'_>| match event {
-                WifiEvent::StaConnected(_) => {
-                    let _ = event_tx.send(LinkInput::Connected);
-                }
+                WifiEvent::StaConnected(_) => events.send(LinkEvent::Connected),
+                WifiEvent::StaStopped => events.send(LinkEvent::Stopped),
                 WifiEvent::StaDisconnected(info) => {
                     let reason = info.reason();
                     match wifi_disconnect_reason_name(reason) {
@@ -525,90 +584,40 @@ impl LinkWorker {
                             reason,
                         ),
                     }
-                    let _ = event_tx.send(LinkInput::Disconnected);
+                    events.send(LinkEvent::Disconnected);
                 }
                 _ => {}
             })
             .map_err(|e| anyhow::anyhow!("WiFi link subscription failed: {:?}", e))?;
-        worker.subscription = Some(subscription);
-        Ok(worker)
-    }
-
-    /// Feeds one input to the worker's machine.
-    fn send(&self, input: LinkInput) -> anyhow::Result<()> {
-        self.tx
-            .as_ref()
-            .and_then(|tx| tx.send(input).ok())
-            .ok_or_else(|| anyhow::anyhow!("WiFi link worker is not running"))
+        Ok(Self {
+            _subscription: subscription,
+            supervisor,
+        })
     }
 }
 
-impl Drop for LinkWorker {
-    fn drop(&mut self) {
-        // The subscription's closure owns a sender; drop it before our own.
-        drop(self.subscription.take());
-        drop(self.tx.take());
-        if let Some(handle) = self.handle.take() {
-            if handle.join().is_err() {
-                log::warn!("WiFi link worker panicked");
-            }
-        }
-    }
-}
+/// The station calls of the ESP-IDF driver; events arrive through the
+/// system event loop in the order the driver posts them.
+struct IdfRadio;
 
-/// Owns the [`LinkMachine`]; exits when every [`Sender`] is dropped
-/// (see [`LinkWorker`]'s `Drop`).
-fn run_link_worker(rx: Receiver<LinkInput>) {
-    let mut machine = LinkMachine::new();
-    let mut deadline: Option<Instant> = None;
-    loop {
-        let input = match deadline {
-            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(input) => input,
-                Err(RecvTimeoutError::Timeout) => {
-                    deadline = None;
-                    LinkInput::BackoffElapsed
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
-            None => match rx.recv() {
-                Ok(input) => input,
-                Err(_) => break,
-            },
-        };
-        let mut action = machine.poll(input);
-        loop {
-            match action {
-                LinkAction::None => break,
-                LinkAction::Connect => {
-                    deadline = None;
-                    match esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_connect() }) {
-                        Ok(()) => {
-                            log::info!("WiFi connect requested");
-                            break;
-                        }
-                        Err(e) => {
-                            log::warn!("WiFi connect request failed: {:?}", e);
-                            action = machine.poll(LinkInput::Disconnected);
-                        }
-                    }
-                }
-                LinkAction::Wait { ms } => {
-                    log::info!(
-                        "WiFi reconnect in {} ms (attempt {})",
-                        ms,
-                        machine.failed_attempts()
-                    );
-                    deadline = Some(Instant::now() + Duration::from_millis(ms));
-                    break;
-                }
-            }
-        }
-        if machine.state() == LinkState::Connected {
-            deadline = None;
-        }
+impl LinkRadio for IdfRadio {
+    type Error = EspError;
+
+    fn start(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_idf_svc::sys::esp_wifi_start() })
     }
-    log::debug!("WiFi link worker exited");
+
+    fn connect(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_idf_svc::sys::esp_wifi_connect() })
+    }
+
+    fn disconnect(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_idf_svc::sys::esp_wifi_disconnect() })
+    }
+
+    fn stop(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_idf_svc::sys::esp_wifi_stop() })
+    }
 }
 
 /// Reads the SoftAP factory MAC address from efuse.

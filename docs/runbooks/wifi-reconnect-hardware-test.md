@@ -1,7 +1,7 @@
 # Runbook: Wi-Fi Reconnect Hardware Test (both tiers)
 
 Run this after any change to `juggler::wifi::LinkMachine`, the IDF `WiFiManager` reconnect worker or the esp-hal `WifiLink`, and for the `rustyfarian-knob` M8 outage protocol.
-It exercises a router-side outage on the two S3 LWT examples and records one result per tier.
+It exercises a router-side outage (R1, R2) and the radio suspend/resume cycle (R3) on the two S3 LWT examples and records one result per tier.
 
 **Reference device:** CrowPanel 1.28" HMI ESP32-S3 (`hal_esp32s3_mqtt_lwt` and `idf_esp32s3_mqtt_lwt`, console on the USB-Serial-JTAG port).
 
@@ -43,6 +43,22 @@ Serial lines quoted below are prefixes; numbers vary.
 1. Build with a wrong `WIFI_PASS`, flash, watch the console for 3 minutes.
 2. Pass: attempts keep coming with the delay capped at `30000 ms`; no panic, no reboot, heap stable.
 
+### R3 — suspend/resume demo (20 s every 60 s)
+
+Set `MQTT_SUSPEND_DEMO=1` in `.env`, rebuild and flash; the example suspends at every full minute of uptime and resumes 20 s later.
+Watch at least three cycles per tier.
+
+1. Pass on suspend, hal: `[example] demo: suspend for 20 s`, `[wifi] suspend requested`, `[wifi] suspended —`, `[example] demo: is_suspended = true`, `[example] wifi link Connected -> Suspended`, then `[mqtt] disconnected (`…`), waiting for network` within about 0.5 s.
+2. Pass on suspend, IDF: `[example] demo: suspend for 20 s`, `WiFi suspending`, `WiFi disconnected — reason 8`, `WiFi suspended`, `[example] wifi link Connected -> Suspended`, then `[mqtt] disconnected` within about a second.
+3. Pass while suspended: no `[wifi] reconnecting in` or `WiFi reconnect in` line, no connect request, and every tick reports `would block`.
+   On IDF esp-mqtt logs one transport error about every 10 s (its `reconnect_timeout`); that is expected noise.
+   On IDF a tick `queued` between the suspend and `[mqtt] disconnected` may still reach the broker after the resume; a `would block` tick never does.
+4. Pass on the broker: `just mqtt-watch` shows `<prefix>/status offline` once per cycle, right at the reconnect and immediately followed by `online` (client-id takeover: the 20 s suspend is shorter than the 45 s will timeout, so the broker publishes the will as it drops the old session).
+5. Pass on resume: `[example] demo: resume`, then `[wifi] resume requested` and `[wifi] link up #<n>` on hal, or `WiFi resumed, connect requested` and ESP-IDF's own `sta ip:` line on IDF.
+   Exactly one connect per resume: no `WiFi connect requested` from the worker and no `reconnecting in` / `reconnect in` line.
+6. Pass after resume: `[mqtt] connected`, `[example] connect #<n>` one higher than the cycle before, `status online` retained again, and the first tick after `[mqtt] connected` is `queued` (within 5 s); hal reconnects MQTT within seconds of link up, IDF at esp-mqtt's next retry (up to about 10 s later).
+7. Pass overall: no panic, no reboot, and the minute heap log stays stable across cycles.
+
 ## Results
 
 One line per tier; copy the block into the feature doc session log.
@@ -53,7 +69,10 @@ One line per tier; copy the block into the feature doc session log.
 | R1 router pause      | ESP-IDF |       | pass / fail |                                 |
 | R2 wrong credentials | esp-hal |       | pass / fail |                                 |
 | R2 wrong credentials | ESP-IDF |       | pass / fail |                                 |
+| R3 suspend/resume    | esp-hal |       | pass / fail |                                 |
+| R3 suspend/resume    | ESP-IDF |       | pass / fail |                                 |
 
 R1 timings: pause → `status offline`: `__ s`; un-pause → first `queued` tick: `__ s`. Git rev: `_______`.
+R3 timings per tier: `demo: resume` → `[mqtt] connected`: `__ s`.
 
 Attach the serial logs (`tmp/<tier>-reconnect-serial.log`); the examples never print the Wi-Fi password.

@@ -110,3 +110,9 @@ pub const MQTT_USER: Option<&str> = option_env!("MQTT_USER");
 pub fn mqtt_pass() -> Option<&'static str> {
     option_env!("MQTT_PASS")
 }
+
+/// `MQTT_SUSPEND_DEMO=1` makes the S3 LWT examples suspend Wi-Fi for 20 s every 60 s.
+#[allow(dead_code)]
+pub fn mqtt_suspend_demo() -> bool {
+    option_env!("MQTT_SUSPEND_DEMO") == Some("1")
+}

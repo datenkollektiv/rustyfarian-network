@@ -10,7 +10,10 @@
 //! * `<prefix>/cmd` is subscribed; each inbound message is logged by `on_message`.
 //! * Every 5 s the main loop `try_publish`es a tick on `<prefix>/tick`;
 //!   `WouldBlock` (not connected or client busy) is logged and skipped.
-//! * Wi-Fi and MQTT state changes and the free heap (once a minute) are logged.
+//! * Wi-Fi link and MQTT state changes and the free heap (once a minute) are logged.
+//! * With `MQTT_SUSPEND_DEMO=1` the radio is suspended for 20 s every 60 s
+//!   (`WiFiManager::suspend` / `resume`), the cycle a deep-sleep firmware runs when
+//!   a sleep attempt is aborted; the broker sees the will, then `online` again.
 //!
 //! Build-time environment (all `option_env!`, see `.env.example`):
 //!
@@ -24,6 +27,7 @@
 //! | `MQTT_USER`         | unset                  | Optional username                     |
 //! | `MQTT_PASS`         | unset                  | Optional password                     |
 //! | `MQTT_TOPIC_PREFIX` | `rustyfarian/idf-mqtt` | Topic prefix for status/cmd/tick      |
+//! | `MQTT_SUSPEND_DEMO` | unset                  | `1`: suspend 20 s every 60 s          |
 //!
 //! # Build and flash
 //!
@@ -47,6 +51,8 @@ const TICK_SECS: u64 = 5;
 const HEAP_LOG_SECS: u64 = 60;
 const KEEP_ALIVE_SECS: u64 = 30;
 const WIFI_FIRST_CONNECT_WAIT_MS: u64 = 30_000;
+const SUSPEND_EVERY_SECS: u64 = 60;
+const SUSPEND_FOR_SECS: u64 = 20;
 
 fn free_heap() -> u32 {
     // SAFETY: plain FFI query with no arguments or side effects.
@@ -126,9 +132,9 @@ fn main() -> anyhow::Result<()> {
         tick_topic
     );
 
+    let suspend_demo = env::mqtt_suspend_demo();
     let mut tick: u32 = 0;
-    let mut connects: u32 = 0;
-    let mut wifi_was_up = false;
+    let mut last_link = wifi.link_state();
     let mut mqtt_was_up = false;
     let mut secs_since_heap_log: u64 = 0;
     loop {
@@ -136,24 +142,30 @@ fn main() -> anyhow::Result<()> {
         tick += 1;
         secs_since_heap_log += TICK_SECS;
 
-        let wifi_up = match wifi.is_connected() {
-            Ok(up) => up,
-            Err(e) => {
-                log::warn!("[example] wifi status unavailable: {:#}", e);
-                false
+        let uptime = tick as u64 * TICK_SECS;
+        if suspend_demo && uptime % SUSPEND_EVERY_SECS == 0 {
+            log::info!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
+            if let Err(e) = wifi.suspend() {
+                log::warn!("[example] suspend failed: {:#}", e);
             }
-        };
-        if wifi_up != wifi_was_up {
-            log::info!("[example] wifi {} -> {}", wifi_was_up, wifi_up);
-            wifi_was_up = wifi_up;
+        } else if suspend_demo && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
+            log::info!("[example] demo: resume");
+            if let Err(e) = wifi.resume() {
+                log::warn!("[example] resume failed: {:#}", e);
+            }
+        }
+
+        let link = wifi.link_state();
+        if link != last_link {
+            log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
+            last_link = link;
         }
         let mqtt_up = mqtt.is_connected();
         if mqtt_up != mqtt_was_up {
             if mqtt_up {
-                connects += 1;
                 log::info!(
                     "[example] connect #{} free heap: {} B",
-                    connects,
+                    mqtt.connect_count(),
                     free_heap()
                 );
             }
@@ -164,15 +176,15 @@ fn main() -> anyhow::Result<()> {
         let payload = format!(
             "{{\"tick\":{},\"uptime_s\":{},\"free_heap\":{}}}",
             tick,
-            tick as u64 * TICK_SECS,
+            uptime,
             free_heap()
         );
         match mqtt.try_publish(&tick_topic, &payload) {
             Ok(()) => log::info!("[example] tick #{} queued", tick),
             Err(TryPublishError::WouldBlock) => log::info!(
-                "[example] tick #{} would block (wifi {} mqtt {})",
+                "[example] tick #{} would block (wifi {:?} mqtt {})",
                 tick,
-                wifi_up,
+                link,
                 mqtt_up
             ),
             Err(TryPublishError::Other(e)) => {
@@ -185,7 +197,7 @@ fn main() -> anyhow::Result<()> {
             log::info!(
                 "[example] heap free: {} B, connects: {}",
                 free_heap(),
-                connects
+                mqtt.connect_count()
             );
         }
     }

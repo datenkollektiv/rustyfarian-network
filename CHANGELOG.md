@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Requested by `rustyfarian-knob` (U2f); see `docs/features/wifi-reconnect-and-suspend-v1.md` and bug 009.
 - `rustyfarian-esp-hal-network::wifi::{WifiLink, link_task}`: a library-owned station supervisor; the firmware declares `static LINK: WifiLink = WifiLink::new();` and spawns `link_task(&LINK, controller)` instead of writing a reconnect loop.
   `is_connected()`, `state()` and `connect_count()` are readable from any task.
+- Radio suspend/resume on both tiers for deep-sleep firmware (`rustyfarian-knob` U2f, PR 2): `LinkMachine` gains `LinkInput::{Suspend, Resume}`, `LinkState::Suspended` and `LinkAction::Disconnect`, pauses reconnects while suspended, answers a connect that lands after a suspend with another disconnect, and resumes with a fresh back-off.
+  The tiers differ in what suspend does to the radio: ESP-IDF stops it, esp-hal only disconnects the station (esp-radio has no stop; the reset of deep sleep powers it down).
+  ESP-IDF `WiFiManager::{suspend, resume, link_state}` take `&self` and run `esp_wifi_disconnect` + `esp_wifi_stop` (resume: `esp_wifi_start` + `esp_wifi_connect`) inline, so the radio is stopped when `suspend()` returns; a resume right after a suspend issues one connect, never two.
+  esp-hal `WifiLink::{suspend, resume, is_suspended}` are non-blocking signals that `run` honours at every await; `is_suspended()` turns `true` once the disconnect finished or gave up after `SUSPEND_DISCONNECT_TIMEOUT_MS` (500 ms).
+  No MQTT suspend call: the client sends no DISCONNECT, so the broker publishes the will; see `docs/wifi-suspend-and-deep-sleep.md` for the deep-sleep recipes and the per-tier MQTT behaviour, and runbook scenario R3.
+- `juggler::wifi::LinkHandover` (pure, `no_std`) and `juggler::wifi::{LinkSupervisor, LinkRadio, LinkEvent, LinkEvents}` (`std`): the suspend bookkeeping of the esp-hal `WifiLink` and the thread-based supervisor of the ESP-IDF `WiFiManager`, host-tested with a mock radio against delayed driver events, rapid suspend/resume cycles and concurrent callers.
+  The supervisor drops driver events queued before a stop however late they arrive, and only that stop's `Stopped` event re-admits link events (`resume()` never waits, no timeout); it requires the tier to deliver every driver event in order, which ESP-IDF's blocking event post provides. Every transition, including a failed resume's retry, is scheduled under one lock.
+  `rustyfarian-esp-idf-network`'s `wifi` feature now enables `juggler/std`.
+- `rustyfarian-esp-idf-network` `MqttHandle::connect_count()`: broker sessions since boot, bumped when `is_connected()` turns `true`, like the esp-hal handle.
+- `MQTT_SUSPEND_DEMO=1` makes `hal_esp32s3_mqtt_lwt` and `idf_esp32s3_mqtt_lwt` suspend Wi-Fi for 20 s every 60 s; both examples now log link-state changes.
 - `idf_esp32s3_mqtt_lwt`: ESP-IDF twin of `hal_esp32s3_mqtt_lwt` (same env keys, LWT `offline` and retained `online` on `<prefix>/status`, a tick every 5 s, default client id `idf-s3-mqtt`, prefix `rustyfarian/idf-mqtt`).
   Runbook `docs/runbooks/wifi-reconnect-hardware-test.md` covers the router-outage protocol for both tiers.
 - `juggler::espnow::{ScanMachine, ScanInput, ScanAction, ScanError, SendOutcome}`: a pure, clock-injected state machine for `scan_for_peer`, shared by both tiers; the caller feeds `ScanInput` (`Start`, `Completed`, `Failed`, `Abort`, `Sent`) and performs each `ScanAction`, and `ScanError::Aborted` reports an abort. A failed peer registration restores the previously pinned channel and peer (best effort) before reporting the original `ScanError`.
@@ -68,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rustyfarian-esp-hal-network`: the `embassy` feature now enables the optional `embassy-futures` dependency (already used by `mqtt`) for the `WifiLink` select.
 - All seven bare-metal station examples spawn `link_task` instead of their own `wifi_task`; the reconnect delay after a link loss is now 1 s doubling to 30 s (was 500 ms / 5 s), and the link log lines are `[wifi] link up #<n>`, `[wifi] disconnected — <reason>` and `[wifi] reconnecting in <ms> ms`.
 - `rustyfarian-esp-idf-network` `MqttHandle::try_publish`, `try_publish_retained` and `try_publish_with` return `TryPublishError::WouldBlock` while `is_connected()` is `false`, matching the esp-hal tier; the check is best effort, so a publish accepted just before esp-mqtt notices a dead transport can still sit in the outbox and go out after the next connect at QoS 1.
   Callers that relied on queueing before the first connect must wait for `is_connected()` (every example already does); the OTA runtime's status publish already treats `WouldBlock` as retry-then-drop.

@@ -97,13 +97,41 @@
 //!     .with_keep_alive(120);           // keep-alive every 2 min
 //! ```
 //!
+//! ## While Wi-Fi is suspended
+//!
+//! `WiFiManager::suspend()` stops the radio under the client; this module has no
+//! suspend call of its own, because `esp_mqtt_client_stop` sends DISCONNECT and
+//! would cancel the will.
+//!
+//! * **State:** the stop removes the station interface, which aborts the socket;
+//!   esp-mqtt reports `Disconnected` (expected within a second, at the latest on
+//!   the next keep-alive ping), `is_connected()` turns `false` and `on_disconnect`
+//!   fires once.
+//! * **Publishing:** `try_publish*` returns `WouldBlock` from then on; a message
+//!   queued between `suspend()` and that event sits in the esp-mqtt outbox and
+//!   may go out after the reconnect (QoS 1). `publish*` keeps enqueuing.
+//! * **Retry cadence:** esp-mqtt keeps retrying its transport every
+//!   `reconnect_timeout` (10 s by default) and logs one transport error per
+//!   attempt; no callback fires for these. A longer
+//!   [`with_reconnect_timeout`](MqttConfig::with_reconnect_timeout) quiets the log
+//!   but also delays the reconnect after `resume()` by up to that value.
+//! * **Broker view:** the client sent no DISCONNECT, so the broker publishes the
+//!   will after 1.5 × keep-alive. A shorter suspend ends in a client-id takeover
+//!   on the reconnect: the broker publishes the will as it drops the old session,
+//!   then the new session publishes its startup or `on_connect` message, so a
+//!   retained `offline` is followed by `online` within the same second.
+//! * **After `resume()`:** the next esp-mqtt retry after the link is up
+//!   reconnects (up to `reconnect_timeout` later); builder subscriptions are
+//!   re-issued and [`MqttHandle::connect_count`] bumps once `is_connected()` is
+//!   `true` again.
+//!
 //! [`MqttManager`] is still available but deprecated — use [`MqttBuilder`] for
 //! new code.
 
 use anyhow::Context as _;
 use pennant::PulseEffect;
 use rgb::RGB8;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -903,6 +931,9 @@ impl<'a> MqttBuilder<'a> {
         let epoch = Arc::new(ConnectionEpoch::new());
         let epoch_for_thread = Arc::clone(&epoch);
         let epoch_for_handle = Arc::clone(&epoch);
+        // Sessions confirmed since boot; bumped right after each successful confirm.
+        let connects = Arc::new(AtomicU32::new(0));
+        let connects_for_thread = Arc::clone(&connects);
 
         // Acknowledged-publish correlation, shared between the event loop (which
         // resolves PUBACKs) and the handle (which registers and waits).
@@ -994,8 +1025,12 @@ impl<'a> MqttBuilder<'a> {
                                         confirmed,
                                         "fast path: confirm(token) must succeed right after advance()"
                                     );
+                                    if confirmed {
+                                        connects_for_thread.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 } else {
                                     let epoch = Arc::clone(&epoch_for_thread);
+                                    let connects = Arc::clone(&connects_for_thread);
                                     let startup_topic = startup_topic.clone();
                                     let on_connect = on_connect.clone();
                                     let prelude = move |client: &mut SubscribableClient| {
@@ -1045,7 +1080,9 @@ impl<'a> MqttBuilder<'a> {
                                                 ),
                                             }
                                         }
-                                        if !epoch.confirm(token) {
+                                        if epoch.confirm(token) {
+                                            connects.fetch_add(1, Ordering::Relaxed);
+                                        } else {
                                             log::debug!(
                                                 "[mqtt] connect helper: connection state changed \
                                                  before on_connect finished; not marking connected"
@@ -1131,6 +1168,7 @@ impl<'a> MqttBuilder<'a> {
         Ok(MqttHandle {
             client: shared_client,
             epoch: epoch_for_handle,
+            connects,
             pending,
             _alive: alive,
         })
@@ -1229,6 +1267,7 @@ impl<'a> MqttBuilder<'a> {
 pub struct MqttHandle {
     client: Arc<Mutex<SubscribableClient>>,
     epoch: Arc<ConnectionEpoch>,
+    connects: Arc<AtomicU32>,
     // Registry correlating in-flight acked publishes to their PUBACK; shared
     // with the event-loop thread, which resolves entries on `Published`.
     pending: PendingAcks,
@@ -1566,5 +1605,15 @@ impl MqttHandle {
     /// this connection and are retried on the next reconnect.
     pub fn is_connected(&self) -> bool {
         self.epoch.is_connected()
+    }
+
+    /// Number of broker sessions established since boot, like the esp-hal
+    /// handle's `connect_count`.
+    ///
+    /// Bumped each time [`is_connected`](Self::is_connected) turns `true` (after
+    /// the startup message, `on_connect` and the subscriptions), so a firmware
+    /// that sees it change can republish retained state for the new session.
+    pub fn connect_count(&self) -> u32 {
+        self.connects.load(Ordering::Relaxed)
     }
 }

@@ -14,6 +14,9 @@
 //! * Every 5 s the main loop `try_publish`es a tick on `<prefix>/tick`;
 //!   `WouldBlock` is logged and skipped, never retried in place.
 //! * Free heap is logged after connect and once a minute for soak runs.
+//! * With `MQTT_SUSPEND_DEMO=1` the radio is suspended for 20 s every 60 s
+//!   (`WifiLink::suspend` / `resume`), the cycle a deep-sleep firmware runs when
+//!   a sleep attempt is aborted; the broker sees the will, then `online` again.
 //!
 //! Build-time environment (all `option_env!`, see `.env.example`):
 //!
@@ -27,6 +30,7 @@
 //! | `MQTT_USER`       | unset                  | Optional username                     |
 //! | `MQTT_PASS`       | unset                  | Optional password                     |
 //! | `MQTT_TOPIC_PREFIX` | `rustyfarian/hal-mqtt` | Topic prefix for status/cmd/tick   |
+//! | `MQTT_SUSPEND_DEMO` | unset                  | `1`: suspend 20 s every 60 s       |
 //!
 //! # Build and flash
 //!
@@ -41,7 +45,7 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
@@ -51,6 +55,7 @@ use rustyfarian_esp_hal_network::mqtt::{
 };
 use rustyfarian_esp_hal_network::wifi::{
     link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    SUSPEND_DISCONNECT_TIMEOUT_MS,
 };
 use static_cell::StaticCell;
 
@@ -60,6 +65,8 @@ static LINK: WifiLink = WifiLink::new();
 
 const TICK_SECS: u64 = 5;
 const HEAP_LOG_SECS: u64 = 60;
+const SUSPEND_EVERY_SECS: u64 = 60;
+const SUSPEND_FOR_SECS: u64 = 20;
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -72,6 +79,9 @@ fn wifi_password() -> &'static str {
 }
 fn mqtt_password() -> Option<&'static str> {
     option_env!("MQTT_PASS")
+}
+fn suspend_demo() -> bool {
+    option_env!("MQTT_SUSPEND_DEMO") == Some("1")
 }
 
 const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
@@ -202,6 +212,7 @@ async fn main(spawner: Spawner) {
     );
 
     let mut tick: u32 = 0;
+    let mut last_link = LINK.state();
     let mut last_state = mqtt.state();
     let mut was_connected = false;
     let mut secs_since_heap_log: u64 = 0;
@@ -210,6 +221,26 @@ async fn main(spawner: Spawner) {
         tick += 1;
         secs_since_heap_log += TICK_SECS;
 
+        let uptime = tick as u64 * TICK_SECS;
+        if suspend_demo() && uptime % SUSPEND_EVERY_SECS == 0 {
+            println!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
+            LINK.suspend();
+            // The deep-sleep recipe: wait, bounded, until the station is down.
+            let deadline = Instant::now() + Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS);
+            while !LINK.is_suspended() && Instant::now() < deadline {
+                Timer::after(Duration::from_millis(10)).await;
+            }
+            println!("[example] demo: is_suspended = {}", LINK.is_suspended());
+        } else if suspend_demo() && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
+            println!("[example] demo: resume");
+            LINK.resume();
+        }
+
+        let link = LINK.state();
+        if link != last_link {
+            println!("[example] wifi link {:?} -> {:?}", last_link, link);
+            last_link = link;
+        }
         let state = mqtt.state();
         if state != last_state {
             println!("[example] mqtt state {:?} -> {:?}", last_state, state);
@@ -230,7 +261,7 @@ async fn main(spawner: Spawner) {
             format_args!(
                 "{{\"tick\":{},\"uptime_s\":{},\"free_heap\":{}}}",
                 tick,
-                tick as u64 * TICK_SECS,
+                uptime,
                 esp_alloc::HEAP.free()
             ),
         );

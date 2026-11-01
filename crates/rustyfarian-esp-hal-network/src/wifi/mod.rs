@@ -897,7 +897,7 @@ mod link;
     feature = "embassy",
     any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
 ))]
-pub use link::{link_task, WifiLink};
+pub use link::{link_task, WifiLink, SUSPEND_DISCONNECT_TIMEOUT_MS};
 
 /// Returns the MAC address the SoftAP broadcasts.
 ///
