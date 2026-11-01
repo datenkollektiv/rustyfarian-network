@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::wifi::NetworkLink` and `juggler::mqtt::{MqttClient, MqttMessage}`: the shared `no_std` traits firmware can be generic over, so the same application code runs on both tiers (ADR 022, tier-parity Step 4); the tiers implement them in later steps.
+  `juggler::wifi::mock::MockLink` and `juggler::mqtt::mock::MockMqttClient` (feature `mock`) let firmware host-test that code.
 - Tier-parity spike examples (ADR 022, Step 2): `idf_c3_async_mqtt` runs an async app over the existing `WiFiManager` and `MqttHandle` threads, `idf_c3_async_mqtt_native` runs the same app on `esp-idf-svc`'s `AsyncWifi` and `EspAsyncMqttClient`; both use `block_on` with `embassy-time` on esp-idf-svc's time driver.
 - `juggler::wifi::{LinkMachine, LinkInput, LinkAction, LinkState, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS}`: the pure station reconnect policy both tiers run (1 s back-off doubling to 30 s, reset on connect, stale-input tolerant), host-tested and re-exported from both tiers' `wifi` modules.
   Requested by `rustyfarian-knob` (U2f); see `docs/features/wifi-reconnect-and-suspend-v1.md` and bug 009.

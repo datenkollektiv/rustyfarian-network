@@ -25,6 +25,7 @@
 // Test double for the deprecated `WifiDriver`; it goes away with the trait.
 #![allow(deprecated)]
 
+pub use super::link_mock::{MockLink, MockLinkError};
 use super::{WifiDriver, WifiPowerSave};
 
 /// Error type for [`MockWifiDriver`].

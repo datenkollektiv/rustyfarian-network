@@ -1,5 +1,11 @@
 //! Pure MQTT primitives — no I/O, no ESP-IDF.
 
+mod client;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
+
+pub use client::{MqttClient, MqttMessage};
+
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.
 ///
 /// Uses ceiling division so that a timeout that is not an exact multiple of

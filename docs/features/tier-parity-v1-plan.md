@@ -101,23 +101,25 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 - [x] Known candidates: esp-hal MQTT runner (link watch, stall deadline, socket timeout, reconnect pacing), IDF MQTT (connection epoch confirm, `try_publish` refusal while disconnected, startup message), hal `WifiLink::run` select loop (park recheck, disconnect timeout).
 - Done when: the maintainer has reviewed the table; it sets the scope of Steps 5 and 6.
 
-### Step 4: Public traits, port traits and mocks in `juggler`
+### Step 4: Public traits and mocks in `juggler`
 
-- [ ] Public traits (no_std): `juggler::wifi::NetworkLink` (`type Error`; `state`, `is_connected`, `is_suspended`, `connect_count`, `suspend`, `resume`; `async fn wait_connected(&self)`) and `juggler::mqtt::MqttClient` (`type Error`; `state`, `is_connected`, `connect_count`, `try_publish`, `try_publish_retained`, `try_publish_with` with `&[u8]` payloads and `TryPublishError<Self::Error>`; `async fn publish_acked(...)`; `async fn receive(&self) -> InboundMessage`).
-- [ ] Port traits from the Step 3 inventory (for example `MqttPort`: enqueue, subscribe, and the event mapping into a shared `MqttEvent`), each with a mock behind `mock`.
-- [ ] Reusable conformance suites (`run_link_contract`, `run_mqtt_contract`) that any `NetworkLink` / `MqttClient` must pass.
-- Done when: `just test` runs the suites against the mocks.
-- **R:** trait names; whether `InboundMessage` moves from the hal crate to `juggler`; `wait_connected` return type (`()` versus the IP).
+- [x] `juggler::wifi::NetworkLink` (no_std): `type Error`; `state`, `is_connected` (default: `Connected`), `is_suspended`, `connect_count`, `suspend`, `resume`; `async fn wait_connected` (associated and IP).
+- [x] `juggler::mqtt::MqttClient` (no_std): `type Error`, `type Message: MqttMessage`; `state`, `is_connected`, `connect_count`, `try_publish` / `try_publish_retained` (defaults) / `try_publish_with` with `&[u8]` payloads; `async fn publish` (waits for the client to take the message, not for the PUBACK), `wait_connected`, `receive`.
+- [x] `MqttMessage` accessor trait (`topic`, `payload`, `retained`, `qos`), so each tier keeps its own message storage.
+- [x] Mocks behind `mock`: `juggler::wifi::mock::MockLink`, `juggler::mqtt::mock::MockMqttClient`, for firmware host tests.
+- [x] Host test `one_app_both_tiers`: one generic function over both traits, run against the mocks (`just test-wifi`).
+- Decided 2026-11-01 by the maintainer: the cores are sans-IO state machines (ADR 022 decision 10 amended); conformance suites therefore test the machines in Steps 5 and 6.
+- Review answers: names `NetworkLink` / `MqttClient`; the message stays tier-owned behind `MqttMessage`; `wait_connected` returns `()`; acknowledged publish is not in the trait (only IDF offers it today).
 
 ### Step 5: Link core
 
-- [ ] Generic link core in `juggler` implementing `NetworkLink` over the existing `LinkHandover` (no_std) and `LinkSupervisor` (std): counters, `is_suspended`, and an `embassy-sync` waiter behind `wait_connected`.
+- [ ] Link machine in `juggler` (sans-IO, no_std) covering the inventory's link rules: readiness as association plus IP, `connect_count`, park and recheck, back-off pre-emption, idle restart; `LinkHandover` and `LinkSupervisor` become its std and no_std drivers.
 - [ ] Host tests run the link conformance suite over the core with `MockRadio`, including concurrent suspend/resume while a `wait_connected` is pending (executor: `embassy-futures::block_on`, dev-dependency).
 - Done when: `just test` and `just clippy-pure` pass.
 
 ### Step 6: MQTT session core
 
-- [ ] Generic `MqttSession<P: MqttPort>` in `juggler` implementing `MqttClient`: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, one connect work order for both tiers (subscribe, startup message, then ready; bug 014), and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
+- [ ] MQTT session machine in `juggler` (sans-IO, no_std) behind both tiers' `MqttClient` handles: state machine (existing `MqttConnectionState` transitions), connect count, `try_publish` refusal while not connected, ack waiter, bounded inbound queue with drop counter, one connect work order for both tiers (subscribe, startup message, then ready; bug 014), and a network gate: no attempt while the link has no IP or is suspended (hal behaviour, bug 010).
 - [ ] Host tests run the MQTT conformance suite plus the moved rules from the Step 3 inventory (stall deadline, epoch confirm) with injected time.
 - Done when: `just test` passes; no tier code changed yet.
 
@@ -125,14 +127,14 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 7: esp-hal adopts the cores
 
-- [ ] `WifiLink` and the MQTT runner become ports plus aliases over the cores (`pub type MqttHandle = MqttSession<HalMqttPort>`); the extracted branches are deleted from the tier.
+- [ ] `WifiLink` and the MQTT runner become thin runners of the link and session machines and implement `NetworkLink` / `MqttClient`; the extracted branches are deleted from the tier.
 - [ ] Static parity assertion in the crate (`const _: () = { fn check<T: NetworkLink>() {} ... }`), compiled by `just clippy-hal`.
 - Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the U2f supervisor and runner behaviour is unchanged (same host tests, now in `juggler`).
 - Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because runner logic moved.
 
 ### Step 8: IDF adopts the cores
 
-- [ ] `WiFiManager` gets `NetworkLink` through the link core (inherent `state()` added, `link_state()` deprecated); `MqttHandle` becomes `MqttSession<IdfMqttPort>`, the port wrapping the esp-mqtt client and event thread (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
+- [ ] `WiFiManager` gets `NetworkLink` through the link core (inherent `state()` added, `link_state()` deprecated); `MqttHandle` runs the session machine on its event thread and implements `MqttClient` (ADR 017 callback contract unchanged; inherent `&str` publish methods stay).
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
 - [ ] Bug 010: the IDF port starts esp-mqtt only once the station has an IP and stops it while the link is down or suspended, driven by the core's network gate; close the bug after the hardware run.
 - Done when: `just verify` (static assertion included) and `idf_esp32s3_mqtt_lwt` build pass.

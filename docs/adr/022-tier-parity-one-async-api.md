@@ -90,11 +90,13 @@ That feature lets embassy-time work on both tiers.
    - Each behaviour gap in the table above is its own feature.
 10. Behaviour lives in host-testable cores in `juggler`; the tiers only implement narrow port traits (ports and adapters, the strategy pattern).
    - Precedents already in the code: the sans-IO state machines `LinkMachine` and `ScanMachine`, and `LinkSupervisor<R: LinkRadio>`, a generic core whose IDF port `IdfRadio` maps four `esp_wifi_*` calls and whose races are tested on the host against `MockRadio`.
-   - The public traits of decision 4 are implemented once, generically, in `juggler` wherever the behaviour is the same on both tiers (for example an MQTT session core generic over an MQTT port), so both tiers behave the same by construction.
+   - The cores are sans-IO state machines (inputs in, actions out, like `LinkMachine`), driven by a thin runner per tier, so both tiers behave the same by construction (amended 2026-11-01 after the tier-parity Step 3 inventory).
+   - One machine fits both execution models (threads and events on ESP-IDF, cancel-safe async on esp-hal), while one async port trait would not.
+   - The public traits of decision 4 sit on the runners' handles.
    - A port trait is narrow: one driver call or one event mapping per method, no decisions.
    - Time and wake-ups are injected: clocks as parameters, and `embassy-sync` primitives, which are `no_std` and run on the host.
-   - Async cores are tested on the host with a small executor as a dev-dependency (for example `embassy-futures::block_on`).
-   - Each tier keeps its own public type names through type aliases over the generic core (for example `pub type MqttHandle = MqttSession<IdfMqttPort>`), so consumers never spell the generic.
+   - The machines are tested on the host without an executor; the traits' async methods are tested through mocks with a polling `block_on`.
+   - Each tier keeps its own public type names for the runners' handles (`WiFiManager`, `WifiLink`, `MqttHandle`).
    - Review rule: a branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
 
 ## Consequences

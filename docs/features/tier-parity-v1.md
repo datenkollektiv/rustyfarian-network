@@ -10,14 +10,14 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 
 ## Decisions
 
-| Decision                                                       | Reason                                                         | Rejected Alternative                            |
-|:---------------------------------------------------------------|:---------------------------------------------------------------|:------------------------------------------------|
-| Async API on both tiers                                        | Consumer code exchangeable (ADR 022, decision 2)               | Blocking primary surface; per-consumer adapters |
-| Behaviour in `juggler` cores over narrow ports                 | Host-tested, parity by construction (ADR 022, decision 10)     | Logic duplicated per tier; `dyn` ports          |
+| Decision                                               | Reason                                                                | Rejected Alternative                             |
+|:-------------------------------------------------------|:----------------------------------------------------------------------|:-------------------------------------------------|
+| Async API on both tiers                                | Consumer code exchangeable (ADR 022, decision 2)                      | Blocking primary surface; per-consumer adapters  |
+| Cores are sans-IO state machines in `juggler`          | One machine fits threads (IDF) and cancel-safe async (hal)            | Async code generic over one port; `dyn` ports    |
 | IDF async as wrappers over the existing worker threads | Spike: equal behaviour, native types only saved the runtime they omit | `esp-idf-svc` `AsyncWifi` / `EspAsyncMqttClient` |
-| Blocking IDF API stays during 0.x                              | Additive change                                                | Removing it now                                 |
-| Per-tier type aliases over generic cores                       | Consumers never spell the generics                             | Generic public types                            |
-| Wi-Fi and MQTT first                                           | Upstream request U2g                                           | All domains at once                             |
+| Blocking IDF API stays during 0.x                      | Additive change                                                       | Removing it now                                  |
+| Per-tier type aliases over generic cores               | Consumers never spell the generics                                    | Generic public types                             |
+| Wi-Fi and MQTT first                                   | Upstream request U2g                                                  | All domains at once                              |
 
 ## Constraints
 - ADR 021 holds: the firmware owns the executor and the providers, and libraries select none.
@@ -30,7 +30,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [ ] Which IDF executor do the examples use? `block_on` works with the generic timer queue; `embassy-executor` (`platform-std`) is untested.
 - [x] Does the embassy crate set unify across tiers? Yes for the IDF graph: one `embassy-time-driver` 0.2.2, no duplicate embassy crates (Step 2 spike).
 - [ ] Is each breaking item (IDF payload type, `is_connected` return type, `with_startup_message` signature) a break or a deprecation?
-- [ ] What are the trait names, where does `InboundMessage` live, and what does `wait_connected` return?
+- [x] What are the trait names, where does `InboundMessage` live, and what does `wait_connected` return? `NetworkLink` / `MqttClient`, tier-owned behind `MqttMessage`, `()`.
 - [ ] Does the blocking IDF API become thin wrappers over the async one?
 - [x] Which IDF async foundation wins the Step 2 spike? Wrappers over the worker threads (variant A).
 
@@ -40,7 +40,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [ ] Step 1 — IDF `MqttHandle::state()` and stale docs
 - [x] Step 2 — async IDF spike
 - [x] Step 3 — extraction inventory ([inventory](tier-parity-v1-inventory.md))
-- [ ] Step 4 — public traits, ports and mocks
+- [x] Step 4 — public traits and mocks
 - [ ] Step 5 — link core
 - [ ] Step 6 — MQTT session core
 - [ ] Step 7 — esp-hal adopts the cores
@@ -60,3 +60,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Bug 010 filed (IDF MQTT starts before the IP); spike examples now start MQTT after the IP, library fix planned in Steps 6 and 8
 - 2026-11-01 — Step 2 done on the C3: variant A chosen, ADR 022 decision 2 amended, thread-memory fix (bug 013) planned in Step 8
 - 2026-11-01 — Step 3 inventory written; bug 014 filed (IDF reports ready before SUBSCRIBE); review point: cores as sans-IO machines
+- 2026-11-01 — Step 4 done: `NetworkLink`, `MqttClient`, `MqttMessage` and mocks in `juggler`; cores decided as sans-IO machines (ADR 022 decision 10 amended)
