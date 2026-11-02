@@ -61,3 +61,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 8a done: IDF `WiFiManager` feeds IP events, gains `state`/`is_ready`/`wait_ready`, implements `NetworkLink`; bench runs for both tiers deferred by the maintainer
 - 2026-11-01 — Step 8b-1 done: IDF `MqttHandle` driven by `SessionMachine` (bug 014 order), implements `MqttClient` with a receive queue; network gate (8b-2) next
 - 2026-11-01 — Step 8b-2 done: IDF MQTT is gated on the link, `NetworkGate`/`Outbox`/`subscribe_ready` land in `juggler` with host tests and mutation checks, `MqttBuilder::build(&wifi)` is the approved 0.x break, bug 010 fixed in code (bench run pending); Step 8c and Steps 9–11 open
+- 2026-11-02 — Bug 010 bench run on the C3 (`idf_c3_async_mqtt`): the client is created 40 ms after `sta ip:` and connects 300 ms later with no transport error, and a ~2 minute block showed no MQTT line until the recovery 250 ms after the next IP; bug 010 closed
