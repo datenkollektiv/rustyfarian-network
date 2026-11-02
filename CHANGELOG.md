@@ -180,6 +180,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The esp-hal OTA download erased every target flash sector about eight times per image: `FlashRegion::write` is read-modify-erase-write, so each 512-byte chunk erased its sector (bug 004).
+  An unencrypted partition is now erased once and streamed through the non-erasing `NorFlash` view, with `juggler::ota::ChunkAligner` (host-tested) holding back a partial word so every write is 4-byte aligned; an encrypted partition keeps the read-modify-write path, which the ROM's whole-sector encryption requires.
+  The socket read buffer is word-aligned so the driver does not copy through its own 4 KiB sector buffer, and `esp-bootloader-esp-idf` now enables its `embedded-storage` feature.
 - The `bool` passed to the ESP-IDF `on_connect` callback is esp-idf-svc's session-present flag; the docs called it `is_clean_session` with the opposite meaning, and `idf_c3_mqtt`, `idf_esp32_mqtt` and `idf_esp32s3_mqtt_lwt` logged "clean session" for a resumed one. The value passed is unchanged.
 - `rustyfarian-esp-idf-network` `MqttBuilder::build` logged the broker URL and client id read from an `MqttConfig` that can carry credentials, which CodeQL reports as `rust/cleartext-logging`; it now logs the fixed message `[mqtt] creating client`, and callers log host and client id from their own values.
 - `rustyfarian-esp-idf-network` `WiFiManager` never reconnected after a link loss in either connect mode (bug 009): the `StaDisconnected` subscription only logged, so a router outage left the station down until reboot.

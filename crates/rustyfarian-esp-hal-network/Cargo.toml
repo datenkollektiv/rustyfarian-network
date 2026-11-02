@@ -209,7 +209,9 @@ esp-hal                 = { workspace = true, features = ["unstable"], optional 
 esp-radio               = { workspace = true, optional = true }
 esp-rtos                = { workspace = true, optional = true }
 esp-alloc               = { workspace = true, optional = true }
-esp-bootloader-esp-idf  = { workspace = true, optional = true }
+# `embedded-storage`: the `NorFlash` view of a partition (`as_nor_flash`), which
+# writes without the read-modify-erase cycle (bug 004).
+esp-bootloader-esp-idf  = { workspace = true, optional = true, features = ["embedded-storage"] }
 # `embedded-storage`: the `NorFlash` impls the provisioning store needs are opt-in since esp-storage 0.10.
 esp-storage             = { workspace = true, optional = true, features = ["critical-section", "embedded-storage"] }
 

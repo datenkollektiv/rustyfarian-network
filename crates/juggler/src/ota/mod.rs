@@ -22,6 +22,7 @@ pub mod verifier;
 pub mod version;
 #[cfg(feature = "ota-wire")]
 pub mod wire;
+pub mod write_align;
 
 pub use deadline::{ActivationPermit, Deadline};
 pub use decision::{
@@ -52,3 +53,4 @@ pub use wire::{
     CommandError, FailReason, Manifest, ManifestError, OtaCommand, OtaStatus, RollbackReason,
     StatusError, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES,
 };
+pub use write_align::{round_up, AlignError, ChunkAligner, MAX_WRITE_SIZE};
