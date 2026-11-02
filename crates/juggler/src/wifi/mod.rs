@@ -413,19 +413,96 @@ impl<'a> ApConfig<'a> {
 
 /// Maps common ESP-IDF Wi-Fi disconnect reason codes to human-readable names.
 ///
-/// Codes follow `wifi_err_reason_t` in ESP-IDF.
-/// Returns `None` for unmapped codes so callers can log the raw number instead
-/// of a misleading `"unknown"` string.
+/// Codes and spellings follow `wifi_err_reason_t` (`esp_wifi_types_generic.h`)
+/// so a log line can be matched against the ESP-IDF documentation.
+/// The 802.11 management codes 1..=24 and the ESP-IDF band 200..=212 are
+/// covered; rarer 802.11 codes (TDLS, QoS, fast transition, 25..=68) stay
+/// unmapped and log as `(unmapped)` instead of a guess.
 pub fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
     match reason {
+        1 => Some("UNSPECIFIED"),
         2 => Some("AUTH_EXPIRE"),
+        3 => Some("AUTH_LEAVE"),
+        4 => Some("ASSOC_EXPIRE"),
+        5 => Some("ASSOC_TOOMANY"),
+        6 => Some("NOT_AUTHED"),
+        7 => Some("NOT_ASSOCED"),
+        8 => Some("ASSOC_LEAVE"),
+        9 => Some("ASSOC_NOT_AUTHED"),
+        10 => Some("DISASSOC_PWRCAP_BAD"),
+        11 => Some("DISASSOC_SUPCHAN_BAD"),
+        12 => Some("BSS_TRANSITION_DISASSOC"),
+        13 => Some("IE_INVALID"),
+        14 => Some("MIC_FAILURE"),
         15 => Some("4WAY_HANDSHAKE_TIMEOUT"),
+        16 => Some("GROUP_KEY_UPDATE_TIMEOUT"),
+        17 => Some("IE_IN_4WAY_DIFFERS"),
+        18 => Some("GROUP_CIPHER_INVALID"),
+        19 => Some("PAIRWISE_CIPHER_INVALID"),
+        20 => Some("AKMP_INVALID"),
+        21 => Some("UNSUPP_RSN_IE_VERSION"),
+        22 => Some("INVALID_RSN_IE_CAP"),
+        23 => Some("802_1X_AUTH_FAILED"),
+        24 => Some("CIPHER_SUITE_REJECTED"),
         200 => Some("BEACON_TIMEOUT"),
         201 => Some("NO_AP_FOUND"),
         202 => Some("AUTH_FAIL"),
         203 => Some("ASSOC_FAIL"),
         204 => Some("HANDSHAKE_TIMEOUT"),
+        205 => Some("CONNECTION_FAIL"),
+        206 => Some("AP_TSF_RESET"),
+        207 => Some("ROAMING"),
+        208 => Some("ASSOC_COMEBACK_TIME_TOO_LONG"),
+        209 => Some("SA_QUERY_TIMEOUT"),
+        210 => Some("NO_AP_FOUND_W_COMPATIBLE_SECURITY"),
+        211 => Some("NO_AP_FOUND_IN_AUTHMODE_THRESHOLD"),
+        212 => Some("NO_AP_FOUND_IN_RSSI_THRESHOLD"),
         _ => None,
+    }
+}
+
+/// `true` for the disconnect reasons that point at the credentials or at a
+/// network that is not there, so a log line may suggest checking them.
+///
+/// The four are those a wrong SSID, a wrong password or an access point that is
+/// out of range produce: `4WAY_HANDSHAKE_TIMEOUT` (15), `NO_AP_FOUND` (201),
+/// `AUTH_FAIL` (202) and `HANDSHAKE_TIMEOUT` (204).
+/// A router-initiated deauthentication (`AUTH_LEAVE`, `ASSOC_LEAVE`), a beacon
+/// loss or the library's own suspend are deliberately not in the set: they say
+/// nothing about the credentials, and the old unconditional hint sent users
+/// hunting for a typo after every suspend (bug 011).
+pub fn reason_suggests_credentials(reason: u16) -> bool {
+    matches!(reason, 15 | 201 | 202 | 204)
+}
+
+/// The sentence appended to a disconnect log line when the reason points at the
+/// credentials; empty otherwise.
+pub const CREDENTIALS_HINT: &str = " — check SSID/password and network availability";
+
+/// The hint to append for a reason, `""` when it says nothing about credentials.
+pub fn credentials_hint(reason: u16) -> &'static str {
+    if reason_suggests_credentials(reason) {
+        CREDENTIALS_HINT
+    } else {
+        ""
+    }
+}
+
+/// One-line form of a disconnect reason, shared by both tiers:
+/// `reason 8 (ASSOC_LEAVE)`, plus [`CREDENTIALS_HINT`] only where it applies.
+///
+/// ```ignore
+/// log::warn!("WiFi disconnected — {}", DisconnectReason(info.reason()));
+/// ```
+pub struct DisconnectReason(pub u16);
+
+impl core::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match wifi_disconnect_reason_name(self.0) {
+            Some(name) => write!(f, "reason {} ({})", self.0, name)?,
+            None => write!(f, "reason {} (unmapped)", self.0)?,
+        }
+        f.write_str(credentials_hint(self.0))
     }
 }
 
@@ -541,6 +618,58 @@ mod tests {
     fn unknown_disconnect_reason_returns_none() {
         assert_eq!(wifi_disconnect_reason_name(0), None);
         assert_eq!(wifi_disconnect_reason_name(999), None);
+        assert_eq!(wifi_disconnect_reason_name(25), None, "TDLS stays unmapped");
+    }
+
+    #[test]
+    fn the_common_802_11_codes_are_named() {
+        for (code, name) in [
+            (1, "UNSPECIFIED"),
+            (3, "AUTH_LEAVE"),
+            (4, "ASSOC_EXPIRE"),
+            (8, "ASSOC_LEAVE"),
+            (13, "IE_INVALID"),
+            (23, "802_1X_AUTH_FAILED"),
+            (24, "CIPHER_SUITE_REJECTED"),
+            (205, "CONNECTION_FAIL"),
+            (210, "NO_AP_FOUND_W_COMPATIBLE_SECURITY"),
+            (212, "NO_AP_FOUND_IN_RSSI_THRESHOLD"),
+        ] {
+            assert_eq!(wifi_disconnect_reason_name(code), Some(name), "code {code}");
+        }
+    }
+
+    #[test]
+    fn only_reasons_that_point_at_the_credentials_carry_the_hint() {
+        for reason in [15, 201, 202, 204] {
+            assert!(reason_suggests_credentials(reason), "reason {reason}");
+        }
+        for reason in [1, 2, 3, 8, 200, 203, 205, 207] {
+            assert!(!reason_suggests_credentials(reason), "reason {reason}");
+            assert_eq!(credentials_hint(reason), "", "reason {reason}");
+        }
+        assert_eq!(credentials_hint(202), CREDENTIALS_HINT);
+    }
+
+    #[test]
+    fn a_disconnect_line_names_the_reason_and_hints_only_when_useful() {
+        assert_eq!(
+            alloc::format!("{}", DisconnectReason(8)),
+            "reason 8 (ASSOC_LEAVE)"
+        );
+        assert_eq!(
+            alloc::format!("{}", DisconnectReason(3)),
+            "reason 3 (AUTH_LEAVE)",
+            "a router deauth must not blame the credentials"
+        );
+        assert_eq!(
+            alloc::format!("{}", DisconnectReason(202)),
+            "reason 202 (AUTH_FAIL) — check SSID/password and network availability"
+        );
+        assert_eq!(
+            alloc::format!("{}", DisconnectReason(77)),
+            "reason 77 (unmapped)"
+        );
     }
 
     // ── ConnectMode tests ───────────────────────────────────────────────

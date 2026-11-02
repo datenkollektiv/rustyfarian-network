@@ -92,11 +92,12 @@ use rgb::RGB8;
 // `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
 #[allow(deprecated)]
 pub use juggler::wifi::{
-    validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name, ApConfig,
-    ConnectMode, LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig,
-    WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN,
-    DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
-    RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    credentials_hint, reason_suggests_credentials, validate_ap_config, validate_password,
+    validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode, DisconnectReason,
+    LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver,
+    WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS,
+    PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS,
+    SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -633,20 +634,10 @@ impl LinkWorker {
                 WifiEvent::StaConnected(_) => events.send(LinkEvent::Connected),
                 WifiEvent::StaStopped => events.send(LinkEvent::Stopped),
                 WifiEvent::StaDisconnected(info) => {
-                    let reason = info.reason();
-                    match wifi_disconnect_reason_name(reason) {
-                        Some(name) => log::warn!(
-                            "WiFi disconnected — reason {} ({}) — \
-                             check SSID/password and network availability",
-                            reason,
-                            name,
-                        ),
-                        None => log::warn!(
-                            "WiFi disconnected — reason {} (unmapped) — \
-                             check SSID/password and network availability",
-                            reason,
-                        ),
-                    }
+                    // The shared line names the reason and adds the credentials
+                    // hint only for reasons that point at them (bug 011), so a
+                    // router deauth or our own suspend no longer blames them.
+                    log::warn!("WiFi disconnected — {}", DisconnectReason(info.reason()));
                     events.send(LinkEvent::Disconnected);
                 }
                 _ => {}
