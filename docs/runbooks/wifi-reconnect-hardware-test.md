@@ -66,14 +66,14 @@ Watch at least three cycles per tier.
 
 One line per tier; copy the block into the feature doc session log.
 
-| Scenario             | Tier    | Board        | Result      | Evidence (serial / broker line)                                        |
-|:---------------------|:--------|:-------------|:------------|:-----------------------------------------------------------------------|
-| R1 router pause      | esp-hal |              | pass / fail |                                                                        |
-| R1 router pause      | ESP-IDF | CrowPanel S3 | pass        | back-off 1→30 s, ticks `would block`, MQTT back 270 ms after `sta ip:` |
-| R2 wrong credentials | esp-hal |              | pass / fail |                                                                        |
-| R2 wrong credentials | ESP-IDF |              | pass / fail |                                                                        |
-| R3 suspend/resume    | esp-hal | CrowPanel S3 | pass        | 3 cycles, `link up #2/#3`, no retry line, broker offline→online        |
-| R3 suspend/resume    | ESP-IDF | CrowPanel S3 | pass        | 3 cycles, gate parks before the drop, broker offline→online            |
+| Scenario             | Tier    | Board        | Result      | Evidence (serial / broker line)                                                     |
+|:---------------------|:--------|:-------------|:------------|:------------------------------------------------------------------------------------|
+| R1 router pause      | esp-hal |              | pass / fail |                                                                                     |
+| R1 router pause      | ESP-IDF | CrowPanel S3 | pass        | back-off 1→30 s, ticks `would block`, MQTT back 270 ms after `sta ip:`              |
+| R2 wrong credentials | esp-hal | ESP32-C3     | pass        | hint on `FourWayHandshakeTimeout`, ladder capped at 30000 ms (`tmp/c3-r2-hal3.log`) |
+| R2 wrong credentials | ESP-IDF | ESP32-C3     | pass        | hint on `reason 15`, none on `205`, capped at 30000 ms (`tmp/c3-r2-idf-async4.log`) |
+| R3 suspend/resume    | esp-hal | CrowPanel S3 | pass        | 3 cycles, `link up #2/#3`, no retry line, broker offline→online                     |
+| R3 suspend/resume    | ESP-IDF | CrowPanel S3 | pass        | 3 cycles, gate parks before the drop, broker offline→online                         |
 
 R1 timings: pause → `status offline`: about 45 s (the keep-alive will, not timestamped); un-pause → first `queued` tick: 33.5 s on IDF, spent waiting out one 30 s back-off, then 0.3 s from `sta ip:` to `[mqtt] connected`. Git rev: `c5146ca`.
 R3 timings per tier: `demo: resume` → `[mqtt] connected`: esp-hal sub-second (same serial tick); ESP-IDF 3.6 s, of which 3.5 s is association and 80 ms the MQTT connect.
