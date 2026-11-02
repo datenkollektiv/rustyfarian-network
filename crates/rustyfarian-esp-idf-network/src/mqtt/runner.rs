@@ -251,32 +251,30 @@ impl Runner {
         let on_connect = self.on_connect.clone();
         let session_present = self.session_present;
 
-        // The helper does the connect work under one lock of the client, off this
-        // thread and off the event-loop thread: esp-mqtt holds its recursive
-        // `api_lock` for the whole connect handshake, and esp-idf-svc parks the
-        // mqtt task until the event loop calls `next()` again, so neither thread
-        // may take the client mutex (ADR 017).
+        // The helper does the connect work under one hold of the outbox's
+        // client lock, off this thread and off the event-loop thread: esp-mqtt
+        // holds its recursive `api_lock` for the whole connect handshake, and
+        // esp-idf-svc parks the mqtt task until the event loop calls `next()`
+        // again, so neither thread may take the client lock (ADR 017).
         let spawned = std::thread::Builder::new()
             .name("mqtt-connect".into())
             .stack_size(CONNECT_THREAD_STACK_SIZE)
             .spawn(move || {
-                let mut guard = match outbox.lock() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        log::warn!("[mqtt] connect thread: client mutex poisoned: {}", e);
-                        session.send(SessionInput::WorkFailed(token));
-                        return;
-                    }
-                };
-                super::connect_work(
-                    &mut guard,
-                    &session,
-                    token,
-                    subscribe.then_some(topics.as_slice()),
-                    startup_topic.as_deref(),
-                    on_connect.as_deref(),
-                    session_present,
-                );
+                let attached = outbox.with_client_mut(|client| {
+                    super::connect_work(
+                        client,
+                        &session,
+                        token,
+                        subscribe.then_some(topics.as_slice()),
+                        startup_topic.as_deref(),
+                        on_connect.as_deref(),
+                        session_present,
+                    );
+                });
+                if attached.is_none() {
+                    log::error!("[mqtt] connect helper: no client attached to the session");
+                    session.send(SessionInput::WorkFailed(token));
+                }
             })
             .is_ok();
         if !spawned {

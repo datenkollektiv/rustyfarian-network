@@ -9,12 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `juggler::mqtt::NetworkGate` (`no_std`) and `juggler::mqtt::{Outbox, PendingPublish}` (`std`): the network gate turns link-readiness observations into exactly one `SessionInput::NetworkUp`/`NetworkDown` per transition (never a `NetworkDown` before the link was up), and the outbox holds up to four publishes that arrive before the client exists, dropping the oldest and counting it; both host-tested with mutation checks (tier-parity Step 8b-2).
+- `juggler::mqtt::NetworkGate` (`no_std`) and `juggler::mqtt::{Outbox, PendingPublish}` (`std`): the network gate turns link-readiness observations into exactly one `SessionInput::NetworkUp`/`NetworkDown` per transition (never a `NetworkDown` before the link was up), and the outbox holds up to four publishes that arrive before the client exists, dropping the oldest and counting it for the synchronous path (the shared trait method waits for room instead — see Changed); both host-tested with mutation checks (tier-parity Step 8b-2).
 - `juggler::wifi::LinkSupervisor::subscribe_ready` and `rustyfarian-esp-idf-network` `WiFiManager::subscribe_ready`: the supervisor tells one sink per readiness transition and returns the readiness at registration, taken under the same lock, so the seed and the subscription are atomic and no transition can be lost between them; a consumer that must gate its work on the link therefore needs neither a poll nor a second IDF event subscription.
 - `juggler::mqtt::SessionMachine::driver_idle`: `true` while closing a session whose driver had already dropped its transport (it was in the retry pause), so the tier reports `Disconnected` itself instead of waiting for a driver event that never comes; closing an idle client also skips the disconnect call.
 - `rustyfarian-esp-idf-network` `MqttHandle::dropped_publish()`, `mqtt::PUBLISH_QUEUE_DEPTH` and `mqtt::DEFAULT_RECONNECT_TIMEOUT_MS`: the publish-queue counter matches esp-hal, the queue depth is esp-hal's four slots, and the default retry pause is the 10 s both tiers use.
 
 ### Changed
+
+- `juggler::mqtt::MqttClient::publish` now waits for admission queue space on both tiers and never evicts a queued message to make room.
+  The contract is implemented once, in the new `juggler::mqtt::Outbox::publish_waiting`, which the ESP-IDF trait impl delegates to; esp-hal's existing publish-channel send already implemented it, so its code is unchanged.
+  The ESP-IDF pre-client queue therefore no longer drops its oldest entry when a `publish` arrives with all slots taken, while the legacy synchronous `MqttHandle::publish_with` keeps dropping (and counting) it — its behaviour is unchanged.
+  A message admitted and then refused by the transport is still dropped and counted in `dropped_publish()`.
+  `juggler::mqtt::Outbox` also gains `with_client_mut` and `try_with_client_mut` (with `TryClient`) in place of `client_mut`, so the outbox is reachable without an outer mutex.
 
 - `rustyfarian-esp-idf-network` MQTT is gated on the Wi-Fi link (bug 010, tier-parity Step 8b-2): the esp-mqtt client is created only once the station is associated with an IP — so a normal boot logs no `Error transport connect` — no attempt and no retry happens while the link is down or suspended, and the session reconnects as soon as the IP returns instead of up to `reconnect_timeout` later.
   The shared `SessionMachine` drives it: esp-mqtt's own auto-reconnect is off, every attempt runs from a new `mqtt-net` runner thread and is paced by `MqttConfig::reconnect_timeout_ms`, the event-loop thread only translates esp-mqtt events into session inputs, and the connect helper reports its result to the runner, which performs the close (ADR 017 unchanged).

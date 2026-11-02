@@ -13,7 +13,7 @@ pub mod session;
 pub use client::{MqttClient, MqttMessage};
 pub use gate::NetworkGate;
 #[cfg(feature = "std")]
-pub use outbox::{Outbox, PendingPublish};
+pub use outbox::{Outbox, PendingPublish, TryClient};
 pub use session::{SessionAction, SessionInput, SessionMachine, SessionToken, SESSION_RETRY_MS};
 
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.

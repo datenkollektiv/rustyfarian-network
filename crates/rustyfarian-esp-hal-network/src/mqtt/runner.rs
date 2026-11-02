@@ -207,6 +207,11 @@ impl MqttHandle {
 
     /// Queues a publish, waiting for queue space.
     ///
+    /// This is the admission contract of `juggler::mqtt::MqttClient::publish`,
+    /// defined once in `juggler` and shared with the ESP-IDF tier: the
+    /// `send().await` on the publish channel is the wait, and a message already
+    /// in the channel is never evicted to make room for a newer one.
+    ///
     /// Unlike [`try_publish_with`](Self::try_publish_with) this does not check
     /// the connection: a message queued while disconnected goes out after the
     /// next successful connect.

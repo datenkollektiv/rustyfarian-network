@@ -5,17 +5,21 @@
 //! connect; both must therefore hold a publish until a client can take it.
 //! [`Outbox`] is that holding place, shared so both tiers behave alike: a
 //! publish with a client attached goes straight out, one without is queued in
-//! [`Outbox::new`]'s depth slots, and the oldest entry is dropped (and counted)
-//! when the queue is full. Order is kept: a message queued before the client
-//! existed is handed over before anything published after it.
+//! [`Outbox::new`]'s depth slots. Two policies share that queue:
+//! [`Outbox::publish_waiting`] waits for room and never evicts — the
+//! [`MqttClient::publish`](super::MqttClient::publish) contract both tiers
+//! implement — while the legacy synchronous [`Outbox::publish`] drops (and
+//! counts) the oldest entry to make room. Order is kept: a message queued
+//! before the client existed is handed over before anything published after it.
 //!
 //! Requires the `std` feature.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use super::QoS;
+use crate::wait_list::WaitList;
 
 /// One publish waiting for a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,17 @@ struct Inner<C> {
     pending: VecDeque<PendingPublish>,
 }
 
+/// Outcome of [`Outbox::try_with_client_mut`].
+#[derive(Debug)]
+pub enum TryClient<R> {
+    /// A client is attached and the closure ran on it.
+    Attached(R),
+    /// No client is attached.
+    Detached,
+    /// The outbox lock is held elsewhere, so the closure did not run.
+    Busy,
+}
+
 /// Holds publishes until a client can take them (see the module docs).
 ///
 /// Every method takes the sink as an argument instead of storing it, so the
@@ -72,6 +87,9 @@ pub struct Outbox<C> {
     inner: Mutex<Inner<C>>,
     depth: usize,
     dropped: AtomicU32,
+    /// Tasks waiting for a client or for room in `pending` (see
+    /// [`publish_waiting`](Self::publish_waiting)).
+    space: WaitList,
 }
 
 impl<C> Outbox<C> {
@@ -84,6 +102,7 @@ impl<C> Outbox<C> {
             }),
             depth,
             dropped: AtomicU32::new(0),
+            space: WaitList::new(),
         }
     }
 
@@ -92,24 +111,36 @@ impl<C> Outbox<C> {
     /// `send` returns whether the client took the message; one it refuses is
     /// counted in [`dropped`](Self::dropped). Runs with the outbox locked, so
     /// no publish can slip in between the queued ones and the client.
+    ///
+    /// Wakes every [`publish_waiting`](Self::publish_waiting) waiter once the
+    /// queue is drained and the lock is released.
     pub fn attach(&self, client: C, mut send: impl FnMut(&mut C, &PendingPublish) -> bool) {
-        let mut inner = lock(&self.inner);
-        inner.client = Some(client);
-        let queued = core::mem::take(&mut inner.pending);
-        if let Some(client) = inner.client.as_mut() {
-            for message in &queued {
-                if !send(client, message) {
-                    self.count_dropped(1);
+        {
+            let mut inner = lock(&self.inner);
+            inner.client = Some(client);
+            let queued = core::mem::take(&mut inner.pending);
+            if let Some(client) = inner.client.as_mut() {
+                for message in &queued {
+                    if !send(client, message) {
+                        self.count_dropped(1);
+                    }
                 }
             }
         }
+        // After the guard: waiters take the outbox lock inside their check, so
+        // waking under it would invert the check(outbox) -> wake(waitlist)
+        // order.
+        self.space.wake_all();
     }
 
     /// Sends `message`, or queues it until a client is attached.
     ///
-    /// With a client attached the message goes straight out through `send`;
-    /// without one it is queued, and the oldest queued message is dropped
-    /// (counted) when all [`depth`](Self::new) slots are taken.
+    /// The synchronous, legacy policy: with a client attached the message goes
+    /// straight out through `send`; without one it is queued, and the oldest
+    /// queued message is dropped (counted) when all [`depth`](Self::new) slots
+    /// are taken. It cannot wait — use
+    /// [`publish_waiting`](Self::publish_waiting) for the shared
+    /// [`MqttClient::publish`](super::MqttClient::publish) contract.
     pub fn publish(
         &self,
         message: PendingPublish,
@@ -129,8 +160,45 @@ impl<C> Outbox<C> {
         inner.pending.push_back(message);
     }
 
+    /// Sends `message`, waiting for room when the queue is full.
+    ///
+    /// With a client attached the message goes straight out through `send`; one
+    /// the client refuses is counted in [`dropped`](Self::dropped), exactly as
+    /// in [`publish`](Self::publish). Without a client it is queued, and when
+    /// all [`depth`](Self::new) slots are taken this waits until one frees up or
+    /// a client attaches — it never evicts a queued message. This is the shared
+    /// [`MqttClient::publish`](super::MqttClient::publish) contract.
+    pub async fn publish_waiting(
+        &self,
+        message: PendingPublish,
+        mut send: impl FnMut(&mut C, &PendingPublish) -> bool,
+    ) {
+        loop {
+            {
+                let mut inner = lock(&self.inner);
+                if let Some(client) = inner.client.as_mut() {
+                    if !send(client, &message) {
+                        self.count_dropped(1);
+                    }
+                    return;
+                }
+                if inner.pending.len() < self.depth {
+                    inner.pending.push_back(message);
+                    return;
+                }
+            }
+            self.space
+                .wait(|| {
+                    let inner = lock(&self.inner);
+                    (inner.client.is_some() || inner.pending.len() < self.depth).then_some(())
+                })
+                .await;
+        }
+    }
+
     /// Queued publishes the outbox had to drop: no client attached and all
-    /// slots taken, or a send the client refused.
+    /// slots taken (the synchronous [`publish`](Self::publish) only), or a send
+    /// the client refused.
     pub fn dropped(&self) -> u32 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -140,9 +208,31 @@ impl<C> Outbox<C> {
         lock(&self.inner).client.is_some()
     }
 
-    /// The attached client, for a caller that already holds the outbox.
-    pub fn client_mut(&mut self) -> Option<&mut C> {
-        self.inner.get_mut().ok()?.client.as_mut()
+    /// Runs `f` on the attached client, or reports that there is none.
+    ///
+    /// Takes the outbox lock for the call, so the client can be reached without
+    /// an outer mutex around the whole outbox.
+    pub fn with_client_mut<R>(&self, f: impl FnOnce(&mut C) -> R) -> Option<R> {
+        let mut inner = lock(&self.inner);
+        inner.client.as_mut().map(f)
+    }
+
+    /// Runs `f` on the attached client without waiting for the outbox lock.
+    ///
+    /// A contended lock reports [`TryClient::Busy`] instead of blocking, so a
+    /// caller on the event-loop or connect-helper thread can fail fast; the
+    /// tier maps that to its non-blocking "would block" error.
+    pub fn try_with_client_mut<R>(&self, f: impl FnOnce(&mut C) -> R) -> TryClient<R> {
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => return TryClient::Busy,
+            // Poisoning is ignored here as it is in `lock` above.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        match inner.client.as_mut() {
+            Some(client) => TryClient::Attached(f(client)),
+            None => TryClient::Detached,
+        }
     }
 
     /// Detaches the client, for shutdown; anything still queued stays queued.
@@ -167,6 +257,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::{pin, Pin};
+    use std::task::{Context, Poll, Waker};
+
     use super::*;
 
     /// The client in these tests: a log of everything it took.
@@ -174,6 +268,10 @@ mod tests {
     struct RecordingClient {
         sent: Vec<String>,
         refuse: bool,
+    }
+
+    fn poll_with<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+        future.as_mut().poll(&mut Context::from_waker(waker))
     }
 
     fn sink(client: &mut RecordingClient, message: &PendingPublish) -> bool {
@@ -305,5 +403,102 @@ mod tests {
         assert_eq!(message.payload(), b"\x00\x01");
         assert_eq!(message.qos(), QoS::ExactlyOnce);
         assert!(message.retain());
+    }
+
+    #[test]
+    fn a_full_queue_makes_publish_waiting_pending_without_evicting() {
+        let outbox = Outbox::new(2);
+        outbox.publish(message("a"), sink);
+        outbox.publish(message("b"), sink);
+        let mut waiting = pin!(outbox.publish_waiting(message("c"), sink));
+        assert!(
+            poll_with(waiting.as_mut(), Waker::noop()).is_pending(),
+            "a full queue must wait instead of making room"
+        );
+        let inner = outbox.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .pending
+                .iter()
+                .map(PendingPublish::topic)
+                .collect::<Vec<_>>(),
+            ["a", "b"],
+            "the queued set must be unchanged"
+        );
+        assert_eq!(outbox.dropped(), 0);
+    }
+
+    #[test]
+    fn attaching_completes_a_waiter_and_hands_every_message_over_in_order() {
+        let outbox = Outbox::new(4);
+        for topic in ["a", "b", "c", "d"] {
+            outbox.publish(message(topic), sink);
+        }
+        let mut waiting = pin!(outbox.publish_waiting(message("e"), sink));
+        assert!(poll_with(waiting.as_mut(), Waker::noop()).is_pending());
+        outbox.attach(RecordingClient::default(), sink);
+        assert!(
+            poll_with(waiting.as_mut(), Waker::noop()).is_ready(),
+            "attach must wake the waiter"
+        );
+        assert_eq!(sent(&outbox), ["a", "b", "c", "d", "e"]);
+        assert_eq!(outbox.dropped(), 0, "waiting never evicts");
+    }
+
+    #[test]
+    fn publish_waiting_with_a_client_attached_sends_at_once() {
+        let outbox = Outbox::new(4);
+        outbox.attach(RecordingClient::default(), sink);
+        let mut waiting = pin!(outbox.publish_waiting(message("a"), sink));
+        assert!(poll_with(waiting.as_mut(), Waker::noop()).is_ready());
+        assert_eq!(sent(&outbox), ["a"]);
+        assert_eq!(outbox.dropped(), 0);
+    }
+
+    #[test]
+    fn a_publish_waiting_the_client_refuses_is_counted() {
+        let outbox = Outbox::new(4);
+        outbox.attach(
+            RecordingClient {
+                refuse: true,
+                ..Default::default()
+            },
+            sink,
+        );
+        let mut waiting = pin!(outbox.publish_waiting(message("a"), sink));
+        assert!(poll_with(waiting.as_mut(), Waker::noop()).is_ready());
+        assert_eq!(outbox.dropped(), 1);
+        assert!(sent(&outbox).is_empty());
+    }
+
+    #[test]
+    fn with_client_mut_reaches_the_attached_client() {
+        let outbox: Outbox<RecordingClient> = Outbox::new(4);
+        assert_eq!(outbox.with_client_mut(|client| client.sent.len()), None);
+        outbox.attach(RecordingClient::default(), sink);
+        let len = outbox.with_client_mut(|client| {
+            client.sent.push("x".to_string());
+            client.sent.len()
+        });
+        assert_eq!(len, Some(1));
+    }
+
+    #[test]
+    fn try_with_client_mut_reports_detached_busy_and_attached() {
+        let outbox: Outbox<RecordingClient> = Outbox::new(4);
+        assert!(matches!(
+            outbox.try_with_client_mut(|client| client.sent.len()),
+            TryClient::Detached
+        ));
+        outbox.attach(RecordingClient::default(), sink);
+        assert!(matches!(
+            outbox.try_with_client_mut(|client| client.sent.len()),
+            TryClient::Attached(0)
+        ));
+        let _held = outbox.inner.lock().unwrap();
+        assert!(matches!(
+            outbox.try_with_client_mut(|_| ()),
+            TryClient::Busy
+        ));
     }
 }
