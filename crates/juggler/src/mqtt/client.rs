@@ -88,6 +88,8 @@ pub trait MqttClient {
     ) -> Result<(), Self::Error>;
 
     /// Completes once the session is `Connected`.
+    ///
+    /// Any number of tasks may wait concurrently; the tier wakes all of them.
     async fn wait_connected(&self);
 
     /// Waits for the next message on a subscribed topic.

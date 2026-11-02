@@ -56,7 +56,7 @@ use embassy_time::{with_timeout, Duration, Timer};
 use esp_radio::wifi::ConnectionError;
 use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
-use juggler::waker_slots::WakerSlots;
+use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use juggler::wifi::{
     LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink, CREDENTIALS_HINT,
 };
@@ -135,12 +135,10 @@ impl WifiLink {
                 let registered = self
                     .ready_wakers
                     .lock(|w| w.borrow_mut().register(cx.waker()));
-                if self.is_ready() {
-                    Poll::Ready(true)
-                } else if registered {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(false)
+                match poll_ready(registered, self.is_ready()) {
+                    ReadyPoll::Ready => Poll::Ready(true),
+                    ReadyPoll::Waiting => Poll::Pending,
+                    ReadyPoll::Full => Poll::Ready(false),
                 }
             })
             .await;
