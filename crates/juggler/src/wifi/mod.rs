@@ -488,8 +488,13 @@ pub fn credentials_hint(reason: u16) -> &'static str {
     }
 }
 
-/// One-line form of a disconnect reason, shared by both tiers:
+/// One-line form of an ESP-IDF disconnect reason:
 /// `reason 8 (ASSOC_LEAVE)`, plus [`CREDENTIALS_HINT`] only where it applies.
+///
+/// The ESP-IDF tier logs this directly; the esp-hal tier shares the hint but not
+/// the code formatting, because esp-radio reports a named reason instead of the
+/// numeric code and `WifiLink` logs that name followed by [`credentials_hint`]'s
+/// text (bug 011).
 ///
 /// ```ignore
 /// log::warn!("WiFi disconnected — {}", DisconnectReason(info.reason()));

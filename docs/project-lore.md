@@ -324,7 +324,7 @@ Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe
 `is_connected()` still flips only after `on_connect` returns, through a generation-checked compare-and-swap (`juggler::mqtt::ConnectionEpoch`), so a stale helper after a fast reconnect cannot mark a dead connection connected.
 `MqttHandle::publish*`, `try_publish*`, `subscribe`, and `publish_acked` return `PublishAckError::WrongThread` from inside any callback, detected through the thread-local `juggler::mqtt::CallbackScope`.
 User rule: from `on_connect` use the `client` argument, never `MqttHandle`; from `on_message` / `on_disconnect` never touch the client, hand the work to another thread.
-`rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; see `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`.
+`rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; see `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`.
 
 **You cannot "release the event before `on_message`": esp-idf-svc 0.53 calls `receiver.done()` only inside `EspMqttConnection::next()`.**
 Dropping the borrowed event releases nothing, and the next `next()` blocks until the next event arrives, which re-parks the mqtt task while it holds `api_lock`.

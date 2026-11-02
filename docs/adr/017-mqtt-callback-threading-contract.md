@@ -97,6 +97,6 @@ Kept as a possible opt-in design for a future breaking release, not adopted now.
 ## References
 
 - `docs/project-lore.md` § "MQTT Event Loop" — full context on the deadlock mechanism and the fix.
-- `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md` — initial bug report.
+- `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md` — initial bug report.
 - `docs/features/archive/mqtt-publish-acked-v1.md` — origin of the `WrongThread` error variant.
 - rgb-clock outbox `docs/outbox/rustyfarian-network-try-publish-from-callback.md` (external repo, field validation).
