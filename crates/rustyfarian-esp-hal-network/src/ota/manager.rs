@@ -8,11 +8,15 @@ use core::time::Duration as CoreDuration;
 
 use embassy_net::tcp::TcpSocket;
 use embassy_time::{with_timeout, Duration, Instant};
+use embedded_storage::nor_flash::NorFlash;
 use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
-use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
+use esp_bootloader_esp_idf::partitions::{FlashRegion, NorFlashRegion, PARTITION_TABLE_MAX_LEN};
 use esp_storage::FlashStorage;
-use juggler::ota::{classify_read_error, ActivationPermit, Deadline, OtaError, StreamingVerifier};
+use juggler::ota::{
+    classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, OtaError,
+    StreamingVerifier,
+};
 
 use super::http::async_client::fetch_get;
 use super::http::parse_url;
@@ -28,6 +32,30 @@ fn to_embassy(d: CoreDuration) -> Duration {
     // cannot overflow.
     let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
     Duration::from_micros(micros.min(u64::MAX / 2))
+}
+
+/// Bytes requested per socket read.
+const CHUNK_LEN: usize = 512;
+
+/// A socket read buffer whose start is word-aligned, so a NOR driver writes
+/// from it without copying through a sector-sized temporary.
+#[repr(align(4))]
+struct ChunkBuf([u8; CHUNK_LEN]);
+
+/// Where downloaded bytes go.
+///
+/// `FlashRegion::write` is read-modify-erase-write: it reads the whole 4 KiB
+/// sector, patches the chunk in, erases the sector and writes it back, so a
+/// 512-byte chunk stream erased each sector eight times per image (bug 004).
+/// An unencrypted partition therefore gets its sectors erased once up front and
+/// is written through the non-erasing `NorFlash` view.
+/// An encrypted partition keeps the read-modify-write path, because the ROM
+/// encrypts whole sectors and the plain view is not available for it.
+enum Sink<'r, 'a, 'd> {
+    /// Read-modify-erase-write; accepts any offset and length.
+    ReadModifyWrite(&'r mut FlashRegion<'a, 'd>),
+    /// Erased once by the caller; needs word-aligned, contiguous writes.
+    Nor(NorFlashRegion<'r, 'a, 'd>),
 }
 
 /// Selects the next OTA slot for boot.
@@ -263,17 +291,50 @@ impl<'d> EspHalOtaManager<'d> {
         let content_length = http_resp.content_length;
         log::info!("OTA: downloading {} bytes", content_length);
 
+        // 4a. Pick the write path, erasing an unencrypted partition's sectors
+        //     once here instead of once per chunk (bug 004). The span covers
+        //     the image rounded up to whole sectors, which also leaves room for
+        //     the aligner's final word padding; `Content-Length <= capacity`
+        //     holds, and a partition is a whole number of sectors, so the span
+        //     never leaves the partition.
+        let sector = FlashStorage::SECTOR_SIZE;
+        let erased_span = round_up(content_length as u32, sector).min(max_bytes as u32);
+        let mut aligner = ChunkAligner::new(<NorFlashRegion<'_, '_, '_> as NorFlash>::WRITE_SIZE);
+        // `as_nor_flash()` refuses an encrypted partition (the ROM encrypts whole
+        // sectors, so that path must keep read-modify-erase-write). It is probed
+        // first and taken again below: the borrow of a failed probe would
+        // otherwise live through the arm that needs `region` back.
+        let nor_capable = region.as_nor_flash().is_ok();
+        let mut sink = if nor_capable {
+            let mut nor = region.as_nor_flash().map_err(|e| {
+                log::error!("OTA: partition is not writable through NorFlash: {:?}", e);
+                OtaError::FlashWriteFailed
+            })?;
+            log::info!("OTA: erasing {} bytes of the target partition", erased_span);
+            nor.erase(0, erased_span).map_err(|e| {
+                log::error!("OTA: erase of the target partition failed: {:?}", e);
+                OtaError::FlashWriteFailed
+            })?;
+            Sink::Nor(nor)
+        } else {
+            Sink::ReadModifyWrite(&mut region)
+        };
+        deadline.check(elapsed())?;
+
         // 5. Stream body: each chunk feeds both the flash region and the verifier.
         //    Each socket read waits at most `min(per-read timeout, remaining
         //    deadline)`; a timed-out wait is `DownloadTimeout`, a socket read
         //    error is `ServerUnreachable`.
         let mut verifier = StreamingVerifier::new();
-        let mut chunk_buf = [0u8; 512];
+        // Word-aligned so `write_nor` writes from this buffer directly; a
+        // misaligned slice would make it copy through its own 4 KiB sector
+        // buffer, on the stack, once per chunk.
+        let mut chunk_buf = ChunkBuf([0u8; CHUNK_LEN]);
         let mut remaining = content_length;
 
         while remaining > 0 {
-            let to_read = (remaining as usize).min(chunk_buf.len());
-            let n = with_timeout(budget(), socket.read(&mut chunk_buf[..to_read]))
+            let to_read = (remaining as usize).min(chunk_buf.0.len());
+            let n = with_timeout(budget(), socket.read(&mut chunk_buf.0[..to_read]))
                 .await
                 .map_err(|_| {
                     log::error!(
@@ -295,17 +356,44 @@ impl<'d> EspHalOtaManager<'d> {
                 return Err(OtaError::DownloadFailed { status: 0 });
             }
             deadline.check(elapsed())?;
-            let chunk = &chunk_buf[..n];
+            let chunk = &chunk_buf.0[..n];
             verifier.update(chunk);
-            // `write()` is the inherent `FlashRegion` method (see `capacity()` above).
-            region
-                .write((content_length - remaining) as u32, chunk)
+            let offset = (content_length - remaining) as u32;
+            match &mut sink {
+                // `write()` is the inherent `FlashRegion` method: it erases the
+                // sector around the chunk (bug 004), which is required here
+                // because the partition is encrypted.
+                Sink::ReadModifyWrite(region) => {
+                    region.write(offset, chunk).map_err(|e| {
+                        log::error!("Flash write failed: {:?}", e);
+                        OtaError::FlashWriteFailed
+                    })?;
+                }
+                // The partition is blank, so the chunk goes straight to flash;
+                // the aligner holds back a partial word for the next chunk.
+                Sink::Nor(nor) => {
+                    aligner
+                        .push(offset, chunk, |at, data| nor.write(at, data))
+                        .map_err(|e| {
+                            log::error!("Flash write failed: {:?}", e);
+                            OtaError::FlashWriteFailed
+                        })?;
+                }
+            }
+            deadline.check(elapsed())?;
+            remaining -= n as u64;
+        }
+
+        // 5a. Write the tail the aligner held back, padded with 0xFF inside the
+        //     erased span.
+        if let Sink::Nor(nor) = &mut sink {
+            aligner
+                .finish(content_length as u32, |at, data| nor.write(at, data))
                 .map_err(|e| {
-                    log::error!("Flash write failed: {:?}", e);
+                    log::error!("OTA: final flash write failed: {:?}", e);
                     OtaError::FlashWriteFailed
                 })?;
             deadline.check(elapsed())?;
-            remaining -= n as u64;
         }
 
         log::info!("OTA: download complete, verifying SHA-256");
