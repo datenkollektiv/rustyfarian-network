@@ -8,6 +8,7 @@
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::task::Poll;
 
 use embassy_futures::select::{select, Either};
 use embassy_net::tcp::TcpSocket;
@@ -15,9 +16,9 @@ use embassy_net::{IpAddress, IpEndpoint, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
-use embassy_sync::signal::Signal;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
 use juggler::mqtt::{MqttClient, SessionAction, SessionInput, SessionMachine};
+use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, PubError, Publication,
     Session, SubscriptionOptions, TopicFilter, Will,
@@ -46,6 +47,11 @@ const RST_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const NETWORK_LOST: &str = "network lost";
 /// Outcome string for a session await that outlived the stall deadline.
 const TRANSPORT_STALLED: &str = "transport stalled";
+/// Tasks that [`MqttHandle::wait_connected`] wakes directly; more waiters
+/// re-check every [`CONNECTED_WAITER_POLL`] instead.
+const CONNECTED_WAITERS: usize = 4;
+/// How often a waiter beyond [`CONNECTED_WAITERS`] re-checks the session.
+const CONNECTED_WAITER_POLL: Duration = Duration::from_millis(500);
 
 type Socket = TcpSocket<'static>;
 type Conn<'a> = Connection<'a, 'static, &'a mut Socket>;
@@ -58,7 +64,8 @@ struct Shared {
     /// The shared session lifecycle (ADR 022 decision 10); the runner feeds it,
     /// the handle reads state, publish gate and connect count from it.
     machine: Mutex<CriticalSectionRawMutex, RefCell<SessionMachine>>,
-    connected: Signal<CriticalSectionRawMutex, ()>,
+    /// Tasks in [`MqttHandle::wait_connected`]; a full set refuses, never mass-wakes.
+    connected: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<CONNECTED_WAITERS>>>,
     dropped_inbound: AtomicU32,
     dropped_publish: AtomicU32,
 }
@@ -69,7 +76,7 @@ impl Shared {
             publish_q: Channel::new(),
             inbound_q: Channel::new(),
             machine: Mutex::new(RefCell::new(SessionMachine::with_retry(retry_ms))),
-            connected: Signal::new(),
+            connected: Mutex::new(RefCell::new(WakerSlots::new())),
             dropped_inbound: AtomicU32::new(0),
             dropped_publish: AtomicU32::new(0),
         }
@@ -79,7 +86,7 @@ impl Shared {
     fn poll(&self, input: SessionInput) -> SessionAction {
         let action = self.machine.lock(|m| m.borrow_mut().poll(input));
         if matches!(input, SessionInput::WorkDone(_)) && self.can_publish() {
-            self.connected.signal(());
+            self.connected.lock(|w| w.borrow_mut().wake_all());
         }
         action
     }
@@ -140,10 +147,27 @@ impl MqttHandle {
 
     /// Waits until the session is connected.
     ///
-    /// Intended for one waiter at a time (a `Signal` wakes one task per connect).
+    /// Any number of tasks may wait: up to four are woken directly, and further
+    /// ones re-check every 500 ms.
     pub async fn wait_connected(&self) {
-        while !self.is_connected() {
-            self.shared.connected.wait().await;
+        loop {
+            let woken = core::future::poll_fn(|cx| {
+                // Register first, then check: a readiness change in between still wakes us.
+                let registered = self
+                    .shared
+                    .connected
+                    .lock(|w| w.borrow_mut().register(cx.waker()));
+                match poll_ready(registered, self.shared.can_publish()) {
+                    ReadyPoll::Ready => Poll::Ready(true),
+                    ReadyPoll::Waiting => Poll::Pending,
+                    ReadyPoll::Full => Poll::Ready(false),
+                }
+            })
+            .await;
+            if woken {
+                return;
+            }
+            Timer::after(CONNECTED_WAITER_POLL).await;
         }
     }
 

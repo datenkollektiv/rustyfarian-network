@@ -6,6 +6,9 @@
 //! "full" instead, and the caller falls back to a timer for that waiter.
 //! The slot of a waiter that was dropped stays taken until the next
 //! [`wake_all`](WakerSlots::wake_all); the set never grows.
+//!
+//! [`poll_ready`] is the shared poll protocol the tiers use around it: register
+//! under the slot lock, release the lock, check the condition, then classify.
 
 use core::task::Waker;
 
@@ -69,6 +72,37 @@ impl<const N: usize> Default for WakerSlots<N> {
     }
 }
 
+/// What a readiness poll should do, from [`poll_ready`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyPoll {
+    /// The condition held; nothing was registered.
+    Ready,
+    /// The waker is registered; wait for [`WakerSlots::wake_all`].
+    Waiting,
+    /// Every slot was taken, so no waker is registered; re-check on a timer.
+    Full,
+}
+
+/// Decides one readiness poll from the registration and condition results.
+///
+/// Call in this order: register the waker under the slot lock, release the lock,
+/// check the condition, then pass both results here. Registering first means a
+/// condition change between the two still wakes the waiter; checking first would
+/// leave it parked until the next change.
+///
+/// Takes the two results rather than a closure because the condition check must
+/// not run while the slot lock is held: the task that publishes the change may
+/// need that same lock, so the check belongs outside it.
+pub fn poll_ready(waker_registered: bool, condition_met: bool) -> ReadyPoll {
+    if condition_met {
+        ReadyPoll::Ready
+    } else if waker_registered {
+        ReadyPoll::Waiting
+    } else {
+        ReadyPoll::Full
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +121,31 @@ mod tests {
     fn counting() -> (Arc<Counter>, Waker) {
         let counter = Arc::new(Counter(AtomicU32::new(0)));
         (Arc::clone(&counter), Waker::from(counter))
+    }
+
+    #[test]
+    fn poll_ready_covers_every_registration_and_condition_pair() {
+        assert_eq!(poll_ready(true, true), ReadyPoll::Ready);
+        assert_eq!(poll_ready(false, true), ReadyPoll::Ready);
+        assert_eq!(poll_ready(true, false), ReadyPoll::Waiting);
+        assert_eq!(poll_ready(false, false), ReadyPoll::Full);
+    }
+
+    #[test]
+    fn a_full_set_reports_full_and_accepts_after_wake_all() {
+        let mut slots = WakerSlots::<2>::new();
+        let (a, wa) = counting();
+        let (b, wb) = counting();
+        let (_, wc) = counting();
+        slots.register(&wa);
+        slots.register(&wb);
+        let registered = slots.register(&wc);
+        assert!(!registered, "the third task gets no slot");
+        assert_eq!(poll_ready(registered, false), ReadyPoll::Full);
+        slots.wake_all();
+        assert_eq!(a.0.load(Ordering::SeqCst), 1, "the registered tasks wake");
+        assert_eq!(b.0.load(Ordering::SeqCst), 1);
+        assert!(slots.register(&wc), "a freed slot is offered again");
     }
 
     #[test]
