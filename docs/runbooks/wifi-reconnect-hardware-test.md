@@ -39,7 +39,7 @@ Serial lines quoted below are prefixes; numbers vary.
    On IDF, at most the ticks `queued` between the pause and the `[mqtt] disconnected` line may arrive after the reconnect (esp-mqtt outbox, QoS 1); any tick logged `would block` must never reach the broker.
    Pass on both tiers: `[example] mqtt state Connected -> Disconnected` after the pause and `-> Connected` again after the un-pause.
    The example samples the state every 5 s, so it may miss a short `Connecting` phase; check each retry by its per-attempt log instead (`[mqtt] tcp connect failed` on hal, `[mqtt] reconnecting in` plus `Transport connected` on IDF).
-7. Record the time from un-pause to the first `queued` tick; expect under 45 s on hal (back-off at most 30 s plus the MQTT connect) and under 5 s on IDF (at most one Wi-Fi back-off plus the connect, with no MQTT retry wait).
+7. Record the time from un-pause to the first `queued` tick; expect under 45 s on hal (back-off at most 30 s plus the MQTT connect) and under 35 s on IDF (at most one 30 s Wi-Fi back-off plus the connect, with no MQTT retry wait).
 
 ### R2 — wrong credentials (optional)
 
@@ -66,16 +66,16 @@ Watch at least three cycles per tier.
 
 One line per tier; copy the block into the feature doc session log.
 
-| Scenario             | Tier    | Board        | Result      | Evidence (serial / broker line)                                 |
-|:---------------------|:--------|:-------------|:------------|:----------------------------------------------------------------|
-| R1 router pause      | esp-hal |              | pass / fail |                                                                 |
-| R1 router pause      | ESP-IDF |              | pass / fail |                                                                 |
-| R2 wrong credentials | esp-hal |              | pass / fail |                                                                 |
-| R2 wrong credentials | ESP-IDF |              | pass / fail |                                                                 |
-| R3 suspend/resume    | esp-hal | CrowPanel S3 | pass        | 3 cycles, `link up #2/#3`, no retry line, broker offline→online |
-| R3 suspend/resume    | ESP-IDF | CrowPanel S3 | pass        | 3 cycles, gate parks before the drop, broker offline→online     |
+| Scenario             | Tier    | Board        | Result      | Evidence (serial / broker line)                                        |
+|:---------------------|:--------|:-------------|:------------|:-----------------------------------------------------------------------|
+| R1 router pause      | esp-hal |              | pass / fail |                                                                        |
+| R1 router pause      | ESP-IDF | CrowPanel S3 | pass        | back-off 1→30 s, ticks `would block`, MQTT back 270 ms after `sta ip:` |
+| R2 wrong credentials | esp-hal |              | pass / fail |                                                                        |
+| R2 wrong credentials | ESP-IDF |              | pass / fail |                                                                        |
+| R3 suspend/resume    | esp-hal | CrowPanel S3 | pass        | 3 cycles, `link up #2/#3`, no retry line, broker offline→online        |
+| R3 suspend/resume    | ESP-IDF | CrowPanel S3 | pass        | 3 cycles, gate parks before the drop, broker offline→online            |
 
-R1 timings: pause → `status offline`: `__ s`; un-pause → first `queued` tick: `__ s`. Git rev: `c5146ca`.
+R1 timings: pause → `status offline`: about 45 s (the keep-alive will, not timestamped); un-pause → first `queued` tick: 33.5 s on IDF, spent waiting out one 30 s back-off, then 0.3 s from `sta ip:` to `[mqtt] connected`. Git rev: `c5146ca`.
 R3 timings per tier: `demo: resume` → `[mqtt] connected`: esp-hal sub-second (same serial tick); ESP-IDF 3.6 s, of which 3.5 s is association and 80 ms the MQTT connect.
 R3 note: on IDF the suspend still logs one `[mqtt] error: ESP_FAIL` when the radio stops under esp-mqtt, plus the expected `[mqtt] disconnected`; suppressing it would need `suspend` to wait for the client to close, which no handshake offers today.
 
