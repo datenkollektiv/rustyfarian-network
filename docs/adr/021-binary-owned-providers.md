@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-10-31 by the maintainer; the implementation lands with [esp-hal-binary-owned-console-and-panic-handler-v1.md](../features/esp-hal-binary-owned-console-and-panic-handler-v1.md), whose hardware gate (examples still print on a CrowPanel S3 and a C3 Super Mini) stays open.
+Accepted — 2026-10-31 by the maintainer; the implementation lands with [esp-hal-binary-owned-console-and-panic-handler-v1.md](../features/archive/esp-hal-binary-owned-console-and-panic-handler-v1.md), whose hardware gate (examples still print on a CrowPanel S3 and a C3 Super Mini) stays open.
 
 ## Context
 
@@ -86,6 +86,6 @@ The captive-portal fallback of that firmware calls `.start_scheduler_running(spa
 ## References
 
 - [bug 007](../bugs/007-lora-forces-critical-section-provider-2026-10-30.md) — the `critical-section` precedent on the IDF tier
-- `docs/features/esp-hal-binary-owned-console-and-panic-handler-v1.md` — feature doc, decisions, constraints and gate
+- `docs/features/archive/esp-hal-binary-owned-console-and-panic-handler-v1.md` — feature doc, decisions, constraints and gate
 - `review-queue/archive/rustyfarian-network-u2d-esp-hal-println-uart-forward.md` — the `rustyfarian-knob` U2d request
 - [ADR 006](006-no-std-esp-hal-wifi.md), [ADR 019](019-esp-hal-async-mqtt-client.md), [ADR 020](020-esp-hal-espnow-owned-radio-and-sync-shim.md) — the other esp-hal tier decisions

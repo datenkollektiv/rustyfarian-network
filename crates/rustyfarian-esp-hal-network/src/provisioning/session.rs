@@ -371,7 +371,7 @@ impl ProvisioningSession {
     /// The SoftAP interface MAC address, read once at session start.
     ///
     /// This is the MAC the provisioning SSID was derived from.
-    /// `docs/features/per-device-name-prefill-v1.md` will derive the hal
+    /// `docs/features/archive/per-device-name-prefill-v1.md` will derive the hal
     /// `dev_name` pre-fill from it.
     pub fn ap_mac(&self) -> [u8; 6] {
         self.ap_mac

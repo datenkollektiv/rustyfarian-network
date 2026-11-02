@@ -1,6 +1,6 @@
 ---
 gate: hardware
-gate-note: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a and T5b for Step 7 (then Step 9's two-tier run)
+gate-note: CrowPanel S3 bench run for Step 9 (one app on two tiers), also covering the esp-hal R1, T5a and T5b
 desk-work: available
 ---
 
@@ -38,14 +38,14 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 ## State
 - [ ] Design approved (ADR 022 accepted, plan reviewed)
 - [x] Step 0 — feature doc and roadmap entry
-- [ ] Step 1 — IDF `MqttHandle::state()` and stale docs
+- [x] Step 1 — IDF `MqttHandle::state()` and stale docs
 - [x] Step 2 — async IDF spike
 - [x] Step 3 — extraction inventory ([inventory](tier-parity-v1-inventory.md))
 - [x] Step 4 — public traits and mocks
 - [x] Step 5 — link core
 - [x] Step 6 — MQTT session core
 - [ ] Step 7 — esp-hal adopts the cores (desk work done, CrowPanel S3 rerun pending)
-- [ ] Step 8 — IDF adopts the cores (8a, 8b-1, 8b-2 done; bug 013 and the bench run open)
+- [ ] Step 8 — IDF adopts the cores (8a, 8b-1, 8b-2 done and bench-run on the C3 and S3; only 8c, bug 013, open)
 - [ ] Step 9 — one app, two tiers (hardware gate, release 0.7.0)
 - [ ] Step 10 — Wi-Fi names and value types
 - [ ] Step 11 — MQTT shape
@@ -62,3 +62,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 8b-1 done: IDF `MqttHandle` driven by `SessionMachine` (bug 014 order), implements `MqttClient` with a receive queue; network gate (8b-2) next
 - 2026-11-01 — Step 8b-2 done: IDF MQTT is gated on the link, `NetworkGate`/`Outbox`/`subscribe_ready` land in `juggler` with host tests and mutation checks, `MqttBuilder::build(&wifi)` is the approved 0.x break, bug 010 fixed in code (bench run pending); Step 8c and Steps 9–11 open
 - 2026-11-02 — Bug 010 bench run on the C3 (`idf_c3_async_mqtt`): the client is created 40 ms after `sta ip:` and connects 300 ms later with no transport error, and a ~2 minute block showed no MQTT line until the recovery 250 ms after the next IP; bug 010 closed
+- 2026-11-02 — Roadmap hygiene: gate moved to the Step 9 bench run; Step 1 ticked after the IDF R1 on the S3; next is Step 9
