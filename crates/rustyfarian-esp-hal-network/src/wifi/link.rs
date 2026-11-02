@@ -53,9 +53,12 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
+use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::WakerSlots;
-use juggler::wifi::{LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink};
+use juggler::wifi::{
+    LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink, CREDENTIALS_HINT,
+};
 
 /// Upper bound on the disconnect that [`WifiLink::suspend`] triggers (milliseconds);
 /// [`WifiLink::is_suspended`] turns `true` when it finishes or this bound passes.
@@ -313,9 +316,15 @@ impl WifiLink {
                                 }
                                 Either3::Second(result) => {
                                     match result {
-                                        Ok(info) => {
-                                            log::warn!("[wifi] disconnected — {:?}", info.reason)
-                                        }
+                                        // esp-radio reports a named reason, not the
+                                        // ESP-IDF code, so the name is its `Debug`
+                                        // form; the credentials hint is the one both
+                                        // tiers share (bug 011).
+                                        Ok(info) => log::warn!(
+                                            "[wifi] disconnected — {:?}{}",
+                                            info.reason,
+                                            hal_disconnect_hint(&info.reason)
+                                        ),
                                         Err(e) => log::warn!("[wifi] disconnected — {:?}", e),
                                     }
                                     break self.poll(LinkInput::Disconnected);
@@ -400,3 +409,20 @@ const _: fn() = || {
     fn implements<T: NetworkLink>() {}
     implements::<WifiLink>();
 };
+
+/// The credentials hint for an esp-radio disconnect reason.
+///
+/// esp-radio reports a named reason rather than the ESP-IDF code, so the four
+/// reasons the shared [`reason_suggests_credentials`] lists are matched on their
+/// variants here: `4WAY_HANDSHAKE_TIMEOUT`, `NO_AP_FOUND`, `AUTH_FAIL` and
+/// `HANDSHAKE_TIMEOUT`. `reason_suggests_credentials` itself cannot be used
+/// because the numeric code is not exposed (bug 011).
+fn hal_disconnect_hint(reason: &DisconnectReason) -> &'static str {
+    match reason {
+        DisconnectReason::FourWayHandshakeTimeout
+        | DisconnectReason::HandshakeTimeout
+        | DisconnectReason::NoAccessPointFound
+        | DisconnectReason::AuthenticationFailed => CREDENTIALS_HINT,
+        _ => "",
+    }
+}

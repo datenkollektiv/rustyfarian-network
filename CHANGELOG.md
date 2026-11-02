@@ -180,6 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The ESP-IDF Wi-Fi disconnect log blamed the credentials for every reason, including a router deauth and the library's own suspend (bug 011).
+  `wifi_disconnect_reason_name` now names the 802.11 codes 1..=24 and the ESP-IDF band 200..=212, and the new `reason_suggests_credentials` / `DisconnectReason` pair appends the hint only for `4WAY_HANDSHAKE_TIMEOUT`, `NO_AP_FOUND`, `AUTH_FAIL` and `HANDSHAKE_TIMEOUT`; the esp-hal `WifiLink` logs the same hint from esp-radio's variants.
 - The esp-hal OTA download erased every target flash sector about eight times per image: `FlashRegion::write` is read-modify-erase-write, so each 512-byte chunk erased its sector (bug 004).
   An unencrypted partition is now erased once and streamed through the non-erasing `NorFlash` view, with `juggler::ota::ChunkAligner` (host-tested) holding back a partial word so every write is 4-byte aligned; an encrypted partition keeps the read-modify-write path, which the ROM's whole-sector encryption requires.
   The socket read buffer is word-aligned so the driver does not copy through its own 4 KiB sector buffer, and `esp-bootloader-esp-idf` now enables its `embedded-storage` feature.
