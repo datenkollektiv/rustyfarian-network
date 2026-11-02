@@ -151,8 +151,8 @@ pub use pennant::{SimpleLed, StatusLed};
 use juggler::mqtt::{
     connection_wait_iterations, format_broker_url, in_callback, next_state, validate_broker_host,
     validate_broker_port, validate_client_id, validate_publish_topic, validate_subscribe_filter,
-    AckOutcome, CallbackScope, MqttClient, MqttEvent, Outbox, PendingAcks, PendingPublish,
-    SessionInput, SessionToken, SubscribeClient,
+    AckOutcome, CallbackScope, MqttClient, MqttEvent, PendingAcks, PendingPublish, SessionInput,
+    SessionToken, SubscribeClient, TryClient,
 };
 
 mod runner;
@@ -1352,9 +1352,15 @@ impl MqttHandle {
     ///
     /// `Ok(())` means the message was handed to the session, not that the
     /// broker received it. A call made before the station has an IP is held in
-    /// [`PUBLISH_QUEUE_DEPTH`] slots and sent once the client exists (see
-    /// [`dropped_publish`](Self::dropped_publish)); after that, messages wait in
-    /// esp-mqtt's outbox and can still go out after a reconnect (QoS 1).
+    /// [`PUBLISH_QUEUE_DEPTH`] slots and sent once the client exists; after
+    /// that, messages wait in esp-mqtt's outbox and can still go out after a
+    /// reconnect (QoS 1).
+    ///
+    /// This synchronous method cannot wait: when all [`PUBLISH_QUEUE_DEPTH`]
+    /// slots are taken, the oldest held message is dropped and counted (see
+    /// [`dropped_publish`](Self::dropped_publish)). The shared
+    /// [`MqttClient::publish`] trait method waits for room instead and never
+    /// evicts.
     ///
     /// # Threading
     ///
@@ -1407,11 +1413,11 @@ impl MqttHandle {
     /// instead of hanging. Call it from a normal task/thread (e.g. the main
     /// loop).
     ///
-    /// The client mutex is held only long enough to enqueue and read the
+    /// The outbox lock is held only long enough to enqueue and read the
     /// message id; it is released before the wait begins. `timeout` bounds
-    /// only that PUBACK wait, not the earlier wait for the client mutex — a
-    /// slow `on_connect` still holding the mutex delays the call before the
-    /// timer even starts.
+    /// only that PUBACK wait, not the earlier wait for the lock — a slow
+    /// `on_connect` still holding the client delays the call before the timer
+    /// even starts.
     ///
     /// # Errors
     ///
@@ -1419,8 +1425,8 @@ impl MqttHandle {
     /// - [`PublishAckError::Disconnected`] — the session dropped before the ack
     ///   (retry-eligible; never a false `Ok`).
     /// - [`PublishAckError::WrongThread`] — called from inside any callback.
-    /// - [`PublishAckError::Other`] — topic validation, `enqueue`, or a poisoned
-    ///   mutex failed (a local fault, not a broker outcome).
+    /// - [`PublishAckError::Other`] — topic validation or `enqueue` failed (a
+    ///   local fault, not a broker outcome).
     pub fn publish_acked(
         &self,
         topic: &str,
@@ -1434,17 +1440,14 @@ impl MqttHandle {
         validate_publish_topic(topic)
             .map_err(|e| PublishAckError::Other(anyhow::anyhow!("invalid publish topic: {}", e)))?;
 
-        // Enqueue under the client mutex to obtain the message id, then release
-        // the mutex *before* waiting so the event loop can deliver the PUBACK.
-        let msg_id = {
-            let mut guard = self.session.outbox().lock().map_err(|_| {
-                PublishAckError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
-            })?;
-            let client = guard.client_mut().ok_or(PublishAckError::Disconnected)?;
-            client
-                .enqueue(topic, EspQoS::AtLeastOnce, retained, payload)
-                .map_err(|e| PublishAckError::Other(e.into()))?
-        };
+        // Enqueue under the outbox lock to obtain the message id, then release
+        // the lock *before* waiting so the event loop can deliver the PUBACK.
+        let msg_id = self
+            .session
+            .outbox()
+            .with_client_mut(|client| client.enqueue(topic, EspQoS::AtLeastOnce, retained, payload))
+            .ok_or(PublishAckError::Disconnected)?
+            .map_err(|e| PublishAckError::Other(e.into()))?;
 
         // Register after enqueue; the pure registry's early-outcome buffer makes
         // the (practically impossible) enqueue→register race correct regardless.
@@ -1553,17 +1556,18 @@ impl MqttHandle {
             return Err(TryPublishError::WouldBlock);
         }
         log::debug!("[mqtt] try_publish to '{}': {} bytes", topic, payload.len());
-        let mut guard = self.session.outbox().try_lock().map_err(|e| match e {
-            std::sync::TryLockError::WouldBlock => TryPublishError::WouldBlock,
-            std::sync::TryLockError::Poisoned(_) => {
-                TryPublishError::Other(anyhow::anyhow!("MQTT client mutex poisoned"))
+        match self
+            .session
+            .outbox()
+            .try_with_client_mut(|client| client.enqueue(topic, to_esp_qos(qos), retain, payload))
+        {
+            TryClient::Attached(result) => {
+                result.map_err(|e| TryPublishError::Other(e.into()))?;
+                Ok(())
             }
-        })?;
-        let client = guard.client_mut().ok_or(TryPublishError::WouldBlock)?;
-        client
-            .enqueue(topic, to_esp_qos(qos), retain, payload)
-            .map_err(|e| TryPublishError::Other(e.into()))?;
-        Ok(())
+            // No client yet, or the connect helper holds the client.
+            TryClient::Detached | TryClient::Busy => Err(TryPublishError::WouldBlock),
+        }
     }
 
     /// Subscribes to a topic.
@@ -1584,15 +1588,12 @@ impl MqttHandle {
         validate_subscribe_filter(topic)
             .map_err(|e| anyhow::anyhow!("invalid subscribe filter: {}", e))?;
         log::debug!("[mqtt] subscribing to '{}'", topic);
-        let mut guard = self
+        let subscribed = self
             .session
             .outbox()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MQTT client mutex poisoned"))?;
-        let client = guard
-            .client_mut()
+            .with_client_mut(|client| client.subscribe(topic, to_esp_qos(qos)))
             .ok_or_else(|| anyhow::anyhow!("MQTT client is not started yet (no network)"))?;
-        client.subscribe(topic, to_esp_qos(qos))?;
+        subscribed?;
         Ok(())
     }
 
@@ -1705,8 +1706,10 @@ impl MqttHandle {
     /// `dropped_publish`.
     ///
     /// A publish that arrives before the station has an IP waits in
-    /// [`PUBLISH_QUEUE_DEPTH`] slots; anything beyond that drops the oldest
-    /// entry here, as does a message esp-mqtt refuses.
+    /// [`PUBLISH_QUEUE_DEPTH`] slots. The synchronous `publish*` methods drop
+    /// the oldest held entry when all slots are taken; the shared
+    /// [`MqttClient::publish`] waits for room instead. A message esp-mqtt
+    /// refuses is counted here too, whichever method published it.
     pub fn dropped_publish(&self) -> u32 {
         self.session.dropped_publish()
     }
@@ -1734,7 +1737,11 @@ impl MqttClient for MqttHandle {
         MqttHandle::try_publish_with(self, topic, payload, qos, retain)
     }
 
-    /// Hands the message to esp-mqtt's outbox; this tier never waits for space.
+    /// Waits until the outbox has room, then hands the message over.
+    ///
+    /// Never evicts a queued message (unlike the synchronous
+    /// [`publish_with`](MqttHandle::publish_with)); a message esp-mqtt then
+    /// refuses is dropped and counted in [`dropped_publish`](MqttHandle::dropped_publish).
     async fn publish(
         &self,
         topic: &str,
@@ -1742,7 +1749,14 @@ impl MqttClient for MqttHandle {
         qos: QoS,
         retain: bool,
     ) -> anyhow::Result<()> {
-        self.publish_with(topic, payload, qos, retain)
+        self.ensure_not_in_callback().context("publish rejected")?;
+        validate_publish_topic(topic)
+            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
+        log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
+        self.session
+            .publish_waiting(PendingPublish::new(topic, payload, qos, retain))
+            .await;
+        Ok(())
     }
 
     async fn wait_connected(&self) {
@@ -1767,7 +1781,7 @@ const _: fn() = || {
 /// closes the transport, so esp-mqtt reconnects and the work runs again (bug 014).
 #[allow(clippy::too_many_arguments)]
 fn connect_work(
-    outbox: &mut Outbox<SubscribableClient>,
+    client: &mut SubscribableClient,
     session: &Session,
     token: SessionToken,
     topics: Option<&[(String, QoS)]>,
@@ -1779,11 +1793,6 @@ fn connect_work(
         log::debug!("[mqtt] connect helper: stale session, skipping its connect work");
         return;
     }
-    let Some(client) = outbox.client_mut() else {
-        log::error!("[mqtt] connect helper: no client attached to the session");
-        session.send(SessionInput::WorkFailed(token));
-        return;
-    };
     let mut done = true;
     for (topic, qos) in topics.unwrap_or_default() {
         match client.subscribe_topic(topic, *qos) {

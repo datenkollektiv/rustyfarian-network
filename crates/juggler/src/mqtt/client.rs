@@ -22,8 +22,14 @@ pub trait MqttMessage {
 /// `try_publish*` never wait: they refuse with [`TryPublishError::WouldBlock`]
 /// while the session is not [`Connected`](MqttConnectionState::Connected) or
 /// the client cannot take the message right now.
-/// [`publish`](Self::publish) waits until the client has taken the message
-/// (queue space, never the broker's acknowledgement).
+///
+/// [`publish`](Self::publish) waits until the tier's admission queue has room
+/// for the message, so it never makes room by evicting one that is already
+/// queued. Once admitted, delivery is best effort: a message the transport
+/// refuses is dropped and counted in the tier's `dropped_publish()` — waiting
+/// is for admission, never for the broker's acknowledgement. The contract is
+/// implemented once, in `Outbox::publish_waiting` (`std`); the esp-hal tier's
+/// channel send already behaves this way.
 ///
 /// The returned futures are not required to be `Send`, because the esp-hal
 /// ones are not.
@@ -68,7 +74,11 @@ pub trait MqttClient {
         retain: bool,
     ) -> Result<(), TryPublishError<Self::Error>>;
 
-    /// Publishes, waiting until the client has taken the message.
+    /// Publishes, waiting until the admission queue has room for the message.
+    ///
+    /// Never evicts a queued message to make room; a message the transport
+    /// refuses afterwards is dropped and counted in the tier's
+    /// `dropped_publish()`.
     async fn publish(
         &self,
         topic: &str,

@@ -77,8 +77,9 @@ pub(crate) struct Session {
     arrivals: WaitList,
     dropped_inbound: AtomicU32,
     /// The esp-mqtt client, once the station has an IP (bug 010), plus the
-    /// publishes that arrived before it.
-    outbox: Arc<Mutex<Outbox<SubscribableClient>>>,
+    /// publishes that arrived before it. The outbox owns its own lock, so no
+    /// outer mutex is needed to reach the client.
+    outbox: Arc<Outbox<SubscribableClient>>,
     /// Session inputs for the runner thread; the event loop and the connect
     /// helper only report, they never act (ADR 017).
     inputs: Sender<Msg>,
@@ -92,7 +93,7 @@ impl Session {
             inbound: Mutex::new(VecDeque::with_capacity(INBOUND_QUEUE_DEPTH)),
             arrivals: WaitList::new(),
             dropped_inbound: AtomicU32::new(0),
-            outbox: Arc::new(Mutex::new(Outbox::new(PUBLISH_QUEUE_DEPTH))),
+            outbox: Arc::new(Outbox::new(PUBLISH_QUEUE_DEPTH)),
             inputs,
         }
     }
@@ -119,30 +120,37 @@ impl Session {
     }
 
     /// The shared outbox, for the connect helper and the runner.
-    pub(crate) fn outbox(&self) -> &Arc<Mutex<Outbox<SubscribableClient>>> {
+    pub(crate) fn outbox(&self) -> &Arc<Outbox<SubscribableClient>> {
         &self.outbox
     }
 
     /// Hands the client to the outbox, which then takes every queued publish.
     pub(crate) fn attach_client(&self, client: SubscribableClient) {
-        lock(&self.outbox).attach(client, send_pending);
+        self.outbox.attach(client, send_pending);
     }
 
     /// Takes the client back out, for shutdown.
     pub(crate) fn take_client(&self) -> Option<SubscribableClient> {
-        lock(&self.outbox).take_client()
+        self.outbox.take_client()
     }
 
-    /// Publishes through the outbox: straight out with a client attached,
-    /// queued while there is none (see [`Outbox`]).
+    /// The synchronous publish: straight out with a client attached, queued
+    /// while there is none, dropping the oldest entry when all slots are taken
+    /// (see [`Outbox::publish`]).
     pub(crate) fn publish(&self, message: PendingPublish) {
-        lock(&self.outbox).publish(message, send_pending);
+        self.outbox.publish(message, send_pending);
+    }
+
+    /// The shared [`MqttClient::publish`](juggler::mqtt::MqttClient::publish)
+    /// contract: waits until the outbox has room, never evicting a queued entry.
+    pub(crate) async fn publish_waiting(&self, message: PendingPublish) {
+        self.outbox.publish_waiting(message, send_pending).await;
     }
 
     /// Publishes the outbox had to drop (no client yet and all slots taken, or
     /// a publish the client refused).
     pub(crate) fn dropped_publish(&self) -> u32 {
-        lock(&self.outbox).dropped()
+        self.outbox.dropped()
     }
 
     pub(crate) fn state(&self) -> MqttConnectionState {
