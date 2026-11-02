@@ -58,13 +58,13 @@ Implemented 2026-11-02.
 - `AUTH_EXPIRE` (2) is deliberately not in the credentials set: the bug's expected behaviour names four reasons, and an auth timeout is not proof of a typo.
 
 ## Hardware Verification (2026-11-02)
-| Tier | Board | Observed line |
-|:--|:--|:--|
-| ESP-IDF | ESP32-C3 | `reason 15 (4WAY_HANDSHAKE_TIMEOUT) — check SSID/password and network availability` |
-| esp-hal | ESP32-C3 | `connect failed: … FourWayHandshakeTimeout … — check SSID/password and network availability` |
+| Tier    | Board        | Observed line                                                                                           |
+|:--------|:-------------|:--------------------------------------------------------------------------------------------------------|
+| ESP-IDF | ESP32-C3     | `reason 15 (4WAY_HANDSHAKE_TIMEOUT) — check SSID/password and network availability`                     |
+| esp-hal | ESP32-C3     | `connect failed: … FourWayHandshakeTimeout … — check SSID/password and network availability`            |
 | ESP-IDF | ESP32-C3, S3 | `reason 3 (AUTH_LEAVE)`, `2 (AUTH_EXPIRE)`, `205 (CONNECTION_FAIL)`, `8 (ASSOC_LEAVE)` — named, no hint |
 
-The four no-hint reasons come from the router blocks (bug 010, runbook R1) and the suspend cycles (R3); the hint cases are the R2 wrong-password run, which also held the back-off cap at `30000 ms` on both tiers.
+The four no-hint reasons come from the router blocks (bug 010, runbook R1) and the suspend cycles (R3); the hint cases are the R2 wrong-password run (`idf_c3_async_mqtt` and `hal_c3_connect_async` on a C3), which also held the back-off cap at `30000 ms` on both tiers.
 
 ## Owner
 Claude (tier-parity work)

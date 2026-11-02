@@ -2,8 +2,8 @@
 id: 014
 title: IDF MQTT session reports ready before its subscriptions are sent
 captured-on: 2026-11-01
-doc-version: 1
-status: open-defect
+doc-version: 2
+status: closed
 kind: defect
 ---
 
@@ -49,6 +49,18 @@ All ESP-IDF targets, `rustyfarian-esp-idf-network` 0.6.0 and branch `reconnect-r
 - Confirm the epoch only after the subscriptions, in one helper run: subscribe, startup message, `on_connect`, confirm.
 - Fix it in the shared MQTT session core (tier-parity Step 6) so both tiers use one connect work order, and add a host test for the order.
 
+## Hardware Verification (2026-11-02)
+
+The order is enforced by the shared machine, not just by the example: the IDF `connect_work` subscribes, publishes the startup message and runs `on_connect`, and only then reports `WorkDone`; `SessionMachine` becomes ready on that input and never earlier.
+
+| Board | Example | Order observed |
+|:--|:--|:--|
+| ESP32-C3 | `idf_c3_mqtt` | `subscribed` before retained `online` and first heartbeat |
+| ESP32-C3 | `idf_c3_mqtt_callback_guard` | `subscribed` before `on_connect`'s publish; ready 160 ms later |
+| ESP32-S3 | `idf_esp32s3_mqtt_lwt` | `subscribed` before the retained `online` |
+
+In every run `[mqtt] subscribed to …` precedes the `on_connect` publish and the first publish the example makes after `is_connected()`, which is what the bug's window was missing.
+
 ## Owner
 Claude (tier-parity work)
 
@@ -61,3 +73,4 @@ Claude (tier-parity work)
 - 2026-11-01 — Captured as a defect via /bug dialog from the tier-parity Step 3 inventory
 - 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)
 - 2026-11-01 — Fixed in code (tier-parity Step 8b-1): the IDF helper thread subscribes, publishes the startup message and runs `on_connect` before the session reports ready; close after the bench run
+- 2026-11-02 — Closed after the bench runs: `connect_work` implements the order and `SessionMachine` is ready only on `WorkDone`; the C3 and S3 logs show the subscription ahead of every `on_connect` publish and before `is_connected()` first turns true.
