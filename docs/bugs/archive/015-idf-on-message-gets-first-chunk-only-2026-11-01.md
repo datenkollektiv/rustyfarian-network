@@ -2,8 +2,8 @@
 id: 015
 title: IDF on_message receives only the first chunk of a large message
 captured-on: 2026-11-01
-doc-version: 1
-status: open-defect
+doc-version: 2
+status: closed
 kind: defect
 ---
 
@@ -46,6 +46,21 @@ All ESP-IDF targets with `rustyfarian-esp-idf-network` 0.6.0 and branch `reconne
 - This changes what the callback receives (whole messages, oversized ones dropped and counted), so record it as a behaviour change in the CHANGELOG.
 - Decide whether the deprecated `MqttManager` gets the fix or stays as it is.
 
+## Fix
+Implemented 2026-11-02.
+
+- The builder's event loop assembles first and dispatches afterwards: one `ChunkAssembler` per event-loop thread now feeds both the `on_message` callback and the receive queue, so the callback runs once per whole message.
+- A message above `MAX_INBOUND_PAYLOAD_LEN` (16 KiB) is dropped and counted in `dropped_inbound()` instead of being delivered truncated, as for the queue; `on_message`'s rustdoc now says so.
+- The deprecated `MqttManager` keeps the old behaviour: it is deprecated, and the fix lives in the builder the crate documents.
+
+## Hardware Verification (2026-11-02, ESP32-C3, `idf_c3_mqtt`)
+| Payload | Before the fix | After the fix |
+|:--|:--|:--|
+| 3000 B to the subscribed command topic | callback logged about 1000 B | callback logged all 3000 B |
+| 20000 B | not run | dropped: `[mqtt] dropped inbound message above 16384 bytes` |
+
+A normal `ping` published right after the oversized one still arrived (`[cmd] ping received`), so the assembler recovers from a dropped message.
+
 ## Owner
 Claude (tier-parity work)
 
@@ -55,3 +70,4 @@ Claude (tier-parity work)
 
 ## Session Log
 - 2026-11-01 — Captured as a defect via /bug dialog after the review of 3117e31
+- 2026-11-02 — Fixed and verified: reproduced on a C3 (3000 B published, about 1000 B delivered), then assembled the chunks before dispatch; the callback now sees whole messages and an oversized one is dropped and counted.

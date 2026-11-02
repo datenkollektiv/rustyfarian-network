@@ -850,7 +850,11 @@ impl<'a> MqttBuilder<'a> {
 
     /// Registers a callback invoked for each incoming message.
     ///
-    /// Called with `(topic, payload)` for every `Received` event.
+    /// Called once with `(topic, payload)` per whole message: a message above
+    /// esp-mqtt's receive buffer arrives in several `Received` events, and the
+    /// callback is run after they were reassembled (bug 015).
+    /// A message above `MAX_INBOUND_PAYLOAD_LEN` is dropped and counted in
+    /// [`MqttHandle::dropped_inbound`] instead of being delivered truncated.
     /// Do not call any [`MqttHandle`] method from it — such calls return an error
     /// carrying [`PublishAckError::WrongThread`]; hand the message to another thread
     /// (via a channel) if processing must trigger a publish.
@@ -1097,68 +1101,57 @@ impl<'a> MqttBuilder<'a> {
                             topic,
                             details,
                             ..
-                        } => match on_message {
-                            // Unchanged contract: the callback sees each event that
-                            // carries a topic (the first chunk of a long message).
-                            Some(ref f) => {
-                                if let Some(topic_str) = topic {
-                                    f(topic_str, data);
+                        } => {
+                            // esp-mqtt splits a message above its receive buffer into
+                            // chunks: the first carries the topic, the follow-ups only
+                            // an offset. Assemble them, so the callback and the receive
+                            // queue both see whole messages (bug 015).
+                            let chunk = match (details, topic) {
+                                (Details::Complete, Some(topic)) => {
+                                    Some(Chunk::Complete { topic, data })
                                 }
-                            }
-                            // The receive queue gets whole messages only: esp-mqtt
-                            // splits one that exceeds its buffer into chunks.
-                            None => {
-                                let chunk = match (details, topic) {
-                                    (Details::Complete, Some(topic)) => {
-                                        Some(Chunk::Complete { topic, data })
+                                (Details::InitialChunk(first), Some(topic)) => Some(Chunk::First {
+                                    topic,
+                                    data,
+                                    total: first.total_data_size,
+                                }),
+                                (Details::SubsequentChunk(next), _) => Some(Chunk::Next {
+                                    data,
+                                    offset: next.current_data_offset,
+                                    total: next.total_data_size,
+                                }),
+                                _ => None,
+                            };
+                            if let Some(chunk) = chunk {
+                                let abandoned = assembler.abandoned();
+                                let outcome = assembler.feed(chunk);
+                                session_for_thread
+                                    .count_dropped(assembler.abandoned().wrapping_sub(abandoned));
+                                match outcome {
+                                    Assembled::Message { topic, payload } => match on_message {
+                                        Some(ref f) => f(&topic, &payload),
+                                        None => session_for_thread
+                                            .push_message(InboundMessage { topic, payload }),
+                                    },
+                                    Assembled::Pending => {}
+                                    Assembled::TooLarge => {
+                                        session_for_thread.count_dropped(1);
+                                        log::warn!(
+                                            "[mqtt] dropped inbound message above {} bytes",
+                                            MAX_INBOUND_PAYLOAD_LEN
+                                        );
                                     }
-                                    (Details::InitialChunk(first), Some(topic)) => {
-                                        Some(Chunk::First {
-                                            topic,
-                                            data,
-                                            total: first.total_data_size,
-                                        })
-                                    }
-                                    (Details::SubsequentChunk(next), _) => Some(Chunk::Next {
-                                        data,
-                                        offset: next.current_data_offset,
-                                        total: next.total_data_size,
-                                    }),
-                                    _ => None,
-                                };
-                                if let Some(chunk) = chunk {
-                                    let abandoned = assembler.abandoned();
-                                    let outcome = assembler.feed(chunk);
-                                    session_for_thread.count_dropped(
-                                        assembler.abandoned().wrapping_sub(abandoned),
-                                    );
-                                    match outcome {
-                                        Assembled::Message { topic, payload } => {
-                                            session_for_thread
-                                                .push_message(InboundMessage { topic, payload });
-                                        }
-                                        Assembled::Pending => {}
-                                        Assembled::TooLarge => {
+                                    Assembled::OutOfOrder => {
+                                        // A message in progress was counted as
+                                        // abandoned above; a stray chunk counts once.
+                                        if assembler.abandoned() == abandoned {
                                             session_for_thread.count_dropped(1);
-                                            log::warn!(
-                                                "[mqtt] dropped inbound message above {} bytes",
-                                                MAX_INBOUND_PAYLOAD_LEN
-                                            );
                                         }
-                                        Assembled::OutOfOrder => {
-                                            // A message in progress was counted as
-                                            // abandoned above; a stray chunk counts once.
-                                            if assembler.abandoned() == abandoned {
-                                                session_for_thread.count_dropped(1);
-                                            }
-                                            log::warn!(
-                                                "[mqtt] dropped an out-of-order inbound chunk"
-                                            );
-                                        }
+                                        log::warn!("[mqtt] dropped an out-of-order inbound chunk");
                                     }
                                 }
                             }
-                        },
+                        }
                         EventPayload::Subscribed(id) => {
                             log::info!("[mqtt] subscription confirmed (id: {})", id);
                         }
@@ -1702,7 +1695,8 @@ impl MqttHandle {
         self.session.try_receive()
     }
 
-    /// Received messages dropped because the queue was full.
+    /// Received messages dropped: the queue was full, the message exceeded
+    /// `MAX_INBOUND_PAYLOAD_LEN`, or its chunks arrived out of order.
     pub fn dropped_inbound(&self) -> u32 {
         self.session.dropped_inbound()
     }
