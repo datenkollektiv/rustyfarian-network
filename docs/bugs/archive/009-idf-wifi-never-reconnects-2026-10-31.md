@@ -2,7 +2,7 @@
 id: 009
 title: IDF WiFiManager never reconnects after a link loss
 captured-on: 2026-10-31
-doc-version: 1
+doc-version: 2
 status: closed
 kind: defect
 ---
@@ -58,3 +58,4 @@ Maintainer; hardware re-check by the `rustyfarian-knob` maintainer (CrowPanel S3
 ## Session Log
 - 2026-10-31 — Captured as a defect from request U2f; fixed in the same change (PR 1 of U2f), hardware re-check by the knob maintainer pending
 - 2026-11-02 — Suspend/resume gate (R3) run on the CrowPanel S3 for both tiers, 3 cycles each, pass; it exposed that `suspend` reported readiness only after stopping the radio, so the MQTT session scheduled a retry it then had to park — fixed by reporting readiness before the stop; the scenario this bug reports (R1, router pause) still needs a device pause on the router.
+- 2026-11-02 — R1 run on the CrowPanel S3 (ESP-IDF, 3-minute router block): the back-off ladder climbed 1000→30000 ms and never higher, ticks reported `would block`, no MQTT attempt or retry appeared while blocked, and the station reconnected on its own 33.5 s after the un-block with MQTT back 270 ms after `sta ip:`; gate complete, closing.
