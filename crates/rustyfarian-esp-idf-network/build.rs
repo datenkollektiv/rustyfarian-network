@@ -12,6 +12,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MQTT_PORT");
     println!("cargo:rerun-if-env-changed=MQTT_USER");
     println!("cargo:rerun-if-env-changed=MQTT_CLIENT_ID");
+    // Enables the suspend/resume demo in the S3 LWT examples; without a trigger
+    // the example keeps the value it was last compiled with.
+    println!("cargo:rerun-if-env-changed=MQTT_SUSPEND_DEMO");
     println!("cargo:rerun-if-env-changed=OTA_URL");
     // Rerun triggers for the OTA runtime example (firmware version, topic prefix).
     println!("cargo:rerun-if-env-changed=FIRMWARE_VERSION");

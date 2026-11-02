@@ -180,6 +180,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `LinkSupervisor::suspend` reported the link as down only after the radio had stopped, so the MQTT gate learned about a deliberate suspend from the transport's corpse: esp-mqtt logged an error and the session scheduled a retry that the gate then had to park (runbook R3).
+  Readiness is now reported before the stop, because the state machine is already `Suspended` when `poll(Suspend)` returns; the spurious `[mqtt] reconnecting in` line is gone, and one `[mqtt] error` from esp-mqtt's own teardown remains on ESP-IDF.
+- `MQTT_SUSPEND_DEMO` now has a `rerun-if-env-changed` trigger in both crates' `build.rs`: without it, setting the variable kept the value the example was last compiled with, so the suspend demo silently did not run.
 - The ESP-IDF Wi-Fi disconnect log blamed the credentials for every reason, including a router deauth and the library's own suspend (bug 011).
   `wifi_disconnect_reason_name` now names the 802.11 codes 1..=24 and the ESP-IDF band 200..=212, and the new `reason_suggests_credentials` / `DisconnectReason` pair appends the hint only for `4WAY_HANDSHAKE_TIMEOUT`, `NO_AP_FOUND`, `AUTH_FAIL` and `HANDSHAKE_TIMEOUT`; the esp-hal `WifiLink` logs the same hint from esp-radio's variants.
 - The esp-hal OTA download erased every target flash sector about eight times per image: `FlashRegion::write` is read-modify-erase-write, so each 512-byte chunk erased its sector (bug 004).

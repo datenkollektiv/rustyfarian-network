@@ -260,6 +260,11 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// Disconnects and stops the radio on the caller's thread and pauses
     /// reconnects; the radio is stopped when this returns `Ok`.
     ///
+    /// Readiness is reported before the stop, so consumers learn the link is down
+    /// even when the stop fails.
+    /// That report is a notification, not a close handshake: a consumer that moves
+    /// the change to another thread can still be overtaken by the stop.
+    ///
     /// Idempotent. On error reconnects stay paused and the next call retries the stop.
     pub fn suspend(&self) -> Result<(), R::Error> {
         let mut core = self.lock();
@@ -270,9 +275,15 @@ impl<R: LinkRadio> LinkSupervisor<R> {
             return Ok(());
         }
         log::info!("WiFi suspending");
+        // Report before the stop: the machine is already `Suspended`, so consumers
+        // must hear that the link is gone before the driver tears it down, including
+        // when the stop then fails. This is a notification, not a handshake — a
+        // consumer that hands the change to another thread (the MQTT gate) can lose
+        // the race, which is why the transport may log one error as it dies
+        // (runbook R3). Guaranteeing a clean close would need an acknowledgement.
+        core.report_ready();
         core.radio_down()?;
         log::info!("WiFi suspended");
-        core.report_ready();
         Ok(())
     }
 
@@ -491,6 +502,8 @@ mod tests {
         fail_every_stop: u32,
         connect_calls: u32,
         stop_calls: u32,
+        /// Readiness reports and radio calls in the order they happened.
+        order: Vec<&'static str>,
     }
 
     fn nth(every: u32, call: u32) -> bool {
@@ -560,7 +573,11 @@ mod tests {
         }
         fn disconnect(&mut self) -> Result<(), Self::Error> {
             self.enter();
-            self.log.lock().unwrap().attempt_live = false;
+            {
+                let mut log = self.log.lock().unwrap();
+                log.attempt_live = false;
+                log.order.push("disconnect");
+            }
             self.leave();
             Ok(())
         }
@@ -568,6 +585,7 @@ mod tests {
             self.enter();
             let result = {
                 let mut log = self.log.lock().unwrap();
+                log.order.push("stop");
                 log.stop_calls += 1;
                 if log.fail_stop || nth(log.fail_every_stop, log.stop_calls) {
                     Err("stop failed")
@@ -724,6 +742,67 @@ mod tests {
         rig.sup.suspend().unwrap();
         rig.sup.suspend().unwrap();
         assert_eq!(*seen.lock().unwrap(), [true, false]);
+    }
+
+    /// Subscribes a sink that appends every readiness report to the mock's log,
+    /// so the notifications and the radio calls share one order.
+    fn rig_recording_readiness(auto_events: bool) -> Rig {
+        let rig = rig(auto_events);
+        let log = Arc::clone(&rig.log);
+        rig.sup.subscribe_ready(move |ready| {
+            log.lock()
+                .unwrap()
+                .order
+                .push(if ready { "ready(true)" } else { "ready(false)" });
+        });
+        rig
+    }
+
+    #[test]
+    fn readiness_falls_before_the_radio_is_disconnected_and_stopped() {
+        let rig = rig_recording_readiness(true);
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        settle();
+        rig.log.lock().unwrap().order.clear();
+
+        rig.sup.suspend().unwrap();
+
+        assert_eq!(
+            rig.log.lock().unwrap().order,
+            ["ready(false)", "disconnect", "stop"],
+            "consumers hear about the suspend before the radio is torn down"
+        );
+    }
+
+    #[test]
+    fn a_failed_stop_reports_the_suspend_and_a_retry_does_not_repeat_it() {
+        let rig = rig_recording_readiness(true);
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        settle();
+        {
+            let mut log = rig.log.lock().unwrap();
+            log.order.clear();
+            log.fail_stop = true;
+        }
+
+        assert!(rig.sup.suspend().is_err(), "the stop fails");
+
+        assert_eq!(
+            rig.log.lock().unwrap().order,
+            ["ready(false)", "disconnect", "stop"],
+            "readiness falls even though the stop failed"
+        );
+
+        rig.log.lock().unwrap().fail_stop = false;
+        rig.sup.suspend().unwrap();
+
+        assert_eq!(
+            rig.log.lock().unwrap().order,
+            ["ready(false)", "disconnect", "stop", "disconnect", "stop"],
+            "the retry finishes the stop without a second transition"
+        );
     }
 
     #[test]
