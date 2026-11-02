@@ -53,6 +53,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
+use esp_radio::wifi::ConnectionError;
 use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::WakerSlots;
@@ -257,7 +258,14 @@ impl WifiLink {
                             },
                             Either::Second(Ok(_)) => break self.link_up(""),
                             Either::Second(Err(e)) => {
-                                log::warn!("[wifi] connect failed: {:?}", e);
+                                // A refused association arrives here, not as a
+                                // disconnect event, so the hint belongs on this
+                                // line too (bug 011).
+                                log::warn!(
+                                    "[wifi] connect failed: {:?}{}",
+                                    e,
+                                    connect_failure_hint(&e)
+                                );
                                 break self.poll(LinkInput::Disconnected);
                             }
                         }
@@ -423,6 +431,16 @@ fn hal_disconnect_hint(reason: &DisconnectReason) -> &'static str {
         | DisconnectReason::HandshakeTimeout
         | DisconnectReason::NoAccessPointFound
         | DisconnectReason::AuthenticationFailed => CREDENTIALS_HINT,
+        _ => "",
+    }
+}
+
+/// The same hint for a connect that never associated: esp-radio reports the
+/// rejection as [`ConnectionError::Failed`] carrying the reason a disconnect
+/// event would have, and a wrong password is the common cause (bug 011).
+fn connect_failure_hint(error: &ConnectionError) -> &'static str {
+    match error {
+        ConnectionError::Failed(info) => hal_disconnect_hint(&info.reason),
         _ => "",
     }
 }
