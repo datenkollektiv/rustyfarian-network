@@ -2010,7 +2010,7 @@ mod tests {
     }
 
     /// Regression test for the three-way connect-time deadlock cycle (see
-    /// `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`): a publisher
+    /// `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`): a publisher
     /// blocked on esp-mqtt's `api_lock` during the handshake holds the client
     /// mutex indefinitely — that lock can only be released once the event
     /// loop thread returns to `next()`. `spawn_connect_thread` is the only
@@ -2101,7 +2101,7 @@ mod tests {
         );
     }
 
-    /// Regression test for `docs/bugs/001-on-connect-enqueue-deadlock-2026-09-27.md`
+    /// Regression test for `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`
     /// "Remaining Items": the stale-helper protection (`ConnectionEpoch`)
     /// cannot cancel a running `on_connect` — it can only stop it from
     /// flipping the connected flag after the fact.

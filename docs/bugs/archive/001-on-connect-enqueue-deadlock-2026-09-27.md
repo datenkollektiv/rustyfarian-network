@@ -2,8 +2,8 @@
 id: 001
 title: Client calls inside MqttBuilder on_connect deadlock the ESP-IDF MQTT event loop
 captured-on: 2026-09-27
-doc-version: 4
-status: open-defect
+doc-version: 5
+status: closed
 kind: defect
 ---
 
@@ -87,11 +87,20 @@ Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), 
 - Corrected during review: `EspMqttClient::subscribe` never waits for a SUBACK, the blocker was always `api_lock`; a second, three-way cycle (publisher holding the mutex on `api_lock` during the handshake, mqtt task parked, event loop blocked on the mutex for `on_connect`) is removed by the same change.
 - Rustdoc, both READMEs, CHANGELOG, `docs/project-lore.md` "MQTT Event Loop", and a CLAUDE.md failure row describe the final rule: use the `client` argument in `on_connect`, never `MqttHandle` from any callback, never the client from `on_message` / `on_disconnect`.
 
-## Remaining Items
+## Hardware Verification (2026-11-02)
+| Board    | Example                      | Evidence                                                                |
+|:---------|:-----------------------------|:------------------------------------------------------------------------|
+| ESP32-C3 | `idf_c3_mqtt_callback_guard` | ready 180 ms after `Connected`; `guard_hits` = 2 × `received` for 316 s |
+| ESP32-C3 | `idf_c3_mqtt`                | retained `online` on the broker; 14 heartbeats; `[cmd] ping received`   |
+| ESP32-S3 | `idf_esp32s3_mqtt_lwt`       | retained `online`; 15 ticks; MQTT connect 60 ms after the IP            |
+
+`received` runs slightly ahead of `sent` in the guard run because QoS 1 resends when a PUBACK is not handled within 1 s (at-least-once, `docs/project-lore.md` "OTA Consumer Runtime"); `guard_hits` tracked `2 × received` exactly, so duplicates are the only cause.
+`idf_c3_mqtt_button_oled` was dropped from the gate: it needs an SSD1306 and exercises the same connect path as the two C3 runs above.
+
+## Follow-ups (not part of this defect)
 - Helper-spawn failure (heap exhaustion): the session never sees `WorkDone`, so `is_connected()` is `false` while the transport is up; `MqttHandle` publishes still reach the outbox, and subscriptions and `on_connect` retry on the next reconnect; an injectable spawner would make this path host-testable.
 - A running `on_connect` cannot be cancelled by a disconnect; it is documented as short-lived and idempotent, and a connection-aware callback API is a candidate for the next breaking release.
 - 0.6 (now optional): `on_connect` → `Fn(bool)` is no longer needed for safety; `with_connect_message(topic, payload, retain)` remains a convenience idea.
-- Hardware re-check pending: `idf_c3_mqtt` (retained status now published from `on_connect`), `idf_c3_mqtt_button_oled`, one `with_startup_message()` user, and `idf_c3_mqtt_callback_guard` for the `on_message` path.
 
 ## Links
 - Source report: upstream bug report from the downstream consumer (on-connect enqueue deadlock).
@@ -107,3 +116,4 @@ Florian Waibel — landed on `main` as `511b37f` (fix), `76d0d6e` (0.5.1 bump), 
 - 2026-09-27 — Merged to `main` as four commits (`511b37f`, `76d0d6e`, `5550775`, `2f2597a`) and pushed; `idf_c3_mqtt_button_oled` headless path confirmed on hardware, broker connection still blocked by a stale shell export; bug stays open until the MQTT paths are verified.
 - 2026-09-28 — rustyfarian-rgb-clock filed an upstream request (their bug 001): on 0.5.0, `try_publish` from `on_message` hung the client until reset on an ESP32-C3. This is field confirmation of the `on_message` path, which had been inferred here. Re-checked against IDF v5.3.3 and esp-idf-svc 0.53.0: `receiver.done()` runs only inside `next()`, so "release the event before `on_message`" is not a viable fix (ADR 017). The `idf_c3_mqtt_callback_guard` example was added as the pending hardware re-check for both the connect path and the message path; the `try_publish*` docs were corrected. Still open pending that hardware run.
 - 2026-11-02 — Re-checked against the post-Step-8b-2 code: the defect is still fixed and the hazard is unchanged, because esp-mqtt's `api_lock` scope and esp-idf-svc's park-until-`next()` are upstream and untouched; the plumbing references above were refreshed (tier-owned `mqtt-connect` worker, shared order subscriptions → startup → `on_connect`, `SessionToken` instead of `ConnectionEpoch`, `Close` performed by the lock-free runner), and `ConnectionEpoch`, `spawn_connect_thread` and `spawn_subscriber_thread` are deprecated; status stays `open-defect` pending the hardware run.
+- 2026-11-02 — Closed on hardware: the C3 guard example cleared both callback paths (316 s, `guard_hits` = 2 × `received`), `idf_c3_mqtt` confirmed the ordinary connect plus inbound path, and the S3 confirmed the same connect path on a second chip; `idf_c3_mqtt_button_oled` dropped from the gate as redundant.
