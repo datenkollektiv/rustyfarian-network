@@ -2,8 +2,8 @@
 id: 010
 title: IDF MQTT client starts connecting before Wi-Fi has an IP
 captured-on: 2026-11-01
-doc-version: 3
-status: fixed-in-code
+doc-version: 4
+status: closed
 kind: defect
 ---
 
@@ -60,6 +60,30 @@ Implemented as tier-parity Step 8b-2 (2026-11-01); the bench run below still gat
 - Publishes made before the IP wait in `juggler::mqtt::Outbox` (four slots, oldest dropped and counted in `MqttHandle::dropped_publish`).
 - `idf_c3_mqtt` no longer waits for the IP before `build`, so the boot order that reproduced the bug is the example's default path.
 
+## Hardware Verification (2026-11-02, ESP32-C3, `idf_c3_async_mqtt`)
+
+Boot — the order the bug was filed against:
+
+```
+7765  sta ip: 192.168.31.180
+7785  [mqtt] session created; the gate opens when the link is ready
+7805  [mqtt] client started
+8065  [mqtt] connected
+8085  [example] mqtt up after 7498 ms
+```
+
+The client is created 40 ms after the IP and connects 300 ms later; no `Error transport connect`, no `esp-tls` line and no MQTT line before `sta ip:`.
+The bug measured the first attempt at `build + 30 ms`, 3.5 s early, with the session arriving on esp-mqtt's retry 10 s later.
+
+Outage — a ~2 minute router block:
+
+- The back-off ladder climbed 1000→30000 ms and never higher; every tick reported `would block`.
+- No MQTT line of any kind appeared between the teardown error and the recovery: no retry, no `Host is unreachable`, no `[mqtt] error` after the first one.
+  The bug had a retry every ~15 s, each with both errors.
+- Recovery: `sta ip:` → `[mqtt] network up, connecting` → `[mqtt] connected` in 250 ms.
+  The bug reconnected 14 s after the IP.
+- Broker: `status` flipped `offline` when the will fired and back to `online` after recovery.
+
 ## Owner
 Claude (tier-parity work)
 
@@ -73,3 +97,4 @@ Claude (tier-parity work)
 - 2026-11-01 — Updated: outage evidence from the variant A run (retries during the outage, reconnect 14 s after the IP)
 - 2026-11-01 — Shared rule implemented in `juggler::mqtt::SessionMachine` (tier-parity Step 6); the IDF fix lands when IDF adopts it (Step 8)
 - 2026-11-01 — Fixed in code (Step 8b-2): link-gated client creation, `NetworkGate` + `subscribe_ready` feed, esp-mqtt auto-reconnect off with runner-paced attempts; status `fixed-in-code` until the bench run confirms the boot log has no transport error and the outage shows zero MQTT lines
+- 2026-11-02 — Closed on hardware: `idf_c3_async_mqtt` on an ESP32-C3 created the client 40 ms after `sta ip:` and connected 300 ms later with no transport error, and a ~2 minute router block produced no MQTT line at all until the recovery 250 ms after the next IP.
