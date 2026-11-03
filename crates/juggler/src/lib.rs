@@ -89,8 +89,8 @@
 ))]
 extern crate alloc;
 
-// Shared test fixtures; every user sits under `wifi` or `mqtt` (provisioning implies both).
-#[cfg(all(test, any(feature = "wifi", feature = "mqtt")))]
+// Shared test fixtures; every user sits under `wifi`, `mqtt` (provisioning implies both) or `espnow`.
+#[cfg(all(test, any(feature = "wifi", feature = "mqtt", feature = "espnow")))]
 pub(crate) mod test_support;
 
 // ── Always-available (no feature gate) ──────────────────────────────────────

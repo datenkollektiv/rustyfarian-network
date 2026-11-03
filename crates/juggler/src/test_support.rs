@@ -48,7 +48,7 @@ mod tests {
 ///
 /// Enough for the test doubles, which wake themselves while pending; a future
 /// that never becomes ready spins forever, so tests only await ready paths.
-#[cfg(feature = "mqtt")]
+#[cfg(any(feature = "mqtt", feature = "espnow"))]
 pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());

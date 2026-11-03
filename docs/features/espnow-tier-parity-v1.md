@@ -7,23 +7,28 @@ desk-work: available
 
 Goal: ESP-NOW consumer code is exchangeable between the tiers ([ADR 022](../adr/022-tier-parity-one-async-api.md), Phase 6 of the [tier-parity plan](tier-parity-v1-plan.md)).
 Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
+Plan: [espnow-tier-parity-v1-plan](espnow-tier-parity-v1-plan.md), with the step list and the approved breaking changes.
+Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md), with the extraction rules and the scope findings.
 
 ## Decisions
 
-| Decision                                               | Reason                                            | Rejected Alternative                    |
-|:-------------------------------------------------------|:--------------------------------------------------|:----------------------------------------|
-| Shared async trait in `juggler::espnow`                | One app on both tiers (ADR 022 decision 4)        | Per-tier helpers with diverging shapes  |
-| The driver keeps the pinned channel                    | One `scan_for_peer(&mac, &config)` shape          | Caller-held `&mut Option<u8>` (esp-hal) |
-| ESP-IDF blocking scan becomes `scan_for_peer_blocking` | The async scan takes the shared name; a 0.x break | A new async name on both tiers          |
-| ESP-IDF async runs on one `espnow-tx` worker           | Fixed stack like `mqtt-net` (ADR 022 variant A)   | A thread per call (the bug 013 pattern) |
-| The async send reports the MAC-layer ACK               | A link policy needs it; ESP-IDF `send` hides it   | Fire-and-forget send in the trait       |
+| Decision                                               | Reason                                              | Rejected Alternative                    |
+|:-------------------------------------------------------|:----------------------------------------------------|:----------------------------------------|
+| Shared async trait in `juggler::espnow`                | One app on both tiers (ADR 022 decision 4)          | Per-tier helpers with diverging shapes  |
+| The driver keeps the pinned channel                    | One `scan_for_peer(&mac, &config)` shape            | Caller-held `&mut Option<u8>` (esp-hal) |
+| ESP-IDF blocking scan becomes `scan_for_peer_blocking` | The async scan takes the shared name; a 0.x break   | A new async name on both tiers          |
+| ESP-IDF async runs on one `espnow-tx` worker           | Fixed stack like `mqtt-net` (ADR 022 variant A)     | A thread per call (the bug 013 pattern) |
+| The async send reports the MAC-layer ACK               | A link policy needs it; ESP-IDF `send` hides it     | Fire-and-forget send in the trait       |
+| ESP-IDF `espnow-tx` worker owns the send callback      | Fixes the stale-ACK hazard ADR 020 fixed on esp-hal | A callback per call (released ESP-IDF)  |
+| One sans-IO `TxCore` in juggler for both tiers         | Cancellation and stale results tested once          | Per-tier send queues                    |
+| Optional `embassy-time` / `embassy-futures` on juggler | One `EmbassyClock` for `PeerSession` on both tiers  | A clock adapter per firmware            |
 
 ## Constraints
 - ADR 021 holds: the firmware owns the executor, the timer queue and the providers.
 - ADR 020 holds: on esp-hal the trait sits on the `run_sender` runner.
 - ADR 012 holds: scanning needs a driver-owned radio on ESP-IDF.
 - esp-hal ESP-NOW is unreleased, so its API changes freely.
-- ESP-IDF changes are additive except the approved `scan_for_peer` rename.
+- ESP-IDF breaks B1–B6 and the `scan_for_peer` rename are approved (2026-11-03); see the plan.
 - Every step ends with `just fmt`, `just verify`, `just clippy-hal` and `just build-example` for touched examples.
 
 ## Requirements
@@ -37,15 +42,15 @@ Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
 - Receive is part of the shared trait (`async` receive returning the sender MAC), because the peer link counts received frames and portable apps must not need a tier receive path.
 
 ## Open Questions
-- [ ] Trait and method names: `send_async` / `recv_async` (esp-hal today) or `send` / `receive`?
+- [x] Trait and method names: `send_async` / `recv_async` (esp-hal today) or `send` / `receive`? — `EspNowLink` with `send_acked` / `receive`, see the plan
 - [x] Does the trait cover receive, or does each tier keep its own receive path? — yes, see Requirements
-- [ ] Do the sync `send_and_wait` forms converge (ESP-IDF takes `timeout_ms`, esp-hal does not)?
+- [x] Do the sync `send_and_wait` forms converge (ESP-IDF takes `timeout_ms`, esp-hal does not)? — no, a capability row; esp-hal's sync send spins in esp-radio
 - [ ] Stack and heap cost of the `espnow-tx` worker, measured against bug 013.
 - [ ] Hardware gate: mixed IDF/hal fleet run, shared with the esp-hal-espnow-v1 validation plan.
 
 ## State
 - [x] Design approved
-- [ ] Extraction inventory (tier logic that is not mapping moves to `juggler`)
+- [x] Extraction inventory (tier logic that is not mapping moves to `juggler`)
 - [ ] Shared trait and mock in `juggler`
 - [ ] esp-hal implements the trait, pin moved into the driver
 - [ ] ESP-IDF `espnow-tx` worker and async surface, blocking scan renamed
@@ -64,3 +69,5 @@ Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
 ## Session Log
 - 2026-11-03 — Feature doc created via /feature dialog, split from the peer-link request
 - 2026-11-03 — Design review folded in: outcome classification, cancellation and timeout, scan ownership, receive in the trait
+- 2026-11-03 — Inventory and step plan written; B1–B6, names, juggler deps approved; two released ESP-IDF bugs found (stale ACK, oversize receive)
+- 2026-11-03 — Review contracts settled: atomic scan admission, preemption, shutdown, scan cancellation, broadcast refusal, unordered receive

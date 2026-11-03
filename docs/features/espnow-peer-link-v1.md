@@ -40,7 +40,7 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 ## Open Questions
 - [x] Backoff defaults (first delay, cap, factor)? — 2 s first retry, doubling, capped at 60 s (`PeerLinkConfig`)
 - [x] When is the state `Lost`: at the failure threshold, or only after a failed rescan? — from the threshold-triggered rescan until a scan succeeds or the coordinator is heard or ACKs on the last channel
-- [ ] Helper shape: a loop that owns the sends, or an observer the app feeds its send results?
+- [x] Helper shape: a loop that owns the sends, or an observer the app feeds its send results? — a `PeerSession` handle that owns the sends plus a `run` loop (plan Step 6)
 - [x] Does `PeerLink` absorb or sit beside the existing `PeerTracker` heartbeat tracker? — beside it; `PeerTracker` stays the heartbeat-timeout tracker
 - [ ] The consumer's in-project core (`rgb-puzzle-link`) was not found locally; compare once it is shared.
 
@@ -64,3 +64,4 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 - 2026-11-03 — Feature doc created via /feature dialog from `review-queue/rustyfarian-network-espnow-peer-link-v1.md`
 - 2026-11-03 — Design review folded in: outcome classes, timer contract, ordering and stale results, coordinator-only `PeerHeard`
 - 2026-11-03 — `PeerLink` core implemented in juggler, `SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`
+- 2026-11-03 — Helper shape settled (`PeerSession`), delivered by espnow-tier-parity-v1 Steps 6–7

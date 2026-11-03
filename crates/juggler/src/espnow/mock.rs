@@ -27,7 +27,12 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use super::{EspNowDriver, EspNowEvent, MacAddress, PeerConfig, WifiInterface};
+use core::time::Duration;
+
+use super::{
+    ClassifySend, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig, ScanConfig,
+    ScanResult, SendOutcome, WifiInterface,
+};
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 
@@ -170,5 +175,192 @@ impl EspNowDriver for MockEspNowDriver {
 
     fn try_recv(&self) -> Option<EspNowEvent> {
         self.state.borrow_mut().rx_queue.pop_front()
+    }
+}
+
+// ─── MockEspNowLink ──────────────────────────────────────────────────────────
+
+/// Error type for [`MockEspNowLink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockLinkError {
+    /// The frame was transmitted but not acknowledged ([`SendOutcome::NoAck`]).
+    NoAck,
+    /// The frame was not transmitted, or the scan failed ([`SendOutcome::Local`]).
+    Local,
+}
+
+impl core::fmt::Display for MockLinkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoAck => write!(f, "mock ESP-NOW frame not acknowledged"),
+            Self::Local => write!(f, "mock ESP-NOW local failure"),
+        }
+    }
+}
+
+impl ClassifySend for MockLinkError {
+    fn outcome(&self) -> SendOutcome {
+        match self {
+            Self::NoAck => SendOutcome::NoAck,
+            Self::Local => SendOutcome::Local,
+        }
+    }
+}
+
+struct LinkState {
+    send_script: VecDeque<Result<(), MockLinkError>>,
+    scan_script: VecDeque<Result<ScanResult, MockLinkError>>,
+    last_timeout: Option<Duration>,
+    pinned: Option<u8>,
+}
+
+/// Mock implementation of [`EspNowLink`] (and [`EspNowDriver`]) for host-side tests.
+///
+/// Peers, sent frames and the receive queue live in an inner [`MockEspNowDriver`], so the
+/// inspection helpers match it.
+/// [`send_acked`](EspNowLink::send_acked) and [`scan_for_peer`](EspNowLink::scan_for_peer)
+/// pop the next scripted result; with an empty script a send succeeds and a scan fails
+/// with [`MockLinkError::Local`].
+/// A frame is recorded as sent when its scripted result is `Ok` or
+/// [`MockLinkError::NoAck`] (it was transmitted), not for [`MockLinkError::Local`].
+/// A successful scan pins its channel; a failed one keeps the previous pin.
+/// [`receive`](EspNowLink::receive) pends while the queue is empty, so tests only await it
+/// after queueing a frame.
+pub struct MockEspNowLink {
+    driver: MockEspNowDriver,
+    state: RefCell<LinkState>,
+}
+
+impl MockEspNowLink {
+    /// Creates a mock with empty scripts, no peers and no pin.
+    pub fn new() -> Self {
+        Self {
+            driver: MockEspNowDriver::new(),
+            state: RefCell::new(LinkState {
+                send_script: VecDeque::new(),
+                scan_script: VecDeque::new(),
+                last_timeout: None,
+                pinned: None,
+            }),
+        }
+    }
+
+    /// Queues the result of a future [`send_acked`](EspNowLink::send_acked) call.
+    pub fn script_send(&self, result: Result<(), MockLinkError>) {
+        self.state.borrow_mut().send_script.push_back(result);
+    }
+
+    /// Queues the result of a future [`scan_for_peer`](EspNowLink::scan_for_peer) call.
+    pub fn script_scan(&self, result: Result<ScanResult, MockLinkError>) {
+        self.state.borrow_mut().scan_script.push_back(result);
+    }
+
+    /// Enqueues a frame for [`receive`](EspNowLink::receive) and `try_recv`.
+    pub fn queue_rx_event(&self, event: EspNowEvent) {
+        self.driver.queue_rx_event(event);
+    }
+
+    /// Sets the pinned channel directly.
+    pub fn set_pinned_channel(&self, channel: Option<u8>) {
+        self.state.borrow_mut().pinned = channel;
+    }
+
+    /// Copies the transmitted `(mac, data)` pairs.
+    pub fn sent_messages(&self) -> Vec<(MacAddress, Vec<u8>)> {
+        self.driver.sent_messages()
+    }
+
+    /// Copies the registered peers as `(mac, interface)` pairs.
+    pub fn peer_list(&self) -> Vec<(MacAddress, WifiInterface)> {
+        self.driver.peer_list()
+    }
+
+    /// The timeout passed to the latest [`send_acked`](EspNowLink::send_acked), if any.
+    pub fn last_send_timeout(&self) -> Option<Duration> {
+        self.state.borrow().last_timeout
+    }
+}
+
+impl Default for MockEspNowLink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EspNowDriver for MockEspNowLink {
+    type Error = MockLinkError;
+
+    fn add_peer(&self, config: &PeerConfig) -> Result<(), Self::Error> {
+        self.driver
+            .add_peer(config)
+            .map_err(|_| MockLinkError::Local)
+    }
+
+    fn remove_peer(&self, mac: &MacAddress) -> Result<(), Self::Error> {
+        self.driver
+            .remove_peer(mac)
+            .map_err(|_| MockLinkError::Local)
+    }
+
+    fn send(&self, mac: &MacAddress, data: &[u8]) -> Result<(), Self::Error> {
+        self.driver
+            .send(mac, data)
+            .map_err(|_| MockLinkError::Local)
+    }
+
+    fn try_recv(&self) -> Option<EspNowEvent> {
+        self.driver.try_recv()
+    }
+}
+
+impl EspNowLink for MockEspNowLink {
+    async fn send_acked(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), Self::Error> {
+        let scripted = {
+            let mut state = self.state.borrow_mut();
+            state.last_timeout = Some(timeout);
+            state.send_script.pop_front().unwrap_or(Ok(()))
+        };
+        if !matches!(scripted, Err(MockLinkError::Local)) {
+            self.driver
+                .send(mac, data)
+                .map_err(|_| MockLinkError::Local)?;
+        }
+        scripted
+    }
+
+    async fn receive(&self) -> EspNowEvent {
+        core::future::poll_fn(|cx| match self.driver.try_recv() {
+            Some(event) => core::task::Poll::Ready(event),
+            None => {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await
+    }
+
+    async fn scan_for_peer(
+        &self,
+        _mac: &MacAddress,
+        _config: &ScanConfig<'_>,
+    ) -> Result<ScanResult, Self::Error> {
+        let mut state = self.state.borrow_mut();
+        let result = state
+            .scan_script
+            .pop_front()
+            .unwrap_or(Err(MockLinkError::Local));
+        if let Ok(found) = result {
+            state.pinned = Some(found.channel);
+        }
+        result
+    }
+
+    fn pinned_channel(&self) -> Option<u8> {
+        self.state.borrow().pinned
     }
 }

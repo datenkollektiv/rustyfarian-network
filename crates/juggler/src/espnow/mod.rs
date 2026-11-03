@@ -7,8 +7,12 @@
 //! - [`PeerConfig`] — peer registration parameters
 //! - [`PeerTracker`] — heartbeat-based peer liveness tracking
 //! - [`PeerLink`] — clock-injected supervisor that decides when to (re)scan for the coordinator
+//! - [`EspNowLink`] — async acked send, receive and scan surface both tiers implement
+//! - [`ClassifySend`] — maps a tier send error onto [`SendOutcome`]
+//! - [`OversizeLog`] — counter and rate-limited log decision for dropped oversize frames
+//! - [`TxCore`] — sans-IO send queue: request ids, deadlines, cancellation, scan exclusion
 //! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers
-//! - [`mock::MockEspNowDriver`] — test double for host-side unit tests
+//! - [`mock::MockEspNowDriver`], [`mock::MockEspNowLink`] — test doubles for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
 //! # Feature flags
@@ -19,10 +23,12 @@
 
 pub mod command;
 pub mod link;
+pub mod link_trait;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod scan;
 pub mod tracker;
+pub mod tx;
 
 pub use command::{
     parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
@@ -31,8 +37,10 @@ pub use command::{
 pub use link::{
     PeerLink, PeerLinkAction, PeerLinkConfig, PeerLinkEpoch, PeerLinkEvent, PeerLinkState,
 };
+pub use link_trait::{ClassifySend, EspNowLink};
 pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
 pub use tracker::PeerTracker;
+pub use tx::{Abandon, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -168,9 +176,74 @@ impl EspNowEvent {
         }
     }
 
+    /// Create an event, or return the payload length if it exceeds [`MAX_DATA_LEN`].
+    ///
+    /// Never truncates: the caller decides what to do with an oversize frame, normally drop it
+    /// and count it with [`OversizeLog`].
+    ///
+    /// ```
+    /// use juggler::espnow::{EspNowEvent, MAX_DATA_LEN};
+    ///
+    /// assert!(EspNowEvent::try_new([0; 6], b"ok").is_ok());
+    /// assert_eq!(EspNowEvent::try_new([0; 6], &[0; 1470]).unwrap_err(), 1470);
+    /// ```
+    pub fn try_new(mac: MacAddress, data: &[u8]) -> Result<Self, usize> {
+        if data.len() > MAX_DATA_LEN {
+            Err(data.len())
+        } else {
+            Ok(Self::new(mac, data))
+        }
+    }
+
     /// Returns the payload bytes that were received.
     pub fn payload(&self) -> &[u8] {
         &self.data[..self.len]
+    }
+}
+
+// ─── OversizeLog ────────────────────────────────────────────────────────────
+
+/// Every n-th oversize frame is logged after the first one.
+const OVERSIZE_LOG_EVERY: u32 = 32;
+
+/// Counts dropped oversize frames and decides which drops are worth a log line.
+///
+/// Receive paths call [`record`](Self::record) for every frame [`EspNowEvent::try_new`]
+/// refused; it returns `true` for the first drop and then every 32nd, so a noisy neighbour
+/// cannot flood the log.
+/// The counter is advisory: it uses load and store only (no read-modify-write, which
+/// `riscv32imc` lacks), so concurrent recorders may lose a count.
+#[derive(Debug, Default)]
+pub struct OversizeLog {
+    dropped: core::sync::atomic::AtomicU32,
+}
+
+impl OversizeLog {
+    /// Creates a log with nothing dropped.
+    pub const fn new() -> Self {
+        Self {
+            dropped: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Records one dropped frame; `true` if the drop should be logged.
+    pub fn record(&self) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        let dropped = self.dropped.load(Relaxed).wrapping_add(1);
+        self.dropped.store(dropped, Relaxed);
+        Self::should_log(dropped)
+    }
+
+    /// Number of oversize frames dropped so far (wraps at `u32::MAX`).
+    pub fn dropped(&self) -> u32 {
+        self.dropped.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Rate limit: the first drop and then every 32nd.
+    pub fn should_log(dropped_so_far: u32) -> bool {
+        dropped_so_far
+            .wrapping_sub(1)
+            .is_multiple_of(OVERSIZE_LOG_EVERY)
     }
 }
 
@@ -384,6 +457,49 @@ mod tests {
         let event = EspNowEvent::new(mac, data);
         assert_eq!(event.payload(), b"hello");
         assert_eq!(event.mac, mac);
+    }
+
+    #[test]
+    fn try_new_keeps_payload_up_to_the_limit() {
+        let data = [0xA5u8; MAX_DATA_LEN];
+        let event = EspNowEvent::try_new([1; 6], &data).unwrap();
+        assert_eq!(event.mac, [1; 6]);
+        assert_eq!(event.payload(), &data[..]);
+        assert_eq!(EspNowEvent::try_new([1; 6], &[]).unwrap().payload(), b"");
+    }
+
+    #[test]
+    fn try_new_reports_the_oversize_length_without_truncating() {
+        assert_eq!(
+            EspNowEvent::try_new([1; 6], &[0; MAX_DATA_LEN + 1]).unwrap_err(),
+            MAX_DATA_LEN + 1
+        );
+        assert_eq!(EspNowEvent::try_new([1; 6], &[0; 1470]).unwrap_err(), 1470);
+    }
+
+    #[test]
+    fn oversize_log_rate_limits_to_first_then_every_32nd() {
+        assert!(OversizeLog::should_log(1));
+        assert!(!OversizeLog::should_log(2));
+        assert!(!OversizeLog::should_log(32));
+        assert!(OversizeLog::should_log(33));
+        assert!(OversizeLog::should_log(65));
+        let logged = (1..=1000u32)
+            .filter(|n| OversizeLog::should_log(*n))
+            .count();
+        assert_eq!(logged, 32);
+    }
+
+    #[test]
+    fn oversize_log_counts_every_drop_and_logs_selectively() {
+        let log = OversizeLog::new();
+        assert_eq!(log.dropped(), 0);
+        let decisions: alloc::vec::Vec<bool> = (0..34).map(|_| log.record()).collect();
+        assert_eq!(log.dropped(), 34);
+        assert!(decisions[0]);
+        assert!(decisions[1..32].iter().all(|d| !d));
+        assert!(decisions[32]);
+        assert!(!decisions[33]);
     }
 
     // ── PeerConfig tests ─────────────────────────────────────────────────

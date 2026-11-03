@@ -558,6 +558,13 @@ impl<'a> ScanMachine<'a> {
     }
 
     fn finish(&mut self, result: Result<ScanResult, ScanError>) -> ScanAction {
+        if self.burst_expired {
+            log::debug!(
+                "Burst timeout {:?} reached after {} channels; stopping scan",
+                self.config.burst_timeout,
+                self.probed
+            );
+        }
         self.state = State::Finished(result);
         ScanAction::Done(result)
     }
