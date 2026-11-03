@@ -91,7 +91,7 @@ lora = [
 ]
 
 # espnow: ESP-NOW peer-to-peer driver.
-espnow = ["juggler/wifi", "juggler/espnow"]
+espnow = ["juggler/wifi", "juggler/espnow", "juggler/std"]
 
 # ota: Streaming download + SHA-256 verify + partition swap.
 ota = ["juggler/ota", "juggler/ota-wire", "dep:embedded-svc"]

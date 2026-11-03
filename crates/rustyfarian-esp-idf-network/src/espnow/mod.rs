@@ -45,9 +45,10 @@
 //! No special `sdkconfig` needed on either chip — radio contention is
 //! eliminated by design.
 
+use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -56,13 +57,167 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
 };
+use juggler::espnow::{ClassifySend, OversizeLog, ScanAction, ScanInput, ScanMachine};
 pub use juggler::espnow::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
     SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
     DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT, DEFAULT_RX_CHANNEL_CAPACITY,
     DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
 };
-use juggler::espnow::{ScanAction, ScanInput, ScanMachine};
+use juggler::wait_list::WaitList;
+
+/// Errors of [`EspIdfEspNow`] as seen through [`EspNowDriver`] and the shared
+/// [`juggler::espnow::EspNowLink`] contract.
+///
+/// Only [`NoAck`](Self::NoAck) means "transmitted, not acknowledged"; every other variant
+/// classifies as a local failure (see [`ClassifySend`]), because the peer never had a chance
+/// to answer.
+/// The type implements [`std::error::Error`], so `?` converts it into [`anyhow::Error`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum EspIdfEspNowError {
+    /// The frame was transmitted but the peer did not acknowledge it.
+    NoAck,
+    /// The operation did not start before its deadline.
+    Timeout,
+    /// Another operation holds the radio.
+    Busy,
+    /// A scan is running; application sends are refused until it ends.
+    ScanInProgress,
+    /// The operation needs a driver-owned radio and this driver does not own it.
+    RadioNotOwned,
+    /// The payload exceeds [`MAX_DATA_LEN`].
+    PayloadTooLarge {
+        /// Length of the refused payload in bytes.
+        len: usize,
+    },
+    /// An acknowledged send to the broadcast address, which never yields a MAC ACK.
+    Broadcast,
+    /// The driver is shutting down.
+    Shutdown,
+    /// A scan failed.
+    Scan(ScanError),
+    /// An ESP-IDF call failed.
+    Driver(anyhow::Error),
+}
+
+impl fmt::Display for EspIdfEspNowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAck => f.write_str("peer did not ACK"),
+            Self::Timeout => f.write_str("ESP-NOW operation timed out before it started"),
+            Self::Busy => f.write_str("ESP-NOW radio is busy"),
+            Self::ScanInProgress => f.write_str("ESP-NOW scan in progress"),
+            Self::RadioNotOwned => f.write_str(
+                "operation requires a driver-owned radio (init_with_radio or init_with_radio_sta)",
+            ),
+            Self::PayloadTooLarge { len } => write!(
+                f,
+                "ESP-NOW payload of {len} bytes exceeds the maximum of {MAX_DATA_LEN} bytes"
+            ),
+            Self::Broadcast => f.write_str("acknowledged send to the broadcast address"),
+            Self::Shutdown => f.write_str("ESP-NOW driver is shutting down"),
+            Self::Scan(e) => write!(f, "ESP-NOW scan failed: {e}"),
+            Self::Driver(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EspIdfEspNowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Scan(e) => Some(e),
+            // `Display` already shows the top message of the chain; continue below it.
+            Self::Driver(e) => e.chain().nth(1),
+            _ => None,
+        }
+    }
+}
+
+impl EspIdfEspNowError {
+    /// Unwraps a [`Driver`](Self::Driver) error without adding a link to its chain.
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Driver(e) => e,
+            other => anyhow::Error::new(other),
+        }
+    }
+}
+
+impl ClassifySend for EspIdfEspNowError {
+    fn outcome(&self) -> SendOutcome {
+        match self {
+            Self::NoAck => SendOutcome::NoAck,
+            _ => SendOutcome::Local,
+        }
+    }
+}
+
+impl From<ScanError> for EspIdfEspNowError {
+    fn from(e: ScanError) -> Self {
+        Self::Scan(e)
+    }
+}
+
+/// The receive queue shared by the C callback, [`EspNowDriver::try_recv`] and
+/// [`EspIdfEspNow::receive`]: a frame leaves it exactly once, whichever consumer pops it.
+struct RxQueue {
+    frames: Mutex<VecDeque<EspNowEvent>>,
+    capacity: usize,
+    waiters: WaitList,
+    oversize: OversizeLog,
+}
+
+impl RxQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+            waiters: WaitList::new(),
+            oversize: OversizeLog::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<EspNowEvent>> {
+        self.frames.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn pop(&self) -> Option<EspNowEvent> {
+        self.lock().pop_front()
+    }
+
+    /// Receive-callback entry: queue a valid frame, drop and count an oversize one.
+    fn push_frame(&self, mac: MacAddress, data: &[u8]) {
+        let event = match EspNowEvent::try_new(mac, data) {
+            Ok(event) => event,
+            Err(len) => {
+                if self.oversize.record() {
+                    log::warn!(
+                        "ESP-NOW: dropped oversize frame ({} B > {} B) from {:02X?}, {} dropped in total",
+                        len,
+                        MAX_DATA_LEN,
+                        mac,
+                        self.oversize.dropped()
+                    );
+                }
+                return;
+            }
+        };
+        {
+            let mut frames = self.lock();
+            if frames.len() >= self.capacity {
+                drop(frames);
+                log::warn!(
+                    "ESP-NOW receive queue full — frame from {:02X?} dropped",
+                    mac
+                );
+                return;
+            }
+            frames.push_back(event);
+        }
+        self.waiters.wake_all();
+    }
+}
 
 /// Radio-management mode the driver is operating in.
 ///
@@ -110,8 +265,8 @@ impl RadioMode {
 
 /// ESP-IDF implementation of [`EspNowDriver`].
 ///
-/// Wraps [`EspNow<'static>`] and bridges the C receive callback into a
-/// [`std::sync::mpsc::sync_channel`] for non-blocking polling.
+/// Wraps [`EspNow<'static>`] and bridges the C receive callback into a bounded queue that
+/// [`EspNowDriver::try_recv`] polls and [`EspIdfEspNow::receive`] awaits.
 ///
 /// # Radio management
 ///
@@ -133,7 +288,7 @@ impl RadioMode {
 ///   ADR 012 for the documented ~0–20 % send failure rate.
 pub struct EspIdfEspNow {
     esp_now: EspNow<'static>,
-    rx: Receiver<EspNowEvent>,
+    rx: Arc<RxQueue>,
     _wifi: Option<EspWifi<'static>>,
     /// Serialises ownership of the single global send callback that
     /// `esp_now_register_send_cb` exposes.  Both [`scan_for_peer`] and
@@ -350,7 +505,7 @@ impl EspIdfEspNow {
 
         // The pin is read before the scan: the machine restores the radio to it on failure.
         let mut machine = ScanMachine::new(*mac, *config, self.pinned_channel_opt());
-        let result = self.drive_scan(&mut machine, config.burst_timeout);
+        let result = self.drive_scan(&mut machine);
 
         // Publish the pinned channel only for a successful scan; a failed scan
         // leaves the previous pin untouched (the machine restores the radio to it).
@@ -388,6 +543,25 @@ impl EspIdfEspNow {
         Ok((driver, result))
     }
 
+    /// Waits for the next received frame.
+    ///
+    /// Frames above [`MAX_DATA_LEN`] never reach the queue: they are dropped and counted
+    /// ([`oversize_dropped`](Self::oversize_dropped)).
+    ///
+    /// Safe to call from several tasks or threads at once: each frame goes to exactly one
+    /// consumer, and no order among waiting callers is promised.
+    /// [`EspNowDriver::try_recv`] draws from the same queue, so a frame taken there is not
+    /// seen here.
+    /// Cancel-safe: dropping the future loses no frame.
+    pub async fn receive(&self) -> EspNowEvent {
+        self.rx.waiters.wait(|| self.rx.pop()).await
+    }
+
+    /// Number of oversize frames dropped by the receive callback (wraps at `u32::MAX`).
+    pub fn oversize_dropped(&self) -> u32 {
+        self.rx.oversize.dropped()
+    }
+
     fn pinned_channel_opt(&self) -> Option<u8> {
         match self.pinned_channel.load(Ordering::Relaxed) {
             u8::MAX => None,
@@ -406,11 +580,7 @@ impl EspIdfEspNow {
     /// On dual-radio (Wi-Fi + ESP-NOW on the same chip) deployments,
     /// schedule scans during quiet periods if predictable per-frame
     /// power matters.
-    fn drive_scan(
-        &self,
-        machine: &mut ScanMachine<'_>,
-        burst_timeout: Duration,
-    ) -> Result<ScanResult, ScanFailure> {
+    fn drive_scan(&self, machine: &mut ScanMachine<'_>) -> Result<ScanResult, ScanFailure> {
         let mac = *machine.mac();
         let probe_data = machine.probe_data();
         let epoch = Instant::now();
@@ -449,7 +619,7 @@ impl EspIdfEspNow {
                     match self.add_peer(&peer) {
                         Ok(()) => ScanInput::Completed,
                         Err(e) => {
-                            last_register_error = Some(e);
+                            last_register_error = Some(e.into_anyhow());
                             ScanInput::Failed
                         }
                     }
@@ -620,13 +790,6 @@ impl EspIdfEspNow {
                     ScanInput::Completed
                 }
                 ScanAction::Done(result) => {
-                    if machine.burst_expired() {
-                        log::debug!(
-                            "Burst timeout {:?} reached after {} channels; stopping scan",
-                            burst_timeout,
-                            machine.probed()
-                        );
-                    }
                     return result.map_err(|kind| match (kind, cb_error.take()) {
                         (ScanError::Aborted, Some(e)) => ScanFailure {
                             kind,
@@ -799,19 +962,11 @@ impl EspIdfEspNow {
     ) -> anyhow::Result<Self> {
         let esp_now = EspNow::take().context("failed to acquire EspNow singleton")?;
 
-        let (tx, rx): (SyncSender<EspNowEvent>, Receiver<EspNowEvent>) = sync_channel(capacity);
+        let rx = Arc::new(RxQueue::new(capacity));
 
+        let callback_queue = Arc::clone(&rx);
         esp_now
-            .register_recv_cb(move |info, data| {
-                let mac = *info.src_addr;
-                let event = EspNowEvent::new(mac, data);
-                if tx.try_send(event).is_err() {
-                    log::warn!(
-                        "ESP-NOW receive queue full — frame from {:02X?} dropped",
-                        mac
-                    );
-                }
-            })
+            .register_recv_cb(move |info, data| callback_queue.push_frame(*info.src_addr, data))
             .context("failed to register ESP-NOW receive callback")?;
 
         Ok(Self {
@@ -901,9 +1056,9 @@ impl Drop for SendCbScope<'_> {
 }
 
 impl EspNowDriver for EspIdfEspNow {
-    type Error = anyhow::Error;
+    type Error = EspIdfEspNowError;
 
-    fn add_peer(&self, config: &PeerConfig) -> anyhow::Result<()> {
+    fn add_peer(&self, config: &PeerConfig) -> Result<(), Self::Error> {
         let peer_info = PeerInfo {
             peer_addr: config.mac,
             channel: config.channel,
@@ -919,24 +1074,27 @@ impl EspNowDriver for EspIdfEspNow {
         self.esp_now
             .add_peer(peer_info)
             .context("failed to add ESP-NOW peer")
+            .map_err(EspIdfEspNowError::Driver)
     }
 
-    fn remove_peer(&self, mac: &MacAddress) -> anyhow::Result<()> {
+    fn remove_peer(&self, mac: &MacAddress) -> Result<(), Self::Error> {
         self.esp_now
             .del_peer(*mac)
             .context("failed to remove ESP-NOW peer")
+            .map_err(EspIdfEspNowError::Driver)
     }
 
-    fn send(&self, mac: &MacAddress, data: &[u8]) -> anyhow::Result<()> {
-        juggler::espnow::validate_payload(data)
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("payload validation failed")?;
+    fn send(&self, mac: &MacAddress, data: &[u8]) -> Result<(), Self::Error> {
+        if data.len() > MAX_DATA_LEN {
+            return Err(EspIdfEspNowError::PayloadTooLarge { len: data.len() });
+        }
         self.esp_now
             .send(*mac, data)
             .context("failed to send ESP-NOW frame")
+            .map_err(EspIdfEspNowError::Driver)
     }
 
     fn try_recv(&self) -> Option<EspNowEvent> {
-        self.rx.try_recv().ok()
+        self.rx.pop()
     }
 }

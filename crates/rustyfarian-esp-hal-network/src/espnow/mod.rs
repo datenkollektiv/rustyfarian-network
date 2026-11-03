@@ -19,10 +19,12 @@
 //!   `WiFiManager::init_async` starts it; an owned-radio firmware calls it itself.
 //! * A global heap (`esp_alloc::heap_allocator!`): the Wi-Fi blob and every received frame allocate.
 //! * No embassy executor is needed for the sync [`EspNowDriver`] methods.
-//!   The `async` helpers ([`EspHalEspNow::recv_async`], [`EspHalEspNow::send_async`],
-//!   [`EspHalEspNow::send_async_timeout`], [`EspHalEspNow::scan_for_peer`]) need one, the sender
-//!   runner ([`EspHalEspNow::run_sender`]) must be spawned for the send helpers, and an `embassy-time` driver (provided by
+//!   The `async` helpers ([`EspHalEspNow::receive`], [`EspHalEspNow::send_acked`],
+//!   [`EspHalEspNow::scan_for_peer`]) need one, the sender runner ([`EspHalEspNow::run_sender`])
+//!   must be spawned for the send helpers, and an `embassy-time` driver (provided by
 //!   `esp_rtos` with the `embassy` feature that `espnow` implies).
+//!   The same three methods and [`EspHalEspNow::pinned_channel`] form the shared
+//!   [`EspNowLink`] trait that the ESP-IDF tier implements too.
 //! * `esp-radio` allows a single ESP-NOW instance per boot; a second constructor call returns
 //!   [`EspHalEspNowError::AlreadyInitialised`] while the first handle is alive.
 //!
@@ -31,13 +33,17 @@
 //! * [`EspNowDriver::send`] blocks for the TX duration (about 1-30 ms including 802.11 retries):
 //!   `esp-radio`'s send waiter busy-spins until the send callback fired.
 //!   It ignores the MAC-layer ACK, like the IDF `send`; [`EspHalEspNow::send_and_wait`] reports it.
-//!   Prefer [`EspHalEspNow::send_async`] in embassy tasks (it needs the runner).
+//!   Prefer [`EspHalEspNow::send_acked`] in embassy tasks (it needs the runner).
+//!   Both sync forms return [`EspHalEspNowError::ScanInProgress`] while a scan runs.
 //! * Only one send can be in flight.
 //!   The sender sits in a take-out cell; a concurrent sender gets [`EspHalEspNowError::Busy`].
 //!   No critical section or interrupt-masking lock is ever held across a send.
 //! * Async sends and scan probes go through [`EspHalEspNow::run_sender`], a runner task that owns every
 //!   asynchronous transmission and never drops a send future; a cancelled or timed-out caller never
 //!   orphans a completion, so a late send callback cannot be attributed to the next send.
+//!   The queue, request ids, deadlines, cancellation and the scan-versus-send exclusion are the
+//!   shared [`juggler::espnow::TxCore`], so both tiers behave alike; an application send during a
+//!   scan fails at once with [`EspHalEspNowError::ScanInProgress`].
 //!   An async sender waits up to 100 ms (or its own deadline) for a just-spawned runner to start;
 //!   without a running runner it then fails with [`EspHalEspNowError::NoSenderRunner`].
 //!   The sync [`EspNowDriver::send`] and [`EspHalEspNow::send_and_wait`] lease the sender directly,
@@ -45,7 +51,8 @@
 //!   If the radio never fires the send callback, the runner (and a sync send) waits forever, like `esp-radio`'s own send waiter.
 //! * Receive: `esp-radio` keeps a static 10-frame queue that drops the oldest frame on overflow and
 //!   cannot be resized (the IDF tier defaults to 32).
-//!   Drain it at the frame rate of the busiest peer.
+//!   Drain it at the frame rate of the busiest peer; [`EspHalEspNow::receive`] is safe to call
+//!   from several tasks, and each frame goes to exactly one of them.
 //!   Frames can reach 1470 bytes (ESP-NOW v2); frames above [`MAX_DATA_LEN`] (250) are dropped,
 //!   counted ([`EspHalEspNow::oversize_dropped`]) and reported with a rate-limited warning.
 //!   They are never truncated.
@@ -93,9 +100,10 @@ mod driver;
 pub use driver::EspHalEspNow;
 
 pub use juggler::espnow::{
-    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
-    SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
+    ClassifySend, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig, ScanConfig,
+    ScanError, ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
 };
+use juggler::espnow::{Completion, Refusal, ScanRefusal};
 pub use juggler::wifi::TxPowerLevel;
 
 #[cfg(all(
@@ -113,8 +121,6 @@ pub const MAX_CHANNEL: u8 = 14;
 pub const MIN_TX_POWER_QUARTER_DBM: i8 = 8;
 /// Highest TX power accepted by the driver, in quarter dBm (21 dBm).
 pub const MAX_TX_POWER_QUARTER_DBM: i8 = 84;
-/// Every n-th oversize frame is logged after the first one.
-const OVERSIZE_LOG_EVERY: u32 = 32;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -231,6 +237,15 @@ pub enum EspHalEspNowError {
     Timeout,
     /// An async send needs [`EspHalEspNow::run_sender`] to be running.
     NoSenderRunner,
+    /// A peer scan holds the radio: an application send is refused, or was still queued when the
+    /// scan began and was dropped unsent.
+    /// Never transmitted, so it counts as a local failure.
+    ScanInProgress,
+    /// `send_acked` to the broadcast address: broadcast frames are never acknowledged.
+    /// Use [`EspNowDriver::send`] to broadcast.
+    Broadcast,
+    /// The send queue was shut down; the handle never does this today.
+    Shutdown,
     /// ESP-NOW driver error.
     Radio(RadioError),
     /// [`EspHalEspNow::scan_for_peer`] did not find the peer or could not register it.
@@ -255,6 +270,9 @@ impl core::fmt::Display for EspHalEspNowError {
             Self::SendFailed => write!(f, "ESP-NOW frame was not acknowledged"),
             Self::Timeout => write!(f, "ESP-NOW send did not complete in time"),
             Self::NoSenderRunner => write!(f, "the ESP-NOW sender runner is not running"),
+            Self::ScanInProgress => write!(f, "an ESP-NOW peer scan holds the radio"),
+            Self::Broadcast => write!(f, "broadcast frames are never acknowledged"),
+            Self::Shutdown => write!(f, "the ESP-NOW send queue was shut down"),
             Self::Radio(e) => write!(f, "ESP-NOW driver error: {e:?}"),
             Self::Scan(e) => write!(f, "ESP-NOW scan failed: {e}"),
             #[cfg(all(feature = "espnow", any(feature = "esp32c3", feature = "esp32c6")))]
@@ -264,6 +282,20 @@ impl core::fmt::Display for EspHalEspNowError {
 }
 
 impl core::error::Error for EspHalEspNowError {}
+
+impl ClassifySend for EspHalEspNowError {
+    /// Only a frame that was transmitted but not acknowledged (`SendFailed`) is `NoAck`.
+    ///
+    /// Everything else means the frame never went out, so the peer never had a chance to answer:
+    /// busy sender, bad frame, driver error, a scan in progress, and `Timeout` (on esp-hal a
+    /// timeout always means the send never started, see ADR 020).
+    fn outcome(&self) -> SendOutcome {
+        match self {
+            Self::SendFailed => SendOutcome::NoAck,
+            _ => SendOutcome::Local,
+        }
+    }
+}
 
 // ─── Pure helpers (host-tested) ─────────────────────────────────────────────
 
@@ -288,17 +320,40 @@ pub(crate) fn validate_frame_len(data: &[u8]) -> Result<(), EspHalEspNowError> {
         .map_err(|_| EspHalEspNowError::PayloadTooLarge { len: data.len() })
 }
 
-/// Maps the result of a probe send to the [`SendOutcome`] the scan machine expects.
+/// The error for a request that [`TxCore::submit`] refused.
 ///
-/// `Ok` is a MAC-layer ACK; a transmitted but unacknowledged frame (`SendFailed`) is `NoAck`;
-/// everything else means the frame never went out and is `Local`: busy sender, bad frame,
-/// driver error, and `Timeout` (on esp-hal a timeout always means the send never started,
-/// see ADR 020).
-pub(crate) fn probe_outcome(result: Result<(), EspHalEspNowError>) -> SendOutcome {
-    match result {
-        Ok(()) => SendOutcome::Acked,
-        Err(EspHalEspNowError::SendFailed) => SendOutcome::NoAck,
-        Err(_) => SendOutcome::Local,
+/// `Full` only reaches here when a caller gave up waiting for a slot, hence `Timeout`.
+pub(crate) fn refusal_error(refusal: Refusal, len: usize) -> EspHalEspNowError {
+    match refusal {
+        Refusal::Full => EspHalEspNowError::Timeout,
+        Refusal::Scanning => EspHalEspNowError::ScanInProgress,
+        Refusal::TooLarge => EspHalEspNowError::PayloadTooLarge { len },
+        Refusal::Broadcast => EspHalEspNowError::Broadcast,
+        Refusal::Shutdown => EspHalEspNowError::Shutdown,
+    }
+}
+
+/// The error for a scan that [`TxCore::begin_scan`] refused.
+pub(crate) fn scan_refusal_error(refusal: ScanRefusal) -> EspHalEspNowError {
+    match refusal {
+        ScanRefusal::Busy => EspHalEspNowError::Busy,
+        ScanRefusal::NotOwned => EspHalEspNowError::ControllerNotOwned,
+    }
+}
+
+/// The result a caller gets for a finished request.
+///
+/// A request still queued at its deadline is `Timeout`; one dropped because a scan began is
+/// `ScanInProgress`.
+/// Both mean the frame never went out.
+pub(crate) fn completion_result(
+    completion: Completion<Result<(), EspHalEspNowError>>,
+) -> Result<(), EspHalEspNowError> {
+    match completion {
+        Completion::Done(result) => result,
+        Completion::Expired => Err(EspHalEspNowError::Timeout),
+        Completion::Preempted => Err(EspHalEspNowError::ScanInProgress),
+        Completion::Shutdown => Err(EspHalEspNowError::Shutdown),
     }
 }
 
@@ -347,24 +402,6 @@ pub(crate) fn plan_peer(config: &PeerConfig) -> Result<PeerPlan, EspHalEspNowErr
 /// registered by `esp-radio` itself.
 pub(crate) fn existing_peer_is_idempotent(plan: &PeerPlan) -> bool {
     plan.mac == BROADCAST_MAC && plan.interface == WifiInterface::Sta
-}
-
-/// Builds the event for a received frame, or returns the oversize length.
-///
-/// `EspNowEvent` holds 250 bytes; longer frames must never reach it.
-pub(crate) fn frame_event(src: MacAddress, data: &[u8]) -> Result<EspNowEvent, usize> {
-    if data.len() > MAX_DATA_LEN {
-        Err(data.len())
-    } else {
-        Ok(EspNowEvent::new(src, data))
-    }
-}
-
-/// Rate limit for the oversize warning: the first drop and then every 32nd.
-pub(crate) fn should_log_oversize(dropped_so_far: u32) -> bool {
-    dropped_so_far
-        .wrapping_sub(1)
-        .is_multiple_of(OVERSIZE_LOG_EVERY)
 }
 
 #[cfg(test)]
@@ -484,36 +521,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_event_keeps_payload_up_to_limit() {
-        let data = [0xA5u8; MAX_DATA_LEN];
-        let ev = frame_event(MAC, &data).expect("event");
-        assert_eq!(ev.mac, MAC);
-        assert_eq!(ev.payload(), &data[..]);
-        let short = frame_event(MAC, b"hi").expect("event");
-        assert_eq!(short.payload(), b"hi");
-    }
-
-    #[test]
-    fn frame_event_rejects_oversize_without_truncating() {
-        let data = [0u8; MAX_DATA_LEN + 1];
-        assert_eq!(frame_event(MAC, &data).unwrap_err(), MAX_DATA_LEN + 1);
-        let v2 = [0u8; 1470];
-        assert_eq!(frame_event(MAC, &v2).unwrap_err(), 1470);
-    }
-
-    #[test]
-    fn oversize_log_is_rate_limited() {
-        assert!(should_log_oversize(1));
-        assert!(!should_log_oversize(2));
-        assert!(!should_log_oversize(32));
-        assert!(should_log_oversize(33));
-        assert!(!should_log_oversize(34));
-        assert!(should_log_oversize(65));
-        let logged = (1..=1000u32).filter(|n| should_log_oversize(*n)).count();
-        assert_eq!(logged, 32);
-    }
-
-    #[test]
     fn expiry_is_reached_at_the_deadline_and_never_without_one() {
         let at = Duration::from_millis(100);
         assert!(!expired(Some(at), Duration::from_millis(99)));
@@ -537,10 +544,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_outcome_maps_send_results() {
-        assert_eq!(probe_outcome(Ok(())), SendOutcome::Acked);
+    fn only_an_unacknowledged_frame_is_no_ack() {
         assert_eq!(
-            probe_outcome(Err(EspHalEspNowError::SendFailed)),
+            SendOutcome::of(&Ok::<(), EspHalEspNowError>(())),
+            SendOutcome::Acked
+        );
+        assert_eq!(
+            SendOutcome::of(&Err(EspHalEspNowError::SendFailed)),
             SendOutcome::NoAck
         );
         for e in [
@@ -549,8 +559,76 @@ mod tests {
             EspHalEspNowError::PayloadTooLarge { len: 251 },
             EspHalEspNowError::Radio(RadioError::Internal),
             EspHalEspNowError::InvalidChannel(0),
+            EspHalEspNowError::NoSenderRunner,
+            EspHalEspNowError::ScanInProgress,
+            EspHalEspNowError::Broadcast,
+            EspHalEspNowError::Shutdown,
+            EspHalEspNowError::ControllerNotOwned,
         ] {
-            assert_eq!(probe_outcome(Err(e)), SendOutcome::Local);
+            assert_eq!(SendOutcome::of(&Err(e)), SendOutcome::Local);
+        }
+    }
+
+    #[test]
+    fn refusals_map_to_errors_that_never_went_on_air() {
+        assert_eq!(
+            refusal_error(Refusal::Scanning, 3),
+            EspHalEspNowError::ScanInProgress
+        );
+        assert_eq!(
+            refusal_error(Refusal::Broadcast, 3),
+            EspHalEspNowError::Broadcast
+        );
+        assert_eq!(
+            refusal_error(Refusal::TooLarge, 251),
+            EspHalEspNowError::PayloadTooLarge { len: 251 }
+        );
+        assert_eq!(refusal_error(Refusal::Full, 3), EspHalEspNowError::Timeout);
+        assert_eq!(
+            refusal_error(Refusal::Shutdown, 3),
+            EspHalEspNowError::Shutdown
+        );
+        for refusal in [
+            Refusal::Full,
+            Refusal::Scanning,
+            Refusal::TooLarge,
+            Refusal::Broadcast,
+            Refusal::Shutdown,
+        ] {
+            assert_eq!(
+                SendOutcome::of(&Err(refusal_error(refusal, 0))),
+                SendOutcome::Local
+            );
+        }
+    }
+
+    #[test]
+    fn scan_refusals_map_to_busy_and_controller_not_owned() {
+        assert_eq!(
+            scan_refusal_error(ScanRefusal::Busy),
+            EspHalEspNowError::Busy
+        );
+        assert_eq!(
+            scan_refusal_error(ScanRefusal::NotOwned),
+            EspHalEspNowError::ControllerNotOwned
+        );
+    }
+
+    #[test]
+    fn completions_map_to_results_and_only_a_real_nack_is_no_ack() {
+        assert_eq!(completion_result(Completion::Done(Ok(()))), Ok(()));
+        assert_eq!(
+            completion_result(Completion::Done(Err(EspHalEspNowError::SendFailed))),
+            Err(EspHalEspNowError::SendFailed)
+        );
+        for (completion, error) in [
+            (Completion::Expired, EspHalEspNowError::Timeout),
+            (Completion::Preempted, EspHalEspNowError::ScanInProgress),
+            (Completion::Shutdown, EspHalEspNowError::Shutdown),
+        ] {
+            let result = completion_result(completion);
+            assert_eq!(result, Err(error));
+            assert_eq!(SendOutcome::of(&result), SendOutcome::Local);
         }
     }
 

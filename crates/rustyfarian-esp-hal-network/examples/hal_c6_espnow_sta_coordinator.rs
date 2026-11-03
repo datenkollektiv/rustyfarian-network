@@ -152,7 +152,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-/// Owns every async ESP-NOW transmission (`send_async*` and scan probes); never cancelled.
+/// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
 #[embassy_executor::task]
 async fn sender_task(espnow: &'static EspHalEspNow) -> ! {
     espnow.run_sender().await
@@ -162,14 +162,7 @@ async fn sender_task(espnow: &'static EspHalEspNow) -> ! {
 #[embassy_executor::task]
 async fn rx_task(espnow: &'static EspHalEspNow) {
     loop {
-        let event = match espnow.recv_async().await {
-            Ok(event) => event,
-            Err(e) => {
-                println!("[espnow] recv failed: {}", e);
-                Timer::after(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+        let event = espnow.receive().await;
         RX_FRAMES.fetch_add(1, Ordering::Relaxed);
 
         // Unicast needs a peer entry; channel 0 follows the associated channel.
@@ -180,7 +173,7 @@ async fn rx_task(espnow: &'static EspHalEspNow) {
             }
         }
         match espnow
-            .send_async_timeout(
+            .send_acked(
                 &event.mac,
                 event.payload(),
                 core::time::Duration::from_millis(100),

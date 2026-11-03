@@ -167,8 +167,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sender_task(espnow).unwrap());
     spawner.spawn(rx_task(espnow).unwrap());
 
-    let mut pinned: Option<u8> = FIRST_CHANNEL;
-    scan_until_found(espnow, &coordinator, &mut pinned).await;
+    scan_until_found(espnow, &coordinator).await;
 
     let mut ticker = Ticker::every(Duration::from_millis(SEND_PERIOD_MS));
     let mut seq: u32 = 0;
@@ -183,10 +182,7 @@ async fn main(spawner: Spawner) {
         frame[4..].copy_from_slice(&(Instant::now().as_millis() as u32).to_be_bytes());
 
         sent += 1;
-        match espnow
-            .send_async_timeout(&coordinator, &frame, ACK_TIMEOUT)
-            .await
-        {
+        match espnow.send_acked(&coordinator, &frame, ACK_TIMEOUT).await {
             Ok(()) => {
                 acked += 1;
                 consecutive_failures = 0;
@@ -213,7 +209,7 @@ async fn main(spawner: Spawner) {
                 per_10k / 100,
                 per_10k % 100,
                 RX_ECHOES.load(Ordering::Relaxed),
-                pinned,
+                espnow.pinned_channel(),
                 espnow.oversize_dropped()
             );
         }
@@ -223,22 +219,18 @@ async fn main(spawner: Spawner) {
                 "[espnow] {} sends unacknowledged - rescanning",
                 consecutive_failures
             );
-            scan_until_found(espnow, &coordinator, &mut pinned).await;
+            scan_until_found(espnow, &coordinator).await;
             consecutive_failures = 0;
             ticker.reset();
         }
     }
 }
 
-/// Scans until the coordinator answers; `pinned` keeps the last good channel across attempts.
-async fn scan_until_found(
-    espnow: &EspHalEspNow,
-    coordinator: &MacAddress,
-    pinned: &mut Option<u8>,
-) {
+/// Scans until the coordinator answers; the driver keeps the last good channel across attempts.
+async fn scan_until_found(espnow: &EspHalEspNow, coordinator: &MacAddress) {
     let scan = ScanConfig::new(PROBE);
     loop {
-        match espnow.scan_for_peer(coordinator, &scan, pinned).await {
+        match espnow.scan_for_peer(coordinator, &scan).await {
             Ok(result) => {
                 println!("[espnow] coordinator found on channel {}", result.channel);
                 if !espnow.peer_exists(coordinator) {
@@ -257,7 +249,7 @@ async fn scan_until_found(
     }
 }
 
-/// Owns every async ESP-NOW transmission (`send_async*` and scan probes); never cancelled.
+/// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
 #[embassy_executor::task]
 async fn sender_task(espnow: &'static EspHalEspNow) -> ! {
     espnow.run_sender().await
@@ -268,16 +260,9 @@ async fn sender_task(espnow: &'static EspHalEspNow) -> ! {
 #[embassy_executor::task]
 async fn rx_task(espnow: &'static EspHalEspNow) {
     loop {
-        match espnow.recv_async().await {
-            Ok(_) => {
-                let n = RX_ECHOES.load(Ordering::Relaxed);
-                RX_ECHOES.store(n.wrapping_add(1), Ordering::Relaxed);
-            }
-            Err(e) => {
-                println!("[espnow] recv failed: {}", e);
-                Timer::after(Duration::from_millis(100)).await;
-            }
-        }
+        let _ = espnow.receive().await;
+        let n = RX_ECHOES.load(Ordering::Relaxed);
+        RX_ECHOES.store(n.wrapping_add(1), Ordering::Relaxed);
     }
 }
 

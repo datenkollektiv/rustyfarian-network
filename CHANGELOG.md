@@ -32,9 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- BREAKING: `rustyfarian-esp-idf-network` `EspNowDriver::Error` for `EspIdfEspNow` is now `espnow::EspIdfEspNowError` (variants `NoAck`, `Timeout`, `Busy`, `ScanInProgress`, `RadioNotOwned`, `PayloadTooLarge { len }`, `Broadcast`, `Shutdown`, `Scan(ScanError)`, `Driver(anyhow::Error)`) instead of `anyhow::Error`; it implements `std::error::Error` and `juggler::espnow::ClassifySend` (only `NoAck` is `SendOutcome::NoAck`).
+  Migration: `?` into `anyhow::Result` and `.context(..)` keep working; code that names `anyhow::Error` as the driver error (for example generic code bound to `EspNowDriver<Error = anyhow::Error>`) must use `EspIdfEspNowError`.
+  The inherent `scan_for_peer`, `send_and_wait` and the constructors still return `anyhow::Result`.
+  The `espnow` feature now also enables `juggler/std`, and `EspIdfEspNow::receive` (async, safe for concurrent callers, each frame to exactly one) shares one queue with `try_recv` (tier-parity ESP-NOW Step 4a, B1).
 - `juggler::espnow::SendOutcome::Error` is renamed `Local` and means the frame was not transmitted (queue full, no sender runner, invalid peer, driver error, or a timeout before transmission); `NoAck` is a frame that was transmitted but not acknowledged.
   The type is unreleased, so the rename is not breaking.
   esp-hal `scan_for_peer` now reports a send timeout as `Local`, because on esp-hal a timeout always means the frame never started: a probe that never went out no longer counts as no ACK or as a probed channel, and is recorded as a `ScanFault::ProbeSend`.
+- esp-hal `EspHalEspNow` runs on the shared `juggler::espnow::TxCore` and implements `juggler::espnow::EspNowLink` (tier-parity ESP-NOW Step 3); the esp-hal ESP-NOW API is unreleased, so these renames and refusals are not breaking.
+  `send_async_timeout` is now `send_acked(mac, data, timeout)` (`Duration::MAX` means unbounded), `send_async` is removed (use `send_acked` with `Duration::MAX`), and `recv_async` is now the infallible `receive()`, which is safe to call from several tasks (each frame goes to exactly one) instead of returning `Busy`.
+  The driver now keeps the pinned channel: `scan_for_peer(&mac, &config)` loses its `pinned` argument, `pinned_channel()` reports it (the configured channel at start, then the last successful scan's), and a failed or cancelled scan leaves it unchanged.
+  A scan on a `from_controller` handle is refused with `ControllerNotOwned`, and a concurrent scan with `Busy`.
+  New `EspHalEspNowError::ScanInProgress` (application sends during a scan, async and sync, and queued ones the scan preempts), `Broadcast` (`send_acked` to the broadcast address, which is never acknowledged) and `Shutdown`; `probe_outcome` became `impl ClassifySend` (only `SendFailed` is `NoAck`).
+  The scan holds the radio against application sends until channel, TX power and pin are restored, also when its future is dropped, and waits out a frame already on the air before its first radio action.
+  Oversize receive uses `EspNowEvent::try_new` and `OversizeLog`; the hal copies are gone.
 - `juggler::mqtt::MqttClient::publish` now waits for admission queue space on both tiers and never evicts a queued message to make room.
   The contract is implemented once, in the new `juggler::mqtt::Outbox::publish_waiting`, which the ESP-IDF trait impl delegates to; esp-hal's existing publish-channel send already implemented it, so its code is unchanged.
   The ESP-IDF pre-client queue therefore no longer drops its oldest entry when a `publish` arrives with all slots taken, while the legacy synchronous `MqttHandle::publish_with` keeps dropping (and counting) it — its behaviour is unchanged.
@@ -208,6 +219,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rustyfarian-esp-idf-network` ESP-NOW receive no longer truncates frames above 250 bytes in release builds or panics on them in debug builds: the receive callback now drops them, counts them (`EspIdfEspNow::oversize_dropped`) and logs the first and then every 32nd drop (tier-parity ESP-NOW Step 4a, B5).
 - `rustyfarian-esp-idf-network` `EspIdfEspNow::init_with_radio_sta` came up as SoftAP after an erased flash, so every ESP-NOW send and scan probe failed: it never called `set_configuration`, the only esp-idf-svc call that sets the Wi-Fi mode, and the driver kept the mode stored in NVS; it now sets STA mode before starting the radio.
 - esp-hal `MqttHandle::wait_connected` could strand a second waiter because the `Signal` that woke it parks one waker; the MQTT wait and `WifiLink::wait_connected` now share `juggler::waker_slots::poll_ready` over a four-slot `WakerSlots`, re-checking every 500 ms beyond the slots, and the `MqttClient` trait documents that any number of tasks may wait.
 - `LinkSupervisor::suspend` reported the link as down only after the radio had stopped, so the MQTT gate learned about a deliberate suspend from the transport's corpse: esp-mqtt logged an error and the session scheduled a retry that the gate then had to park (runbook R3).

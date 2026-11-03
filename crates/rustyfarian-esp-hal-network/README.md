@@ -184,8 +184,11 @@ Two examples form a pair (feature `espnow`, ESP32-C3 and ESP32-C6; ADR 020):
   `scan_for_peer` finds the coordinator (`ESPNOW_PEER_MAC`, optional `ESPNOW_CHANNEL` as first pin), then a frame goes out every 100 ms with the ACK counted and the failure rate logged every 10 s; 20 consecutive unacknowledged sends trigger a rescan.
   This is the traffic pattern of hardware gate G-E1 (see `docs/ROADMAP.md`).
 
-Async sends and scan probes need the sender runner: spawn `espnow.run_sender()` once in an `embassy_executor::task` (both examples do) before the first `send_async*` or `scan_for_peer`.
+Async sends and scan probes need the sender runner: spawn `espnow.run_sender()` once in an `embassy_executor::task` (both examples do) before the first `send_acked` or `scan_for_peer`.
 Without it they return `NoSenderRunner`; the sync `send` / `send_and_wait` work without it.
+`EspHalEspNow` implements the shared `juggler::espnow::EspNowLink` (`send_acked`, `receive`, `scan_for_peer`, `pinned_channel`), so generic code runs on both tiers.
+`send_acked` refuses the broadcast address (`Broadcast`), and any application send during a scan fails with `ScanInProgress`.
+`scan_for_peer(&mac, &config)` needs a `new_owned` handle (`ControllerNotOwned` otherwise) and the driver keeps the pinned channel.
 
 ```sh
 WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example hal_c6_espnow_sta_coordinator
@@ -193,7 +196,7 @@ ESPNOW_PEER_MAC="aa:bb:cc:dd:ee:ff" just build-example hal_c3_espnow_peer
 ```
 
 Credentials are read with `option_env!` at build time and never logged.
-The receive queue of `esp-radio` holds 10 frames and drops the oldest, and frames above 250 B are dropped and counted, so drain with `recv_async` in a dedicated task.
+The receive queue of `esp-radio` holds 10 frames and drops the oldest, and frames above 250 B are dropped and counted, so drain with `receive` in a dedicated task.
 
 ## Example: Async SoftAP + Provisioning
 

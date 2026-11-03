@@ -1,8 +1,12 @@
 //! Hardware half of the ESP-NOW driver: `esp-radio` glue behind [`EspHalEspNow`].
 
+use core::cell::RefCell;
+use core::future::poll_fn;
+use core::task::Poll;
+use core::time::Duration;
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
-use embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use esp_radio::esp_now::{
     EspNow, EspNowError, EspNowManager, EspNowReceiver, EspNowSender, EspNowWifiInterface,
@@ -10,15 +14,16 @@ use esp_radio::esp_now::{
 };
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use juggler::espnow::{
-    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanAction, ScanConfig, ScanInput,
-    ScanMachine, ScanResult, SendOutcome, WifiInterface,
+    Completion, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, Next, OversizeLog, PeerConfig,
+    Refusal, ScanAction, ScanConfig, ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome,
+    TxCore, TxId, WifiInterface,
 };
 use juggler::wifi::TxPowerLevel;
 
-use super::cell::{Lease, SharedCopy, Singleton, TakeCell};
+use super::cell::{Gate, Lease, SharedCopy, Singleton, TakeCell, WaiterList, Wakeups};
 use super::{
-    existing_peer_is_idempotent, expired, frame_event, plan_peer, probe_outcome,
-    runner_wait_deadline, should_log_oversize, validate_channel, validate_frame_len,
+    completion_result, existing_peer_is_idempotent, expired, plan_peer, refusal_error,
+    runner_wait_deadline, scan_refusal_error, validate_channel, validate_frame_len,
     validate_tx_power, EspHalEspNowError, EspNowConfig, PeerPlan, RadioError,
     DEFAULT_TX_POWER_QUARTER_DBM, MAX_DATA_LEN,
 };
@@ -32,22 +37,37 @@ const RUNNER_LEASE_RETRY_MS: u64 = 1;
 const RUNNER_START_POLL_MS: u64 = 1;
 /// How long an async send waits for `run_sender` to start before it fails with `NoSenderRunner`.
 const RUNNER_START_GRACE_MS: u64 = 100;
+/// Poll interval while a scan waits for a sync send to hand the sender back.
+const SCAN_SENDER_POLL_MS: u64 = 1;
 
-/// One transmission handed from a caller to [`EspHalEspNow::run_sender`]; the payload is copied.
-struct SendRequest {
-    id: u32,
-    mac: MacAddress,
-    len: u8,
-    data: [u8; MAX_DATA_LEN],
-    /// The runner completes the request with `Timeout` instead of sending it once this has passed.
-    deadline: Option<embassy_time::Instant>,
+/// Request slots of the send queue: one live application request per waiting caller up to this
+/// many, plus the scan's probe and one abandoned frame still on the air.
+const TX_SLOTS: usize = 4;
+/// Callers that park while every slot is taken; one more re-polls itself until a slot frees.
+const FULL_WAITERS: usize = 4;
+/// Concurrent `receive` callers that park; one more re-polls itself until its turn.
+const RECEIVE_WAITERS: usize = 4;
+/// Wakers one locked operation can collect: every slot, every parked waiter, the scan gate.
+const WAKE_CAPACITY: usize = TX_SLOTS + FULL_WAITERS + 2;
+
+type TxResult = Result<(), EspHalEspNowError>;
+type Wakes = Wakeups<WAKE_CAPACITY>;
+
+/// Everything behind the one send-queue lock.
+struct TxState {
+    core: TxCore<TxResult, TX_SLOTS>,
+    /// Callers waiting for a free slot ([`Refusal::Full`]).
+    full_waiters: WaiterList<FULL_WAITERS>,
+    /// The scan, waiting for the frame on the air to finish before its first radio action.
+    idle_waiters: WaiterList<1>,
 }
 
-/// Outcome of the request with the same `id`.
-#[derive(Clone, Copy)]
-struct SendDone {
-    id: u32,
-    result: Result<(), EspHalEspNowError>,
+/// One frame handed out by [`TxCore::next`], copied so the lock can be released to transmit.
+struct Frame {
+    id: TxId,
+    mac: MacAddress,
+    len: usize,
+    data: [u8; MAX_DATA_LEN],
 }
 
 /// One ESP-NOW instance exists per boot (`esp-radio` panics on a second one).
@@ -66,21 +86,18 @@ pub struct EspHalEspNow {
     owns_controller: bool,
     /// `None` until this handle sets a level (`from_controller` without a configured power).
     tx_power_quarter_dbm: SharedCopy<Option<i8>>,
-    /// Transmissions queued for the sender runner.
-    requests: Channel<CriticalSectionRawMutex, SendRequest, 1>,
-    /// Result of the transmission the runner finished last.
-    done: Signal<CriticalSectionRawMutex, SendDone>,
-    /// Serializes async callers from enqueue until their result is consumed.
-    callers: Mutex<CriticalSectionRawMutex, ()>,
-    next_id: SharedCopy<u32>,
+    /// The send queue: request slots, ids, deadlines, cancellation and scan exclusion.
+    /// One lock, held for a few instructions and never across an await or a send.
+    tx: Mutex<CriticalSectionRawMutex, RefCell<TxState>>,
+    /// Wakes the runner after a submission (latched, so a wake-up is never lost).
+    runner_wake: Signal<CriticalSectionRawMutex, ()>,
     /// Set while [`EspHalEspNow::run_sender`] is being polled.
     runner_active: SharedCopy<bool>,
-    /// Id of the request the runner has taken: set before its expiry check, cleared after its
-    /// `SendDone` was signalled.
-    in_flight: SharedCopy<Option<u32>>,
-    oversize_dropped: SharedCopy<u32>,
-    /// Set while a [`EspHalEspNow::scan_for_peer`] call runs.
-    scan_active: SharedCopy<bool>,
+    /// Serialises [`EspHalEspNow::receive`] callers: `esp-radio` keeps one receive waker.
+    receive_gate: Gate<RECEIVE_WAITERS>,
+    oversize: OversizeLog,
+    /// The channel the driver keeps pinned: the configured one at start, then the last scan's.
+    pinned: SharedCopy<Option<u8>>,
     /// Declared last: released after the `esp-radio` parts have been dropped.
     _instance: Singleton<'static>,
 }
@@ -169,6 +186,7 @@ impl EspHalEspNow {
         let handle = Self::assemble(esp_now, Some(controller), Some(tx_power), instance);
         if let Some(channel) = config.channel() {
             handle.set_channel(channel)?;
+            handle.pinned.set(Some(channel));
         }
         Ok(handle)
     }
@@ -191,14 +209,16 @@ impl EspHalEspNow {
             },
             owns_controller,
             tx_power_quarter_dbm: SharedCopy::new(tx_power_quarter_dbm),
-            requests: Channel::new(),
-            done: Signal::new(),
-            callers: Mutex::new(()),
-            next_id: SharedCopy::new(0),
+            tx: Mutex::new(RefCell::new(TxState {
+                core: TxCore::new(),
+                full_waiters: WaiterList::new(),
+                idle_waiters: WaiterList::new(),
+            })),
+            runner_wake: Signal::new(),
             runner_active: SharedCopy::new(false),
-            in_flight: SharedCopy::new(None),
-            oversize_dropped: SharedCopy::new(0),
-            scan_active: SharedCopy::new(false),
+            receive_gate: Gate::new(),
+            oversize: OversizeLog::new(),
+            pinned: SharedCopy::new(None),
             _instance: instance,
         }
     }
@@ -214,10 +234,12 @@ impl EspHalEspNow {
         out
     }
 
-    /// Pins the primary Wi-Fi channel (`1..=14`).
+    /// Sets the primary Wi-Fi channel (`1..=14`).
     ///
     /// For an unassociated station only; an associated station cannot leave its access point's
     /// channel.
+    /// This does not change [`EspHalEspNow::pinned_channel`]: that is the channel configured at
+    /// start or found by the last scan.
     ///
     /// # Errors
     ///
@@ -266,7 +288,17 @@ impl EspHalEspNow {
 
     /// Number of received frames dropped for exceeding [`MAX_DATA_LEN`] since start.
     pub fn oversize_dropped(&self) -> u32 {
-        self.oversize_dropped.get()
+        self.oversize.dropped()
+    }
+
+    /// The channel the driver keeps pinned, if any.
+    ///
+    /// That is the channel of [`EspNowConfig::with_channel`] on an owned radio, replaced by the
+    /// channel of every successful [`EspHalEspNow::scan_for_peer`].
+    /// A failed or cancelled scan leaves it as it was.
+    /// `None` on a [`EspHalEspNow::from_controller`] handle before its first scan.
+    pub fn pinned_channel(&self) -> Option<u8> {
+        self.pinned.get()
     }
 
     /// Sends and reports the MAC-layer ACK.
@@ -278,6 +310,7 @@ impl EspHalEspNow {
     /// # Errors
     ///
     /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
+    /// * [`EspHalEspNowError::ScanInProgress`] while a [`EspHalEspNow::scan_for_peer`] runs.
     /// * [`EspHalEspNowError::Busy`] while another send is in flight (including the sender runner
     ///   mid-transmission).
     /// * [`EspHalEspNowError::SendFailed`] when a unicast frame was not acknowledged.
@@ -285,14 +318,16 @@ impl EspHalEspNow {
     pub fn send_and_wait(&self, mac: &MacAddress, data: &[u8]) -> Result<(), EspHalEspNowError> {
         validate_frame_len(data)?;
         let mut sender = self.lease_sender()?;
+        self.refuse_during_scan()?;
         let waiter = sender.send(mac, data).map_err(map_error)?;
         waiter.wait().map_err(map_error)
     }
 
     /// Runs the sender: owns every asynchronous transmission of this handle.
     ///
-    /// [`EspHalEspNow::send_async`], [`EspHalEspNow::send_async_timeout`] and the probes of
-    /// [`EspHalEspNow::scan_for_peer`] queue their frame here and wait for the result.
+    /// [`EspHalEspNow::send_acked`] and the probes of [`EspHalEspNow::scan_for_peer`] queue their
+    /// frame in the shared [`TxCore`] and wait for the result; this runner takes them one at a
+    /// time.
     /// `esp-radio` has one global send-callback flag, no sequence number and no way to cancel a
     /// send future, so a transmission is polled to completion here and never dropped; a cancelled
     /// caller only stops waiting.
@@ -320,6 +355,16 @@ impl EspHalEspNow {
     /// Dropping this future by mistake clears the running flag; frames already queued then never
     /// complete.
     ///
+    /// The runner asks the queue for work, transmits, and reports back, one frame at a time, so
+    /// the queue's "wait until" answer (a frame in flight while queued requests carry deadlines)
+    /// cannot arise here; if it ever does, the runner sleeps until that time or the next
+    /// submission.
+    /// Requests are expired when the runner picks them up, and their callers also time out by
+    /// themselves.
+    /// A frame is marked in flight when it is handed out, a moment before the sender is leased;
+    /// while a sync send still holds the sender, a caller whose deadline passes therefore waits
+    /// for that sync send (a few tens of ms) before its own frame goes out.
+    ///
     /// Only one runner may run per handle: a second concurrent call logs an error and then does
     /// nothing, forever. It consumes no request and signals no result.
     pub async fn run_sender(&self) -> ! {
@@ -329,19 +374,57 @@ impl EspHalEspNow {
                 core::future::pending::<()>().await;
             }
         };
-        self.in_flight.set(None);
         loop {
-            let request = self.requests.receive().await;
-            let result = self.transmit(&request).await;
-            self.done.signal(SendDone {
-                id: request.id,
-                result,
-            });
-            self.in_flight.set(None);
+            match self.take_next() {
+                Ok(frame) => {
+                    let result = self.transmit(&frame).await;
+                    self.finish(frame.id, result);
+                }
+                Err(Some(until)) => {
+                    let _ =
+                        embassy_time::with_deadline(from_core_time(until), self.runner_wake.wait())
+                            .await;
+                }
+                Err(None) => self.runner_wake.wait().await,
+            }
         }
     }
 
-    async fn transmit(&self, request: &SendRequest) -> Result<(), EspHalEspNowError> {
+    /// Runs `f` on the send queue under its lock, then wakes whoever it collected.
+    ///
+    /// `f` must be short and must not call `with_tx` again.
+    fn with_tx<T>(&self, f: impl FnOnce(&mut TxState, &mut Wakes) -> T) -> T {
+        let mut wakes = Wakes::new();
+        let out = self.tx.lock(|state| f(&mut state.borrow_mut(), &mut wakes));
+        wakes.wake_all();
+        out
+    }
+
+    /// Asks the queue for the next frame, copying it out so the lock is released to transmit.
+    ///
+    /// `Err` carries what to wait for instead: a submission, or also this time when queued
+    /// requests carry deadlines.
+    fn take_next(&self) -> Result<Frame, Option<Duration>> {
+        let now = now_core();
+        self.with_tx(
+            |state, wakes| match state.core.next(now, &mut |waker| wakes.push(waker)) {
+                Next::Transmit { id, mac, data } => {
+                    let mut frame = Frame {
+                        id,
+                        mac,
+                        len: data.len(),
+                        data: [0; MAX_DATA_LEN],
+                    };
+                    frame.data[..data.len()].copy_from_slice(data);
+                    Ok(frame)
+                }
+                Next::WaitUntil(until) => Err(Some(until)),
+                Next::Idle => Err(None),
+            },
+        )
+    }
+
+    async fn transmit(&self, frame: &Frame) -> TxResult {
         let mut sender = loop {
             match self.sender.lease() {
                 Some(lease) => break lease,
@@ -351,18 +434,22 @@ impl EspHalEspNow {
                 }
             }
         };
-        // Marked only once the sender is held, so a caller whose deadline passes while a sync
-        // send still holds the lease is not made to wait for a transmission that never started.
-        // Set before the expiry check: see the invariant on `submit`.
-        self.in_flight.set(Some(request.id));
-        if expired(request.deadline, embassy_time::Instant::now()) {
-            return Err(EspHalEspNowError::Timeout);
-        }
-        let data = &request.data[..usize::from(request.len)];
         sender
-            .send_async(&request.mac, data)
+            .send_async(&frame.mac, &frame.data[..frame.len])
             .await
             .map_err(map_error)
+    }
+
+    /// Reports the result of the frame on the air and wakes its caller, the callers waiting for a
+    /// slot and a scan waiting for the air to clear.
+    fn finish(&self, id: TxId, result: TxResult) {
+        self.with_tx(|state, wakes| {
+            if let Some(waker) = state.core.complete(id, result) {
+                wakes.push(waker);
+            }
+            state.idle_waiters.drain_into(wakes);
+            state.full_waiters.drain_into(wakes);
+        });
     }
 
     /// Waits for `run_sender` to be polled for the first time, bounded by `deadline` and
@@ -399,145 +486,180 @@ impl EspHalEspNow {
 
     /// Queues one frame for the runner and waits for its result.
     ///
-    /// With a `deadline`, queueing, waiting for the sender and the start of the transmission are
-    /// bounded by it; once the runner holds the sender for the request (`in_flight`), the
-    /// transmission is waited out and its real result returned.
+    /// With a `deadline`, waiting for a free slot, queueing and the start of the transmission are
+    /// bounded by it; once the queue has handed the frame to the runner, the transmission is
+    /// waited out and its real result returned (`TxCore::poll_expired` decides under the lock).
     ///
-    /// Invariant behind the timeout path: the runner sets `in_flight` to the request's id only when
-    /// it holds the sender, before it reads the clock for the expiry check, and the caller reads
-    /// `in_flight` after its deadline passed. Either the caller sees the id (the runner may be
-    /// transmitting: wait for the result), or the runner reaches the expiry check later than the
-    /// caller's read, hence after the deadline, and drops the request as expired. The runner never
-    /// starts a transmission that the caller has abandoned, and a request stuck behind a sync send
-    /// past its deadline is dropped, not transmitted.
-    ///
-    /// Cancel-safe: dropping the future at any point leaves at most a queued request that the
-    /// runner still completes (or drops as expired); its result is skipped by the next caller (ids
-    /// differ).
+    /// Cancel-safe: dropping the future at any point abandons the request (`PendingSend`), so a
+    /// queued frame is never transmitted and a frame on the air has its result discarded.
     async fn submit(
         &self,
         mac: &MacAddress,
         data: &[u8],
         deadline: Option<embassy_time::Instant>,
-    ) -> Result<(), EspHalEspNowError> {
+        kind: SendKind,
+    ) -> TxResult {
         validate_frame_len(data)?;
         self.await_runner(deadline).await?;
-        // Held until the result is consumed, so no `SendDone` is overwritten before its caller
-        // has read it.
-        let _caller = bounded(deadline, self.callers.lock())
-            .await
-            .ok_or(EspHalEspNowError::Timeout)?;
-        let id = self.next_id.update(|n| n.wrapping_add(1));
-        let mut request = SendRequest {
-            id,
-            mac: *mac,
-            // Checked against `MAX_DATA_LEN` (250) above.
-            len: data.len() as u8,
-            data: [0; MAX_DATA_LEN],
-            deadline,
+        let id = self.enqueue(mac, data, deadline, kind).await?;
+        // No await sits between the queue accepting the request and this guard.
+        let mut pending = PendingSend {
+            radio: self,
+            id: Some(id),
         };
-        request.data[..data.len()].copy_from_slice(data);
-        bounded(deadline, self.requests.send(request))
-            .await
-            .ok_or(EspHalEspNowError::Timeout)?;
-        if let Some(result) = bounded(deadline, self.wait_done(id)).await {
-            return result;
-        }
-        // Deadline passed: see the invariant above.
-        if self.in_flight.get() == Some(id) && self.runner_active.get() {
-            return self.wait_done(id).await;
-        }
-        match self.done.try_take() {
-            Some(done) if done.id == id => done.result,
-            _ => Err(EspHalEspNowError::Timeout),
-        }
+        let result = self.wait_result(id, deadline).await;
+        pending.id = None;
+        result
     }
 
-    /// Waits for the `SendDone` of request `id`, skipping results of earlier requests.
-    async fn wait_done(&self, id: u32) -> Result<(), EspHalEspNowError> {
-        loop {
-            let done = self.done.wait().await;
-            if done.id == id {
-                return done.result;
-            }
-        }
-    }
-
-    /// Sends without blocking the executor and reports the MAC-layer ACK.
-    ///
-    /// `Ok` means a unicast peer acknowledged the frame; [`EspHalEspNowError::SendFailed`] means
-    /// it did not.
-    /// The transmission runs in [`EspHalEspNow::run_sender`]; concurrent callers queue up behind
-    /// each other.
-    /// There is no timeout: use [`EspHalEspNow::send_async_timeout`] to bound the wait.
-    /// Dropping the future is safe: the runner still completes the transmission.
-    ///
-    /// # Errors
-    ///
-    /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
-    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] did not start
-    ///   within 100 ms (or the timeout, if shorter).
-    /// * [`EspHalEspNowError::SendFailed`] when a unicast frame was not acknowledged.
-    /// * [`EspHalEspNowError::Radio`] if the driver rejects the frame.
-    pub async fn send_async(&self, mac: &MacAddress, data: &[u8]) -> Result<(), EspHalEspNowError> {
-        self.submit(mac, data, None).await
-    }
-
-    /// [`EspHalEspNow::send_async`] with a bounded wait.
-    ///
-    /// `timeout` bounds queueing and the start of transmission; a transmission that has already
-    /// started is waited out and its real result returned.
-    /// A request that did not start in time is never sent: the runner drops it.
-    ///
-    /// # Errors
-    ///
-    /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
-    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] did not start
-    ///   within 100 ms (or the timeout, if shorter).
-    /// * [`EspHalEspNowError::Timeout`] if no completion arrived within `timeout`.
-    /// * [`EspHalEspNowError::SendFailed`] when a unicast frame was not acknowledged.
-    /// * [`EspHalEspNowError::Radio`] if the driver rejects the frame.
-    pub async fn send_async_timeout(
+    /// Puts the frame in the queue, waiting for a free slot until `deadline`.
+    async fn enqueue(
         &self,
         mac: &MacAddress,
         data: &[u8],
-        timeout: core::time::Duration,
-    ) -> Result<(), EspHalEspNowError> {
-        let deadline = embassy_time::Instant::now().checked_add(to_embassy(timeout));
-        self.submit(mac, data, deadline).await
+        deadline: Option<embassy_time::Instant>,
+        kind: SendKind,
+    ) -> Result<TxId, EspHalEspNowError> {
+        let core_deadline = deadline.map(to_core_time);
+        let slot = poll_fn(|cx| {
+            self.with_tx(|state, _| {
+                match state
+                    .core
+                    .submit(now_core(), *mac, data, core_deadline, kind)
+                {
+                    Ok(id) => Poll::Ready(Ok(id)),
+                    Err(Refusal::Full) => {
+                        if !state.full_waiters.register(cx.waker()) {
+                            cx.waker().wake_by_ref();
+                        }
+                        Poll::Pending
+                    }
+                    Err(refusal) => Poll::Ready(Err(refusal_error(refusal, data.len()))),
+                }
+            })
+        });
+        let id = bounded(deadline, slot)
+            .await
+            .ok_or(EspHalEspNowError::Timeout)??;
+        self.runner_wake.signal(());
+        Ok(id)
     }
 
-    /// One scan probe: [`EspHalEspNow::send_async_timeout`] with `timeout` as one absolute
-    /// deadline for waiting on other callers, the transmission and its ACK.
+    /// Waits for the result of request `id`, honouring `deadline` for queued requests only.
+    async fn wait_result(&self, id: TxId, deadline: Option<embassy_time::Instant>) -> TxResult {
+        let completion = match bounded(deadline, self.poll_completion(id, false)).await {
+            Some(completion) => completion,
+            // Deadline passed: a queued request expires here, a frame on the air is waited out.
+            None => self.poll_completion(id, true).await,
+        };
+        completion_result(completion)
+    }
+
+    async fn poll_completion(&self, id: TxId, past_deadline: bool) -> Completion<TxResult> {
+        poll_fn(|cx| {
+            self.with_tx(|state, wakes| {
+                let poll = if past_deadline {
+                    state.core.poll_expired(id, cx.waker())
+                } else {
+                    state.core.poll_result(id, cx.waker())
+                };
+                if poll.is_ready() {
+                    state.full_waiters.drain_into(wakes);
+                }
+                poll
+            })
+        })
+        .await
+    }
+
+    /// Refuses a sync send while a scan holds the radio.
+    ///
+    /// Call it only while holding the sender lease: a scan waits for the sender to be free before
+    /// its first radio action, so a send that leased first finishes before the scan touches the
+    /// radio, and one that leased after `begin_scan` sees the scan here.
+    fn refuse_during_scan(&self) -> Result<(), EspHalEspNowError> {
+        if self.with_tx(|state, _| state.core.is_scanning()) {
+            Err(EspHalEspNowError::ScanInProgress)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Sends and reports the MAC-layer ACK, without blocking the executor.
+    ///
+    /// `Ok` means the unicast peer acknowledged the frame; [`EspHalEspNowError::SendFailed`] means
+    /// it did not.
+    /// The transmission runs in [`EspHalEspNow::run_sender`]; concurrent callers queue up behind
+    /// each other.
+    /// `timeout` bounds waiting for a queue slot, queueing and the start of the transmission; a
+    /// transmission that has already started is waited out and its real result returned.
+    /// A request that did not start in time is never sent: the runner drops it.
+    /// [`Duration::MAX`] means no bound.
+    /// Dropping the future is safe: a queued frame is never sent, and one on the air has its
+    /// result discarded.
+    ///
+    /// # Errors
+    ///
+    /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
+    /// * [`EspHalEspNowError::Broadcast`] for the broadcast address: broadcast frames are never
+    ///   acknowledged, use [`EspNowDriver::send`].
+    /// * [`EspHalEspNowError::ScanInProgress`] while a [`EspHalEspNow::scan_for_peer`] runs, or
+    ///   when one began before this frame started.
+    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] did not start
+    ///   within 100 ms (or the timeout, if shorter).
+    /// * [`EspHalEspNowError::Timeout`] if the frame did not start within `timeout`.
+    /// * [`EspHalEspNowError::SendFailed`] when the frame was not acknowledged.
+    /// * [`EspHalEspNowError::Radio`] if the driver rejects the frame.
+    pub async fn send_acked(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), EspHalEspNowError> {
+        let deadline = embassy_time::Instant::now().checked_add(to_embassy(timeout));
+        self.submit(mac, data, deadline, SendKind::App).await
+    }
+
+    /// One scan probe: a [`SendKind::Probe`] frame with `timeout` as one absolute deadline for
+    /// waiting on a slot, the transmission and its ACK.
     /// Nothing is queued when no time is left ([`EspHalEspNowError::Timeout`]).
     pub(crate) async fn send_probe(
         &self,
         mac: &MacAddress,
         data: &[u8],
-        timeout: core::time::Duration,
+        timeout: Duration,
     ) -> Result<(), EspHalEspNowError> {
         validate_frame_len(data)?;
         if timeout.is_zero() {
             return Err(EspHalEspNowError::Timeout);
         }
-        self.send_async_timeout(mac, data, timeout).await
+        let deadline = embassy_time::Instant::now().checked_add(to_embassy(timeout));
+        self.submit(mac, data, deadline, SendKind::Probe).await
     }
 
     /// Waits for the next valid frame (at most [`MAX_DATA_LEN`] bytes); oversize frames are
     /// dropped and counted.
     ///
-    /// One waiter at a time: a second concurrent call returns [`EspHalEspNowError::Busy`].
+    /// Safe to call from several tasks at once: they take turns, and each frame goes to exactly
+    /// one of them.
+    /// No order among the waiting callers is promised.
     /// While a call is pending, [`EspNowDriver::try_recv`] returns `None`.
-    ///
-    /// # Errors
-    ///
-    /// [`EspHalEspNowError::Busy`] while another receive call is pending.
-    pub async fn recv_async(&self) -> Result<EspNowEvent, EspHalEspNowError> {
-        let mut receiver = self.receiver.lease().ok_or(EspHalEspNowError::Busy)?;
+    pub async fn receive(&self) -> EspNowEvent {
+        let _turn = self.receive_gate.acquire().await;
+        // Only this method takes the receiver out, and the gate lets one call in at a time, so
+        // the lease is always free; the retry only keeps this path panic-free.
+        let mut receiver = loop {
+            match self.receiver.lease() {
+                Some(lease) => break lease,
+                None => {
+                    embassy_time::Timer::after_millis(RUNNER_LEASE_RETRY_MS).await;
+                }
+            }
+        };
         loop {
             let frame = receiver.receive_async().await;
             if let Some(event) = self.event_from(frame) {
-                return Ok(event);
+                return event;
             }
         }
     }
@@ -546,46 +668,48 @@ impl EspHalEspNow {
     /// table set up for it.
     ///
     /// Drives the shared [`ScanMachine`], so the semantics are those of the ESP-IDF tier's
-    /// `scan_for_peer`: stale-peer removal, a channel-0 temporary peer, one MAC-ACK probe per
+    /// scan: stale-peer removal, a channel-0 temporary peer, one MAC-ACK probe per
     /// channel, `probe_confirmations` further probes `confirmation_gap` apart, a `burst_timeout`
-    /// budget, and on failure the radio and the peer registration go back to `pinned`.
+    /// budget, and on failure the radio and the peer registration go back to the pinned channel.
     ///
-    /// `pinned` holds the channel of the previous successful scan (`None` before the first scan).
-    /// It is updated on return, on success and failure alike; keep it and pass it to the next scan.
+    /// The driver keeps the pin ([`EspHalEspNow::pinned_channel`]): the channel of the previous
+    /// successful scan, or the one set with [`EspNowConfig::with_channel`], is where a failed
+    /// scan puts the radio back.
+    /// It is updated on success and left alone on failure and cancellation.
     ///
-    /// Meant for a handle from [`EspHalEspNow::new_owned`], which owns the radio.
-    /// On an associated station (a [`EspHalEspNow::from_controller`] handle) the scan moves the
-    /// radio to every channel in turn and drops the access-point link.
+    /// Needs a handle from [`EspHalEspNow::new_owned`], which owns the radio: moving an
+    /// associated station across channels would drop its access-point link.
     /// Probes go through [`EspHalEspNow::run_sender`]; a probe waits up to 100 ms (or its
     /// timeout) for a just-spawned runner to start.
     /// Without a runner every probe fails, so the scan reports
     /// [`ScanError::NotFound`](juggler::espnow::ScanError::NotFound) with a probe-send
     /// `first_fault` and `probed: 0`, and logs the cause at `warn`.
-    /// A concurrent periodic sender queues in front of a probe and eats into its timeout, so it
-    /// can still delay or skew the result.
+    ///
+    /// The scan holds the radio against application sends from the moment it is admitted until
+    /// channel, TX power and peer registration are restored.
+    /// Application sends during that time fail with [`EspHalEspNowError::ScanInProgress`], and
+    /// those still queued when the scan begins are dropped unsent.
+    /// A frame already on the air is waited out before the first radio action.
     ///
     /// The TX power is boosted to [`TxPowerLevel::Max`] for the burst and restored afterwards,
     /// including when the future is dropped mid-scan.
-    /// A handle from [`EspHalEspNow::from_controller`] cannot change TX power
-    /// ([`EspHalEspNowError::ControllerNotOwned`]); the scan then runs at the caller's level.
     ///
     /// Cancelling the future (dropping it mid-scan) restores the channel, the peer registration and
-    /// the TX power: the temporary peer is removed and, when `pinned` held a channel, the radio and
-    /// the peer go back to it.
-    /// `pinned` is left unchanged in that case, so it still describes the restored state.
+    /// the TX power synchronously in `Drop` (ADR 020 exception, `Drop` cannot await): the
+    /// temporary peer is removed and, when a channel was pinned, the radio and the peer go back to
+    /// it; only then does the exclusion end.
     ///
     /// Each probe is bounded by `config.probe_timeout`; a timeout means the frame never started
     /// and counts as a local failure (not as "no ACK"); a transmitted but unacknowledged frame is "no ACK".
-    /// A cancelled or timed-out probe never orphans a completion (the runner finishes it).
+    /// A cancelled or timed-out probe never orphans a completion.
     /// The scan never changes channel while a probe is being transmitted: a probe that has started
     /// is waited out (the burst budget counts the overrun, the machine is fed the real time), and
     /// one that has not started is dropped by the runner.
-    /// The exception is cancellation, where `ScanCleanup` restores the channel immediately
-    /// (best-effort, `Drop` cannot await).
     /// No lock is held across an await point.
     ///
     /// # Errors
     ///
+    /// * [`EspHalEspNowError::ControllerNotOwned`] on a [`EspHalEspNow::from_controller`] handle.
     /// * [`EspHalEspNowError::Busy`] while another `scan_for_peer` call is running; scans are
     ///   serialized.
     /// * [`EspHalEspNowError::Scan`] with the [`ScanError`](juggler::espnow::ScanError) reported
@@ -594,18 +718,26 @@ impl EspHalEspNow {
         &self,
         mac: &MacAddress,
         config: &ScanConfig<'_>,
-        pinned: &mut Option<u8>,
     ) -> Result<ScanResult, EspHalEspNowError> {
-        let _slot = Singleton::acquire(&self.scan_active).ok_or(EspHalEspNowError::Busy)?;
-        let mut machine = ScanMachine::new(*mac, *config, *pinned);
+        self.with_tx(|state, wakes| {
+            state
+                .core
+                .begin_scan(self.owns_controller, &mut |waker| wakes.push(waker))
+        })
+        .map_err(scan_refusal_error)?;
+        // Declared first, so it drops last: the exclusion ends only after the restore below.
+        let _exclusion = ScanExclusion { radio: self };
+        self.wait_scan_idle().await;
+        let pinned = self.pinned.get();
+        let mut machine = ScanMachine::new(*mac, *config, pinned);
         let start = embassy_time::Instant::now();
         // Declared before `cleanup`, so on cancellation the channel and peer are restored first and
         // the TX power afterwards.
         let mut boost = TxBoost::new(self);
-        let mut cleanup = ScanCleanup::new(self, *mac, *pinned);
+        let mut cleanup = ScanCleanup::new(self, *mac, pinned);
         let mut input = ScanInput::Start;
         let result = loop {
-            let now = core::time::Duration::from_micros(start.elapsed().as_micros());
+            let now = Duration::from_micros(start.elapsed().as_micros());
             input = match machine.poll(now, input) {
                 ScanAction::RemovePeer => completed(self.remove_peer(mac)),
                 ScanAction::RegisterPeer { channel }
@@ -640,16 +772,14 @@ impl EspHalEspNow {
                     channel, timeout, ..
                 } => {
                     let result = self.send_probe(mac, machine.probe_data(), timeout).await;
-                    let outcome = probe_outcome(result);
+                    let outcome = SendOutcome::of(&result);
                     if let (SendOutcome::Local, Err(e)) = (outcome, &result) {
                         machine.log_fault(format_args!("probe on channel {channel} failed: {e:?}"));
                     }
                     ScanInput::Sent(outcome)
                 }
                 ScanAction::WaitUntil(deadline) => {
-                    let micros = u64::try_from(deadline.as_micros()).unwrap_or(u64::MAX);
-                    embassy_time::Timer::at(start + embassy_time::Duration::from_micros(micros))
-                        .await;
+                    embassy_time::Timer::at(start + to_embassy(deadline)).await;
                     ScanInput::Completed
                 }
                 ScanAction::Done(result) => {
@@ -660,8 +790,29 @@ impl EspHalEspNow {
         };
         // Covers a machine that finished without reaching `RestoreTxPower`.
         boost.release();
-        *pinned = machine.pinned_channel();
+        self.pinned.set(machine.pinned_channel());
         result.map_err(EspHalEspNowError::Scan)
+    }
+
+    /// Waits until no frame is on the air and no sync send holds the sender, so the scan's first
+    /// radio action cannot change the channel under a transmission.
+    async fn wait_scan_idle(&self) {
+        poll_fn(|cx| {
+            self.with_tx(|state, _| {
+                if state.core.can_start_scan_io() {
+                    Poll::Ready(())
+                } else {
+                    if !state.idle_waiters.register(cx.waker()) {
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Pending
+                }
+            })
+        })
+        .await;
+        while self.sender.with_locked(|_| ()).is_none() {
+            embassy_time::Timer::after_millis(SCAN_SENDER_POLL_MS).await;
+        }
     }
 
     /// Leases the sender for a blocking send.
@@ -671,16 +822,15 @@ impl EspHalEspNow {
 
     /// Converts a received frame; oversize frames are counted and dropped, never truncated.
     fn event_from(&self, frame: ReceivedData) -> Option<EspNowEvent> {
-        match frame_event(frame.info.src_address, frame.data()) {
+        match EspNowEvent::try_new(frame.info.src_address, frame.data()) {
             Ok(event) => Some(event),
             Err(len) => {
-                let total = self.oversize_dropped.update(|n| n.wrapping_add(1));
-                if should_log_oversize(total) {
+                if self.oversize.record() {
                     log::warn!(
                         "ESP-NOW: dropped oversize frame ({} B > {} B), {} dropped in total",
                         len,
                         MAX_DATA_LEN,
-                        total
+                        self.oversize.dropped()
                     );
                 }
                 None
@@ -720,6 +870,7 @@ impl EspNowDriver for EspHalEspNow {
     fn send(&self, mac: &MacAddress, data: &[u8]) -> Result<(), Self::Error> {
         validate_frame_len(data)?;
         let mut sender = self.lease_sender()?;
+        self.refuse_during_scan()?;
         let waiter = sender.send(mac, data).map_err(map_error)?;
         // The ACK outcome is deliberately ignored, exactly like the IDF `send`.
         let _ = waiter.wait();
@@ -736,6 +887,88 @@ impl EspNowDriver for EspHalEspNow {
         }
         None
     }
+}
+
+impl EspNowLink for EspHalEspNow {
+    async fn send_acked(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), Self::Error> {
+        EspHalEspNow::send_acked(self, mac, data, timeout).await
+    }
+
+    async fn receive(&self) -> EspNowEvent {
+        EspHalEspNow::receive(self).await
+    }
+
+    async fn scan_for_peer(
+        &self,
+        mac: &MacAddress,
+        config: &ScanConfig<'_>,
+    ) -> Result<ScanResult, Self::Error> {
+        EspHalEspNow::scan_for_peer(self, mac, config).await
+    }
+
+    fn pinned_channel(&self) -> Option<u8> {
+        EspHalEspNow::pinned_channel(self)
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `EspHalEspNow` stops implementing `EspNowLink`.
+const _: fn() = || {
+    fn implements<T: EspNowLink>()
+    where
+        <T as EspNowDriver>::Error: juggler::espnow::ClassifySend,
+    {
+    }
+    implements::<EspHalEspNow>();
+};
+
+/// Abandons a request when its caller is dropped before the result was taken.
+struct PendingSend<'a> {
+    radio: &'a EspHalEspNow,
+    /// Cleared once the result has been consumed: a consumed id may be reused.
+    id: Option<TxId>,
+}
+
+impl Drop for PendingSend<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.radio.with_tx(|state, wakes| {
+                state.core.abandon(id);
+                state.full_waiters.drain_into(wakes);
+            });
+        }
+    }
+}
+
+/// Holds the scan exclusion of [`TxCore::begin_scan`]; ends it on drop.
+///
+/// Declared before the scan's restore guards, so it drops after them: the exclusion ends only once
+/// channel, TX power and pin are restored.
+struct ScanExclusion<'a> {
+    radio: &'a EspHalEspNow,
+}
+
+impl Drop for ScanExclusion<'_> {
+    fn drop(&mut self) {
+        self.radio.with_tx(|state, _| state.core.end_scan());
+    }
+}
+
+/// Now on the [`TxCore`] clock: time since the embassy epoch.
+fn now_core() -> Duration {
+    to_core_time(embassy_time::Instant::now())
+}
+
+fn to_core_time(at: embassy_time::Instant) -> Duration {
+    Duration::from_micros(at.as_micros())
+}
+
+fn from_core_time(at: Duration) -> embassy_time::Instant {
+    embassy_time::Instant::from_micros(u64::try_from(at.as_micros()).unwrap_or(u64::MAX))
 }
 
 fn completed(result: Result<(), EspHalEspNowError>) -> ScanInput {
@@ -815,7 +1048,7 @@ async fn bounded<F: core::future::Future>(
     }
 }
 
-fn to_embassy(timeout: core::time::Duration) -> embassy_time::Duration {
+fn to_embassy(timeout: Duration) -> embassy_time::Duration {
     embassy_time::Duration::try_from(timeout).unwrap_or(embassy_time::Duration::MAX)
 }
 
