@@ -1,6 +1,4 @@
 ---
-gate: hardware
-gate-note: CrowPanel S3 bench run for Step 9 (one app on two tiers), also covering the esp-hal R1, T5a and T5b
 desk-work: available
 ---
 
@@ -44,9 +42,9 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Step 4 — public traits and mocks
 - [x] Step 5 — link core
 - [x] Step 6 — MQTT session core
-- [ ] Step 7 — esp-hal adopts the cores (desk work done, CrowPanel S3 rerun pending)
+- [x] Step 7 — esp-hal adopts the cores (T5a/T5b rerun passed on the CrowPanel S3, 2026-11-03)
 - [ ] Step 8 — IDF adopts the cores (8a, 8b-1, 8b-2 done and bench-run on the C3 and S3; only 8c, bug 013, open)
-- [ ] Step 9 — one app, two tiers (hardware gate, release 0.7.0)
+- [x] Step 9 — one app, two tiers (CrowPanel S3 gate passed 2026-11-03; release 0.7.0)
 - [ ] Step 10 — Wi-Fi names and value types
 - [ ] Step 11 — MQTT shape
 
@@ -63,3 +61,7 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-01 — Step 8b-2 done: IDF MQTT is gated on the link, `NetworkGate`/`Outbox`/`subscribe_ready` land in `juggler` with host tests and mutation checks, `MqttBuilder::build(&wifi)` is the approved 0.x break, bug 010 fixed in code (bench run pending); Step 8c and Steps 9–11 open
 - 2026-11-02 — Bug 010 bench run on the C3 (`idf_c3_async_mqtt`): the client is created 40 ms after `sta ip:` and connects 300 ms later with no transport error, and a ~2 minute block showed no MQTT line until the recovery 250 ms after the next IP; bug 010 closed
 - 2026-11-02 — Roadmap hygiene: gate moved to the Step 9 bench run; Step 1 ticked after the IDF R1 on the S3; next is Step 9
+- 2026-11-03 — Step 9 desk work done: `examples-shared/lwt_app.rs` is compiled by both S3 LWT examples (both files are setup only, ESP-IDF on `block_on`), both packages exclude their LWT example, and both READMEs carry the capability table; the CrowPanel S3 gate (R1/R3 with identical `[app]` lines) is open
+- 2026-11-03 — Step 9 bench run on the CrowPanel S3 (working tree at f81d83e plus Step 9): R1 and R3 pass on both tiers, R3 with byte-identical `[app]` template sets and R1 identical except the per-tier prefix and the sampled intermediate states; the same session closed the esp-hal R1 cell and T5a/T5b, so Steps 7 and 9 are done; next is release 0.7.0
+- 2026-11-03 — T6 soak after the bench: esp-hal ran 4 h 28 min (3210 ticks, one external outage of about 25 min with 10 s retry pacing and automatic recovery, heap flat at 25928 B afterwards); ESP-IDF ran 10 min (123 ticks, no gap, no disconnect) but drifted 2148 B, outside the runbook's 1 KiB criterion, and is left to Step 8c (bug 013 territory)
+- 2026-11-03 — Review of 33ae125: `run` no longer awaits the first connect before starting, so the tick loop, the receive loop and the suspend demo report while the broker is unreachable; the `mqtt ready` marker is a third joined future and the `[app]` line set is unchanged. Uptime stays tick-counted, as before the extraction.

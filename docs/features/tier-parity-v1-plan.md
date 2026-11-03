@@ -149,7 +149,7 @@ Split into two reviewable chunks; the CrowPanel S3 rerun covers both after 7b.
 - [x] Kept as tier I/O: socket timeout, stall deadline, network watch, RST flush, publish retries, inbound drop-oldest queue.
 - [x] `impl MqttClient for MqttHandle`, `impl MqttMessage for InboundMessage`, compile-time parity check; log formats unchanged except `connected (…, n subscriptions kept)` for a kept session.
 - Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the runner's host tests move to `juggler` or still pass.
-- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved.
+- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved. Passed on the CrowPanel S3, 2026-11-03 (T5a and T5b).
 
 ### Step 8: IDF adopts the cores
 
@@ -198,11 +198,13 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 
 ### Step 9: One app, two tiers
 
-- [ ] Shared module `examples-shared/lwt_app.rs` (included with `#[path]` by both S3 LWT examples): `async fn run(link: &impl NetworkLink, mqtt: &impl MqttClient)` with status, ticks, `cmd` echo and the suspend demo.
-- [ ] Both examples shrink to setup plus `lwt_app::run`.
-- [ ] Capability table (ADR 022 decision 7) in both crate READMEs, starting from `docs/wifi-suspend-and-deep-sleep.md`: radio while suspended, MQTT reconnect latency, broker address, subscriptions.
+- [x] Shared module `examples-shared/lwt_app.rs` (included with `#[path]` by both S3 LWT examples): `async fn run(link, mqtt, cfg)` with status, ticks, `cmd` echo and the suspend demo.
+  `LwtAppConfig` carries what the traits cannot: the tick topic, the suspend-demo switch and timeout, and the tier heap reporter; the app logs under `[app]` so the two tiers compare line for line.
+- [x] Both examples shrink to setup plus `lwt_app::run`: ESP-IDF on `esp_idf_svc::hal::task::block_on`, esp-hal as the main task.
+- [x] Capability table (ADR 022 decision 7) in both crate READMEs, starting from `docs/wifi-suspend-and-deep-sleep.md`: radio while suspended, MQTT reconnect latency, broker address, subscriptions.
+- Packaging: both crates `exclude` their LWT example, because the shared module lives outside the package; `cargo package` drops the matching `[[example]]` target with a warning, so every other example still ships.
 - Done when: both examples build; the CrowPanel S3 passes runbook R1 and R3 on both tiers with identical app logs.
-- Gate: hardware (knob maintainer).
+- Gate: hardware (knob maintainer) — passed on the CrowPanel S3, 2026-11-03.
 - Checkpoint: release 0.7.0 with U2f and Steps 1–9.
 
 ## Phase 5 — Remaining Wi-Fi and MQTT shape alignment

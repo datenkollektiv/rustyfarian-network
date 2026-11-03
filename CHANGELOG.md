@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- One application body for both tiers (ADR 022, tier-parity Step 9): `examples-shared/lwt_app.rs` is compiled into `idf_esp32s3_mqtt_lwt` and `hal_esp32s3_mqtt_lwt` through `#[path]`, so the two S3 LWT examples differ only in setup and their application lines share the `[app]` prefix for the bench comparison.
+  Both examples are excluded from their crate's published package, because the shared file lives outside the crate, and the ESP-IDF crate gains a `heapless` dev-dependency for the shared payload buffer.
+  The tick loop, receive loop and suspend demo all start at boot; the first-connect line is logged when the session comes up, so a boot with an unreachable broker still reports link state, ticks and the demo.
+  Both crate READMEs gain a "Tier capability differences" table.
 - `juggler::mqtt::NetworkGate` (`no_std`) and `juggler::mqtt::{Outbox, PendingPublish}` (`std`): the network gate turns link-readiness observations into exactly one `SessionInput::NetworkUp`/`NetworkDown` per transition (never a `NetworkDown` before the link was up), and the outbox holds up to four publishes that arrive before the client exists, dropping the oldest and counting it for the synchronous path (the shared trait method waits for room instead — see Changed); both host-tested with mutation checks (tier-parity Step 8b-2).
 - `juggler::wifi::LinkSupervisor::subscribe_ready` and `rustyfarian-esp-idf-network` `WiFiManager::subscribe_ready`: the supervisor tells one sink per readiness transition and returns the readiness at registration, taken under the same lock, so the seed and the subscription are atomic and no transition can be lost between them; a consumer that must gate its work on the link therefore needs neither a poll nor a second IDF event subscription.
 - `juggler::mqtt::SessionMachine::driver_idle`: `true` while closing a session whose driver had already dropped its transport (it was in the retry pause), so the tier reports `Disconnected` itself instead of waiting for a driver event that never comes; closing an idle client also skips the disconnect call.

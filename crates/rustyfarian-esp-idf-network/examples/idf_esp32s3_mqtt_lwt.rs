@@ -1,19 +1,16 @@
 //! ESP-IDF MQTT example for ESP32-S3 (CrowPanel 1.28" HMI): LWT, retained online flag, reconnect.
 //!
-//! Twin of `hal_esp32s3_mqtt_lwt`: same environment keys, same topics, same 5 s tick, so the
-//! two tiers can be compared on one broker (different default client id and prefix).
-//! Wi-Fi joins in `ConnectMode::NonBlocking`; the library reconnects after any link loss
-//! (1 s back-off doubling to 30 s) and esp-mqtt reconnects on its own once the link is back.
+//! Twin of `hal_esp32s3_mqtt_lwt`: same environment keys, same topics, same 5 s tick, and
+//! the same application body — `examples-shared/lwt_app.rs` is compiled into both examples,
+//! so the two tiers can be compared on one broker (different default client id and prefix).
+//! This file is setup only: Wi-Fi, the MQTT builder and one `block_on` that runs the shared app.
 //!
 //! * CONNECT carries an LWT `offline` (retained, QoS 1) on `<prefix>/status`.
 //! * Every (re)connect publishes the retained `online` there from `on_connect`.
-//! * `<prefix>/cmd` is subscribed; each inbound message is logged by `on_message`.
-//! * Every 5 s the main loop `try_publish`es a tick on `<prefix>/tick`;
-//!   `WouldBlock` (not connected or client busy) is logged and skipped.
-//! * Wi-Fi link and MQTT state changes and the free heap (once a minute) are logged.
-//! * With `MQTT_SUSPEND_DEMO=1` the radio is suspended for 20 s every 60 s
-//!   (`WiFiManager::suspend` / `resume`), the cycle a deep-sleep firmware runs when
-//!   a sleep attempt is aborted; the broker sees the will, then `online` again.
+//! * `<prefix>/cmd` is subscribed; inbound messages reach `MqttHandle::receive`, which the
+//!   shared app drains.
+//! * Everything else — the 5 s tick on `<prefix>/tick`, link and MQTT state logs, the free
+//!   heap, and the suspend demo — is the shared app, and its lines start with `[app]`.
 //!
 //! Build-time environment (all `option_env!`, see `.env.example`):
 //!
@@ -36,27 +33,24 @@
 //! just flash idf_esp32s3_mqtt_lwt
 //! ```
 
-use std::time::Duration;
-
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::EspMqttClient;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, QoS, TryPublishError};
+use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 
 #[path = "common/env.rs"]
 mod env;
+#[path = "../../../examples-shared/lwt_app.rs"]
+mod lwt_app;
 
-const TICK_SECS: u64 = 5;
-const HEAP_LOG_SECS: u64 = 60;
 const KEEP_ALIVE_SECS: u64 = 30;
 const WIFI_FIRST_CONNECT_WAIT_MS: u64 = 30_000;
-const SUSPEND_EVERY_SECS: u64 = 60;
-const SUSPEND_FOR_SECS: u64 = 20;
+const SUSPEND_TIMEOUT_MS: u64 = 500;
 
-fn free_heap() -> u32 {
+fn free_heap() -> usize {
     // SAFETY: plain FFI query with no arguments or side effects.
-    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() }
+    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() as usize }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -120,15 +114,6 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             },
         )
-        .on_disconnect(|| log::warn!("[mqtt] disconnected — esp-mqtt reconnects on its own"))
-        .on_message(|topic, payload| match std::str::from_utf8(payload) {
-            Ok(text) => log::info!("[example] rx topic={} payload={}", topic, text),
-            Err(_) => log::info!(
-                "[example] rx topic={} payload={} bytes (binary)",
-                topic,
-                payload.len()
-            ),
-        })
         .build(&wifi)?;
 
     log::info!(
@@ -138,73 +123,12 @@ fn main() -> anyhow::Result<()> {
         tick_topic
     );
 
-    let suspend_demo = env::mqtt_suspend_demo();
-    let mut tick: u32 = 0;
-    let mut last_link = wifi.state();
-    let mut last_state = mqtt.state();
-    let mut mqtt_was_up = false;
-    let mut secs_since_heap_log: u64 = 0;
-    loop {
-        std::thread::sleep(Duration::from_secs(TICK_SECS));
-        tick += 1;
-        secs_since_heap_log += TICK_SECS;
-
-        let uptime = tick as u64 * TICK_SECS;
-        if suspend_demo && uptime % SUSPEND_EVERY_SECS == 0 {
-            log::info!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
-            if let Err(e) = wifi.suspend() {
-                log::warn!("[example] suspend failed: {:#}", e);
-            }
-        } else if suspend_demo && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
-            log::info!("[example] demo: resume");
-            if let Err(e) = wifi.resume() {
-                log::warn!("[example] resume failed: {:#}", e);
-            }
-        }
-
-        let link = wifi.state();
-        if link != last_link {
-            log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
-            last_link = link;
-        }
-        let state = mqtt.state();
-        if state != last_state {
-            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
-            last_state = state;
-        }
-        let mqtt_up = mqtt.is_connected();
-        if mqtt_up && !mqtt_was_up {
-            log::info!(
-                "[example] connect #{} free heap: {} B",
-                mqtt.connect_count(),
-                free_heap()
-            );
-        }
-        mqtt_was_up = mqtt_up;
-
-        let payload = format!(
-            "{{\"tick\":{},\"uptime_s\":{},\"free_heap\":{}}}",
-            tick,
-            uptime,
-            free_heap()
-        );
-        match mqtt.try_publish(&tick_topic, &payload) {
-            Ok(()) => log::info!("[example] tick #{} queued", tick),
-            Err(TryPublishError::WouldBlock) => {
-                log::info!("[example] tick #{} would block (mqtt {:?})", tick, state)
-            }
-            Err(TryPublishError::Other(e)) => {
-                log::warn!("[example] tick #{} failed: {:#}", tick, e)
-            }
-        }
-
-        if secs_since_heap_log >= HEAP_LOG_SECS {
-            secs_since_heap_log = 0;
-            log::info!(
-                "[example] heap free: {} B, connects: {}",
-                free_heap(),
-                mqtt.connect_count()
-            );
-        }
-    }
+    let cfg = lwt_app::LwtAppConfig {
+        tick_topic: &tick_topic,
+        suspend_demo: env::mqtt_suspend_demo(),
+        suspend_timeout_ms: SUSPEND_TIMEOUT_MS,
+        free_heap,
+    };
+    esp_idf_svc::hal::task::block_on(lwt_app::run(&wifi, &mqtt, &cfg));
+    Ok(())
 }

@@ -260,6 +260,23 @@ A firmware that calls `esp_rtos::start` itself in `main` may await freely and pa
 With the scheduler started in `main`, the portal is started with `ProvisioningBuilder::start_scheduler_running(spawner, peripherals.WIFI, store, rng)`, as `examples/hal_c3_provision_mqtt.rs` does.
 The full example shows the `is_provisioned()` branch, the `on_event` hook, and the build-time-seeded `PortalDefaults`.
 
+## Tier capability differences
+
+The tiers share one API ([ADR 022](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/adr/022-tier-parity-one-async-api.md)).
+The differences below are capabilities, not API differences.
+Design detail: [Wi-Fi suspend, resume and deep sleep](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/wifi-suspend-and-deep-sleep.md).
+
+| Capability                   | `rustyfarian-esp-idf-network`                                  | `rustyfarian-esp-hal-network`                  |
+|:-----------------------------|:---------------------------------------------------------------|:-----------------------------------------------|
+| Radio while suspended        | Stopped (`esp_wifi_stop`)                                      | Powered, station disconnected                  |
+| Broker address               | Hostname or IPv4 (DNS via lwIP)                                | IPv4 literal only (no DNS yet)                 |
+| Subscriptions                | Build time and runtime                                         | Build time only                                |
+| Inbound messages             | Callback and/or the `receive()` queue                          | `receive()` channel; no callback               |
+| Inbound retain and QoS       | Not reported (retain is always false, QoS always `AtMostOnce`) | Reported                                       |
+| Executor                     | std threads; `block_on` for the async app                      | `esp-rtos` plus the embassy executor           |
+| Startup message              | `on_connect` closure plus `enqueue`                            | `with_startup_message`                         |
+| Suspend call                 | Blocking; the radio is stopped when it returns                 | Non-blocking signal; wait for `is_suspended()` |
+
 ## Integration with juggler
 
 This crate re-exports all domain modules from `juggler`, so you can import validation logic and types directly:
