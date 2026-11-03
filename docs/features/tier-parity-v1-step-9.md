@@ -1,6 +1,6 @@
 # Tier Parity Step 9 — One App, Two Tiers
 
-Status: desk work, awaiting review (2026-11-02).
+Status: done, CrowPanel S3 gate passed (2026-11-03).
 Program plan: [tier-parity-v1-plan.md](tier-parity-v1-plan.md), Step 9.
 Feature: [tier-parity-v1.md](tier-parity-v1.md).
 
@@ -404,11 +404,103 @@ Run in this order:
 4. `just build-example hal_esp32s3_mqtt_lwt`.
 5. `cargo package --list -p rustyfarian-esp-idf-network` and `cargo package --list -p rustyfarian-esp-hal-network`: the LWT example must be absent and `cargo package` must report the ignored example. The `release-dry-run` recipe already runs the list step.
 
-## Hardware gate (not part of this desk work)
+## Hardware gate: passed
 
-CrowPanel S3 runbook R1 and R3 on both tiers.
-Both runs must show the same `[app]` lines: `mqtt ready`, `connect #N`, the per-tick lines, the `cmd` rx line, and the suspend demo when `MQTT_SUSPEND_DEMO=1`.
-The same bench session also covers the open esp-hal R1 cell and T5a/T5b.
+CrowPanel 1.28" HMI ESP32-S3, 2026-11-03, working tree at `f81d83e` plus this step.
+
+| Run               | esp-hal                          | ESP-IDF               |
+|:------------------|:---------------------------------|:----------------------|
+| R1 router pause   | pass                             | pass                  |
+| R3 suspend/resume | pass                             | pass                  |
+| T5a and T5b       | pass, from the same outage as R1 | not part of this gate |
+
+`[app]` template sets under `sed -E 's/[0-9]+/N/g'`: identical for R3 (13 lines each), and identical for R1 except the per-tier topic prefix in the `rx` line and which intermediate state the 5 s sample catches.
+Link states seen on both tiers are `{Connected, Connecting, Backoff}`, MQTT states `{Connected, Disconnected}`.
+Logs: `tmp/hal-r1.log`, `tmp/idf-r1.log`, `tmp/hal-r3.log`, `tmp/idf-r3.log`.
+T6 soak: ESP-IDF ran `10 min` (123 ticks, no gap, no disconnect) but the heap drifted `2148 B` (`206836 → 204688 B`), outside the runbook's 1 KiB criterion, and is left open for Step 8c; esp-hal ran `4 h 28 min` (3210 ticks, one external outage of about 25 min with 10 s retry pacing and automatic recovery), then a flat `25928 B` heap.
+
+## Bench checklist (CrowPanel S3)
+
+Copy this block into the session log and tick as you go.
+Capture each run to `tmp/` (`tmp/<tier>-<run>.log`).
+
+### Prep
+
+```bash
+just doctor
+just mosquitto up
+just mqtt-watch
+git rev-parse --short HEAD
+```
+
+- Put the IPv4 that `just mosquitto up` prints into `MQTT_HOST` in the `.env` file; the esp-hal tier cannot resolve a hostname.
+- Build the demo-off images first, then rebuild each tier with `MQTT_SUSPEND_DEMO=1` for R3.
+- Keep `MQTT_CLIENT_ID` and `MQTT_TOPIC_PREFIX` at their defaults so the two tiers do not collide on one broker.
+
+### Run order
+
+| # | Run                                    | Tier    | Image    | Criteria                    |
+|:--|:---------------------------------------|:--------|:---------|:----------------------------|
+| 1 | T1 connect and retained `online`       | esp-hal | demo off | esp-hal MQTT T1             |
+| 2 | T2 `just mqtt-pub cmd hello`           | esp-hal | demo off | esp-hal MQTT T2             |
+| 3 | T5a AP off for 90 s, or a MAC block    | esp-hal | demo off | esp-hal MQTT T5a            |
+| 4 | R1/T5b router pause, 3 min             | esp-hal | demo off | wifi-reconnect R1 and T5b   |
+| 5 | R3 three cycles                        | esp-hal | demo on  | wifi-reconnect R3           |
+| 6 | T1 and T2                              | ESP-IDF | demo off | esp-hal MQTT T1 and T2      |
+| 7 | R1 router pause, 3 min                 | ESP-IDF | demo off | wifi-reconnect R1           |
+| 8 | R3 three cycles                        | ESP-IDF | demo on  | wifi-reconnect R3           |
+| 9 | T6 soak, 10 min (optional)             | both    | demo off | esp-hal MQTT T6             |
+
+Runs 3 and 4 are not the same test: T5a needs a real AP outage, T5b and R1 a per-device router pause.
+
+### Per-run commands
+
+```bash
+just flash hal_esp32s3_mqtt_lwt
+just monitor 2>&1 | tee tmp/hal-t1.log
+just mqtt-watch
+just mqtt-pub cmd hello
+just mqtt-status
+```
+
+Repeat with `idf_esp32s3_mqtt_lwt`.
+
+### `[app]` lines to expect
+
+The application body is the same file on both tiers, so every line the app writes starts with `[app]`.
+Setup and library lines keep their `[wifi]`, `[mqtt]`, `WiFi …` and `[example]` prefixes.
+
+| Scenario              | `[app]` lines                                                                    |
+|:----------------------|:---------------------------------------------------------------------------------|
+| every boot            | `mqtt ready — connect #<n>`                                                      |
+| connect and reconnect | `connect #<n> free heap: <n> B`, `mqtt state <A> -> <B>`, `wifi link <A> -> <B>` |
+| per tick              | `tick #<n> queued` or `tick #<n> would block (mqtt <state>)`                     |
+| `cmd`                 | `rx topic=<prefix>/cmd payload=hello retained=false`                             |
+| R3                    | `demo: suspend for 20 s`, `demo: is_suspended = true`, `demo: resume`            |
+| every minute          | `heap free: <n> B, connects: <n>`                                                |
+
+Expected differences: heap values, tick numbers, which transitions the 5 s sample catches, and the `[mqtt]` and `[example]` lines between them.
+The ESP-IDF tier logs one expected `[mqtt] error: ESP_FAIL` when the radio stops under esp-mqtt; it is not an `[app]` line.
+
+### Gate comparison
+
+```bash
+grep -o '\[app\].*' tmp/hal-r1.log | sed -E 's/[0-9]+/N/g' | sort -u > tmp/hal-app-shapes.txt
+grep -o '\[app\].*' tmp/idf-r1.log | sed -E 's/[0-9]+/N/g' | sort -u > tmp/idf-app-shapes.txt
+diff tmp/hal-app-shapes.txt tmp/idf-app-shapes.txt
+```
+
+Pass when both sets hold the same templates for the same scenario.
+Repeat the pair for R3 (the `demo:` templates) and for T1/T2 (the `rx` template).
+
+### Results to record
+
+| Where                             | What                                                     |
+|:----------------------------------|:---------------------------------------------------------|
+| `wifi-reconnect-hardware-test.md` | R1 esp-hal cell, R1 IDF row, R3 esp-hal and IDF rows     |
+| `esp-hal-mqtt-hardware-test.md`   | T5a and T5b rows, plus T1, T2 and T6 if run              |
+| `tier-parity-v1.md` session log   | one line per scenario with the two log paths             |
+| this doc                          | status line set to done plus the date, and the gate note |
 
 ## Follow-up
 

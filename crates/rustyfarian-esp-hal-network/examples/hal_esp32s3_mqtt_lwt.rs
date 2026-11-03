@@ -5,18 +5,18 @@
 //! The firmware starts the `esp-rtos` scheduler itself in `main` and hands Wi-Fi only
 //! the `WIFI` peripheral (`with_wifi_scheduler_running`), the boot shape of a firmware
 //! that must also run without Wi-Fi (rustyfarian-knob, request U2e).
-//! Joins Wi-Fi, then drives the [`MqttRunner`] from its own task and uses the
-//! [`MqttHandle`] from the main loop:
+//!
+//! Twin of `idf_esp32s3_mqtt_lwt`: same environment keys, same topics, same 5 s tick, and
+//! the same application body — `examples-shared/lwt_app.rs` is compiled into both examples,
+//! so the two tiers can be compared on one broker (different default client id and prefix).
+//! This file is setup only: Wi-Fi, the MQTT runner task and the shared app as the main task.
 //!
 //! * CONNECT carries an LWT `offline` (retained, QoS 1) on `<prefix>/status`.
 //! * Every (re)connect publishes the retained startup message `online` there.
-//! * `<prefix>/cmd` is subscribed; each inbound message is logged by `rx_task`.
-//! * Every 5 s the main loop `try_publish`es a tick on `<prefix>/tick`;
-//!   `WouldBlock` is logged and skipped, never retried in place.
-//! * Free heap is logged after connect and once a minute for soak runs.
-//! * With `MQTT_SUSPEND_DEMO=1` the radio is suspended for 20 s every 60 s
-//!   (`WifiLink::suspend` / `resume`), the cycle a deep-sleep firmware runs when
-//!   a sleep attempt is aborted; the broker sees the will, then `online` again.
+//! * `<prefix>/cmd` is subscribed; inbound messages reach `MqttHandle::receive`, which the
+//!   shared app drains.
+//! * Everything else — the 5 s tick on `<prefix>/tick`, link and MQTT state logs, the free
+//!   heap, and the suspend demo — is the shared app, and its lines start with `[app]`.
 //!
 //! Build-time environment (all `option_env!`, see `.env.example`):
 //!
@@ -45,13 +45,10 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::Interface;
-use rustyfarian_esp_hal_network::mqtt::{
-    LwtConfig, MqttBuilder, MqttHandle, MqttRunner, QoS, TryPublishError,
-};
+use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttRunner, QoS};
 use rustyfarian_esp_hal_network::wifi::{
     link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
     SUSPEND_DISCONNECT_TIMEOUT_MS,
@@ -60,16 +57,18 @@ use static_cell::StaticCell;
 
 #[path = "common/env.rs"]
 mod env;
+#[path = "../../../examples-shared/lwt_app.rs"]
+mod lwt_app;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static LINK: WifiLink = WifiLink::new();
 
-const TICK_SECS: u64 = 5;
-const HEAP_LOG_SECS: u64 = 60;
-const SUSPEND_EVERY_SECS: u64 = 60;
-const SUSPEND_FOR_SECS: u64 = 20;
 const KEEP_ALIVE_SECS: u64 = 30;
+
+fn free_heap() -> usize {
+    esp_alloc::HEAP.free()
+}
 
 /// Logs a start-up failure and parks; an example has nothing to fall back to.
 fn fatal(what: &str, reason: &dyn core::fmt::Display) -> ! {
@@ -172,7 +171,6 @@ async fn main(spawner: Spawner) {
         Err(e) => fatal("MQTT build failed", &e),
     };
     spawner.spawn(mqtt_task(mqtt_runner).unwrap());
-    spawner.spawn(rx_task(mqtt).unwrap());
 
     log::info!(
         "[example] topics: status={} cmd={} tick={}",
@@ -181,105 +179,18 @@ async fn main(spawner: Spawner) {
         tick_topic
     );
 
-    let suspend_demo = env::mqtt_suspend_demo();
-    let mut tick: u32 = 0;
-    let mut last_link = LINK.state();
-    let mut last_state = mqtt.state();
-    let mut was_connected = false;
-    let mut secs_since_heap_log: u64 = 0;
-    loop {
-        Timer::after(Duration::from_secs(TICK_SECS)).await;
-        tick += 1;
-        secs_since_heap_log += TICK_SECS;
-
-        let uptime = tick as u64 * TICK_SECS;
-        if suspend_demo && uptime % SUSPEND_EVERY_SECS == 0 {
-            log::info!("[example] demo: suspend for {} s", SUSPEND_FOR_SECS);
-            LINK.suspend();
-            // The deep-sleep recipe: wait, bounded, until the station is down.
-            let deadline = Instant::now() + Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS);
-            while !LINK.is_suspended() && Instant::now() < deadline {
-                Timer::after(Duration::from_millis(10)).await;
-            }
-            log::info!("[example] demo: is_suspended = {}", LINK.is_suspended());
-        } else if suspend_demo && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
-            log::info!("[example] demo: resume");
-            LINK.resume();
-        }
-
-        let link = LINK.state();
-        if link != last_link {
-            log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
-            last_link = link;
-        }
-        let state = mqtt.state();
-        if state != last_state {
-            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
-            last_state = state;
-        }
-        if mqtt.is_connected() && !was_connected {
-            log::info!(
-                "[example] connect #{} free heap: {} B",
-                mqtt.connect_count(),
-                esp_alloc::HEAP.free()
-            );
-        }
-        was_connected = mqtt.is_connected();
-
-        let mut payload = heapless::String::<96>::new();
-        let _ = core::fmt::write(
-            &mut payload,
-            format_args!(
-                "{{\"tick\":{},\"uptime_s\":{},\"free_heap\":{}}}",
-                tick,
-                uptime,
-                esp_alloc::HEAP.free()
-            ),
-        );
-        match mqtt.try_publish(tick_topic, payload.as_bytes()) {
-            Ok(()) => log::info!("[example] tick #{} queued", tick),
-            Err(TryPublishError::WouldBlock) => {
-                log::info!("[example] tick #{} would block (mqtt {:?})", tick, state)
-            }
-            Err(TryPublishError::Other(e)) => log::warn!("[example] tick #{} failed: {}", tick, e),
-        }
-
-        if secs_since_heap_log >= HEAP_LOG_SECS {
-            secs_since_heap_log = 0;
-            log::info!(
-                "[example] heap free: {} B, connects: {}, dropped rx/tx: {}/{}",
-                esp_alloc::HEAP.free(),
-                mqtt.connect_count(),
-                mqtt.dropped_inbound(),
-                mqtt.dropped_publish()
-            );
-        }
-    }
+    let cfg = lwt_app::LwtAppConfig {
+        tick_topic,
+        suspend_demo: env::mqtt_suspend_demo(),
+        suspend_timeout_ms: SUSPEND_DISCONNECT_TIMEOUT_MS,
+        free_heap,
+    };
+    lwt_app::run(&LINK, &mqtt, &cfg).await;
 }
 
 #[embassy_executor::task]
 async fn mqtt_task(runner: MqttRunner) -> ! {
     runner.run().await
-}
-
-#[embassy_executor::task]
-async fn rx_task(mqtt: MqttHandle) {
-    loop {
-        let msg = mqtt.receive().await;
-        match core::str::from_utf8(msg.payload.as_slice()) {
-            Ok(text) => log::info!(
-                "[example] rx topic={} payload={} retained={}",
-                msg.topic.as_str(),
-                text,
-                msg.retained
-            ),
-            Err(_) => log::info!(
-                "[example] rx topic={} payload={} bytes (binary)",
-                msg.topic.as_str(),
-                msg.payload.len()
-            ),
-        }
-    }
 }
 
 #[embassy_executor::task]

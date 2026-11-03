@@ -9,6 +9,9 @@ description = "ESP-IDF (std) drivers for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and pr
 keywords = ["esp32", "esp-idf", "wifi", "mqtt", "lora"]
 categories = ["embedded", "hardware-support"]
 readme = "README.md"
+# The LWT example shares its application body with the esp-hal twin
+# (`examples-shared/lwt_app.rs`), which lives outside this package; it is bench-only.
+exclude = ["examples/idf_esp32s3_mqtt_lwt.rs"]
 
 [package.metadata.docs.rs]
 default-target = "riscv32imc-esp-espidf"
@@ -111,6 +114,9 @@ embassy-sync               = { workspace = true }
 # `block_on` has no integrated timer queue (embassy-executor provides that), so the
 # esp-idf-svc time driver needs the generic queue; 16 timers cover the spike.
 embassy-time-queue-utils   = { version = "=0.3.2", features = ["generic-queue-16"] }
+# `idf_esp32s3_mqtt_lwt` runs the shared app module, which builds its tick payload
+# in a `heapless::String` so it compiles under the esp-hal twin's `#![no_std]`.
+heapless                   = { workspace = true }
 
 [[example]]
 name = "idf_c3_connect"
