@@ -197,6 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rustyfarian-esp-idf-network` `EspIdfEspNow::init_with_radio_sta` came up as SoftAP after an erased flash, so every ESP-NOW send and scan probe failed: it never called `set_configuration`, the only esp-idf-svc call that sets the Wi-Fi mode, and the driver kept the mode stored in NVS; it now sets STA mode before starting the radio.
 - esp-hal `MqttHandle::wait_connected` could strand a second waiter because the `Signal` that woke it parks one waker; the MQTT wait and `WifiLink::wait_connected` now share `juggler::waker_slots::poll_ready` over a four-slot `WakerSlots`, re-checking every 500 ms beyond the slots, and the `MqttClient` trait documents that any number of tasks may wait.
 - `LinkSupervisor::suspend` reported the link as down only after the radio had stopped, so the MQTT gate learned about a deliberate suspend from the transport's corpse: esp-mqtt logged an error and the session scheduled a retry that the gate then had to park (runbook R3).
   Readiness is now reported before the stop, because the state machine is already `Suspended` when `poll(Suspend)` returns; the spurious `[mqtt] reconnecting in` line is gone, and one `[mqtt] error` from esp-mqtt's own teardown remains on ESP-IDF.

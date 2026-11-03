@@ -53,7 +53,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, Configuration, EspWifi};
+use esp_idf_svc::wifi::{
+    AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
+};
 pub use juggler::espnow::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
     SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
@@ -251,6 +253,9 @@ impl EspIdfEspNow {
     /// sends depending on scheduler load).  Sends that fail trigger a re-scan
     /// and retry.  Use [`init_with_radio`](Self::init_with_radio) (SoftAP) for
     /// deterministic, race-free delivery whenever possible.
+    ///
+    /// The radio is always put into STA mode, whatever mode the Wi-Fi driver
+    /// stored in NVS (after an erased flash that is SoftAP).
     pub fn init_with_radio_sta(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
@@ -258,6 +263,10 @@ impl EspIdfEspNow {
     ) -> anyhow::Result<Self> {
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)
             .context("failed to create EspWifi for ESP-NOW radio")?;
+        // `set_configuration` is the only esp-idf-svc call that sets the Wi-Fi mode; without it the
+        // driver keeps the mode stored in NVS, which is SoftAP after an erased flash.
+        wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))
+            .context("failed to set STA mode for ESP-NOW radio")?;
         wifi.start()
             .context("failed to start Wi-Fi radio for ESP-NOW")?;
         log::info!("Wi-Fi STA started for ESP-NOW (promiscuous-bracket channel re-pin)");
