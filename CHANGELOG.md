@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::espnow::PeerLink` (`no_std`, with `PeerLinkConfig`, `PeerLinkEpoch`, `PeerLinkEvent`, `PeerLinkAction` and `PeerLinkState`): a clock-injected supervisor that decides when a node must (re)scan for its coordinator.
+  It issues the boot scan, retries a failed scan with a doubling backoff (2 s up to 60 s), rescans after 20 consecutive unacknowledged sends, never rescans for sends that did not leave the node, and returns to the last channel when the coordinator is heard again; stale scan and send results are discarded by epoch.
+  Host-tested, with mutation checks on the threshold and both stale guards (tier-parity ESP-NOW peer link).
 - `juggler::espnow::ScanFault`, `ScanMachine::{first_fault, log_fault}` and `ScanError::NotFound::first_fault`: the scan machine records the first channel switch or probe send (first or confirmation probe) that failed, and `NotFound` reports it, for example `peer not found after probing 0 of 13 configured channels (first failure: probe send on channel 1)`.
   A scan whose every channel failed before a probe went out therefore no longer reads as plain silence.
   `ScanMachine` and `ScanError` are unreleased, so the new field is not a breaking change.
@@ -24,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `juggler::espnow::SendOutcome::Error` is renamed `Local` and means the frame was not transmitted (queue full, no sender runner, invalid peer, driver error, or a timeout before transmission); `NoAck` is a frame that was transmitted but not acknowledged.
+  The type is unreleased, so the rename is not breaking.
+  esp-hal `scan_for_peer` now reports a send timeout as `Local`, because on esp-hal a timeout always means the frame never started: a probe that never went out no longer counts as no ACK or as a probed channel, and is recorded as a `ScanFault::ProbeSend`.
 - `juggler::mqtt::MqttClient::publish` now waits for admission queue space on both tiers and never evicts a queued message to make room.
   The contract is implemented once, in the new `juggler::mqtt::Outbox::publish_waiting`, which the ESP-IDF trait impl delegates to; esp-hal's existing publish-channel send already implemented it, so its code is unchanged.
   The ESP-IDF pre-client queue therefore no longer drops its oldest entry when a `publish` arrives with all slots taken, while the legacy synchronous `MqttHandle::publish_with` keeps dropping (and counting) it — its behaviour is unchanged.

@@ -26,9 +26,19 @@ Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
 - ESP-IDF changes are additive except the approved `scan_for_peer` rename.
 - Every step ends with `just fmt`, `just verify`, `just clippy-hal` and `just build-example` for touched examples.
 
+## Requirements
+- Outcome classification: the shared error type exposes one portable classification of every send result, `Acked`, `NoAck` (transmitted, no MAC-layer ACK) or `Local` (queue full, no sender runner, invalid peer, driver error, timed out before transmission).
+- Rename `juggler::espnow::SendOutcome::Error` to `Local` and map every tier error onto `SendOutcome` through a trait method, so the generic helper never matches tier error variants.
+- Esp-hal `Timeout` means the frame never started (ADR 020), so `probe_outcome` maps it to `Local` instead of today's `NoAck`.
+- Cancellation: a caller that stops waiting never receives a stale completion, and a started transmission always runs to its end (esp-hal `run_sender` already does this); the ESP-IDF `espnow-tx` worker must match it with request ids.
+- Timeout: the timeout bounds queueing and the start of transmission; a transmission that has started is waited out and reports its real result (esp-hal semantics, ADR 020).
+- Scan ownership: a scan owns the radio; a concurrent scan fails at once with `Busy`, and an application send during a scan fails at once with a `Local` outcome instead of changing the channel or queueing in front of probes.
+- Scanning stays limited to a driver-owned radio on both tiers (ESP-IDF `init_with_radio*`, esp-hal `new_owned`); on a Wi-Fi-associated device the router owns the channel and `scan_for_peer` is refused.
+- Receive is part of the shared trait (`async` receive returning the sender MAC), because the peer link counts received frames and portable apps must not need a tier receive path.
+
 ## Open Questions
 - [ ] Trait and method names: `send_async` / `recv_async` (esp-hal today) or `send` / `receive`?
-- [ ] Does the trait cover receive, or does each tier keep its own receive path?
+- [x] Does the trait cover receive, or does each tier keep its own receive path? — yes, see Requirements
 - [ ] Do the sync `send_and_wait` forms converge (ESP-IDF takes `timeout_ms`, esp-hal does not)?
 - [ ] Stack and heap cost of the `espnow-tx` worker, measured against bug 013.
 - [ ] Hardware gate: mixed IDF/hal fleet run, shared with the esp-hal-espnow-v1 validation plan.
@@ -43,5 +53,14 @@ Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
 - [ ] Tests passing
 - [ ] Documentation updated
 
+<details><summary>Acceptance</summary>
+
+- One unchanged generic application compiles against both tiers (parity compile check plus an example pair, like the tier-parity LWT pair).
+- Host tests: cancellation without stale results, queue pressure classified `Local`, sends during a scan refused.
+- Hardware: mixed-tier fleet in both directions (ESP-IDF peer with esp-hal coordinator and the reverse).
+
+</details>
+
 ## Session Log
 - 2026-11-03 — Feature doc created via /feature dialog, split from the peer-link request
+- 2026-11-03 — Design review folded in: outcome classification, cancellation and timeout, scan ownership, receive in the trait

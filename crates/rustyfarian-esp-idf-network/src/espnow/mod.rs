@@ -562,7 +562,7 @@ impl EspIdfEspNow {
                     ack_status.reset();
                     if let Err(e) = self.send(&mac, probe_data) {
                         machine.log_fault(format_args!("probe on channel {channel} failed: {e:#}"));
-                        ScanInput::Sent(SendOutcome::Error)
+                        ScanInput::Sent(SendOutcome::Local)
                     } else {
                         match ack_status.wait(timeout) {
                             Some(true) => ScanInput::Sent(SendOutcome::Acked),

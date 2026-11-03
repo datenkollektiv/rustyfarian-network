@@ -6,6 +6,7 @@
 //! - [`EspNowEvent`] — received frame (fixed-size, no heap)
 //! - [`PeerConfig`] — peer registration parameters
 //! - [`PeerTracker`] — heartbeat-based peer liveness tracking
+//! - [`PeerLink`] — clock-injected supervisor that decides when to (re)scan for the coordinator
 //! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers
 //! - [`mock::MockEspNowDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
@@ -17,6 +18,7 @@
 //! | `mock`  | `MockEspNowDriver` for downstream host-side tests            |
 
 pub mod command;
+pub mod link;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod scan;
@@ -25,6 +27,9 @@ pub mod tracker;
 pub use command::{
     parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
     TAG_SELF_TEST,
+};
+pub use link::{
+    PeerLink, PeerLinkAction, PeerLinkConfig, PeerLinkEpoch, PeerLinkEvent, PeerLinkState,
 };
 pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
 pub use tracker::PeerTracker;

@@ -290,14 +290,15 @@ pub(crate) fn validate_frame_len(data: &[u8]) -> Result<(), EspHalEspNowError> {
 
 /// Maps the result of a probe send to the [`SendOutcome`] the scan machine expects.
 ///
-/// `Ok` is a MAC-layer ACK; a transmitted but unacknowledged frame and an ACK wait that ran out
-/// of time are both `NoAck`; everything else (busy sender, bad frame, driver error) means the
-/// frame never went out and is `Error`.
+/// `Ok` is a MAC-layer ACK; a transmitted but unacknowledged frame (`SendFailed`) is `NoAck`;
+/// everything else means the frame never went out and is `Local`: busy sender, bad frame,
+/// driver error, and `Timeout` (on esp-hal a timeout always means the send never started,
+/// see ADR 020).
 pub(crate) fn probe_outcome(result: Result<(), EspHalEspNowError>) -> SendOutcome {
     match result {
         Ok(()) => SendOutcome::Acked,
-        Err(EspHalEspNowError::SendFailed | EspHalEspNowError::Timeout) => SendOutcome::NoAck,
-        Err(_) => SendOutcome::Error,
+        Err(EspHalEspNowError::SendFailed) => SendOutcome::NoAck,
+        Err(_) => SendOutcome::Local,
     }
 }
 
@@ -542,17 +543,14 @@ mod tests {
             probe_outcome(Err(EspHalEspNowError::SendFailed)),
             SendOutcome::NoAck
         );
-        assert_eq!(
-            probe_outcome(Err(EspHalEspNowError::Timeout)),
-            SendOutcome::NoAck
-        );
         for e in [
+            EspHalEspNowError::Timeout,
             EspHalEspNowError::Busy,
             EspHalEspNowError::PayloadTooLarge { len: 251 },
             EspHalEspNowError::Radio(RadioError::Internal),
             EspHalEspNowError::InvalidChannel(0),
         ] {
-            assert_eq!(probe_outcome(Err(e)), SendOutcome::Error);
+            assert_eq!(probe_outcome(Err(e)), SendOutcome::Local);
         }
     }
 

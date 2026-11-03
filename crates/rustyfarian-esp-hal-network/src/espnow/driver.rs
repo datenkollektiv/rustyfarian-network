@@ -574,7 +574,8 @@ impl EspHalEspNow {
     /// the peer go back to it.
     /// `pinned` is left unchanged in that case, so it still describes the restored state.
     ///
-    /// Each probe is bounded by `config.probe_timeout`; a timeout counts as "no ACK".
+    /// Each probe is bounded by `config.probe_timeout`; a timeout means the frame never started
+    /// and counts as a local failure (not as "no ACK"); a transmitted but unacknowledged frame is "no ACK".
     /// A cancelled or timed-out probe never orphans a completion (the runner finishes it).
     /// The scan never changes channel while a probe is being transmitted: a probe that has started
     /// is waited out (the burst budget counts the overrun, the machine is fed the real time), and
@@ -640,7 +641,7 @@ impl EspHalEspNow {
                 } => {
                     let result = self.send_probe(mac, machine.probe_data(), timeout).await;
                     let outcome = probe_outcome(result);
-                    if let (SendOutcome::Error, Err(e)) = (outcome, &result) {
+                    if let (SendOutcome::Local, Err(e)) = (outcome, &result) {
                         machine.log_fault(format_args!("probe on channel {channel} failed: {e:?}"));
                     }
                     ScanInput::Sent(outcome)

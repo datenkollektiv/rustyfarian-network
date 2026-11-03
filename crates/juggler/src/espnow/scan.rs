@@ -36,8 +36,9 @@
 //! # Contract for the I/O side
 //!
 //! - [`ScanAction::SendProbe`] carries the probe timeout.
-//!   The caller waits at most that long for the MAC-layer ACK and reports a timeout as
-//!   [`SendOutcome::NoAck`]; an enqueue failure is [`SendOutcome::Error`].
+//!   The caller waits at most that long for the MAC-layer ACK and reports a timeout after
+//!   transmission as [`SendOutcome::NoAck`]; a frame that was never transmitted is
+//!   [`SendOutcome::Local`].
 //! - [`ScanAction::RemovePeer`] is best effort: both `Completed` and `Failed` continue.
 //! - [`ScanAction::BoostTxPower`] and [`ScanAction::RestoreTxPower`] are advisory; a driver
 //!   that cannot change TX power reports `Completed` and the scan proceeds.
@@ -64,10 +65,12 @@ use super::{MacAddress, ScanConfig, ScanResult};
 pub enum SendOutcome {
     /// The peer acknowledged the frame at the MAC layer.
     Acked,
-    /// The frame was transmitted but not acknowledged, or the ACK wait timed out.
+    /// The frame was transmitted, but not acknowledged (or the ACK wait timed out after
+    /// transmission).
     NoAck,
-    /// The frame could not be enqueued (driver error).
-    Error,
+    /// The frame was not transmitted: queue full, no sender runner, invalid peer, driver
+    /// error, or a timeout before transmission.
+    Local,
 }
 
 /// Input fed to [`ScanMachine::poll`].
@@ -145,7 +148,7 @@ pub enum ScanFault {
         /// The channel that could not be set.
         channel: u8,
     },
-    /// Enqueueing a probe on `channel` failed ([`SendOutcome::Error`]), on a first probe or a
+    /// Enqueueing a probe on `channel` failed ([`SendOutcome::Local`]), on a first probe or a
     /// confirmation probe.
     ProbeSend {
         /// The channel the probe was meant for.
@@ -394,7 +397,7 @@ impl<'a> ScanMachine<'a> {
             }
 
             (State::Probing { idx }, ScanInput::Sent(outcome)) => match outcome {
-                SendOutcome::Error => {
+                SendOutcome::Local => {
                     self.record_fault(ScanFault::ProbeSend {
                         channel: self.config.channels[idx],
                     });
@@ -418,7 +421,7 @@ impl<'a> ScanMachine<'a> {
                 SendOutcome::Acked => self.after_ack(now, idx, done + 1),
                 // Unconfirmed: the peer was only passing through (roaming).
                 SendOutcome::NoAck => self.next_channel(now, idx + 1),
-                SendOutcome::Error => {
+                SendOutcome::Local => {
                     self.record_fault(ScanFault::ProbeSend {
                         channel: self.config.channels[idx],
                     });
@@ -742,7 +745,7 @@ mod tests {
                     probes += 1;
                     if peer.fail_send == Some(n) {
                         now += op_cost;
-                        input = ScanInput::Sent(SendOutcome::Error);
+                        input = ScanInput::Sent(SendOutcome::Local);
                         continue;
                     }
                     let silent = peer.acks_before_silence.is_some_and(|k| acks >= k);
@@ -1583,7 +1586,7 @@ mod tests {
         let cfg = ScanConfig::new(b"p").with_channels(&list);
         let mut m = machine(cfg, None);
         let r = drive_with(&mut m, |a| {
-            matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::Error))
+            matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::Local))
         });
         assert_eq!(
             r,
@@ -1606,7 +1609,7 @@ mod tests {
             ScanAction::SendProbe {
                 confirmation: 0, ..
             } => Some(ScanInput::Sent(SendOutcome::Acked)),
-            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Error)),
+            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Local)),
             _ => None,
         });
         assert_eq!(
@@ -1626,7 +1629,7 @@ mod tests {
         let mut m = machine(cfg, None);
         let r = drive_with(&mut m, |a| match a {
             ScanAction::SetChannel { channel: 1 } => Some(ScanInput::Failed),
-            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Error)),
+            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Local)),
             _ => None,
         });
         let first = Some(ScanFault::SetChannel { channel: 1 });
