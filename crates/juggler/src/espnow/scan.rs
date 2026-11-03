@@ -132,6 +132,36 @@ pub enum ScanAction {
     Done(Result<ScanResult, ScanError>),
 }
 
+/// The first I/O failure of a scan that the machine skipped over.
+///
+/// A skipped channel does not count as probed, so a scan that fails on every channel reports
+/// `probed: 0` with no other clue.
+/// The machine records only the first such failure; the driver adds the error detail it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFault {
+    /// The radio refused to switch to `channel` ([`ScanInput::Failed`] after
+    /// [`ScanAction::SetChannel`]).
+    SetChannel {
+        /// The channel that could not be set.
+        channel: u8,
+    },
+    /// Enqueueing a probe on `channel` failed ([`SendOutcome::Error`]), on a first probe or a
+    /// confirmation probe.
+    ProbeSend {
+        /// The channel the probe was meant for.
+        channel: u8,
+    },
+}
+
+impl core::fmt::Display for ScanFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SetChannel { channel } => write!(f, "set channel {channel}"),
+            Self::ProbeSend { channel } => write!(f, "probe send on channel {channel}"),
+        }
+    }
+}
+
 /// Why a scan failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanError {
@@ -141,6 +171,8 @@ pub enum ScanError {
         probed: usize,
         /// Channels in [`ScanConfig::channels`].
         configured: usize,
+        /// The first channel switch or probe send that failed, if any.
+        first_fault: Option<ScanFault>,
     },
     /// The temporary peer (channel 0) could not be registered; nothing was probed.
     RegisterTempPeer,
@@ -159,10 +191,20 @@ pub enum ScanError {
 impl core::fmt::Display for ScanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NotFound { probed, configured } => write!(
-                f,
-                "peer not found after probing {probed} of {configured} configured channels"
-            ),
+            Self::NotFound {
+                probed,
+                configured,
+                first_fault,
+            } => {
+                write!(
+                    f,
+                    "peer not found after probing {probed} of {configured} configured channels"
+                )?;
+                match first_fault {
+                    Some(fault) => write!(f, " (first failure: {fault})"),
+                    None => Ok(()),
+                }
+            }
             Self::RegisterTempPeer => f.write_str("failed to register temporary peer for scanning"),
             Self::RegisterFoundPeer { channel } => {
                 write!(
@@ -239,6 +281,7 @@ pub struct ScanMachine<'a> {
     probed: usize,
     /// Why the scan is unwinding early, if it is.
     failure: Option<ScanError>,
+    first_fault: Option<ScanFault>,
     burst_expired: bool,
 }
 
@@ -257,6 +300,7 @@ impl<'a> ScanMachine<'a> {
             burst_start: Duration::ZERO,
             probed: 0,
             failure: None,
+            first_fault: None,
             burst_expired: false,
         }
     }
@@ -283,6 +327,23 @@ impl<'a> ScanMachine<'a> {
     /// Number of channels on which a probe was actually transmitted so far.
     pub fn probed(&self) -> usize {
         self.probed
+    }
+
+    /// The first channel switch or probe send that failed so far in this scan.
+    pub fn first_fault(&self) -> Option<ScanFault> {
+        self.first_fault
+    }
+
+    /// Logs a failed channel switch or probe send with the driver's error in `detail`.
+    ///
+    /// Call it before feeding the failure: the first fault of a scan is logged at `warn`, the
+    /// repeats at `debug`, so both tiers report a scan that probed nothing the same way.
+    pub fn log_fault(&self, detail: core::fmt::Arguments<'_>) {
+        if self.first_fault.is_none() {
+            log::warn!("ESP-NOW scan: {detail}");
+        } else {
+            log::debug!("ESP-NOW scan: {detail}");
+        }
     }
 
     /// The probe payload to transmit on [`ScanAction::SendProbe`].
@@ -325,10 +386,20 @@ impl<'a> ScanMachine<'a> {
             }
             // A channel the radio refuses (e.g. not allowed in the regulatory domain) is
             // skipped and does not count as probed.
-            (State::SettingChannel { idx }, ScanInput::Failed) => self.next_channel(now, idx + 1),
+            (State::SettingChannel { idx }, ScanInput::Failed) => {
+                self.record_fault(ScanFault::SetChannel {
+                    channel: self.config.channels[idx],
+                });
+                self.next_channel(now, idx + 1)
+            }
 
             (State::Probing { idx }, ScanInput::Sent(outcome)) => match outcome {
-                SendOutcome::Error => self.next_channel(now, idx + 1),
+                SendOutcome::Error => {
+                    self.record_fault(ScanFault::ProbeSend {
+                        channel: self.config.channels[idx],
+                    });
+                    self.next_channel(now, idx + 1)
+                }
                 SendOutcome::NoAck => {
                     self.probed += 1;
                     self.next_channel(now, idx + 1)
@@ -346,7 +417,13 @@ impl<'a> ScanMachine<'a> {
             (State::Confirming { idx, done }, ScanInput::Sent(outcome)) => match outcome {
                 SendOutcome::Acked => self.after_ack(now, idx, done + 1),
                 // Unconfirmed: the peer was only passing through (roaming).
-                SendOutcome::NoAck | SendOutcome::Error => self.next_channel(now, idx + 1),
+                SendOutcome::NoAck => self.next_channel(now, idx + 1),
+                SendOutcome::Error => {
+                    self.record_fault(ScanFault::ProbeSend {
+                        channel: self.config.channels[idx],
+                    });
+                    self.next_channel(now, idx + 1)
+                }
             },
 
             (State::RestoringTxPower { found }, ScanInput::Completed | ScanInput::Failed) => {
@@ -409,6 +486,11 @@ impl<'a> ScanMachine<'a> {
         }
     }
 
+    /// Keep only the first fault of the scan.
+    fn record_fault(&mut self, fault: ScanFault) {
+        self.first_fault.get_or_insert(fault);
+    }
+
     fn send_probe(&self, idx: usize, confirmation: u8) -> ScanAction {
         ScanAction::SendProbe {
             channel: self.config.channels[idx],
@@ -467,6 +549,7 @@ impl<'a> ScanMachine<'a> {
         let error = self.failure.unwrap_or(ScanError::NotFound {
             probed: self.probed,
             configured: self.config.channels.len(),
+            first_fault: self.first_fault,
         });
         self.finish(Err(error))
     }
@@ -755,7 +838,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 13,
-                configured: 13
+                configured: 13,
+                first_fault: None
             })
         );
         assert_eq!(r.pinned, None);
@@ -822,7 +906,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 12,
-                configured: 13
+                configured: 13,
+                first_fault: Some(ScanFault::SetChannel { channel: 9 })
             })
         ));
         let seen = r.seen();
@@ -889,7 +974,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 13,
-                configured: 13
+                configured: 13,
+                first_fault: None
             }),
             "the confirmation probe is not counted as a probed channel"
         );
@@ -986,7 +1072,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 3,
-                configured: 13
+                configured: 13,
+                first_fault: None
             })
         );
         assert_eq!(r.end - D::from_secs(1000), D::from_millis(300));
@@ -1009,7 +1096,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 0,
-                configured: 13
+                configured: 13,
+                first_fault: None
             })
         );
         assert_eq!(r.probes(), 0);
@@ -1053,7 +1141,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 3,
-                configured: 3
+                configured: 3,
+                first_fault: None
             })
         );
     }
@@ -1066,7 +1155,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 0,
-                configured: 0
+                configured: 0,
+                first_fault: None
             })
         );
         assert_eq!(r.probes(), 0);
@@ -1094,7 +1184,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 11,
-                configured: 13
+                configured: 13,
+                first_fault: Some(ScanFault::SetChannel { channel: 12 })
             })
         );
     }
@@ -1112,7 +1203,8 @@ mod tests {
             r.result,
             Err(ScanError::NotFound {
                 probed: 1,
-                configured: 2
+                configured: 2,
+                first_fault: Some(ScanFault::ProbeSend { channel: 1 })
             })
         );
         assert_eq!(r.channels_set(), [1, 6]);
@@ -1432,17 +1524,152 @@ mod tests {
         assert_eq!(m.pinned_channel(), Some(7));
     }
 
+    /// Drive `m` to completion; `step` answers an action, `None` means `Completed`.
+    fn drive_with(
+        m: &mut ScanMachine<'_>,
+        mut step: impl FnMut(&ScanAction) -> Option<ScanInput>,
+    ) -> Result<ScanResult, ScanError> {
+        let mut input = ScanInput::Start;
+        for _ in 0..1_000 {
+            let action = m.poll(D::ZERO, input);
+            if let ScanAction::Done(result) = action {
+                return result;
+            }
+            input = step(&action).unwrap_or(ScanInput::Completed);
+        }
+        panic!("scan did not finish");
+    }
+
+    #[test]
+    fn first_fault_is_none_when_every_channel_just_did_not_ack() {
+        let mut m = machine(ScanConfig::new(b"p"), None);
+        let r = drive_with(&mut m, |a| {
+            matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::NoAck))
+        });
+        assert!(matches!(
+            r,
+            Err(ScanError::NotFound {
+                probed: 13,
+                first_fault: None,
+                ..
+            })
+        ));
+        assert_eq!(m.first_fault(), None);
+    }
+
+    #[test]
+    fn first_fault_records_a_failed_set_channel() {
+        let list = [1, 6];
+        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let mut m = machine(cfg, None);
+        let r = drive_with(&mut m, |a| match a {
+            ScanAction::SetChannel { .. } => Some(ScanInput::Failed),
+            _ => None,
+        });
+        assert_eq!(
+            r,
+            Err(ScanError::NotFound {
+                probed: 0,
+                configured: 2,
+                first_fault: Some(ScanFault::SetChannel { channel: 1 })
+            })
+        );
+        assert_eq!(m.first_fault(), Some(ScanFault::SetChannel { channel: 1 }));
+    }
+
+    #[test]
+    fn first_fault_records_a_probe_send_error() {
+        let list = [1, 6];
+        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let mut m = machine(cfg, None);
+        let r = drive_with(&mut m, |a| {
+            matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::Error))
+        });
+        assert_eq!(
+            r,
+            Err(ScanError::NotFound {
+                probed: 0,
+                configured: 2,
+                first_fault: Some(ScanFault::ProbeSend { channel: 1 })
+            })
+        );
+    }
+
+    #[test]
+    fn first_fault_records_a_confirmation_probe_error() {
+        let list = [6];
+        let cfg = ScanConfig::new(b"p")
+            .with_channels(&list)
+            .with_probe_confirmations(1);
+        let mut m = machine(cfg, None);
+        let r = drive_with(&mut m, |a| match a {
+            ScanAction::SendProbe {
+                confirmation: 0, ..
+            } => Some(ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Error)),
+            _ => None,
+        });
+        assert_eq!(
+            r,
+            Err(ScanError::NotFound {
+                probed: 1,
+                configured: 1,
+                first_fault: Some(ScanFault::ProbeSend { channel: 6 })
+            })
+        );
+    }
+
+    #[test]
+    fn only_the_first_fault_is_kept() {
+        let list = [1, 6, 11];
+        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let mut m = machine(cfg, None);
+        let r = drive_with(&mut m, |a| match a {
+            ScanAction::SetChannel { channel: 1 } => Some(ScanInput::Failed),
+            ScanAction::SendProbe { .. } => Some(ScanInput::Sent(SendOutcome::Error)),
+            _ => None,
+        });
+        let first = Some(ScanFault::SetChannel { channel: 1 });
+        assert_eq!(m.first_fault(), first);
+        assert_eq!(
+            r,
+            Err(ScanError::NotFound {
+                probed: 0,
+                configured: 3,
+                first_fault: first
+            })
+        );
+    }
+
     #[test]
     fn scan_error_display_is_informative() {
         use alloc::string::ToString;
         assert_eq!(
             ScanError::NotFound {
                 probed: 3,
-                configured: 13
+                configured: 13,
+                first_fault: None
             }
             .to_string(),
             "peer not found after probing 3 of 13 configured channels"
         );
+        assert_eq!(
+            ScanError::NotFound {
+                probed: 0,
+                configured: 13,
+                first_fault: Some(ScanFault::ProbeSend { channel: 1 })
+            }
+            .to_string(),
+            "peer not found after probing 0 of 13 configured channels \
+             (first failure: probe send on channel 1)"
+        );
+        assert!(ScanError::NotFound {
+            probed: 0,
+            configured: 13,
+            first_fault: Some(ScanFault::SetChannel { channel: 4 })
+        }
+        .to_string()
+        .ends_with("(first failure: set channel 4)"));
         assert!(ScanError::RegisterTempPeer
             .to_string()
             .contains("temporary"));

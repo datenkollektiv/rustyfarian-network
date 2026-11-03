@@ -38,7 +38,8 @@
 //! * Async sends and scan probes go through [`EspHalEspNow::run_sender`], a runner task that owns every
 //!   asynchronous transmission and never drops a send future; a cancelled or timed-out caller never
 //!   orphans a completion, so a late send callback cannot be attributed to the next send.
-//!   Without a running runner the async senders fail with [`EspHalEspNowError::NoSenderRunner`].
+//!   An async sender waits up to 100 ms (or its own deadline) for a just-spawned runner to start;
+//!   without a running runner it then fails with [`EspHalEspNowError::NoSenderRunner`].
 //!   The sync [`EspNowDriver::send`] and [`EspHalEspNow::send_and_wait`] lease the sender directly,
 //!   work without the runner and return [`EspHalEspNowError::Busy`] while the runner is mid-transmission.
 //!   If the radio never fires the send callback, the runner (and a sync send) waits forever, like `esp-radio`'s own send waiter.
@@ -305,6 +306,15 @@ pub(crate) fn expired<T: PartialOrd>(deadline: Option<T>, now: T) -> bool {
     deadline.is_some_and(|at| now >= at)
 }
 
+/// The instant an async send stops waiting for the sender runner to start: the caller's own
+/// deadline or the end of the start grace, whichever comes first.
+pub(crate) fn runner_wait_deadline<T: Ord>(caller: Option<T>, grace_end: T) -> T {
+    match caller {
+        Some(at) => at.min(grace_end),
+        None => grace_end,
+    }
+}
+
 /// A [`PeerConfig`] after validation, in the shape the driver registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeerPlan {
@@ -512,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn runner_wait_ends_at_the_earlier_of_deadline_and_grace() {
+        let grace_end = Duration::from_millis(100);
+        assert_eq!(
+            runner_wait_deadline(Some(Duration::from_millis(30)), grace_end),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            runner_wait_deadline(Some(Duration::from_millis(500)), grace_end),
+            grace_end
+        );
+        assert_eq!(runner_wait_deadline(None, grace_end), grace_end);
+    }
+
+    #[test]
     fn probe_outcome_maps_send_results() {
         assert_eq!(probe_outcome(Ok(())), SendOutcome::Acked);
         assert_eq!(
@@ -541,7 +565,8 @@ mod tests {
             "{}",
             EspHalEspNowError::Scan(ScanError::NotFound {
                 probed: 3,
-                configured: 13
+                configured: 13,
+                first_fault: None
             })
         )
         .expect("fits");

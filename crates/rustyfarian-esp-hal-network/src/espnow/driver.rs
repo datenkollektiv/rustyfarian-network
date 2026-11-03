@@ -11,16 +11,16 @@ use esp_radio::esp_now::{
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use juggler::espnow::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanAction, ScanConfig, ScanInput,
-    ScanMachine, ScanResult, WifiInterface,
+    ScanMachine, ScanResult, SendOutcome, WifiInterface,
 };
 use juggler::wifi::TxPowerLevel;
 
 use super::cell::{Lease, SharedCopy, Singleton, TakeCell};
 use super::{
     existing_peer_is_idempotent, expired, frame_event, plan_peer, probe_outcome,
-    should_log_oversize, validate_channel, validate_frame_len, validate_tx_power,
-    EspHalEspNowError, EspNowConfig, PeerPlan, RadioError, DEFAULT_TX_POWER_QUARTER_DBM,
-    MAX_DATA_LEN,
+    runner_wait_deadline, should_log_oversize, validate_channel, validate_frame_len,
+    validate_tx_power, EspHalEspNowError, EspNowConfig, PeerPlan, RadioError,
+    DEFAULT_TX_POWER_QUARTER_DBM, MAX_DATA_LEN,
 };
 
 /// Frames examined per [`EspNowDriver::try_recv`] call when the head of the queue is oversize.
@@ -28,6 +28,10 @@ const RX_SKIP_LIMIT: usize = 16;
 
 /// Pause between attempts of the sender runner to lease a sender that a sync send holds.
 const RUNNER_LEASE_RETRY_MS: u64 = 1;
+/// Poll interval while an async send waits for `run_sender` to be polled for the first time.
+const RUNNER_START_POLL_MS: u64 = 1;
+/// How long an async send waits for `run_sender` to start before it fails with `NoSenderRunner`.
+const RUNNER_START_GRACE_MS: u64 = 100;
 
 /// One transmission handed from a caller to [`EspHalEspNow::run_sender`]; the payload is copied.
 struct SendRequest {
@@ -305,8 +309,12 @@ impl EspHalEspNow {
     /// }
     /// ```
     ///
-    /// Without a running runner the async senders return [`EspHalEspNowError::NoSenderRunner`]
-    /// at once; the sync [`EspNowDriver::send`] and [`EspHalEspNow::send_and_wait`] do not need it.
+    /// The runner marks itself active on its first poll, which can come after a task spawned
+    /// right behind it already sends.
+    /// An async sender therefore waits up to 100 ms (or its own deadline, whichever is
+    /// shorter) for the runner to start, and only then returns
+    /// [`EspHalEspNowError::NoSenderRunner`]; without a runner at all it fails after that grace.
+    /// The sync [`EspNowDriver::send`] and [`EspHalEspNow::send_and_wait`] do not need it.
     /// If the radio never fires the send callback, the runner waits forever (and with it every
     /// async sender), like `esp-radio`'s own send waiter.
     /// Dropping this future by mistake clears the running flag; frames already queued then never
@@ -357,6 +365,38 @@ impl EspHalEspNow {
             .map_err(map_error)
     }
 
+    /// Waits for `run_sender` to be polled for the first time, bounded by `deadline` and
+    /// [`RUNNER_START_GRACE_MS`].
+    ///
+    /// The runner sets `runner_active` only on its first poll, and the executor does not
+    /// guarantee that a freshly spawned runner runs before another task that sends.
+    /// A timer (not `yield_now`) paces the poll: the embassy run queue is a stack, so a
+    /// yielding caller is polled again before the runner.
+    ///
+    /// # Errors
+    ///
+    /// [`EspHalEspNowError::NoSenderRunner`] when the runner did not appear in time, also when the
+    /// caller's own deadline is what ran out: the missing runner is the cause, not a slow radio.
+    async fn await_runner(
+        &self,
+        deadline: Option<embassy_time::Instant>,
+    ) -> Result<(), EspHalEspNowError> {
+        if self.runner_active.get() {
+            return Ok(());
+        }
+        let grace_end = embassy_time::Instant::now()
+            .checked_add(embassy_time::Duration::from_millis(RUNNER_START_GRACE_MS))
+            .unwrap_or(embassy_time::Instant::MAX);
+        let give_up = runner_wait_deadline(deadline, grace_end);
+        while !self.runner_active.get() {
+            if expired(Some(give_up), embassy_time::Instant::now()) {
+                return Err(EspHalEspNowError::NoSenderRunner);
+            }
+            embassy_time::Timer::after_millis(RUNNER_START_POLL_MS).await;
+        }
+        Ok(())
+    }
+
     /// Queues one frame for the runner and waits for its result.
     ///
     /// With a `deadline`, queueing, waiting for the sender and the start of the transmission are
@@ -381,9 +421,7 @@ impl EspHalEspNow {
         deadline: Option<embassy_time::Instant>,
     ) -> Result<(), EspHalEspNowError> {
         validate_frame_len(data)?;
-        if !self.runner_active.get() {
-            return Err(EspHalEspNowError::NoSenderRunner);
-        }
+        self.await_runner(deadline).await?;
         // Held until the result is consumed, so no `SendDone` is overwritten before its caller
         // has read it.
         let _caller = bounded(deadline, self.callers.lock())
@@ -437,7 +475,8 @@ impl EspHalEspNow {
     /// # Errors
     ///
     /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
-    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] is not running.
+    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] did not start
+    ///   within 100 ms (or the timeout, if shorter).
     /// * [`EspHalEspNowError::SendFailed`] when a unicast frame was not acknowledged.
     /// * [`EspHalEspNowError::Radio`] if the driver rejects the frame.
     pub async fn send_async(&self, mac: &MacAddress, data: &[u8]) -> Result<(), EspHalEspNowError> {
@@ -453,7 +492,8 @@ impl EspHalEspNow {
     /// # Errors
     ///
     /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
-    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] is not running.
+    /// * [`EspHalEspNowError::NoSenderRunner`] when [`EspHalEspNow::run_sender`] did not start
+    ///   within 100 ms (or the timeout, if shorter).
     /// * [`EspHalEspNowError::Timeout`] if no completion arrived within `timeout`.
     /// * [`EspHalEspNowError::SendFailed`] when a unicast frame was not acknowledged.
     /// * [`EspHalEspNowError::Radio`] if the driver rejects the frame.
@@ -516,8 +556,11 @@ impl EspHalEspNow {
     /// Meant for a handle from [`EspHalEspNow::new_owned`], which owns the radio.
     /// On an associated station (a [`EspHalEspNow::from_controller`] handle) the scan moves the
     /// radio to every channel in turn and drops the access-point link.
-    /// Probes go through [`EspHalEspNow::run_sender`] (without it the scan fails with
-    /// [`EspHalEspNowError::NoSenderRunner`] on the first probe).
+    /// Probes go through [`EspHalEspNow::run_sender`]; a probe waits up to 100 ms (or its
+    /// timeout) for a just-spawned runner to start.
+    /// Without a runner every probe fails, so the scan reports
+    /// [`ScanError::NotFound`](juggler::espnow::ScanError::NotFound) with a probe-send
+    /// `first_fault` and `probed: 0`, and logs the cause at `warn`.
     /// A concurrent periodic sender queues in front of a probe and eats into its timeout, so it
     /// can still delay or skew the result.
     ///
@@ -571,7 +614,15 @@ impl EspHalEspNow {
                     peer.channel = channel;
                     completed(self.add_peer(&peer))
                 }
-                ScanAction::SetChannel { channel } | ScanAction::RestoreChannel { channel } => {
+                ScanAction::SetChannel { channel } => {
+                    cleanup.arm();
+                    let result = self.set_channel(channel);
+                    if let Err(e) = &result {
+                        machine.log_fault(format_args!("failed to set channel {channel}: {e:?}"));
+                    }
+                    completed(result)
+                }
+                ScanAction::RestoreChannel { channel } => {
                     cleanup.arm();
                     completed(self.set_channel(channel))
                 }
@@ -584,9 +635,16 @@ impl EspHalEspNow {
                     boost.release();
                     ScanInput::Completed
                 }
-                ScanAction::SendProbe { timeout, .. } => ScanInput::Sent(probe_outcome(
-                    self.send_probe(mac, machine.probe_data(), timeout).await,
-                )),
+                ScanAction::SendProbe {
+                    channel, timeout, ..
+                } => {
+                    let result = self.send_probe(mac, machine.probe_data(), timeout).await;
+                    let outcome = probe_outcome(result);
+                    if let (SendOutcome::Error, Err(e)) = (outcome, &result) {
+                        machine.log_fault(format_args!("probe on channel {channel} failed: {e:?}"));
+                    }
+                    ScanInput::Sent(outcome)
+                }
                 ScanAction::WaitUntil(deadline) => {
                     let micros = u64::try_from(deadline.as_micros()).unwrap_or(u64::MAX);
                     embassy_time::Timer::at(start + embassy_time::Duration::from_micros(micros))

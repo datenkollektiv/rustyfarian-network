@@ -537,7 +537,9 @@ impl EspIdfEspNow {
                         )
                     };
                     if ret != esp_idf_svc::sys::ESP_OK {
-                        log::warn!("Failed to set channel {}: error code {}", channel, ret);
+                        machine.log_fault(format_args!(
+                            "failed to set channel {channel}: error code {ret}"
+                        ));
                         ScanInput::Failed
                     } else {
                         ScanInput::Completed
@@ -549,15 +551,8 @@ impl EspIdfEspNow {
                     timeout,
                 } => {
                     ack_status.reset();
-                    if self.send(&mac, probe_data).is_err() {
-                        // A failed first probe is silent, like the pre-machine driver.
-                        if confirmation > 0 {
-                            log::debug!(
-                                "Channel {} confirmation probe {} send failed",
-                                channel,
-                                confirmation
-                            );
-                        }
+                    if let Err(e) = self.send(&mac, probe_data) {
+                        machine.log_fault(format_args!("probe on channel {channel} failed: {e:#}"));
                         ScanInput::Sent(SendOutcome::Error)
                     } else {
                         match ack_status.wait(timeout) {

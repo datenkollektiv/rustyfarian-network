@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `juggler::espnow::ScanFault`, `ScanMachine::{first_fault, log_fault}` and `ScanError::NotFound::first_fault`: the scan machine records the first channel switch or probe send (first or confirmation probe) that failed, and `NotFound` reports it, for example `peer not found after probing 0 of 13 configured channels (first failure: probe send on channel 1)`.
+  A scan whose every channel failed before a probe went out therefore no longer reads as plain silence.
+  `ScanMachine` and `ScanError` are unreleased, so the new field is not a breaking change.
+  Both tiers log through the shared `ScanMachine::log_fault`: the first failure at `warn` with the driver error (`ESP-NOW scan: failed to set channel N: ...` / `ESP-NOW scan: probe on channel N failed: ...`) and later ones in the same scan at `debug`; on the ESP-IDF tier this replaces the per-failure `Failed to set channel` warning and the silent first probe failure.
 - One application body for both tiers (ADR 022, tier-parity Step 9): `examples-shared/lwt_app.rs` is compiled into `idf_esp32s3_mqtt_lwt` and `hal_esp32s3_mqtt_lwt` through `#[path]`, so the two S3 LWT examples differ only in setup and their application lines share the `[app]` prefix for the bench comparison.
   Both examples are excluded from their crate's published package, because the shared file lives outside the crate, and the ESP-IDF crate gains a `heapless` dev-dependency for the shared payload buffer.
   The tick loop, receive loop and suspend demo all start at boot; the first-connect line is logged when the session comes up, so a boot with an unreachable broker still reports link state, ticks and the demo.
@@ -216,6 +220,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - esp-hal `ProvisioningStore` never read a committed record back: `try_read_sector` read exactly `record_len` bytes, and esp-storage 0.10 rejects a read length that is not a multiple of its 4-byte `READ_SIZE`, so every provisioned boot reopened the portal with `StoreError::Flash` (bug 006, found on an ESP32-C3 Mini-1).
   The read is now rounded up to `READ_SIZE`, a host mock with word-aligned reads covers it, and the hal provisioning examples log a store error instead of silently re-provisioning.
 - The esp-hal docs no longer call the ESP32-S3 LoRa-only: every pinned dependency supports it, and the claimed `compile_error!` for S3 with `wifi`/`ota` never existed (S3 with `ota` silently compiled the stub manager).
+- `rustyfarian-esp-hal-network` ESP-NOW: an async send or scan probe issued right after spawning `run_sender` no longer fails with `NoSenderRunner`.
+  The runner marks itself active on its first poll, which a task spawned behind it can precede; the sender now waits for it, polling every millisecond on an `embassy_time` timer, for at most 100 ms or its own deadline, and only then returns `NoSenderRunner`.
+  The boot scan of a peer that spawned the runner and a sending task together no longer reports `peer not found after probing 0 of 13 configured channels`.
 
 ## [0.6.0] - 2026-10-09
 

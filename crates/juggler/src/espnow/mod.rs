@@ -26,7 +26,7 @@ pub use command::{
     parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
     TAG_SELF_TEST,
 };
-pub use scan::{ScanAction, ScanError, ScanInput, ScanMachine, SendOutcome};
+pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
 pub use tracker::PeerTracker;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
