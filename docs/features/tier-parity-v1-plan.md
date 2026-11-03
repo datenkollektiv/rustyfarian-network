@@ -53,7 +53,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 - [x] Variant A, `idf_c3_async_mqtt`: `embassy-executor` (`arch-std`) on the main task, the `esp-idf-svc` `embassy-time-driver` feature in the example's dev-dependencies, the existing `WiFiManager` and `MqttHandle` driven from async code through minimal async waits over their worker threads, `Timer::after` ticks.
 - [x] Variant B, `idf_c3_async_mqtt_native`: the same app on `AsyncWifi` and `EspAsyncMqttClient` / `EspAsyncMqttConnection`, with reconnect and the online flag done by the example.
 - [x] Compare both: code a tier port would need, how each fits behind the decision 10 ports, reconnect and callback behaviour against ADR 017, stack and heap high-water marks; amend ADR 022 decision 2 with the winner.
-- [ ] Record in ADR 022's open questions: executor choice, lock unification (`embassy-time-driver 0.2.x`, `embassy-sync`), stack and heap high-water marks versus `idf_c3_mqtt_*`.
+- [x] Record in ADR 022's open questions: executor choice, lock unification (`embassy-time-driver 0.2.x`, `embassy-sync`), stack and heap high-water marks versus `idf_c3_mqtt_*`.
 - Done when: both variants build, `cargo tree -i embassy-time-driver` shows one version, a C3 run publishes ticks with each, and the maintainer has accepted the ADR amendment.
 - Decided 2026-11-01 by the maintainer: spike both instead of assuming the adapter.
 - Decided 2026-11-01 by the maintainer after the hardware run: variant A, async wrappers over the existing worker threads (ADR 022 decision 2 amended).
@@ -184,12 +184,13 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - [x] `juggler::mqtt::{NetworkGate, Outbox, PendingPublish}`: `NetworkGate` turns readiness observations into exactly one `NetworkUp` / `NetworkDown` edge, and `Outbox` holds up to `PUBLISH_QUEUE_DEPTH` (4) publishes until the client exists, dropping and counting the oldest when full.
 - [x] `MqttHandle::dropped_publish()` reports the outbox drops (esp-hal parity).
 - [x] Host tests cover `NetworkGate`, `Outbox`, `subscribe_ready` (including the readiness seed it returns at registration) and `SessionMachine::driver_idle` for every source of a `Close`, with mutation checks on the gate edges, the drop-oldest policy and an unanswered `Close` that blocks the next network-up.
-- [ ] The bench run still gates the bug's closure (IDF runbook R1/R3, esp-hal T5a/T5b); `idf_c3_mqtt` dropped its pre-build IP wait, so the gate is the reproduction case.
+- [x] The bench run still gates the bug's closure (IDF runbook R1/R3, esp-hal T5a/T5b); `idf_c3_mqtt` dropped its pre-build IP wait, so the gate is the reproduction case. Bug 010 closed on 2026-11-02 after the C3 run of `idf_c3_async_mqtt`.
 
 #### Step 8c: MQTT thread memory
 
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
 - [ ] The new `mqtt-net` runner thread (4 KiB) is part of the measuring scope.
+- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion; rerun T6 after the fix.
 
 - Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
 - Gate: rides with the bench run for both tiers.
@@ -205,7 +206,9 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - Packaging: both crates `exclude` their LWT example, because the shared module lives outside the package; `cargo package` drops the matching `[[example]]` target with a warning, so every other example still ships.
 - Done when: both examples build; the CrowPanel S3 passes runbook R1 and R3 on both tiers with identical app logs.
 - Gate: hardware (knob maintainer) — passed on the CrowPanel S3, 2026-11-03.
-- Checkpoint: release 0.7.0 with U2f and Steps 1–9.
+- Follow-up: a downstream rgb-clock task once its esp-hal firmware enables `mqtt` and Phase 6 closes provisioning and OTA parity; until then the in-repo LWT pair is the one-app proof.
+- The removed Step 9 detail doc (bench checklist, `[app]` gate comparison commands, packaging checks) stays in history at `ea640fb:docs/features/tier-parity-v1-step-9.md`.
+- Checkpoint: release 0.7.0 with U2f and Steps 1–9, after Step 8c.
 
 ## Phase 5 — Remaining Wi-Fi and MQTT shape alignment
 

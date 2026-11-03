@@ -17,6 +17,8 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 | Per-tier type aliases over generic cores               | Consumers never spell the generics                                    | Generic public types                              |
 | Wi-Fi and MQTT first                                   | Upstream request U2g                                                  | All domains at once                               |
 | MQTT gate fed by link readiness notifications          | Instant edges on one source of truth (IDF lost-IP is 120 s late)      | Polling `is_ready`; second `IpEvent` subscription |
+| Shared `examples-shared/lwt_app.rs` via `#[path]`      | Bench-only harness; app code stays out of the published crates        | Shipping it in a crate                            |
+| IDF examples on `block_on`                             | Runs on the C3 spike path, no new dependency                          | `embassy-executor` `arch-std`, a new dependency   |
 
 ## Constraints
 - ADR 021 holds: the firmware owns the executor and the providers, and libraries select none.
@@ -26,7 +28,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - Every step ends with `just fmt` and `just verify`, plus `just clippy-hal` and `just build-example` where touched.
 
 ## Open Questions
-- [ ] Which IDF executor do the examples use? `block_on` works with the generic timer queue; `embassy-executor` (`platform-std`) is untested.
+- [x] Which IDF executor do the examples use? `block_on` (Step 9); the firmware chooses its executor (ADR 021), and `embassy-executor` (`arch-std`) on IDF is untested.
 - [x] Does the embassy crate set unify across tiers? Yes for the IDF graph: one `embassy-time-driver` 0.2.2, no duplicate embassy crates (Step 2 spike).
 - [ ] Is each breaking item (IDF payload type, `is_connected` return type, `with_startup_message` signature) a break or a deprecation?
 - [x] What are the trait names, where does `InboundMessage` live, and what does `wait_connected` return? `NetworkLink` / `MqttClient`, tier-owned behind `MqttMessage`, `()`.
@@ -34,7 +36,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 - [x] Which IDF async foundation wins the Step 2 spike? Wrappers over the worker threads (variant A).
 
 ## State
-- [ ] Design approved (ADR 022 accepted, plan reviewed)
+- [x] Design approved (ADR 022 accepted, plan reviewed)
 - [x] Step 0 — feature doc and roadmap entry
 - [x] Step 1 — IDF `MqttHandle::state()` and stale docs
 - [x] Step 2 — async IDF spike
@@ -65,3 +67,4 @@ Other domains (provisioning, OTA, ESP-NOW, behaviour gaps, LoRa) follow as their
 - 2026-11-03 — Step 9 bench run on the CrowPanel S3 (working tree at f81d83e plus Step 9): R1 and R3 pass on both tiers, R3 with byte-identical `[app]` template sets and R1 identical except the per-tier prefix and the sampled intermediate states; the same session closed the esp-hal R1 cell and T5a/T5b, so Steps 7 and 9 are done; next is release 0.7.0
 - 2026-11-03 — T6 soak after the bench: esp-hal ran 4 h 28 min (3210 ticks, one external outage of about 25 min with 10 s retry pacing and automatic recovery, heap flat at 25928 B afterwards); ESP-IDF ran 10 min (123 ticks, no gap, no disconnect) but drifted 2148 B, outside the runbook's 1 KiB criterion, and is left to Step 8c (bug 013 territory)
 - 2026-11-03 — Review of 33ae125: `run` no longer awaits the first connect before starting, so the tick loop, the receive loop and the suspend demo report while the broker is unreachable; the `mqtt ready` marker is a third joined future and the `[app]` line set is unchanged. Uptime stays tick-counted, as before the extraction.
+- 2026-11-03 — Bookkeeping: ADR 022 accepted, Step 9 detail doc folded into this doc and the plan and removed; next is Step 8c (bug 013), then release 0.7.0, then Steps 10–11
