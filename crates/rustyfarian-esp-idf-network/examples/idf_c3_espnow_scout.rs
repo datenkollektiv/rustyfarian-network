@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         log::info!("Scanning for coordinator ...");
-        match espnow.scan_for_peer(&coordinator_mac, &scan_config) {
+        match espnow.scan_for_peer_blocking(&coordinator_mac, &scan_config) {
             Ok(result) => {
                 log::info!(
                     "Coordinator found on channel {} — starting send loop",
@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
             Err(e) => {
                 log::warn!("TX #{} failed: {} — re-scanning ...", seq, e);
                 led.set_high()?; // LED off during scan
-                match espnow.scan_for_peer(&coordinator_mac, &scan_config) {
+                match espnow.scan_for_peer_blocking(&coordinator_mac, &scan_config) {
                     Ok(r) => {
                         log::info!("Re-scan: coordinator now on channel {}", r.channel);
                         led.set_low()?; // LED on — reconnected

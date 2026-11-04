@@ -157,6 +157,11 @@ clippy-provisioning-mqtt-tests:
 check-espnow:
     cargo check -p rustyfarian-esp-idf-network --features espnow --target-dir {{ idf_dir }}
 
+# lint the esp-idf espnow worker, its host-less unit tests and the four ESP-NOW examples (none can run on the host)
+[group('build')]
+clippy-espnow:
+    cargo clippy -p rustyfarian-esp-idf-network --features espnow,wifi --lib --tests --example idf_c3_espnow_coordinator --example idf_c3_espnow_scout --example idf_c3_espnow_scout_promisc --example idf_c3_espnow_sta_scout --target-dir {{ idf_dir }} -- -D warnings
+
 # Fully cleans esp-idf-sys before AND after: switching sdkconfig variants forces a CMake reconfigure.
 # ESP_IDF_SDKCONFIG_DEFAULTS paths MUST be absolute: embuild does not resolve relative overlay
 # lists against the workspace root (relative silently applies neither file → false pass).
@@ -624,6 +629,7 @@ verify:
     just clippy-ota-pure
     just clippy-pure
     just clippy-ota-mqtt-idf
+    just clippy-espnow
     just check-hal
     just check-no-credential-logging
     just check-library-never-reboots

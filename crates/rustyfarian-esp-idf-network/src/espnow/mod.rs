@@ -44,20 +44,33 @@
 //!
 //! No special `sdkconfig` needed on either chip — radio contention is
 //! eliminated by design.
+//!
+//! # Blocking forms
+//!
+//! [`EspNowDriver::send`], [`EspIdfEspNow::send_and_wait`] and
+//! [`EspIdfEspNow::scan_for_peer_blocking`] park the calling thread.
+//! Do not run them on a thread that also polls [`EspNowLink`] futures of the same driver:
+//! futures that were polled once and are then left unpolled on that thread hold queue slots, and
+//! the blocking call can wait for a slot only that thread could free.
+//! `send` ends with `Timeout` after [`SEND_QUEUE_DEADLINE`], `send_and_wait` at its own timeout;
+//! a scan has no bound of its own.
+
+mod worker;
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
+use esp_idf_svc::sys::esp;
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
 };
-use juggler::espnow::{ClassifySend, OversizeLog, ScanAction, ScanInput, ScanMachine};
+use juggler::espnow::{ClassifySend, EspNowLink, OversizeLog, SendKind};
 pub use juggler::espnow::{
     EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
     SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
@@ -65,6 +78,16 @@ pub use juggler::espnow::{
     DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
 };
 use juggler::wait_list::WaitList;
+
+use worker::{block_on, TxShared};
+
+/// How long plain [`EspNowDriver::send`] waits for a queue slot and for its frame to start
+/// before it fails with [`EspIdfEspNowError::Timeout`] (1 s).
+///
+/// A started frame is still waited out.
+/// The bound keeps the call from waiting for ever when every queue slot is held, for instance
+/// by futures of this driver that were polled once and left unpolled on the calling thread.
+pub const SEND_QUEUE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Errors of [`EspIdfEspNow`] as seen through [`EspNowDriver`] and the shared
 /// [`juggler::espnow::EspNowLink`] contract.
@@ -261,6 +284,11 @@ impl RadioMode {
             RadioMode::CallerManagedSta | RadioMode::OwnedStaPromisc => WifiInterface::Sta,
         }
     }
+
+    /// Whether the driver owns the radio, which a channel scan needs (ADR 012).
+    fn owns_radio(self) -> bool {
+        !matches!(self, RadioMode::CallerManagedSta)
+    }
 }
 
 /// ESP-IDF implementation of [`EspNowDriver`].
@@ -286,43 +314,31 @@ impl RadioMode {
 ///   promiscuous-bracket channel re-pin before every send.  Offered only as a
 ///   fallback when SoftAP conflicts with another radio requirement; see
 ///   ADR 012 for the documented ~0–20 % send failure rate.
+///
+/// # Send path
+///
+/// Every transmission runs on one `espnow-tx` thread that the driver starts in every
+/// constructor and joins when it is dropped (see the `worker` module).
+/// The thread owns the send callback, so an acknowledgement always belongs to the frame it was
+/// reported for, and it serialises the frames: [`EspNowDriver::send`], [`send_acked`](Self::send_acked)
+/// and [`send_and_wait`](Self::send_and_wait) queue behind each other, and the scan's probes go
+/// through the same path.
+/// The thread costs a fixed stack of about 6 KiB.
 pub struct EspIdfEspNow {
-    esp_now: EspNow<'static>,
+    /// The ESP-NOW singleton: dropping it deinitialises ESP-NOW and clears both callbacks.
+    /// Declared first, so it drops before the radio it runs on.
+    _esp_now: EspNow<'static>,
     rx: Arc<RxQueue>,
     _wifi: Option<EspWifi<'static>>,
-    /// Serialises ownership of the single global send callback that
-    /// `esp_now_register_send_cb` exposes.  Both [`scan_for_peer`] and
-    /// [`send_and_wait`] register their own send callback for the duration
-    /// of the call; without this guard, a concurrent caller would either
-    /// have its callback replaced or steal another caller's ACKs.
-    send_cb_guard: Mutex<()>,
+    /// The send queue, the pin and the scan slot, shared with the worker and the send callback.
+    shared: Arc<TxShared>,
+    /// The `espnow-tx` thread; joined in [`Drop`] before `esp_now` is dropped.
+    worker: Option<JoinHandle<()>>,
     /// Explicit state for the three radio-management modes the driver supports.
     ///
     /// The driver internally tracks which of the three init paths was taken.
-    /// All branching for
-    /// `default_interface`, `scan_for_peer`, and `send_and_wait` is driven
-    /// off this single field.
+    /// All branching for `default_interface` and the scan is driven off this single field.
     mode: RadioMode,
-    /// Last channel reported by a successful [`scan_for_peer`] call,
-    /// reused by:
-    ///
-    /// - the `Err` branch of [`scan_for_peer`] itself, to restore the peer
-    ///   and radio channel after a failed re-scan so the next
-    ///   [`send_and_wait`] is not penalised by a stale channel + missing peer
-    ///   registration; and
-    /// - when using the unassociated STA radio mode, where the
-    ///   STA background scanner drifts the channel and the promiscuous
-    ///   bracket re-pins it before each frame.
-    ///
-    /// Lifecycle invariants:
-    ///
-    /// - Sentinel [`u8::MAX`] means "no channel ever discovered".
-    /// - Written only by [`scan_for_peer`] on a successful scan.
-    /// - Never cleared once set — a stale value will be overwritten on the
-    ///   next successful scan; if a failed scan ever needs to invalidate it
-    ///   explicitly, store [`u8::MAX`] here.
-    /// - Has no effect in STA or SoftAP modes beyond the failed-scan fallback path.
-    pinned_channel: AtomicU8,
 }
 
 impl EspIdfEspNow {
@@ -444,18 +460,19 @@ impl EspIdfEspNow {
         self.mode.wifi_interface()
     }
 
-    /// Scan Wi-Fi channels to find one where the given peer responds.
+    /// Scan Wi-Fi channels to find one where the given peer responds, without blocking.
     ///
     /// Registers the peer temporarily, probes each channel in
     /// [`ScanConfig::channels`] by sending [`ScanConfig::probe_data`], and
     /// returns the first channel where the peer ACKs the frame.
+    /// The scan runs on the `espnow-tx` thread; this future only waits for it.
     ///
-    /// On success the peer is left registered with the discovered channel.
+    /// On success the peer is left registered with the discovered channel, and the driver keeps
+    /// that channel as its pin ([`pinned_channel`](Self::pinned_channel)).
     /// On failure, if a channel was found in a previous successful scan, the
     /// peer is re-registered on that channel and the radio is restored to it,
-    /// so the next [`send_and_wait`](Self::send_and_wait) can attempt delivery
-    /// without an extra failure round-trip.  If no prior channel is known, the
-    /// peer registration is removed.
+    /// so the next [`send_acked`](Self::send_acked) can attempt delivery without an extra
+    /// failure round-trip.  If no prior channel is known, the peer registration is removed.
     ///
     /// # Supported radio modes
     ///
@@ -474,6 +491,22 @@ impl EspIdfEspNow {
     /// relying on.  Devices that share an AP with the peer do not need to
     /// scan in the first place — both radios are locked to the AP's channel.
     ///
+    /// # Exclusion
+    ///
+    /// The scan holds the radio against application sends from the moment it is admitted until
+    /// channel, TX power and peer registration are restored.
+    /// Application sends during that time fail with [`EspIdfEspNowError::ScanInProgress`], and
+    /// those still queued when the scan begins fail the same way, unsent.
+    /// A frame already on the air is waited out before the first radio action.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future requests cancellation: the worker aborts the scan at its next step
+    /// (after the probe on the air, or at once during a confirmation gap), restores the radio
+    /// through the scan's own teardown, keeps the exclusion until that is done, and discards the
+    /// result.
+    /// The pin is left as it was unless the scan had already found the peer.
+    ///
     /// # Side effects
     ///
     /// - Scanning hops the radio across [`ScanConfig::channels`] via
@@ -482,53 +515,70 @@ impl EspIdfEspNow {
     ///   that a stale entry does not abort the probe loop with
     ///   `ESP_ERR_ESPNOW_EXIST`.  The peer is left registered with the
     ///   discovered channel on success and removed on failure.
+    /// - A probe that has started is waited out however long its callback takes, so
+    ///   [`ScanConfig::probe_timeout`] bounds nothing on this tier.
     ///
     /// # Errors
     ///
-    /// Returns an error if the peer does not respond on any scanned channel,
-    /// or if the driver was created via [`init()`](Self::init) /
-    /// [`init_with_capacity()`](Self::init_with_capacity).
-    pub fn scan_for_peer(
+    /// * [`EspIdfEspNowError::RadioNotOwned`] for a driver created via [`init()`](Self::init) /
+    ///   [`init_with_capacity()`](Self::init_with_capacity).
+    /// * [`EspIdfEspNowError::Busy`] while another scan runs.
+    /// * [`EspIdfEspNowError::Scan`] when the peer does not respond on any scanned channel, or
+    ///   another scan failure.
+    /// * [`EspIdfEspNowError::Driver`] with the ESP-IDF error behind a registration failure.
+    ///
+    /// # Blocking
+    ///
+    /// The future can wait without limit if a probe's send callback never fires (fail-closed:
+    /// the channel must not change under a frame on the air), because
+    /// [`ScanConfig::burst_timeout`] is checked between channels only.
+    /// Dropping the future cancels the scan as described above, and so does dropping the driver.
+    pub async fn scan_for_peer(
+        &self,
+        mac: &MacAddress,
+        config: &ScanConfig<'_>,
+    ) -> Result<ScanResult, EspIdfEspNowError> {
+        let ticket = self.shared.admit_scan(*mac, config)?;
+        self.shared.finish_scan(ticket).await
+    }
+
+    /// Blocking form of [`scan_for_peer`](Self::scan_for_peer): the calling thread parks until
+    /// the scan has finished.
+    ///
+    /// Do not call it on a thread that also polls [`EspNowLink`] futures of this driver: futures
+    /// polled once and then left unpolled on that thread keep their queue slots, and a blocking
+    /// call there can wait for a slot only that thread could free.
+    /// The wait has no limit of its own: a probe is waited out however long its send callback
+    /// takes (fail-closed), and [`ScanConfig::burst_timeout`] is checked between channels only,
+    /// so a callback that never fires stalls the scan until the driver is dropped.
+    ///
+    /// Renamed from `scan_for_peer`, which is now the async form.
+    /// The error is an [`anyhow::Error`] wrapping [`EspIdfEspNowError`] (or the ESP-IDF error
+    /// behind it), so `downcast_ref` still reaches the variant.
+    ///
+    /// # Errors
+    ///
+    /// As [`scan_for_peer`](Self::scan_for_peer).
+    pub fn scan_for_peer_blocking(
         &self,
         mac: &MacAddress,
         config: &ScanConfig<'_>,
     ) -> anyhow::Result<ScanResult> {
-        anyhow::ensure!(
-            matches!(
-                self.mode,
-                RadioMode::OwnedSoftAp | RadioMode::OwnedStaPromisc
-            ),
-            "scan_for_peer requires init_with_radio or init_with_radio_sta \
-             (driver must own the radio); scanning hops Wi-Fi channels and \
-             would break any active AP association the caller relies on"
-        );
+        block_on(self.scan_for_peer(mac, config)).map_err(EspIdfEspNowError::into_anyhow)
+    }
 
-        // The pin is read before the scan: the machine restores the radio to it on failure.
-        let mut machine = ScanMachine::new(*mac, *config, self.pinned_channel_opt());
-        let result = self.drive_scan(&mut machine);
-
-        // Publish the pinned channel only for a successful scan; a failed scan
-        // leaves the previous pin untouched (the machine restores the radio to it).
-        match result {
-            Ok(scan_result) => {
-                self.pinned_channel
-                    .store(scan_result.channel, Ordering::Relaxed);
-                log::info!("Peer {:02X?} found on channel {}", mac, scan_result.channel);
-                Ok(scan_result)
-            }
-            Err(e) => {
-                if matches!(e.kind, ScanError::NotFound { .. }) {
-                    log::warn!("Peer {:02X?} not found on any scanned channel", mac);
-                }
-                Err(e.into_anyhow())
-            }
-        }
+    /// The channel the driver keeps pinned, if any.
+    ///
+    /// It is the channel of the last successful scan; a failed or cancelled scan leaves it as it
+    /// was, and it is `None` before the first successful scan.
+    pub fn pinned_channel(&self) -> Option<u8> {
+        self.shared.pinned_channel()
     }
 
     /// Initialise ESP-NOW, start the radio, and scan for a peer.
     ///
     /// Convenience constructor combining [`init_with_radio()`](Self::init_with_radio)
-    /// and [`scan_for_peer()`](Self::scan_for_peer).
+    /// and [`scan_for_peer_blocking()`](Self::scan_for_peer_blocking).
     /// On success the driver is ready to communicate with the peer on the
     /// discovered channel.
     pub fn init_with_radio_scanning(
@@ -539,7 +589,7 @@ impl EspIdfEspNow {
         scan_config: &ScanConfig<'_>,
     ) -> anyhow::Result<(Self, ScanResult)> {
         let driver = Self::init_with_radio(modem, sys_loop, nvs)?;
-        let result = driver.scan_for_peer(peer_mac, scan_config)?;
+        let result = driver.scan_for_peer_blocking(peer_mac, scan_config)?;
         Ok((driver, result))
     }
 
@@ -562,397 +612,71 @@ impl EspIdfEspNow {
         self.rx.oversize.dropped()
     }
 
-    fn pinned_channel_opt(&self) -> Option<u8> {
-        match self.pinned_channel.load(Ordering::Relaxed) {
-            u8::MAX => None,
-            ch => Some(ch),
-        }
+    /// Sends `data` to `mac` and resolves on the MAC-layer ACK.
+    ///
+    /// `timeout` bounds waiting for a queue slot, queueing and the start of the transmission; a
+    /// frame that has started is waited out and its real result returned, so a late callback is
+    /// never taken for the next frame's ACK.
+    /// A request that did not start in time is never sent.
+    /// [`Duration::MAX`] means no bound.
+    /// Dropping the future is safe: a queued frame is never sent, and one on the air has its
+    /// result discarded.
+    ///
+    /// # Errors
+    ///
+    /// * [`EspIdfEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
+    /// * [`EspIdfEspNowError::Broadcast`] for the broadcast address, which is never
+    ///   acknowledged: use [`EspNowDriver::send`].
+    /// * [`EspIdfEspNowError::ScanInProgress`] while a scan runs, or when one began before this
+    ///   frame started.
+    /// * [`EspIdfEspNowError::Timeout`] if the frame did not start within `timeout`.
+    /// * [`EspIdfEspNowError::NoAck`] when the frame was transmitted and not acknowledged.
+    /// * [`EspIdfEspNowError::Driver`] if ESP-IDF rejects the frame (unknown peer, ...).
+    /// * [`EspIdfEspNowError::Shutdown`] if the driver is being dropped.
+    pub async fn send_acked(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), EspIdfEspNowError> {
+        let outcome = self
+            .shared
+            .run_frame(mac, data, Some(timeout), SendKind::App)
+            .await?;
+        worker::require_ack(outcome)
     }
 
-    /// Drive a [`ScanMachine`] synchronously against the ESP-IDF radio.
+    /// Send data and block until the MAC-layer ACK arrives.
     ///
-    /// The machine owns the algorithm (ADR 009, ADR 012); this function only
-    /// performs the requested I/O and reports the outcome.
+    /// Unlike [`EspNowDriver::send`], which returns once the frame has left the radio, this
+    /// reports whether the peer acknowledged it.
     ///
-    /// Note on radio side-effects: TX power is a global radio setting.
-    /// While the burst is active, any concurrent Wi-Fi or ESP-NOW
-    /// transmissions on this chip also go out at the boosted level.
-    /// On dual-radio (Wi-Fi + ESP-NOW on the same chip) deployments,
-    /// schedule scans during quiet periods if predictable per-frame
-    /// power matters.
-    fn drive_scan(&self, machine: &mut ScanMachine<'_>) -> Result<ScanResult, ScanFailure> {
-        let mac = *machine.mac();
-        let probe_data = machine.probe_data();
-        let epoch = Instant::now();
-
-        let temp_peer = PeerConfig {
-            mac,
-            channel: 0,
-            encrypt: false,
-            interface: self.default_interface(),
-        };
-
-        let ack_status = AckStatus::new();
-        // Held from the TX power boost until the burst ends, like the send-callback scope.
-        let mut cb: Option<SendCbScope<'_>> = None;
-        // Set when the callback could not be registered: the scan is aborted and the
-        // machine unwinds through its normal teardown path.
-        let mut cb_error: Option<anyhow::Error> = None;
-        let mut saved_tx_power: i8 = 0;
-        let mut have_saved_power = false;
-        let mut last_register_error: Option<anyhow::Error> = None;
-
-        let mut input = ScanInput::Start;
-        loop {
-            let action = machine.poll(epoch.elapsed(), input);
-            input = match action {
-                ScanAction::RemovePeer => {
-                    // Best effort: removes a stale registration, or the scan peer.
-                    let _ = self.remove_peer(&mac);
-                    ScanInput::Completed
-                }
-                ScanAction::RegisterPeer { channel } => {
-                    let peer = PeerConfig {
-                        channel,
-                        ..temp_peer
-                    };
-                    match self.add_peer(&peer) {
-                        Ok(()) => ScanInput::Completed,
-                        Err(e) => {
-                            last_register_error = Some(e.into_anyhow());
-                            ScanInput::Failed
-                        }
-                    }
-                }
-                ScanAction::RegisterFallbackPeer { channel } => {
-                    let peer = PeerConfig {
-                        channel,
-                        ..temp_peer
-                    };
-                    match self.add_peer(&peer) {
-                        Ok(()) => log::debug!(
-                            "Peer {:02X?} fallback-registered on last known channel {}",
-                            mac,
-                            channel
-                        ),
-                        Err(e) => log::warn!(
-                            "Failed to fallback-register peer {:02X?} on channel {}: {:#} \
-                             (next send_and_wait will fail until the next successful scan)",
-                            mac,
-                            channel,
-                            e
-                        ),
-                    }
-                    ScanInput::Completed
-                }
-                ScanAction::BoostTxPower => {
-                    match self.register_ack_cb(&ack_status, "scanning") {
-                        Ok(scope) => {
-                            cb.replace(scope);
-                            // Auto-burst: boost TX power to maximum during channel scanning
-                            // to maximise discovery range, then restore the previous level.
-                            // SAFETY: esp_wifi_get_max_tx_power is an FFI call into the
-                            // ESP-IDF Wi-Fi subsystem, which is initialised by
-                            // init_with_radio().  It writes the current TX power to the
-                            // &mut i8 we pass in.
-                            have_saved_power = unsafe {
-                                esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power)
-                            } == esp_idf_svc::sys::ESP_OK;
-
-                            let burst_power = juggler::wifi::TxPowerLevel::Max.to_quarter_dbm();
-                            // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the
-                            // ESP-IDF Wi-Fi subsystem, which is initialised by
-                            // init_with_radio().  burst_power comes from
-                            // TxPowerLevel::Max which is within the valid [8, 84]
-                            // quarter-dBm range required by the API.
-                            if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
-                                != esp_idf_svc::sys::ESP_OK
-                            {
-                                log::warn!(
-                                    "Failed to boost TX power for scanning — \
-                                     continuing at current level"
-                                );
-                            }
-                            ScanInput::Completed
-                        }
-                        Err(e) => {
-                            cb_error = Some(e);
-                            ScanInput::Abort
-                        }
-                    }
-                }
-                ScanAction::RestoreChannel { channel } => {
-                    // Fallback: restore the radio to the last pinned channel so the
-                    // peer registration is consistent with the physical channel.
-                    // SAFETY: scan_for_peer is gated to owned-radio modes, so the
-                    // radio is owned and running. channel is a valid 2.4 GHz channel
-                    // written by a previous successful scan.
-                    let set_ch_ret = unsafe {
-                        esp_idf_svc::sys::esp_wifi_set_channel(
-                            channel,
-                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-                        )
-                    };
-                    if set_ch_ret != esp_idf_svc::sys::ESP_OK {
-                        log::warn!(
-                            "Failed to restore radio to last known channel {}: {:#x} \
-                             (next send may target an inconsistent channel)",
-                            channel,
-                            set_ch_ret
-                        );
-                    }
-                    ScanInput::Completed
-                }
-                ScanAction::SetChannel { channel } => {
-                    log::debug!("Probing channel {} for peer {:02X?}", channel, mac);
-                    // SAFETY: esp_wifi_set_channel is an FFI call into the ESP-IDF
-                    // Wi-Fi subsystem, which is initialised by init_with_radio().
-                    // In SoftAP mode the channel change is a CSA with no connected
-                    // stations, so it takes effect immediately. channel is 1-13.
-                    let ret = unsafe {
-                        esp_idf_svc::sys::esp_wifi_set_channel(
-                            channel,
-                            esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-                        )
-                    };
-                    if ret != esp_idf_svc::sys::ESP_OK {
-                        machine.log_fault(format_args!(
-                            "failed to set channel {channel}: error code {ret}"
-                        ));
-                        ScanInput::Failed
-                    } else {
-                        ScanInput::Completed
-                    }
-                }
-                ScanAction::SendProbe {
-                    channel,
-                    confirmation,
-                    timeout,
-                } => {
-                    ack_status.reset();
-                    if let Err(e) = self.send(&mac, probe_data) {
-                        machine.log_fault(format_args!("probe on channel {channel} failed: {e:#}"));
-                        ScanInput::Sent(SendOutcome::Local)
-                    } else {
-                        match ack_status.wait(timeout) {
-                            Some(true) => ScanInput::Sent(SendOutcome::Acked),
-                            Some(false) => {
-                                if confirmation == 0 {
-                                    log::debug!("No ACK on channel {}", channel);
-                                } else {
-                                    log::debug!(
-                                        "Channel {} unconfirmed: probe {} not ACKed \
-                                         (likely roaming peer)",
-                                        channel,
-                                        confirmation
-                                    );
-                                }
-                                ScanInput::Sent(SendOutcome::NoAck)
-                            }
-                            None => {
-                                if confirmation == 0 {
-                                    log::debug!("Send timeout on channel {}", channel);
-                                } else {
-                                    log::debug!(
-                                        "Channel {} unconfirmed: probe {} timed out",
-                                        channel,
-                                        confirmation
-                                    );
-                                }
-                                ScanInput::Sent(SendOutcome::NoAck)
-                            }
-                        }
-                    }
-                }
-                ScanAction::WaitUntil(deadline) => {
-                    // FreeRTOS delay via std::thread::sleep (esp-idf pthread/usleep shim).
-                    let now = epoch.elapsed();
-                    if deadline > now {
-                        std::thread::sleep(deadline - now);
-                    }
-                    ScanInput::Completed
-                }
-                ScanAction::RestoreTxPower => {
-                    // Restore TX power after scanning regardless of outcome.
-                    // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
-                    // Wi-Fi subsystem, which is initialised by init_with_radio().
-                    // saved_tx_power was previously read from esp_wifi_get_max_tx_power
-                    // (and only used here when have_saved_power is true), so the value
-                    // is guaranteed to be in the valid range the API itself produced.
-                    if have_saved_power
-                        && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
-                            != esp_idf_svc::sys::ESP_OK
-                    {
-                        log::warn!("Failed to restore TX power after scanning");
-                    }
-                    // The burst is over: release the send callback and its guard.
-                    drop(cb.take());
-                    ScanInput::Completed
-                }
-                ScanAction::Done(result) => {
-                    return result.map_err(|kind| match (kind, cb_error.take()) {
-                        (ScanError::Aborted, Some(e)) => ScanFailure {
-                            kind,
-                            cause: Some(e),
-                        },
-                        (ScanError::RegisterTempPeer | ScanError::RegisterFoundPeer { .. }, _) => {
-                            ScanFailure {
-                                kind,
-                                cause: last_register_error.take(),
-                            }
-                        }
-                        _ => ScanFailure { kind, cause: None },
-                    });
-                }
-            };
-        }
-    }
-
-    /// Send data and wait for the MAC-layer ACK.
+    /// Do not call it on a thread that also polls [`EspNowLink`] futures of this driver: futures
+    /// polled once and then left unpolled on that thread keep their queue slots, and this call
+    /// can wait for a slot only that thread could free (it ends with `Timeout` at `timeout_ms`).
     ///
-    /// Unlike [`EspNowDriver::send`] which returns as soon as the frame is
-    /// enqueued, this method blocks until the send callback confirms whether
-    /// the peer ACKed the frame or not.
+    /// `timeout_ms` bounds waiting for the queue and the start of the transmission, so `0` or a
+    /// very small value fails with [`EspIdfEspNowError::Timeout`] unless the `espnow-tx` thread
+    /// starts the frame at once; a frame that has started is waited out, however long its callback takes, and a frame the peer did not
+    /// acknowledge fails with [`EspIdfEspNowError::NoAck`] (inside the returned
+    /// [`anyhow::Error`], reachable with `downcast_ref`).
+    /// During a scan the call fails at once with [`EspIdfEspNowError::ScanInProgress`], and a
+    /// send to the broadcast address fails with [`EspIdfEspNowError::Broadcast`].
     ///
-    /// Returns `Ok(())` on ACK, `Err` on NAK or timeout.
+    /// Concurrent calls queue behind each other and behind [`EspNowDriver::send`] on the
+    /// `espnow-tx` thread, so they cannot steal each other's ACKs.
     ///
-    /// This method temporarily owns the global send-completion callback;
-    /// concurrent calls to `send_and_wait` or
-    /// [`scan_for_peer`](Self::scan_for_peer) on the same driver are
-    /// serialised internally so they cannot steal each other's ACKs.
+    /// # Errors
+    ///
+    /// As [`send_acked`](Self::send_acked).
     pub fn send_and_wait(
         &self,
         mac: &MacAddress,
         data: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
-        let ack_status = AckStatus::new();
-        let _cb = self.register_ack_cb(&ack_status, "send_and_wait")?;
-
-        ack_status.reset();
-
-        match self.mode {
-            RadioMode::OwnedStaPromisc => {
-                let ch = self.pinned_channel.load(Ordering::Relaxed);
-                if ch != u8::MAX {
-                    self.send_with_promisc_repin(mac, data, ch)?;
-                } else {
-                    // No prior scan — no channel to re-pin to; fall through to the
-                    // plain send path and let the caller's scan loop recover.
-                    self.send(mac, data)?;
-                }
-            }
-            RadioMode::OwnedSoftAp | RadioMode::CallerManagedSta => {
-                // SoftAP: beacon schedule holds the channel — no re-pin needed.
-                // Caller-managed: radio managed externally (typically AP-associated).
-                self.send(mac, data)?;
-            }
-        }
-
-        match ack_status.wait(Duration::from_millis(timeout_ms)) {
-            Some(true) => Ok(()),
-            Some(false) => anyhow::bail!("peer did not ACK"),
-            None => anyhow::bail!("send ACK timeout after {} ms", timeout_ms),
-        }
-    }
-
-    /// Re-pin the radio to `channel` and dispatch `esp_now_send` in a single
-    /// `unsafe` block; used by [`send_and_wait`] in
-    /// unassociated STA radio mode.
-    ///
-    /// `set_promiscuous(false)` and `esp_now_send` must be consecutive
-    /// instructions to minimise the scheduler window in which the Wi-Fi
-    /// background scan task (priority 23) can preempt the app task (priority 5)
-    /// and drift the channel.  Even with the tightest possible bracket the race
-    /// is not fully eliminated — see ADR 012 for the ~0–20 % `ESP_ERR_ESPNOW_CHAN`
-    /// rate this path exhibits in production.
-    fn send_with_promisc_repin(
-        &self,
-        mac: &MacAddress,
-        data: &[u8],
-        channel: u8,
-    ) -> anyhow::Result<()> {
-        juggler::espnow::validate_payload(data)
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("payload validation failed")?;
-
-        // SAFETY: this helper is only called from RadioMode::OwnedStaPromisc, so
-        // the radio is owned and running. `channel` was written by a successful
-        // scan_for_peer (the caller has already guarded against u8::MAX), so it
-        // is a valid 2.4 GHz channel.  `mac` and `data` outlive this call.
-        //
-        // The tight bracket captures every intermediate `esp_err_t` so that a
-        // channel-race or country-code failure surfaces as a specific log line
-        // rather than an opaque "peer did not ACK" downstream.
-        let (promisc_on_ret, set_ch_ret, promisc_off_ret, send_ret) = unsafe {
-            let on = esp_idf_svc::sys::esp_wifi_set_promiscuous(true);
-            let set = esp_idf_svc::sys::esp_wifi_set_channel(
-                channel,
-                esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
-            );
-            let off = esp_idf_svc::sys::esp_wifi_set_promiscuous(false);
-            let send = esp_idf_svc::sys::esp_now_send(mac.as_ptr(), data.as_ptr(), data.len());
-            (on, set, off, send)
-        };
-
-        if promisc_on_ret != esp_idf_svc::sys::ESP_OK {
-            log::warn!(
-                "esp_wifi_set_promiscuous(true) failed: {:#x} \
-                 (channel re-pin skipped, send proceeded on previous channel)",
-                promisc_on_ret
-            );
-        }
-        if set_ch_ret != esp_idf_svc::sys::ESP_OK {
-            log::warn!(
-                "esp_wifi_set_channel({}) failed: {:#x} \
-                 (frame sent on whatever channel the radio was on)",
-                channel,
-                set_ch_ret
-            );
-        }
-        if promisc_off_ret != esp_idf_svc::sys::ESP_OK {
-            log::warn!(
-                "esp_wifi_set_promiscuous(false) failed: {:#x} \
-                 (radio left in promiscuous mode)",
-                promisc_off_ret
-            );
-        }
-        if send_ret != esp_idf_svc::sys::ESP_OK {
-            anyhow::bail!("esp_now_send failed: {:#x}", send_ret);
-        }
-        Ok(())
-    }
-
-    /// Take the send-callback guard, install an ACK-recording callback, and
-    /// return a RAII scope that unregisters the callback (and releases the
-    /// guard) on drop.
-    fn register_ack_cb<'a>(
-        &'a self,
-        ack_status: &AckStatus,
-        scope: &'static str,
-    ) -> anyhow::Result<SendCbScope<'a>> {
-        let guard = self
-            .send_cb_guard
-            .lock()
-            .map_err(|_| anyhow::anyhow!("send_cb_guard poisoned"))?;
-
-        let notify = ack_status.0.clone();
-        self.esp_now
-            .register_send_cb(move |_mac, status| {
-                let (lock, cvar) = &*notify;
-                let Ok(mut result) = lock.lock() else {
-                    log::error!("{scope} ACK mutex poisoned — ignoring callback");
-                    return;
-                };
-                *result = Some(matches!(status, SendStatus::SUCCESS));
-                cvar.notify_one();
-            })
-            .with_context(|| format!("failed to register send callback for {scope}"))?;
-
-        Ok(SendCbScope {
-            esp_now: &self.esp_now,
-            _guard: guard,
-        })
+        block_on(self.send_acked(mac, data, Duration::from_millis(timeout_ms)))
+            .map_err(EspIdfEspNowError::into_anyhow)
     }
 
     fn init_inner(
@@ -969,132 +693,144 @@ impl EspIdfEspNow {
             .register_recv_cb(move |info, data| callback_queue.push_frame(*info.src_addr, data))
             .context("failed to register ESP-NOW receive callback")?;
 
+        // One send callback for the driver's lifetime; the worker is the only sender, so it
+        // always belongs to the frame in flight.
+        let shared = Arc::new(TxShared::new(mode));
+        let callback_shared = Arc::clone(&shared);
+        esp_now
+            .register_send_cb(move |mac, status| {
+                callback_shared.on_send_done(mac, matches!(status, SendStatus::SUCCESS));
+            })
+            .context("failed to register ESP-NOW send callback")?;
+        let worker = worker::spawn(Arc::clone(&shared))?;
+
         Ok(Self {
-            esp_now,
+            _esp_now: esp_now,
             rx,
             _wifi: wifi,
-            send_cb_guard: Mutex::new(()),
+            shared,
+            worker: Some(worker),
             mode,
-            pinned_channel: AtomicU8::new(u8::MAX),
         })
     }
 }
 
-/// A failed scan: the machine's verdict plus the driver error that caused it, if any.
-struct ScanFailure {
-    kind: ScanError,
-    cause: Option<anyhow::Error>,
-}
-
-impl ScanFailure {
-    /// Reproduce the error shapes of the pre-state-machine implementation:
-    /// a context message over the driver error for registration failures,
-    /// the plain verdict otherwise.
-    fn into_anyhow(self) -> anyhow::Error {
-        match (self.kind, self.cause) {
-            (ScanError::RegisterTempPeer, Some(cause)) => {
-                cause.context("failed to register temporary peer for scanning")
-            }
-            (ScanError::RegisterFoundPeer { .. }, Some(cause)) => {
-                cause.context("failed to re-register peer on discovered channel")
-            }
-            (ScanError::Aborted, Some(cause)) => cause,
-            (kind, _) => anyhow::Error::new(kind),
-        }
-    }
-}
-
-/// Shared state for awaiting a single MAC-layer ACK from the send callback.
-struct AckStatus(Arc<(Mutex<Option<bool>>, Condvar)>);
-
-impl AckStatus {
-    fn new() -> Self {
-        Self(Arc::new((Mutex::new(None), Condvar::new())))
-    }
-
-    fn reset(&self) {
-        if let Ok(mut guard) = self.0 .0.lock() {
-            *guard = None;
-        }
-    }
-
-    /// Block until an ACK is recorded or `timeout` elapses.
+impl Drop for EspIdfEspNow {
+    /// Stops the `espnow-tx` thread and joins it before `EspNow` is dropped.
     ///
-    /// Loops to absorb spurious wakeups; returns `Some(true)` on ACK,
-    /// `Some(false)` on NAK, `None` on timeout or poisoning.
-    fn wait(&self, timeout: Duration) -> Option<bool> {
-        let (lock, cvar) = &*self.0;
-        let mut guard = lock.lock().ok()?;
-        let deadline = Instant::now().checked_add(timeout)?;
-        while guard.is_none() {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline - now;
-            match cvar.wait_timeout(guard, remaining) {
-                Ok((g, _)) => guard = g,
-                Err(_) => return None,
+    /// Queued and in-flight requests end as [`EspIdfEspNowError::Shutdown`]; the join does not
+    /// depend on a send callback ever firing.
+    /// The send callback owns an `Arc` of the shared state, so it can never outlive it.
+    fn drop(&mut self) {
+        self.shared.begin_shutdown();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                log::error!("the espnow-tx thread panicked");
             }
         }
-        *guard
     }
 }
 
-/// RAII scope holding the send-callback guard for the lifetime of an
-/// ACK-aware operation.  Unregisters the callback on drop so subsequent
-/// plain [`EspNowDriver::send`] calls are not affected.
-struct SendCbScope<'a> {
-    esp_now: &'a EspNow<'static>,
-    _guard: std::sync::MutexGuard<'a, ()>,
+/// Registers `config` as an ESP-NOW peer.
+fn peer_add(config: &PeerConfig) -> Result<(), EspIdfEspNowError> {
+    let peer_info = PeerInfo {
+        peer_addr: config.mac,
+        channel: config.channel,
+        encrypt: config.encrypt,
+        ifidx: match config.interface {
+            juggler::espnow::WifiInterface::Sta => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA,
+            juggler::espnow::WifiInterface::Ap => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
+        },
+        ..Default::default()
+    };
+    // SAFETY: plain FFI call; `peer_info` is a fully initialised `esp_now_peer_info_t` that
+    // lives for the duration of the call, and ESP-NOW copies it.
+    esp!(unsafe { esp_idf_svc::sys::esp_now_add_peer(&peer_info) })
+        .context("failed to add ESP-NOW peer")
+        .map_err(EspIdfEspNowError::Driver)
 }
 
-impl Drop for SendCbScope<'_> {
-    fn drop(&mut self) {
-        let _ = self.esp_now.unregister_send_cb();
-    }
+/// Removes the ESP-NOW peer `mac`.
+fn peer_del(mac: &MacAddress) -> Result<(), EspIdfEspNowError> {
+    // SAFETY: plain FFI call; `mac` points to 6 bytes that live for the duration of the call.
+    esp!(unsafe { esp_idf_svc::sys::esp_now_del_peer(mac.as_ptr()) })
+        .context("failed to remove ESP-NOW peer")
+        .map_err(EspIdfEspNowError::Driver)
 }
 
 impl EspNowDriver for EspIdfEspNow {
     type Error = EspIdfEspNowError;
 
     fn add_peer(&self, config: &PeerConfig) -> Result<(), Self::Error> {
-        let peer_info = PeerInfo {
-            peer_addr: config.mac,
-            channel: config.channel,
-            encrypt: config.encrypt,
-            ifidx: match config.interface {
-                juggler::espnow::WifiInterface::Sta => {
-                    esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA
-                }
-                juggler::espnow::WifiInterface::Ap => esp_idf_svc::sys::wifi_interface_t_WIFI_IF_AP,
-            },
-            ..Default::default()
-        };
-        self.esp_now
-            .add_peer(peer_info)
-            .context("failed to add ESP-NOW peer")
-            .map_err(EspIdfEspNowError::Driver)
+        peer_add(config)
     }
 
     fn remove_peer(&self, mac: &MacAddress) -> Result<(), Self::Error> {
-        self.esp_now
-            .del_peer(*mac)
-            .context("failed to remove ESP-NOW peer")
-            .map_err(EspIdfEspNowError::Driver)
+        peer_del(mac)
     }
 
+    /// Sends a frame and returns once it has left the radio; the MAC-layer ACK is ignored (see
+    /// [`EspIdfEspNow::send_acked`]).
+    ///
+    /// The frame goes through the `espnow-tx` thread, so the call waits for a frame already in
+    /// flight, normally a few tens of milliseconds.
+    /// Waiting for a queue slot and for the frame to start is bounded by [`SEND_QUEUE_DEADLINE`]
+    /// (1 s), after which the call fails with [`EspIdfEspNowError::Timeout`]; a frame that has
+    /// started is waited out, without limit if its send callback never fires (fail-closed).
+    /// During a scan it fails with [`EspIdfEspNowError::ScanInProgress`].
+    /// Broadcast frames are allowed.
+    ///
+    /// Do not call it on a thread that also polls [`EspNowLink`] futures of this driver: futures
+    /// polled once and then left unpolled on that thread keep their queue slots until polled or
+    /// dropped, so the call can only end with `Timeout`.
     fn send(&self, mac: &MacAddress, data: &[u8]) -> Result<(), Self::Error> {
-        if data.len() > MAX_DATA_LEN {
-            return Err(EspIdfEspNowError::PayloadTooLarge { len: data.len() });
-        }
-        self.esp_now
-            .send(*mac, data)
-            .context("failed to send ESP-NOW frame")
-            .map_err(EspIdfEspNowError::Driver)
+        let outcome = block_on(self.shared.run_frame(
+            mac,
+            data,
+            Some(SEND_QUEUE_DEADLINE),
+            SendKind::Unacked,
+        ))?;
+        worker::ignore_ack(outcome)
     }
 
     fn try_recv(&self) -> Option<EspNowEvent> {
         self.rx.pop()
     }
 }
+
+impl EspNowLink for EspIdfEspNow {
+    async fn send_acked(
+        &self,
+        mac: &MacAddress,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), Self::Error> {
+        EspIdfEspNow::send_acked(self, mac, data, timeout).await
+    }
+
+    async fn receive(&self) -> EspNowEvent {
+        EspIdfEspNow::receive(self).await
+    }
+
+    async fn scan_for_peer(
+        &self,
+        mac: &MacAddress,
+        config: &ScanConfig<'_>,
+    ) -> Result<ScanResult, Self::Error> {
+        EspIdfEspNow::scan_for_peer(self, mac, config).await
+    }
+
+    fn pinned_channel(&self) -> Option<u8> {
+        EspIdfEspNow::pinned_channel(self)
+    }
+}
+
+/// Tier parity check (ADR 022): fails to compile if `EspIdfEspNow` stops implementing `EspNowLink`.
+const _: fn() = || {
+    fn implements<T: EspNowLink>()
+    where
+        <T as EspNowDriver>::Error: ClassifySend,
+    {
+    }
+    implements::<EspIdfEspNow>();
+};

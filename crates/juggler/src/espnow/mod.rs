@@ -11,6 +11,8 @@
 //! - [`ClassifySend`] — maps a tier send error onto [`SendOutcome`]
 //! - [`OversizeLog`] — counter and rate-limited log decision for dropped oversize frames
 //! - [`TxCore`] — sans-IO send queue: request ids, deadlines, cancellation, scan exclusion
+//! - [`ScanJobSlot`], [`InFlightMarker`] and `DeadlineSet` (`std`) — the sans-IO parts of a worker-thread driver:
+//!   the scan job hand-off, the awaited send callback and the caller deadlines
 //! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers
 //! - [`mock::MockEspNowDriver`], [`mock::MockEspNowLink`] — test doubles for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
@@ -21,24 +23,32 @@
 //! |:--------|:-------------------------------------------------------------|
 //! | `mock`  | `MockEspNowDriver` for downstream host-side tests            |
 
+pub mod callback;
 pub mod command;
+#[cfg(any(test, feature = "std"))]
+pub mod deadlines;
 pub mod link;
 pub mod link_trait;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod scan;
+pub mod scan_job;
 pub mod tracker;
 pub mod tx;
 
+pub use callback::InFlightMarker;
 pub use command::{
     parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
     TAG_SELF_TEST,
 };
+#[cfg(any(test, feature = "std"))]
+pub use deadlines::{DeadlineFull, DeadlineId, DeadlineSet, DeadlineStorage};
 pub use link::{
     PeerLink, PeerLinkAction, PeerLinkConfig, PeerLinkEpoch, PeerLinkEvent, PeerLinkState,
 };
 pub use link_trait::{ClassifySend, EspNowLink};
 pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
+pub use scan_job::{Cancelled, JobEpoch, ScanJobSlot};
 pub use tracker::PeerTracker;
 pub use tx::{Abandon, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId};
 

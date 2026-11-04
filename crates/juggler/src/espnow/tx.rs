@@ -27,8 +27,9 @@
 //!   result) or "expired or still queued" (never transmitted); there is no window in between.
 //! - Results are per slot and keyed by [`TxId`]: a caller never takes another request's result,
 //!   and a result that arrives for an abandoned or unknown id is dropped.
-//! - While a scan runs, [`SendKind::App`] submissions are refused at once with
-//!   [`Refusal::Scanning`]; [`SendKind::Probe`] submissions (the scan's own frames) are allowed.
+//! - While a scan runs, [`SendKind::App`] and [`SendKind::Unacked`] submissions are refused at
+//!   once with [`Refusal::Scanning`]; [`SendKind::Probe`] submissions (the scan's own frames) are
+//!   allowed.
 //!   Application requests queued before the scan began are completed as
 //!   [`Completion::Preempted`] by [`TxCore::begin_scan`]; a frame in flight finishes first
 //!   ([`TxCore::can_start_scan_io`]).
@@ -75,8 +76,13 @@ pub struct TxId(u32);
 /// Who submits a frame: the application, or a peer scan's own probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendKind {
-    /// An application frame; refused while a scan runs.
+    /// An application frame that promises a unicast MAC ACK; refused while a scan runs, and
+    /// refused for the broadcast address.
     App,
+    /// An application frame that does not report the ACK (`EspNowDriver::send`); like
+    /// [`App`](Self::App) it is refused while a scan runs and preempted when one begins, but it
+    /// may be addressed to [`BROADCAST_MAC`].
+    Unacked,
     /// A scan probe; allowed while a scan runs.
     Probe,
 }
@@ -86,7 +92,8 @@ pub enum SendKind {
 pub enum Refusal {
     /// Every slot is reserved.
     Full,
-    /// A scan is running and the request is an application frame.
+    /// A scan is running and the request is an application frame ([`SendKind::App`] or
+    /// [`SendKind::Unacked`]).
     Scanning,
     /// The payload exceeds [`MAX_DATA_LEN`].
     TooLarge,
@@ -253,7 +260,7 @@ impl<R, const N: usize> TxCore<R, N> {
     /// `deadline` is an absolute time on the caller's clock; `None` waits for ever.
     /// Checked in this order: shutdown, payload size, broadcast, scan gate, free slot.
     /// Broadcast is refused for [`SendKind::App`] only: `send_acked` promises a unicast MAC ACK,
-    /// so use `EspNowDriver::send` for broadcast.
+    /// so use `EspNowDriver::send` ([`SendKind::Unacked`]) for broadcast.
     ///
     /// # Errors
     ///
@@ -276,7 +283,7 @@ impl<R, const N: usize> TxCore<R, N> {
         if kind == SendKind::App && mac == BROADCAST_MAC {
             return Err(Refusal::Broadcast);
         }
-        if self.scanning && kind == SendKind::App {
+        if self.scanning && kind != SendKind::Probe {
             return Err(Refusal::Scanning);
         }
         let index = self
@@ -461,7 +468,8 @@ impl<R, const N: usize> TxCore<R, N> {
 
     /// Claims the scan gate and the radio in one step.
     ///
-    /// From now on [`SendKind::App`] submissions are refused with [`Refusal::Scanning`].
+    /// From now on [`SendKind::App`] and [`SendKind::Unacked`] submissions are refused with
+    /// [`Refusal::Scanning`].
     /// Application requests still queued are completed at once as [`Completion::Preempted`],
     /// their wakers handed to `wake`.
     /// A frame already in flight is not touched: the scan must wait for
@@ -487,7 +495,7 @@ impl<R, const N: usize> TxCore<R, N> {
         }
         self.scanning = true;
         for slot in &mut self.slots {
-            if matches!(slot.state, State::Queued) && slot.kind == SendKind::App {
+            if matches!(slot.state, State::Queued) && slot.kind != SendKind::Probe {
                 slot.state = State::Preempted;
                 if let Some(waker) = slot.waker.take() {
                     wake(waker);
@@ -974,6 +982,37 @@ mod tests {
             .submit(ms(0), BROADCAST_MAC, b"x", None, SendKind::Probe)
             .is_ok());
         assert!(core.submit(ms(0), MAC, b"x", None, SendKind::App).is_ok());
+    }
+
+    #[test]
+    fn an_unacked_frame_may_broadcast_but_is_gated_and_preempted_like_an_app_frame() {
+        let mut core = Core::new();
+        let unicast = core
+            .submit(ms(0), MAC, b"u", None, SendKind::Unacked)
+            .unwrap();
+        let broadcast = core
+            .submit(ms(0), BROADCAST_MAC, b"b", None, SendKind::Unacked)
+            .unwrap();
+        let (w, _) = counting_waker();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        assert_eq!(
+            core.poll_result(unicast, &w),
+            Poll::Ready(Completion::Preempted)
+        );
+        assert_eq!(
+            core.poll_result(broadcast, &w),
+            Poll::Ready(Completion::Preempted)
+        );
+        for mac in [MAC, BROADCAST_MAC] {
+            assert_eq!(
+                core.submit(ms(0), mac, b"x", None, SendKind::Unacked),
+                Err(Refusal::Scanning)
+            );
+        }
+        core.end_scan();
+        assert!(core
+            .submit(ms(0), BROADCAST_MAC, b"x", None, SendKind::Unacked)
+            .is_ok());
     }
 
     #[test]

@@ -50,8 +50,13 @@
 //!   with [`ScanError::Aborted`] / [`ScanError::UnexpectedInput`].
 //!   While the scan is running the machine first unwinds through the normal
 //!   `RestoreTxPower -> RemovePeer -> fallback` sequence, so the caller needs no extra cleanup.
-//!   Before [`ScanInput::Start`], or once the teardown has begun, it finishes at once and the
-//!   caller owns whatever remains.
+//!   Before [`ScanInput::Start`] it finishes at once.
+//!   Once the teardown has begun, `Abort` stands for the input the teardown step expects
+//!   (`Completed`), so feeding it never skips a restore step: the teardown continues and the
+//!   scan ends with the result it was heading for (a found peer keeps its new pin).
+//!   A driver that cancels may therefore feed `Abort` at every step, in place of the result of
+//!   the last action; [`ScanInput::or_abort`] keeps a `Failed` result, which the machine must
+//!   see.
 //!
 //! The machine never loops on its own: every invocation of [`ScanMachine::poll`] returns
 //! within a bounded number of steps.
@@ -84,9 +89,27 @@ pub enum ScanInput {
     Failed,
     /// The caller cannot continue (e.g. the ACK callback could not be registered).
     /// The machine unwinds through its normal teardown and reports [`ScanError::Aborted`].
+    /// Fed during the teardown, it continues the teardown as if the step had completed.
     Abort,
     /// Result of the previous [`ScanAction::SendProbe`].
     Sent(SendOutcome),
+}
+
+impl ScanInput {
+    /// The input to feed when the driver may have been asked to cancel: [`ScanInput::Abort`]
+    /// in place of `self` if `cancel`, except that a `Failed` result is kept.
+    ///
+    /// A failed registration of the found peer or of the temporary peer changes what the
+    /// teardown must do, while every other result is superseded by the abort.
+    /// The cancel is still seen at the next step.
+    #[must_use]
+    pub fn or_abort(self, cancel: bool) -> Self {
+        if cancel && self != Self::Failed {
+            Self::Abort
+        } else {
+            self
+        }
+    }
 }
 
 /// Action the caller must perform before polling again.
@@ -358,6 +381,16 @@ impl<'a> ScanMachine<'a> {
     pub fn poll(&mut self, now: Duration, input: ScanInput) -> ScanAction {
         match (self.state, input) {
             (State::Finished(result), _) => ScanAction::Done(result),
+            // In the teardown `Abort` is the result the step expects: skipping a step would
+            // leave the TX power, the scan peer or the pinned-channel registration unrestored.
+            (
+                State::RestoringTxPower { .. }
+                | State::RemovingScanPeer { .. }
+                | State::RegisteringFound { .. }
+                | State::RestoringChannel { .. }
+                | State::RegisteringFallback,
+                ScanInput::Abort,
+            ) => self.poll(now, ScanInput::Completed),
             (_, ScanInput::Abort) => self.unwind(ScanError::Aborted),
 
             (State::Idle, ScanInput::Start) => {
@@ -471,7 +504,9 @@ impl<'a> ScanMachine<'a> {
     ///
     /// While the scan is running, unwinds through the normal teardown so TX power, the
     /// scan peer and the pinned-channel fallback are handled.
-    /// Before `Start` or inside the teardown itself there is nothing to unwind: finish at once.
+    /// Before `Start` there is nothing to unwind: finish at once.
+    /// An unexpected input inside the teardown also finishes at once, as the teardown cannot
+    /// be trusted to continue; `Abort` never gets here from the teardown.
     fn unwind(&mut self, error: ScanError) -> ScanAction {
         match self.state {
             State::RemovingStale
@@ -1440,6 +1475,111 @@ mod tests {
             m.poll(D::ZERO, ScanInput::Failed),
             ScanAction::Done(Err(ScanError::Aborted))
         );
+    }
+
+    /// Feeds `Abort` at the point where the scan is in `target` teardown state, returning the
+    /// actions that follow until `Done`.
+    fn actions_after_abort(mut m: ScanMachine<'_>, steps_before: usize) -> Vec<ScanAction> {
+        let mut out = Vec::new();
+        let mut action = m.poll(D::ZERO, ScanInput::Start);
+        for _ in 0..steps_before {
+            action = m.poll(D::ZERO, ScanInput::Completed);
+        }
+        out.push(action);
+        loop {
+            action = m.poll(D::ZERO, ScanInput::Abort);
+            out.push(action);
+            if matches!(action, ScanAction::Done(_)) {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn abort_during_the_register_temp_peer_fallback_still_registers_the_fallback_peer() {
+        let mut m = machine(ScanConfig::new(b"p"), Some(9));
+        m.poll(D::ZERO, ScanInput::Start);
+        m.poll(D::ZERO, ScanInput::Completed);
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Failed),
+            ScanAction::RestoreChannel { channel: 9 }
+        );
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Abort),
+            ScanAction::RegisterFallbackPeer { channel: 9 }
+        );
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Abort),
+            ScanAction::Done(Err(ScanError::RegisterTempPeer))
+        );
+    }
+
+    #[test]
+    fn abort_in_every_teardown_state_continues_the_teardown() {
+        // Pinned, aborted while boosting: every later step is fed `Abort`.
+        let seen = actions_after_abort(machine(ScanConfig::new(b"p"), Some(9)), 2);
+        assert_eq!(
+            seen,
+            [
+                ScanAction::BoostTxPower,
+                ScanAction::RestoreTxPower,
+                ScanAction::RemovePeer,
+                ScanAction::RestoreChannel { channel: 9 },
+                ScanAction::RegisterFallbackPeer { channel: 9 },
+                ScanAction::Done(Err(ScanError::Aborted)),
+            ]
+        );
+        // Unpinned: no channel to restore.
+        let seen = actions_after_abort(machine(ScanConfig::new(b"p"), None), 2);
+        assert_eq!(
+            seen,
+            [
+                ScanAction::BoostTxPower,
+                ScanAction::RestoreTxPower,
+                ScanAction::RemovePeer,
+                ScanAction::Done(Err(ScanError::Aborted)),
+            ]
+        );
+    }
+
+    #[test]
+    fn abort_after_the_peer_was_found_keeps_the_new_pin() {
+        let mut config = ScanConfig::new(b"p");
+        config.probe_confirmations = 0;
+        let mut m = machine(config, Some(9));
+        m.poll(D::ZERO, ScanInput::Start);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Completed),
+            ScanAction::SetChannel { channel: 1 }
+        );
+        m.poll(D::ZERO, ScanInput::Completed);
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::RestoreTxPower
+        );
+        assert_eq!(m.poll(D::ZERO, ScanInput::Abort), ScanAction::RemovePeer);
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Abort),
+            ScanAction::RegisterPeer { channel: 1 }
+        );
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Abort),
+            ScanAction::Done(Ok(ScanResult { channel: 1 }))
+        );
+        assert_eq!(m.pinned_channel(), Some(1));
+    }
+
+    #[test]
+    fn or_abort_replaces_every_result_but_failed() {
+        assert_eq!(ScanInput::Completed.or_abort(false), ScanInput::Completed);
+        assert_eq!(ScanInput::Completed.or_abort(true), ScanInput::Abort);
+        assert_eq!(
+            ScanInput::Sent(SendOutcome::Acked).or_abort(true),
+            ScanInput::Abort
+        );
+        assert_eq!(ScanInput::Failed.or_abort(true), ScanInput::Failed);
     }
 
     #[test]

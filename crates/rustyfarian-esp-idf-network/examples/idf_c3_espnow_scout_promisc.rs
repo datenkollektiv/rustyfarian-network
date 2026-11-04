@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         if !connected {
             log::info!("Scanning for coordinator ...");
-            match espnow.scan_for_peer(&coordinator_mac, &scan_config) {
+            match espnow.scan_for_peer_blocking(&coordinator_mac, &scan_config) {
                 Ok(r) => {
                     log::info!("Re-scan: coordinator now on channel {}", r.channel);
                     led.set_low()?;
