@@ -3,6 +3,7 @@
 ## Status
 
 Accepted — 2026-11-03; proposed 2026-11-01, accepted by the maintainer after the tier-parity Step 9 gate ran one application on both tiers on the CrowPanel S3.
+Decision 10 is refined by [ADR 023](023-shared-logic-ladder.md).
 
 ## Context
 
