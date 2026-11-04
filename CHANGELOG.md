@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::espnow::SendKind::Unacked`: an application frame that does not report the ACK; gated and preempted by a scan like `App`, but it may be addressed to the broadcast MAC.
   `EspIdfEspNow` plain `send` uses it, so the adapter-side scan gate for broadcast frames is gone.
 - `rustyfarian-esp-idf-network` `espnow::SEND_QUEUE_DEADLINE` (1 s): the bound on plain `EspNowDriver::send` waiting for a queue slot and for its frame to start.
+- `juggler::espnow::ScanGate<J, R>` with `GateRefusal`, `juggler::espnow::DeferredRestore<P>`, `TxCore::{poll_at, is_shut_down}` and `PROBE_RESERVED_SLOTS` (tier-parity ESP-NOW Step 4c audit): the scan admission, cancellation and finish rules and the completion-by-deadline rule move out of the ESP-IDF worker and esp-hal driver into host-tested juggler cores.
+  `ScanGate::admit` claims the radio and stores the job in one call (a refused scan preempts nothing), `cancel` before pickup ends the exclusion itself, and `finish` ends it in the call that publishes the result.
+  `TxCore::poll_at(id, now, waker)` expires a queued request by its own stored deadline and waits out a frame in flight; it replaces `TxCore::poll_expired`, which was unreleased.
+  `DeferredRestore` holds a cancelled scan's restore until the probe on the air has completed.
+  Mutation-checked: the probe reservation, the admission pre-check, the cancel and finish exclusion ends, `poll_at` expiry and the deferral.
 
 ### Changed
 
@@ -248,6 +253,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `juggler::espnow::TxCore` keeps one slot for the scan's probe, so application callers can no longer fill the queue and starve the probe of a scan admitted afterwards: ESP-IDF scans could report `NotFound` with the peer present, because a refused probe counted as a local failure and the channel was skipped.
+  Application sends now have `TX_SLOTS - 1` (3) slots on both tiers; `TxCore::new` needs at least two slots.
+- esp-hal `scan_for_peer`: cancelling the future while a probe is on the air no longer changes the channel, the peer table or the TX power under that frame.
+  The restore waits for the frame's completion, the sender runner applies it, and the scan exclusion lasts until then.
+- `rustyfarian-esp-idf-network` shutdown during a scan skips the peer-table calls as well as the channel and TX-power calls, and `EspIdfEspNow::init_with_radio` now starts with `pinned_channel()` returning the SoftAP's channel 1 (the trait documents the pin as set by a scan or at start); `init_with_radio_sta` sets no channel and has none until a scan.
+- ESP-NOW docs on both tiers state the fail-closed rule (a send callback that never fires blocks that frame, every later transmission and every scan until the driver is dropped), and `ScanConfig::probe_timeout` now says what it bounds: queueing and start of a probe on esp-hal, nothing on ESP-IDF.
+- `rustyfarian-esp-idf-network` the receive-queue-full warning is rate limited (the first drop, then every 32nd, with a running total).
 - `rustyfarian-esp-idf-network` ESP-NOW receive no longer truncates frames above 250 bytes in release builds or panics on them in debug builds: the receive callback now drops them, counts them (`EspIdfEspNow::oversize_dropped`) and logs the first and then every 32nd drop (tier-parity ESP-NOW Step 4a, B5).
 - `rustyfarian-esp-idf-network` ESP-NOW acknowledgements can no longer be taken for the next frame's: `send_and_wait` and the scan registered a send callback per call and dropped it on timeout, so a late callback could be read as a later frame's ACK, and plain `send` had no callback at all.
   The `espnow-tx` worker now owns one permanent callback and keeps one frame in flight at a time, matched by id and destination (tier-parity ESP-NOW Step 4b, inventory finding 1).

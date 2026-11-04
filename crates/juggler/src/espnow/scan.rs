@@ -36,9 +36,11 @@
 //! # Contract for the I/O side
 //!
 //! - [`ScanAction::SendProbe`] carries the probe timeout.
-//!   The caller waits at most that long for the MAC-layer ACK and reports a timeout after
-//!   transmission as [`SendOutcome::NoAck`]; a frame that was never transmitted is
-//!   [`SendOutcome::Local`].
+//!   It bounds queueing and the start of the probe, if the driver can bound them: a probe that
+//!   did not start in time is [`SendOutcome::Local`].
+//!   A probe that has started is waited out (the channel must not change under a frame on the
+//!   air) and reported as [`SendOutcome::Acked`] or [`SendOutcome::NoAck`] by its real MAC-layer
+//!   result; the ESP-IDF tier bounds nothing with it.
 //! - [`ScanAction::RemovePeer`] is best effort: both `Completed` and `Failed` continue.
 //! - [`ScanAction::BoostTxPower`] and [`ScanAction::RestoreTxPower`] are advisory; a driver
 //!   that cannot change TX power reports `Completed` and the scan proceeds.

@@ -70,6 +70,9 @@ impl SendOutcome {
 ///   A send to the broadcast MAC is refused, classified [`SendOutcome::Local`]: broadcast frames
 ///   are never acknowledged, so use [`EspNowDriver::send`] for broadcast.
 ///   The future is cancel-safe: dropping it neither loses nor steals another call's result.
+///   Fail-closed: a started frame is waited out without limit, so a send callback that never
+///   fires blocks this call and every later transmission (sends and scan probes alike) until the
+///   driver is dropped or shut down; callback timing is typical (milliseconds), never guaranteed.
 /// * [`receive`](Self::receive) is infallible and waits for the next frame.
 ///   Concurrent `receive` calls are safe and each frame goes to exactly one caller; no ordering
 ///   among waiting callers is promised.
@@ -80,6 +83,9 @@ impl SendOutcome {
 ///   so the caller stores nothing.
 ///   A second scan while one runs is refused, and so is a scan on a radio the driver does not
 ///   own (it must not change the channel under a connected station).
+///   The scan never changes the channel under a probe on the air, so it is fail-closed too: a
+///   probe whose send callback never fires blocks the scan and every later transmission until
+///   the driver is dropped or shut down.
 /// * [`pinned_channel`](Self::pinned_channel) is the channel the driver pinned, if any.
 ///
 /// The returned futures are not required to be `Send`, because the esp-hal ones are not
@@ -92,6 +98,10 @@ where
     /// Sends `data` to `mac` and resolves on the MAC-layer ACK.
     ///
     /// See the [trait docs](EspNowLink) for the timeout, scan and cancellation rules.
+    ///
+    /// Fail-closed: once the frame has started, the wait for its send callback has no limit.
+    /// A callback that never fires blocks this call and every later transmission until the
+    /// driver is dropped or shut down.
     async fn send_acked(
         &self,
         mac: &MacAddress,
@@ -103,6 +113,10 @@ where
     async fn receive(&self) -> EspNowEvent;
 
     /// Scans the configured channels for the peer `mac` and pins the channel it answers on.
+    ///
+    /// Fail-closed: a probe that has started is waited out without limit (the channel must not
+    /// change under it), so a send callback that never fires blocks the scan and every later
+    /// transmission until the driver is dropped or shut down.
     async fn scan_for_peer(
         &self,
         mac: &MacAddress,

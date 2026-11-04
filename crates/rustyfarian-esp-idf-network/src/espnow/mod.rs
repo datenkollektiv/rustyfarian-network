@@ -81,6 +81,9 @@ use juggler::wait_list::WaitList;
 
 use worker::{block_on, TxShared};
 
+/// The channel [`EspIdfEspNow::init_with_radio`] starts its SoftAP on, which is the pin at start.
+const SOFTAP_CHANNEL: u8 = 1;
+
 /// How long plain [`EspNowDriver::send`] waits for a queue slot and for its frame to start
 /// before it fails with [`EspIdfEspNowError::Timeout`] (1 s).
 ///
@@ -189,6 +192,9 @@ struct RxQueue {
     capacity: usize,
     waiters: WaitList,
     oversize: OversizeLog,
+    /// Counts frames dropped because the queue was full; reuses the oversize log's counter and
+    /// its rule of logging the first drop and then every 32nd.
+    overflow: OversizeLog,
 }
 
 impl RxQueue {
@@ -198,6 +204,7 @@ impl RxQueue {
             capacity,
             waiters: WaitList::new(),
             oversize: OversizeLog::new(),
+            overflow: OversizeLog::new(),
         }
     }
 
@@ -230,10 +237,13 @@ impl RxQueue {
             let mut frames = self.lock();
             if frames.len() >= self.capacity {
                 drop(frames);
-                log::warn!(
-                    "ESP-NOW receive queue full — frame from {:02X?} dropped",
-                    mac
-                );
+                if self.overflow.record() {
+                    log::warn!(
+                        "ESP-NOW receive queue full — frame from {:02X?} dropped, {} dropped in total",
+                        mac,
+                        self.overflow.dropped()
+                    );
+                }
                 return;
             }
             frames.push_back(event);
@@ -324,6 +334,15 @@ impl RadioMode {
 /// and [`send_and_wait`](Self::send_and_wait) queue behind each other, and the scan's probes go
 /// through the same path.
 /// The thread costs a fixed stack of about 6 KiB.
+///
+/// # Missing send callback (fail-closed)
+///
+/// The thread waits for each frame's send callback without a limit while the driver lives, so a
+/// frame is never mistaken for its successor and the channel never changes under one.
+/// The callback normally arrives within a few milliseconds, but nothing guarantees it: if it
+/// never fires, that frame and every later transmission (acknowledged or not, scan probes
+/// included) block until the driver is dropped, which ends every wait with
+/// [`EspIdfEspNowError::Shutdown`].
 pub struct EspIdfEspNow {
     /// The ESP-NOW singleton: dropping it deinitialises ESP-NOW and clears both callbacks.
     /// Declared first, so it drops before the radio it runs on.
@@ -352,6 +371,7 @@ impl EspIdfEspNow {
             DEFAULT_RX_CHANNEL_CAPACITY,
             None,
             RadioMode::CallerManagedSta,
+            None,
         )
     }
 
@@ -360,7 +380,7 @@ impl EspIdfEspNow {
     /// The Wi-Fi radio must already be started by the caller.
     /// Frames received while the queue is full are dropped with a warning log.
     pub fn init_with_capacity(capacity: usize) -> anyhow::Result<Self> {
-        Self::init_inner(capacity, None, RadioMode::CallerManagedSta)
+        Self::init_inner(capacity, None, RadioMode::CallerManagedSta, None)
     }
 
     /// Initialise ESP-NOW and start the Wi-Fi radio internally in
@@ -393,7 +413,7 @@ impl EspIdfEspNow {
             .context("failed to create EspWifi for ESP-NOW radio")?;
         wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
             ssid_hidden: true,
-            channel: 1,
+            channel: SOFTAP_CHANNEL,
             auth_method: AuthMethod::None,
             ..Default::default()
         }))
@@ -402,10 +422,12 @@ impl EspIdfEspNow {
             .context("failed to start Wi-Fi SoftAP for ESP-NOW")?;
         log::info!("Wi-Fi SoftAP started for ESP-NOW (channel-stable, no AP connection)");
 
+        // The SoftAP started on `SOFTAP_CHANNEL`, so that is the pin until a scan finds another.
         Self::init_inner(
             DEFAULT_RX_CHANNEL_CAPACITY,
             Some(wifi),
             RadioMode::OwnedSoftAp,
+            Some(SOFTAP_CHANNEL),
         )
     }
 
@@ -442,10 +464,12 @@ impl EspIdfEspNow {
             .context("failed to start Wi-Fi radio for ESP-NOW")?;
         log::info!("Wi-Fi STA started for ESP-NOW (promiscuous-bracket channel re-pin)");
 
+        // No channel is set on the unassociated station, so there is no pin before a scan.
         Self::init_inner(
             DEFAULT_RX_CHANNEL_CAPACITY,
             Some(wifi),
             RadioMode::OwnedStaPromisc,
+            None,
         )
     }
 
@@ -569,8 +593,12 @@ impl EspIdfEspNow {
 
     /// The channel the driver keeps pinned, if any.
     ///
-    /// It is the channel of the last successful scan; a failed or cancelled scan leaves it as it
-    /// was, and it is `None` before the first successful scan.
+    /// On a driver from [`init_with_radio`](Self::init_with_radio) it starts as the SoftAP's
+    /// channel (1); afterwards it is the channel of the last successful scan.
+    /// A failed or cancelled scan leaves it as it was.
+    /// It is `None` on the other constructors until the first successful scan (the unassociated
+    /// station of [`init_with_radio_sta`](Self::init_with_radio_sta) sets no channel, and the
+    /// caller-managed radio of [`init`](Self::init) cannot scan).
     pub fn pinned_channel(&self) -> Option<u8> {
         self.shared.pinned_channel()
     }
@@ -581,6 +609,11 @@ impl EspIdfEspNow {
     /// and [`scan_for_peer_blocking()`](Self::scan_for_peer_blocking).
     /// On success the driver is ready to communicate with the peer on the
     /// discovered channel.
+    ///
+    /// The scan waits without a limit for the send callback of a probe that has started
+    /// (fail-closed, see [`scan_for_peer_blocking`](Self::scan_for_peer_blocking)): a callback
+    /// that never fires blocks this constructor, and every later transmission, until the driver
+    /// is dropped.
     pub fn init_with_radio_scanning(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
@@ -622,6 +655,10 @@ impl EspIdfEspNow {
     /// Dropping the future is safe: a queued frame is never sent, and one on the air has its
     /// result discarded.
     ///
+    /// Fail-closed: the wait for a started frame's send callback has no limit, so a callback
+    /// that never fires blocks this call and every later transmission until the driver is
+    /// dropped (the callback normally arrives within a few milliseconds).
+    ///
     /// # Errors
     ///
     /// * [`EspIdfEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
@@ -657,9 +694,12 @@ impl EspIdfEspNow {
     ///
     /// `timeout_ms` bounds waiting for the queue and the start of the transmission, so `0` or a
     /// very small value fails with [`EspIdfEspNowError::Timeout`] unless the `espnow-tx` thread
-    /// starts the frame at once; a frame that has started is waited out, however long its callback takes, and a frame the peer did not
-    /// acknowledge fails with [`EspIdfEspNowError::NoAck`] (inside the returned
-    /// [`anyhow::Error`], reachable with `downcast_ref`).
+    /// starts the frame at once.
+    /// A frame that has started is waited out, however long its callback takes (fail-closed: a
+    /// callback that never fires blocks this call and every later transmission until the driver
+    /// is dropped), and a frame the peer did not acknowledge fails with
+    /// [`EspIdfEspNowError::NoAck`] (inside the returned [`anyhow::Error`], reachable with
+    /// `downcast_ref`).
     /// During a scan the call fails at once with [`EspIdfEspNowError::ScanInProgress`], and a
     /// send to the broadcast address fails with [`EspIdfEspNowError::Broadcast`].
     ///
@@ -683,6 +723,7 @@ impl EspIdfEspNow {
         capacity: usize,
         wifi: Option<EspWifi<'static>>,
         mode: RadioMode,
+        initial_pin: Option<u8>,
     ) -> anyhow::Result<Self> {
         let esp_now = EspNow::take().context("failed to acquire EspNow singleton")?;
 
@@ -695,7 +736,7 @@ impl EspIdfEspNow {
 
         // One send callback for the driver's lifetime; the worker is the only sender, so it
         // always belongs to the frame in flight.
-        let shared = Arc::new(TxShared::new(mode));
+        let shared = Arc::new(TxShared::new(mode, initial_pin));
         let callback_shared = Arc::clone(&shared);
         esp_now
             .register_send_cb(move |mac, status| {
@@ -721,6 +762,10 @@ impl Drop for EspIdfEspNow {
     /// Queued and in-flight requests end as [`EspIdfEspNowError::Shutdown`]; the join does not
     /// depend on a send callback ever firing.
     /// The send callback owns an `Arc` of the shared state, so it can never outlive it.
+    ///
+    /// A scan interrupted by the drop leaves the channel, the TX power and the peer registration
+    /// as they were at that moment (no probe may be on the air while they change); ESP-NOW is
+    /// deinitialised right after.
     fn drop(&mut self) {
         self.shared.begin_shutdown();
         if let Some(worker) = self.worker.take() {

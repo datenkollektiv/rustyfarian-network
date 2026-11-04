@@ -14,9 +14,9 @@ use esp_radio::esp_now::{
 };
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use juggler::espnow::{
-    Completion, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, Next, OversizeLog, PeerConfig,
-    Refusal, ScanAction, ScanConfig, ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome,
-    TxCore, TxId, WifiInterface,
+    Completion, DeferredRestore, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, Next,
+    OversizeLog, PeerConfig, Refusal, ScanAction, ScanConfig, ScanInput, ScanMachine, ScanResult,
+    SendKind, SendOutcome, TxCore, TxId, WifiInterface,
 };
 use juggler::wifi::TxPowerLevel;
 
@@ -40,8 +40,11 @@ const RUNNER_START_GRACE_MS: u64 = 100;
 /// Poll interval while a scan waits for a sync send to hand the sender back.
 const SCAN_SENDER_POLL_MS: u64 = 1;
 
-/// Request slots of the send queue: one live application request per waiting caller up to this
-/// many, plus the scan's probe and one abandoned frame still on the air.
+/// Request slots of the send queue.
+///
+/// [`TxCore`] keeps one slot for the scan's probe, so application requests (a waiting caller each,
+/// and an abandoned frame still on the air counts as one) share the other `TX_SLOTS - 1`; more
+/// callers park in a [`WaiterList`] until a slot frees.
 const TX_SLOTS: usize = 4;
 /// Callers that park while every slot is taken; one more re-polls itself until a slot frees.
 const FULL_WAITERS: usize = 4;
@@ -60,6 +63,9 @@ struct TxState {
     full_waiters: WaiterList<FULL_WAITERS>,
     /// The scan, waiting for the frame on the air to finish before its first radio action.
     idle_waiters: WaiterList<1>,
+    /// The restore of a scan that was cancelled while its probe was still on the air; the runner
+    /// applies it right after that frame's completion, and only then ends the scan exclusion.
+    deferred: DeferredRestore<ScanRestore>,
 }
 
 /// One frame handed out by [`TxCore::next`], copied so the lock can be released to transmit.
@@ -213,6 +219,7 @@ impl EspHalEspNow {
                 core: TxCore::new(),
                 full_waiters: WaiterList::new(),
                 idle_waiters: WaiterList::new(),
+                deferred: DeferredRestore::new(),
             })),
             runner_wake: Signal::new(),
             runner_active: SharedCopy::new(false),
@@ -442,14 +449,56 @@ impl EspHalEspNow {
 
     /// Reports the result of the frame on the air and wakes its caller, the callers waiting for a
     /// slot and a scan waiting for the air to clear.
+    ///
+    /// If the scan was cancelled while this frame was its probe on the air, the air is clear now:
+    /// the deferred restore of channel, peer and TX power runs here, and only then does the
+    /// exclusion end.
     fn finish(&self, id: TxId, result: TxResult) {
-        self.with_tx(|state, wakes| {
+        let restore = self.with_tx(|state, wakes| {
             if let Some(waker) = state.core.complete(id, result) {
                 wakes.push(waker);
             }
             state.idle_waiters.drain_into(wakes);
             state.full_waiters.drain_into(wakes);
+            state.deferred.due(&state.core)
         });
+        if let Some(plan) = restore {
+            self.apply_restore(&plan);
+            self.end_scan();
+        }
+    }
+
+    /// Ends the scan exclusion; call it only after the restore is done.
+    fn end_scan(&self) {
+        self.with_tx(|state, _| state.core.end_scan());
+    }
+
+    /// Puts the radio back after a cancelled scan: removes the scan's peer and, when a channel
+    /// was pinned, returns the radio and the peer to it, then restores the TX power.
+    ///
+    /// Channel and peer first, TX power afterwards, as the scan's own teardown does.
+    fn apply_restore(&self, plan: &ScanRestore) {
+        if plan.undo_scan {
+            // The peer may not be registered yet; that is not worth a warning.
+            let _ = self.remove_peer(&plan.mac);
+            if let Some(channel) = plan.pinned {
+                let mut peer = PeerConfig::new(plan.mac);
+                peer.channel = channel;
+                if let Err(e) = self
+                    .set_channel(channel)
+                    .and_then(|()| self.add_peer(&peer))
+                {
+                    log::warn!(
+                        "ESP-NOW scan cancelled: could not restore channel {channel}: {e:?}"
+                    );
+                }
+            }
+        }
+        if let Some(previous) = plan.power {
+            if self.set_max_tx_power(previous).is_err() {
+                log::warn!("ESP-NOW scan: could not restore TX power to {previous} quarter dBm");
+            }
+        }
     }
 
     /// Waits for `run_sender` to be polled for the first time, bounded by `deadline` and
@@ -488,7 +537,7 @@ impl EspHalEspNow {
     ///
     /// With a `deadline`, waiting for a free slot, queueing and the start of the transmission are
     /// bounded by it; once the queue has handed the frame to the runner, the transmission is
-    /// waited out and its real result returned (`TxCore::poll_expired` decides under the lock).
+    /// waited out and its real result returned (`TxCore::poll_at` decides under the lock).
     ///
     /// Cancel-safe: dropping the future at any point abandons the request (`PendingSend`), so a
     /// queued frame is never transmitted and a frame on the air has its result discarded.
@@ -547,22 +596,20 @@ impl EspHalEspNow {
 
     /// Waits for the result of request `id`, honouring `deadline` for queued requests only.
     async fn wait_result(&self, id: TxId, deadline: Option<embassy_time::Instant>) -> TxResult {
-        let completion = match bounded(deadline, self.poll_completion(id, false)).await {
+        let completion = match bounded(deadline, self.poll_completion(id)).await {
             Some(completion) => completion,
-            // Deadline passed: a queued request expires here, a frame on the air is waited out.
-            None => self.poll_completion(id, true).await,
+            // Deadline passed: `TxCore::poll_at` sees it in the request's own deadline, so a
+            // queued request expires here and a frame on the air is waited out.
+            // The timer fires at or after the deadline on the same clock, so the core agrees.
+            None => self.poll_completion(id).await,
         };
         completion_result(completion)
     }
 
-    async fn poll_completion(&self, id: TxId, past_deadline: bool) -> Completion<TxResult> {
+    async fn poll_completion(&self, id: TxId) -> Completion<TxResult> {
         poll_fn(|cx| {
             self.with_tx(|state, wakes| {
-                let poll = if past_deadline {
-                    state.core.poll_expired(id, cx.waker())
-                } else {
-                    state.core.poll_result(id, cx.waker())
-                };
+                let poll = state.core.poll_at(id, now_core(), cx.waker());
                 if poll.is_ready() {
                     state.full_waiters.drain_into(wakes);
                 }
@@ -598,6 +645,10 @@ impl EspHalEspNow {
     /// Dropping the future is safe: a queued frame is never sent, and one on the air has its
     /// result discarded.
     ///
+    /// Fail-closed: the wait for a started frame's send callback has no limit, so a radio that
+    /// never fires it blocks this call and every later transmission (the runner waits for ever)
+    /// until the handle is dropped.
+    ///
     /// # Errors
     ///
     /// * [`EspHalEspNowError::PayloadTooLarge`] for a frame above [`MAX_DATA_LEN`].
@@ -621,7 +672,9 @@ impl EspHalEspNow {
     }
 
     /// One scan probe: a [`SendKind::Probe`] frame with `timeout` as one absolute deadline for
-    /// waiting on a slot, the transmission and its ACK.
+    /// waiting on a slot, queueing and the start of the transmission.
+    /// A probe that has started is waited out and its real result returned; the deadline does not
+    /// bound the ACK.
     /// Nothing is queued when no time is left ([`EspHalEspNowError::Timeout`]).
     pub(crate) async fn send_probe(
         &self,
@@ -698,13 +751,24 @@ impl EspHalEspNow {
     /// the TX power synchronously in `Drop` (ADR 020 exception, `Drop` cannot await): the
     /// temporary peer is removed and, when a channel was pinned, the radio and the peer go back to
     /// it; only then does the exclusion end.
+    /// If a probe is still on the air at that moment, `Drop` touches neither the channel, the TX
+    /// power nor the peer table: the restore waits for that frame's completion, the sender runner
+    /// applies it right after, and the exclusion lasts until then (so application sends keep
+    /// failing with `ScanInProgress` for the few milliseconds of the frame).
+    /// A cancelled scan keeps the previous pin; a peer found on the way is only confirmed in the
+    /// synchronous tail of the scan, where the future cannot be dropped.
     ///
-    /// Each probe is bounded by `config.probe_timeout`; a timeout means the frame never started
-    /// and counts as a local failure (not as "no ACK"); a transmitted but unacknowledged frame is "no ACK".
+    /// `config.probe_timeout` bounds queueing and the start of each probe: a probe that did not
+    /// start in time is never sent and counts as a local failure (not as "no ACK").
+    /// It does not bound the ACK: a probe that has started is waited out and its real MAC-layer
+    /// result used (transmitted but unacknowledged is "no ACK").
     /// A cancelled or timed-out probe never orphans a completion.
     /// The scan never changes channel while a probe is being transmitted: a probe that has started
     /// is waited out (the burst budget counts the overrun, the machine is fed the real time), and
     /// one that has not started is dropped by the runner.
+    /// That wait is fail-closed: if the radio never fires the send callback of a started probe, the
+    /// runner waits for ever, and with it this scan and every later transmission, until the handle
+    /// is dropped.
     /// No lock is held across an await point.
     ///
     /// # Errors
@@ -725,16 +789,13 @@ impl EspHalEspNow {
                 .begin_scan(self.owns_controller, &mut |waker| wakes.push(waker))
         })
         .map_err(scan_refusal_error)?;
-        // Declared first, so it drops last: the exclusion ends only after the restore below.
-        let _exclusion = ScanExclusion { radio: self };
-        self.wait_scan_idle().await;
+        // Holds the exclusion and, on drop, restores whatever the scan changed (immediately, or
+        // after the probe on the air when the future was cancelled mid-probe).
         let pinned = self.pinned.get();
+        let mut guard = ScanGuard::new(self, *mac, pinned);
+        self.wait_scan_idle().await;
         let mut machine = ScanMachine::new(*mac, *config, pinned);
         let start = embassy_time::Instant::now();
-        // Declared before `cleanup`, so on cancellation the channel and peer are restored first and
-        // the TX power afterwards.
-        let mut boost = TxBoost::new(self);
-        let mut cleanup = ScanCleanup::new(self, *mac, pinned);
         let mut input = ScanInput::Start;
         let result = loop {
             let now = Duration::from_micros(start.elapsed().as_micros());
@@ -742,13 +803,13 @@ impl EspHalEspNow {
                 ScanAction::RemovePeer => completed(self.remove_peer(mac)),
                 ScanAction::RegisterPeer { channel }
                 | ScanAction::RegisterFallbackPeer { channel } => {
-                    cleanup.arm();
+                    guard.arm();
                     let mut peer = PeerConfig::new(*mac);
                     peer.channel = channel;
                     completed(self.add_peer(&peer))
                 }
                 ScanAction::SetChannel { channel } => {
-                    cleanup.arm();
+                    guard.arm();
                     let result = self.set_channel(channel);
                     if let Err(e) = &result {
                         machine.log_fault(format_args!("failed to set channel {channel}: {e:?}"));
@@ -756,16 +817,16 @@ impl EspHalEspNow {
                     completed(result)
                 }
                 ScanAction::RestoreChannel { channel } => {
-                    cleanup.arm();
+                    guard.arm();
                     completed(self.set_channel(channel))
                 }
                 ScanAction::BoostTxPower => {
                     // Advisory: without a controller the scan runs at the caller's level.
-                    boost.engage();
+                    guard.engage_boost();
                     ScanInput::Completed
                 }
                 ScanAction::RestoreTxPower => {
-                    boost.release();
+                    guard.release_boost();
                     ScanInput::Completed
                 }
                 ScanAction::SendProbe {
@@ -783,13 +844,13 @@ impl EspHalEspNow {
                     ScanInput::Completed
                 }
                 ScanAction::Done(result) => {
-                    cleanup.disarm();
+                    guard.disarm();
                     break result;
                 }
             };
         };
         // Covers a machine that finished without reaching `RestoreTxPower`.
-        boost.release();
+        guard.release_boost();
         self.pinned.set(machine.pinned_channel());
         result.map_err(EspHalEspNowError::Scan)
     }
@@ -944,20 +1005,6 @@ impl Drop for PendingSend<'_> {
     }
 }
 
-/// Holds the scan exclusion of [`TxCore::begin_scan`]; ends it on drop.
-///
-/// Declared before the scan's restore guards, so it drops after them: the exclusion ends only once
-/// channel, TX power and pin are restored.
-struct ScanExclusion<'a> {
-    radio: &'a EspHalEspNow,
-}
-
-impl Drop for ScanExclusion<'_> {
-    fn drop(&mut self) {
-        self.radio.with_tx(|state, _| state.core.end_scan());
-    }
-}
-
 /// Now on the [`TxCore`] clock: time since the embassy epoch.
 fn now_core() -> Duration {
     to_core_time(embassy_time::Instant::now())
@@ -978,31 +1025,59 @@ fn completed(result: Result<(), EspHalEspNowError>) -> ScanInput {
     }
 }
 
-/// Scan-burst TX power: raises the power on [`TxBoost::engage`] and puts the previous level back
-/// on [`TxBoost::release`] or, as a safety net, when dropped (cancelled scan future).
-/// The level restored is the one saved at [`TxBoost::engage`], not whatever was set since.
-struct TxBoost<'a> {
-    radio: &'a EspHalEspNow,
-    saved: Option<i8>,
+/// What a cancelled scan leaves to restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanRestore {
+    mac: MacAddress,
+    /// The scan touched the channel or the peer table: remove its peer and return to `pinned`.
+    undo_scan: bool,
+    /// The channel to return the radio and the peer to, if one was pinned before the scan.
+    pinned: Option<u8>,
+    /// The TX power to put back, if the scan boosted it.
+    power: Option<i8>,
 }
 
-/// Puts the radio back when a scan future is dropped mid-scan: removes the temporary peer and,
-/// when a channel was pinned before the scan, returns the radio and the peer to it.
-/// This is the machine's own failure fallback, run synchronously.
-struct ScanCleanup<'a> {
+impl ScanRestore {
+    /// False when the scan changed nothing the radio would have to be put back from.
+    fn has_work(&self) -> bool {
+        self.undo_scan || self.power.is_some()
+    }
+}
+
+/// Holds the scan exclusion of [`TxCore::begin_scan`] for one `scan_for_peer` call and puts the
+/// radio back when the call ends.
+///
+/// It also owns the scan-burst TX power: [`ScanGuard::engage_boost`] raises it and
+/// [`ScanGuard::release_boost`] puts the saved level back.
+///
+/// On a normal finish the machine has restored everything itself, so the drop only ends the
+/// exclusion.
+/// When the future is dropped mid-scan, the drop restores what the scan touched (the machine's
+/// own failure fallback, run synchronously, ADR 020 exception): the scan peer is removed and,
+/// when a channel was pinned, the radio and the peer go back to it, then the TX power.
+/// A probe that is still on the air must not see the channel change under it: the restore then
+/// waits in [`DeferredRestore`] and the runner applies it right after that frame's completion.
+/// The exclusion ends only once the restore is done, in both cases.
+///
+/// A scan that was cancelled keeps the previous pin.
+/// The peer is only confirmed after the last probe, and everything after that is synchronous
+/// (no await), so a dropped future never has a found peer to keep.
+struct ScanGuard<'a> {
     radio: &'a EspHalEspNow,
     mac: MacAddress,
     pinned: Option<u8>,
     armed: bool,
+    saved_power: Option<i8>,
 }
 
-impl<'a> ScanCleanup<'a> {
+impl<'a> ScanGuard<'a> {
     fn new(radio: &'a EspHalEspNow, mac: MacAddress, pinned: Option<u8>) -> Self {
         Self {
             radio,
             mac,
             pinned,
             armed: false,
+            saved_power: None,
         }
     }
 
@@ -1014,25 +1089,49 @@ impl<'a> ScanCleanup<'a> {
     fn disarm(&mut self) {
         self.armed = false;
     }
-}
 
-impl Drop for ScanCleanup<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
+    fn engage_boost(&mut self) {
+        if self.saved_power.is_some() {
             return;
         }
-        // The peer may not be registered yet; that is not worth a warning.
-        let _ = self.radio.remove_peer(&self.mac);
-        if let Some(channel) = self.pinned {
-            let mut peer = PeerConfig::new(self.mac);
-            peer.channel = channel;
-            if let Err(e) = self
-                .radio
-                .set_channel(channel)
-                .and_then(|()| self.radio.add_peer(&peer))
-            {
-                log::warn!("ESP-NOW scan cancelled: could not restore channel {channel}: {e:?}");
+        let Some(previous) = self.radio.tx_power_quarter_dbm() else {
+            return;
+        };
+        let max = TxPowerLevel::Max.to_quarter_dbm();
+        if self.radio.set_max_tx_power(max).is_ok() {
+            self.saved_power = Some(previous);
+        }
+    }
+
+    fn release_boost(&mut self) {
+        if let Some(previous) = self.saved_power.take() {
+            if self.radio.set_max_tx_power(previous).is_err() {
+                log::warn!("ESP-NOW scan: could not restore TX power to {previous} quarter dBm");
             }
+        }
+    }
+}
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        let plan = ScanRestore {
+            mac: self.mac,
+            undo_scan: self.armed,
+            pinned: self.pinned,
+            power: self.saved_power.take(),
+        };
+        if !plan.has_work() {
+            self.radio.end_scan();
+            return;
+        }
+        // Decided under the queue lock: either the air is clear and the restore runs now, or the
+        // runner finds the plan right after the probe's completion.
+        let now = self
+            .radio
+            .with_tx(|state, _| state.deferred.request(&state.core, plan));
+        if let Some(plan) = now {
+            self.radio.apply_restore(&plan);
+            self.radio.end_scan();
         }
     }
 }
@@ -1050,39 +1149,6 @@ async fn bounded<F: core::future::Future>(
 
 fn to_embassy(timeout: Duration) -> embassy_time::Duration {
     embassy_time::Duration::try_from(timeout).unwrap_or(embassy_time::Duration::MAX)
-}
-
-impl<'a> TxBoost<'a> {
-    fn new(radio: &'a EspHalEspNow) -> Self {
-        Self { radio, saved: None }
-    }
-
-    fn engage(&mut self) {
-        if self.saved.is_some() {
-            return;
-        }
-        let Some(previous) = self.radio.tx_power_quarter_dbm() else {
-            return;
-        };
-        let max = TxPowerLevel::Max.to_quarter_dbm();
-        if self.radio.set_max_tx_power(max).is_ok() {
-            self.saved = Some(previous);
-        }
-    }
-
-    fn release(&mut self) {
-        if let Some(previous) = self.saved.take() {
-            if self.radio.set_max_tx_power(previous).is_err() {
-                log::warn!("ESP-NOW scan: could not restore TX power to {previous} quarter dBm");
-            }
-        }
-    }
-}
-
-impl Drop for TxBoost<'_> {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 fn peer_info(plan: &PeerPlan) -> PeerInfo {

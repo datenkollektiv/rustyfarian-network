@@ -74,7 +74,7 @@ mod tests {
     const OTHER: MacAddress = [9, 9, 9, 9, 9, 9];
 
     fn id() -> TxId {
-        TxCore::<u8, 1>::new()
+        TxCore::<u8, 2>::new()
             .submit(Duration::ZERO, MAC, b"x", None, SendKind::App)
             .unwrap()
     }

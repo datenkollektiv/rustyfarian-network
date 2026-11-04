@@ -27,6 +27,10 @@
 //!   result) or "expired or still queued" (never transmitted); there is no window in between.
 //! - Results are per slot and keyed by [`TxId`]: a caller never takes another request's result,
 //!   and a result that arrives for an abandoned or unknown id is dropped.
+//! - One slot is reserved for the scan's own probe ([`PROBE_RESERVED_SLOTS`]): application
+//!   submissions get [`Refusal::Full`] when only that slot is free, so a queue that
+//!   application callers filled (and whose preempted requests still hold their slots until the
+//!   callers collect them) can never starve the probe of a scan that is then admitted.
 //! - While a scan runs, [`SendKind::App`] and [`SendKind::Unacked`] submissions are refused at
 //!   once with [`Refusal::Scanning`]; [`SendKind::Probe`] submissions (the scan's own frames) are
 //!   allowed.
@@ -42,12 +46,14 @@
 //! reused and no other request can receive that result).
 //! The started frame still runs to its end.
 //!
-//! When the caller's own deadline passes, it must not abandon blindly: call
-//! [`TxCore::poll_expired`] under the lock instead.
-//! It reports a finished request, expires a still-queued one (so it is never transmitted) and
-//! returns `Pending` for a frame in flight, which the caller then keeps waiting for with
-//! [`TxCore::poll_result`].
-//! [`TxCore::is_in_flight`] answers the same question without consuming anything.
+//! When the caller's own deadline passes, it must not abandon blindly: poll with
+//! [`TxCore::poll_at`] under the lock instead.
+//! It uses the deadline stored with the request: it reports a finished request, expires a
+//! still-queued one whose deadline has passed (so it is never transmitted) and returns `Pending`
+//! for a frame in flight, which the caller keeps waiting for.
+//! The caller therefore needs no deadline bookkeeping of its own, only a way to be woken at the
+//! deadline.
+//! [`TxCore::is_in_flight`] answers the in-flight question without consuming anything.
 //!
 //! # Wakers
 //!
@@ -59,13 +65,19 @@
 //! # Slots
 //!
 //! A slot is reserved from [`TxCore::submit`] until its result is taken by `poll_result` or
-//! `poll_expired`, or until `abandon`.
+//! `poll_at`, or until `abandon`.
 //! A caller that neither waits nor abandons keeps its slot, so it must always do one of them.
 
 use core::task::{Poll, Waker};
 use core::time::Duration;
 
 use super::{MacAddress, BROADCAST_MAC, MAX_DATA_LEN};
+
+/// Slots that only [`SendKind::Probe`] submissions may take: application submissions are
+/// refused with [`Refusal::Full`] when this many (or fewer) slots are free.
+///
+/// [`TxCore`] needs at least one slot more than this.
+pub const PROBE_RESERVED_SLOTS: usize = 1;
 
 /// Opaque handle of one submitted request.
 ///
@@ -90,7 +102,8 @@ pub enum SendKind {
 /// Why [`TxCore::submit`] refused a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Every slot is reserved.
+    /// Every slot is reserved, or only the slot kept for a scan probe is free (an application
+    /// frame never takes it, see [`PROBE_RESERVED_SLOTS`]).
     Full,
     /// A scan is running and the request is an application frame ([`SendKind::App`] or
     /// [`SendKind::Unacked`]).
@@ -235,8 +248,12 @@ impl<R, const N: usize> Default for TxCore<R, N> {
 
 impl<R, const N: usize> TxCore<R, N> {
     /// An empty queue, no scan running.
+    ///
+    /// `N` must exceed [`PROBE_RESERVED_SLOTS`], or no application frame could ever be queued
+    /// (a compile-time error otherwise).
     #[must_use]
     pub fn new() -> Self {
+        const { assert!(N > PROBE_RESERVED_SLOTS) };
         Self {
             slots: core::array::from_fn(|_| Slot::free()),
             next_id: 0,
@@ -259,6 +276,8 @@ impl<R, const N: usize> TxCore<R, N> {
     ///
     /// `deadline` is an absolute time on the caller's clock; `None` waits for ever.
     /// Checked in this order: shutdown, payload size, broadcast, scan gate, free slot.
+    /// An application frame needs more than [`PROBE_RESERVED_SLOTS`] free slots; a probe takes
+    /// any free one.
     /// Broadcast is refused for [`SendKind::App`] only: `send_acked` promises a unicast MAC ACK,
     /// so use `EspNowDriver::send` ([`SendKind::Unacked`]) for broadcast.
     ///
@@ -285,6 +304,19 @@ impl<R, const N: usize> TxCore<R, N> {
         }
         if self.scanning && kind != SendKind::Probe {
             return Err(Refusal::Scanning);
+        }
+        let free = self
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot.state, State::Free))
+            .count();
+        let needed = if kind == SendKind::Probe {
+            1
+        } else {
+            PROBE_RESERVED_SLOTS + 1
+        };
+        if free < needed {
+            return Err(Refusal::Full);
         }
         let index = self
             .slots
@@ -361,14 +393,16 @@ impl<R, const N: usize> TxCore<R, N> {
         }
     }
 
-    /// Like [`poll_result`](Self::poll_result), for a caller whose own deadline passed.
+    /// Like [`poll_result`](Self::poll_result), but also expires the request by its own deadline.
     ///
-    /// A finished request is reported; a queued one is removed and reported
-    /// [`Completion::Expired`] (it will never be transmitted); a frame in flight is `Pending`
-    /// (the waker is registered) and must be waited out.
-    pub fn poll_expired(&mut self, id: TxId, waker: &Waker) -> Poll<Completion<R>> {
+    /// A finished request is reported.
+    /// A queued request whose stored deadline has passed at `now` (`now >= deadline`) is removed
+    /// and reported [`Completion::Expired`]: it will never be transmitted.
+    /// A frame in flight is `Pending` (the waker is registered) and is waited out, however late.
+    /// A request without a deadline behaves exactly as under `poll_result`.
+    pub fn poll_at(&mut self, id: TxId, now: Duration, waker: &Waker) -> Poll<Completion<R>> {
         if let Some(slot) = self.caller_slot(id) {
-            if matches!(slot.state, State::Queued) {
+            if matches!(slot.state, State::Queued) && expired(slot.deadline, now) {
                 slot.release();
                 return Poll::Ready(Completion::Expired);
             }
@@ -548,10 +582,84 @@ impl<R, const N: usize> TxCore<R, N> {
         self.scanning = false;
     }
 
+    /// True once [`shutdown`](Self::shutdown) was called.
+    #[must_use]
+    pub fn is_shut_down(&self) -> bool {
+        self.shut_down
+    }
+
     /// True while a scan holds the gate.
     #[must_use]
     pub fn is_scanning(&self) -> bool {
         self.scanning
+    }
+}
+
+/// A scan's restore that waits for a probe still on the air.
+///
+/// A scan that is cancelled mid-probe must not touch the channel, the TX power or the peer table
+/// while its probe frame is being transmitted.
+/// Where the cancel has to run synchronously (a `Drop` on esp-hal, which cannot await), the
+/// owner asks [`request`](Self::request) with a plan of what to restore:
+///
+/// - With the air clear ([`TxCore::can_start_scan_io`]) the plan comes straight back and the
+///   caller restores at once.
+/// - With a frame in flight the plan is kept, and the runner asks [`due`](Self::due) right after
+///   it reports that frame's completion; the plan comes back then, to be applied by the runner.
+///
+/// Either way the owner of the plan ends the exclusion ([`TxCore::end_scan`]) only after it
+/// applied it, so a scan's exclusion lasts until channel, TX power and peer are restored.
+/// Both calls belong under the same lock as the [`TxCore`] they read, so the decision and the
+/// completion cannot interleave.
+#[derive(Debug)]
+pub struct DeferredRestore<P> {
+    plan: Option<P>,
+}
+
+impl<P> Default for DeferredRestore<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P> DeferredRestore<P> {
+    /// Nothing deferred.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { plan: None }
+    }
+
+    /// The scan was cancelled with `plan` to restore.
+    ///
+    /// Returns the plan when the air is clear: restore now.
+    /// Returns `None` when a frame is in flight; the plan is kept for [`due`](Self::due).
+    /// A plan that was already waiting is replaced (one scan runs at a time, so this does not
+    /// happen).
+    pub fn request<R, const N: usize>(&mut self, core: &TxCore<R, N>, plan: P) -> Option<P> {
+        if core.can_start_scan_io() {
+            self.plan = None;
+            Some(plan)
+        } else {
+            self.plan = Some(plan);
+            None
+        }
+    }
+
+    /// The plan to apply now: one is waiting and the air has cleared.
+    ///
+    /// Call it right after [`TxCore::complete`].
+    pub fn due<R, const N: usize>(&mut self, core: &TxCore<R, N>) -> Option<P> {
+        if core.can_start_scan_io() {
+            self.plan.take()
+        } else {
+            None
+        }
+    }
+
+    /// True while a plan waits for the frame in flight.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.plan.is_some()
     }
 }
 
@@ -588,7 +696,8 @@ mod tests {
         counter.0.load(Ordering::SeqCst)
     }
 
-    type Core = TxCore<u8, 3>;
+    /// Four slots: three for application frames and the one reserved for a scan probe.
+    type Core = TxCore<u8, 4>;
 
     fn app(core: &mut Core, now: u64, data: &[u8], deadline: Option<u64>) -> TxId {
         core.submit(ms(now), MAC, data, deadline.map(ms), SendKind::App)
@@ -731,23 +840,108 @@ mod tests {
         // The deadline passes while the frame is on the air.
         assert_eq!(step(&mut core, 60).0, None);
         assert!(core.is_in_flight(a));
-        assert_eq!(core.poll_expired(a, &w), Poll::Pending);
+        assert_eq!(core.poll_at(a, ms(60), &w), Poll::Pending);
         core.complete(a, 5);
         assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Done(5)));
     }
 
     #[test]
-    fn poll_expired_expires_a_queued_request_and_reports_finished_ones() {
+    fn poll_at_expires_a_queued_request_only_once_its_own_deadline_passed() {
         let mut core = Core::new();
         let (w, _) = counting_waker();
         let a = app(&mut core, 0, b"a", None);
+        let b = app(&mut core, 0, b"b", Some(100));
+        step(&mut core, 0);
+        // b is queued behind a and its deadline has not passed: it keeps waiting.
+        assert_eq!(core.poll_at(b, ms(99), &w), Poll::Pending);
+        // The deadline passes: b is removed and never sent.
+        assert_eq!(
+            core.poll_at(b, ms(100), &w),
+            Poll::Ready(Completion::Expired)
+        );
+        core.complete(a, 7);
+        assert_eq!(
+            core.poll_at(a, ms(1000), &w),
+            Poll::Ready(Completion::Done(7))
+        );
+        assert_eq!(step(&mut core, 1).0, None, "b was never handed out");
+    }
+
+    #[test]
+    fn poll_at_never_expires_a_request_without_a_deadline_or_a_frame_in_flight() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        let a = app(&mut core, 0, b"a", Some(10));
         let b = app(&mut core, 0, b"b", None);
         step(&mut core, 0);
-        // b is queued behind a: the caller's deadline removes it, and it is never sent.
-        assert_eq!(core.poll_expired(b, &w), Poll::Ready(Completion::Expired));
-        core.complete(a, 7);
-        assert_eq!(core.poll_expired(a, &w), Poll::Ready(Completion::Done(7)));
-        assert_eq!(step(&mut core, 1).0, None);
+        // In flight: waited out past its deadline.
+        assert_eq!(core.poll_at(a, ms(10_000), &w), Poll::Pending);
+        // No deadline: queued for ever.
+        assert_eq!(core.poll_at(b, ms(u64::MAX / 2_000_000), &w), Poll::Pending);
+    }
+
+    #[test]
+    fn poll_at_reports_a_finished_request_even_past_its_deadline() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        let a = app(&mut core, 0, b"a", Some(10));
+        step(&mut core, 0);
+        core.complete(a, 3);
+        assert_eq!(
+            core.poll_at(a, ms(500), &w),
+            Poll::Ready(Completion::Done(3))
+        );
+    }
+
+    #[test]
+    fn application_frames_leave_one_slot_for_a_scan_probe() {
+        let mut core = Core::new();
+        for _ in 0..3 {
+            app(&mut core, 0, b"x", None);
+        }
+        assert_eq!(
+            core.submit(ms(0), MAC, b"x", None, SendKind::App),
+            Err(Refusal::Full)
+        );
+        assert_eq!(
+            core.submit(ms(0), MAC, b"x", None, SendKind::Unacked),
+            Err(Refusal::Full),
+            "an unacknowledged frame may not take the reserved slot either"
+        );
+        assert!(core.submit(ms(0), MAC, b"p", None, SendKind::Probe).is_ok());
+    }
+
+    #[test]
+    fn a_probe_is_admitted_after_application_callers_filled_the_queue() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        let ids: Vec<TxId> = (0..3).map(|_| app(&mut core, 0, b"x", None)).collect();
+        // Preempted requests keep their slots until their callers collect the result.
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        let probe = core
+            .submit(ms(0), MAC, b"p", None, SendKind::Probe)
+            .expect("the reserved slot is free");
+        assert_eq!(
+            core.submit(ms(0), MAC, b"p", None, SendKind::Probe),
+            Err(Refusal::Full),
+            "all four slots are now held"
+        );
+        for id in ids {
+            assert_eq!(core.poll_result(id, &w), Poll::Ready(Completion::Preempted));
+        }
+        assert_eq!(step(&mut core, 0).0.map(|f| f.0), Some(probe));
+    }
+
+    #[test]
+    fn an_abandoned_frame_on_the_air_does_not_take_the_probe_slot() {
+        let mut core = Core::new();
+        let a = app(&mut core, 0, b"a", None);
+        app(&mut core, 0, b"b", None);
+        app(&mut core, 0, b"c", None);
+        step(&mut core, 0);
+        assert_eq!(core.abandon(a), Abandon::InFlight);
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        assert!(core.submit(ms(0), MAC, b"p", None, SendKind::Probe).is_ok());
     }
 
     #[test]
@@ -1060,5 +1254,58 @@ mod tests {
         core.shutdown(&mut |_| {});
         assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Done(3)));
         assert!(core.can_start_scan_io());
+    }
+
+    #[test]
+    fn a_restore_requested_with_the_air_clear_comes_straight_back() {
+        let mut core = Core::new();
+        let mut deferred = DeferredRestore::new();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        assert_eq!(deferred.request(&core, "restore"), Some("restore"));
+        assert!(!deferred.is_pending());
+        assert_eq!(deferred.due(&core), None);
+    }
+
+    #[test]
+    fn a_restore_requested_mid_probe_waits_for_the_probe_to_complete() {
+        let mut core = Core::new();
+        let mut deferred = DeferredRestore::new();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        let probe = core
+            .submit(ms(0), MAC, b"p", None, SendKind::Probe)
+            .unwrap();
+        step(&mut core, 0);
+        // The scan future is dropped: its caller abandons the probe, which stays on the air.
+        assert_eq!(core.abandon(probe), Abandon::InFlight);
+        assert_eq!(deferred.request(&core, "restore"), None);
+        assert!(deferred.is_pending());
+        assert_eq!(deferred.due(&core), None, "the probe is still on the air");
+        core.complete(probe, 1);
+        assert_eq!(deferred.due(&core), Some("restore"));
+        assert!(!deferred.is_pending());
+        assert_eq!(deferred.due(&core), None, "the plan is applied once");
+    }
+
+    #[test]
+    fn the_exclusion_outlasts_the_deferral() {
+        let mut core = Core::new();
+        let mut deferred = DeferredRestore::new();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        let probe = core
+            .submit(ms(0), MAC, b"p", None, SendKind::Probe)
+            .unwrap();
+        step(&mut core, 0);
+        core.abandon(probe);
+        assert_eq!(deferred.request(&core, 7), None);
+        core.complete(probe, 1);
+        // Between the completion and the end of the restore, application sends stay refused.
+        assert!(deferred.due(&core).is_some());
+        assert!(core.is_scanning());
+        assert_eq!(
+            core.submit(ms(0), MAC, b"x", None, SendKind::App),
+            Err(Refusal::Scanning)
+        );
+        core.end_scan();
+        assert!(core.submit(ms(0), MAC, b"x", None, SendKind::App).is_ok());
     }
 }

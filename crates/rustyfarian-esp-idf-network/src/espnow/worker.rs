@@ -19,9 +19,9 @@
 //! - Callers (async futures or blocking calls) never touch the radio.
 //!   They submit under the lock, wait on the [`WaitList`] (blocking calls park their thread
 //!   through a tiny `block_on`), and read their own slot's result.
-//! - One `Mutex` ([`TxState`]) guards the [`TxCore`], the [`InFlightMarker`] (frame in flight and
-//!   the callback outcome), the shutdown flag, the [`DeadlineSet`] of the callers and the
-//!   [`ScanJobSlot`].
+//! - One `Mutex` ([`TxState`]) guards the [`TxCore`] (which also knows about shutdown), the
+//!   [`InFlightMarker`] (frame in flight and the callback outcome), the [`DeadlineSet`] of the
+//!   callers and the [`ScanGate`] (the scan job slot together with the scan exclusion).
 //!   It is held for a few instructions and never across a radio call, a wait, or a waker call;
 //!   wakers run after unlocking.
 //!   It is never held together with the [`WaitList`] lock, so there is no lock order to violate.
@@ -43,8 +43,9 @@
 //!
 //! The library has no timer (ADR 021), so the worker is the timer: a caller with a finite
 //! deadline registers it in [`TxState`], the worker never sleeps past the earliest one, wakes the
-//! waiting callers at it, and each caller then asks [`TxCore::poll_expired`] under the lock
-//! whether its frame never started (expired) or is on the air (waited out).
+//! waiting callers at it, and each caller then asks [`TxCore::poll_at`] under the lock, which
+//! decides from the deadline stored with the request whether its frame never started (expired)
+//! or is on the air (waited out).
 //! A deadline bounds waiting for a slot, queueing and the start of the transmission, so a timeout
 //! of zero (or one shorter than the worker's reaction) fails with `Timeout` unless the worker
 //! started the frame at once.
@@ -63,16 +64,18 @@
 //! # Scan jobs
 //!
 //! A scan runs on the worker.
-//! Admission is atomic: [`TxCore::begin_scan`] and the job slot are set in one critical section,
-//! so from then on application sends fail with `ScanInProgress` and queued ones were completed as
-//! `Preempted`.
+//! Admission is atomic: [`ScanGate::admit`] claims the radio ([`TxCore::begin_scan`]) and stores
+//! the job in one call, so from then on application sends fail with `ScanInProgress` and queued
+//! ones were completed as `Preempted`; a refused scan changes and preempts nothing.
+//! The queue keeps one slot for the scan's probes, so the probe is never refused for lack of room.
 //! The worker finishes the frame in flight, runs the [`ScanMachine`] with its probes as
 //! [`SendKind::Probe`] frames through the same in-flight and callback path, restores channel,
-//! TX power and peer registration, and only then calls [`TxCore::end_scan`].
+//! TX power and peer registration, and only then does [`ScanGate::finish`] end the exclusion
+//! while publishing the result.
 //!
 //! # Cancellation of a scan
 //!
-//! Dropping the async scan future (or its ticket) cancels the job in the [`ScanJobSlot`] and wakes
+//! Dropping the async scan future (or its ticket) cancels the job in the [`ScanGate`] and wakes
 //! the worker; it never touches the radio (`Drop` cannot await).
 //! The worker feeds [`ScanInput::Abort`] at its next step, and the machine unwinds through its
 //! own restore sequence, so the exclusion is held until the restore is done and the caller's
@@ -80,33 +83,45 @@
 //! The next step comes at one of these points:
 //!
 //! - During a probe: the frame on the air is waited out first (the channel must not change under
-//!   a transmission, and its callback arrives within milliseconds), then the probe result is
-//!   replaced by `Abort`.
+//!   a transmission; its callback typically arrives within milliseconds, but one that never
+//!   arrives blocks the scan and every later transmission until shutdown, see "Threads, locks
+//!   and the callback"), then the probe result is replaced by `Abort`.
 //! - During a confirmation gap: the gap sleeps on the `Condvar`, so cancellation interrupts it
 //!   at once and `Abort` follows.
 //! - Inside the machine's teardown `Abort` stands for the step's expected input, so it is fed
 //!   at every step and never skips a restore; a scan that had already found the peer keeps its
 //!   new pin ([`ScanInput::or_abort`] keeps a `Failed` result).
-//! - Before the worker picks the job up: the slot drops the job, the ticket ends the exclusion,
-//!   and no radio action happens at all.
+//! - Before the worker picks the job up: the gate drops the job and ends the exclusion, and no
+//!   radio action happens at all.
 //! - After the scan finished: the unread result is discarded.
 //!
 //! Shutdown behaves like cancellation, and its wait for a callback that never fires ends.
-//! Once shutdown is set the teardown skips the channel and TX-power calls: a probe may still be
-//! on the air and the driver is going away.
+//! Once shutdown is set the teardown skips the channel, TX-power and peer-table calls: a probe
+//! may still be on the air, the driver is going away and ESP-NOW is deinitialised next.
 //!
 //! # Not covered by host tests
 //!
 //! This module needs ESP-IDF and cannot run on the host, so its `#[cfg(test)]` tests only
 //! type-check (the workspace clippy compiles them) and cover error mapping.
 //! The decisions live in `juggler` with host tests: [`TxCore`], [`ScanMachine`],
-//! [`ScanJobSlot`], [`InFlightMarker`] and [`DeadlineSet`].
+//! [`ScanGate`], [`InFlightMarker`] and [`DeadlineSet`].
 //! The behaviour itself (threads, callback ordering, shutdown join, cancellation) is exercised by
 //! the C3 smoke run only.
+//!
+//! # Fail-closed send callback
+//!
+//! `esp_now_send` accepts a frame and the MAC-layer result arrives later in the send callback.
+//! The worker waits for that callback without a limit while the driver lives, because the
+//! channel and the peer table must not change under a frame on the air and a late callback must
+//! not be taken for the next frame's.
+//! A callback that never fires therefore blocks that frame, every later transmission and every
+//! scan until the driver is dropped (shutdown ends the wait); the docs describe the callback
+//! timing as typical (a few milliseconds), never as guaranteed.
 
 use std::ffi::CStr;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{JoinHandle, Thread};
@@ -114,10 +129,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use juggler::espnow::{
-    Cancelled, Completion, DeadlineId, DeadlineSet, DeadlineStorage, InFlightMarker, JobEpoch,
-    MacAddress, Next, PeerConfig, Refusal, ScanAction, ScanConfig, ScanError, ScanInput,
-    ScanJobSlot, ScanMachine, ScanRefusal, ScanResult, SendKind, SendOutcome, TxCore, TxId,
-    MAX_DATA_LEN,
+    Cancelled, Completion, DeadlineId, DeadlineSet, DeadlineStorage, GateRefusal, InFlightMarker,
+    JobEpoch, MacAddress, Next, PeerConfig, Refusal, ScanAction, ScanConfig, ScanError, ScanGate,
+    ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome, TxCore, TxId, MAX_DATA_LEN,
 };
 use juggler::wait_list::WaitList;
 
@@ -132,8 +146,11 @@ use super::{EspIdfEspNowError, RadioMode};
 /// the cause, and is the deepest on this thread.
 pub(super) const WORKER_STACK_SIZE: usize = 6144;
 
-/// Request slots of the send queue: application requests of concurrent callers, the scan's probe
-/// and one abandoned frame still on the air.
+/// Request slots of the send queue.
+///
+/// [`TxCore`] keeps one slot for the scan's probe, so application requests of concurrent callers
+/// (and an abandoned frame still on the air, which is one of them) share the other
+/// `TX_SLOTS - 1`; more callers wait for a slot until their deadline.
 const TX_SLOTS: usize = 4;
 
 /// Result of one transmission, as reported to the caller of the frame.
@@ -223,11 +240,11 @@ struct TxState {
     core: TxCore<TxOutcome, TX_SLOTS>,
     /// The frame handed to the radio whose send callback has not arrived, and the verdict.
     inflight: InFlightMarker,
-    shutdown: bool,
     /// Deadlines of callers that wait; the worker wakes them when one passes.
     deadlines: DeadlineSet,
-    /// The single scan job: admission, hand-off, result and cancellation.
-    scan: ScanJobSlot<ScanJob, Result<ScanResult, ScanFailure>>,
+    /// The single scan job: admission, hand-off, result, cancellation and the scan exclusion of
+    /// `core`, kept in step by the gate.
+    scan: ScanGate<ScanJob, Result<ScanResult, ScanFailure>>,
 }
 
 /// One frame handed out by [`TxCore::next`], copied so the lock can be released to transmit.
@@ -248,7 +265,7 @@ pub(super) struct TxShared {
     epoch: Instant,
     mode: RadioMode,
     /// The channel the driver keeps pinned; [`u8::MAX`] means none.
-    pinned: std::sync::atomic::AtomicU8,
+    pinned: AtomicU8,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -285,10 +302,11 @@ fn probe_lost(shutdown: bool) -> EspIdfEspNowError {
     }
 }
 
-fn map_scan_refusal(refusal: ScanRefusal) -> EspIdfEspNowError {
+fn map_gate_refusal(refusal: GateRefusal) -> EspIdfEspNowError {
     match refusal {
-        ScanRefusal::Busy => EspIdfEspNowError::Busy,
-        ScanRefusal::NotOwned => EspIdfEspNowError::RadioNotOwned,
+        GateRefusal::Shutdown => EspIdfEspNowError::Shutdown,
+        GateRefusal::Busy => EspIdfEspNowError::Busy,
+        GateRefusal::NotOwned => EspIdfEspNowError::RadioNotOwned,
     }
 }
 
@@ -353,7 +371,7 @@ impl Drop for PendingSend<'_> {
 pub(super) struct ScanTicket<'a> {
     shared: &'a TxShared,
     epoch: JobEpoch,
-    consumed: std::cell::Cell<bool>,
+    consumed: AtomicBool,
 }
 
 impl ScanTicket<'_> {
@@ -363,14 +381,14 @@ impl ScanTicket<'_> {
     fn poll(&self) -> Option<Result<ScanResult, EspIdfEspNowError>> {
         let (taken, shutdown) = {
             let mut state = self.shared.lock();
-            (state.scan.take(self.epoch), state.shutdown)
+            (state.scan.take(self.epoch), state.core.is_shut_down())
         };
         if let Some(result) = taken {
-            self.consumed.set(true);
+            self.consumed.store(true, Ordering::Relaxed);
             return Some(result.map_err(ScanFailure::into_error));
         }
         if shutdown {
-            self.consumed.set(true);
+            self.consumed.store(true, Ordering::Relaxed);
             return Some(Err(EspIdfEspNowError::Shutdown));
         }
         None
@@ -379,17 +397,14 @@ impl ScanTicket<'_> {
 
 impl Drop for ScanTicket<'_> {
     fn drop(&mut self) {
-        if self.consumed.get() {
+        if self.consumed.load(Ordering::Relaxed) {
             return;
         }
         let cancelled = {
-            let mut state = self.shared.lock();
-            let cancelled = state.scan.cancel(self.epoch);
-            if matches!(cancelled, Cancelled::Discarded(_)) {
-                // No worker will run the job, so nobody else ends the exclusion.
-                state.core.end_scan();
-            }
-            cancelled
+            let mut guard = self.shared.lock();
+            let state = &mut *guard;
+            // A job no worker picked up is dropped and the gate ends the exclusion itself.
+            state.scan.cancel(&mut state.core, self.epoch)
         };
         if matches!(cancelled, Cancelled::Requested) {
             self.shared.wake.notify_all();
@@ -426,20 +441,20 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 impl TxShared {
-    pub(super) fn new(mode: RadioMode) -> Self {
+    /// `initial_pin` is the channel the owned radio starts on, if the driver set one.
+    pub(super) fn new(mode: RadioMode, initial_pin: Option<u8>) -> Self {
         Self {
             state: Mutex::new(TxState {
                 core: TxCore::new(),
                 inflight: InFlightMarker::new(),
-                shutdown: false,
                 deadlines: DeadlineSet::with_capacity(DEADLINE_CAPACITY),
-                scan: ScanJobSlot::new(),
+                scan: ScanGate::new(),
             }),
             wake: Condvar::new(),
             waiters: WaitList::new(),
             epoch: Instant::now(),
             mode,
-            pinned: std::sync::atomic::AtomicU8::new(u8::MAX),
+            pinned: AtomicU8::new(initial_pin.unwrap_or(u8::MAX)),
         }
     }
 
@@ -454,7 +469,7 @@ impl TxShared {
 
     /// The channel the driver keeps pinned, if any.
     pub(super) fn pinned_channel(&self) -> Option<u8> {
-        match self.pinned.load(std::sync::atomic::Ordering::Relaxed) {
+        match self.pinned.load(Ordering::Relaxed) {
             u8::MAX => None,
             channel => Some(channel),
         }
@@ -473,9 +488,7 @@ impl TxShared {
     /// Ends every request, tells the worker to stop and wakes every caller; idempotent.
     pub(super) fn begin_shutdown(&self) {
         {
-            let mut state = self.lock();
-            state.shutdown = true;
-            state.core.shutdown(&mut |_waker| {});
+            self.lock().core.shutdown(&mut |_waker| {});
         }
         self.wake.notify_all();
         self.waiters.wake_all();
@@ -522,9 +535,6 @@ impl TxShared {
     ) -> Option<Result<TxId, EspIdfEspNowError>> {
         let now = self.now();
         let mut state = self.lock();
-        if state.shutdown {
-            return Some(Err(EspIdfEspNowError::Shutdown));
-        }
         match state.core.submit(now, *mac, data, deadline, kind) {
             Ok(id) => {
                 drop(state);
@@ -538,20 +548,12 @@ impl TxShared {
 
     /// The caller's view of request `id`; `None` while it is pending.
     ///
-    /// With a passed `deadline` a queued request expires and a frame on the air is waited out.
-    fn poll_completion(
-        &self,
-        id: TxId,
-        deadline: Option<Duration>,
-    ) -> Option<Completion<TxOutcome>> {
-        let past = deadline.is_some_and(|at| self.now() >= at);
+    /// The core uses the deadline stored with the request: once it passed, a queued request
+    /// expires and a frame on the air is waited out.
+    fn poll_completion(&self, id: TxId) -> Option<Completion<TxOutcome>> {
+        let now = self.now();
         let mut state = self.lock();
-        let poll = if past {
-            state.core.poll_expired(id, Waker::noop())
-        } else {
-            state.core.poll_result(id, Waker::noop())
-        };
-        match poll {
+        match state.core.poll_at(id, now, Waker::noop()) {
             Poll::Ready(completion) => Some(completion),
             Poll::Pending => None,
         }
@@ -582,10 +584,7 @@ impl TxShared {
             shared: self,
             id: Some(id),
         };
-        let completion = self
-            .waiters
-            .wait(|| self.poll_completion(id, deadline))
-            .await;
+        let completion = self.waiters.wait(|| self.poll_completion(id)).await;
         pending.id = None;
         // The slot is free again: callers waiting for one may proceed.
         self.waiters.wake_all();
@@ -605,31 +604,22 @@ impl TxShared {
         let job = ScanJob::new(mac, config);
         let mut preempted = false;
         let admitted = {
-            let mut state = self.lock();
-            if state.shutdown {
-                Err((EspIdfEspNowError::Shutdown, job))
-            } else if !state.scan.is_empty() {
-                // A job is pending or running, or its result has not been taken: the previous
-                // scan's result must not be overwritten (`end_scan` already cleared the gate).
-                Err((EspIdfEspNowError::Busy, job))
-            } else {
-                match state
-                    .core
-                    .begin_scan(self.mode.owns_radio(), &mut |_waker| preempted = true)
-                {
-                    Err(refusal) => Err((map_scan_refusal(refusal), job)),
-                    Ok(()) => state.scan.admit(job).map_err(|job| {
-                        state.core.end_scan();
-                        (EspIdfEspNowError::Busy, job)
-                    }),
-                }
-            }
+            let mut guard = self.lock();
+            let state = &mut *guard;
+            // One call: shutdown, a job or untaken result in the slot, then the radio claim,
+            // with nothing changed (and nothing preempted) on a refusal.
+            state.scan.admit(
+                &mut state.core,
+                self.mode.owns_radio(),
+                job,
+                &mut |_waker| preempted = true,
+            )
         };
         let epoch = match admitted {
             Ok(epoch) => epoch,
-            Err((error, job)) => {
+            Err((refusal, job)) => {
                 drop(job);
-                return Err(error);
+                return Err(map_gate_refusal(refusal));
             }
         };
         self.wake.notify_all();
@@ -639,7 +629,7 @@ impl TxShared {
         Ok(ScanTicket {
             shared: self,
             epoch,
-            consumed: std::cell::Cell::new(false),
+            consumed: AtomicBool::new(false),
         })
     }
 
@@ -726,7 +716,7 @@ impl TxShared {
                         TxOutcome::NoAck
                     });
                 }
-                if state.shutdown {
+                if state.core.is_shut_down() {
                     break None;
                 }
                 state = self.park(state, None);
@@ -755,7 +745,7 @@ impl TxShared {
     fn run(&self) {
         let mut state = self.lock();
         loop {
-            if state.shutdown {
+            if state.core.is_shut_down() {
                 return;
             }
             let (step, expired) = self.next_frame(&mut state);
@@ -775,7 +765,7 @@ impl TxShared {
                 }
                 Step::Wait(until) => {
                     // Nothing is in flight here, so a pending scan may start.
-                    if state.scan.has_pending() && state.core.can_start_scan_io() {
+                    if state.scan.may_start(&state.core) {
                         let Some((epoch, job)) = state.scan.pickup() else {
                             continue;
                         };
@@ -796,20 +786,23 @@ impl TxShared {
     /// True when the scan must be given up: its caller is gone or the driver is shutting down.
     fn abort_requested(&self, epoch: JobEpoch) -> bool {
         let state = self.lock();
-        state.shutdown || state.scan.cancel_requested(epoch)
+        state.core.is_shut_down() || state.scan.cancel_requested(epoch)
     }
 
     /// False once shutdown is set: the teardown then skips the channel and TX-power calls, as a
     /// probe may still be on the air and the driver is going away.
     fn radio_io_allowed(&self) -> bool {
-        !self.lock().shutdown
+        !self.lock().core.is_shut_down()
     }
 
     /// Sleeps until `until` on the scan's clock, ending early on cancellation or shutdown.
     fn sleep_until(&self, epoch: JobEpoch, until: Duration) {
         let mut state = self.lock();
         loop {
-            if state.shutdown || state.scan.cancel_requested(epoch) || self.now() >= until {
+            if state.core.is_shut_down()
+                || state.scan.cancel_requested(epoch)
+                || self.now() >= until
+            {
                 return;
             }
             state = self.park(state, Some(until));
@@ -828,8 +821,7 @@ impl TxShared {
         // The pin follows the machine whatever became of the caller: on a success the peer is
         // registered on the new channel, on any failure the machine restored the old one.
         if let Some(channel) = machine.pinned_channel() {
-            self.pinned
-                .store(channel, std::sync::atomic::Ordering::Relaxed);
+            self.pinned.store(channel, Ordering::Relaxed);
         }
         match &result {
             Ok(found) => log::info!("Peer {:02X?} found on channel {}", job.mac, found.channel),
@@ -844,12 +836,13 @@ impl TxShared {
     /// Ends the exclusion and publishes the result, or discards it when the caller is gone.
     fn finish_scan_job(&self, epoch: JobEpoch, result: Option<Result<ScanResult, ScanFailure>>) {
         let discarded = {
-            let mut state = self.lock();
-            state.core.end_scan();
+            let mut guard = self.lock();
+            let state = &mut *guard;
+            // The gate ends the exclusion in the call that publishes (or drops) the result.
             match result {
-                Some(result) => state.scan.finish(epoch, result),
+                Some(result) => state.scan.finish(&mut state.core, epoch, result),
                 None => {
-                    state.scan.release(epoch);
+                    state.scan.release(&mut state.core, epoch);
                     None
                 }
             }
@@ -869,28 +862,28 @@ impl TxShared {
         mac: &MacAddress,
         data: &[u8],
     ) -> Result<SendOutcome, EspIdfEspNowError> {
-        let id = {
-            let mut state = self.lock();
-            if state.shutdown {
-                return Err(EspIdfEspNowError::Shutdown);
-            }
-            state
-                .core
-                .submit(self.now(), *mac, data, None, SendKind::Probe)
-                .map_err(|refusal| map_refusal(refusal, data.len()))?
-        };
+        // `TxCore` keeps a slot for the probe, so a queue that application callers filled (and
+        // whose preempted requests are not yet collected) cannot refuse it with `Full`.
+        let id = self
+            .lock()
+            .core
+            .submit(self.now(), *mac, data, None, SendKind::Probe)
+            .map_err(|refusal| map_refusal(refusal, data.len()))?;
         // The queue holds nothing else (the worker drained it before the scan began, and
         // application sends are refused), so the first frame is ours; any other is serviced too.
         loop {
-            let (step, _) = {
+            let (step, expired) = {
                 let mut state = self.lock();
                 self.next_frame(&mut state)
             };
+            if expired {
+                self.waiters.wake_all();
+            }
             let Step::Send(frame) = step else {
                 let shutdown = {
                     let mut state = self.lock();
                     state.core.abandon(id);
-                    state.shutdown
+                    state.core.is_shut_down()
                 };
                 return Err(probe_lost(shutdown));
             };
@@ -908,7 +901,7 @@ impl TxShared {
                     None
                 }
             };
-            (completion, state.shutdown)
+            (completion, state.core.is_shut_down())
         };
         match completion.map(map_completion) {
             Some(Ok(TxOutcome::Acked)) => Ok(SendOutcome::Acked),
@@ -957,6 +950,15 @@ impl TxShared {
             }
             let action = machine.poll(self.now(), input);
             input = match action {
+                // Shutdown: the driver is going away and ESP-NOW is deinitialised next, so the
+                // teardown leaves channel, TX power and peer registration as they are.
+                ScanAction::RemovePeer
+                | ScanAction::RegisterPeer { .. }
+                | ScanAction::RegisterFallbackPeer { .. }
+                    if !self.radio_io_allowed() =>
+                {
+                    ScanInput::Completed
+                }
                 ScanAction::RemovePeer => {
                     // Best effort: removes a stale registration, or the scan peer.
                     let _ = super::peer_del(&mac);
@@ -1365,11 +1367,15 @@ mod tests {
             EspIdfEspNowError::Shutdown
         ));
         assert!(matches!(
-            map_scan_refusal(ScanRefusal::Busy),
+            map_gate_refusal(GateRefusal::Shutdown),
+            EspIdfEspNowError::Shutdown
+        ));
+        assert!(matches!(
+            map_gate_refusal(GateRefusal::Busy),
             EspIdfEspNowError::Busy
         ));
         assert!(matches!(
-            map_scan_refusal(ScanRefusal::NotOwned),
+            map_gate_refusal(GateRefusal::NotOwned),
             EspIdfEspNowError::RadioNotOwned
         ));
     }

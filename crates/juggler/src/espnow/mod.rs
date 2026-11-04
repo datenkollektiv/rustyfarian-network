@@ -48,9 +48,12 @@ pub use link::{
 };
 pub use link_trait::{ClassifySend, EspNowLink};
 pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
-pub use scan_job::{Cancelled, JobEpoch, ScanJobSlot};
+pub use scan_job::{Cancelled, GateRefusal, JobEpoch, ScanGate, ScanJobSlot};
 pub use tracker::PeerTracker;
-pub use tx::{Abandon, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId};
+pub use tx::{
+    Abandon, Completion, DeferredRestore, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId,
+    PROBE_RESERVED_SLOTS,
+};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -311,6 +314,12 @@ pub struct ScanConfig<'a> {
     /// Payload sent as the probe frame.
     pub probe_data: &'a [u8],
     /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
+    ///
+    /// On esp-hal it bounds queueing and the start of a probe: a probe that did not start in time
+    /// is never sent and counts as a local failure.
+    /// A probe that has started is waited out, and its real MAC-layer result is used.
+    /// On ESP-IDF a started probe is waited out too (fail-closed) and probes are not queued
+    /// behind other frames, so this field bounds nothing there.
     pub probe_timeout: core::time::Duration,
     /// Total burst timeout (default: [`DEFAULT_BURST_TIMEOUT`] = 3 s).
     ///
