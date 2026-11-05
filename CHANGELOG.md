@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ADR 023 adopted: shared tier logic follows a three-rung ladder, and the ladder retrofit moves the Wi-Fi, MQTT, ESP-NOW, OTA, provisioning and LoRa logic of both tiers onto shared `juggler` cores.
+  The bench re-runs that the retrofit needs are mapped to gates in `docs/runbooks/release-0.7.0-hardware-test.md`.
+- `juggler::wifi::LinkHandover::{start, idle_wait, take_ready_change}` and the enum `juggler::wifi::IdleWait` (`Link`, `Park`, `Restart`), re-exported from `juggler::wifi`.
+  `juggler::wifi::ConnectMode::effective_timeout_secs` returns the connect timeout that both tiers share.
+- `Clone` on `juggler::wifi::LinkMachine`, `juggler::wifi::LinkHandover` and `juggler::backoff::ExponentialBackoff`.
+- `juggler::mqtt::{ConnectWorkPlan, ConnectStep}`: the ordered connect work (subscriptions, startup message and `on_connect`) that both tiers run.
+  `ChunkAssembler::dropped_by_last_feed()` reports how many messages the last feed dropped.
+- `juggler::ota::runtime::HealthConfig::{time_bound, TIME_BOUND_SLACK}`: the health policy's time bound, which the IDF health loop no longer computes itself.
+  The IDF health loop now stops with `SlotUnreadable` on an `Ignored` action instead of replaying the last action.
+- `juggler::espnow::TxCore::admit_direct`, `ScanTeardown`, `CancelOutcome`, `ScanMachine::{max_polls, abort_teardown, poll_bounded}`, and the `ScanGate` cancel path (`cancel_running`, `on_probe_complete`, `has_deferred`).
+  `ScanGate` takes a third type parameter, defaulting to `ScanTeardown`, so existing uses still compile.
+- `juggler::ota::check_content_length` (re-exported flat on both tiers), `juggler::ota::download::{DownloadMachine, DownloadInput, DownloadAction}`, `juggler::ota::runtime::{repair_status, BeginFailure, begin_failure_outcome, RuntimeFlags}`, `BootOutcome::records_suspect()`, and `juggler::ota::persist::{BusyRetry, read_with_busy_retry}`.
+  `rustyfarian-esp-idf-network` `ota::BusyRetry` stays at its path as a re-export, and `rustyfarian-esp-hal-network` `ota` re-exports `BusyRetry` and `read_with_busy_retry` under `ota-wire`.
+- `juggler::provisioning` gains the shared captive-portal cores, re-exported at `juggler::provisioning`: `portal` (`plan_portal`, `PortalPlan`, `Prefill`, `compose_mqtt_uri` and the nonce helpers), `portal_flow::{PortalMachine, PortalInput, PortalAction}`, `dns` (the DNS codec), `boot::{classify_wifi_mqtt, portal_outcome}` and `templates`.
+- `juggler::provisioning::flash_store::{ProvisioningStore, StoreError}` behind the new `flash-store` feature; `rustyfarian-esp-hal-network` re-exports them at the same path.
+- `juggler::lora::{LorawanPhy, map_rf_config, LorawanTicker, TickEvent, Outcome, IrqOutcome, classify_irq, ldro_required, RadioErrorKind}`, the PHY constants (for example `LORAWAN_PUBLIC_SYNC_WORD`, `RX_PAYLOAD_MAX` and the `IRQ_*` bits), `Region::{default_rf_hz, image_calibration_hz}`, and the `juggler::lora::sx1262` bring-up (`init`, `InitError`, `InitStep`, `BRING_UP_ORDER`).
+  The ESP-IDF and esp-hal `lora` modules re-export the same shared surface.
 - `juggler::espnow::EspNowLink` (async `send_acked`, `receive`, `scan_for_peer` and `pinned_channel` on top of `EspNowDriver`), `ClassifySend` with `SendOutcome::of`, `EspNowEvent::try_new` (returns the oversize length instead of truncating), `OversizeLog` (drop counter and rate-limited log decision, first drop then every 32nd) and `espnow::mock::MockEspNowLink` (scripted send and scan results, receive queue); `ScanMachine` now logs an expired burst at `debug` when the scan finishes, and the `espnow` feature alone is enough for the shared host-test fixtures (tier-parity ESP-NOW Step 1, juggler only; neither tier implements the trait yet).
 - `juggler::espnow::TxCore<R, N>` (`no_std`, no alloc) with `TxId`, `SendKind`, `Refusal`, `ScanRefusal`, `Completion`, `Abandon` and `Next`: the sans-IO ESP-NOW send queue both tiers will run (tier-parity ESP-NOW Step 2, juggler only; neither tier uses it yet).
   It owns request ids with a stale-completion guard, FIFO order with one frame in flight, deadlines that bound queueing and start (a started frame is waited out), cancellation through `abandon`, per-slot results and wakers, queue pressure (`Full`) and the scan gate (`begin_scan`/`end_scan`: `Busy`, `NotOwned`, app frames refused with `Scanning`, probes allowed, queued app requests completed as `Preempted`, `can_start_scan_io` waits for a frame in flight).
@@ -46,9 +63,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TxCore::poll_at(id, now, waker)` expires a queued request by its own stored deadline and waits out a frame in flight; it replaces `TxCore::poll_expired`, which was unreleased.
   `DeferredRestore` holds a cancelled scan's restore until the probe on the air has completed.
   Mutation-checked: the probe reservation, the admission pre-check, the cancel and finish exclusion ends, `poll_at` expiry and the deferral.
+- `rustyfarian-esp-hal-network` `esp32` feature now supports `wifi` and `mqtt` on the classic ESP32, with `esp-radio`, `esp-rtos` and `esp-alloc` forwarded to the chip; provisioning and ESP-NOW stay unsupported on it.
+- `rustyfarian-esp-hal-network` `ota::EspHalOtaManager::selected_slot(&mut self) -> Result<SlotId, OtaError>` reports the slot the bootloader selected; the host stub does not mirror it.
+- Examples `hal_esp32_connect_async`, `hal_esp32_mqtt_lwt`, `hal_c3_mqtt_lwt`, `hal_esp32s3_provision_mqtt`, `hal_c3_ota` and `hal_esp32s3_ota` in `rustyfarian-esp-hal-network`, and `idf_c6_mqtt` in `rustyfarian-esp-idf-network`.
+  `hal_c3_ota` and `hal_esp32s3_ota` run the direct HTTP OTA check and need a server on a 192.168.31.x host.
+- Just recipes `build-all-examples` (optional prefix, `KEEP_GOING=1` to continue past failures), `build-xtensa-idf-mqtt` (builds `idf_esp32_mqtt` and `idf_esp32s3_mqtt_lwt`) and `flash-ota-baseline` (flashes the baseline of a bare-metal OTA example).
 
 ### Changed
 
+- BREAKING: `juggler::wifi::LinkAction` gains `Ignored` (exhaustive enum).
+  `LinkMachine::poll` returns it instead of `None` for a `NetworkUp` outside `Connected`, a duplicate `NetworkUp`, and a `NetworkDown` while already down.
+  Both tiers re-export the enum unchanged.
+- BREAKING: `juggler::wifi::LinkInput` gains `ConnectFailed`, which a refused radio connect now feeds.
+  It backs off from `Connecting` and is ignored in every other state.
+- BREAKING: `juggler::mqtt::SessionAction` gains `Ignored` and `Ready`.
+  `WorkDone` returns `Ready` instead of `None`, and out-of-phase inputs return `Ignored` instead of `None`.
+- BREAKING: `juggler::mqtt::SessionAction::ConnectWork` gains the field `session_present: bool`.
+- BREAKING: `juggler::espnow::ScanInput` gains `Shutdown`, which finishes a scan at once without a teardown; `ScanInput::or_abort` keeps it.
+- BREAKING: `juggler::espnow::ScanAction` gains `Ignored`.
+  `ScanMachine::poll` and `ScanTeardown::poll` return it after `Done` instead of repeating the result.
+  `ScanMachine::abort_teardown()` before `Start` is not done until it is polled.
+- BREAKING: `juggler::espnow::TxCore::complete` returns the enum `Completed` (`Delivered`, `Discarded`, `Unknown`) instead of `Option<Waker>`.
+- BREAKING: `juggler::espnow::Completion::Unknown` and `Refusal::Expired` are new, so exhaustive matches need an arm.
+  `poll_result` and `poll_at` on a dead id return `Unknown` instead of `Expired`.
+- BREAKING: `juggler::espnow::PeerLinkAction` gains `Ignored`, which rejected `PeerLink` events return instead of `None`.
+- BREAKING: `juggler::ota::runtime::{ViewStep, PublishStep, DeliveryStep}` each gain `Ignored`.
+  `ReporterMachine::on_view`, `on_publish` and `on_delivery` enforce the view, publish, delivery order.
+  `CompletionRetry::on_result` returns the new enum `CompletionStep` (`Retry`, `Stop`, `Ignored`) instead of `bool`.
+- BREAKING: `juggler::ota::HealthAction` gains `Ignored`; `SlotReading::PendingVerify` carries a `SlotId`; `HealthAction::NoteRollback` carries `(RollbackReason, SlotId)`.
+  Both tiers re-export the types unchanged.
+- BREAKING: `juggler::lora::LoraRadio` gains the required methods `cancel_rx` and `irq_pending`, so external implementors must add them.
+  The generic bridge needs `juggler::lora::RadioErrorKind` on the radio error.
+- BREAKING: `juggler::lora::MockRadioError` gains `Timeout` and `InvalidRfConfig`, and `rustyfarian-esp-hal-network` `lora::LoraError` gains `InvalidRfConfig`.
+- `rustyfarian-esp-idf-network` `EspIdfLoraRadio::cancel_rx` and `irq_pending` are now `LoraRadio` trait methods that return `Result`.
+  `LoraRadioAdapter` is a type alias for `juggler::lora::LorawanPhy<EspIdfLoraRadio<'d, ANT>>` at the same path, adds `ignored_events()`, `radio()`, `radio_mut()` and `into_radio()`, and the `lora-modulation` dependency is dropped.
+- Behaviour: IDF `WiFiManager::new` (blocking, with or without LED), `get_ip` and `wait_connected` now wait for supervisor readiness (association plus the station's DHCP IP event) instead of polling `is_connected()` and `wait_netif_up()`.
+  The signatures are unchanged.
+- Behaviour: the IDF `LinkSupervisor` and the esp-hal `WifiLink` feed `LinkMachine` from the IP up and IP down edges.
+  Duplicate or out-of-phase edges are logged or dropped as `Ignored`, and `is_ready()` is unchanged.
+  `LinkSupervisor::suspend` reports readiness before the radio stops.
+- Behaviour: the IDF MQTT shutdown runs `Shutdown` through `SessionMachine` to `Close` before the client stops.
+  The esp-hal MQTT runner closes the socket on network loss, and both tiers run connect work from `ConnectWorkPlan`.
+- Behaviour: IDF `scan_for_peer` and the `espnow-tx` scan loop end a scan that is polled after `Done` as an error exit.
+  A probe that has not started within `ScanConfig::probe_timeout` is a local failure.
+- Behaviour: esp-hal `send_and_wait` to `BROADCAST_MAC` returns `EspHalEspNowError::Broadcast`, matching ESP-IDF.
+  A sync send checks the sender lease before the payload size, so an oversize frame while the sender is busy reports `Busy`.
+  A cancelled scan restores TX power, removes the temporary peer, restores the channel, and then registers the fallback peer.
+- Behaviour: esp-hal `fetch_and_apply` reports a missing Content-Length as `DownloadFailed { status: 0 }` instead of `ServerUnreachable`, reads the partition table only after the server answered, and stops the write path on every error after Prepare.
+  The IDF tier also rejects a response with any `Transfer-Encoding` header, as esp-hal does.
+- Behaviour: the IDF health policy fails closed with `SlotUnreadable` on a slot that stays busy past the failure deadline, on two `Ignored` events in a row, or past its time bound.
+- Behaviour: a fresh device prefills `dev_name` with `device_name` on esp-hal.
+  esp-hal DNS answers AAAA, and every type except A and ANY, with NOERROR and zero answers; IDF DNS rejects QR=1 queries and copies RD.
+  A refused invalid submission now gets a 409 on both tiers, and both tiers check the profile before the AP settings.
+- ESP-IDF `Session` and esp-hal `Shared` wake `wait_connected` only on `SessionAction::Ready`.
 - `juggler::espnow::ScanMachine`: `ScanInput::Abort` inside the teardown (`RestoreTxPower` through `RegisterFallbackPeer`) now continues the teardown as if the step had completed, instead of finishing at once.
   An abort during the temporary-peer fallback therefore still emits `RegisterFallbackPeer`, and a scan that had found the peer keeps its new pin.
   Before the teardown `Abort` unwinds as before; the esp-hal scan never feeds `Abort`, so it is unaffected.
@@ -247,6 +314,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- `rustyfarian-esp-idf-network` `mqtt::MqttManager`: deprecated since 0.7.0 and kept, not removed; use `MqttBuilder` and `MqttHandle`.
+- `juggler::mqtt::SessionPhase` and `juggler::mqtt::connection_wait_iterations`: deprecated since 0.7.0 and kept; use `SessionMachine` and `MqttHandle::state()`.
+- `juggler::espnow::DeferredRestore`: deprecated since 0.7.0; `ScanGate` now holds the deferred teardown.
+- `juggler::lora::{LorawanDevice, LorawanResponse}`: deprecated and kept; use `LorawanTicker`.
+- `rustyfarian-esp-idf-network` `EspIdfLoraRadio::irq_pending()` and `cancel_rx()` inherent forwarders: deprecated since 0.7.0; call the `LoraRadio` trait methods.
+- `juggler::ota::runtime::begin_failure`: deprecated; use `begin_failure_outcome`.
 - `juggler::mqtt::{ConnectionEpoch, spawn_connect_thread, spawn_subscriber_thread}`: no tier uses them since tier-parity Steps 8b-1 and 8b-2 — `SessionMachine`'s `SessionToken` guards stale sessions and the ESP-IDF tier runs its connect work on its own worker — and they are slated for removal in 1.0; the regression tests and the public-path test still cover them until then.
 - `rustyfarian-esp-idf-network` `WiFiManager::link_state()`: use `state()`, the name both tiers share.
 - `juggler::wifi::WifiDriver`: no tier implements it; ADR 022's shared link traits replace it. Its docs no longer claim the ESP-IDF `WiFiManager` as an implementor, and `MqttConnectionState`'s docs now hold for both tiers.

@@ -77,6 +77,7 @@ pub struct ChunkAssembler {
     max_len: usize,
     progress: Progress,
     abandoned: u32,
+    dropped_by_last_feed: u32,
 }
 
 impl ChunkAssembler {
@@ -86,6 +87,7 @@ impl ChunkAssembler {
             max_len,
             progress: Progress::Idle,
             abandoned: 0,
+            dropped_by_last_feed: 0,
         }
     }
 
@@ -94,8 +96,28 @@ impl ChunkAssembler {
         self.abandoned
     }
 
+    /// Messages the last [`feed`](Self::feed) dropped: a message in progress
+    /// it abandoned, plus the message it reported as
+    /// [`TooLarge`](Assembled::TooLarge). An [`OutOfOrder`](Assembled::OutOfOrder)
+    /// chunk counts once in total, whether or not it abandoned a message.
+    pub fn dropped_by_last_feed(&self) -> u32 {
+        self.dropped_by_last_feed
+    }
+
     /// Feeds one chunk.
     pub fn feed(&mut self, chunk: Chunk<'_>) -> Assembled {
+        let abandoned = self.abandoned;
+        let outcome = self.assemble(chunk);
+        let abandoned_now = self.abandoned.wrapping_sub(abandoned);
+        self.dropped_by_last_feed = match outcome {
+            Assembled::TooLarge => abandoned_now.wrapping_add(1),
+            Assembled::OutOfOrder => abandoned_now.max(1),
+            Assembled::Message { .. } | Assembled::Pending => abandoned_now,
+        };
+        outcome
+    }
+
+    fn assemble(&mut self, chunk: Chunk<'_>) -> Assembled {
         match chunk {
             Chunk::Complete { topic, data } => {
                 self.abandon();
@@ -343,5 +365,131 @@ mod tests {
             message("u", b"new")
         );
         assert_eq!(a.abandoned(), 1);
+    }
+
+    /// Feeds `chunks` and returns the summed drop count, the value the ESP-IDF
+    /// event loop hands to its counter.
+    fn dropped(a: &mut ChunkAssembler, chunks: &[Chunk<'_>]) -> u32 {
+        chunks
+            .iter()
+            .map(|chunk| {
+                a.feed(*chunk);
+                a.dropped_by_last_feed()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn complete_message_drops_nothing() {
+        let mut a = ChunkAssembler::new(8);
+        let chunks = [
+            Chunk::Complete {
+                topic: "t",
+                data: b"one",
+            },
+            Chunk::First {
+                topic: "t",
+                data: b"ab",
+                total: 4,
+            },
+            Chunk::Next {
+                data: b"cd",
+                offset: 2,
+                total: 4,
+            },
+        ];
+        assert_eq!(dropped(&mut a, &chunks), 0);
+    }
+
+    #[test]
+    fn too_large_counts_one() {
+        let mut a = ChunkAssembler::new(4);
+        let chunks = [
+            Chunk::First {
+                topic: "t",
+                data: b"ab",
+                total: 6,
+            },
+            Chunk::Next {
+                data: b"cd",
+                offset: 2,
+                total: 6,
+            },
+            Chunk::Next {
+                data: b"ef",
+                offset: 4,
+                total: 6,
+            },
+        ];
+        assert_eq!(
+            dropped(&mut a, &chunks),
+            1,
+            "the skipped chunks add nothing"
+        );
+        let mut b = ChunkAssembler::new(2);
+        let complete = [Chunk::Complete {
+            topic: "t",
+            data: b"abc",
+        }];
+        assert_eq!(dropped(&mut b, &complete), 1);
+    }
+
+    #[test]
+    fn stray_chunk_without_message_counts_one() {
+        let mut a = ChunkAssembler::new(8);
+        let stray = Chunk::Next {
+            data: b"cd",
+            offset: 2,
+            total: 4,
+        };
+        assert_eq!(a.feed(stray), Assembled::OutOfOrder);
+        assert_eq!(a.dropped_by_last_feed(), 1);
+    }
+
+    #[test]
+    fn out_of_order_chunk_abandoning_a_message_counts_one_not_two() {
+        let mut a = ChunkAssembler::new(8);
+        a.feed(Chunk::First {
+            topic: "t",
+            data: b"ab",
+            total: 4,
+        });
+        assert_eq!(a.dropped_by_last_feed(), 0);
+        let wrong_offset = Chunk::Next {
+            data: b"cd",
+            offset: 3,
+            total: 4,
+        };
+        assert_eq!(a.feed(wrong_offset), Assembled::OutOfOrder);
+        assert_eq!(a.abandoned(), 1, "the message in progress was abandoned");
+        assert_eq!(a.dropped_by_last_feed(), 1);
+    }
+
+    #[test]
+    fn new_first_chunk_abandoning_a_message_counts_one() {
+        let mut a = ChunkAssembler::new(8);
+        a.feed(Chunk::First {
+            topic: "t",
+            data: b"ab",
+            total: 4,
+        });
+        let restart = a.feed(Chunk::First {
+            topic: "u",
+            data: b"xy",
+            total: 4,
+        });
+        assert_eq!(restart, Assembled::Pending);
+        assert_eq!(a.dropped_by_last_feed(), 1);
+        let oversized = a.feed(Chunk::First {
+            topic: "v",
+            data: b"xy",
+            total: 9,
+        });
+        assert_eq!(oversized, Assembled::TooLarge);
+        assert_eq!(
+            a.dropped_by_last_feed(),
+            2,
+            "the abandoned message plus the oversized one"
+        );
     }
 }

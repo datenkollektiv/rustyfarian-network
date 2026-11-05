@@ -95,9 +95,14 @@
 //!   radio action happens at all.
 //! - After the scan finished: the unread result is discarded.
 //!
-//! Shutdown behaves like cancellation, and its wait for a callback that never fires ends.
-//! Once shutdown is set the teardown skips the channel, TX-power and peer-table calls: a probe
-//! may still be on the air, the driver is going away and ESP-NOW is deinitialised next.
+//! Shutdown ends the wait for a callback that never fires, and the worker feeds
+//! [`ScanInput::Shutdown`] at its next step: the machine finishes at once without a teardown, so
+//! no channel, TX-power or peer-table call follows (a probe may still be on the air, the driver
+//! is going away and ESP-NOW is deinitialised next).
+//!
+//! The scan loop is bounded by [`ScanMachine::poll_bounded`]: past [`ScanMachine::max_polls`] it
+//! feeds `Abort` once, and a machine that still has not finished after the teardown budget is a
+//! bug, reported as [`ScanError::UnexpectedInput`].
 //!
 //! # Not covered by host tests
 //!
@@ -129,9 +134,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use juggler::espnow::{
-    Cancelled, Completion, DeadlineId, DeadlineSet, DeadlineStorage, GateRefusal, InFlightMarker,
-    JobEpoch, MacAddress, Next, PeerConfig, Refusal, ScanAction, ScanConfig, ScanError, ScanGate,
-    ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome, TxCore, TxId, MAX_DATA_LEN,
+    Cancelled, Completed, Completion, DeadlineId, DeadlineSet, DeadlineStorage, GateRefusal,
+    InFlightMarker, JobEpoch, MacAddress, Next, PeerConfig, Refusal, ScanAction, ScanConfig,
+    ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome, TxCore, TxId,
+    MAX_DATA_LEN,
 };
 use juggler::wait_list::WaitList;
 
@@ -279,13 +285,18 @@ fn map_completion(completion: Completion<TxOutcome>) -> Result<TxOutcome, EspIdf
         Completion::Expired => Err(EspIdfEspNowError::Timeout),
         Completion::Preempted => Err(EspIdfEspNowError::ScanInProgress),
         Completion::Shutdown => Err(EspIdfEspNowError::Shutdown),
+        // The caller lost track of its own request: no result to report.
+        Completion::Unknown => Err(EspIdfEspNowError::Busy),
     }
 }
 
-/// The error of a refused submission; `Full` is only reported once the caller's deadline passed.
+/// The error of a refused submission.
 fn map_refusal(refusal: Refusal, len: usize) -> EspIdfEspNowError {
     match refusal {
-        Refusal::Full => EspIdfEspNowError::Timeout,
+        Refusal::Expired => EspIdfEspNowError::Timeout,
+        // Not reached: a full queue is a wait (`try_submit` retries) until the deadline, after
+        // which the core answers `Expired`.
+        Refusal::Full => EspIdfEspNowError::Busy,
         Refusal::Scanning => EspIdfEspNowError::ScanInProgress,
         Refusal::TooLarge => EspIdfEspNowError::PayloadTooLarge { len },
         Refusal::Broadcast => EspIdfEspNowError::Broadcast,
@@ -526,6 +537,7 @@ impl TxShared {
     /// One attempt to queue the frame.
     ///
     /// `None` means the queue is full and the deadline has not passed: wait and retry.
+    /// Once it has passed the core answers [`Refusal::Expired`] instead.
     fn try_submit(
         &self,
         mac: &MacAddress,
@@ -541,7 +553,7 @@ impl TxShared {
                 self.wake.notify_all();
                 Some(Ok(id))
             }
-            Err(Refusal::Full) if deadline.is_none_or(|at| now < at) => None,
+            Err(Refusal::Full) => None,
             Err(refusal) => Some(Err(map_refusal(refusal, data.len()))),
         }
     }
@@ -708,6 +720,7 @@ impl TxShared {
         let code = send_frame(&frame.mac, &frame.data[..frame.len], repin);
         let mut state = self.lock();
         let result = if code == esp_idf_svc::sys::ESP_OK {
+            // ADR 020 fail-closed exception: no time bound while the frame is on the air.
             loop {
                 if let Some(acked) = state.inflight.take_outcome() {
                     break Some(if acked {
@@ -725,12 +738,31 @@ impl TxShared {
             Some(TxOutcome::SendFailed(code))
         };
         state.inflight.clear();
-        if let Some(result) = result {
-            // The caller is woken through the wait list, not through the slot's waker.
-            let _ = state.core.complete(frame.id, result);
-        }
+        // The caller is woken through the wait list, not through the slot's waker.
+        let completed = result.map(|result| state.core.complete(frame.id, result));
+        let shutdown = state.core.is_shut_down();
         drop(state);
         self.waiters.wake_all();
+        match completed {
+            // Only shutdown may end a request while its frame is on the air.
+            Some(Completed::Unknown) => {
+                debug_assert!(
+                    shutdown,
+                    "ESP-NOW frame {:?} completed while not in flight",
+                    frame.id
+                );
+                if !shutdown {
+                    log::warn!(
+                        "ESP-NOW: send result for frame {:?} that is not in flight dropped",
+                        frame.id
+                    );
+                }
+            }
+            Some(Completed::Discarded) => {
+                log::debug!("ESP-NOW: result of an abandoned frame discarded");
+            }
+            Some(Completed::Delivered(_)) | None => {}
+        }
     }
 
     /// The channel to re-pin application frames to, if this mode needs it.
@@ -789,10 +821,16 @@ impl TxShared {
         state.core.is_shut_down() || state.scan.cancel_requested(epoch)
     }
 
-    /// False once shutdown is set: the teardown then skips the channel and TX-power calls, as a
-    /// probe may still be on the air and the driver is going away.
-    fn radio_io_allowed(&self) -> bool {
-        !self.lock().core.is_shut_down()
+    /// The input to feed the scan machine in place of `input`: [`ScanInput::Shutdown`] once the
+    /// driver shuts down, [`ScanInput::Abort`] (see [`ScanInput::or_abort`]) once the caller
+    /// cancelled.
+    fn scan_input(&self, epoch: JobEpoch, input: ScanInput) -> ScanInput {
+        let state = self.lock();
+        if state.core.is_shut_down() {
+            ScanInput::Shutdown
+        } else {
+            input.or_abort(state.scan.cancel_requested(epoch))
+        }
     }
 
     /// Sleeps until `until` on the scan's clock, ending early on cancellation or shutdown.
@@ -854,23 +892,27 @@ impl TxShared {
 
     /// Transmits one scan probe through the queue and reports how it went.
     ///
-    /// The probe is waited out however long the callback takes (fail-closed): the channel must
-    /// not change under a frame on the air.
-    /// The machine's probe timeout therefore bounds nothing on this tier.
+    /// `timeout` bounds the probe's queue wait only: a probe that has not started by then is
+    /// never sent (`Timeout`, a local failure for the machine).
+    /// A probe that has started is waited out however long the callback takes (ADR 020
+    /// fail-closed): the channel must not change under a frame on the air.
     fn transmit_probe(
         &self,
         mac: &MacAddress,
         data: &[u8],
+        timeout: Duration,
     ) -> Result<SendOutcome, EspIdfEspNowError> {
         // `TxCore` keeps a slot for the probe, so a queue that application callers filled (and
         // whose preempted requests are not yet collected) cannot refuse it with `Full`.
+        let now = self.now();
         let id = self
             .lock()
             .core
-            .submit(self.now(), *mac, data, None, SendKind::Probe)
+            .submit(now, *mac, data, now.checked_add(timeout), SendKind::Probe)
             .map_err(|refusal| map_refusal(refusal, data.len()))?;
         // The queue holds nothing else (the worker drained it before the scan began, and
         // application sends are refused), so the first frame is ours; any other is serviced too.
+        // No frame at all means the probe expired at pickup, or shutdown ended it.
         loop {
             let (step, expired) = {
                 let mut state = self.lock();
@@ -880,12 +922,7 @@ impl TxShared {
                 self.waiters.wake_all();
             }
             let Step::Send(frame) = step else {
-                let shutdown = {
-                    let mut state = self.lock();
-                    state.core.abandon(id);
-                    state.core.is_shut_down()
-                };
-                return Err(probe_lost(shutdown));
+                break;
             };
             self.service(&frame, None);
             if frame.id == id {
@@ -936,29 +973,23 @@ impl TxShared {
             interface: self.mode.wifi_interface(),
         };
 
-        let mut saved_tx_power: i8 = 0;
-        let mut have_saved_power = false;
-        let mut power_boosted = false;
+        // `Some` once the level before the burst was read: `RestoreTxPower` puts it back.
+        let mut saved_tx_power: Option<i8> = None;
         let mut last_register_error: Option<anyhow::Error> = None;
 
         let mut input = ScanInput::Start;
         loop {
-            // On cancellation or shutdown `Abort` replaces every result but a failure; inside
-            // the machine's teardown it continues the restore, so it may be fed at every step.
+            // On shutdown `Shutdown` ends the scan without a teardown; on cancellation `Abort`
+            // replaces every result but a failure, and inside the machine's teardown it continues
+            // the restore, so it may be fed at every step.
             if input != ScanInput::Start {
-                input = input.or_abort(self.abort_requested(epoch));
+                input = self.scan_input(epoch, input);
             }
-            let action = machine.poll(self.now(), input);
+            let action = match machine.poll_bounded(self.now(), input) {
+                Ok(action) => action,
+                Err(kind) => return Err(ScanFailure { kind, cause: None }),
+            };
             input = match action {
-                // Shutdown: the driver is going away and ESP-NOW is deinitialised next, so the
-                // teardown leaves channel, TX power and peer registration as they are.
-                ScanAction::RemovePeer
-                | ScanAction::RegisterPeer { .. }
-                | ScanAction::RegisterFallbackPeer { .. }
-                    if !self.radio_io_allowed() =>
-                {
-                    ScanInput::Completed
-                }
                 ScanAction::RemovePeer => {
                     // Best effort: removes a stale registration, or the scan peer.
                     let _ = super::peer_del(&mac);
@@ -998,16 +1029,18 @@ impl TxShared {
                     }
                     ScanInput::Completed
                 }
-                ScanAction::BoostTxPower if !self.radio_io_allowed() => ScanInput::Completed,
                 ScanAction::BoostTxPower => {
                     // Auto-burst: boost TX power to maximum during channel scanning to maximise
-                    // discovery range, then restore the previous level.
+                    // discovery range; the machine asks for the restore of the previous level.
+                    let mut current: i8 = 0;
                     // SAFETY: esp_wifi_get_max_tx_power is an FFI call into the ESP-IDF Wi-Fi
                     // subsystem, which is initialised by init_with_radio().  It writes the
                     // current TX power to the &mut i8 we pass in.
-                    have_saved_power =
-                        unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut saved_tx_power) }
-                            == esp_idf_svc::sys::ESP_OK;
+                    if unsafe { esp_idf_svc::sys::esp_wifi_get_max_tx_power(&mut current) }
+                        == esp_idf_svc::sys::ESP_OK
+                    {
+                        saved_tx_power = Some(current);
+                    }
 
                     let burst_power = juggler::wifi::TxPowerLevel::Max.to_quarter_dbm();
                     // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF Wi-Fi
@@ -1015,20 +1048,12 @@ impl TxShared {
                     // from TxPowerLevel::Max which is within the valid [8, 84] quarter-dBm
                     // range required by the API.
                     if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(burst_power) }
-                        == esp_idf_svc::sys::ESP_OK
+                        != esp_idf_svc::sys::ESP_OK
                     {
-                        power_boosted = true;
-                    } else {
                         log::warn!(
                             "Failed to boost TX power for scanning — continuing at current level"
                         );
                     }
-                    ScanInput::Completed
-                }
-                ScanAction::RestoreChannel { .. } | ScanAction::SetChannel { .. }
-                    if !self.radio_io_allowed() =>
-                {
-                    // Shutdown: a probe may still be on the air, and the driver is going away.
                     ScanInput::Completed
                 }
                 ScanAction::RestoreChannel { channel } => {
@@ -1078,8 +1103,8 @@ impl TxShared {
                 ScanAction::SendProbe {
                     channel,
                     confirmation,
-                    timeout: _,
-                } => match self.transmit_probe(&mac, probe_data) {
+                    timeout,
+                } => match self.transmit_probe(&mac, probe_data, timeout) {
                     Ok(SendOutcome::Acked) => ScanInput::Sent(SendOutcome::Acked),
                     Ok(outcome) => {
                         if confirmation == 0 {
@@ -1104,35 +1129,36 @@ impl TxShared {
                     self.sleep_until(epoch, deadline);
                     ScanInput::Completed
                 }
-                ScanAction::RestoreTxPower if !self.radio_io_allowed() => ScanInput::Completed,
                 ScanAction::RestoreTxPower => {
-                    // Restore TX power after scanning regardless of outcome.
-                    // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF Wi-Fi
-                    // subsystem, which is initialised by init_with_radio().  saved_tx_power was
-                    // previously read from esp_wifi_get_max_tx_power (and only used here when
-                    // have_saved_power is true), so the value is in the range the API produced.
-                    if have_saved_power
-                        && unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) }
+                    if let Some(previous) = saved_tx_power.take() {
+                        // SAFETY: esp_wifi_set_max_tx_power is an FFI call into the ESP-IDF
+                        // Wi-Fi subsystem, which is initialised by init_with_radio().  previous
+                        // was read from esp_wifi_get_max_tx_power, so the value is in the range
+                        // the API produced.
+                        if unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(previous) }
                             != esp_idf_svc::sys::ESP_OK
-                    {
-                        log::warn!("Failed to restore TX power after scanning");
+                        {
+                            log::warn!("Failed to restore TX power after scanning");
+                        }
                     }
-                    power_boosted = false;
                     ScanInput::Completed
                 }
                 ScanAction::Done(result) => {
-                    if power_boosted && have_saved_power && self.radio_io_allowed() {
-                        // SAFETY: as in `RestoreTxPower`; covers a machine that finished
-                        // without reaching it.
-                        let _ =
-                            unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(saved_tx_power) };
-                    }
                     return result.map_err(|kind| match (kind, last_register_error.take()) {
                         (
                             ScanError::RegisterTempPeer | ScanError::RegisterFoundPeer { .. },
                             cause,
                         ) => ScanFailure { kind, cause },
                         _ => ScanFailure { kind, cause: None },
+                    });
+                }
+                // ADR 023 decision 5: the loop returns at `Done`, so a no-op answer means the
+                // machine was polled past its end, a driver bug.
+                ScanAction::Ignored => {
+                    log::error!("ESP-NOW scan: the machine ignored an input; giving up");
+                    return Err(ScanFailure {
+                        kind: ScanError::UnexpectedInput,
+                        cause: None,
                     });
                 }
             };
@@ -1342,13 +1368,21 @@ mod tests {
             map_completion(Completion::Shutdown),
             Err(EspIdfEspNowError::Shutdown)
         ));
+        assert!(matches!(
+            map_completion(Completion::Unknown),
+            Err(EspIdfEspNowError::Busy)
+        ));
     }
 
     #[test]
     fn refusals_map_to_the_contract_errors() {
         assert!(matches!(
-            map_refusal(Refusal::Full, 3),
+            map_refusal(Refusal::Expired, 3),
             EspIdfEspNowError::Timeout
+        ));
+        assert!(matches!(
+            map_refusal(Refusal::Full, 3),
+            EspIdfEspNowError::Busy
         ));
         assert!(matches!(
             map_refusal(Refusal::Scanning, 3),

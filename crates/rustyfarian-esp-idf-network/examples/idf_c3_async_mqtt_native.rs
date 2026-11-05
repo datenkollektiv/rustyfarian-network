@@ -49,6 +49,7 @@ use esp_idf_svc::mqtt::client::{
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
+#[allow(deprecated)]
 use juggler::mqtt::{
     format_broker_url, ConnectionEpoch, EpochToken, MqttConnectionState, SessionPhase,
 };
@@ -71,6 +72,7 @@ const WORKER_TASKS: [&std::ffi::CStr; 2] = [c"mqtt_task", c"MQTT Sending ta"];
 static LINK_UP: AtomicBool = AtomicBool::new(false);
 /// Sessions confirmed since boot.
 static CONNECTS: AtomicU32 = AtomicU32::new(0);
+#[allow(deprecated)]
 static PHASE: SessionPhase = SessionPhase::new();
 /// Token of the latest `Connected`, handed from the pump to `sessions`.
 static NEW_SESSION: Signal<CriticalSectionRawMutex, EpochToken> = Signal::new();

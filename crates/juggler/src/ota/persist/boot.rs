@@ -2,6 +2,8 @@
 //!
 //! This module never reboots, never marks an image valid and never publishes; it returns what the runtime must do.
 
+use core::time::Duration;
+
 use super::kv::OtaKv;
 use super::store::{OtaStore, SettleOutcome, StoreError};
 use crate::ota::wire::RollbackReason;
@@ -93,6 +95,52 @@ impl Default for BusyTally {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How often and how patiently a hardware read retries while the OTA handle is in use.
+///
+/// On ESP-IDF the `EspOta` handle is a process singleton, so a download in progress makes it busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusyRetry {
+    /// Number of tries; values below 1 count as 1.
+    pub tries: u8,
+    /// Pause between two tries.
+    pub delay: Duration,
+}
+
+impl Default for BusyRetry {
+    /// Five tries, 200 ms apart (about 800 ms in the worst case).
+    fn default() -> Self {
+        Self {
+            tries: 5,
+            delay: Duration::from_millis(200),
+        }
+    }
+}
+
+/// Runs `read_once` up to `retry.tries` times, calling `sleep(retry.delay)` between two tries.
+///
+/// `read_once` reports a failure as `(code, busy)`, where `busy` marks the "handle in use" failure.
+///
+/// # Errors
+///
+/// [`HardwareReadError::Busy`] when every failure was busy, otherwise [`HardwareReadError::Read`] with the last code (see [`BusyTally`]).
+pub fn read_with_busy_retry<T>(
+    retry: BusyRetry,
+    mut read_once: impl FnMut() -> Result<T, (i32, bool)>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, HardwareReadError> {
+    let mut tally = BusyTally::new();
+    for attempt in 0..retry.tries.max(1) {
+        if attempt > 0 {
+            sleep(retry.delay);
+        }
+        match read_once() {
+            Ok(value) => return Ok(value),
+            Err((code, busy)) => tally.record(code, busy),
+        }
+    }
+    Err(tally.into_error())
 }
 
 /// Result of [`note_boot_slot`].
@@ -244,6 +292,16 @@ pub struct BootOutcome {
     pub report_pending: bool,
     /// Bookkeeping writes that failed while the safe action was kept.
     pub warnings: BootWarnings,
+}
+
+impl BootOutcome {
+    /// The boot ended fail-closed on a store fault, so a repair is warranted.
+    pub const fn records_suspect(&self) -> bool {
+        matches!(
+            self.disposition,
+            BootDisposition::FailedClosed(BootFault::Store(_))
+        )
+    }
 }
 
 /// Early-boot step: marks the attempt activated when the running slot is the attempt's slot.
@@ -403,6 +461,63 @@ pub fn reconcile_boot<K: OtaKv>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retry() -> BusyRetry {
+        BusyRetry {
+            tries: 4,
+            delay: Duration::from_millis(7),
+        }
+    }
+
+    #[test]
+    fn read_with_busy_retry_succeeds_on_the_third_try() {
+        let (mut tries, mut sleeps) = (0, alloc::vec::Vec::new());
+        let read = read_with_busy_retry(
+            retry(),
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err((259, true))
+                } else {
+                    Ok(tries)
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert_eq!(read, Ok(3));
+        assert_eq!(sleeps, [Duration::from_millis(7); 2], "tries - 1 sleeps");
+    }
+
+    #[test]
+    fn read_with_busy_retry_all_busy_is_busy() {
+        let mut sleeps = 0;
+        let read: Result<(), _> =
+            read_with_busy_retry(retry(), || Err((259, true)), |_| sleeps += 1);
+        assert_eq!(read, Err(HardwareReadError::Busy));
+        assert_eq!(sleeps, 3);
+    }
+
+    #[test]
+    fn read_with_busy_retry_mixed_is_a_read_error() {
+        let mut tries = 0;
+        let read: Result<(), _> = read_with_busy_retry(
+            retry(),
+            || {
+                tries += 1;
+                Err(if tries == 2 { (5, false) } else { (259, true) })
+            },
+            |_| {},
+        );
+        assert_eq!(read, Err(HardwareReadError::Read(259)));
+        let zero = BusyRetry {
+            tries: 0,
+            delay: Duration::ZERO,
+        };
+        let mut sleeps = 0;
+        let read: Result<(), _> = read_with_busy_retry(zero, || Err((5, false)), |_| sleeps += 1);
+        assert_eq!((read, sleeps), (Err(HardwareReadError::Read(5)), 0));
+        assert_eq!(BusyRetry::default().tries, 5);
+    }
 
     #[test]
     fn tally_says_busy_only_when_every_failure_was_busy() {

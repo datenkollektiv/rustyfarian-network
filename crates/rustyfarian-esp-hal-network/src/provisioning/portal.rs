@@ -16,8 +16,10 @@
 //! Security-checklist items implemented in this file (see
 //! `docs/features/archive/esp-hal-provisioning-v1.md`):
 //!
-//! - Item 1: nonce check on every mutating POST (`nonce_matches`).
-//! - Item 2: `Prefill` never holds `wifi_pass` or `mqtt_pass`.
+//! - Item 1: nonce check on every mutating POST
+//!   (`juggler::provisioning::body_nonce_matches`, constant-time).
+//! - Item 2: `juggler::provisioning::Prefill` never holds `wifi_pass` or
+//!   `mqtt_pass`.
 //! - Item 3: `Content-Length > DEFAULT_REQUEST_SIZE_CAP` returns 413.
 //! - Item 5: `Cache-Control: no-store` baked into `build_response` and
 //!   `MINIMAL_500` unconditionally.
@@ -42,6 +44,10 @@
 //! `config_to_save` (about 1.4 KiB) across the call, so a `POST /save` adds
 //! approximately 12.5 KiB to the peak.
 //! This raises the worst-case stack depth to at most approximately **20.5 KiB**.
+//! Every form render (`GET /`, the `400` and `500` re-renders) holds the
+//! stored record (about 1.4 KiB) while `juggler::provisioning::Prefill`
+//! borrows from it; the failed-save render drops `config_to_save` first, so
+//! the peak above still bounds it.
 //! These figures are an analytic upper bound from host `size_of`, not
 //! measured; runbook H2 only checks for overflow at the default stack.
 //!
@@ -93,6 +99,15 @@ use juggler::provisioning::html_json_escape::html_escape_to;
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
 use juggler::provisioning::parse_form;
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
+use juggler::provisioning::{
+    body_nonce_matches,
+    templates::{COMMITTED_HTML, FACTORY_RESET_HTML, PROBE_PATHS, SESSION_FINISHED_BODY},
+    PortalAction, PortalInput, ProvisioningConfig,
+};
 #[cfg(any(
     test,
     all(
@@ -100,15 +115,7 @@ use juggler::provisioning::parse_form;
         any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
     )
 ))]
-use juggler::provisioning::templates::WIFI_MQTT_PORTAL_HTML;
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-use juggler::provisioning::SchemaProfile;
+use juggler::provisioning::{templates::template_for, Prefill};
 
 #[cfg(any(
     test,
@@ -117,7 +124,7 @@ use juggler::provisioning::SchemaProfile;
         any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
     )
 ))]
-use super::session::portal::{PortalDefaultsOwned, PortalRenderConfig};
+use super::session::portal::PortalRenderConfig;
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
@@ -155,60 +162,15 @@ const DEFAULT_TX_BUF: usize = 6144;
 /// and before `socket.close()` is called.
 const REQUEST_BODY_DRAIN_DEADLINE_MS: u64 = 500;
 
-// ── OS captive-portal probe paths ────────────────────────────────────────────
-
-/// Well-known paths probed by phone OSes to detect a captive portal.
+/// Deadline for receiving the request headers after `accept`.
 ///
-/// The portal responds to each with a `302` redirect to `http://{ap_ip}/`.
-/// The OS receives unexpected content and pops the captive-portal browser.
-const PROBE_PATHS: [&str; 6] = [
-    "/generate_204",
-    "/gen_204",
-    "/hotspot-detect.html",
-    "/ncsi.txt",
-    "/connecttest.txt",
-    "/canonical.html",
-];
+/// A phone may open speculative idle connections; without this bound one that
+/// never sends the header terminator would hold the single accept socket and
+/// block the portal.  IDF httpd has its own receive timeout, so this budget is
+/// a bare-metal adapter fact.
+const REQUEST_HEADER_TIMEOUT_MS: u64 = 5_000;
 
 // ── Page content ─────────────────────────────────────────────────────────────
-
-/// Page shown after a successful commit.
-const COMMITTED_HTML: &[u8] = b"<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Provisioned</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
-<h1>Provisioned</h1>\
-<p>Credentials saved. The device will restart and join your network.</p>\
-</body></html>";
-
-/// Page shown after a factory-reset request.
-const FACTORY_RESET_HTML: &[u8] = b"<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory reset</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
-<h1>Factory reset requested</h1>\
-<p>The host application will complete the reset.</p>\
-</body></html>";
-
-/// `409` body for a `/save` or `/factory-reset` that arrives after the session
-/// already reached a terminal state (or while a submission is being saved):
-/// the first terminal event stands and nothing was changed.
-const SESSION_FINISHED_BODY: &[u8] =
-    b"Conflict: this provisioning session has already finished or is saving \
-      another submission; nothing was changed. Wait for the device to restart.";
-
-/// Applies `input` to the session state held in `cell`.
-///
-/// On success the cell holds the next state.  A refused transition leaves the
-/// cell untouched and is returned so the caller can refuse the request before
-/// any side effect (flash write, outcome signal, event callback) — the first
-/// terminal event of a session stands.
-pub(crate) fn transition(
-    cell: &core::cell::Cell<juggler::provisioning::ProvisioningState>,
-    input: juggler::provisioning::ProvisioningInput,
-) -> Result<juggler::provisioning::ProvisioningState, juggler::provisioning::InvalidTransition> {
-    let next = cell.get().apply(input)?;
-    cell.set(next);
-    Ok(next)
-}
 
 /// GET /factory-reset — confirmation page with nonce-bearing POST form.
 const FACTORY_RESET_CONFIRM_HTML_PART1: &str =
@@ -686,247 +648,31 @@ pub(crate) fn body_read_target(hdr_end: usize, content_length: usize, cap: usize
     hdr_end.saturating_add(content_length).min(cap)
 }
 
-// ── Nonce check ───────────────────────────────────────────────────────────────
-
-/// Extracts `_nonce` from a `application/x-www-form-urlencoded` body and
-/// compares it to `expected` using a constant-time byte loop.
-///
-/// The nonce is 8 lowercase hex characters and requires no percent-decoding.
-/// The comparison accumulates differences with bitwise OR so the runtime is
-/// independent of the position of the first differing byte (constant-time
-/// within the length check).
-///
-/// Returns `false` if the field is absent or any byte differs.
-pub(crate) fn nonce_matches(body: &[u8], expected: &str) -> bool {
-    let value = match extract_form_field(body, b"_nonce") {
-        Some(v) => v,
-        None => return false,
-    };
-    let expected = expected.as_bytes();
-    if value.len() != expected.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (a, b) in value.iter().zip(expected.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
-/// Extracts a raw (un-decoded) form field value for `key` from a URL-encoded body.
-///
-/// Returns the bytes between `key=` and the next `&` (or end of input), or
-/// `None` if the key is absent.
-fn extract_form_field<'a>(body: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    // Build the key= pattern in a stack buffer to avoid dynamic allocation.
-    let mut ke = [0u8; 64];
-    if key.len() + 1 > ke.len() {
-        return None;
-    }
-    ke[..key.len()].copy_from_slice(key);
-    ke[key.len()] = b'=';
-    let key_eq = &ke[..key.len() + 1];
-
-    // Search for the key= pattern in the body.
-    let mut i = 0;
-    while i + key_eq.len() <= body.len() {
-        // Must be at the start or after an '&'.
-        if (i == 0 || body[i - 1] == b'&') && &body[i..i + key_eq.len()] == key_eq {
-            let value_start = i + key_eq.len();
-            let value_end = body[value_start..]
-                .iter()
-                .position(|&b| b == b'&')
-                .map(|p| value_start + p)
-                .unwrap_or(body.len());
-            return Some(&body[value_start..value_end]);
-        }
-        i += 1;
-    }
-    None
-}
-
 // ── Pre-fill ──────────────────────────────────────────────────────────────────
 
-/// Non-secret pre-fill values for the portal form.
+/// Reads the stored record for the form pre-fill.
 ///
-/// Carries only fields that are safe to surface (SSID, MQTT host/port,
-/// MQTT user, MQTT client ID, OTA URL, device name).  Password fields
-/// (`wifi_pass`, `mqtt_pass`) are **deliberately absent** — they are never
-/// pre-filled and must be re-entered on every submission.
-///
-/// # Security — item 2
-///
-/// This struct must never be extended with `wifi_pass`, `mqtt_pass`, or any
-/// other credential field.  The fields present correspond exactly to the
-/// `{{PLACEHOLDER}}` tokens in the portal HTML template that the current
-/// render pass substitutes.
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-struct Prefill {
-    wifi_ssid: heapless::String<32>,
-    mqtt_uri: heapless::String<74>, // mqtt://host:port where host ≤ 64, port ≤ 5
-    mqtt_user: heapless::String<64>,
-    mqtt_client: heapless::String<23>,
-    ota_url: heapless::String<128>,
-    dev_name: heapless::String<24>,
-}
-
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-impl Prefill {
-    fn empty() -> Self {
-        Self {
-            wifi_ssid: heapless::String::new(),
-            mqtt_uri: heapless::String::new(),
-            mqtt_user: heapless::String::new(),
-            mqtt_client: heapless::String::new(),
-            ota_url: heapless::String::new(),
-            dev_name: heapless::String::new(),
-        }
-    }
-
-    /// Builds a pre-fill from caller-supplied non-secret defaults.
-    ///
-    /// Used as the empty-store fallback (fresh / factory-reset device) so the
-    /// portal form comes up pre-populated. The bare-metal tier serves only the
-    /// `WifiMqttDevice` profile; `dev_name` is intentionally left empty so the
-    /// renderer falls back to `PortalRenderConfig.device_name`. No secret is
-    /// ever sourced — `PortalDefaultsOwned` carries none.
-    fn from_defaults(defaults: &PortalDefaultsOwned, profile: SchemaProfile) -> Self {
-        let mut prefill = Prefill::empty();
-        // Common to every profile.
-        let _ = prefill.wifi_ssid.push_str(defaults.wifi_ssid.as_str());
-        let _ = prefill.ota_url.push_str(defaults.ota_url.as_str());
-        // Profile-specific MQTT fields (no-ops for other profiles' templates).
-        if profile == SchemaProfile::WifiMqttDevice {
-            prefill.mqtt_uri = compose_mqtt_uri(&defaults.mqtt_host, &defaults.mqtt_port);
-            let _ = prefill.mqtt_user.push_str(defaults.mqtt_user.as_str());
-            let _ = prefill.mqtt_client.push_str(defaults.mqtt_client.as_str());
-        }
-        prefill
-    }
-}
-
-/// Recomposes an `mqtt://host:port` URI from separate host and port strings,
-/// capped at the `Prefill.mqtt_uri` field width.
-///
-/// Returns an empty string when either component is empty — a host-only or
-/// port-only value is not a usable broker URI (and would fail `parse_form`),
-/// so pre-filling a partial URI would only mislead.
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-fn compose_mqtt_uri(host: &str, port: &str) -> heapless::String<74> {
-    let mut uri = heapless::String::<74>::new();
-    if host.is_empty() || port.is_empty() {
-        return uri;
-    }
-    let _ = uri.push_str("mqtt://");
-    let host_take = host.len().min(64);
-    let _ = uri.push_str(&host[..host_take]);
-    let _ = uri.push(':');
-    let port_take = port.len().min(5);
-    let _ = uri.push_str(&port[..port_take]);
-    uri
-}
-
-/// Loads non-secret pre-fill values for the portal form.
-///
-/// A stored configuration for the active profile takes precedence. Otherwise —
-/// when unprovisioned, when the stored profile doesn't match, or on a store
-/// error — falls back to the caller-supplied non-secret `defaults` (seeded from
-/// `.env` on a fresh / factory-reset device) so the form still comes up
-/// pre-populated. Secrets are never sourced from either path.
+/// A store error reads as "no record", so the form still comes up pre-filled
+/// from the defaults; `Prefill::select` then picks the source.  Security
+/// item 2: the pre-fill never holds a secret (see `juggler::provisioning::Prefill`).
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
-fn load_prefill(
-    store: &dyn PortalStore,
-    profile: SchemaProfile,
-    defaults: &PortalDefaultsOwned,
-) -> Prefill {
+fn load_stored(store: &dyn PortalStore) -> Option<ProvisioningConfig> {
     match store.load() {
-        Ok(Some(cfg)) if cfg.profile() == profile => {
-            let mut prefill = Prefill::empty();
-            // Safely copy fields — truncate if they somehow exceed the max
-            // (should never happen with validated configs).
-            let _ = prefill
-                .wifi_ssid
-                .push_str(&cfg.wifi_ssid()[..cfg.wifi_ssid().len().min(32)]);
-            let ota_url = cfg.ota_url().unwrap_or("");
-            let _ = prefill.ota_url.push_str(&ota_url[..ota_url.len().min(128)]);
-            let _ = prefill
-                .dev_name
-                .push_str(&cfg.device_name()[..cfg.device_name().len().min(24)]);
-            if let Some(mqtt) = cfg.mqtt() {
-                // Recompose mqtt_uri from the stored host + port.
-                let mut port_str = heapless::String::<5>::new();
-                let _ = core::fmt::write(&mut port_str, format_args!("{}", mqtt.port()));
-                prefill.mqtt_uri = compose_mqtt_uri(mqtt.host(), &port_str);
-                if let Some(u) = mqtt.username() {
-                    let _ = prefill.mqtt_user.push_str(&u[..u.len().min(64)]);
-                }
-                if let Some(c) = mqtt.client_id() {
-                    let _ = prefill.mqtt_client.push_str(&c[..c.len().min(23)]);
-                }
-            }
-            prefill
-        }
-        Ok(Some(_)) | Ok(None) => Prefill::from_defaults(defaults, profile),
+        Ok(stored) => stored,
         Err(e) => {
             log::debug!(
-                "load_prefill: store.load() failed ({:?}), rendering defaults",
+                "load_stored: store.load() failed ({:?}), rendering defaults",
                 e
             );
-            Prefill::from_defaults(defaults, profile)
+            None
         }
     }
 }
 
 // ── Template rendering ─────────────────────────────────────────────────────────
-
-/// Selects the portal HTML template for `profile`.
-///
-/// v1 reaches this function only for `SchemaProfile::WifiMqttDevice` because
-/// `start()` rejects other profiles via `validate_profile` before any peripheral
-/// is consumed.  The match is kept explicit (rather than collapsed to an
-/// unconditional return) so that adding a future variant to `SchemaProfile`
-/// fails to compile here and forces a deliberate decision about template
-/// selection — `unreachable!()` on the LoRaWAN arm documents the runtime
-/// invariant `validate_profile` upholds, while the absence of a wildcard arm
-/// is the compile-time guard.
-#[cfg(any(
-    test,
-    all(
-        feature = "embassy",
-        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
-    )
-))]
-fn template_for(profile: SchemaProfile) -> &'static str {
-    match profile {
-        SchemaProfile::WifiMqttDevice => WIFI_MQTT_PORTAL_HTML,
-        SchemaProfile::LorawanFieldDevice => {
-            unreachable!(
-                "template_for reached LorawanFieldDevice; validate_profile must reject this before start() spawns the HTTP task"
-            )
-        }
-    }
-}
 
 /// Renders the portal HTML template with placeholders substituted.
 ///
@@ -953,7 +699,7 @@ fn template_for(profile: SchemaProfile) -> &'static str {
 fn render_portal_template(
     config: &PortalRenderConfig,
     nonce: &str,
-    prefill: &Prefill,
+    prefill: &Prefill<'_>,
     error_text: Option<&str>,
     out_buf: &mut [u8],
 ) -> Result<usize, ()> {
@@ -1017,32 +763,22 @@ fn render_portal_template(
                         write_html_escaped(out_buf, &mut pos, nonce)?;
                     }
                     b"WIFI_SSID" => {
-                        write_html_escaped(out_buf, &mut pos, prefill.wifi_ssid.as_str())?;
+                        write_html_escaped(out_buf, &mut pos, prefill.wifi_ssid)?;
                     }
                     b"MQTT_URI" => {
                         write_html_escaped(out_buf, &mut pos, prefill.mqtt_uri.as_str())?;
                     }
                     b"MQTT_USER" => {
-                        write_html_escaped(out_buf, &mut pos, prefill.mqtt_user.as_str())?;
+                        write_html_escaped(out_buf, &mut pos, prefill.mqtt_user)?;
                     }
                     b"MQTT_CLIENT" => {
-                        write_html_escaped(out_buf, &mut pos, prefill.mqtt_client.as_str())?;
+                        write_html_escaped(out_buf, &mut pos, prefill.mqtt_client)?;
                     }
                     b"OTA_URL" => {
-                        write_html_escaped(out_buf, &mut pos, prefill.ota_url.as_str())?;
+                        write_html_escaped(out_buf, &mut pos, prefill.ota_url)?;
                     }
                     b"DEV_NAME" => {
-                        // Prefer the stored value (user customised through a
-                        // previous provisioning cycle) over the caller's
-                        // default.  A fresh device has an empty `Prefill` and
-                        // falls back to `PortalConfig.device_name` so the
-                        // portal header still surfaces a meaningful name.
-                        let value = if prefill.dev_name.is_empty() {
-                            config.device_name.as_str()
-                        } else {
-                            prefill.dev_name.as_str()
-                        };
-                        write_html_escaped(out_buf, &mut pos, value)?;
+                        write_html_escaped(out_buf, &mut pos, prefill.dev_name)?;
                     }
                     b"FW_VER" => {
                         write_html_escaped(out_buf, &mut pos, config.firmware_version.as_str())?;
@@ -1133,8 +869,6 @@ pub(crate) fn dispatch_request(
     ap_ip_str: &str,
     resp_buf: &mut [u8],
 ) -> Result<usize, ()> {
-    use juggler::provisioning::ProvisioningInput;
-
     let target = req.target_str();
 
     match req.method {
@@ -1173,81 +907,7 @@ pub(crate) fn dispatch_request(
             }
 
             // ── GET / (and any other GET) → portal HTML ───────────────────
-            let prefill = load_prefill(store, config.profile, &config.defaults);
-            let nonce = shared.nonce.as_str();
-
-            // Render the template into the back portion of resp_buf.
-            let header_overhead = 160usize;
-            if resp_buf.len() <= header_overhead {
-                return Err(());
-            }
-            // Use a temporary render buffer that is the full resp_buf.  We
-            // first render the body into a stack buffer, then wrap it in the
-            // response.  Since the body can be ~5 KiB and resp_buf is 6 KiB,
-            // we render into resp_buf directly from the body offset and then
-            // shift everything after computing the header.
-            //
-            // Simpler approach: render into a separate stack buffer.
-            // `resp_buf` is on the HTTP-task stack at 6 KiB; a body render
-            // buffer of the same size would double the peak.  Instead we
-            // render the body directly into `resp_buf` starting at byte 0,
-            // record the body length, build the header at the *end* of the
-            // buffer (reversed), then shift — but that is complex.
-            //
-            // Pragmatic approach: build_response requires knowing body length
-            // upfront.  We have a 6 KiB resp_buf.  We estimate the header
-            // is ≤ 160 bytes and render the body into resp_buf[160..],
-            // then call build_response(&mut resp_buf[..body_start + body_len],
-            // ...) but we need the body slice independent.
-            //
-            // Cleanest viable approach with the given buffers:
-            // render template directly, then prepend the header via memmove.
-            const HEADER_RESERVE: usize = 200;
-            if resp_buf.len() < HEADER_RESERVE {
-                return Err(());
-            }
-            // Render body into resp_buf[HEADER_RESERVE..].
-            let body_len = render_portal_template(
-                config,
-                nonce,
-                &prefill,
-                None,
-                &mut resp_buf[HEADER_RESERVE..],
-            )
-            .map_err(|_| ())?;
-
-            // Build the response header in a small temp buffer.
-            let mut hdr_buf = [0u8; HEADER_RESERVE];
-            let mut hdr_pos = 0usize;
-            write_bytes(
-                &mut hdr_buf,
-                &mut hdr_pos,
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ",
-            )
-            .map_err(|_| ())?;
-            write_u32_decimal(&mut hdr_buf, &mut hdr_pos, body_len as u32).map_err(|_| ())?;
-            write_bytes(
-                &mut hdr_buf,
-                &mut hdr_pos,
-                b"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-            )
-            .map_err(|_| ())?;
-
-            let hdr_len = hdr_pos;
-
-            // Shift body to make room for the header.
-            let total = hdr_len + body_len;
-            if total > resp_buf.len() {
-                return Err(());
-            }
-            // Move body: copy from HEADER_RESERVE..HEADER_RESERVE+body_len
-            // to hdr_len..hdr_len+body_len.
-            resp_buf.copy_within(HEADER_RESERVE..HEADER_RESERVE + body_len, hdr_len);
-
-            // Write header.
-            resp_buf[..hdr_len].copy_from_slice(&hdr_buf[..hdr_len]);
-
-            Ok(total)
+            form_response(resp_buf, b"HTTP/1.1 200 OK", shared, store, config, None)
         }
 
         Method::Post => {
@@ -1256,19 +916,6 @@ pub(crate) fn dispatch_request(
             // ── POST /save ────────────────────────────────────────────────
             if target == "/save" {
                 // SECURITY: never log request bodies — they carry wifi_pass / mqtt_pass.
-
-                // Step 1: nonce check (constant-time).
-                if !nonce_matches(body_after_headers, shared.nonce.as_str()) {
-                    log::warn!("POST /save rejected: nonce mismatch");
-                    return build_response(
-                        resp_buf,
-                        403,
-                        "text/plain; charset=utf-8",
-                        b"Forbidden: session token mismatch.",
-                    );
-                }
-
-                // Step 2: decode body as UTF-8 for parse_form.
                 let body_str = match core::str::from_utf8(body_after_headers) {
                     Ok(s) => s,
                     Err(_) => {
@@ -1282,22 +929,34 @@ pub(crate) fn dispatch_request(
                     }
                 };
 
-                // Step 3: parse and validate.
-                match parse_form(body_str, config.profile) {
-                    Err(errors) => {
-                        // Apply InvalidSubmission to state machine.
-                        shared.state.lock(|cell| {
-                            if let Ok(next) = cell.get().apply(ProvisioningInput::InvalidSubmission)
-                            {
-                                cell.set(next);
-                            }
-                        });
+                // The form is parsed only behind a valid nonce (constant-time
+                // check); `PortalMachine` sequences the rest (nonce → gate →
+                // persist → commit).
+                let nonce_ok = body_nonce_matches(body_after_headers, shared.nonce.as_str());
+                let parsed = nonce_ok.then(|| parse_form(body_str, config.profile));
+                let form_valid = matches!(parsed, Some(Ok(_)));
+                return match (
+                    shared.poll(PortalInput::Save {
+                        nonce_ok,
+                        form_valid,
+                    }),
+                    parsed,
+                ) {
+                    (PortalAction::Forbidden, _) => {
+                        log::warn!("POST /save rejected: nonce mismatch");
+                        build_response(
+                            resp_buf,
+                            403,
+                            "text/plain; charset=utf-8",
+                            b"Forbidden: session token mismatch.",
+                        )
+                    }
+                    (PortalAction::RejectForm, Some(Err(errors))) => {
                         if let Some(cb) = shared.on_event {
                             (cb)(ProvisioningEvent::SubmissionRejected);
                         }
                         log::info!("POST /save rejected: {} field error(s)", errors.len());
 
-                        // Re-render with errors.
                         // Heap-allocated: nine field errors plus the resubmit
                         // hint outgrow any small fixed buffer, and a silently
                         // truncated block would leave unclosed tags.
@@ -1307,13 +966,10 @@ pub(crate) fn dispatch_request(
                                 .push_str("<div class=\"errors\"><strong>Please fix:</strong><ul>");
                             for err in &errors {
                                 errors_html.push_str("<li>");
-                                // Use html_escape_to for field names.
                                 html_escape_to(err.field.form_name(), |s| {
                                     errors_html.push_str(s);
                                 });
                                 errors_html.push_str(": ");
-                                // Format the error message via alloc::format! since
-                                // alloc is available in bare-metal embassy builds.
                                 let err_str = alloc::format!("{}", err.error);
                                 html_escape_to(err_str.as_str(), |s| {
                                     errors_html.push_str(s);
@@ -1327,209 +983,199 @@ pub(crate) fn dispatch_request(
 
                         // Stored / default values, never the rejected
                         // submission (and never a secret).
-                        let prefill = load_prefill(store, config.profile, &config.defaults);
-                        const HDR_RES: usize = 200;
-                        if resp_buf.len() < HDR_RES {
-                            return Err(());
-                        }
-                        let body_len = render_portal_template(
+                        form_response(
+                            resp_buf,
+                            b"HTTP/1.1 400 Bad Request",
+                            shared,
+                            store,
                             config,
-                            shared.nonce.as_str(),
-                            &prefill,
-                            if errors_html.is_empty() {
-                                None
-                            } else {
-                                Some(errors_html.as_str())
-                            },
-                            &mut resp_buf[HDR_RES..],
+                            (!errors_html.is_empty()).then_some(errors_html.as_str()),
                         )
-                        .map_err(|_| ())?;
-
-                        let mut hdr_buf = [0u8; HDR_RES];
-                        let mut hdr_pos = 0usize;
-                        write_bytes(
-                            &mut hdr_buf,
-                            &mut hdr_pos,
-                            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ",
-                        )
-                        .map_err(|_| ())?;
-                        write_u32_decimal(&mut hdr_buf, &mut hdr_pos, body_len as u32)
-                            .map_err(|_| ())?;
-                        write_bytes(
-                            &mut hdr_buf,
-                            &mut hdr_pos,
-                            b"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-                        )
-                        .map_err(|_| ())?;
-                        let hdr_len = hdr_pos;
-                        let total = hdr_len + body_len;
-                        if total > resp_buf.len() {
-                            return Err(());
-                        }
-                        resp_buf.copy_within(HDR_RES..HDR_RES + body_len, hdr_len);
-                        resp_buf[..hdr_len].copy_from_slice(&hdr_buf[..hdr_len]);
-                        return Ok(total);
                     }
-                    Ok(config_to_save) => {
-                        // Gate before touching flash: once the session is
-                        // Committed or FactoryResetPending, the first terminal
-                        // event stands and this submission must not be
-                        // written, signalled, or reported as accepted.
-                        if let Err(t) = shared
-                            .state
-                            .lock(|cell| transition(cell, ProvisioningInput::ValidSubmission))
-                        {
-                            log::warn!("POST /save refused: session already {:?}", t.state);
-                            return build_response(
-                                resp_buf,
-                                409,
-                                "text/plain; charset=utf-8",
-                                SESSION_FINISHED_BODY,
-                            );
-                        }
+                    (PortalAction::Persist, Some(Ok(config_to_save))) => {
                         if let Some(cb) = shared.on_event {
                             (cb)(ProvisioningEvent::SubmissionAccepted);
                         }
-
                         // Persist to flash via the type-erased PortalStore trait.
-                        let save_result = store.save(&config_to_save);
-
-                        match save_result {
+                        let saved = match store.save(&config_to_save) {
+                            Ok(()) => Some(config_to_save),
                             Err(e) => {
                                 log::error!("POST /save persist failed: {:?}", e);
-                                // Persisting always accepts PersistFailed.
-                                let _ = shared.state.lock(|cell| {
-                                    transition(cell, ProvisioningInput::PersistFailed)
-                                });
-
-                                // Re-render with banner.
+                                None
+                            }
+                        };
+                        let ok = saved.is_some();
+                        match (shared.poll(PortalInput::PersistDone { ok }), saved) {
+                            (PortalAction::Committed, Some(committed)) => {
+                                // Effect order: publish + signal, then the event.
+                                shared
+                                    .outcome
+                                    .signal(ProvisioningOutcome::Committed(committed));
+                                if let Some(cb) = shared.on_event {
+                                    (cb)(ProvisioningEvent::Committed);
+                                }
+                                build_response(
+                                    resp_buf,
+                                    200,
+                                    "text/html; charset=utf-8",
+                                    COMMITTED_HTML.as_bytes(),
+                                )
+                            }
+                            (PortalAction::PersistFailed, _) => {
                                 let banner = alloc::format!(
                                     "<div class=\"errors\">Could not save credentials to flash. Please try again.<p>{}</p></div>",
                                     juggler::provisioning::templates::RESUBMIT_HINT,
                                 );
-                                let prefill = load_prefill(store, config.profile, &config.defaults);
-                                const HDR_RES: usize = 200;
-                                if resp_buf.len() < HDR_RES {
-                                    return Err(());
-                                }
-                                let body_len = render_portal_template(
-                                    config,
-                                    shared.nonce.as_str(),
-                                    &prefill,
-                                    Some(banner.as_str()),
-                                    &mut resp_buf[HDR_RES..],
-                                )
-                                .map_err(|_| ())?;
-
-                                let mut hdr_buf = [0u8; HDR_RES];
-                                let mut hdr_pos = 0usize;
-                                write_bytes(&mut hdr_buf, &mut hdr_pos, b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ").map_err(|_| ())?;
-                                write_u32_decimal(&mut hdr_buf, &mut hdr_pos, body_len as u32)
-                                    .map_err(|_| ())?;
-                                write_bytes(
-                                    &mut hdr_buf,
-                                    &mut hdr_pos,
-                                    b"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-                                )
-                                .map_err(|_| ())?;
-                                let hdr_len = hdr_pos;
-                                let total = hdr_len + body_len;
-                                if total > resp_buf.len() {
-                                    return Err(());
-                                }
-                                resp_buf.copy_within(HDR_RES..HDR_RES + body_len, hdr_len);
-                                resp_buf[..hdr_len].copy_from_slice(&hdr_buf[..hdr_len]);
-                                return Ok(total);
-                            }
-                            Ok(()) => {
-                                // Persist succeeded.  Unreachable with the gate
-                                // above (only this handler leaves Persisting),
-                                // but never signal a commit the session did
-                                // not accept.
-                                if let Err(t) = shared
-                                    .state
-                                    .lock(|cell| transition(cell, ProvisioningInput::PersistOk))
-                                {
-                                    log::error!(
-                                        "POST /save: persisted but commit refused from {:?}",
-                                        t.state
-                                    );
-                                    return build_response(
-                                        resp_buf,
-                                        409,
-                                        "text/plain; charset=utf-8",
-                                        SESSION_FINISHED_BODY,
-                                    );
-                                }
-
-                                // Clone config_to_save before moving into signal.
-                                let committed_config = config_to_save;
-                                shared
-                                    .outcome
-                                    .signal(ProvisioningOutcome::Committed(committed_config));
-
-                                if let Some(cb) = shared.on_event {
-                                    (cb)(ProvisioningEvent::Committed);
-                                }
-
-                                return build_response(
+                                form_response(
                                     resp_buf,
-                                    200,
-                                    "text/html; charset=utf-8",
-                                    COMMITTED_HTML,
+                                    b"HTTP/1.1 500 Internal Server Error",
+                                    shared,
+                                    store,
+                                    config,
+                                    Some(banner.as_str()),
+                                )
+                            }
+                            (other, _) => {
+                                log::error!(
+                                    "POST /save: persisted but the session answered {:?}",
+                                    other
                                 );
+                                session_finished(resp_buf)
                             }
                         }
                     }
-                }
+                    (PortalAction::Refused(t), _) => {
+                        log::warn!("POST /save refused: session already {:?}", t.state);
+                        session_finished(resp_buf)
+                    }
+                    (other, _) => {
+                        log::error!("POST /save: unexpected portal action {:?}", other);
+                        Err(())
+                    }
+                };
             }
 
             // ── POST /factory-reset ───────────────────────────────────────
             if target == "/factory-reset" {
-                if !nonce_matches(body_after_headers, shared.nonce.as_str()) {
-                    log::warn!("POST /factory-reset rejected: nonce mismatch");
-                    return build_response(
-                        resp_buf,
-                        403,
-                        "text/plain; charset=utf-8",
-                        b"Forbidden: session token mismatch.",
-                    );
-                }
-
-                // A reset after a commit is refused: the saved credentials
-                // stand and the host is never told a reset was requested.
-                if let Err(t) = shared
-                    .state
-                    .lock(|cell| transition(cell, ProvisioningInput::FactoryReset))
-                {
-                    log::warn!("POST /factory-reset refused: session already {:?}", t.state);
-                    return build_response(
-                        resp_buf,
-                        409,
-                        "text/plain; charset=utf-8",
-                        SESSION_FINISHED_BODY,
-                    );
-                }
-                shared
-                    .outcome
-                    .signal(ProvisioningOutcome::FactoryResetRequested);
-                if let Some(cb) = shared.on_event {
-                    (cb)(ProvisioningEvent::FactoryResetRequested);
-                }
-                log::info!("Factory reset requested via portal");
-
-                return build_response(
-                    resp_buf,
-                    200,
-                    "text/html; charset=utf-8",
-                    FACTORY_RESET_HTML,
-                );
+                let nonce_ok = body_nonce_matches(body_after_headers, shared.nonce.as_str());
+                return match shared.poll(PortalInput::FactoryReset { nonce_ok }) {
+                    PortalAction::Forbidden => {
+                        log::warn!("POST /factory-reset rejected: nonce mismatch");
+                        build_response(
+                            resp_buf,
+                            403,
+                            "text/plain; charset=utf-8",
+                            b"Forbidden: session token mismatch.",
+                        )
+                    }
+                    PortalAction::ResetAccepted => {
+                        // Effect order: signal, then the event.
+                        shared
+                            .outcome
+                            .signal(ProvisioningOutcome::FactoryResetRequested);
+                        if let Some(cb) = shared.on_event {
+                            (cb)(ProvisioningEvent::FactoryResetRequested);
+                        }
+                        log::info!("Factory reset requested via portal");
+                        build_response(
+                            resp_buf,
+                            200,
+                            "text/html; charset=utf-8",
+                            FACTORY_RESET_HTML.as_bytes(),
+                        )
+                    }
+                    // A reset after a commit is refused: the saved credentials
+                    // stand and the host is never told a reset was requested.
+                    PortalAction::Refused(t) => {
+                        log::warn!("POST /factory-reset refused: session already {:?}", t.state);
+                        session_finished(resp_buf)
+                    }
+                    other => {
+                        log::error!("POST /factory-reset: unexpected portal action {:?}", other);
+                        Err(())
+                    }
+                };
             }
 
             // ── Any other POST → 404 ──────────────────────────────────────
             build_response(resp_buf, 404, "text/plain; charset=utf-8", b"Not Found")
         }
     }
+}
+
+/// The `409` response for a request the session refused.
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
+fn session_finished(resp_buf: &mut [u8]) -> Result<usize, ()> {
+    build_response(
+        resp_buf,
+        409,
+        "text/plain; charset=utf-8",
+        SESSION_FINISHED_BODY.as_bytes(),
+    )
+}
+
+/// Renders the portal form, pre-filled from the store or the defaults, as a
+/// complete response with `status_line` (no trailing CRLF) into `resp_buf`.
+///
+/// The body is rendered into `resp_buf` behind a header reserve, then moved
+/// down behind the real header, so no second body-sized buffer is needed.
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
+fn form_response(
+    resp_buf: &mut [u8],
+    status_line: &[u8],
+    shared: &SharedState,
+    store: &dyn PortalStore,
+    config: &PortalRenderConfig,
+    error_text: Option<&str>,
+) -> Result<usize, ()> {
+    const HEADER_RESERVE: usize = 200;
+    if resp_buf.len() < HEADER_RESERVE {
+        return Err(());
+    }
+    let stored = load_stored(store);
+    let defaults = config.defaults.as_borrowed();
+    let prefill = Prefill::select(
+        stored.as_ref(),
+        config.profile,
+        &defaults,
+        config.device_name.as_str(),
+    );
+    let body_len = render_portal_template(
+        config,
+        shared.nonce.as_str(),
+        &prefill,
+        error_text,
+        &mut resp_buf[HEADER_RESERVE..],
+    )?;
+
+    let mut hdr_buf = [0u8; HEADER_RESERVE];
+    let mut hdr_pos = 0usize;
+    write_bytes(&mut hdr_buf, &mut hdr_pos, status_line)?;
+    write_bytes(
+        &mut hdr_buf,
+        &mut hdr_pos,
+        b"\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ",
+    )?;
+    write_u32_decimal(&mut hdr_buf, &mut hdr_pos, body_len as u32)?;
+    write_bytes(
+        &mut hdr_buf,
+        &mut hdr_pos,
+        b"\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+    )?;
+    let hdr_len = hdr_pos;
+    let total = hdr_len + body_len;
+    if total > resp_buf.len() {
+        return Err(());
+    }
+    resp_buf.copy_within(HEADER_RESERVE..HEADER_RESERVE + body_len, hdr_len);
+    resp_buf[..hdr_len].copy_from_slice(&hdr_buf[..hdr_len]);
+    Ok(total)
 }
 
 // ── Async accept-loop (bare-metal only) ──────────────────────────────────────
@@ -1626,8 +1272,27 @@ pub(crate) async fn run_portal_dyn(
         }
 
         // Read the request into req_buf until we see "\r\n\r\n" (header end)
-        // or fill the buffer.
-        let filled = read_request(&mut socket, &mut req_buf, DEFAULT_REQUEST_SIZE_CAP).await;
+        // or fill the buffer, within the header deadline: a client that never
+        // finishes its headers must not hold the single accept socket.
+        let filled = match embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(REQUEST_HEADER_TIMEOUT_MS),
+            read_request(&mut socket, &mut req_buf, DEFAULT_REQUEST_SIZE_CAP),
+        )
+        .await
+        {
+            Ok(filled) => filled,
+            Err(_) => {
+                log::debug!(
+                    "Portal: no request headers within {} ms; closing",
+                    REQUEST_HEADER_TIMEOUT_MS
+                );
+                socket.abort();
+                let _ = socket.flush().await;
+                // SECURITY: a partial request may hold credential bytes.
+                req_buf.fill(0xFF);
+                continue;
+            }
+        };
 
         let mut body_drain_target: Option<(usize, usize)> = None;
 
@@ -1824,35 +1489,18 @@ mod tests {
     /// from the analyzer.
     ///
     /// Not cryptographic material either way: production nonces come from the
-    /// hardware RNG (`generate_nonce` in `session.rs`).  The fixture only has
-    /// to be a well-formed 8-hex string, so callers that compare it against a
-    /// request body must build that body at runtime (see
-    /// `nonce_mismatch_returns_403_without_invoking_parse_form`).
+    /// hardware RNG (`format_nonce(rng.random())` in `session.rs`).  The
+    /// fixture only has to be a well-formed 8-hex string.
     fn test_nonce() -> &'static str {
-        &test_nonce_pair().0
-    }
-
-    /// A nonce guaranteed to differ from [`test_nonce`], for mismatch asserts.
-    fn test_nonce_mismatch() -> &'static str {
-        &test_nonce_pair().1
-    }
-
-    fn test_nonce_pair() -> &'static (alloc::string::String, alloc::string::String) {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
         use std::sync::OnceLock;
 
-        static NONCE: OnceLock<(alloc::string::String, alloc::string::String)> = OnceLock::new();
+        static NONCE: OnceLock<alloc::string::String> = OnceLock::new();
         NONCE.get_or_init(|| {
             let mut hasher = RandomState::new().build_hasher();
             hasher.write_u8(0);
-            let value = hasher.finish() as u32;
-            // Complementing guarantees a different value of the same width, so
-            // the mismatch assertion cannot flake on an unlucky draw.
-            (
-                alloc::format!("{value:08x}"),
-                alloc::format!("{:08x}", !value),
-            )
+            alloc::format!("{:08x}", hasher.finish() as u32)
         })
     }
 
@@ -2168,204 +1816,6 @@ mod tests {
             MINIMAL_500.windows(HEADER.len()).any(|w| w == HEADER),
             "MINIMAL_500 is missing 'Cache-Control: no-store\\r\\n'"
         );
-    }
-
-    // ── Nonce matching ────────────────────────────────────────────────────────
-
-    /// Correct nonce matches.
-    #[test]
-    fn nonce_matches_correct() {
-        assert!(nonce_matches(b"_nonce=abc12345&wifi_ssid=x", "abc12345"));
-    }
-
-    /// Wrong nonce does not match.
-    #[test]
-    fn nonce_matches_wrong() {
-        assert!(!nonce_matches(b"_nonce=wrong000&wifi_ssid=x", "abc12345"));
-    }
-
-    /// Absent nonce field returns false.
-    #[test]
-    fn nonce_matches_absent() {
-        assert!(!nonce_matches(b"wifi_ssid=x", "abc12345"));
-    }
-
-    /// Different-length nonce returns false (constant-time path).
-    #[test]
-    fn nonce_matches_different_length() {
-        assert!(!nonce_matches(b"_nonce=short&wifi_ssid=x", "abc12345"));
-    }
-
-    /// Nonce at the end of the body (no trailing &) is found.
-    #[test]
-    fn nonce_matches_at_end_of_body() {
-        assert!(nonce_matches(b"wifi_ssid=net&_nonce=deadbeef", "deadbeef"));
-    }
-
-    // ── extract_form_field ────────────────────────────────────────────────────
-
-    /// Field at start of body.
-    #[test]
-    fn extract_field_at_start() {
-        let field = extract_form_field(b"foo=bar&baz=qux", b"foo");
-        assert_eq!(field, Some(b"bar".as_slice()));
-    }
-
-    /// Field in middle of body.
-    #[test]
-    fn extract_field_in_middle() {
-        let field = extract_form_field(b"a=1&foo=bar&c=3", b"foo");
-        assert_eq!(field, Some(b"bar".as_slice()));
-    }
-
-    /// Field at end of body (no trailing &).
-    #[test]
-    fn extract_field_at_end() {
-        let field = extract_form_field(b"a=1&foo=bar", b"foo");
-        assert_eq!(field, Some(b"bar".as_slice()));
-    }
-
-    /// Missing field returns None.
-    #[test]
-    fn extract_field_missing() {
-        let field = extract_form_field(b"a=1&b=2", b"foo");
-        assert_eq!(field, None);
-    }
-
-    // ── Security-checklist item 1: nonce locking tests ────────────────────────
-
-    /// Security-checklist item 1 lock: a POST body whose `_nonce` field does
-    /// not match the expected nonce must be rejected before any form parsing.
-    ///
-    /// This test validates `nonce_matches` returns `false` for a mismatch,
-    /// confirming the 403 guard fires before `parse_form` would be invoked.
-    #[test]
-    fn nonce_mismatch_returns_403_without_invoking_parse_form() {
-        // Both bodies are built from the generated fixture, so the comparison
-        // stays meaningful without pinning a literal nonce in the source.
-        let expected = test_nonce();
-
-        // Body with wrong nonce — parse_form would normally run after nonce check.
-        // With the wrong nonce, dispatch_request must return 403.
-        let body_wrong_nonce = alloc::format!(
-            "_nonce={}&wifi_ssid=net&wifi_pass=secret",
-            test_nonce_mismatch()
-        );
-
-        // nonce_matches returns false → caller should return 403.
-        assert!(
-            !nonce_matches(body_wrong_nonce.as_bytes(), expected),
-            "nonce mismatch must return false from nonce_matches"
-        );
-
-        // Correct nonce does match.
-        let body_correct_nonce = alloc::format!("_nonce={expected}&wifi_ssid=net&wifi_pass=secret");
-        assert!(
-            nonce_matches(body_correct_nonce.as_bytes(), expected),
-            "correct nonce must return true from nonce_matches"
-        );
-
-        // The 403 response path is confirmed by asserting that a 403-containing
-        // response buffer (from build_response) carries the correct status line
-        // and Cache-Control header.
-        let mut resp_buf = [0u8; 512];
-        let n = build_response(
-            &mut resp_buf,
-            403,
-            "text/plain; charset=utf-8",
-            b"Forbidden: session token mismatch.",
-        )
-        .expect("build_response should succeed");
-        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(
-            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
-            "expected 403 status"
-        );
-        assert!(resp.contains("Cache-Control: no-store\r\n"));
-    }
-
-    /// Security-checklist item 1 lock: the nonce comparison loop accumulates
-    /// differences with bitwise OR so the runtime is (approximately)
-    /// independent of where the first differing byte falls.
-    ///
-    /// This test verifies the *shape* of the comparison (OR-accumulator) by
-    /// checking that mismatches differing at the first byte and at the last
-    /// byte both produce timing within the same order of magnitude.
-    ///
-    /// On CI where timing is unreliable, the test additionally asserts the
-    /// functional correctness of the OR-accumulator (no early exit) by
-    /// confirming that `nonce_matches` always inspects all bytes.
-    #[test]
-    fn nonce_compare_is_length_independent_constant_time() {
-        use core::hint::black_box;
-        use std::time::Instant;
-
-        // All-zero 8-byte expected nonce.
-        let expected = "00000000";
-
-        // Mismatch at byte 0: first byte differs.
-        let body_diff_at_0 = b"_nonce=10000000";
-        // Mismatch at byte 7: last byte differs.
-        let body_diff_at_7 = b"_nonce=00000001";
-        // Identical (match — sanity check for timing).
-        let body_match = b"_nonce=00000000";
-
-        // Functional check first.
-        assert!(!nonce_matches(body_diff_at_0, expected));
-        assert!(!nonce_matches(body_diff_at_7, expected));
-        assert!(nonce_matches(body_match, expected));
-
-        // Timing check: the comparison must not short-circuit on the first
-        // differing byte.  We sample 1000 iterations for each variant and
-        // compare the medians.
-        const ITERATIONS: u64 = 1_000;
-
-        let mut times_diff_0 = alloc::vec::Vec::with_capacity(ITERATIONS as usize);
-        let mut times_diff_7 = alloc::vec::Vec::with_capacity(ITERATIONS as usize);
-
-        for _ in 0..ITERATIONS {
-            let t0 = Instant::now();
-            let _ = black_box(nonce_matches(
-                black_box(body_diff_at_0),
-                black_box(expected),
-            ));
-            times_diff_0.push(t0.elapsed().as_nanos());
-
-            let t0 = Instant::now();
-            let _ = black_box(nonce_matches(
-                black_box(body_diff_at_7),
-                black_box(expected),
-            ));
-            times_diff_7.push(t0.elapsed().as_nanos());
-        }
-
-        times_diff_0.sort_unstable();
-        times_diff_7.sort_unstable();
-        let median_0 = times_diff_0[ITERATIONS as usize / 2];
-        let median_7 = times_diff_7[ITERATIONS as usize / 2];
-
-        // The two medians must be within a 50× factor of each other.
-        // This is a loose bound — pure logic without branching on the result
-        // will be within 2–5× even under OS jitter; 50× catches an obvious
-        // early-return optimisation while not requiring nanosecond accuracy.
-        //
-        // If this assertion becomes flaky on CI, the timing guard is gated by
-        // the environment variable `TIMING_TEST=1` (see comment below).  The
-        // structural correctness (OR-accumulator, no short-circuit) is already
-        // guaranteed by the functional assertions above.
-        if std::env::var("SKIP_TIMING_TEST").is_err() {
-            let ratio = if median_0 > median_7 {
-                median_0 as f64 / median_7.max(1) as f64
-            } else {
-                median_7 as f64 / median_0.max(1) as f64
-            };
-            assert!(
-                ratio < 50.0,
-                "nonce comparison timing ratio {ratio:.1}× exceeds 50× bound: \
-                 diff-at-0 median={median_0}ns diff-at-7 median={median_7}ns. \
-                 Set SKIP_TIMING_TEST=1 to skip this assertion."
-            );
-        }
     }
 
     // ── Security-checklist item 2: no password pre-fill ───────────────────────
@@ -2758,134 +2208,18 @@ mod tests {
         );
     }
 
-    // ── PortalConfig.device_name fallback ─────────────────────────────────────
+    // ── Device-name pre-fill in the render ────────────────────────────────────
 
-    /// Locks the contract that `PortalConfig.device_name` is surfaced into
-    /// the `{{DEV_NAME}}` placeholder when there is no stored device name in
-    /// `Prefill`.
-    ///
-    /// Without this fallback the renderer would output an empty string on a
-    /// fresh / unprovisioned device, contradicting the public `PortalConfig`
-    /// API which advertises `device_name` as "surfaced in the portal header".
-    ///
-    /// The renderer prefers a non-empty `Prefill.dev_name` (a previously
-    /// stored value) over the configured default — so a user who customised
-    /// their device name through a prior provisioning cycle keeps that name
-    /// across re-provisioning.
-    #[test]
-    fn dev_name_falls_back_to_config_when_prefill_is_empty() {
-        // The DEV_NAME render arm in `render_portal_template` (around
-        // line 935) selects `config.device_name` when `prefill.dev_name` is
-        // empty, else `prefill.dev_name`.  Verify both arms.
-
-        let prefill_empty = Prefill::empty();
-        assert!(
-            prefill_empty.dev_name.is_empty(),
-            "fresh Prefill must have empty dev_name for this test"
-        );
-
-        // When Prefill.dev_name is empty, the chosen value must be the
-        // config default.
-        let config_dev_name = "RustyFarian-PRD-01";
-        let chosen = if prefill_empty.dev_name.is_empty() {
-            config_dev_name
-        } else {
-            prefill_empty.dev_name.as_str()
-        };
-        assert_eq!(
-            chosen, config_dev_name,
-            "empty Prefill.dev_name must yield the configured default"
-        );
-
-        // When Prefill.dev_name is non-empty (user customised it through a
-        // previous provisioning cycle), the stored value takes precedence.
-        let mut prefill_stored = Prefill::empty();
-        let _ = prefill_stored.dev_name.push_str("user-renamed-device");
-        let chosen = if prefill_stored.dev_name.is_empty() {
-            config_dev_name
-        } else {
-            prefill_stored.dev_name.as_str()
-        };
-        assert_eq!(
-            chosen, "user-renamed-device",
-            "non-empty Prefill.dev_name must take precedence over the configured default"
-        );
-    }
-
-    // ── Prefill::from_defaults (.env-seeded pre-fill) ─────────────────────────
-
-    /// `from_defaults` maps non-secret `.env` defaults into the Wi-Fi+MQTT
-    /// pre-fill, recomposing `mqtt://host:port` from the separate host/port
-    /// defaults. `dev_name` is left empty so the renderer falls back to
-    /// `PortalRenderConfig.device_name`.
-    #[test]
-    fn from_defaults_populates_wifi_mqtt_fields() {
-        use super::super::session::portal::PortalDefaultsOwned;
-        use juggler::provisioning::{PortalDefaults, SchemaProfile};
-
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
-            wifi_ssid: "HomeNet",
-            mqtt_host: "broker.local",
-            mqtt_port: "1883",
-            mqtt_user: "sensor",
-            mqtt_client: "c3-01",
-            ota_url: "http://ota.local/fw.bin",
-            ..PortalDefaults::default()
-        });
-
-        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
-        assert_eq!(prefill.wifi_ssid.as_str(), "HomeNet");
-        assert_eq!(prefill.mqtt_uri.as_str(), "mqtt://broker.local:1883");
-        assert_eq!(prefill.mqtt_user.as_str(), "sensor");
-        assert_eq!(prefill.mqtt_client.as_str(), "c3-01");
-        assert_eq!(prefill.ota_url.as_str(), "http://ota.local/fw.bin");
-        assert!(
-            prefill.dev_name.is_empty(),
-            "dev_name must stay empty so the renderer falls back to config.device_name"
-        );
-    }
-
-    /// Empty defaults yield an all-empty pre-fill — identical to the previous
-    /// `Prefill::empty()` behavior for an unconfigured device.
-    #[test]
-    fn from_defaults_empty_yields_empty_prefill() {
-        use super::super::session::portal::PortalDefaultsOwned;
-        use juggler::provisioning::{PortalDefaults, SchemaProfile};
-
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
-        assert!(prefill.wifi_ssid.is_empty());
-        assert!(prefill.mqtt_uri.is_empty());
-        assert!(prefill.mqtt_user.is_empty());
-        assert!(prefill.mqtt_client.is_empty());
-        assert!(prefill.ota_url.is_empty());
-    }
-
-    /// A host-only or port-only default is not a usable broker URI, so
-    /// `compose_mqtt_uri` returns empty rather than a partial `mqtt://host:`.
-    #[test]
-    fn compose_mqtt_uri_requires_both_host_and_port() {
-        assert_eq!(
-            compose_mqtt_uri("broker.local", "1883").as_str(),
-            "mqtt://broker.local:1883"
-        );
-        assert!(compose_mqtt_uri("broker.local", "").is_empty());
-        assert!(compose_mqtt_uri("", "1883").is_empty());
-    }
-
-    /// Renders the full Wi-Fi+MQTT form into a host buffer with the given
-    /// configured device name.
-    fn render_with_device_name(prefill: &Prefill, device_name: &str) -> std::string::String {
+    /// Renders the full Wi-Fi+MQTT form into a host buffer from a pre-fill.
+    fn render(prefill: &Prefill<'_>) -> std::string::String {
         use super::super::session::portal::{
             PortalDefaultsOwned, PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
         };
         use juggler::provisioning::{PortalDefaults, SchemaProfile};
 
-        let mut dev_name = heapless::String::<RENDER_DEVICE_NAME_MAX>::new();
-        let _ = dev_name.push_str(device_name);
         let config = PortalRenderConfig {
             firmware_version: heapless::String::<RENDER_FW_VERSION_MAX>::new(),
-            device_name: dev_name,
+            device_name: heapless::String::<RENDER_DEVICE_NAME_MAX>::new(),
             profile: SchemaProfile::WifiMqttDevice,
             defaults: PortalDefaultsOwned::from_borrowed(&PortalDefaults::default()),
         };
@@ -2895,27 +2229,35 @@ mod tests {
         std::string::String::from_utf8(buf[..len].to_vec()).expect("rendered HTML is UTF-8")
     }
 
-    /// Empty store (defaults path) → the `dev_name` input carries the
-    /// configured `PortalConfig.device_name`.
+    /// Fresh device: the shared pre-fill puts the configured device name into
+    /// the `dev_name` input (the render no longer has its own fallback).
     #[test]
     fn empty_store_renders_configured_device_name() {
-        use super::super::session::portal::PortalDefaultsOwned;
         use juggler::provisioning::{PortalDefaults, SchemaProfile};
 
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let prefill = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice);
-        let html = render_with_device_name(&prefill, "rgb-clock");
+        let defaults = PortalDefaults::default();
+        let prefill = Prefill::select(None, SchemaProfile::WifiMqttDevice, &defaults, "rgb-clock");
+        let html = render(&prefill);
         assert!(html.contains("name=\"dev_name\" value=\"rgb-clock\""));
     }
 
-    /// A stored device name takes precedence over the configured one.
+    /// The owned defaults reach the form through `as_borrowed`.
     #[test]
-    fn stored_device_name_wins_in_render() {
-        let mut prefill = Prefill::empty();
-        let _ = prefill.dev_name.push_str("user-renamed");
-        let html = render_with_device_name(&prefill, "rgb-clock");
-        assert!(html.contains("name=\"dev_name\" value=\"user-renamed\""));
-        assert!(!html.contains("rgb-clock"));
+    fn owned_defaults_render_through_the_shared_prefill() {
+        use super::super::session::portal::PortalDefaultsOwned;
+        use juggler::provisioning::{PortalDefaults, SchemaProfile};
+
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
+            wifi_ssid: "HomeNet",
+            mqtt_host: "broker.local",
+            mqtt_port: "1883",
+            ..PortalDefaults::default()
+        });
+        let defaults = owned.as_borrowed();
+        let prefill = Prefill::select(None, SchemaProfile::WifiMqttDevice, &defaults, "d");
+        let html = render(&prefill);
+        assert!(html.contains("value=\"HomeNet\""));
+        assert!(html.contains("value=\"mqtt://broker.local:1883\""));
     }
 
     // ── Fix 1: render overflow returns Err ───────────────────────────────────
@@ -2950,9 +2292,12 @@ mod tests {
 
         // Build a Prefill whose wifi_ssid is at maximum capacity (32 chars).
         // This ensures the WIFI_SSID substitution writes at least 32 bytes.
-        let mut prefill = Prefill::empty();
         let long_ssid = "A".repeat(32);
-        let _ = prefill.wifi_ssid.push_str(&long_ssid);
+        let defaults = PortalDefaults {
+            wifi_ssid: &long_ssid,
+            ..PortalDefaults::default()
+        };
+        let prefill = Prefill::select(None, SchemaProfile::WifiMqttDevice, &defaults, "");
 
         // A buffer of 256 bytes is far too small for the full portal HTML
         // (which is ~4–6 KiB rendered).  The render must detect the overflow
@@ -3013,81 +2358,21 @@ mod tests {
         }
     }
 
-    // ── Session gate: the first terminal event stands ───────────────────────
-
-    use core::cell::Cell;
-    use juggler::provisioning::{ProvisioningInput, ProvisioningState};
-
-    #[test]
-    fn transition_accepts_and_stores_the_next_state() {
-        let cell = Cell::new(ProvisioningState::AwaitingSubmission);
-        assert_eq!(
-            transition(&cell, ProvisioningInput::ValidSubmission),
-            Ok(ProvisioningState::Persisting)
-        );
-        assert_eq!(cell.get(), ProvisioningState::Persisting);
-        assert_eq!(
-            transition(&cell, ProvisioningInput::PersistOk),
-            Ok(ProvisioningState::Committed)
-        );
-        assert_eq!(cell.get(), ProvisioningState::Committed);
-    }
-
-    #[test]
-    fn save_after_factory_reset_is_refused_and_reset_stands() {
-        let cell = Cell::new(ProvisioningState::AwaitingSubmission);
-        assert!(transition(&cell, ProvisioningInput::FactoryReset).is_ok());
-
-        let refused = transition(&cell, ProvisioningInput::ValidSubmission)
-            .expect_err("a submission after a reset must be refused before store.save");
-        assert_eq!(refused.state, ProvisioningState::FactoryResetPending);
-        assert_eq!(cell.get(), ProvisioningState::FactoryResetPending);
-    }
-
-    #[test]
-    fn save_after_commit_is_refused_and_commit_stands() {
-        let cell = Cell::new(ProvisioningState::Committed);
-        let refused = transition(&cell, ProvisioningInput::ValidSubmission)
-            .expect_err("a second submission after a commit must be refused");
-        assert_eq!(refused.state, ProvisioningState::Committed);
-        assert_eq!(cell.get(), ProvisioningState::Committed);
-    }
-
-    #[test]
-    fn factory_reset_after_commit_or_while_persisting_is_refused() {
-        for state in [ProvisioningState::Committed, ProvisioningState::Persisting] {
-            let cell = Cell::new(state);
-            let refused = transition(&cell, ProvisioningInput::FactoryReset)
-                .expect_err("reset must be refused once a submission was accepted");
-            assert_eq!(refused.state, state);
-            assert_eq!(
-                cell.get(),
-                state,
-                "a refused reset must not change the state"
-            );
-        }
-    }
-
-    #[test]
-    fn persist_ok_outside_persisting_is_refused_so_no_commit_is_signalled() {
-        let cell = Cell::new(ProvisioningState::FactoryResetPending);
-        assert!(transition(&cell, ProvisioningInput::PersistOk).is_err());
-        assert_eq!(cell.get(), ProvisioningState::FactoryResetPending);
-    }
-
+    /// The shared `409` body fits a response and is never cached.
     #[test]
     fn session_finished_response_is_409_conflict_and_not_cached() {
+        use juggler::provisioning::templates::SESSION_FINISHED_BODY;
         let mut buf = [0u8; 512];
         let n = build_response(
             &mut buf,
             409,
             "text/plain; charset=utf-8",
-            SESSION_FINISHED_BODY,
+            SESSION_FINISHED_BODY.as_bytes(),
         )
         .expect("409 response fits");
         let resp = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(resp.starts_with("HTTP/1.1 409 Conflict\r\n"));
         assert!(resp.contains("Cache-Control: no-store\r\n"));
-        assert!(resp.ends_with(core::str::from_utf8(SESSION_FINISHED_BODY).unwrap()));
+        assert!(resp.ends_with(SESSION_FINISHED_BODY));
     }
 }

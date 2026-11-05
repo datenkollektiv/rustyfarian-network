@@ -15,6 +15,8 @@
 //! | `Close` | `esp_mqtt_client_disconnect` (sets a bit) |
 //! | `Wait { ms }` | a deadline in this thread |
 //! | `ConnectWork` | the per-connect helper thread |
+//! | `Ready` | none; [`Session::poll`] already woke `wait_connected` |
+//! | `Ignored` | none; logged, and an error after a long run of them |
 //!
 //! Auto-reconnect is off (`reconnect_timeout: None` in the client
 //! configuration), so esp-mqtt makes no attempt of its own: an attempt happens
@@ -39,7 +41,7 @@ use esp_idf_svc::handle::RawHandle as _;
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EspMqttConnection, LwtConfiguration, MqttClientConfiguration,
 };
-use juggler::mqtt::{NetworkGate, SessionAction, SessionInput, SessionToken};
+use juggler::mqtt::{ConnectWorkPlan, NetworkGate, SessionAction, SessionInput, SessionToken};
 
 use super::session::Session;
 use super::{to_esp_qos, LwtParts, SubscribableClient, CONNECT_THREAD_STACK_SIZE};
@@ -47,6 +49,10 @@ use super::{to_esp_qos, LwtParts, SubscribableClient, CONNECT_THREAD_STACK_SIZE}
 /// Stack of the runner thread: it only logs, reads a channel and calls the
 /// handful of esp-mqtt entry points above (no recursion, no payloads).
 pub(super) const RUNNER_STACK_SIZE: usize = 4096;
+
+/// Ignored inputs in a row after which the runner reports that it and the
+/// machine have fallen out of step (ADR 023 decisions 5 and 6).
+const IGNORED_IN_A_ROW_LIMIT: u32 = 16;
 
 /// One message to the runner.
 pub(super) enum Msg {
@@ -126,9 +132,8 @@ pub(super) struct Runner {
     pub(super) handle: Option<usize>,
     /// Link readiness at build time, fed into the gate before any event.
     pub(super) seed_ready: bool,
-    /// The broker's session-present flag of the current connection; the machine
-    /// does not carry it in `ConnectWork`, but `on_connect` reports it.
-    pub(super) session_present: bool,
+    /// Inputs the machine ignored in a row; see [`IGNORED_IN_A_ROW_LIMIT`].
+    pub(super) ignored_in_a_row: u32,
     pub(super) subscribe_topics: Vec<(String, juggler::mqtt::QoS)>,
     pub(super) startup_topic: Option<String>,
     pub(super) on_connect: Option<Arc<std::sync::Mutex<super::OnConnectCallback>>>,
@@ -194,13 +199,28 @@ impl Runner {
 
     /// Feeds one input to the machine and performs its action.
     fn act(&mut self, input: SessionInput, retry_at: &mut Option<Instant>) {
-        if let SessionInput::Connected { session_present } = input {
-            self.session_present = session_present;
+        let action = self.session.poll(input);
+        if action == SessionAction::Ignored {
+            log::debug!("[mqtt] session ignored {:?}", input);
+            self.ignored_in_a_row = self.ignored_in_a_row.saturating_add(1);
+            if self.ignored_in_a_row == IGNORED_IN_A_ROW_LIMIT {
+                log::error!(
+                    "[mqtt] the session ignored {} inputs in a row; runner and machine are out of step",
+                    IGNORED_IN_A_ROW_LIMIT
+                );
+            }
+            return;
         }
-        match self.session.poll(input) {
-            SessionAction::None => {}
+        self.ignored_in_a_row = 0;
+        match action {
+            // `Session::poll` already woke `wait_connected`.
+            SessionAction::None | SessionAction::Ready | SessionAction::Ignored => {}
             SessionAction::Connect => self.connect(),
-            SessionAction::ConnectWork { token, subscribe } => self.connect_work(token, subscribe),
+            SessionAction::ConnectWork {
+                token,
+                subscribe,
+                session_present,
+            } => self.connect_work(token, subscribe, session_present),
             SessionAction::Close => self.close(),
             SessionAction::Wait { ms } => {
                 log::warn!("[mqtt] reconnecting in {} ms", ms);
@@ -237,9 +257,14 @@ impl Runner {
     }
 
     /// Runs one session's connect work on the helper thread (ADR 017).
-    fn connect_work(&mut self, token: SessionToken, subscribe: bool) {
-        let subscribe = subscribe && !self.subscribe_topics.is_empty();
-        if !subscribe && self.startup_topic.is_none() && self.on_connect.is_none() {
+    fn connect_work(&mut self, token: SessionToken, subscribe: bool, session_present: bool) {
+        let plan = ConnectWorkPlan::new(
+            subscribe,
+            self.subscribe_topics.len(),
+            self.startup_topic.is_some(),
+            self.on_connect.is_some(),
+        );
+        if plan.is_empty() {
             self.session.send(SessionInput::WorkDone(token));
             return;
         }
@@ -249,7 +274,6 @@ impl Runner {
         let topics = self.subscribe_topics.clone();
         let startup_topic = self.startup_topic.clone();
         let on_connect = self.on_connect.clone();
-        let session_present = self.session_present;
 
         // The helper does the connect work under one hold of the outbox's
         // client lock, off this thread and off the event-loop thread: esp-mqtt
@@ -263,12 +287,15 @@ impl Runner {
                 let attached = outbox.with_client_mut(|client| {
                     super::connect_work(
                         client,
-                        &session,
-                        token,
-                        subscribe.then_some(topics.as_slice()),
-                        startup_topic.as_deref(),
-                        on_connect.as_deref(),
-                        session_present,
+                        &super::ConnectWork {
+                            session: &session,
+                            token,
+                            plan,
+                            topics: &topics,
+                            startup_topic: startup_topic.as_deref(),
+                            on_connect: on_connect.as_deref(),
+                            session_present,
+                        },
                     );
                 });
                 if attached.is_none() {
@@ -311,9 +338,12 @@ impl Runner {
         }
     }
 
-    /// Stops the client; dropping it makes the event-loop thread's `next()`
-    /// return, so that thread exits too.
+    /// Ends the session through the machine, then stops the client; dropping
+    /// it makes the event-loop thread's `next()` return, so that thread exits too.
     fn shutdown(&mut self) {
+        // The machine answers `Close` for a busy session, which `act` performs;
+        // nothing reads the `Disconnected` that follows, and no retry is armed.
+        self.act(SessionInput::Shutdown, &mut None);
         if let Some(handle) = self.handle.take() {
             // Wake the task out of its reconnect wait first: otherwise `stop`
             // waits out the whole pause (`reconnect_timeout_ms / 2`, 5 s).

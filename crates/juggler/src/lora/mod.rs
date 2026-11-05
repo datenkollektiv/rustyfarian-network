@@ -2,10 +2,21 @@
 //!
 //! # Architecture
 //!
-//! - [`LoraRadio`] — hardware-agnostic radio interface
-//! - [`lorawan::LorawanDevice<R>`] — LoRaWAN Class A stack, generic over the radio
+//! The domain follows the shared-logic ladder (ADR 023):
+//!
+//! - Flat rules: [`Region::default_rf_hz`], [`ldro_required`], [`classify_irq`] and
+//!   the LoRaWAN PHY constants below.
+//! - Rung 1: [`sx1262::init`] — the SX1262 bring-up order, generic over
+//!   `embedded-hal` and shared by both tiers.
+//! - [`LorawanPhy<R>`] — the `lorawan-device` `PhyRxTx + Timings` bridge over a
+//!   [`LoraRadio`] port.
+//! - Rung 2: [`LorawanTicker`] — decodes IRQ and clock samples into the events
+//!   that drive `lorawan-device`'s `nb_device::Device`.
+//! - [`LoraRadio`] — the narrow, hardware-agnostic radio port
 //! - [`mock::MockLoraRadio`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
+//!
+//! [`lorawan::LorawanDevice<R>`] is a deprecated stub that no code drives.
 //!
 //! # Feature flags
 //!
@@ -16,15 +27,21 @@
 pub mod commands;
 pub mod config;
 pub mod lorawan;
+pub mod phy;
+pub mod sx1262;
+pub mod ticker;
 
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
 // Re-export top-level types for ergonomic imports.
 pub use config::{HeltecV3Pins, LoraConfig, Region};
+#[allow(deprecated)]
 pub use lorawan::{
     Downlink, LorawanDevice, LorawanError, LorawanResponse, LorawanSessionData, LorawanState,
 };
+pub use phy::{map_rf_config, LorawanPhy};
+pub use ticker::{LorawanTicker, Outcome, TickEvent};
 
 // ─── RX window timing defaults ────────────────────────────────────────────────
 
@@ -60,6 +77,93 @@ pub const RX_WINDOW_OFFSET_MS: i32 = -500;
 ///
 /// HAL implementations may override [`LoraRadio::rx_window_duration_ms`].
 pub const RX_WINDOW_DURATION_MS: u32 = 3000;
+
+// ─── LoRaWAN PHY policy ───────────────────────────────────────────────────────
+
+/// LoRaWAN public-network sync word for the SX126x family (TTN and other public networks).
+///
+/// The SX126x uses a 16-bit sync word; `0x34` is the SX127x spelling of the same value.
+pub const LORAWAN_PUBLIC_SYNC_WORD: u16 = 0x3444;
+
+/// LoRaWAN preamble length in symbols, for uplinks and downlinks alike.
+pub const LORAWAN_PREAMBLE_LEN: u16 = 8;
+
+/// Uplinks use standard (non-inverted) IQ.
+pub const UPLINK_IQ_INVERTED: bool = false;
+
+/// Downlinks use inverted IQ, which keeps devices from hearing each other's uplinks.
+pub const DOWNLINK_IQ_INVERTED: bool = true;
+
+/// Uplinks carry a PHY-layer CRC.
+pub const UPLINK_CRC_ON: bool = true;
+
+/// Downlinks carry NO PHY-layer CRC.
+///
+/// With CRC on, the SX1262 either treats the missing CRC bytes as payload or
+/// flags `crc_err` and drops the frame, so RX must run with CRC off.
+pub const DOWNLINK_CRC_ON: bool = false;
+
+/// Largest payload the radio accepts in an RX window, in bytes (the LoRa PHY maximum).
+pub const RX_PAYLOAD_MAX: u8 = 255;
+
+/// Return `true` when low-data-rate optimisation (LDRO) is required.
+///
+/// LDRO is required when: BW=125 kHz and SF≥11, or BW=250 kHz and SF=12.
+pub fn ldro_required(sf: SpreadingFactor, bw: Bandwidth) -> bool {
+    matches!(
+        (sf, bw),
+        (
+            SpreadingFactor::SF11 | SpreadingFactor::SF12,
+            Bandwidth::BW125
+        ) | (SpreadingFactor::SF12, Bandwidth::BW250)
+    )
+}
+
+// ─── IRQ classification ───────────────────────────────────────────────────────
+
+/// SX126x IRQ register bit: transmission finished.
+pub const IRQ_TX_DONE: u16 = 1 << 0;
+/// SX126x IRQ register bit: a packet was received.
+pub const IRQ_RX_DONE: u16 = 1 << 1;
+/// SX126x IRQ register bit: the received packet failed its CRC.
+pub const IRQ_CRC_ERR: u16 = 1 << 6;
+/// SX126x IRQ register bit: the RX or TX hardware timeout expired.
+pub const IRQ_TIMEOUT: u16 = 1 << 9;
+
+/// What a latched IRQ word means for the operation in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqOutcome {
+    /// No relevant bit is set: the operation is still in progress.
+    None,
+    /// Transmission finished.
+    TxDone,
+    /// A packet was received.
+    RxDone,
+    /// The hardware timeout expired.
+    Timeout,
+    /// A packet arrived with a bad CRC.
+    CrcError,
+}
+
+/// Classify a raw SX126x IRQ word.
+///
+/// Priority: `Timeout` > `CrcError` > `RxDone` > `TxDone` > `None`, the order in
+/// which the radio's receive and transmit polls test the bits. A `crc_err`
+/// latched together with `rx_done` is therefore a `CrcError`, never a packet.
+/// Bits other than the four named ones (preamble, sync word, header) are ignored.
+pub fn classify_irq(flags: u16) -> IrqOutcome {
+    if flags & IRQ_TIMEOUT != 0 {
+        IrqOutcome::Timeout
+    } else if flags & IRQ_CRC_ERR != 0 {
+        IrqOutcome::CrcError
+    } else if flags & IRQ_RX_DONE != 0 {
+        IrqOutcome::RxDone
+    } else if flags & IRQ_TX_DONE != 0 {
+        IrqOutcome::TxDone
+    } else {
+        IrqOutcome::None
+    }
+}
 
 // ─── Core radio types ─────────────────────────────────────────────────────────
 
@@ -119,7 +223,8 @@ pub struct RxConfig {
 
 /// Which LoRaWAN receive window is being opened.
 ///
-/// The `LoraRadioAdapter` uses this to select EU868 RX1 or RX2 frequency/DR.
+/// `lorawan-device` already encodes the RX1 or RX2 frequency and data rate in the
+/// RF config, so [`LorawanPhy`] passes a fixed placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RxWindow {
     /// First receive window: opens 1 s after end of TX (configurable via join accept).
@@ -194,9 +299,92 @@ pub trait LoraRadio {
     /// Hardware-calibrated RX window opening offset in ms.
     ///
     /// A negative value opens the window earlier to compensate for hardware latency.
-    /// The `LoraRadioAdapter` adds this to the LoRaWAN-specified window timing.
+    /// [`LorawanPhy`] reports this to `lorawan-device` as the window timing offset.
     fn rx_window_offset_ms(&self) -> i32;
 
     /// Duration the RX window stays open waiting for a preamble, in ms.
     fn rx_window_duration_ms(&self) -> u32;
+
+    /// Abort any RX or TX in progress and return the radio to standby.
+    ///
+    /// Called when `lorawan-device` closes an RX window (`CancelRx`).
+    fn cancel_rx(&mut self) -> Result<(), Self::Error>;
+
+    /// Return `true` if a TX-done, RX-done, timeout or CRC-error IRQ is latched,
+    /// without clearing it.
+    ///
+    /// The event loop polls this instead of relying on a DIO1 edge interrupt.
+    fn irq_pending(&mut self) -> Result<bool, Self::Error>;
+}
+
+/// Classifies a radio error for [`LorawanPhy`]: one error mapping per method.
+///
+/// Implemented by each tier's radio error type so the shared bridge can tell a
+/// closed RX window apart from a real failure.
+pub trait RadioErrorKind {
+    /// The error for an RF configuration the radio cannot represent.
+    fn invalid_rf_config() -> Self;
+
+    /// Return `true` when the error is an RX window that closed with no packet.
+    fn is_rx_timeout(&self) -> bool;
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ldro_table_for_sf11_sf12_at_125k() {
+        assert!(ldro_required(SpreadingFactor::SF11, Bandwidth::BW125));
+        assert!(ldro_required(SpreadingFactor::SF12, Bandwidth::BW125));
+        assert!(!ldro_required(SpreadingFactor::SF10, Bandwidth::BW125));
+        assert!(!ldro_required(SpreadingFactor::SF7, Bandwidth::BW125));
+    }
+
+    #[test]
+    fn ldro_table_at_250k_and_500k() {
+        assert!(ldro_required(SpreadingFactor::SF12, Bandwidth::BW250));
+        assert!(!ldro_required(SpreadingFactor::SF11, Bandwidth::BW250));
+        assert!(!ldro_required(SpreadingFactor::SF12, Bandwidth::BW500));
+    }
+
+    #[test]
+    fn classify_irq_priority() {
+        assert_eq!(
+            classify_irq(IRQ_CRC_ERR | IRQ_RX_DONE),
+            IrqOutcome::CrcError
+        );
+        assert_eq!(classify_irq(IRQ_TIMEOUT), IrqOutcome::Timeout);
+        assert_eq!(
+            classify_irq(IRQ_TIMEOUT | IRQ_CRC_ERR | IRQ_RX_DONE),
+            IrqOutcome::Timeout
+        );
+        assert_eq!(classify_irq(0), IrqOutcome::None);
+        assert_eq!(classify_irq(IRQ_TX_DONE), IrqOutcome::TxDone);
+        assert_eq!(classify_irq(IRQ_RX_DONE), IrqOutcome::RxDone);
+    }
+
+    #[test]
+    fn classify_irq_ignores_diagnostic_bits() {
+        let preamble_sync_header = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
+        assert_eq!(classify_irq(preamble_sync_header), IrqOutcome::None);
+    }
+
+    #[test]
+    fn lorawan_phy_policy_values() {
+        assert_eq!(LORAWAN_PUBLIC_SYNC_WORD, 0x3444);
+        assert_eq!(LORAWAN_PREAMBLE_LEN, 8);
+        assert_eq!(
+            (
+                UPLINK_IQ_INVERTED,
+                DOWNLINK_IQ_INVERTED,
+                UPLINK_CRC_ON,
+                DOWNLINK_CRC_ON
+            ),
+            (false, true, true, false)
+        );
+        assert_eq!(RX_PAYLOAD_MAX, 255);
+    }
 }

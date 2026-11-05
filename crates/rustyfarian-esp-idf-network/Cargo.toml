@@ -59,7 +59,6 @@ rgb               = { workspace = true, optional = true }
 # ── Optional — lora only ─────────────────────────────────────────────────────
 sx126x            = { workspace = true, optional = true }
 lorawan-device    = { workspace = true, optional = true }
-lora-modulation   = { workspace = true, optional = true }
 nb                = { workspace = true, optional = true }
 embedded-hal      = { workspace = true, optional = true }
 rand_core         = { version = "0.6", default-features = false, optional = true }
@@ -84,7 +83,6 @@ lora = [
     "juggler/lora",
     "dep:sx126x",
     "dep:lorawan-device",
-    "dep:lora-modulation",
     "dep:rand_core",
     "dep:nb",
     "dep:embedded-hal",
@@ -132,6 +130,10 @@ required-features = ["wifi"]
 
 [[example]]
 name = "idf_c3_mqtt"
+required-features = ["wifi", "mqtt"]
+
+[[example]]
+name = "idf_c6_mqtt"
 required-features = ["wifi", "mqtt"]
 
 [[example]]

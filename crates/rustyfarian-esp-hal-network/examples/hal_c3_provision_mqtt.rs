@@ -18,7 +18,7 @@
 //!
 //! The HTTP portal task requires at least **24 KiB** of stack.
 //! The steady-state frame is ~8.3 KiB (`req_buf` 2048 B + `resp_buf` 6144 B
-//! + executor overhead); a `POST /save` request transiently adds ~12.5 KiB
+//! plus executor overhead); a `POST /save` request transiently adds ~12.5 KiB
 //! (analytic upper bound, not measured) for `ProvisioningStore::save`'s
 //! encode and read buffers plus the portal's parsed config, raising the peak
 //! to ~20.5 KiB.

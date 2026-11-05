@@ -26,7 +26,7 @@ pub mod network_link;
 #[cfg(feature = "std")]
 pub mod supervisor;
 
-pub use handover::LinkHandover;
+pub use handover::{IdleWait, LinkHandover};
 pub use link::{
     LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
     RECONNECT_BACKOFF_MAX_MS,
@@ -133,6 +133,22 @@ pub enum ConnectMode {
     NonBlocking,
 }
 
+impl ConnectMode {
+    /// How long the manager's constructor waits for the link, or `None` to
+    /// return at once.
+    ///
+    /// A status indicator needs the blocking wait to drive it, so
+    /// [`NonBlocking`](Self::NonBlocking) with `has_indicator` falls back to
+    /// [`DEFAULT_TIMEOUT_SECS`].
+    pub fn effective_timeout_secs(self, has_indicator: bool) -> Option<u64> {
+        match self {
+            Self::Blocking { timeout_secs } => Some(timeout_secs),
+            Self::NonBlocking if has_indicator => Some(DEFAULT_TIMEOUT_SECS),
+            Self::NonBlocking => None,
+        }
+    }
+}
+
 impl Default for ConnectMode {
     fn default() -> Self {
         Self::Blocking {
@@ -235,6 +251,9 @@ impl TxPowerLevel {
 pub struct WiFiConfig<'a> {
     pub ssid: &'a str,
     pub password: &'a str,
+    /// How the ESP-IDF `WiFiManager` constructor waits for the link (see
+    /// [`ConnectMode::effective_timeout_secs`]). The esp-hal tier ignores it: a
+    /// firmware there waits through `WifiLink::wait_connected`.
     pub connect_mode: ConnectMode,
     pub power_save: WifiPowerSave,
     pub tx_power: TxPowerLevel,
@@ -678,6 +697,19 @@ mod tests {
     }
 
     // ── ConnectMode tests ───────────────────────────────────────────────
+
+    #[test]
+    fn effective_timeout_covers_every_mode_and_indicator() {
+        let blocking = ConnectMode::Blocking { timeout_secs: 7 };
+        assert_eq!(blocking.clone().effective_timeout_secs(false), Some(7));
+        assert_eq!(blocking.effective_timeout_secs(true), Some(7));
+        assert_eq!(ConnectMode::NonBlocking.effective_timeout_secs(false), None);
+        assert_eq!(
+            ConnectMode::NonBlocking.effective_timeout_secs(true),
+            Some(DEFAULT_TIMEOUT_SECS),
+            "an indicator falls back to the blocking default"
+        );
+    }
 
     #[test]
     fn connect_mode_default_is_blocking_30s() {

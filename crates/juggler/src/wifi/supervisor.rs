@@ -1,7 +1,8 @@
 //! Thread-based station supervisor for std tiers (the ESP-IDF `WiFiManager`).
 //!
 //! A worker thread owns the reconnect timer and feeds driver events to the
-//! shared [`LinkMachine`]; [`LinkSupervisor::suspend`] and
+//! shared [`LinkMachine`], held in a [`LinkHandover`] like on the esp-hal tier;
+//! [`LinkSupervisor::suspend`] and
 //! [`LinkSupervisor::resume`] run on the caller's thread. Every transition and
 //! the radio call it implies happen under one lock, so a connect never
 //! interleaves with a stop, whichever threads call in.
@@ -29,11 +30,17 @@ use std::fmt::Debug;
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Poll, Waker};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::link::{LinkAction, LinkInput, LinkMachine, LinkState};
+use super::handover::LinkHandover;
+use super::link::{LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_MAX_MS};
+use crate::wait_list::{Wait, WaitList};
+
+/// Machine polls one input may take: the action, plus one more after a refused
+/// connect. More means the machine and this loop disagree, so `step` stops.
+const STEP_ROUNDS: usize = 2;
 
 /// The station calls a [`LinkSupervisor`] makes; each must return without blocking for long.
 pub trait LinkRadio: Send + 'static {
@@ -84,7 +91,9 @@ impl LinkEvents {
 }
 
 struct Core<R> {
-    machine: LinkMachine,
+    /// Only `poll`, the park epoch, readiness and the readiness edges are used;
+    /// no action is handed over, because every radio call runs under the lock.
+    handover: LinkHandover,
     radio: R,
     /// `false` between a successful stop and the next start.
     radio_started: bool,
@@ -95,17 +104,24 @@ struct Core<R> {
     /// When the back-off ends; set and cleared only together with the state, so
     /// no timer outlives the `Backoff` it belongs to.
     backoff_at: Option<Instant>,
-    /// Pending [`ReadyWait`] futures by id, woken (and removed) when the link becomes ready.
-    ready_waiters: Vec<(u64, Waker)>,
-    /// Id for the next [`ReadyWait`] that registers.
-    next_waiter: u64,
     /// Sinks told once per readiness transition (see [`LinkSupervisor::subscribe_ready`]).
     ready_sinks: Vec<Box<dyn Fn(bool) + Send + 'static>>,
-    /// Readiness as last handed to `ready_sinks`.
-    ready_reported: bool,
 }
 
 impl<R: LinkRadio> Core<R> {
+    /// A core around a started radio.
+    fn new(radio: R, machine: LinkMachine) -> Self {
+        Self {
+            handover: LinkHandover::with_machine(machine),
+            radio,
+            radio_started: true,
+            stops: 0,
+            fenced: 0,
+            backoff_at: None,
+            ready_sinks: Vec::new(),
+        }
+    }
+
     fn fence_up(&self) -> bool {
         self.fenced != self.stops
     }
@@ -119,8 +135,16 @@ impl<R: LinkRadio> Core<R> {
         self.radio.connect()
     }
 
-    /// Disconnects and stops a started radio, raising the fence.
+    /// Takes the station down within one park epoch of the handover.
     fn radio_down(&mut self) -> Result<(), R::Error> {
+        let epoch = self.handover.begin_park();
+        let result = self.stop_radio();
+        self.handover.end_park(epoch);
+        result
+    }
+
+    /// Disconnects and stops a started radio, raising the fence.
+    fn stop_radio(&mut self) -> Result<(), R::Error> {
         if !self.radio_started {
             return Ok(());
         }
@@ -136,11 +160,9 @@ impl<R: LinkRadio> Core<R> {
 
     /// Hands a readiness change to the sinks, once per transition.
     fn report_ready(&mut self) {
-        let ready = self.machine.is_ready();
-        if ready == self.ready_reported {
+        let Some(ready) = self.handover.take_ready_change() else {
             return;
-        }
-        self.ready_reported = ready;
+        };
         for sink in &self.ready_sinks {
             sink(ready);
         }
@@ -152,6 +174,8 @@ impl<R: LinkRadio> Core<R> {
 /// Dropping it stops and joins the worker, so no radio call runs afterwards.
 pub struct LinkSupervisor<R: LinkRadio> {
     core: Arc<Mutex<Core<R>>>,
+    /// [`ReadyWait`] futures; beside the core, never inside it, so no lock nests.
+    ready: Arc<WaitList>,
     tx: Sender<Msg>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -162,23 +186,14 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// Supervision begins with [`start`](Self::start); feed driver events
     /// through [`events`](Self::events), honouring the module's event contract.
     pub fn spawn(radio: R, machine: LinkMachine, builder: thread::Builder) -> io::Result<Self> {
-        let core = Arc::new(Mutex::new(Core {
-            machine,
-            radio,
-            radio_started: true,
-            stops: 0,
-            fenced: 0,
-            backoff_at: None,
-            ready_waiters: Vec::new(),
-            next_waiter: 0,
-            ready_sinks: Vec::new(),
-            ready_reported: false,
-        }));
+        let core = Arc::new(Mutex::new(Core::new(radio, machine)));
+        let ready = Arc::new(WaitList::new());
         let (tx, rx) = mpsc::channel();
-        let worker = Arc::clone(&core);
-        let handle = builder.spawn(move || run_worker(&rx, &worker))?;
+        let (worker, worker_ready) = (Arc::clone(&core), Arc::clone(&ready));
+        let handle = builder.spawn(move || run_worker(&rx, &worker, &worker_ready))?;
         Ok(Self {
             core,
+            ready,
             tx,
             handle: Some(handle),
         })
@@ -196,7 +211,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
 
     /// Current link state, including [`LinkState::Suspended`].
     pub fn state(&self) -> LinkState {
-        self.lock().machine.state()
+        self.lock().handover.state()
     }
 
     /// `true` once a suspend has taken effect: the state is
@@ -204,17 +219,17 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// leaves it `false` until a later [`suspend`](Self::suspend) succeeds.
     pub fn is_suspended(&self) -> bool {
         let core = self.lock();
-        core.machine.state() == LinkState::Suspended && !core.radio_started
+        core.handover.is_suspended() && !core.radio_started
     }
 
     /// `true` while associated with the IP configuration reported (see [`LinkMachine::is_ready`]).
     pub fn is_ready(&self) -> bool {
-        self.lock().machine.is_ready()
+        self.lock().handover.is_ready()
     }
 
     /// Associations since boot (see [`LinkMachine::connect_count`]).
     pub fn connect_count(&self) -> u32 {
-        self.lock().machine.connect_count()
+        self.lock().handover.connect_count()
     }
 
     /// Completes once the link is ready; the worker wakes it, nothing polls.
@@ -222,9 +237,11 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// Dropping the future before it completes removes its registration, so
     /// cancelled waits (timeouts, `select`) leave nothing behind.
     pub fn wait_ready(&self) -> ReadyWait<'_, R> {
+        let core: &Mutex<Core<R>> = &self.core;
+        let check: ReadyCheck<'_> = Box::new(move || lock(core).handover.is_ready().then_some(()));
         ReadyWait {
-            core: &self.core,
-            id: None,
+            wait: self.ready.wait(check),
+            _core: std::marker::PhantomData,
         }
     }
 
@@ -249,12 +266,12 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     pub fn subscribe_ready(&self, sink: impl Fn(bool) + Send + 'static) -> bool {
         let mut core = self.lock();
         core.ready_sinks.push(Box::new(sink));
-        core.machine.is_ready()
+        core.handover.is_ready()
     }
 
     #[cfg(test)]
     fn ready_waiter_count(&self) -> usize {
-        self.lock().ready_waiters.len()
+        self.ready.len()
     }
 
     /// Disconnects and stops the radio on the caller's thread and pauses
@@ -268,10 +285,10 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// Idempotent. On error reconnects stay paused and the next call retries the stop.
     pub fn suspend(&self) -> Result<(), R::Error> {
         let mut core = self.lock();
-        let action = core.machine.poll(LinkInput::Suspend);
+        let effective = core.handover.suspend();
         core.backoff_at = None;
         // A repeated call only has work left if an earlier stop failed.
-        if action == LinkAction::None && !core.radio_started {
+        if !effective && !core.radio_started {
             return Ok(());
         }
         log::info!("WiFi suspending");
@@ -295,7 +312,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     /// retries with its back-off.
     pub fn resume(&self) -> Result<(), R::Error> {
         let mut core = self.lock();
-        if core.machine.poll(LinkInput::Resume) != LinkAction::Connect {
+        if core.handover.poll(LinkInput::Resume) != LinkAction::Connect {
             return Ok(());
         }
         core.backoff_at = None;
@@ -309,7 +326,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
                 log::warn!("WiFi resume: connect request failed: {:?}", e);
                 // Schedule the retry under the same lock, then let the worker
                 // pick up the new deadline.
-                step(&mut core, LinkInput::Disconnected);
+                step(&mut core, LinkInput::ConnectFailed);
                 core.report_ready();
                 let _ = self.tx.send(Msg::Wake);
                 Err(e)
@@ -322,58 +339,20 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     }
 }
 
+/// Readiness check of a [`ReadyWait`], boxed so the future has a nameable type.
+type ReadyCheck<'a> = Box<dyn FnMut() -> Option<()> + Send + Sync + 'a>;
+
 /// Future returned by [`LinkSupervisor::wait_ready`].
 pub struct ReadyWait<'a, R: LinkRadio> {
-    core: &'a Mutex<Core<R>>,
-    /// Registration id, assigned on the first pending poll.
-    id: Option<u64>,
+    wait: Wait<'a, (), ReadyCheck<'a>>,
+    _core: std::marker::PhantomData<&'a Mutex<Core<R>>>,
 }
 
 impl<R: LinkRadio> std::future::Future for ReadyWait<'_, R> {
     type Output = ();
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        let core_ref = self.core;
-        let mut core = lock(core_ref);
-        if core.machine.is_ready() {
-            if let Some(id) = self.id.take() {
-                core.ready_waiters.retain(|(waiter, _)| *waiter != id);
-            }
-            return Poll::Ready(());
-        }
-        let id = match self.id {
-            Some(id) => id,
-            None => {
-                let id = core.next_waiter;
-                core.next_waiter = core.next_waiter.wrapping_add(1);
-                self.id = Some(id);
-                id
-            }
-        };
-        match core
-            .ready_waiters
-            .iter_mut()
-            .find(|(waiter, _)| *waiter == id)
-        {
-            Some((_, waker)) => {
-                if !waker.will_wake(cx.waker()) {
-                    waker.clone_from(cx.waker());
-                }
-            }
-            // First poll, or the worker woke and removed this entry.
-            None => core.ready_waiters.push((id, cx.waker().clone())),
-        }
-        Poll::Pending
-    }
-}
-
-impl<R: LinkRadio> Drop for ReadyWait<'_, R> {
-    fn drop(&mut self) {
-        if let Some(id) = self.id {
-            lock(self.core)
-                .ready_waiters
-                .retain(|(waiter, _)| *waiter != id);
-        }
+        std::pin::Pin::new(&mut self.wait).poll(cx)
     }
 }
 
@@ -392,7 +371,7 @@ fn lock<R>(core: &Mutex<Core<R>>) -> MutexGuard<'_, Core<R>> {
     core.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>) {
+fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>, ready: &WaitList) {
     loop {
         let backoff_at = lock(core).backoff_at;
         let msg = match backoff_at {
@@ -406,57 +385,62 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>) {
                 Err(_) => break,
             },
         };
-        let mut core = lock(core);
-        let input = match msg {
-            None | Some(Msg::Wake) => match core.backoff_at {
-                Some(at) if Instant::now() >= at => {
-                    core.backoff_at = None;
-                    LinkInput::BackoffElapsed
+        let is_ready = {
+            let mut core = lock(core);
+            let input = match msg {
+                None | Some(Msg::Wake) => match core.backoff_at {
+                    Some(at) if Instant::now() >= at => {
+                        core.backoff_at = None;
+                        LinkInput::BackoffElapsed
+                    }
+                    _ => continue,
+                },
+                Some(Msg::Shutdown) => break,
+                Some(Msg::Event(LinkEvent::Stopped)) => {
+                    if core.fence_up() {
+                        core.fenced = core.fenced.wrapping_add(1);
+                    }
+                    continue;
                 }
-                _ => continue,
-            },
-            Some(Msg::Shutdown) => break,
-            Some(Msg::Event(LinkEvent::Stopped)) => {
-                if core.fence_up() {
-                    core.fenced = core.fenced.wrapping_add(1);
+                Some(Msg::Event(event)) if core.fence_up() => {
+                    log::debug!("WiFi {:?} predates the last stop, dropped", event);
+                    continue;
                 }
-                continue;
-            }
-            Some(Msg::Event(event)) if core.fence_up() => {
-                log::debug!("WiFi {:?} predates the last stop, dropped", event);
-                continue;
-            }
-            Some(Msg::Event(LinkEvent::Connected)) => LinkInput::Connected,
-            Some(Msg::Event(LinkEvent::Disconnected)) => LinkInput::Disconnected,
-            Some(Msg::Event(LinkEvent::NetworkUp)) => LinkInput::NetworkUp,
-            Some(Msg::Event(LinkEvent::NetworkDown)) => LinkInput::NetworkDown,
-            Some(Msg::Input(input)) => input,
+                Some(Msg::Event(LinkEvent::Connected)) => LinkInput::Connected,
+                Some(Msg::Event(LinkEvent::Disconnected)) => LinkInput::Disconnected,
+                Some(Msg::Event(LinkEvent::NetworkUp)) => LinkInput::NetworkUp,
+                Some(Msg::Event(LinkEvent::NetworkDown)) => LinkInput::NetworkDown,
+                Some(Msg::Input(input)) => input,
+            };
+            step(&mut core, input);
+            core.report_ready();
+            core.handover.is_ready()
         };
-        step(&mut core, input);
-        if core.machine.is_ready() {
-            for (_, waker) in core.ready_waiters.drain(..) {
-                waker.wake();
-            }
+        // Woken after the core lock is released, so a waiter's check never blocks on it.
+        if is_ready {
+            ready.wake_all();
         }
-        core.report_ready();
     }
     log::debug!("WiFi link worker exited");
 }
 
-/// Feeds one input to the machine and performs the resulting actions.
+/// Feeds one input to the machine and performs the resulting actions, at most
+/// [`STEP_ROUNDS`] of them.
 fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
-    let mut action = core.machine.poll(input);
-    loop {
+    let mut action = core.handover.poll(input);
+    let mut settled = false;
+    for _ in 0..STEP_ROUNDS {
         match action {
-            LinkAction::None => break,
+            LinkAction::None => {}
+            LinkAction::Ignored => {
+                log::debug!("WiFi {:?} ignored in {:?}", input, core.handover.state());
+            }
             LinkAction::Connect => match core.connect() {
-                Ok(()) => {
-                    log::info!("WiFi connect requested");
-                    break;
-                }
+                Ok(()) => log::info!("WiFi connect requested"),
                 Err(e) => {
                     log::warn!("WiFi connect request failed: {:?}", e);
-                    action = core.machine.poll(LinkInput::Disconnected);
+                    action = core.handover.poll(LinkInput::ConnectFailed);
+                    continue;
                 }
             },
             LinkAction::Disconnect => {
@@ -464,21 +448,32 @@ fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
                 if let Err(e) = core.radio_down() {
                     log::warn!("WiFi stop while suspended failed: {:?}", e);
                 }
-                break;
             }
             LinkAction::Wait { ms } => {
                 log::info!(
                     "WiFi reconnect in {} ms (attempt {})",
                     ms,
-                    core.machine.failed_attempts()
+                    core.handover.failed_attempts()
                 );
                 core.backoff_at = Some(Instant::now() + Duration::from_millis(ms));
-                break;
             }
         }
+        settled = true;
+        break;
     }
-    if core.machine.state() != LinkState::Backoff {
+    if core.handover.state() != LinkState::Backoff {
         core.backoff_at = None;
+    }
+    if !settled {
+        // The machine kept asking for I/O; never let the worker spin under the lock.
+        log::error!(
+            "WiFi link step for {:?} did not settle in {} rounds (last {:?}); pausing {} ms",
+            input,
+            STEP_ROUNDS,
+            action,
+            RECONNECT_BACKOFF_MAX_MS
+        );
+        core.backoff_at = Some(Instant::now() + Duration::from_millis(RECONNECT_BACKOFF_MAX_MS));
     }
 }
 
@@ -486,6 +481,7 @@ fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Waker;
     use std::vec::Vec;
 
     #[derive(Default)]
@@ -516,9 +512,24 @@ mod tests {
         log: Arc<Mutex<Log>>,
         busy: Arc<AtomicBool>,
         post: Option<Sender<LinkEvent>>,
+        stop_gate: Arc<Mutex<Option<StopGate>>>,
+    }
+
+    /// Holds the next stop: it reports `entered`, then waits for `release`.
+    struct StopGate {
+        entered: Sender<()>,
+        release: Receiver<()>,
     }
 
     impl MockRadio {
+        fn new(log: &Arc<Mutex<Log>>) -> Self {
+            Self {
+                log: Arc::clone(log),
+                busy: Arc::new(AtomicBool::new(false)),
+                post: None,
+                stop_gate: Arc::new(Mutex::new(None)),
+            }
+        }
         fn enter(&self) {
             if self.busy.swap(true, Ordering::SeqCst) {
                 self.log
@@ -583,6 +594,11 @@ mod tests {
         }
         fn stop(&mut self) -> Result<(), Self::Error> {
             self.enter();
+            let gate = self.stop_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.recv();
+            }
             let result = {
                 let mut log = self.log.lock().unwrap();
                 log.order.push("stop");
@@ -608,6 +624,7 @@ mod tests {
     struct Rig {
         sup: LinkSupervisor<MockRadio>,
         log: Arc<Mutex<Log>>,
+        stop_gate: Arc<Mutex<Option<StopGate>>>,
     }
 
     impl Rig {
@@ -640,10 +657,10 @@ mod tests {
             tx
         });
         let radio = MockRadio {
-            log: Arc::clone(&log),
-            busy: Arc::new(AtomicBool::new(false)),
             post,
+            ..MockRadio::new(&log)
         };
+        let stop_gate = Arc::clone(&radio.stop_gate);
         let sup = LinkSupervisor::spawn(
             radio,
             LinkMachine::with_backoff(10, 20),
@@ -651,7 +668,11 @@ mod tests {
         )
         .unwrap();
         *slot.lock().unwrap() = Some(sup.events());
-        Rig { sup, log }
+        Rig {
+            sup,
+            log,
+            stop_gate,
+        }
     }
 
     fn settle() {
@@ -886,6 +907,96 @@ mod tests {
             0,
             "cancelled waits must leave nothing behind"
         );
+    }
+
+    #[test]
+    fn a_wait_registered_before_readiness_completes_once_the_network_is_up() {
+        use std::future::Future;
+        let rig = rig(false);
+        rig.sup.events().send(LinkEvent::Connected);
+        wait_for_state(&rig.sup, LinkState::Connected);
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut ready = std::pin::pin!(rig.sup.wait_ready());
+        assert!(
+            ready.as_mut().poll(&mut cx).is_pending(),
+            "associated without an IP is not ready"
+        );
+        assert_eq!(rig.sup.ready_waiter_count(), 1);
+
+        rig.sup.events().send(LinkEvent::NetworkUp);
+        assert!(eventually(|| flag.0.load(Ordering::SeqCst)));
+        assert!(ready.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(rig.sup.ready_waiter_count(), 0);
+    }
+
+    #[test]
+    fn a_cancelled_wait_leaves_no_registration_behind() {
+        use std::future::Future;
+        let rig = rig(false);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut wait = Box::pin(rig.sup.wait_ready());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(rig.sup.ready_waiter_count(), 1);
+        drop(wait);
+        assert_eq!(rig.sup.ready_waiter_count(), 0);
+    }
+
+    #[test]
+    fn a_refused_connect_arms_one_backoff_per_step() {
+        let log = Arc::new(Mutex::new(Log {
+            started: true,
+            fail_every_connect: 1,
+            ..Log::default()
+        }));
+        let mut core = Core::new(MockRadio::new(&log), LinkMachine::with_backoff(10, 20));
+
+        step(&mut core, LinkInput::Start);
+        assert_eq!(log.lock().unwrap().connect_calls, 1, "one connect per step");
+        assert_eq!(core.handover.state(), LinkState::Backoff);
+        assert!(core.backoff_at.is_some(), "a back-off is armed");
+
+        for calls in 2..=6 {
+            core.backoff_at = None;
+            step(&mut core, LinkInput::BackoffElapsed);
+            assert_eq!(log.lock().unwrap().connect_calls, calls);
+            assert_eq!(core.handover.state(), LinkState::Backoff);
+            assert!(core.backoff_at.is_some());
+        }
+        assert!(log.lock().unwrap().violations.is_empty());
+    }
+
+    #[test]
+    fn is_suspended_stays_false_until_the_radio_stop_finished() {
+        let rig = rig(true);
+        rig.sup.start();
+        assert!(eventually(|| rig.sup.is_ready()));
+        settle();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *rig.stop_gate.lock().unwrap() = Some(StopGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        thread::scope(|s| {
+            let suspender = s.spawn(|| rig.sup.suspend());
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the stop must start");
+            let reader = s.spawn(|| rig.sup.is_suspended());
+            thread::sleep(Duration::from_millis(30));
+            let answered_during_stop = reader.is_finished();
+            release_tx.send(()).unwrap();
+            let seen = reader.join().unwrap();
+            assert!(
+                !(answered_during_stop && seen),
+                "is_suspended reported the suspend before the radio stopped"
+            );
+            suspender.join().unwrap().unwrap();
+        });
+        assert!(rig.sup.is_suspended());
     }
 
     #[test]

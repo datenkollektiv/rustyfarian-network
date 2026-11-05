@@ -14,13 +14,20 @@ pub use client::{MqttClient, MqttMessage};
 pub use gate::NetworkGate;
 #[cfg(feature = "std")]
 pub use outbox::{Outbox, PendingPublish, TryClient};
-pub use session::{SessionAction, SessionInput, SessionMachine, SessionToken, SESSION_RETRY_MS};
+pub use session::{
+    ConnectStep, ConnectWorkPlan, SessionAction, SessionInput, SessionMachine, SessionToken,
+    SESSION_RETRY_MS,
+};
 
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.
 ///
 /// Uses ceiling division so that a timeout that is not an exact multiple of
 /// 100 ms is always fully respected — e.g. 5050 ms yields 51 iterations
 /// (5100 ms of polling) rather than 50 (5000 ms).
+#[deprecated(
+    note = "its only user is the deprecated ESP-IDF `MqttManager`: both tiers' builders wait \
+            on `MqttClient::wait_connected`; slated for removal in 1.0"
+)]
 pub fn connection_wait_iterations(timeout_ms: u64) -> u64 {
     timeout_ms.div_ceil(100)
 }
@@ -331,9 +338,11 @@ pub fn next_state(current: MqttConnectionState, event: MqttEvent) -> Option<Mqtt
 ///
 /// Uses only atomic `load` and `store`, so it builds on targets without
 /// atomic read-modify-write (`riscv32imc`).
+#[deprecated(note = "use SessionMachine / MqttHandle::state()")]
 #[derive(Debug)]
 pub struct SessionPhase(core::sync::atomic::AtomicU8);
 
+#[allow(deprecated)]
 impl SessionPhase {
     const ATTEMPTING: u8 = 0;
     const LOST: u8 = 1;
@@ -367,6 +376,7 @@ impl SessionPhase {
     }
 }
 
+#[allow(deprecated)]
 impl Default for SessionPhase {
     fn default() -> Self {
         Self::new()

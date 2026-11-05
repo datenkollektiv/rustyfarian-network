@@ -86,7 +86,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(retry_ms: u64, inputs: Sender<Msg>) -> Self {
+    pub(super) fn new(retry_ms: u64, inputs: Sender<Msg>) -> Self {
         Self {
             machine: Mutex::new(SessionMachine::with_retry(retry_ms)),
             ready: WaitList::new(),
@@ -104,16 +104,13 @@ impl Session {
         let _ = self.inputs.send(Msg::Input(input));
     }
 
-    /// Feeds the machine; wakes `wait_connected` once connect work made the session ready.
+    /// Feeds the machine; wakes `wait_connected` when it answers
+    /// [`SessionAction::Ready`].
     ///
-    /// Only the runner calls this: every action it returns is a driver call.
+    /// Only the runner calls this: every other action it returns is a driver call.
     pub(crate) fn poll(&self, input: SessionInput) -> SessionAction {
-        let (action, ready) = {
-            let mut machine = lock(&self.machine);
-            let action = machine.poll(input);
-            (action, machine.can_publish())
-        };
-        if ready && matches!(input, SessionInput::WorkDone(_)) {
+        let action = lock(&self.machine).poll(input);
+        if action == SessionAction::Ready {
             self.ready.wake_all();
         }
         action

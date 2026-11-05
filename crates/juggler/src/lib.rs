@@ -15,6 +15,7 @@
 //! | `ota` | `ota` | `heapless`, `sha2` |
 //! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless` (implies wifi+mqtt+lora) |
+//! | `flash-store` | `provisioning::flash_store` | `embedded-storage` (implies `provisioning`) |
 //! | `mock` | `wifi::mock`, `lora::mock`, `espnow::mock` | (implies wifi+lora+espnow) |
 //!
 //! ## Cargo features
@@ -72,7 +73,7 @@
 //! Each domain module re-exports its primary types at the crate root for ergonomic imports:
 //! - `wifi::*` exports [`WiFiConfig`](wifi::WiFiConfig), [`WifiDriver`](wifi::WifiDriver), etc.
 //! - `mqtt::*` exports [`MqttConnectionState`](mqtt::MqttConnectionState), validation functions, etc.
-//! - `lora::*` exports [`LoraRadio`](lora::LoraRadio), [`LorawanDevice`](lora::LorawanDevice), etc.
+//! - `lora::*` exports [`LoraRadio`](lora::LoraRadio), [`LorawanPhy`](lora::LorawanPhy), [`LorawanTicker`](lora::LorawanTicker), etc.
 //! - `espnow::*` exports [`EspNowDriver`](espnow::EspNowDriver), [`PeerTracker`](espnow::PeerTracker), etc.
 //! - `ota::*` exports [`OtaError`](ota::OtaError), [`StreamingVerifier`](ota::StreamingVerifier), etc.
 //! - `provisioning::*` exports [`ProvisioningState`](provisioning::ProvisioningState), [`SchemaProfile`](provisioning::SchemaProfile), etc.

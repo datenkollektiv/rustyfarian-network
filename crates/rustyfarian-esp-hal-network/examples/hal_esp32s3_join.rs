@@ -2,32 +2,32 @@
 //!
 //! Phase 5, Step 2: SX1262 hardware bring-up.
 //!
-//! Performs the minimal SPI sequence required to verify the radio is alive:
+//! Runs the shared SX1262 bring-up, `juggler::lora::sx1262::init` (re-exported as
+//! `rustyfarian_esp_hal_network::lora::sx1262`), the same step order the ESP-IDF
+//! tier runs (ADR 023 rung 1):
 //!
-//! 1. Hardware reset (GPIO 12, active-low)
-//! 2. Poll BUSY (GPIO 13) until low — chip signals readiness
-//! 3. `SetDIO3AsTCXOCtrl` — power the TCXO at 1.8 V via DIO3 (mandatory on this board)
-//! 4. `SetDio2AsRfSwitchCtrl` — enable automatic RF switch control via DIO2
-//! 5. `GetStatus` — read and decode the chip status byte
+//! 1. Hardware reset (GPIO 12, active-low), driven here
+//! 2. `SetStandby`, `SetPacketType(LoRa)`, `SetRfFrequency` (868.1 MHz, EU868)
+//! 3. `SetDIO3AsTCXOCtrl` — power the TCXO at 1.8 V via DIO3, 10 ms startup
+//! 4. `ClearDeviceErrors` — clear the expected `XOSC_START_ERR` before calibrating
+//! 5. `Calibrate`, `CalibrateImage`, PA / TX / buffer / modulation / packet / IRQ setup
+//! 6. `SetDio2AsRfSwitchCtrl` and the LoRaWAN public sync word
+//! 7. `GetStatus` — read and decode the chip status
+//!
+//! Every BUSY wait is bounded and polls `GetStatus` over SPI 1 ms apart.
 //!
 //! Expected output after a clean reset:
 //!
 //! ```text
-//! sx1262: reset complete, BUSY low
-//! sx1262: TCXO enabled (DIO3 @ 1.8 V, 5 ms startup)
-//! sx1262: RF switch control enabled (DIO2)
-//! sx1262: GetStatus -> 0x22 (chip_mode=STDBY_RC, cmd_status=idle)
+//! hal_esp32s3_join: SX1262 bring-up starting
+//! sx1262: reset pulsed
+//! sx1262: shared bring-up complete
+//! sx1262: GetStatus -> chip_mode=Some(StbyRC)
 //! sx1262: bring-up complete
 //! ```
 //!
-//! `cmd_status=idle` (0x1) is the normal post-reset state — the SX1262 datasheet
-//! marks 0x1 as "reserved" but in practice it means "last configuration command
-//! completed, no data to return".
-//! `cmd_status=ok` (0x2) only appears after commands that return a data payload.
-//! Both are healthy; `chip_mode=STDBY_RC` is the authoritative success indicator.
-//!
-//! If BUSY never clears or `GetStatus` returns `0x00`, the most likely cause is that
-//! `SetDIO3AsTCXOCtrl` was not sent — the TCXO has no power and the radio has no clock.
+//! If the bring-up reports `BusyTimeout(Reset)`, check wiring and power; a
+//! `BusyTimeout` on a later step names the command that stalled.
 //! See `docs/heltec-wifi-lora-32-v3.md` for the full pin reference and failure-mode table.
 //!
 //! ## Pin assignments (Heltec WiFi LoRa 32 V3)
@@ -56,8 +56,9 @@
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-use embedded_hal::digital::InputPin;
-use embedded_hal::spi::{Operation, SpiDevice};
+use core::convert::Infallible;
+
+use embedded_hal::digital::{ErrorType, OutputPin};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
@@ -66,6 +67,8 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_println::println;
+use rustyfarian_esp_hal_network::lora::sx1262::{self, SX126x};
+use rustyfarian_esp_hal_network::lora::{LoraConfig, Region};
 
 // Minimal panic handler — replace with `panic-halt` or `panic-probe` in production.
 #[panic_handler]
@@ -73,49 +76,46 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-/// Poll BUSY (active-high) until low, with a 10 ms time-based timeout.
-///
-/// Each iteration sleeps 10 µs so the total worst-case wait is bounded
-/// at ~10 ms regardless of CPU frequency or compiler optimisation level.
-/// Returns `true` if BUSY cleared, `false` on timeout.
-fn wait_busy_low(busy: &mut impl InputPin, delay: &Delay) -> bool {
-    for _ in 0..1_000 {
-        if !busy.is_high().unwrap_or(true) {
-            return true;
-        }
-        delay.delay_micros(10);
+/// The dev-dependency `juggler` (host-test features such as `ota-wire`) links
+/// `alloc` into every example, which then needs a global allocator. This
+/// bring-up never allocates, so an allocator that always fails is enough.
+struct NoHeap;
+
+// SAFETY: `alloc` returns null, which `GlobalAlloc` permits to signal failure;
+// `dealloc` is never reached because no allocation ever succeeds.
+unsafe impl core::alloc::GlobalAlloc for NoHeap {
+    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
+        core::ptr::null_mut()
     }
-    false
+
+    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {}
 }
 
-/// Decode the SX1262 status byte and return human-readable strings for each field.
-fn decode_status(status: u8) -> (&'static str, &'static str) {
-    let chip_mode = match (status >> 4) & 0x07 {
-        0x2 => "STDBY_RC",
-        0x3 => "STDBY_XOSC",
-        0x4 => "FS",
-        0x5 => "RX",
-        0x6 => "TX",
-        _ => "unknown",
-    };
-    let cmd_status = match (status >> 1) & 0x07 {
-        // 0x0 and 0x1: datasheet says "reserved" but 0x1 is the normal state
-        // after a write-only configuration command (no data payload to return).
-        0x0 | 0x1 => "idle",
-        0x2 => "data_available",
-        0x3 => "timeout",
-        0x5 => "error",
-        0x6 => "fail_to_exec",
-        0x7 => "tx_done",
-        _ => "reserved",
-    };
-    (chip_mode, cmd_status)
+#[global_allocator]
+static HEAP: NoHeap = NoHeap;
+
+/// The antenna pin `SX126x` asks for. The Heltec V3 drives its RF switch from
+/// DIO2 (`SetDio2AsRfSwitchCtrl`), so no GPIO is needed.
+struct NoAntennaPin;
+
+impl ErrorType for NoAntennaPin {
+    type Error = Infallible;
+}
+
+impl OutputPin for NoAntennaPin {
+    fn set_low(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    fn set_high(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
 }
 
 #[main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
-    let delay = Delay::new();
+    let mut delay = Delay::new();
 
     println!("hal_esp32s3_join: SX1262 bring-up starting");
 
@@ -129,11 +129,11 @@ fn main() -> ! {
 
     // BUSY is active-high — high means the chip is processing a command.
     // SX1262 drives this line; no pull resistor needed.
-    let mut busy = Input::new(peripherals.GPIO13, InputConfig::default());
+    let busy = Input::new(peripherals.GPIO13, InputConfig::default());
 
     // DIO1 is the join-accept / TX-done IRQ — not used in this bring-up step.
     // SX1262 drives this line; no pull resistor needed.
-    let _dio1 = Input::new(peripherals.GPIO14, InputConfig::default());
+    let dio1 = Input::new(peripherals.GPIO14, InputConfig::default());
 
     // --- SPI bus setup ------------------------------------------------------
 
@@ -151,101 +151,49 @@ fn main() -> ! {
 
     // Wrap SpiBus + CS pin into an SpiDevice — ExclusiveDevice asserts/deasserts
     // NSS automatically around each transaction.
-    let mut spi = ExclusiveDevice::new_no_delay(spi_bus, cs).unwrap();
+    let spi = ExclusiveDevice::new_no_delay(spi_bus, cs).unwrap();
 
     // --- Step 1: Hardware reset ---------------------------------------------
     //
-    // Assert RESET low for 200 µs, then release.
-    // SX1262 datasheet requires at least 100 µs; 200 µs gives comfortable margin.
+    // Assert RESET low for 200 µs, then release (datasheet: at least 100 µs).
+    // Driven here rather than through `SX126x::reset`, which wraps the pulse in
+    // `critical_section::with` (bug 007); the shared bring-up waits out the reset.
 
     rst.set_low();
     delay.delay_micros(200);
     rst.set_high();
+    println!("sx1262: reset pulsed");
 
-    // Wait for BUSY to go low — chip signals readiness within ~3 ms after reset.
-    if !wait_busy_low(&mut busy, &delay) {
-        println!("sx1262: ERROR — BUSY did not clear after reset (check wiring or power)");
+    // --- Steps 2–6: shared bring-up -----------------------------------------
+
+    let mut radio = SX126x::new(spi, (rst, busy, NoAntennaPin, dio1));
+    let config = LoraConfig {
+        region: Region::EU868,
+        ..LoraConfig::default()
+    };
+    if let Err(e) = sx1262::init(
+        &mut radio,
+        &mut delay,
+        &config,
+        sx1262::DEFAULT_BUSY_POLL_BOUND,
+    ) {
+        println!("sx1262: ERROR — bring-up failed: {:?}", e);
         loop {}
     }
-    println!("sx1262: reset complete, BUSY low");
+    println!("sx1262: shared bring-up complete");
 
-    // --- Step 2: SetDIO3AsTCXOCtrl (mandatory on Heltec V3) ----------------
+    // --- Step 7: GetStatus --------------------------------------------------
     //
-    // The Heltec V3 TCXO is powered from the SX1262 DIO3 output pin, not from a
-    // fixed supply rail.  Without this command the radio has no reference clock
-    // and every subsequent command will stall or return garbage.
-    //
-    // Parameters:
-    //   0x97        = SetDIO3AsTCXOCtrl opcode
-    //   0x02        = 1.8 V output (register code)
-    //   0x00 0x01 0x40 = 320 ticks × 15.625 µs/tick = 5 ms startup delay
+    // Expected chip_mode = StbyRC after the bring-up.
 
-    spi.transaction(&mut [Operation::Write(&[0x97, 0x02, 0x00, 0x01, 0x40])])
-        .unwrap();
-
-    if !wait_busy_low(&mut busy, &delay) {
-        println!("sx1262: ERROR — BUSY did not clear after SetDIO3AsTCXOCtrl");
-        loop {}
-    }
-    println!("sx1262: TCXO enabled (DIO3 @ 1.8 V, 5 ms startup)");
-
-    // --- Step 3: SetDio2AsRfSwitchCtrl -------------------------------------
-    //
-    // Configures DIO2 to drive the onboard RF switch automatically:
-    //   high during TX, low otherwise.
-    // Without this the RF switch position is undefined and TX/RX is unreliable.
-    //
-    // Parameters:
-    //   0x9D = SetDio2AsRfSwitchCtrl opcode
-    //   0x01 = enable
-
-    spi.transaction(&mut [Operation::Write(&[0x9D, 0x01])])
-        .unwrap();
-
-    if !wait_busy_low(&mut busy, &delay) {
-        println!("sx1262: ERROR — BUSY did not clear after SetDio2AsRfSwitchCtrl");
-        loop {}
-    }
-    println!("sx1262: RF switch control enabled (DIO2)");
-
-    // --- Step 4: GetStatus --------------------------------------------------
-    //
-    // Reads the chip status byte to confirm the radio is alive and in STDBY_RC.
-    //
-    // SPI frame:
-    //   MOSI: [0xC0, 0x00]   (opcode + NOP)
-    //   MISO: [?,    status] (status returned during the NOP byte)
-    //
-    // Expected status byte = 0x22:
-    //   bits 6:4 = 0x2 → chip_mode = STDBY_RC
-    //   bits 3:1 = 0x1 → cmd_status = idle (normal after a configuration command)
-
-    let mut rx = [0u8; 2];
-    spi.transaction(&mut [Operation::Transfer(&mut rx, &[0xC0, 0x00])])
-        .unwrap();
-
-    if !wait_busy_low(&mut busy, &delay) {
-        println!("sx1262: ERROR — BUSY did not clear after GetStatus");
-        loop {}
-    }
-
-    let status = rx[1];
-    let (chip_mode, cmd_status) = decode_status(status);
-    println!(
-        "sx1262: GetStatus -> 0x{:02x} (chip_mode={}, cmd_status={})",
-        status, chip_mode, cmd_status
-    );
-
-    if status == 0x00 {
-        println!(
-            "sx1262: WARNING — status is 0x00; likely TCXO not powered \
-             or SPI wiring issue"
-        );
+    match radio.get_status() {
+        Ok(status) => println!("sx1262: GetStatus -> chip_mode={:?}", status.chip_mode()),
+        Err(_) => println!("sx1262: WARNING — GetStatus failed (SPI wiring?)"),
     }
 
     // --- Done ---------------------------------------------------------------
 
     println!("sx1262: bring-up complete");
-    println!("Next step: implement full SX1262 init in EspHalLoraRadio and attempt OTAA join");
+    println!("Next step: implement EspHalLoraRadio on the shared bring-up and attempt OTAA join");
     loop {}
 }

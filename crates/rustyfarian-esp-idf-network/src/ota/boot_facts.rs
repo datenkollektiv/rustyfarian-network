@@ -11,39 +11,16 @@
 //! v1 two-slot assumption: partition labels are mapped with `slot_for_partition`, which knows only `ota_0` and `ota_1`.
 //! Any other label, including `ota_2` and up, maps to `FACTORY_SLOT`, so a partition table with more than two OTA slots is misreported (a running `ota_2` looks like the factory image).
 
-use std::time::Duration;
-
 use embedded_svc::ota::SlotState as SvcSlotState;
 use esp_idf_svc::ota::EspOta;
 use esp_idf_svc::sys::{EspError, ESP_ERR_INVALID_STATE, ESP_ERR_NOT_FOUND};
 use juggler::ota::persist::{
-    note_boot_slot, slot_for_partition, slot_label, BusyTally, HardwareFacts, HardwareReadError,
-    NoteBoot, NoteBootError, OtaStore, UpdateSlot,
+    note_boot_slot, read_with_busy_retry, slot_for_partition, slot_label, BusyRetry, HardwareFacts,
+    HardwareReadError, NoteBoot, NoteBootError, OtaStore, UpdateSlot,
 };
 use juggler::ota::{SlotId, SlotState};
 
 use super::store::EspNvsKv;
-
-/// How often and how patiently to retry when the `EspOta` singleton is in use.
-///
-/// `EspOta` is a process singleton, so a download in progress makes it busy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BusyRetry {
-    /// Number of tries; values below 1 count as 1.
-    pub tries: u8,
-    /// Pause between two tries.
-    pub delay: Duration,
-}
-
-impl Default for BusyRetry {
-    /// Five tries, 200 ms apart (about 800 ms in the worst case).
-    fn default() -> Self {
-        Self {
-            tries: 5,
-            delay: Duration::from_millis(200),
-        }
-    }
-}
 
 fn map_state(state: SvcSlotState) -> SlotState {
     match state {
@@ -101,6 +78,11 @@ impl Failure {
             busy: false,
         }
     }
+
+    /// The `(code, busy)` pair `read_with_busy_retry` tallies.
+    fn pair(self) -> (i32, bool) {
+        (self.code, self.busy)
+    }
 }
 
 /// One short-lived `EspOta` handle: both slots are read on it and it is dropped before returning.
@@ -130,17 +112,11 @@ fn read_once() -> Result<HardwareFacts, Failure> {
 ///
 /// [`HardwareReadError::Busy`] when every failure was `EspOta::new()` reporting the singleton in use, otherwise [`HardwareReadError::Read`] with the last code.
 pub fn read_hardware_facts(retry: BusyRetry) -> Result<HardwareFacts, HardwareReadError> {
-    let mut tally = BusyTally::new();
-    for attempt in 0..retry.tries.max(1) {
-        if attempt > 0 {
-            std::thread::sleep(retry.delay);
-        }
-        match read_once() {
-            Ok(facts) => return Ok(facts),
-            Err(failure) => tally.record(failure.code, failure.busy),
-        }
-    }
-    Err(tally.into_error())
+    read_with_busy_retry(
+        retry,
+        || read_once().map_err(Failure::pair),
+        std::thread::sleep,
+    )
 }
 
 /// The slot the bootloader will select on the next boot, read on its own short-lived `EspOta` handle (dropped before returning).
@@ -152,17 +128,11 @@ fn read_next_boot_once() -> Result<SlotId, Failure> {
 
 /// Reads the next-boot slot with the same busy handling as [`read_hardware_facts`].
 fn read_next_boot(retry: BusyRetry) -> Result<SlotId, HardwareReadError> {
-    let mut tally = BusyTally::new();
-    for attempt in 0..retry.tries.max(1) {
-        if attempt > 0 {
-            std::thread::sleep(retry.delay);
-        }
-        match read_next_boot_once() {
-            Ok(slot) => return Ok(slot),
-            Err(failure) => tally.record(failure.code, failure.busy),
-        }
-    }
-    Err(tally.into_error())
+    read_with_busy_retry(
+        retry,
+        || read_next_boot_once().map_err(Failure::pair),
+        std::thread::sleep,
+    )
 }
 
 fn slot_name(slot: SlotId) -> &'static str {
@@ -266,7 +236,7 @@ mod tests {
     fn default_retry_is_the_clock_bound() {
         let retry = BusyRetry::default();
         assert_eq!(retry.tries, 5);
-        assert_eq!(retry.delay, Duration::from_millis(200));
+        assert_eq!(retry.delay, std::time::Duration::from_millis(200));
     }
 
     #[test]

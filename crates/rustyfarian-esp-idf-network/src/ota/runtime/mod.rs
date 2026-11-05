@@ -54,11 +54,8 @@ use std::thread;
 use anyhow::Context;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use juggler::mqtt::validate_publish_topic;
-use juggler::ota::runtime::initial_admission;
-use juggler::ota::{
-    reconcile_boot, BootDisposition, BootFault, FailReason, OtaCommand, OtaStore, StoreError,
-    Version,
-};
+use juggler::ota::runtime::RuntimeFlags;
+use juggler::ota::{reconcile_boot, FailReason, OtaCommand, OtaStore, StoreError, Version};
 
 pub use intake::OtaSubmitter;
 pub use juggler::ota::{
@@ -260,17 +257,14 @@ fn launch(
     if outcome.warnings != Default::default() {
         log::warn!("[ota] boot bookkeeping warnings: {:?}", outcome.warnings);
     }
-    let admit = initial_admission(&outcome);
-    flags.set_admission_open(admit);
-    flags.set_health_settled(admit);
-    flags.set_refuse_mark_valid(outcome.refuse_mark_valid);
-    flags.set_roll_back_now_at_boot(outcome.roll_back_now);
-    flags.set_records_suspect(matches!(
-        outcome.disposition,
-        BootDisposition::FailedClosed(BootFault::Store(_))
-    ));
+    let boot_flags = RuntimeFlags::from_boot(&outcome);
+    flags.set_admission_open(boot_flags.admission_open);
+    flags.set_health_settled(boot_flags.health_settled);
+    flags.set_refuse_mark_valid(boot_flags.refuse_mark_valid);
+    flags.set_roll_back_now_at_boot(boot_flags.roll_back_now_at_boot);
+    flags.set_records_suspect(boot_flags.records_suspect);
 
-    if outcome.roll_back_now {
+    if boot_flags.roll_back_now_at_boot {
         roll_back_at_boot(&cfg);
     }
 

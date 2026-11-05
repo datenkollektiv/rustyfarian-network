@@ -46,7 +46,7 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - [x] Does the trait cover receive, or does each tier keep its own receive path? — yes, see Requirements
 - [x] Do the sync `send_and_wait` forms converge (ESP-IDF takes `timeout_ms`, esp-hal does not)? — no, a capability row; esp-hal's sync send spins in esp-radio
 - [ ] Stack and heap cost of the `espnow-tx` worker, measured against bug 013.
-- [ ] Hardware gate: mixed IDF/hal fleet run, shared with the esp-hal-espnow-v1 validation plan.
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## State
 - [x] Design approved
@@ -62,7 +62,7 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 
 - One unchanged generic application compiles against both tiers (parity compile check plus an example pair, like the tier-parity LWT pair).
 - Host tests: cancellation without stale results, queue pressure classified `Local`, sends during a scan refused.
-- Hardware: mixed-tier fleet in both directions (ESP-IDF peer with esp-hal coordinator and the reverse).
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 </details>
 

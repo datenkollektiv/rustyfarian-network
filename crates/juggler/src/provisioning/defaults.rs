@@ -5,7 +5,7 @@
 //! where the [`ProvisioningStore`](crate::provisioning) holds nothing to
 //! pre-fill from. It is consumed by both provisioning tiers
 //! (`rustyfarian-esp-hal-network` and `rustyfarian-esp-idf-network`) as the
-//! empty-store fallback for their `load_prefill` step.
+//! empty-store fallback of [`Prefill::select`](crate::provisioning::Prefill::select).
 //!
 //! # Security
 //!
@@ -40,7 +40,7 @@
 /// the active profile are ignored.
 ///
 /// The device name is intentionally absent — it flows through the portal's
-/// existing `device_name` configuration and its `{{DEV_NAME}}` fallback.
+/// `device_name` configuration into [`Prefill::select`](crate::provisioning::Prefill::select).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PortalDefaults<'a> {
     /// Wi-Fi SSID default (both profiles).

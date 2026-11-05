@@ -6,14 +6,22 @@
 //! return [`StoreError`] for any failure mode; error variants carry only
 //! lengths and expectations — never input bytes — so error output cannot leak
 //! credentials.
+//!
+//! This is the shared rung-1 driver of ADR 023: generic over
+//! `embedded-storage`'s [`NorFlash`], with no chip-specific code, so any tier
+//! with a `NorFlash` partition can use it (the bare-metal tier re-exports it as
+//! `rustyfarian_esp_hal_network::provisioning::ProvisioningStore`). The
+//! ESP-IDF tier keeps its NVS-backed store.
+
+mod record;
 
 use core::fmt;
 
+use crate::provisioning::ProvisioningConfig;
 use embedded_storage::nor_flash::NorFlash;
 use heapless::Vec as HVec;
-use juggler::provisioning::ProvisioningConfig;
 
-use super::record::{
+use record::{
     decode_record, encode_record, pad_to_write_granularity, pick_active, DecodedRecord,
     HEADER_FIXED, RECORD_LEN_OFFSET, SECTOR_SIZE, STORE_SIZE,
 };
@@ -811,11 +819,11 @@ mod tests {
     use super::test_flash::{MockFlash, MockFlash8KiB, MockFlashWordRead};
     use super::test_flash_instrumented::InstrumentedFlash;
     use super::*;
-    use heapless::String as HS;
-    use juggler::provisioning::{
+    use crate::provisioning::{
         config::{DEVICE_NAME_MAX_LEN, MQTT_HOST_MAX_LEN, OTA_URL_MAX_LEN},
         profile::MqttFields,
     };
+    use heapless::String as HS;
 
     fn hs<const N: usize>(s: &str) -> HS<N> {
         let mut h = HS::new();
@@ -832,8 +840,8 @@ mod tests {
             None,
         );
         ProvisioningConfig::from_storage_parts(
-            hs::<{ juggler::wifi::SSID_MAX_LEN }>("my-net"),
-            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
+            hs::<{ crate::wifi::SSID_MAX_LEN }>("my-net"),
+            hs::<{ crate::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
@@ -940,8 +948,8 @@ mod tests {
         // `sample_config()` encodes to 112 B, which is word-sized; one more
         // SSID byte makes the record 113 B so the read must be rounded up.
         let cfg = ProvisioningConfig::from_storage_parts(
-            hs::<{ juggler::wifi::SSID_MAX_LEN }>("my-net1"),
-            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
+            hs::<{ crate::wifi::SSID_MAX_LEN }>("my-net1"),
+            hs::<{ crate::wifi::PASSWORD_MAX_LEN }>("p@ssw0rd1"),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
@@ -999,7 +1007,7 @@ mod tests {
 
     #[test]
     fn store_round_trips_config_with_extras_beyond_512_bytes() {
-        let mut extras: heapless::Vec<_, { juggler::provisioning::EXTRA_FIELDS_MAX }> =
+        let mut extras: heapless::Vec<_, { crate::provisioning::EXTRA_FIELDS_MAX }> =
             heapless::Vec::new();
         for i in 0..8u8 {
             let mut key = HS::new();
@@ -1010,13 +1018,13 @@ mod tests {
                 value.push((b'0' + i) as char).unwrap();
             }
             extras
-                .push(juggler::provisioning::ExtraField { key, value })
+                .push(crate::provisioning::ExtraField { key, value })
                 .unwrap();
         }
         let base = sample_config();
         let cfg = ProvisioningConfig::from_storage_parts(
-            hs::<{ juggler::wifi::SSID_MAX_LEN }>(base.wifi_ssid()),
-            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>(base.wifi_password()),
+            hs::<{ crate::wifi::SSID_MAX_LEN }>(base.wifi_ssid()),
+            hs::<{ crate::wifi::PASSWORD_MAX_LEN }>(base.wifi_password()),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>(base.device_name()),
             None,
@@ -1025,7 +1033,7 @@ mod tests {
         );
 
         let mut staging = [0u8; SECTOR_SIZE];
-        let len = super::super::record::encode_record(&cfg, 1, &mut staging).unwrap();
+        let len = super::record::encode_record(&cfg, 1, &mut staging).unwrap();
         assert!(len > 512 && len <= MAX_RECORD_LEN, "record is {len} B");
 
         let mut store = ProvisioningStore::open(MockFlash::new(), 0, 8192).unwrap();
@@ -1070,7 +1078,7 @@ mod tests {
     /// `decode_record` receives the right slice.
     #[test]
     fn try_read_sector_reads_only_record_len_bytes() {
-        use super::super::record::encode_record;
+        use super::record::encode_record;
 
         let cfg = sample_config();
 

@@ -10,6 +10,8 @@
 //! # Roles
 //!
 //! - Callers: [`TxCore::submit`] a frame, then [`TxCore::poll_result`] until it is ready.
+//!   A caller that transmits by itself (a blocking send that owns the radio for the moment)
+//!   asks [`TxCore::admit_direct`] instead, which runs the same checks without a slot.
 //! - One runner (a worker thread or a task): [`TxCore::next`] hands out the next frame, the
 //!   runner transmits it and reports the result with [`TxCore::complete`].
 //! - A scan owner brackets its work with [`TxCore::begin_scan`] and [`TxCore::end_scan`].
@@ -26,7 +28,10 @@
 //!   that reads [`TxCore::is_in_flight`] under the same lock sees either "started" (wait for the
 //!   result) or "expired or still queued" (never transmitted); there is no window in between.
 //! - Results are per slot and keyed by [`TxId`]: a caller never takes another request's result,
-//!   and a result that arrives for an abandoned or unknown id is dropped.
+//!   and a result that arrives for an abandoned or unknown id is dropped; [`TxCore::complete`]
+//!   says which ([`Completed`]).
+//! - A full queue is a wait, not an error: [`TxCore::submit`] answers [`Refusal::Full`] until the
+//!   caller's deadline has passed and [`Refusal::Expired`] from then on.
 //! - One slot is reserved for the scan's own probe ([`PROBE_RESERVED_SLOTS`]): application
 //!   submissions get [`Refusal::Full`] when only that slot is free, so a queue that
 //!   application callers filled (and whose preempted requests still hold their slots until the
@@ -116,6 +121,8 @@ pub enum Refusal {
     Broadcast,
     /// [`TxCore::shutdown`] was called.
     Shutdown,
+    /// No slot was free and the caller's deadline has passed: the request was never queued.
+    Expired,
 }
 
 /// Why [`TxCore::begin_scan`] refused.
@@ -133,15 +140,28 @@ pub enum Completion<R> {
     /// The runner transmitted the frame and reported this result.
     Done(R),
     /// The deadline passed before the transmission started; nothing was sent.
-    ///
-    /// Also reported for an id that is no longer live (already consumed or abandoned), never
-    /// another request's result.
     Expired,
     /// An application request was still queued when a scan began; nothing was sent.
     /// Tiers classify it as a local failure.
     Preempted,
     /// [`TxCore::shutdown`] ended the request, in flight or not; its late result is ignored.
     Shutdown,
+    /// The id is no longer live (its result was already taken, or it was abandoned): there is
+    /// nothing to report, and never another request's result.
+    /// A caller that sees it has lost track of its own request.
+    Unknown,
+}
+
+/// What [`TxCore::complete`] did with a result.
+#[derive(Debug, Clone)]
+pub enum Completed {
+    /// The result was stored for its caller; wake the waker, if any, outside the lock.
+    Delivered(Option<Waker>),
+    /// The caller had abandoned the request: the result was discarded and the slot freed.
+    Discarded,
+    /// No frame with this id is in flight (stale, duplicate or unknown, or ended by
+    /// [`TxCore::shutdown`]): the result was dropped.
+    Unknown,
 }
 
 /// What [`TxCore::abandon`] did.
@@ -275,9 +295,12 @@ impl<R, const N: usize> TxCore<R, N> {
     /// Queues a frame.
     ///
     /// `deadline` is an absolute time on the caller's clock; `None` waits for ever.
-    /// Checked in this order: shutdown, payload size, broadcast, scan gate, free slot.
+    /// Checked in this order: shutdown, payload size, broadcast, scan gate (the checks of
+    /// [`admit_direct`](Self::admit_direct)), then a free slot.
     /// An application frame needs more than [`PROBE_RESERVED_SLOTS`] free slots; a probe takes
     /// any free one.
+    /// Without a free slot the answer is [`Refusal::Full`] (wait for a slot and retry) while
+    /// `now` is before `deadline`, and [`Refusal::Expired`] once it has reached it.
     /// Broadcast is refused for [`SendKind::App`] only: `send_acked` promises a unicast MAC ACK,
     /// so use `EspNowDriver::send` ([`SendKind::Unacked`]) for broadcast.
     ///
@@ -292,19 +315,7 @@ impl<R, const N: usize> TxCore<R, N> {
         deadline: Option<Duration>,
         kind: SendKind,
     ) -> Result<TxId, Refusal> {
-        let _ = now;
-        if self.shut_down {
-            return Err(Refusal::Shutdown);
-        }
-        if data.len() > MAX_DATA_LEN {
-            return Err(Refusal::TooLarge);
-        }
-        if kind == SendKind::App && mac == BROADCAST_MAC {
-            return Err(Refusal::Broadcast);
-        }
-        if self.scanning && kind != SendKind::Probe {
-            return Err(Refusal::Scanning);
-        }
+        self.admit_direct(mac, data.len(), kind)?;
         let free = self
             .slots
             .iter()
@@ -316,7 +327,11 @@ impl<R, const N: usize> TxCore<R, N> {
             PROBE_RESERVED_SLOTS + 1
         };
         if free < needed {
-            return Err(Refusal::Full);
+            return Err(if expired(deadline, now) {
+                Refusal::Expired
+            } else {
+                Refusal::Full
+            });
         }
         let index = self
             .slots
@@ -346,6 +361,33 @@ impl<R, const N: usize> TxCore<R, N> {
         Ok(TxId(id))
     }
 
+    /// Admits a frame that the caller transmits itself, without a slot (a blocking send).
+    ///
+    /// Runs the checks of [`submit`](Self::submit) in the same order: shutdown, payload size
+    /// (`len`), broadcast for [`SendKind::App`], scan gate.
+    /// Call it under the same lock that guards the radio hand-off, so a scan admitted after it
+    /// waits for the frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Shutdown`], [`Refusal::TooLarge`], [`Refusal::Broadcast`] or
+    /// [`Refusal::Scanning`].
+    pub fn admit_direct(&self, mac: MacAddress, len: usize, kind: SendKind) -> Result<(), Refusal> {
+        if self.shut_down {
+            return Err(Refusal::Shutdown);
+        }
+        if len > MAX_DATA_LEN {
+            return Err(Refusal::TooLarge);
+        }
+        if kind == SendKind::App && mac == BROADCAST_MAC {
+            return Err(Refusal::Broadcast);
+        }
+        if self.scanning && kind != SendKind::Probe {
+            return Err(Refusal::Scanning);
+        }
+        Ok(())
+    }
+
     /// True when a slot, in any non-free state, holds `id`.
     fn is_live(&self, id: u32) -> bool {
         self.slots
@@ -362,10 +404,11 @@ impl<R, const N: usize> TxCore<R, N> {
 
     /// Polls the result of request `id` and registers `waker` for it.
     ///
-    /// `Ready` consumes the result and frees the slot.
+    /// `Ready` consumes the result and frees the slot; an id that is no longer live is
+    /// [`Completion::Unknown`].
     pub fn poll_result(&mut self, id: TxId, waker: &Waker) -> Poll<Completion<R>> {
         let Some(slot) = self.caller_slot(id) else {
-            return Poll::Ready(Completion::Expired);
+            return Poll::Ready(Completion::Unknown);
         };
         match core::mem::replace(&mut slot.state, State::Free) {
             State::Done(result) => {
@@ -389,7 +432,7 @@ impl<R, const N: usize> TxCore<R, N> {
                 register(&mut slot.waker, waker);
                 Poll::Pending
             }
-            State::Free | State::AbandonedInFlight => Poll::Ready(Completion::Expired),
+            State::Free | State::AbandonedInFlight => Poll::Ready(Completion::Unknown),
         }
     }
 
@@ -481,21 +524,23 @@ impl<R, const N: usize> TxCore<R, N> {
         }
     }
 
-    /// Reports the result of the frame handed out as `id`; returns the caller's waker, which
-    /// the tier wakes outside its lock.
+    /// Reports the result of the frame handed out as `id`; see [`Completed`].
     ///
-    /// A result for an id that is not in flight (stale, unknown) is dropped and returns `None`,
-    /// as does the result of an abandoned request.
-    pub fn complete(&mut self, id: TxId, result: R) -> Option<Waker> {
-        let slot = self.slots.iter_mut().find(|slot| {
+    /// A delivered result carries the caller's waker, which the tier wakes outside its lock.
+    /// The result of an abandoned request is discarded, and one for an id that is not in flight
+    /// (stale, duplicate, unknown, or ended by shutdown) is dropped.
+    pub fn complete(&mut self, id: TxId, result: R) -> Completed {
+        let Some(slot) = self.slots.iter_mut().find(|slot| {
             slot.id == id.0 && matches!(slot.state, State::InFlight | State::AbandonedInFlight)
-        })?;
+        }) else {
+            return Completed::Unknown;
+        };
         if matches!(slot.state, State::AbandonedInFlight) {
             slot.release();
-            return None;
+            return Completed::Discarded;
         }
         slot.state = State::Done(result);
-        slot.waker.take()
+        Completed::Delivered(slot.waker.take())
     }
 
     // -- scan gate ---------------------------------------------------------------------------
@@ -611,17 +656,24 @@ impl<R, const N: usize> TxCore<R, N> {
 /// applied it, so a scan's exclusion lasts until channel, TX power and peer are restored.
 /// Both calls belong under the same lock as the [`TxCore`] they read, so the decision and the
 /// completion cannot interleave.
+#[deprecated(
+    since = "0.7.0",
+    note = "use `ScanGate::cancel_running` and `ScanGate::on_probe_complete`, which also own the \
+            scan exclusion"
+)]
 #[derive(Debug)]
 pub struct DeferredRestore<P> {
     plan: Option<P>,
 }
 
+#[allow(deprecated)]
 impl<P> Default for DeferredRestore<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl<P> DeferredRestore<P> {
     /// Nothing deferred.
     #[must_use]
@@ -704,6 +756,14 @@ mod tests {
             .unwrap()
     }
 
+    /// The waker of a delivered result; `None` when it was not delivered or had no waker.
+    fn delivered(completed: Completed) -> Option<Waker> {
+        match completed {
+            Completed::Delivered(waker) => waker,
+            Completed::Discarded | Completed::Unknown => None,
+        }
+    }
+
     /// Runs `next`, collecting the wakers of expired requests.
     fn step(core: &mut Core, now: u64) -> (Option<(TxId, Vec<u8>)>, Vec<Waker>) {
         let mut woken = Vec::new();
@@ -759,7 +819,7 @@ mod tests {
         assert_eq!(core.poll_result(b, &wb), Poll::Pending);
 
         step(&mut core, 0);
-        let woken = core.complete(a, 11).expect("a's waker");
+        let woken = delivered(core.complete(a, 11)).expect("a's waker");
         woken.wake();
         assert_eq!((wakes(&ca), wakes(&cb)), (1, 0));
         // b's poll must not see a's result.
@@ -767,7 +827,7 @@ mod tests {
         assert_eq!(core.poll_result(a, &wa), Poll::Ready(Completion::Done(11)));
 
         step(&mut core, 0);
-        core.complete(b, 22).expect("b's waker").wake();
+        delivered(core.complete(b, 22)).expect("b's waker").wake();
         assert_eq!(wakes(&cb), 1);
         assert_eq!(core.poll_result(b, &wb), Poll::Ready(Completion::Done(22)));
     }
@@ -975,7 +1035,10 @@ mod tests {
         assert_ne!(a, b);
         // The abandoned frame is still on the air, so b waits.
         assert_eq!(step(&mut core, 1).0, None);
-        assert!(core.complete(a, 1).is_none(), "discarded, no waker");
+        assert!(
+            matches!(core.complete(a, 1), Completed::Discarded),
+            "discarded, no waker"
+        );
         assert_eq!(
             core.poll_result(b, &w),
             Poll::Pending,
@@ -984,8 +1047,8 @@ mod tests {
         assert_eq!(step(&mut core, 2).0, Some((b, b"b".to_vec())));
         core.complete(b, 2);
         assert_eq!(core.poll_result(b, &w), Poll::Ready(Completion::Done(2)));
-        // Polling the abandoned id never yields anything but Expired.
-        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Expired));
+        // Polling the abandoned id never yields anything but Unknown.
+        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Unknown));
     }
 
     #[test]
@@ -999,12 +1062,12 @@ mod tests {
         let b = app(&mut core, 0, b"b", None);
         assert_eq!(step(&mut core, 1).0.map(|f| f.0), Some(b));
         // A late duplicate for a must not complete b.
-        assert!(core.complete(a, 99).is_none());
+        assert!(matches!(core.complete(a, 99), Completed::Unknown));
         assert!(core.is_in_flight(b));
         assert_eq!(core.poll_result(b, &w), Poll::Pending);
         // Nor does a completion for a frame that was never handed out.
         let c = app(&mut core, 0, b"c", None);
-        assert!(core.complete(c, 98).is_none());
+        assert!(matches!(core.complete(c, 98), Completed::Unknown));
         assert_eq!(core.poll_result(c, &w), Poll::Pending);
     }
 
@@ -1019,7 +1082,7 @@ mod tests {
         let b = app(&mut core, 0, b"b", None);
         step(&mut core, 0);
         core.complete(b, 2);
-        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Expired));
+        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Unknown));
         assert_eq!(core.poll_result(b, &w), Poll::Ready(Completion::Done(2)));
     }
 
@@ -1227,7 +1290,7 @@ mod tests {
         assert!(!core.is_in_flight(a));
         assert!(core.can_start_scan_io());
         // The send callback firing later is ignored.
-        assert!(core.complete(a, 9).is_none());
+        assert!(matches!(core.complete(a, 9), Completed::Unknown));
         assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Shutdown));
         assert_eq!(core.poll_result(b, &w), Poll::Ready(Completion::Shutdown));
         assert_eq!(
@@ -1257,6 +1320,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn a_restore_requested_with_the_air_clear_comes_straight_back() {
         let mut core = Core::new();
         let mut deferred = DeferredRestore::new();
@@ -1267,6 +1331,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn a_restore_requested_mid_probe_waits_for_the_probe_to_complete() {
         let mut core = Core::new();
         let mut deferred = DeferredRestore::new();
@@ -1287,6 +1352,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn the_exclusion_outlasts_the_deferral() {
         let mut core = Core::new();
         let mut deferred = DeferredRestore::new();
@@ -1307,5 +1373,202 @@ mod tests {
         );
         core.end_scan();
         assert!(core.submit(ms(0), MAC, b"x", None, SendKind::App).is_ok());
+    }
+
+    #[test]
+    fn complete_unknown_id_is_unknown() {
+        let mut core = Core::new();
+        let queued = app(&mut core, 0, b"a", None);
+        // Queued, never handed out: not in flight.
+        assert!(matches!(core.complete(queued, 1), Completed::Unknown));
+        let (w, _) = counting_waker();
+        assert_eq!(core.poll_result(queued, &w), Poll::Pending);
+    }
+
+    #[test]
+    fn complete_abandoned_is_discarded() {
+        let mut core = Core::new();
+        let a = app(&mut core, 0, b"a", None);
+        step(&mut core, 0);
+        core.abandon(a);
+        assert!(matches!(core.complete(a, 1), Completed::Discarded));
+        // The slot is free: a duplicate callback for the same id is now unknown.
+        assert!(matches!(core.complete(a, 1), Completed::Unknown));
+    }
+
+    #[test]
+    fn complete_live_returns_delivered() {
+        let mut core = Core::new();
+        let a = app(&mut core, 0, b"a", None);
+        step(&mut core, 0);
+        assert!(matches!(core.complete(a, 1), Completed::Delivered(None)));
+        let (w, c) = counting_waker();
+        let b = app(&mut core, 0, b"b", None);
+        assert_eq!(core.poll_result(b, &w), Poll::Pending);
+        step(&mut core, 0);
+        delivered(core.complete(b, 2))
+            .expect("b registered a waker")
+            .wake();
+        assert_eq!(wakes(&c), 1);
+    }
+
+    #[test]
+    fn poll_result_for_dead_id_is_unknown_not_expired() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        let a = app(&mut core, 0, b"a", None);
+        step(&mut core, 0);
+        core.complete(a, 1);
+        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Done(1)));
+        assert_eq!(core.poll_result(a, &w), Poll::Ready(Completion::Unknown));
+        assert_eq!(core.poll_at(a, ms(5), &w), Poll::Ready(Completion::Unknown));
+        let b = app(&mut core, 0, b"b", None);
+        core.abandon(b);
+        assert_eq!(core.poll_result(b, &w), Poll::Ready(Completion::Unknown));
+    }
+
+    #[test]
+    fn submit_full_before_deadline_is_full() {
+        let mut core = Core::new();
+        for _ in 0..3 {
+            app(&mut core, 0, b"x", None);
+        }
+        assert_eq!(
+            core.submit(ms(99), MAC, b"x", Some(ms(100)), SendKind::App),
+            Err(Refusal::Full)
+        );
+        assert_eq!(
+            core.submit(ms(99), MAC, b"x", None, SendKind::App),
+            Err(Refusal::Full),
+            "no deadline: a full queue is always a wait"
+        );
+    }
+
+    #[test]
+    fn submit_full_after_deadline_is_expired() {
+        let mut core = Core::new();
+        for _ in 0..3 {
+            app(&mut core, 0, b"x", None);
+        }
+        assert_eq!(
+            core.submit(ms(100), MAC, b"x", Some(ms(100)), SendKind::App),
+            Err(Refusal::Expired)
+        );
+        // A free slot admits even a request whose deadline has passed: `next` expires it.
+        let mut core = Core::new();
+        let late = core
+            .submit(ms(100), MAC, b"x", Some(ms(100)), SendKind::App)
+            .unwrap();
+        assert_eq!(step(&mut core, 100).0, None);
+        let (w, _) = counting_waker();
+        assert_eq!(core.poll_result(late, &w), Poll::Ready(Completion::Expired));
+    }
+
+    #[test]
+    fn admit_direct_refuses_broadcast_for_app() {
+        let core = Core::new();
+        assert_eq!(
+            core.admit_direct(BROADCAST_MAC, 1, SendKind::App),
+            Err(Refusal::Broadcast)
+        );
+        assert_eq!(core.admit_direct(MAC, 1, SendKind::App), Ok(()));
+    }
+
+    #[test]
+    fn admit_direct_allows_broadcast_for_unacked() {
+        let core = Core::new();
+        assert_eq!(
+            core.admit_direct(BROADCAST_MAC, MAX_DATA_LEN, SendKind::Unacked),
+            Ok(())
+        );
+        assert_eq!(
+            core.admit_direct(BROADCAST_MAC, MAX_DATA_LEN + 1, SendKind::Unacked),
+            Err(Refusal::TooLarge)
+        );
+    }
+
+    #[test]
+    fn admit_direct_refuses_while_scanning() {
+        let mut core = Core::new();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        for kind in [SendKind::App, SendKind::Unacked] {
+            assert_eq!(core.admit_direct(MAC, 1, kind), Err(Refusal::Scanning));
+        }
+        assert_eq!(core.admit_direct(MAC, 1, SendKind::Probe), Ok(()));
+        core.end_scan();
+        assert_eq!(core.admit_direct(MAC, 1, SendKind::Unacked), Ok(()));
+    }
+
+    #[test]
+    fn admit_direct_check_order_matches_submit() {
+        let big = [0u8; MAX_DATA_LEN + 1];
+        // Each case satisfies every later check's refusal condition too.
+        let cases = [
+            (true, &big[..], Refusal::Shutdown),
+            (false, &big[..], Refusal::TooLarge),
+            (false, &b"x"[..], Refusal::Broadcast),
+        ];
+        for (shut_down, data, expected) in cases {
+            let mut core = Core::new();
+            core.begin_scan(true, &mut |_| {}).unwrap();
+            if shut_down {
+                core.shutdown(&mut |_| {});
+            }
+            assert_eq!(
+                core.admit_direct(BROADCAST_MAC, data.len(), SendKind::App),
+                Err(expected)
+            );
+            assert_eq!(
+                core.submit(ms(0), BROADCAST_MAC, data, None, SendKind::App),
+                Err(expected)
+            );
+        }
+        let mut core = Core::new();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        assert_eq!(
+            core.admit_direct(MAC, 1, SendKind::App),
+            Err(Refusal::Scanning)
+        );
+        assert_eq!(
+            core.submit(ms(0), MAC, b"x", None, SendKind::App),
+            Err(Refusal::Scanning)
+        );
+    }
+
+    #[test]
+    fn probe_with_zero_timeout_expires_on_pickup_as_local() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        // A zero timeout: the deadline is the submission time.
+        let probe = core
+            .submit(ms(7), MAC, b"p", Some(ms(7)), SendKind::Probe)
+            .unwrap();
+        assert_eq!(step(&mut core, 7).0, None, "never handed out");
+        // The tiers map `Expired` to a local failure: the probe never left.
+        assert_eq!(
+            core.poll_result(probe, &w),
+            Poll::Ready(Completion::Expired)
+        );
+    }
+
+    #[test]
+    fn probe_deadline_does_not_cancel_a_frame_on_the_air() {
+        let mut core = Core::new();
+        let (w, _) = counting_waker();
+        core.begin_scan(true, &mut |_| {}).unwrap();
+        let probe = core
+            .submit(ms(0), MAC, b"p", Some(ms(100)), SendKind::Probe)
+            .unwrap();
+        assert_eq!(step(&mut core, 99).0.map(|f| f.0), Some(probe));
+        // Long past the deadline, neither the runner nor the caller expires it.
+        assert_eq!(step(&mut core, 10_000).0, None);
+        assert_eq!(core.poll_at(probe, ms(10_000), &w), Poll::Pending);
+        assert!(core.is_in_flight(probe));
+        assert!(matches!(core.complete(probe, 3), Completed::Delivered(_)));
+        assert_eq!(
+            core.poll_result(probe, &w),
+            Poll::Ready(Completion::Done(3))
+        );
     }
 }

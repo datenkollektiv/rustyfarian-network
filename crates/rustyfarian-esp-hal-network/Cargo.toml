@@ -14,7 +14,7 @@ categories  = ["embedded", "hardware-support", "no-std"]
 readme = "README.md"
 # The LWT example shares its application body with the ESP-IDF twin
 # (`examples-shared/lwt_app.rs`), which lives outside this package; it is bench-only.
-exclude = ["examples/hal_esp32s3_mqtt_lwt.rs"]
+exclude = ["examples/hal_esp32s3_mqtt_lwt.rs", "examples/hal_esp32_mqtt_lwt.rs", "examples/hal_c3_mqtt_lwt.rs"]
 
 [package.metadata.docs.rs]
 default-target = "riscv32imc-unknown-none-elf"
@@ -89,6 +89,7 @@ ota-wire = ["ota", "juggler/ota-wire"]
 provisioning = [
     "wifi",
     "juggler/provisioning",
+    "juggler/flash-store",
     "dep:esp-storage",
     "embassy",
 ]
@@ -161,15 +162,15 @@ esp32c6 = [
 ]
 
 # ESP32: Xtensa LX6, xtensa-esp32-none-elf
-# Supports: lora, ota ONLY. esp-radio does support esp32, but Wi-Fi is not wired:
-# this feature forwards no chip to esp-radio/esp-rtos/esp-alloc, so wifi and
-# provisioning with esp32 do not build.
+# Supports: wifi, mqtt, lora, ota. Provisioning and ESP-NOW are not wired for it.
 esp32 = [
     "esp-hal?/esp32",
+    "esp-radio?/esp32",
+    "esp-rtos?/esp32",
+    "esp-alloc?/esp32",
     "esp-bootloader-esp-idf?/esp32",
     "esp-storage?/esp32",
 ]
-# esp-radio, esp-rtos, esp-alloc intentionally NOT listed for esp32.
 
 # ESP32-S3: Xtensa LX7, xtensa-esp32s3-none-elf
 # Supports: wifi, lora, ota, provisioning
@@ -195,7 +196,7 @@ rgb              = { workspace = true }
 # --no-default-features.
 embassy-sync     = { workspace = true }
 heapless         = { workspace = true }
-# `embedded_storage` and `nb` are always-on so the provisioning/store.rs and
+# `embedded_storage` and `nb` are always-on so the provisioning/session.rs and
 # lora/driver.rs source files (and their embedded unit tests) can compile with
 # --no-default-features on the host toolchain without the chip-specific optional
 # deps (esp-hal, esp-radio, etc.) being activated.  Both crates are pure Rust
@@ -242,7 +243,7 @@ embassy-time     = { workspace = true }
 # [dependencies] entry so that `cfg(test)` compilation with --no-default-features
 # can reach juggler::ota, juggler::provisioning, juggler::wifi, juggler::mqtt, and
 # juggler::lora without pulling in any chip-specific hardware crate.
-juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "wifi", "mqtt", "lora", "espnow"] }
+juggler = { workspace = true, default-features = false, features = ["ota", "ota-wire", "provisioning", "flash-store", "wifi", "mqtt", "lora", "espnow"] }
 
 # The examples are the firmware: they carry `esp-println` (console) and `esp-backtrace`
 # (panic handler) themselves. The target triple is the only place that can carry the chip
@@ -289,8 +290,24 @@ name = "hal_c6_provision_mqtt"
 required-features = ["provisioning", "esp32c6", "rt", "embassy"]
 
 [[example]]
+name = "hal_esp32s3_provision_mqtt"
+required-features = ["provisioning", "esp32s3", "rt", "embassy"]
+
+[[example]]
 name = "hal_esp32s3_connect_async"
 required-features = ["wifi", "esp32s3", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32_connect_async"
+required-features = ["wifi", "esp32", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32_mqtt_lwt"
+required-features = ["mqtt", "esp32", "rt", "embassy"]
+
+[[example]]
+name = "hal_c3_mqtt_lwt"
+required-features = ["mqtt", "esp32c3", "rt", "embassy"]
 
 [[example]]
 name = "hal_c6_mqtt_lwt"
@@ -311,3 +328,11 @@ required-features = ["espnow", "esp32c6", "rt", "embassy"]
 [[example]]
 name = "hal_c3_espnow_peer"
 required-features = ["espnow", "esp32c3", "rt", "embassy"]
+
+[[example]]
+name = "hal_c3_ota"
+required-features = ["ota", "wifi", "esp32c3", "rt", "embassy"]
+
+[[example]]
+name = "hal_esp32s3_ota"
+required-features = ["ota", "wifi", "esp32s3", "rt", "embassy"]

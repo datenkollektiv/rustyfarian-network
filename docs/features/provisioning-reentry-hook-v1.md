@@ -1,6 +1,5 @@
 ---
-gate: hardware
-gate-note: BOOT held 3 s after boot on a C3 reaches each outcome in idf_c3_provision_mqtt
+gate: none
 desk-work: available
 ---
 
@@ -43,6 +42,8 @@ Part 6 of [`wifi-portal-fallback-v1.md`](./wifi-portal-fallback-v1.md); second c
 - [x] Core implementation
 - [x] Tests passing
 - [x] Documentation updated
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-10-27 — Feature doc created via /feature dialog; option (a) chosen, design approved upstream.

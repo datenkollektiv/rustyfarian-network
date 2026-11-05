@@ -89,7 +89,9 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
-use crate::wifi::{softap_mac, ApConfig, SoftApManager};
+use juggler::provisioning::{format_nonce, plan_portal, PortalPlanInput};
+
+use crate::wifi::{softap_mac, SoftApManager};
 
 use dns::DnsResponder;
 
@@ -257,25 +259,24 @@ impl<'a> ProvisioningBuilder<'a> {
             self.on_event.unwrap_or_else(|| Arc::new(|_| {}));
 
         let mac = softap_mac().context("failed to read SoftAP MAC")?;
-        let ssid = resolve_softap_ssid(self.config.ssid_override, self.config.ssid_prefix, &mac)
-            .map_err(|e| anyhow::anyhow!("invalid SoftAP SSID override: {e}"))?;
-        log::info!("Provisioning SSID resolved (len={})", ssid.len());
-
-        let ap_config = match self.config.ap_password {
-            Some(pw) => {
-                if pw.len() < juggler::wifi::AP_PASSWORD_MIN_LEN {
-                    anyhow::bail!(
-                        "AP password too short (len={}, min {})",
-                        pw.len(),
-                        juggler::wifi::AP_PASSWORD_MIN_LEN
-                    );
-                }
-                ApConfig::wpa2(ssid.as_str(), pw)
-            }
-            None => ApConfig::open(ssid.as_str()),
-        }
-        .with_channel(self.config.channel)
-        .with_max_connections(DEFAULT_MAX_CONNECTIONS);
+        let plan = plan_portal(
+            &PortalPlanInput {
+                ssid_override: self.config.ssid_override,
+                ssid_prefix: self.config.ssid_prefix,
+                ap_password: self.config.ap_password,
+                channel: self.config.channel,
+                device_name: self.config.device_name,
+                defaults: self.config.defaults,
+                profile: self.config.profile,
+            },
+            &mac,
+            |_| true,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        log::info!("Provisioning SSID resolved (len={})", plan.ssid.len());
+        let ap_config = plan
+            .ap_config()
+            .with_max_connections(DEFAULT_MAX_CONNECTIONS);
 
         let softap = SoftApManager::start(modem, sys_loop.clone(), Some(nvs.clone()), ap_config)
             .context("failed to start SoftAP")?;
@@ -290,10 +291,8 @@ impl<'a> ProvisioningBuilder<'a> {
         ));
         let state = SharedState::new();
         let nonce = Arc::new(generate_nonce());
-        let device_name = self.config.device_name.resolve(&mac).as_str().to_string();
-        if matches!(self.config.device_name, DeviceName::MacSuffixed(_))
-            && !self.config.defaults.mqtt_client.is_empty()
-        {
+        let device_name = plan.device_name.as_str().to_string();
+        if plan.client_id_override_warning {
             log::warn!("Device name is MAC-suffixed but a default MQTT client ID is set; it overrides the per-device client ID unless cleared in the portal");
         }
         log::info!(
@@ -357,7 +356,7 @@ fn subscribe_ap_events(
 /// Generates an 8-hex-character session nonce from the hardware RNG.
 fn generate_nonce() -> String {
     let value = unsafe { esp_idf_svc::sys::esp_random() };
-    format!("{value:08x}")
+    format_nonce(value).as_str().to_string()
 }
 
 /// Experimental: API may change before 1.0.

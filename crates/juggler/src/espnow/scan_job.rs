@@ -16,12 +16,17 @@
 //!
 //! [`ScanGate`] wraps the slot together with the [`TxCore`] scan exclusion, so that admitting,
 //! cancelling and finishing a scan are each one call that keeps the two in step.
+//! It also owns the rule that the exclusion ends only after the restore: a scan cancelled while
+//! its probe is on the air keeps its teardown in the gate until the probe completes.
+//! Both tiers use it; a driver that runs the scan in the caller's own future (esp-hal) admits a
+//! job and picks it up itself.
 //!
 //! The slot never drops a job or a result itself: every method that discards one hands it back,
 //! so the caller can drop it after releasing its lock.
 
 use core::task::Waker;
 
+use super::scan::ScanTeardown;
 use super::tx::{ScanRefusal, TxCore};
 
 /// Identifies one admitted job; a stale epoch matches nothing.
@@ -178,6 +183,21 @@ impl<J, R> ScanJobSlot<J, R> {
     }
 }
 
+/// What [`ScanGate::cancel_running`] decided.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome<J, R, T> {
+    /// The job was not running: see [`Cancelled`] (never [`Cancelled::Requested`]).
+    /// Nothing was touched that needs a restore.
+    NotRunning(Cancelled<J, R>),
+    /// No frame is on the air: run the teardown now, then end the exclusion with
+    /// [`ScanGate::release`].
+    RunNow(T),
+    /// A frame (the scan's probe) is on the air: the gate keeps the teardown until
+    /// [`ScanGate::on_probe_complete`] hands it back, and the exclusion holds until the runner
+    /// has run it and called [`ScanGate::release`].
+    Deferred,
+}
+
 /// Why [`ScanGate::admit`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateRefusal {
@@ -207,24 +227,32 @@ pub enum GateRefusal {
 /// - [`finish`](Self::finish) and [`release`](Self::release): the worker ends the exclusion in
 ///   the same call that publishes the result, so a result is never visible while the exclusion
 ///   still holds, and the slot stays occupied until the caller takes the result.
+/// - [`cancel_running`](Self::cancel_running) and [`on_probe_complete`](Self::on_probe_complete):
+///   a scan that is cancelled synchronously (a `Drop` that cannot await) hands over its
+///   teardown `T`; with the air clear it comes straight back to be run now, with a probe on the
+///   air the gate keeps it and the runner gets it right after that frame's completion.
+///   Either way the exclusion ends with `release` once the teardown has run.
 ///
 /// The exclusion is ended only for the job that holds it: a stale epoch changes nothing.
-pub struct ScanGate<J, R> {
+pub struct ScanGate<J, R, T = ScanTeardown> {
     slot: ScanJobSlot<J, R>,
+    /// The teardown of a cancelled scan that waits for its probe to leave the air.
+    deferred: Option<(JobEpoch, T)>,
 }
 
-impl<J, R> Default for ScanGate<J, R> {
+impl<J, R, T> Default for ScanGate<J, R, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<J, R> ScanGate<J, R> {
+impl<J, R, T> ScanGate<J, R, T> {
     /// An empty gate.
     #[must_use]
     pub fn new() -> Self {
         Self {
             slot: ScanJobSlot::new(),
+            deferred: None,
         }
     }
 
@@ -238,9 +266,9 @@ impl<J, R> ScanGate<J, R> {
     /// # Errors
     ///
     /// The refusal and the unconsumed `job`.
-    pub fn admit<T, const N: usize>(
+    pub fn admit<C, const N: usize>(
         &mut self,
-        core: &mut TxCore<T, N>,
+        core: &mut TxCore<C, N>,
         owns_radio: bool,
         job: J,
         wake: &mut impl FnMut(Waker),
@@ -271,7 +299,7 @@ impl<J, R> ScanGate<J, R> {
 
     /// True when the worker may pick the job up: one is pending and no frame is on the air.
     #[must_use]
-    pub fn may_start<T, const N: usize>(&self, core: &TxCore<T, N>) -> bool {
+    pub fn may_start<C, const N: usize>(&self, core: &TxCore<C, N>) -> bool {
         self.slot.has_pending() && core.can_start_scan_io()
     }
 
@@ -290,9 +318,9 @@ impl<J, R> ScanGate<J, R> {
     ///
     /// Returns the result back when it is to be discarded (its caller cancelled, or `epoch` is
     /// not the running job); drop it after releasing the lock.
-    pub fn finish<T, const N: usize>(
+    pub fn finish<C, const N: usize>(
         &mut self,
-        core: &mut TxCore<T, N>,
+        core: &mut TxCore<C, N>,
         epoch: JobEpoch,
         result: R,
     ) -> Option<R> {
@@ -303,7 +331,7 @@ impl<J, R> ScanGate<J, R> {
     }
 
     /// The worker ends the running job `epoch` without a result and ends the exclusion.
-    pub fn release<T, const N: usize>(&mut self, core: &mut TxCore<T, N>, epoch: JobEpoch) {
+    pub fn release<C, const N: usize>(&mut self, core: &mut TxCore<C, N>, epoch: JobEpoch) {
         if self.slot.is_running(epoch) {
             core.end_scan();
         }
@@ -320,9 +348,9 @@ impl<J, R> ScanGate<J, R> {
     /// A job not yet picked up is dropped and the exclusion ends here (the returned
     /// [`Cancelled::Discarded`] is how the caller knows); a running job is told to give up and
     /// its worker ends the exclusion.
-    pub fn cancel<T, const N: usize>(
+    pub fn cancel<C, const N: usize>(
         &mut self,
-        core: &mut TxCore<T, N>,
+        core: &mut TxCore<C, N>,
         epoch: JobEpoch,
     ) -> Cancelled<J, R> {
         let cancelled = self.slot.cancel(epoch);
@@ -330,6 +358,51 @@ impl<J, R> ScanGate<J, R> {
             core.end_scan();
         }
         cancelled
+    }
+
+    /// The scan of job `epoch` is cancelled while its own driver runs it, with `teardown` to
+    /// put the radio back; see [`CancelOutcome`].
+    ///
+    /// A job not yet picked up is dropped and the exclusion ends here, exactly as in
+    /// [`cancel`](Self::cancel).
+    /// For a running job the decision is taken under the caller's lock, from
+    /// [`TxCore::can_start_scan_io`], so it cannot interleave with the probe's completion.
+    pub fn cancel_running<C, const N: usize>(
+        &mut self,
+        core: &mut TxCore<C, N>,
+        epoch: JobEpoch,
+        teardown: T,
+    ) -> CancelOutcome<J, R, T> {
+        match self.cancel(core, epoch) {
+            Cancelled::Requested if core.can_start_scan_io() => CancelOutcome::RunNow(teardown),
+            Cancelled::Requested => {
+                self.deferred = Some((epoch, teardown));
+                CancelOutcome::Deferred
+            }
+            other => CancelOutcome::NotRunning(other),
+        }
+    }
+
+    /// The deferred teardown, once the air has cleared; call it right after
+    /// [`TxCore::complete`].
+    ///
+    /// The runner runs the teardown and then ends the exclusion with
+    /// [`release`](Self::release) for the returned epoch.
+    pub fn on_probe_complete<C, const N: usize>(
+        &mut self,
+        core: &TxCore<C, N>,
+    ) -> Option<(JobEpoch, T)> {
+        if core.can_start_scan_io() {
+            self.deferred.take()
+        } else {
+            None
+        }
+    }
+
+    /// True while a cancelled scan's teardown waits for its probe to leave the air.
+    #[must_use]
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
     }
 
     /// True when a new job could be admitted as far as the slot is concerned.
@@ -653,6 +726,150 @@ mod tests {
             assert!(gate.may_start(&core));
             gate.pickup();
             assert!(!gate.may_start(&core), "nothing is pending any more");
+        }
+
+        /// A gate whose deferred payload is a label, as the tiers use a `ScanTeardown`.
+        type Own = ScanGate<(), (), &'static str>;
+
+        /// A scan its own driver runs: admitted and picked up at once.
+        fn running(gate: &mut Own, core: &mut Core) -> JobEpoch {
+            let epoch = gate.admit(core, true, (), &mut |_| {}).unwrap();
+            assert!(gate.may_start(core));
+            assert_eq!(gate.pickup(), Some((epoch, ())));
+            epoch
+        }
+
+        /// Puts the scan's probe on the air and abandons it, as a dropped scan future does.
+        fn probe_on_the_air(core: &mut Core) -> crate::espnow::TxId {
+            let probe = core
+                .submit(Duration::ZERO, MAC, b"p", None, SendKind::Probe)
+                .unwrap();
+            assert!(matches!(
+                core.next(Duration::ZERO, &mut |_| {}),
+                Next::Transmit { .. }
+            ));
+            core.abandon(probe);
+            probe
+        }
+
+        #[test]
+        fn cancel_with_clear_air_runs_now() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            assert_eq!(
+                gate.cancel_running(&mut core, epoch, "restore"),
+                CancelOutcome::RunNow("restore")
+            );
+            assert!(!gate.has_deferred());
+            assert_eq!(gate.on_probe_complete(&core), None);
+            assert!(core.is_scanning(), "the teardown has not run yet");
+            gate.release(&mut core, epoch);
+            assert!(!core.is_scanning());
+        }
+
+        #[test]
+        fn cancel_with_probe_in_flight_defers_until_completion() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            let probe = probe_on_the_air(&mut core);
+            assert_eq!(
+                gate.cancel_running(&mut core, epoch, "restore"),
+                CancelOutcome::Deferred
+            );
+            assert!(gate.has_deferred());
+            assert_eq!(gate.on_probe_complete(&core), None, "still on the air");
+            core.complete(probe, 1);
+            assert_eq!(gate.on_probe_complete(&core), Some((epoch, "restore")));
+            assert!(!gate.has_deferred());
+            assert_eq!(gate.on_probe_complete(&core), None, "handed out once");
+        }
+
+        #[test]
+        fn exclusion_ends_only_after_finish() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            let probe = probe_on_the_air(&mut core);
+            assert_eq!(
+                gate.cancel_running(&mut core, epoch, "restore"),
+                CancelOutcome::Deferred
+            );
+            core.complete(probe, 1);
+            let (due, _) = gate.on_probe_complete(&core).unwrap();
+            // Between the completion and the end of the restore, application sends stay refused.
+            assert!(core.is_scanning());
+            assert_eq!(
+                core.submit(Duration::ZERO, MAC, b"x", None, SendKind::App),
+                Err(crate::espnow::Refusal::Scanning)
+            );
+            gate.release(&mut core, due);
+            assert!(!core.is_scanning());
+            assert!(gate.is_empty());
+            assert!(core
+                .submit(Duration::ZERO, MAC, b"x", None, SendKind::App)
+                .is_ok());
+        }
+
+        #[test]
+        fn a_finished_scan_ends_the_exclusion_on_release() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            gate.release(&mut core, epoch);
+            assert!(!core.is_scanning());
+            assert!(gate.is_empty());
+        }
+
+        #[test]
+        fn second_admit_while_scanning_is_refused() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Busy, ()))
+            );
+            // Also while a cancelled scan's teardown waits for its probe.
+            let probe = probe_on_the_air(&mut core);
+            gate.cancel_running(&mut core, epoch, "restore");
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Busy, ()))
+            );
+            core.complete(probe, 1);
+            let (due, _) = gate.on_probe_complete(&core).unwrap();
+            gate.release(&mut core, due);
+            assert!(gate.admit(&mut core, true, (), &mut |_| {}).is_ok());
+        }
+
+        #[test]
+        fn cancel_before_pickup_discards_and_ends_the_exclusion_without_a_teardown() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = gate.admit(&mut core, true, (), &mut |_| {}).unwrap();
+            assert_eq!(
+                gate.cancel_running(&mut core, epoch, "restore"),
+                CancelOutcome::NotRunning(Cancelled::Discarded(()))
+            );
+            assert!(!core.is_scanning());
+            assert!(!gate.has_deferred());
+        }
+
+        #[test]
+        fn a_stale_cancel_running_changes_nothing() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let old = running(&mut gate, &mut core);
+            gate.release(&mut core, old);
+            let new = running(&mut gate, &mut core);
+            assert_eq!(
+                gate.cancel_running(&mut core, old, "restore"),
+                CancelOutcome::NotRunning(Cancelled::Stale)
+            );
+            assert!(core.is_scanning());
+            assert!(!gate.cancel_requested(new));
         }
     }
 }

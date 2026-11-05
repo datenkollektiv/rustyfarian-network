@@ -278,6 +278,7 @@ fn mqtt_std_public_paths() {
 
 #[cfg(feature = "lora")]
 #[test]
+#[allow(deprecated)]
 fn lora_public_paths() {
     use juggler::lora::{
         Bandwidth, CodingRate, Downlink, HeltecV3Pins, LoraConfig, LoraRadio, LorawanDevice,
@@ -363,12 +364,90 @@ fn lora_public_paths() {
     // LorawanDevice can be named and constructed (requires mock or a real radio).
     // We name the type in a phantom way to confirm the import compiles.
     fn _accepts_device<R: LoraRadio>(_: &LorawanDevice<R>) {}
+
+    // Shared-logic ladder (ADR 023): flat rules, rung-1 bring-up, PHY bridge, rung-2 ticker.
+    use juggler::lora::sx1262::{
+        init, irq_flags, InitError, InitStep, BRING_UP_ORDER, DEFAULT_BUSY_POLL_BOUND,
+    };
+    use juggler::lora::{
+        classify_irq, ldro_required, map_rf_config, IrqOutcome, LorawanPhy, LorawanTicker, Outcome,
+        RadioErrorKind, TickEvent, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED, LORAWAN_PREAMBLE_LEN,
+        LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
+    };
+    let _: u32 = Region::EU868.default_rf_hz();
+    let _: u32 = Region::EU868.image_calibration_hz();
+    let _: IrqOutcome = classify_irq(0);
+    let _: bool = ldro_required(SpreadingFactor::SF12, Bandwidth::BW125);
+    let _ = (
+        LORAWAN_PUBLIC_SYNC_WORD,
+        LORAWAN_PREAMBLE_LEN,
+        UPLINK_IQ_INVERTED,
+        DOWNLINK_IQ_INVERTED,
+        UPLINK_CRC_ON,
+        DOWNLINK_CRC_ON,
+        RX_PAYLOAD_MAX,
+        DEFAULT_BUSY_POLL_BOUND,
+        BRING_UP_ORDER,
+    );
+    let _ = (
+        init::<NoSpi, NoPin, NoPin, NoPin, NoPin, core::convert::Infallible, NoDelay>,
+        irq_flags,
+        map_rf_config,
+    );
+    let _: Option<InitError> = None;
+    let _: Option<InitStep> = None;
+    let mut ticker = LorawanTicker::new(1_000, 0);
+    let _: Option<TickEvent> = ticker.update(false, 0);
+    let _: Outcome = Outcome::Continue;
+    fn _accepts_phy<R: LoraRadio>(_: &LorawanPhy<R>)
+    where
+        R::Error: RadioErrorKind,
+    {
+    }
+
+    struct NoSpi;
+    impl embedded_hal::spi::ErrorType for NoSpi {
+        type Error = core::convert::Infallible;
+    }
+    impl embedded_hal::spi::SpiDevice for NoSpi {
+        fn transaction(
+            &mut self,
+            _: &mut [embedded_hal::spi::Operation<'_, u8>],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    struct NoPin;
+    impl embedded_hal::digital::ErrorType for NoPin {
+        type Error = core::convert::Infallible;
+    }
+    impl embedded_hal::digital::OutputPin for NoPin {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl embedded_hal::digital::InputPin for NoPin {
+        fn is_high(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+        fn is_low(&mut self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+    struct NoDelay;
+    impl embedded_hal::delay::DelayNs for NoDelay {
+        fn delay_ns(&mut self, _: u32) {}
+    }
 }
 
 // ── lora::mock ────────────────────────────────────────────────────────────────
 
 #[cfg(all(feature = "lora", feature = "mock"))]
 #[test]
+#[allow(deprecated)]
 fn lora_mock_public_paths() {
     use juggler::lora::mock::{MockLoraRadio, RecordedTx, RxResponse};
     use juggler::lora::{LoraConfig, LorawanDevice, RxQuality};
@@ -577,6 +656,7 @@ fn ota_runtime_public_paths() {
         decide_intake, plan_rollback, rejects_delta, DeliveryStep, Feed, HealthAction,
         HealthConfig, HealthEvent, HealthMachine, IntakeDecision, ManifestBody, OfferPlan,
         PublishOutcome, PublishStep, ReporterConfig, ReporterMachine, Retention, SendResult,
+        ViewStep,
     };
     use juggler::ota::{
         ConfigError, DeadlineAction, FailReason, HealthVerdict, OtaCommand, OtaSettings, OtaStacks,
@@ -611,6 +691,7 @@ fn ota_runtime_public_paths() {
 
     let mut reporter = ReporterMachine::new(ReporterConfig::from(&timings));
     assert!(reporter.report_due(Duration::ZERO));
+    assert_eq!(reporter.on_view(Duration::ZERO, true), ViewStep::Publish);
     assert_eq!(
         reporter.on_publish(Duration::ZERO, PublishOutcome::Acked),
         PublishStep::MarkDelivered

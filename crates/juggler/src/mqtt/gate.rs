@@ -126,4 +126,15 @@ mod tests {
         }
         assert_eq!(gate.feed(true), Some(I::NetworkUp));
     }
+
+    #[test]
+    fn gate_never_repeats_an_edge() {
+        // The esp-hal runner feeds every polled sample through one gate.
+        let mut gate = NetworkGate::new();
+        let edges: alloc::vec::Vec<SessionInput> = [true, true, false, false, true]
+            .into_iter()
+            .filter_map(|sample| gate.feed(sample))
+            .collect();
+        assert_eq!(edges, [I::NetworkUp, I::NetworkDown, I::NetworkUp]);
+    }
 }

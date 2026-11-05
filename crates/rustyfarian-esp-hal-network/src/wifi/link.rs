@@ -58,7 +58,7 @@ use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use juggler::wifi::{
-    LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink, CREDENTIALS_HINT,
+    IdleWait, LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink, CREDENTIALS_HINT,
 };
 
 /// Upper bound on the disconnect that [`WifiLink::suspend`] triggers (milliseconds);
@@ -160,7 +160,10 @@ impl WifiLink {
     /// [`is_suspended`](Self::is_suspended); the reset after sleep re-initialises
     /// the radio.
     pub fn suspend(&self) {
-        if self.with(|h| h.suspend()) {
+        // Readiness falls before the station goes down, as on the ESP-IDF tier.
+        let (woken, change) = self.with(|h| (h.suspend(), h.take_ready_change()));
+        self.report_ready(change);
+        if woken {
             log::info!("[wifi] suspend requested");
             self.wake.signal(());
         }
@@ -172,7 +175,9 @@ impl WifiLink {
     /// [`suspend`](Self::suspend), even before the disconnect ran: the supervisor
     /// keeps an association that is still up, or the attempt still in flight.
     pub fn resume(&self) {
-        if self.with(|h| h.resume()) {
+        let (woken, change) = self.with(|h| (h.resume(), h.take_ready_change()));
+        self.report_ready(change);
+        if woken {
             log::info!("[wifi] resume requested");
             self.wake.signal(());
         }
@@ -182,17 +187,32 @@ impl WifiLink {
         self.handover.lock(|h| f(&mut h.borrow_mut()))
     }
 
+    /// Feeds an input observed by `run` and reports the readiness edge it caused.
     fn poll(&self, input: LinkInput) -> LinkAction {
-        self.with(|h| h.poll(input))
+        let (action, change) = self.with(|h| (h.poll(input), h.take_ready_change()));
+        self.report_ready(change);
+        action
+    }
+
+    /// Hands a readiness edge from [`LinkHandover::take_ready_change`] to the waiters.
+    fn report_ready(&self, change: Option<bool>) {
+        if change == Some(true) {
+            log::info!("[wifi] network ready");
+            self.ready_wakers.lock(|w| w.borrow_mut().wake_all());
+        }
     }
 
     /// Waits for `suspend`/`resume` and takes the action they handed over.
     async fn handed_over(&self) -> LinkAction {
         self.wake.wait().await;
-        self.with(|h| h.take())
+        let action = self.with(|h| h.take());
+        if action == LinkAction::Ignored {
+            log::debug!("[wifi] handover overtaken by the supervisor, dropped");
+        }
+        action
     }
 
-    /// Reports the stack's IPv4 configuration to the machine and wakes waiters once ready.
+    /// Reports the stack's IPv4 configuration to the machine.
     fn report_network(&self, stack: Stack<'static>) {
         let up = stack.is_config_up();
         if up == self.is_ready() {
@@ -203,21 +223,32 @@ impl WifiLink {
         } else {
             LinkInput::NetworkDown
         });
-        if self.is_ready() {
-            log::info!("[wifi] network ready");
-            self.ready_wakers.lock(|w| w.borrow_mut().wake_all());
-        }
     }
 
-    /// Feeds an association to the machine; logs it unless suspended.
+    /// Feeds an association to the machine and logs it.
     fn link_up(&self, how: &str) -> LinkAction {
         let action = self.poll(LinkInput::Connected);
+        self.log_association(how);
+        action
+    }
+
+    /// Restarts supervision through [`LinkHandover::start`] and returns the first action.
+    fn start(&self, associated: bool) -> LinkAction {
+        let (action, change) = self.with(|h| (h.start(associated), h.take_ready_change()));
+        self.report_ready(change);
+        if associated {
+            self.log_association(" (adopted)");
+        }
+        action
+    }
+
+    /// Logs an association the machine was just told about.
+    fn log_association(&self, how: &str) {
         if self.state() == LinkState::Connected {
             log::info!("[wifi] link up #{}{}", self.connect_count(), how);
         } else {
             log::info!("[wifi] associated while suspended, disconnecting again");
         }
-        action
     }
 
     /// Supervises the station forever: initial association, every reconnect,
@@ -230,14 +261,7 @@ impl WifiLink {
         // A cancelled earlier `run` may have left the machine mid-attempt; keep a
         // suspend the firmware already asked for.
         self.wake.reset();
-        let suspended = self.with(|h| h.restart());
-        let mut action = if suspended {
-            LinkAction::Disconnect
-        } else if controller.is_connected() {
-            self.link_up(" (adopted)")
-        } else {
-            self.poll(LinkInput::Start)
-        };
+        let mut action = self.start(controller.is_connected());
         loop {
             action = match action {
                 LinkAction::Connect if controller.is_connected() => {
@@ -251,7 +275,8 @@ impl WifiLink {
                         match select(self.handed_over(), connect.as_mut()).await {
                             Either::First(handed) => match handed {
                                 LinkAction::Disconnect => break LinkAction::Disconnect,
-                                // A resume right after a suspend: keep the attempt in flight.
+                                // A resume right after a suspend, or nothing (`None`,
+                                // `Ignored`): keep the attempt in flight.
                                 _ => continue,
                             },
                             Either::Second(Ok(_)) => break self.link_up(""),
@@ -264,7 +289,7 @@ impl WifiLink {
                                     e,
                                     connect_failure_hint(&e)
                                 );
-                                break self.poll(LinkInput::Disconnected);
+                                break self.poll(LinkInput::ConnectFailed);
                             }
                         }
                     }
@@ -293,71 +318,81 @@ impl WifiLink {
                     loop {
                         match select(self.handed_over(), timer.as_mut()).await {
                             Either::First(handed) => match handed {
-                                LinkAction::None => continue,
+                                LinkAction::None | LinkAction::Ignored => continue,
                                 other => break other,
                             },
                             Either::Second(()) => break self.poll(LinkInput::BackoffElapsed),
                         }
                     }
                 }
-                LinkAction::None => match self.state() {
-                    LinkState::Connected => {
-                        self.report_network(stack);
-                        let mut gone = pin!(controller.wait_for_disconnect_async());
-                        loop {
-                            match select3(
-                                self.handed_over(),
-                                gone.as_mut(),
-                                Timer::after_millis(NETWORK_POLL_MS),
-                            )
-                            .await
-                            {
-                                Either3::First(handed) => match handed {
-                                    LinkAction::None => continue,
-                                    other => break other,
-                                },
-                                Either3::Third(()) => {
-                                    self.report_network(stack);
-                                    continue;
-                                }
-                                Either3::Second(result) => {
-                                    match result {
-                                        // esp-radio reports a named reason, not the
-                                        // ESP-IDF code, so the name is its `Debug`
-                                        // form; the credentials hint is the one both
-                                        // tiers share (bug 011).
-                                        Ok(info) => log::warn!(
-                                            "[wifi] disconnected — {:?}{}",
-                                            info.reason,
-                                            hal_disconnect_hint(&info.reason)
-                                        ),
-                                        Err(e) => log::warn!("[wifi] disconnected — {:?}", e),
+                LinkAction::None | LinkAction::Ignored => {
+                    if action == LinkAction::Ignored {
+                        log::debug!("[wifi] input ignored in {:?}", self.state());
+                    }
+                    match self.with(|h| h.idle_wait()) {
+                        IdleWait::Link => {
+                            self.report_network(stack);
+                            let mut gone = pin!(controller.wait_for_disconnect_async());
+                            loop {
+                                match select3(
+                                    self.handed_over(),
+                                    gone.as_mut(),
+                                    Timer::after_millis(NETWORK_POLL_MS),
+                                )
+                                .await
+                                {
+                                    Either3::First(handed) => match handed {
+                                        LinkAction::None | LinkAction::Ignored => continue,
+                                        other => break other,
+                                    },
+                                    Either3::Third(()) => {
+                                        self.report_network(stack);
+                                        continue;
                                     }
-                                    break self.poll(LinkInput::Disconnected);
+                                    Either3::Second(result) => {
+                                        match result {
+                                            // esp-radio reports a named reason, not the
+                                            // ESP-IDF code, so the name is its `Debug`
+                                            // form; the credentials hint is the one both
+                                            // tiers share (bug 011).
+                                            Ok(info) => log::warn!(
+                                                "[wifi] disconnected — {:?}{}",
+                                                info.reason,
+                                                hal_disconnect_hint(&info.reason)
+                                            ),
+                                            Err(e) => {
+                                                log::warn!("[wifi] disconnected — {:?}", e)
+                                            }
+                                        }
+                                        break self.poll(LinkInput::Disconnected);
+                                    }
                                 }
                             }
                         }
-                    }
-                    state => {
-                        match select(self.handed_over(), Timer::after_millis(RECHECK_MS)).await {
-                            Either::First(handed) => handed,
-                            // Parked: catch an association that slipped past the disconnect.
-                            Either::Second(()) if state == LinkState::Suspended => {
-                                if controller.is_connected() {
-                                    self.link_up("")
-                                } else {
-                                    LinkAction::None
+                        IdleWait::Park => {
+                            match select(self.handed_over(), Timer::after_millis(RECHECK_MS)).await
+                            {
+                                Either::First(handed) => handed,
+                                // Catch an association that slipped past the disconnect;
+                                // the machine answers it with another `Disconnect`.
+                                Either::Second(()) if controller.is_connected() => {
+                                    log::info!("[wifi] still associated while suspended");
+                                    self.poll(LinkInput::Connected)
                                 }
+                                Either::Second(()) => LinkAction::None,
                             }
-                            // Not reachable while `run` owns the machine from its own reset;
-                            // reset again rather than stall.
-                            Either::Second(()) => {
-                                self.with(|h| h.restart());
-                                self.poll(LinkInput::Start)
+                        }
+                        IdleWait::Restart => {
+                            match select(self.handed_over(), Timer::after_millis(RECHECK_MS)).await
+                            {
+                                Either::First(handed) => handed,
+                                // Not reachable while `run` owns the machine from its own
+                                // start; start again rather than stall.
+                                Either::Second(()) => self.start(controller.is_connected()),
                             }
                         }
                     }
-                },
+                }
             };
         }
     }

@@ -1,6 +1,5 @@
 ---
-gate: hardware
-gate-note: HAL record with extras round-trips on a C3 or C6 board across a reboot
+gate: none
 desk-work: available
 ---
 
@@ -41,7 +40,8 @@ Answers `review-queue/rustyfarian-network-boot-device-name-v1.md` (spookhouse) a
 - [x] Core implementation
 - [x] Tests passing
 - [x] Documentation updated
-- [ ] Hardware gate: `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md` on C3 and C6
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-10-27 — Feature doc created via /feature dialog

@@ -306,28 +306,23 @@ impl WiFiManager {
             anyhow::bail!("WiFi link worker is not running");
         }
 
-        if let Some(led_driver) = led {
-            let timeout_secs = match config.connect_mode {
-                ConnectMode::Blocking { timeout_secs } => timeout_secs,
-                ConnectMode::NonBlocking => {
-                    log::warn!(
-                        "Non-blocking connection requested but LED driver is present; \
-                         falling back to blocking with {}s timeout",
-                        DEFAULT_TIMEOUT_SECS
-                    );
-                    DEFAULT_TIMEOUT_SECS
-                }
-            };
-            Self::connect_with_led(&mut wifi, led_driver, timeout_secs)?;
-        } else {
-            match config.connect_mode {
-                ConnectMode::Blocking { timeout_secs } => {
-                    Self::wait_for_connection(&mut wifi, timeout_secs)?;
-                }
-                ConnectMode::NonBlocking => {
-                    log::info!("WiFi connect requested (non-blocking)");
-                }
+        let has_indicator = led.is_some();
+        if matches!(config.connect_mode, ConnectMode::NonBlocking) && has_indicator {
+            log::warn!(
+                "Non-blocking connection requested but LED driver is present; \
+                 falling back to blocking with {}s timeout",
+                DEFAULT_TIMEOUT_SECS
+            );
+        }
+        match (
+            config.connect_mode.effective_timeout_secs(has_indicator),
+            led,
+        ) {
+            (Some(timeout_secs), Some(led_driver)) => {
+                Self::connect_with_led(&link, led_driver, timeout_secs)?;
             }
+            (Some(timeout_secs), None) => Self::wait_for_connection(&link, timeout_secs)?,
+            (None, _) => log::info!("WiFi connect requested (non-blocking)"),
         }
 
         Ok(Self { link, wifi })
@@ -346,11 +341,7 @@ impl WiFiManager {
         Self::new::<NoLed>(modem, sys_loop, nvs, config, None)
     }
 
-    fn connect_with_led<L>(
-        wifi: &mut BlockingWifi<EspWifi<'static>>,
-        led: &mut L,
-        timeout_secs: u64,
-    ) -> anyhow::Result<()>
+    fn connect_with_led<L>(link: &LinkWorker, led: &mut L, timeout_secs: u64) -> anyhow::Result<()>
     where
         L: StatusLed,
         L::Error: std::fmt::Debug,
@@ -380,13 +371,10 @@ impl WiFiManager {
                 ));
             }
 
-            match wifi.is_connected() {
-                Ok(true) => {
-                    log::info!("WiFi connected");
-                    break;
-                }
-                Ok(false) => {}
-                Err(e) => log::debug!("is_connected transient error: {}", e),
+            // Ready means associated and the station's IP reported (supervisor).
+            if link.supervisor.is_ready() {
+                log::info!("WiFi connected and netif up");
+                break;
             }
 
             // Pulse blue light
@@ -395,10 +383,6 @@ impl WiFiManager {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // Wait for DHCP
-        wifi.wait_netif_up()?;
-        log::info!("WiFi netif up");
-
         led.set_color(RGB8::from(status_colors::CONNECTED))
             .map_err(|e| anyhow::anyhow!("LED error: {:?}", e))?;
 
@@ -406,10 +390,7 @@ impl WiFiManager {
     }
 
     /// Internal helper to wait for connection with a timeout (no LED).
-    fn wait_for_connection(
-        wifi: &mut BlockingWifi<EspWifi<'static>>,
-        timeout_secs: u64,
-    ) -> anyhow::Result<()> {
+    fn wait_for_connection(link: &LinkWorker, timeout_secs: u64) -> anyhow::Result<()> {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -424,16 +405,14 @@ impl WiFiManager {
                 ));
             }
 
-            match wifi.is_connected() {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(e) => log::debug!("is_connected transient error: {}", e),
+            // Ready means associated and the station's IP reported (supervisor).
+            if link.supervisor.is_ready() {
+                break;
             }
 
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
 
-        wifi.wait_netif_up()?;
         log::info!("WiFi connected and netif up");
 
         Ok(())
@@ -461,25 +440,24 @@ impl WiFiManager {
     ///
     /// The assigned IPv4 address, or `None` if timeout expires.
     ///
-    /// Transient ESP-IDF errors during the polling loop (common during association)
-    /// are logged at `debug` level and treated as "not ready yet" rather than
-    /// propagated to the caller.
+    /// Waits for the readiness the reconnect supervisor tracks (association plus
+    /// the station's IP event, see [`is_ready`](Self::is_ready)), then reads the
+    /// address. A transient ESP-IDF error reading it is logged at `debug` level
+    /// and treated as "not ready yet" rather than propagated to the caller.
     pub fn get_ip(&self, timeout_ms: u64) -> anyhow::Result<Option<Ipv4Addr>> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            match self.wifi.is_connected() {
-                Ok(true) => match self.wifi.wifi().sta_netif().get_ip_info() {
+            if self.link.supervisor.is_ready() {
+                match self.wifi.wifi().sta_netif().get_ip_info() {
                     Ok(ip_info) if !ip_info.ip.is_unspecified() => {
                         log::info!("WiFi IP: {:?}", ip_info.ip);
                         return Ok(Some(ip_info.ip));
                     }
                     Ok(_) => {}
                     Err(e) => log::debug!("get_ip_info transient error: {}", e),
-                },
-                Ok(false) => {}
-                Err(e) => log::debug!("is_connected transient error: {}", e),
+                }
             }
 
             if start.elapsed() >= timeout {

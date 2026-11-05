@@ -72,6 +72,7 @@ just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example 
 just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify)
 just test                  # all platform-independent unit tests (no ESP toolchain needed; in verify)
 just build-example <name>  # build a hardware example with auto-detected chip + target
+just build-all-examples [prefix]  # build every tier example (optional name prefix); stops at the first failure unless KEEP_GOING=1
 just flash <name>          # build + flash to a connected board
 just run <name>            # flash + serial monitor
 just portal-save <host> <extras> <key_len> <value_len>  # post the provisioning form with x_* extras to a running SoftAP portal (positional args)

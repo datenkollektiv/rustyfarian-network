@@ -13,8 +13,8 @@
 //!
 //! # No-std
 //!
-//! This crate is `#![no_std]` and host-testable end-to-end using a
-//! `MockFlash` test double in the test suite. The embassy tasks require
+//! This crate is `#![no_std]`. The store and its `MockFlash` host tests live
+//! in `juggler::provisioning::flash_store` (`just test-provisioning`). The embassy tasks require
 //! `features = ["esp32c3", "embassy", "rt"]` (or `esp32c6` / `esp32s3`).
 //!
 //! # Real-hardware use
@@ -22,9 +22,6 @@
 //! Real-hardware use requires `esp-storage = { features = ["critical-section"] }`
 //! in the consuming binary. This is a Phase 2 concern; the
 //! cache-disable-during-flash-write hazard is tracked in esp-idf#10079.
-
-mod record;
-mod store;
 
 /// Minimal DHCP server substrate for the SoftAP captive-portal.
 pub(crate) mod dhcp;
@@ -35,7 +32,9 @@ pub(crate) mod portal;
 /// Public provisioning builder / session API.
 pub mod session;
 
-pub use store::{ProvisioningStore, StoreError};
+// The NorFlash store is the shared rung-1 driver in `juggler` (ADR 023); it is
+// re-exported here at its historical path.
+pub use juggler::provisioning::flash_store::{ProvisioningStore, StoreError};
 
 // ── Public session API ─────────────────────────────────────────────────────────
 

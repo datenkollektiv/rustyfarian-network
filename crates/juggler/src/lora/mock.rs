@@ -7,15 +7,13 @@
 //!
 //! ```rust,ignore
 //! use juggler::lora::mock::MockLoraRadio;
-//! use juggler::lora::{LoraConfig, LorawanDevice};
+//! use juggler::lora::LorawanPhy;
 //!
 //! let radio = MockLoraRadio::new();
-//! let config = LoraConfig::default();
-//! let mut device = LorawanDevice::new(radio, config);
-//! device.join().unwrap();
+//! let phy = LorawanPhy::new(radio);
 //! ```
 
-use super::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
+use super::{LoraRadio, RadioErrorKind, RxConfig, RxQuality, RxWindow, TxConfig};
 use heapless::Vec;
 
 /// A recorded `prepare_tx` call, available for inspection in tests.
@@ -40,6 +38,10 @@ pub struct RxResponse {
 /// - Serves pre-programmed RX responses (via [`queue_rx_response`][Self::queue_rx_response]).
 /// - `receive()` returns `nb::Error::WouldBlock` until a response is queued.
 /// - `transmit()` immediately returns `Ok(0)` (zero on-air ms).
+/// - `receive()` reports a closed RX window once after
+///   [`inject_rx_timeout`][Self::inject_rx_timeout].
+/// - `irq_pending()` returns [`irq_latched`][Self::irq_latched];
+///   `cancel_rx()` counts its calls in [`cancel_count`][Self::cancel_count].
 pub struct MockLoraRadio {
     /// All `prepare_tx` calls in order.
     pub tx_calls: Vec<RecordedTx, 16>,
@@ -53,7 +55,12 @@ pub struct MockLoraRadio {
     pub rx_window_offset: i32,
     /// Simulated `rx_window_duration_ms` value.
     pub rx_window_duration: u32,
+    /// Value returned by `irq_pending()`.
+    pub irq_latched: bool,
+    /// Number of `cancel_rx()` calls made.
+    pub cancel_count: usize,
     current_freq_hz: u32,
+    rx_timeout_pending: bool,
 }
 
 impl MockLoraRadio {
@@ -66,7 +73,10 @@ impl MockLoraRadio {
             configured_quality: RxQuality { rssi: -90, snr: 5 },
             rx_window_offset: super::RX_WINDOW_OFFSET_MS,
             rx_window_duration: super::RX_WINDOW_DURATION_MS,
+            irq_latched: false,
+            cancel_count: 0,
             current_freq_hz: 0,
+            rx_timeout_pending: false,
         }
     }
 
@@ -94,6 +104,12 @@ impl MockLoraRadio {
             .map_err(|_| MockRadioError::CapacityExhausted)
     }
 
+    /// Make the next `receive()` call report a closed RX window
+    /// ([`MockRadioError::Timeout`]), ahead of any queued response.
+    pub fn inject_rx_timeout(&mut self) {
+        self.rx_timeout_pending = true;
+    }
+
     /// Return `true` if all queued RX responses have been consumed.
     pub fn rx_queue_empty(&self) -> bool {
         self.rx_responses.is_empty()
@@ -116,11 +132,29 @@ impl Default for MockLoraRadio {
 pub enum MockRadioError {
     /// Triggered when `tx_calls` or `rx_responses` Vec capacity is exhausted.
     CapacityExhausted,
+    /// The RX window closed with no packet (see [`MockLoraRadio::inject_rx_timeout`]).
+    Timeout,
+    /// The RF configuration has no `juggler::lora` equivalent.
+    InvalidRfConfig,
 }
 
 impl core::fmt::Display for MockRadioError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "mock radio capacity exhausted")
+        match self {
+            Self::CapacityExhausted => write!(f, "mock radio capacity exhausted"),
+            Self::Timeout => write!(f, "mock radio timeout"),
+            Self::InvalidRfConfig => write!(f, "unsupported RF config (SF/BW/CR)"),
+        }
+    }
+}
+
+impl RadioErrorKind for MockRadioError {
+    fn invalid_rf_config() -> Self {
+        Self::InvalidRfConfig
+    }
+
+    fn is_rx_timeout(&self) -> bool {
+        matches!(self, Self::Timeout)
     }
 }
 
@@ -148,6 +182,9 @@ impl LoraRadio for MockLoraRadio {
     }
 
     fn receive(&mut self, buf: &mut [u8]) -> nb::Result<(usize, RxQuality), MockRadioError> {
+        if core::mem::take(&mut self.rx_timeout_pending) {
+            return Err(nb::Error::Other(MockRadioError::Timeout));
+        }
         if self.rx_responses.is_empty() {
             return Err(nb::Error::WouldBlock);
         }
@@ -188,6 +225,15 @@ impl LoraRadio for MockLoraRadio {
 
     fn rx_window_duration_ms(&self) -> u32 {
         self.rx_window_duration
+    }
+
+    fn cancel_rx(&mut self) -> Result<(), MockRadioError> {
+        self.cancel_count += 1;
+        Ok(())
+    }
+
+    fn irq_pending(&mut self) -> Result<bool, MockRadioError> {
+        Ok(self.irq_latched)
     }
 }
 
@@ -269,6 +315,21 @@ mod tests {
 
         // Queue is now empty
         assert!(radio.rx_queue_empty());
+        assert!(matches!(
+            radio.receive(&mut buf),
+            Err(nb::Error::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn injected_rx_timeout_is_reported_once() {
+        let mut radio = MockLoraRadio::new();
+        radio.inject_rx_timeout();
+        let mut buf = [0u8; 8];
+        assert!(matches!(
+            radio.receive(&mut buf),
+            Err(nb::Error::Other(MockRadioError::Timeout))
+        ));
         assert!(matches!(
             radio.receive(&mut buf),
             Err(nb::Error::WouldBlock)

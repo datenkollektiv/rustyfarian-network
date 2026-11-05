@@ -99,7 +99,7 @@ pub struct OtaTimings {
     pub poll_interval: Duration,
     /// Interval between reads of the running slot at policy start.
     pub slot_retry: Duration,
-    /// Failed slot reads (not counting "busy") before the deadline may end verification.
+    /// Slot reads before the deadline may end verification: failed reads for a failed read, failed and busy reads together for a busy one.
     pub slot_min_attempts: u32,
     /// Failed slot reads between two warnings.
     pub slot_warn_every: u32,

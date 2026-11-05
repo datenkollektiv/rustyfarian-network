@@ -1,6 +1,6 @@
 //! LoRaWAN Class A device and session persistence types.
 //!
-//! [`LorawanDevice`] is generic over any [`super::LoraRadio`] implementation,
+//! [`LorawanDevice`] (deprecated) is generic over any [`super::LoraRadio`] implementation,
 //! so it can be driven by a [`super::mock::MockLoraRadio`] in host-side tests
 //! or by `rustyfarian_esp_idf_network::lora::sx1262_driver::EspIdfLoraRadio` on the Heltec V3.
 //!
@@ -147,6 +147,9 @@ impl<E: core::fmt::Debug + core::fmt::Display> core::fmt::Display for LorawanErr
 // stack-allocated and cannot be boxed in a no_std context without alloc.
 // The enum is only ever returned from a function, never stored in collections.
 #[allow(clippy::large_enum_variant)]
+#[deprecated(
+    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTicker}"
+)]
 #[derive(Debug)]
 pub enum LorawanResponse {
     /// Tick again in `ms` milliseconds. Cap at 100 ms during active TX/RX phases.
@@ -194,12 +197,19 @@ pub struct Downlink {
 /// The current `process()` implementation returns [`LorawanResponse::NoUpdate`]
 /// until the `PhyRxTx` bridge is completed.
 /// All other parts of the beekeeper firmware continue to function normally.
+///
+/// Deprecated: no code drives this stub. Drive `lorawan-device`'s
+/// `nb_device::Device` with [`super::LorawanPhy`] and [`super::LorawanTicker`].
+#[deprecated(
+    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTicker}"
+)]
 pub struct LorawanDevice<R: LoraRadio> {
     radio: R,
     config: LoraConfig,
     state: LorawanState,
 }
 
+#[allow(deprecated)]
 impl<R: LoraRadio> LorawanDevice<R> {
     /// Create a new [`LorawanDevice`] with the given radio and application config.
     pub fn new(radio: R, config: LoraConfig) -> Self {
@@ -324,6 +334,7 @@ impl<R: LoraRadio> LorawanDevice<R> {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

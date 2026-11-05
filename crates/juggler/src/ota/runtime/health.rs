@@ -11,7 +11,7 @@ use core::time::Duration;
 
 use crate::ota::persist::{BootDisposition, BootOutcome};
 use crate::ota::runtime::config::{DeadlineAction, OtaTimings};
-use crate::ota::RollbackReason;
+use crate::ota::{RollbackReason, SlotId};
 
 /// The slice of [`OtaTimings`] the policy uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub struct HealthConfig {
     pub poll_interval: Duration,
     /// Interval between slot reads at start.
     pub slot_retry: Duration,
-    /// Failed (not busy) slot reads before the deadline may end verification.
+    /// Slot reads before the deadline may end verification: failed reads for a failed read, failed and busy reads together for a busy one.
     pub slot_min_attempts: u32,
     /// Failed slot reads between two warnings.
     pub slot_warn_every: u32,
@@ -38,6 +38,24 @@ pub struct HealthConfig {
     pub rollback_retry: Duration,
     /// What happens at the deadline.
     pub deadline_action: DeadlineAction,
+}
+
+impl HealthConfig {
+    /// Slack added to [`time_bound`](Self::time_bound) for sleeps and slow slot reads.
+    pub const TIME_BOUND_SLACK: Duration = Duration::from_secs(60);
+
+    /// The longest a driver loop may run [`HealthMachine`] before it must stop fail-closed (ADR 023 decision 6).
+    ///
+    /// Every path of the machine finishes within `failure_deadline + healthy_dwell`, the rollback retries (`rollback_retry * rollback_attempts`), the completion retries (`complete_retry * complete_attempts`) and [`TIME_BOUND_SLACK`](Self::TIME_BOUND_SLACK).
+    /// The sum saturates instead of overflowing.
+    /// The driver measures its own elapsed time and compares it against this value.
+    pub fn time_bound(&self) -> Duration {
+        self.failure_deadline
+            .saturating_add(self.healthy_dwell)
+            .saturating_add(self.rollback_retry.saturating_mul(self.rollback_attempts))
+            .saturating_add(self.complete_retry.saturating_mul(self.complete_attempts))
+            .saturating_add(Self::TIME_BOUND_SLACK)
+    }
 }
 
 impl From<&OtaTimings> for HealthConfig {
@@ -61,11 +79,13 @@ impl From<&OtaTimings> for HealthConfig {
 /// What reading the running slot returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotReading {
-    /// The running slot is pending verification.
-    PendingVerify,
+    /// The running slot, which is pending verification.
+    PendingVerify(SlotId),
     /// The running slot is in any other state.
     NotPending,
     /// The OTA handle is held by another thread (the worker); says nothing about the slot.
+    ///
+    /// Busy reads are retried, but once the failure deadline has passed and `slot_min_attempts` reads (busy or failed) were made, a busy read ends the policy with [`HealthVerdict::SlotUnreadable`] too.
     Busy,
     /// The read failed for another reason.
     Failed,
@@ -107,14 +127,18 @@ pub enum HealthAction {
     MarkValid,
     /// Record the completed attempt for the running version and answer with [`HealthEvent::Completed`].
     CompleteAttempt,
-    /// Note this rollback reason (the first reason wins) and answer with [`HealthEvent::Noted`].
-    NoteRollback(RollbackReason),
+    /// Note this rollback reason for the running slot read at start (the first reason wins) and answer with [`HealthEvent::Noted`].
+    NoteRollback(RollbackReason, SlotId),
     /// Roll back once and answer with [`HealthEvent::RollbackReturned`].
     Rollback,
     /// Call the app's restart callback and answer with [`HealthEvent::RestartReturned`].
     Restart,
     /// The policy is finished; apply the verdict.
     Finish(HealthVerdict),
+    /// The event did not answer the pending action; nothing changed (ADR 023 decision 5).
+    ///
+    /// A driver that maps every action to its answer never sees this, so it treats it as an internal error.
+    Ignored,
 }
 
 /// How the policy ended.
@@ -205,8 +229,9 @@ enum Phase {
 pub struct HealthMachine {
     cfg: HealthConfig,
     phase: Phase,
-    pending: HealthAction,
+    slot: Option<SlotId>,
     failed_reads: u32,
+    busy_reads: u32,
     warn: Option<u32>,
     complete_tries: u32,
     rollback_tries: u32,
@@ -218,8 +243,9 @@ impl HealthMachine {
         Self {
             cfg,
             phase: Phase::ReadSlot,
-            pending: HealthAction::ReadSlot,
+            slot: None,
             failed_reads: 0,
+            busy_reads: 0,
             warn: None,
             complete_tries: 0,
             rollback_tries: 0,
@@ -234,14 +260,9 @@ impl HealthMachine {
     /// Advances the policy.
     ///
     /// `elapsed` is the time since boot, `refuse` the library's refusal flag.
-    /// An event that does not answer the pending action repeats that action, so a confused driver cannot skip a step.
+    /// An event that does not answer the pending action returns [`HealthAction::Ignored`] and changes nothing, so a confused driver cannot skip a step; the pending action is still answered by its own event.
+    /// A finished policy answers every event with its [`HealthAction::Finish`].
     pub fn step(&mut self, elapsed: Duration, refuse: bool, event: HealthEvent) -> HealthAction {
-        let action = self.advance(elapsed, refuse, event);
-        self.pending = action;
-        action
-    }
-
-    fn advance(&mut self, elapsed: Duration, refuse: bool, event: HealthEvent) -> HealthAction {
         match (self.phase, event) {
             (Phase::ReadSlot, HealthEvent::Begin | HealthEvent::Woke) => HealthAction::ReadSlot,
             (Phase::ReadSlot, HealthEvent::Slot(reading)) => self.on_slot(elapsed, refuse, reading),
@@ -301,7 +322,7 @@ impl HealthMachine {
                 self.finish(HealthVerdict::RestartReturned)
             }
             (Phase::Done(verdict), _) => HealthAction::Finish(verdict),
-            _ => self.pending,
+            _ => HealthAction::Ignored,
         }
     }
 
@@ -313,11 +334,20 @@ impl HealthMachine {
     fn on_slot(&mut self, elapsed: Duration, refuse: bool, reading: SlotReading) -> HealthAction {
         match reading {
             SlotReading::NotPending => self.finish(HealthVerdict::NothingToVerify),
-            SlotReading::PendingVerify => {
+            SlotReading::PendingVerify(slot) => {
+                self.slot = Some(slot);
                 self.phase = Phase::Poll;
                 self.poll_tick(elapsed, refuse)
             }
-            SlotReading::Busy => HealthAction::Sleep(self.cfg.slot_retry),
+            SlotReading::Busy => {
+                self.busy_reads = self.busy_reads.saturating_add(1);
+                let reads = self.busy_reads.saturating_add(self.failed_reads);
+                if reads >= self.cfg.slot_min_attempts && elapsed >= self.cfg.failure_deadline {
+                    self.finish(HealthVerdict::SlotUnreadable)
+                } else {
+                    HealthAction::Sleep(self.cfg.slot_retry)
+                }
+            }
             SlotReading::Failed => {
                 self.failed_reads += 1;
                 if self.failed_reads % self.cfg.slot_warn_every.max(1)
@@ -350,14 +380,18 @@ impl HealthMachine {
             self.phase = Phase::Poll;
             return HealthAction::Sleep(self.cfg.poll_interval);
         }
+        // Only a pending slot reaches the deadline, and it was read at start.
+        let Some(slot) = self.slot else {
+            return self.finish(HealthVerdict::SlotUnreadable);
+        };
         match self.cfg.deadline_action {
             DeadlineAction::Rollback => {
                 self.phase = Phase::Noting { restart: false };
-                HealthAction::NoteRollback(RollbackReason::HealthDeadline)
+                HealthAction::NoteRollback(RollbackReason::HealthDeadline, slot)
             }
             DeadlineAction::NoteAndRestart(reason) => {
                 self.phase = Phase::Noting { restart: true };
-                HealthAction::NoteRollback(reason)
+                HealthAction::NoteRollback(reason, slot)
             }
         }
     }
@@ -377,14 +411,44 @@ mod tests {
         HealthConfig::from(&OtaTimings::default())
     }
 
+    #[test]
+    fn time_bound_sums_every_phase_and_the_slack() {
+        let c = HealthConfig {
+            healthy_dwell: secs(10),
+            failure_deadline: secs(100),
+            rollback_attempts: 3,
+            rollback_retry: secs(5),
+            complete_attempts: 4,
+            complete_retry: secs(2),
+            ..cfg()
+        };
+        assert_eq!(
+            c.time_bound(),
+            secs(100 + 10 + 3 * 5 + 4 * 2) + HealthConfig::TIME_BOUND_SLACK
+        );
+        assert_eq!(HealthConfig::TIME_BOUND_SLACK, secs(60));
+    }
+
+    #[test]
+    fn time_bound_saturates_instead_of_overflowing() {
+        let c = HealthConfig {
+            rollback_attempts: u32::MAX,
+            rollback_retry: Duration::MAX,
+            ..cfg()
+        };
+        assert_eq!(c.time_bound(), Duration::MAX);
+    }
+
     fn started() -> HealthMachine {
         let mut m = HealthMachine::new(cfg());
         assert_eq!(m.step(Duration::ZERO, false, E::Begin), A::ReadSlot);
         m
     }
 
+    const SLOT: SlotId = SlotId(1);
+
     fn pending_at(m: &mut HealthMachine, t: Duration) -> HealthAction {
-        m.step(t, false, E::Slot(SlotReading::PendingVerify))
+        m.step(t, false, E::Slot(SlotReading::PendingVerify(SLOT)))
     }
 
     #[test]
@@ -397,14 +461,30 @@ mod tests {
     }
 
     #[test]
-    fn busy_reads_never_count_toward_giving_up() {
+    fn busy_before_deadline_sleeps() {
         let mut m = started();
         for i in 0..200 {
-            let a = m.step(secs(500 + i), false, E::Slot(SlotReading::Busy));
+            let a = m.step(secs(i % 119), false, E::Slot(SlotReading::Busy));
             assert_eq!(a, A::Sleep(Duration::from_millis(200)));
-            assert_eq!(m.step(secs(500 + i), false, E::Woke), A::ReadSlot);
+            assert_eq!(m.step(secs(i % 119), false, E::Woke), A::ReadSlot);
         }
         assert_eq!(m.take_warning(), None);
+    }
+
+    #[test]
+    fn permanent_busy_reaches_slot_unreadable_after_deadline() {
+        let mut m = started();
+        for i in 1..=4 {
+            let a = m.step(secs(500), false, E::Slot(SlotReading::Busy));
+            assert!(
+                matches!(a, A::Sleep(_)),
+                "busy read {i} is below the minimum"
+            );
+            m.step(secs(500), false, E::Woke);
+        }
+        let a = m.step(secs(500), false, E::Slot(SlotReading::Busy));
+        assert_eq!(a, A::Finish(HealthVerdict::SlotUnreadable));
+        assert!(!HealthVerdict::SlotUnreadable.opens_admission());
     }
 
     #[test]
@@ -427,16 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn busy_reads_between_failures_do_not_help_giving_up() {
+    fn busy_and_failed_reads_count_together_only_for_a_busy_read() {
         let mut m = started();
-        for _ in 0..4 {
+        for _ in 0..2 {
             m.step(secs(300), false, E::Slot(SlotReading::Failed));
             m.step(secs(300), false, E::Woke);
             m.step(secs(300), false, E::Slot(SlotReading::Busy));
             m.step(secs(300), false, E::Woke);
         }
+        let a = m.step(secs(300), false, E::Slot(SlotReading::Failed));
+        assert!(
+            matches!(a, A::Sleep(_)),
+            "three failed reads are not enough"
+        );
+        m.step(secs(300), false, E::Woke);
         let a = m.step(secs(300), false, E::Slot(SlotReading::Busy));
-        assert!(matches!(a, A::Sleep(_)));
+        assert_eq!(a, A::Finish(HealthVerdict::SlotUnreadable));
     }
 
     #[test]
@@ -465,13 +551,13 @@ mod tests {
     fn a_refusal_blocks_the_predicate_until_the_deadline_rolls_back() {
         let mut m = started();
         assert_eq!(
-            m.step(secs(60), true, E::Slot(SlotReading::PendingVerify)),
+            m.step(secs(60), true, E::Slot(SlotReading::PendingVerify(SLOT))),
             A::Sleep(secs(1))
         );
         assert_eq!(m.step(secs(61), true, E::Woke), A::Sleep(secs(1)));
         assert_eq!(
             m.step(secs(120), true, E::Woke),
-            A::NoteRollback(RollbackReason::HealthDeadline)
+            A::NoteRollback(RollbackReason::HealthDeadline, SLOT)
         );
     }
 
@@ -497,7 +583,7 @@ mod tests {
         assert_eq!(m.step(secs(32), false, E::Healthy(true)), A::MarkValid);
         assert_eq!(
             m.step(secs(120), false, E::Marked(false)),
-            A::NoteRollback(RollbackReason::HealthDeadline)
+            A::NoteRollback(RollbackReason::HealthDeadline, SLOT)
         );
     }
 
@@ -555,7 +641,7 @@ mod tests {
         assert_eq!(m.step(secs(120), false, E::Woke), A::Evaluate);
         assert_eq!(
             m.step(secs(120), false, E::Healthy(false)),
-            A::NoteRollback(RollbackReason::HealthDeadline)
+            A::NoteRollback(RollbackReason::HealthDeadline, SLOT)
         );
         let mut rollbacks = 0;
         let mut action = m.step(secs(120), false, E::Noted);
@@ -613,7 +699,7 @@ mod tests {
         }
         assert_eq!(
             m.step(secs(15), false, E::Woke),
-            A::NoteRollback(RollbackReason::Unhealthy)
+            A::NoteRollback(RollbackReason::Unhealthy, SLOT)
         );
         assert_eq!(m.step(secs(15), false, E::Noted), A::Restart);
         let end = m.step(secs(15), false, E::RestartReturned);
@@ -622,12 +708,162 @@ mod tests {
     }
 
     #[test]
-    fn an_unexpected_event_repeats_the_pending_action() {
+    fn out_of_phase_event_is_ignored_and_pending_kept() {
         let mut m = started();
-        assert_eq!(m.step(secs(1), false, E::Marked(true)), A::ReadSlot);
-        assert_eq!(m.step(secs(1), false, E::RestartReturned), A::ReadSlot);
-        pending_at(&mut m, secs(31));
-        assert_eq!(m.step(secs(31), false, E::Completed(true)), A::Evaluate);
+        assert_eq!(m.step(secs(1), false, E::Marked(true)), A::Ignored);
+        assert_eq!(m.step(secs(1), false, E::RestartReturned), A::Ignored);
+        assert_eq!(pending_at(&mut m, secs(31)), A::Evaluate);
+        assert_eq!(m.step(secs(31), false, E::Completed(true)), A::Ignored);
+        assert_eq!(
+            m.step(secs(31), false, E::RollbackReturned(true)),
+            A::Ignored
+        );
+        assert_eq!(m.step(secs(31), false, E::Woke), A::Ignored);
+        assert_eq!(
+            m.step(secs(31), false, E::Healthy(true)),
+            A::MarkValid,
+            "the pending Evaluate is still answered by its own event"
+        );
+
+        let mut m = started();
+        pending_at(&mut m, secs(120));
+        m.step(secs(120), false, E::Healthy(false));
+        assert_eq!(m.step(secs(120), false, E::Noted), A::Rollback);
+        assert_eq!(
+            m.step(secs(120), false, E::Noted),
+            A::Ignored,
+            "a stray event never repeats the rollback"
+        );
+        assert_eq!(m.step(secs(120), false, E::Woke), A::Ignored);
+        assert_eq!(
+            m.step(secs(120), false, E::RollbackReturned(true)),
+            A::Finish(HealthVerdict::DeadlineRolledBack)
+        );
+    }
+
+    #[test]
+    fn note_rollback_carries_the_slot_read_at_start() {
+        for slot in [SlotId(0), SlotId(1)] {
+            let mut m = started();
+            assert_eq!(
+                m.step(secs(1), false, E::Slot(SlotReading::PendingVerify(slot))),
+                A::Sleep(secs(1))
+            );
+            assert_eq!(
+                m.step(secs(120), true, E::Woke),
+                A::NoteRollback(RollbackReason::HealthDeadline, slot)
+            );
+        }
+    }
+
+    /// Drives a scripted driver until the policy finishes; panics on `Ignored` or after 5000 steps.
+    fn drive(
+        mut c: HealthConfig,
+        restart: bool,
+        mut answer: impl FnMut(A) -> E,
+    ) -> (HealthVerdict, usize) {
+        if restart {
+            c.deadline_action = DeadlineAction::NoteAndRestart(RollbackReason::Unhealthy);
+        }
+        let mut m = HealthMachine::new(c);
+        let mut t = Duration::ZERO;
+        let mut event = E::Begin;
+        for steps in 1..=5_000 {
+            let a = m.step(t, false, event);
+            match a {
+                A::Finish(v) => return (v, steps),
+                A::Ignored => panic!("ignored after {steps} steps"),
+                A::Sleep(d) => t += d,
+                _ => {}
+            }
+            event = answer(a);
+        }
+        panic!("no verdict within 5000 steps");
+    }
+
+    /// A scripted driver: the answer to one action, given the slot reading to report.
+    type Script = fn(A, E) -> E;
+
+    #[test]
+    fn every_scripted_path_reaches_finish() {
+        let slot = E::Slot(SlotReading::PendingVerify(SLOT));
+        let cases: [(&str, bool, Script, HealthVerdict); 6] = [
+            (
+                "healthy",
+                false,
+                |a, slot| match a {
+                    A::ReadSlot => slot,
+                    A::Evaluate => E::Healthy(true),
+                    A::MarkValid => E::Marked(true),
+                    A::CompleteAttempt => E::Completed(true),
+                    _ => E::Woke,
+                },
+                HealthVerdict::Applied,
+            ),
+            (
+                "unhealthy",
+                false,
+                |a, slot| match a {
+                    A::ReadSlot => slot,
+                    A::Evaluate => E::Healthy(false),
+                    A::NoteRollback(..) => E::Noted,
+                    A::Rollback => E::RollbackReturned(true),
+                    _ => E::Woke,
+                },
+                HealthVerdict::DeadlineRolledBack,
+            ),
+            (
+                "mark-fail",
+                false,
+                |a, slot| match a {
+                    A::ReadSlot => slot,
+                    A::Evaluate => E::Healthy(true),
+                    A::MarkValid => E::Marked(false),
+                    A::NoteRollback(..) => E::Noted,
+                    A::Rollback => E::RollbackReturned(false),
+                    _ => E::Woke,
+                },
+                HealthVerdict::DeadlineRollbackFailed,
+            ),
+            (
+                "rollback-fail",
+                false,
+                |a, slot| match a {
+                    A::ReadSlot => slot,
+                    A::Evaluate => E::Healthy(false),
+                    A::NoteRollback(..) => E::Noted,
+                    A::Rollback => E::RollbackReturned(false),
+                    _ => E::Woke,
+                },
+                HealthVerdict::DeadlineRollbackFailed,
+            ),
+            (
+                "restart",
+                true,
+                |a, slot| match a {
+                    A::ReadSlot => slot,
+                    A::Evaluate => E::Healthy(false),
+                    A::NoteRollback(..) => E::Noted,
+                    A::Restart => E::RestartReturned,
+                    _ => E::Woke,
+                },
+                HealthVerdict::RestartReturned,
+            ),
+            (
+                "busy-forever",
+                false,
+                |a, _| match a {
+                    A::ReadSlot => E::Slot(SlotReading::Busy),
+                    _ => E::Woke,
+                },
+                HealthVerdict::SlotUnreadable,
+            ),
+        ];
+        for (name, restart, script, verdict) in cases {
+            let (got, steps) = drive(cfg(), restart, |a| script(a, slot));
+            assert_eq!(got, verdict, "{name}");
+            assert!(steps < 5_000, "{name}");
+        }
     }
 
     #[test]
@@ -638,7 +874,7 @@ mod tests {
                 A::Evaluate
                     | A::MarkValid
                     | A::CompleteAttempt
-                    | A::NoteRollback(_)
+                    | A::NoteRollback(..)
                     | A::Rollback
                     | A::Restart
             )

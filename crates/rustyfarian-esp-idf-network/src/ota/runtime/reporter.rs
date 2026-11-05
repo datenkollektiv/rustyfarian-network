@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use juggler::ota::runtime::{
     ack_delivered, rejects_delta, retry_completion, CompletionRetry, CompletionRetryConfig,
-    CompletionTry, DeliveryStep, PublishOutcome, PublishStep, ReporterConfig, ReporterMachine,
-    ViewStep,
+    CompletionStep, CompletionTry, DeliveryStep, PublishOutcome, PublishStep, ReporterConfig,
+    ReporterMachine, ViewStep,
 };
 use juggler::ota::{FailReason, OtaStatus, PendingReportView};
 
@@ -110,9 +110,19 @@ fn service_completion(ctx: &ReporterCtx, retry: &mut CompletionRetry, origin: In
         CompletionTry::Gone => log::info!("[ota] no attempt record remains; the retry stops"),
         CompletionTry::StillFailing => log::warn!("[ota] the attempt record is still not cleared"),
     }
-    if !retry.on_result(origin.elapsed(), result) {
-        ctx.shared.clear_completion_retry();
+    match retry.on_result(origin.elapsed(), result) {
+        CompletionStep::Retry => {}
+        CompletionStep::Stop => ctx.shared.clear_completion_retry(),
+        CompletionStep::Ignored => {
+            log::error!("[ota] the completion retry was not armed: {result:?}");
+        }
     }
+}
+
+/// The loop and the machine disagree on the step of the pass (ADR 023 decision 6): end the pass and retry at the next window.
+fn desync(machine: &mut ReporterMachine, origin: Instant, what: &str) {
+    log::error!("[ota] the reporter {what} out of order; the pass ends");
+    machine.on_store_error(origin.elapsed());
 }
 
 fn service_report(ctx: &ReporterCtx, machine: &mut ReporterMachine, origin: Instant) {
@@ -126,9 +136,12 @@ fn service_report(ctx: &ReporterCtx, machine: &mut ReporterMachine, origin: Inst
             Ok(PendingReportView::Ready(report)) => match machine.on_view(origin.elapsed(), true) {
                 ViewStep::Publish => report,
                 ViewStep::Idle => return,
+                ViewStep::Ignored => return desync(machine, origin, "read the view"),
             },
             Ok(PendingReportView::None | PendingReportView::AwaitingBootReconcile) => {
-                machine.on_view(origin.elapsed(), false);
+                if machine.on_view(origin.elapsed(), false) == ViewStep::Ignored {
+                    desync(machine, origin, "read the view");
+                }
                 return;
             }
             Err(e) => {
@@ -182,6 +195,7 @@ fn service_report(ctx: &ReporterCtx, machine: &mut ReporterMachine, origin: Inst
                 }
                 return;
             }
+            PublishStep::Ignored => return desync(machine, origin, "published"),
             PublishStep::MarkDelivered => {
                 match ctx
                     .records
@@ -195,6 +209,9 @@ fn service_report(ctx: &ReporterCtx, machine: &mut ReporterMachine, origin: Inst
                         match machine.on_delivery(origin.elapsed(), delivery) {
                             DeliveryStep::Done => return,
                             DeliveryStep::PublishNext => continue,
+                            DeliveryStep::Ignored => {
+                                return desync(machine, origin, "marked a delivery")
+                            }
                         }
                     }
                     Err(e) => {

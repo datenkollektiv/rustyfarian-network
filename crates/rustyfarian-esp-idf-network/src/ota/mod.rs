@@ -54,7 +54,7 @@ mod flasher;
 pub mod runtime;
 mod store;
 
-pub use boot_facts::{note_boot_slot_idf, read_hardware_facts, slot_evidence_line, BusyRetry};
+pub use boot_facts::{note_boot_slot_idf, read_hardware_facts, slot_evidence_line};
 pub use store::{open_store, open_store_in, EspNvsKv};
 
 // The runtime's configuration and verdict types, flat like the rest of the `juggler::ota` surface.
@@ -69,17 +69,17 @@ pub use juggler::ota::{
 // this crate rather than adding a redundant direct `juggler` dependency.
 // `StreamingVerifier` is also used internally below (via this same import).
 pub use juggler::ota::{
-    bytes_to_hex, classify_read_error, decide_offer, decide_update, hex_to_bytes, note_boot_slot,
-    reconcile, reconcile_boot, slot_for_partition, slot_from_label, slot_label, ActivationPermit,
-    Admission, AttemptRecord, BlockedBy, BootDisposition, BootFacts, BootFault, BootOutcome,
-    BootWarnings, BusyTally, CommandError, CorruptRecord, Deadline, Delivery, FailReason,
-    FailedDownload, HardwareFacts, HardwareReadError, ImageMetadata, KvError, KvStr, Manifest,
-    ManifestError, NoteBoot, NoteBootError, OfferDecision, OtaCommand, OtaError, OtaKv, OtaState,
-    OtaStatus, OtaStore, PendingReport, PendingReportView, ReasonNote, ReconcileAction,
-    RefusalNote, RepairedRecord, ReportRecord, RollbackNoted, RollbackReason, RollbackRequest,
-    SettleOutcome, SlotId, SlotState, StatusError, StoreError, StoredAttempt, StreamingVerifier,
-    UpdateDecision, UpdateSlot, Version, FACTORY_SLOT, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES,
-    NVS_NAMESPACE,
+    bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
+    hex_to_bytes, note_boot_slot, read_with_busy_retry, reconcile, reconcile_boot,
+    slot_for_partition, slot_from_label, slot_label, ActivationPermit, Admission, AttemptRecord,
+    BlockedBy, BootDisposition, BootFacts, BootFault, BootOutcome, BootWarnings, BusyRetry,
+    BusyTally, CommandError, CorruptRecord, Deadline, Delivery, FailReason, FailedDownload,
+    HardwareFacts, HardwareReadError, ImageMetadata, KvError, KvStr, Manifest, ManifestError,
+    NoteBoot, NoteBootError, OfferDecision, OtaCommand, OtaError, OtaKv, OtaState, OtaStatus,
+    OtaStore, PendingReport, PendingReportView, ReasonNote, ReconcileAction, RefusalNote,
+    RepairedRecord, ReportRecord, RollbackNoted, RollbackReason, RollbackRequest, SettleOutcome,
+    SlotId, SlotState, StatusError, StoreError, StoredAttempt, StreamingVerifier, UpdateDecision,
+    UpdateSlot, Version, FACTORY_SLOT, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
 };
 
 macro_rules! target_chip {
@@ -134,11 +134,11 @@ mod target_chip_guard {
     }
 }
 
-use std::io::Write;
 use std::time::{Duration, Instant};
 
-use downloader::{check_content_length, FirmwareDownloader};
+use downloader::{FirmwareDownloader, FirmwareResponse, DOWNLOAD_BUFFER_SIZE};
 use flasher::{FirmwareFlasher, OtaWriter};
+use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
 
 pub use downloader::url_for_log;
 
@@ -243,11 +243,15 @@ impl OtaSession {
     /// write it to the inactive OTA slot, and set that slot as the boot partition.
     ///
     /// The server is contacted before any flash is touched: a connection or
-    /// HTTP-status failure, a response without a `Content-Length` (including
-    /// chunked transfer), and an image larger than the inactive partition
-    /// ([`OtaError::InsufficientSpace`]) all fail without erasing anything.
+    /// HTTP-status failure, a response without a `Content-Length` or with a
+    /// `Transfer-Encoding` (`DownloadFailed { status: 0 }`), and an image larger
+    /// than the inactive partition ([`OtaError::InsufficientSpace`]) all fail
+    /// without erasing anything; the rule is [`check_content_length`], shared
+    /// with the esp-hal tier.
     /// A body that ends before `Content-Length` bytes arrive fails with
     /// `DownloadFailed { status: 0 }`, as on the esp-hal tier.
+    /// The order of the steps is `juggler::ota::download::DownloadMachine`,
+    /// which the esp-hal tier runs as well.
     ///
     /// The operation is streaming: the full image is never held in RAM.
     /// Once the headers pass, only the sectors the image needs are erased and
@@ -274,73 +278,101 @@ impl OtaSession {
         expected_sha256: &[u8; 32],
     ) -> Result<(), OtaError> {
         let start = Instant::now();
-        let deadline = self.deadline;
+        let per_op = Duration::from_secs(self.config.timeout_secs);
+        let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
+        let downloader = FirmwareDownloader::new(url).with_timeout(per_op);
 
-        deadline.check(start.elapsed())?;
-
-        let downloader = FirmwareDownloader::new(url)
-            .with_timeout(Duration::from_secs(self.config.timeout_secs));
-
-        let response = downloader.connect()?;
-        deadline.check(start.elapsed())?;
-
-        let mut flasher = FirmwareFlasher::new()?;
-        let image_len = check_content_length(
-            response.content_length(),
-            flasher.update_partition_capacity()?,
-        )?;
-        let mut ota_writer = flasher.begin(image_len)?;
-        if let Err(e) = deadline.check(start.elapsed()) {
-            return Err(abort_with(ota_writer, e));
-        }
-        let mut verifier = StreamingVerifier::new();
-
-        let result = {
-            let mut verifying_writer = VerifyingWriter {
-                inner: &mut ota_writer,
-                verifier: &mut verifier,
-            };
-            response.stream(
-                image_len,
-                &mut verifying_writer,
-                |downloaded, total| {
-                    log::debug!("OTA progress: {}/{} bytes", downloaded, total);
+        // Until `Prepare`, nothing is open that needs an abort.
+        let mut connected: Option<(FirmwareResponse, FirmwareFlasher)> = None;
+        let mut input = DownloadInput::Begin;
+        let (len, mut response, mut flasher) = loop {
+            let action = machine
+                .poll_bounded(input, start.elapsed())
+                .inspect_err(|e| log::error!("OTA download stopped: {}", e))?;
+            input = match action {
+                // The per-read timeout is fixed at connection creation, so the budget is not applied here.
+                DownloadAction::Connect { .. } => match connect(&downloader) {
+                    Ok((response, flasher, capacity)) => {
+                        let headers = DownloadInput::Headers {
+                            content_length: response.content_length(),
+                            chunked: response.chunked(),
+                            capacity,
+                        };
+                        connected = Some((response, flasher));
+                        headers
+                    }
+                    Err(e) => DownloadInput::ConnectFailed(e),
                 },
-                || deadline.check(start.elapsed()),
-            )
+                DownloadAction::Prepare { len } => match connected.take() {
+                    Some((response, flasher)) => break (len, response, flasher),
+                    None => return Err(unexpected(&action)),
+                },
+                DownloadAction::Done(result) => return result,
+                other => return Err(unexpected(&other)),
+            };
         };
 
-        match result {
+        log::info!("Firmware size: {} bytes", len);
+        let mut ota_writer = match flasher.begin(len as usize) {
+            Ok(writer) => writer,
             Err(e) => {
-                log::error!("Firmware download failed: {}", e);
-                return Err(abort_with(ota_writer, e));
-            }
-            Ok(bytes) => {
-                log::info!("Download complete, verifying {} bytes", bytes);
-            }
-        }
-
-        let computed = verifier.finalize();
-        if &computed != expected_sha256 {
-            log::error!("SHA-256 mismatch — aborting OTA, boot slot unchanged");
-            return Err(abort_with(ota_writer, OtaError::ChecksumMismatch));
-        }
-        log::info!("SHA-256 verified — completing OTA partition swap");
-        if let Err(e) = deadline.check(start.elapsed()) {
-            log::error!("OTA deadline exceeded after verification — aborting, boot slot unchanged");
-            return Err(abort_with(ota_writer, e));
-        }
-
-        let permit = match deadline.permit_activation(start.elapsed()) {
-            Ok(permit) => permit,
-            Err(e) => {
-                log::error!(
-                    "OTA deadline exceeded before activation — aborting, boot slot unchanged"
-                );
-                return Err(abort_with(ota_writer, e));
+                return match machine.poll_bounded(DownloadInput::PrepareFailed(e), start.elapsed())
+                {
+                    Ok(DownloadAction::Done(result)) => result,
+                    Ok(other) => Err(unexpected(&other)),
+                    Err(e) => Err(e),
+                }
             }
         };
-        ota_writer.complete(permit)
+
+        let mut verifier = StreamingVerifier::new();
+        let mut buffer = [0u8; DOWNLOAD_BUFFER_SIZE];
+        let mut input = DownloadInput::Prepared;
+        loop {
+            let action = match machine.poll_bounded(input, start.elapsed()) {
+                Ok(action) => action,
+                Err(e) => {
+                    log::error!(
+                        "OTA download stopped: {} — aborting, boot slot unchanged",
+                        e
+                    );
+                    return Err(abort_with(ota_writer, e));
+                }
+            };
+            input = match action {
+                DownloadAction::Read { max, .. } => {
+                    let want = (max as usize).min(DOWNLOAD_BUFFER_SIZE);
+                    match response.read(&mut buffer[..want]) {
+                        Ok(n) => DownloadInput::Read(n),
+                        Err(e) => DownloadInput::ReadFailed(e),
+                    }
+                }
+                DownloadAction::Write { n } => {
+                    verifier.update(&buffer[..n]);
+                    match ota_writer.write_chunk(&buffer[..n]) {
+                        Ok(()) => DownloadInput::Written,
+                        Err(e) => DownloadInput::WriteFailed(e),
+                    }
+                }
+                DownloadAction::Finalize => {
+                    log::info!("Download complete, verifying {} bytes", len);
+                    DownloadInput::Digest(
+                        core::mem::replace(&mut verifier, StreamingVerifier::new()).finalize(),
+                    )
+                }
+                DownloadAction::Abort(e) => {
+                    log::error!("OTA download failed: {} — aborting, boot slot unchanged", e);
+                    let _ = ota_writer.abort();
+                    return finish(&mut machine, DownloadInput::Aborted, start);
+                }
+                DownloadAction::Activate(permit) => {
+                    log::info!("SHA-256 verified — completing OTA partition swap");
+                    let result = ota_writer.complete(permit);
+                    return finish(&mut machine, DownloadInput::Activated(result), start);
+                }
+                other => return Err(abort_with(ota_writer, unexpected(&other))),
+            };
+        }
     }
 
     /// Experimental: API may change before 1.0.
@@ -384,24 +416,6 @@ impl OtaSession {
     }
 }
 
-/// Adapter that feeds every write to both an `OtaWriter` (flash) and a
-/// `StreamingVerifier` (SHA-256) without any intermediate allocation.
-struct VerifyingWriter<'a, 'b> {
-    inner: &'a mut OtaWriter<'b>,
-    verifier: &'a mut StreamingVerifier,
-}
-
-impl Write for VerifyingWriter<'_, '_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.verifier.update(buf);
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 /// Abort the flash session and hand back the error that ended it.
 ///
 /// The abort result is deliberately ignored: the original error is the one the
@@ -409,4 +423,35 @@ impl Write for VerifyingWriter<'_, '_> {
 fn abort_with(writer: OtaWriter<'_>, err: OtaError) -> OtaError {
     let _ = writer.abort();
     err
+}
+
+/// Connect, read the response headers, and size the inactive partition.
+///
+/// The partition is looked up only after the server answered, so nothing on
+/// flash is touched for an unreachable server.
+fn connect(
+    downloader: &FirmwareDownloader,
+) -> Result<(FirmwareResponse, FirmwareFlasher, u64), OtaError> {
+    let response = downloader.connect()?;
+    let flasher = FirmwareFlasher::new()?;
+    let capacity = flasher.update_partition_capacity()? as u64;
+    Ok((response, flasher, capacity))
+}
+
+/// Feed the last outcome and return the machine's final result.
+fn finish(
+    machine: &mut DownloadMachine,
+    input: DownloadInput,
+    start: Instant,
+) -> Result<(), OtaError> {
+    match machine.poll_bounded(input, start.elapsed())? {
+        DownloadAction::Done(result) => result,
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// An action the loop's current phase cannot perform: an internal error.
+fn unexpected(action: &DownloadAction) -> OtaError {
+    log::error!("OTA download: unexpected step {:?}", action);
+    OtaError::DownloadFailed { status: 0 }
 }

@@ -44,8 +44,9 @@ pub mod kv;
 pub mod store;
 
 pub use boot::{
-    note_boot_slot, reconcile_boot, BootDisposition, BootFault, BootOutcome, BootWarnings,
-    BusyTally, HardwareFacts, HardwareReadError, NoteBoot, NoteBootError, UpdateSlot,
+    note_boot_slot, read_with_busy_retry, reconcile_boot, BootDisposition, BootFault, BootOutcome,
+    BootWarnings, BusyRetry, BusyTally, HardwareFacts, HardwareReadError, NoteBoot, NoteBootError,
+    UpdateSlot,
 };
 pub use keys::{slot_for_partition, slot_from_label, slot_label, FACTORY_SLOT};
 pub use kv::{KvError, KvStr, OtaKv};

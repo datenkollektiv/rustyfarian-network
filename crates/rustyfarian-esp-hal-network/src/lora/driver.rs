@@ -3,9 +3,14 @@
 //! [`EspHalLoraRadio`] will use `esp-hal` SPI + GPIO once the hardware API
 //! is verified on a Heltec V3 board. All methods currently return stub errors
 //! matching the operation attempted (e.g. [`LoraError::TransmitFailed`] from TX methods).
+//!
+//! When implemented, the bring-up calls the shared [`juggler::lora::sx1262::init`]
+//! (ADR 023 rung 1) with the esp-hal `Delay`, exactly as the ESP-IDF tier and the
+//! `hal_esp32s3_join` example do, and the radio plugs into the shared
+//! [`juggler::lora::LorawanPhy`] bridge through [`RadioErrorKind`].
 
 use juggler::lora::config::LoraConfig;
-use juggler::lora::{LoraRadio, RxConfig, RxQuality, RxWindow, TxConfig};
+use juggler::lora::{LoraRadio, RadioErrorKind, RxConfig, RxQuality, RxWindow, TxConfig};
 use pennant::StatusLed;
 
 /// Error type for [`EspHalLoraRadio`] operations.
@@ -15,6 +20,8 @@ pub enum LoraError {
     SpiInitFailed,
     /// Radio hardware not responding or configuration rejected.
     RadioInitFailed,
+    /// RF configuration contains an unsupported spreading factor, bandwidth, or coding rate.
+    InvalidRfConfig,
     /// Frame transmission failed.
     TransmitFailed,
     /// Frame reception failed.
@@ -32,12 +39,23 @@ impl core::fmt::Display for LoraError {
         match self {
             Self::SpiInitFailed => write!(f, "SPI init failed"),
             Self::RadioInitFailed => write!(f, "radio init failed"),
+            Self::InvalidRfConfig => write!(f, "unsupported RF config (SF/BW/CR)"),
             Self::TransmitFailed => write!(f, "transmit failed"),
             Self::ReceiveFailed => write!(f, "receive failed"),
             Self::Timeout => write!(f, "radio timeout"),
             Self::BusyTimeout => write!(f, "radio busy timeout"),
             Self::IrqStatusReadFailed => write!(f, "IRQ status read failed"),
         }
+    }
+}
+
+impl RadioErrorKind for LoraError {
+    fn invalid_rf_config() -> Self {
+        Self::InvalidRfConfig
+    }
+
+    fn is_rx_timeout(&self) -> bool {
+        matches!(self, Self::Timeout)
     }
 }
 
@@ -115,5 +133,13 @@ impl<S: StatusLed> LoraRadio for EspHalLoraRadio<S> {
 
     fn rx_window_duration_ms(&self) -> u32 {
         juggler::lora::RX_WINDOW_DURATION_MS
+    }
+
+    fn cancel_rx(&mut self) -> Result<(), LoraError> {
+        Err(LoraError::ReceiveFailed)
+    }
+
+    fn irq_pending(&mut self) -> Result<bool, LoraError> {
+        Err(LoraError::IrqStatusReadFailed)
     }
 }

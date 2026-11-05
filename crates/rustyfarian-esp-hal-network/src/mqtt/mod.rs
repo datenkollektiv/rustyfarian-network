@@ -277,12 +277,22 @@ pub(crate) const fn stall_timeout_ms(keep_alive_secs: u64) -> u64 {
 
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 mod runner;
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 pub use runner::{MqttBuilder, MqttHandle, MqttRunner};
 

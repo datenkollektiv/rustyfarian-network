@@ -81,26 +81,24 @@ Paths such as `esp_now/mod.rs:645` or `wifi/mod.rs:3206` in the table below are 
 - Fail-closed by design: if the radio never fires the send callback, `run_sender` (and a sync send) waits forever, like `esp-radio`'s own send waiter.
 
 ## Open Questions
-- [ ] Does the unassociated STA drift off the pinned channel on `esp-radio` as it does on ESP-IDF (ADR 012)? Cannot be answered without hardware; gate G-E1: 30 minutes, nunchuk-style C3 peer sending every 100 ms to a C6 on channel 6, send failures below 1 %. Escalate along the mitigation ladder in Decisions.
 - [x] Sender runner task that owns every transmission (removes the settle-window hazard); API change for `send_async` — done 2026-10-30: `EspHalEspNow::run_sender`, async senders return `NoSenderRunner` without it
-- [ ] Is leaving `esp-radio/coex` off acceptable for the associated brain? Gate G-E2: the 30-minute C6 recv-loss comparison below.
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 Resolved on 2026-10-30 (see Decisions): sync shim vs async trait, `esp_rtos` requirement, AMPDU/coex knobs, TX power default.
 The 5 dBm default is not trusted for room-scale props: the consumer's idf firmware needed a 13 dBm cap because of receiver saturation at close range, so the opposite direction (too little power) must be measured as well; the passthrough makes both cases a one-line change.
 
 ## Validation plan
-- C3 owned radio: two boards exchange frames by STA MAC; `scan_for_peer` finds a peer on channels 1, 6 and 11.
-- C6 coordinator: STA joined to a router plus ESP-NOW to two C3 peers for 30 minutes; recv loss comparable to the idf tier.
-- Mixed fleet: hal C3 peer talks to an idf C6 coordinator.
-- IDF re-check after the `ScanMachine` migration: `EspIdfEspNow::scan_for_peer` against a nunchuk on channels 1, 6 and 11 (host-untestable; covered by the consumer's G0/G2 gates).
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## State
 - [x] Design approved — 2026-10-30 by the maintainer (ADR 020 Accepted)
 - [x] Core implementation — `juggler::espnow::ScanMachine` done 2026-10-30; `espnow::EspHalEspNow` (both constructors, `EspNowDriver`, async helpers, TX power) done 2026-10-30; async `scan_for_peer` on the hal tier done 2026-10-30
-- [x] Tests passing (host and cross-compile; hardware pending) — `ScanMachine` host tests pass (`just test-espnow`); `espnow` cells, config and frame-mapping host tests pass (`just test-hal`); `just check-espnow-hal` and `just clippy-hal` pass on C6 and C3; hardware gates G-E1, G-E2 and the validation plan open
+- [x] Tests passing (host and cross-compile) — `ScanMachine` host tests pass (`just test-espnow`); `espnow` cells, config and frame-mapping host tests pass (`just test-hal`); `just check-espnow-hal` and `just clippy-hal` pass on C6 and C3
 - [x] Documentation updated — README, AGENTS.md, ROADMAP, CHANGELOG, lore (2026-10-30)
 - [x] Examples — `hal_c6_espnow_sta_coordinator`, `hal_c3_espnow_peer` (2026-10-30)
-- [x] Implemented, hardware pending — gates G-E1 (unassociated STA channel drift: 30 min of 100 ms sends, failures below 1 %) and G-E2 (C6 coex-off recv loss) stay open in Open Questions; no flashing was done
+- [x] Implemented (no board was flashed as of 2026-10-30)
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Implementation notes (2026-10-30)
 

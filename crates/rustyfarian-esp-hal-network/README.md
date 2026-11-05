@@ -31,12 +31,12 @@ Minimum Rust is 1.95.
 
 Select **exactly one** of the following:
 
-| Feature   | Target            | Compiles                                |
-|:----------|:------------------|:----------------------------------------|
-| `esp32c3` | ESP32-C3 (RISC-V) | All domains ✓                          |
-| `esp32c6` | ESP32-C6 (RISC-V) | All domains ✓                          |
-| `esp32s3` | ESP32-S3 (Xtensa) | All domains ✓                          |
-| `esp32`   | ESP32 (Xtensa)    | `lora` and `ota` only (Wi-Fi not wired) |
+| Feature   | Target            | Compiles                                                      |
+|:----------|:------------------|:--------------------------------------------------------------|
+| `esp32c3` | ESP32-C3 (RISC-V) | All domains ✓                                                |
+| `esp32c6` | ESP32-C6 (RISC-V) | All domains ✓                                                |
+| `esp32s3` | ESP32-S3 (Xtensa) | All domains ✓                                                |
+| `esp32`   | ESP32 (Xtensa)    | `wifi`, `mqtt`, `lora` and `ota` (no provisioning or ESP-NOW) |
 
 The chip features touch neither `esp-println` nor `esp-backtrace`; this crate depends on neither.
 The firmware adds both and selects exactly one console (`auto`, `jtag-serial`, `uart`, `no-op`) and the panic handler itself (ADR 021).
@@ -291,8 +291,8 @@ use rustyfarian_esp_hal_network::lora::LoraConfig;
 
 ## Chip Support Caveats
 
-- **ESP32** (Xtensa LX6): LoRa and OTA; Wi-Fi and provisioning are not wired in this crate yet.
-- `esp-radio 1.0.0-beta.1` does support the ESP32, but the `esp32` feature does not forward a chip to `esp-radio`, `esp-rtos` or `esp-alloc`.
+- **ESP32** (Xtensa LX6): Wi-Fi, MQTT, LoRa and OTA; provisioning and ESP-NOW are not wired in this crate yet.
+- The `esp32` feature forwards the chip to `esp-radio`, `esp-rtos` and `esp-alloc`, which `esp-radio 1.0.0-beta.1` supports on the ESP32.
 - **ESP32-S3** (Xtensa LX7): Full support for Wi-Fi, LoRa, OTA, and provisioning; flash with the IDF-built bootloader (`just flash` does this).
 - **ESP32-C3 and ESP32-C6** (RISC-V): Full support for Wi-Fi, LoRa, OTA, provisioning, and ESP-NOW (`espnow`).
 - The firmware selects the `esp-println` console and the panic handler (`esp-backtrace` or its own `#[panic_handler]`); this crate depends on neither crate.

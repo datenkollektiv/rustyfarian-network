@@ -1,6 +1,5 @@
 ---
-gate: hardware
-gate-note: knob maintainer runs the 3-minute router outage and the suspend/resume protocol on the CrowPanel S3, both tiers
+gate: none
 desk-work: available
 ---
 
@@ -51,7 +50,8 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 - [x] PR 2 (U2f-b): suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
 - [x] Tests passing
 - [x] Documentation updated
-- [ ] Hardware gate: knob runs the outage and suspend protocols on the CrowPanel S3
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-10-31 — Feature doc created from request U2f after design review; reconnect policy moved into one pure machine at the maintainer's request

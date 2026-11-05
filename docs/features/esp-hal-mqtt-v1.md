@@ -67,7 +67,10 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 - [x] Does the client allocate? No — caller-provided buffers, all `StaticCell` (knob question).
 - [x] S3 main-task stack needs no tuning: 13-minute run with broker restart, heap flat at 25 928 B (2026-10-14).
 - [x] T3 (USB power cut → LWT): pass on the CrowPanel 2026-10-16, `status offline` 45–51 s after the cut.
-- [ ] T5 (Wi-Fi loss): the 2026-10-16 run exposed three findings (state stayed `Connected`, `queued` publishes lost, 22 s TCP-reset recovery); fixed (unreleased), re-run by the knob maintainer pending (T5a AP off + T5b router pause).
+- T5 (Wi-Fi loss): the 2026-10-16 run exposed three findings (state stayed `Connected`, `queued` publishes lost, 22 s TCP-reset recovery); fixed (unreleased).
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+
 - [ ] Should this land after `esp-hal-espnow-v1.md` so STA + ESP-NOW + MQTT coexistence is validated once?
 
 ## State
@@ -75,9 +78,9 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 - [x] Core implementation (`mqtt` feature, `minimq` runner, C3/C6/S3 arms, two examples)
 - [x] Tests passing (`just test-hal` 192 host tests, `just clippy-hal` 14 targets)
 - [x] Documentation updated (ADR 019, README, CHANGELOG, runbook `docs/runbooks/esp-hal-mqtt-hardware-test.md`)
-- [x] S3 hardware: T1, T2, T3, T4, T6 pass (CrowPanel, 2026-10-14/16); T5 re-run with the network-loss fix pending
-- [ ] Knob maintainer re-run of T5a/T5b with timestamped serial and broker logs against the fix
-- [ ] C6 hardware: build + clippy only; validation with the rgb-puzzle consumer
+- [x] S3 hardware: T1, T2, T3, T4, T6 pass (CrowPanel, 2026-10-14/16)
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-10-12 — Feature doc created from the rgb-puzzle brain esp-hal variant gap analysis; expands the long-term roadmap line into a request.

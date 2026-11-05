@@ -44,7 +44,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 - [x] Deprecate `juggler::wifi::WifiDriver` (`#[deprecated(note = "use the ADR 022 traits")]`), fix its implementor list; keep the re-exports with `#[allow(deprecated)]`.
 - [x] Log the state in `idf_esp32s3_mqtt_lwt` next to `connect #<n>`.
 - Done when: host tests cover the state mapping; `idf_esp32s3_mqtt_lwt` builds.
-- Gate: rides along with the open U2f hardware session (runbook R1 shows `Connecting → Connected → Disconnected → Connected`).
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md (runbook R1 shows `Connecting → Connected → Disconnected → Connected`).
 
 ## Phase 1 — The async IDF question, answered on hardware
 
@@ -190,10 +190,10 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
 - [ ] The new `mqtt-net` runner thread (4 KiB) is part of the measuring scope.
-- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion; rerun T6 after the fix.
+- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion.
 
 - Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
-- Gate: rides with the bench run for both tiers.
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Phase 4 — Proof and release checkpoint
 

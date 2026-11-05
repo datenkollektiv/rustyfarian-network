@@ -126,6 +126,12 @@ Nothing in the repository changed between the green and red runs; `just act <job
 Fix: pin the ESP-IDF-building jobs to `runs-on: ubuntu-24.04` (rust.yml, clippy.yml); `just act` maps that label to `catthehacker/ubuntu:act-24.04` (with `--pull=false`, the GHCR pull is denied without a login) because act has no default image for it.
 An ESP-IDF upgrade (`docs/features/esp-idf-v5-5-upgrade-v1.md`) is the only path back to `ubuntu-latest`, and only if its esp-clang links against the new libxml2 soname.
 
+**The esp toolchain's Xtensa LLVM backend crashes rustc (SIGSEGV after `Error while trying to spill A8 from class AR: Cannot scavenge register without an emergency spill slot!`) on a function with too many arguments.**
+Seen 2026-11-04 on `rustyfarian-esp-idf-network` with `wifi,mqtt` for `xtensa-esp32-espidf` and `xtensa-esp32s3-espidf` at opt-level 3, breaking `idf_esp32_mqtt` and the hardware-validated `idf_esp32s3_mqtt_lwt`.
+RISC-V IDF targets and the S3 LoRa-only build compiled the same code, and a rebuild after a full RAM-disk clean crashed again, so it is not a stale cache.
+The error names no function; an LLVM machine-IR dump located it in the IDF MQTT `connect_work` with eight arguments.
+Fix: bundle the arguments into one struct (`ConnectWork` in `crates/rustyfarian-esp-idf-network/src/mqtt/mod.rs`), and run `just build-xtensa-idf-mqtt` after widening any tier signature.
+
 ---
 
 ## esp-hal Bare-Metal Stack (esp-radio / esp-hal waves)
@@ -263,13 +269,21 @@ The symptom is self-contradictory output — `ensure-bootloader.sh` reports "bui
 Fix: normalise the directory before globbing (absolute stays as-is, relative gets `$PWD/`), and re-check after the populating build so a failed harvest cannot pass silently.
 The re-check is fatal only on `xtensa-*` targets, where the bundled bootloader is genuinely incompatible; on RISC-V it warns and lets `flash.sh` fall through, matching the `c6` path that has always relied on the bundled bootloader.
 
+**`cargo clean -p esp-idf-sys` does not force the bootloader to be rebuilt.**
+It removes cargo's fingerprints, but `release/build/esp-idf-sys-<hash>/out/` survives: the build script regenerates `out/sdkconfig` while the bootloader subproject can keep the old `bootloader.bin`.
+Any harvest that switches sdkconfig variants must also delete `release/build/esp-idf-sys-*` (what `just clean-idf` does) and then grep `out/sdkconfig` for the variant's rollback line.
+
+**Rollback protection of a bare-metal OTA image depends on the bootloader, which is built from the sdkconfig overlay, not the example's features.**
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is set only by `sdkconfig.ota.defaults`, so the bootloader cache is keyed by variant: `<chip>.bin` (generic) and `<chip>-ota.bin` (rollback on).
+`flash.sh` picks `-ota` whenever the example's features include `ota`, and `ensure-bootloader.sh --ota` builds it (c3 via `idf_c3_ota_runtime`, esp32s3 via `idf_esp32s3_mqtt_lwt` plus the `ota` feature).
+
 **The IDF-built v5.3.3 bootloader successfully boots bare-metal esp-hal images — verified 2026-09-26 on both RISC-V and Xtensa.**
 With the `$PWD/`-prefix cache fix in place, `just run hal_c3_connect_async_led` flashed an esp-hal 1.2.2 bare-metal binary together with the IDF v5.3.3 bootloader (harvested from an IDF example build) and it booted cleanly on ESP32-C3 (RISC-V): serial output shows `boot: ESP-IDF v5.3.3 2nd stage bootloader`, followed by Wi-Fi and DHCP coming up normally.
 The same workaround (`espflash flash --bootloader <path> --ignore-app-descriptor`) boots an `esp-bootloader-esp-idf 0.6` bare-metal image on Heltec WiFi LoRa 32 V3 (Xtensa ESP32-S3), validating the app-descriptor compat fix on both architecture families.
 
 **The harvested bootloader is cached inside the RAM-disk target dir and does not survive reboot or detach — first bare-metal flash afterwards rebuilds the full IDF example (~1m26s) just to re-harvest the ~26 KB `bootloader.bin`.**
 The bottleneck is not the harvest operation itself (~12 s warm cache), but the full ESP-IDF CMake build that precedes it when the cache is cold.
-A future improvement (not yet implemented) would copy the harvested `bootloader.bin` to a persistent cache outside the RAM disk, keyed by chip and IDF version, so a reboot or `just ramdisk detach` followed by another bare-metal flash would reuse the file instead of triggering a full rebuild.
+The stable cache is `<idf_dir>/bootloader/<chip>.bin` (generic) and `<chip>-ota.bin` (rollback-enabled), written by `scripts/ensure-bootloader.sh` and read by `flash.sh` without globbing; it still lives under `idf_dir`, so it does not survive a RAM-disk detach. A copy outside the RAM disk, keyed by chip and IDF version, remains unimplemented.
 Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
 
 ---

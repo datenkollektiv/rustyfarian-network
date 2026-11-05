@@ -22,8 +22,8 @@
 
 use core::fmt;
 
-use juggler::mqtt::CLIENT_ID_MAX_LEN;
-use juggler::provisioning::{
+use crate::mqtt::CLIENT_ID_MAX_LEN;
+use crate::provisioning::{
     config::{
         DEVICE_NAME_MAX_LEN, MQTT_HOST_MAX_LEN, MQTT_PASS_MAX_LEN, MQTT_USER_MAX_LEN,
         OTA_URL_MAX_LEN,
@@ -32,7 +32,7 @@ use juggler::provisioning::{
     ExtraField, ProvisioningConfig, EXTRA_FIELDS_MAX, EXTRA_KEY_MAX_LEN, EXTRA_VALUE_MAX_LEN,
 };
 
-use super::store::StoreError;
+use super::StoreError;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -594,9 +594,9 @@ fn build_config(
         b.map(|v| bytes_to_hstring::<N>(v, tag)).transpose()
     }
 
-    let wifi_ssid: HString<{ juggler::wifi::SSID_MAX_LEN }> =
+    let wifi_ssid: HString<{ crate::wifi::SSID_MAX_LEN }> =
         bytes_to_hstring(wifi_ssid_bytes, TAG_WIFI_SSID)?;
-    let wifi_password: HString<{ juggler::wifi::PASSWORD_MAX_LEN }> =
+    let wifi_password: HString<{ crate::wifi::PASSWORD_MAX_LEN }> =
         bytes_to_hstring(wifi_pass_bytes, TAG_WIFI_PASS)?;
     let ota_url: HString<OTA_URL_MAX_LEN> = bytes_to_hstring(ota_url_bytes, TAG_OTA_URL)?;
     let device_name: HString<DEVICE_NAME_MAX_LEN> =
@@ -687,9 +687,9 @@ mod tests {
     extern crate alloc;
     extern crate std;
     use super::*;
+    use crate::provisioning::profile::MqttFields;
+    use crate::provisioning::ProvisioningConfig;
     use alloc::format;
-    use juggler::provisioning::profile::MqttFields;
-    use juggler::provisioning::ProvisioningConfig;
 
     /// Build a minimal `WifiMqttDevice` config for testing.
     fn make_wifi_mqtt_config(
@@ -722,8 +722,8 @@ mod tests {
         );
 
         ProvisioningConfig::from_storage_parts(
-            hs::<{ juggler::wifi::SSID_MAX_LEN }>(ssid),
-            hs::<{ juggler::wifi::PASSWORD_MAX_LEN }>(pass),
+            hs::<{ crate::wifi::SSID_MAX_LEN }>(ssid),
+            hs::<{ crate::wifi::PASSWORD_MAX_LEN }>(pass),
             hs::<OTA_URL_MAX_LEN>("http://ota.example.com/fw.bin"),
             hs::<DEVICE_NAME_MAX_LEN>("test-device"),
             None,
@@ -739,7 +739,7 @@ mod tests {
     ///
     /// Derived from OS entropy rather than written as literals, so no fixed key
     /// material exists in the source -- the same pattern as `test_psk()` in
-    /// `juggler::wifi` and `test_nonce()` in `provisioning::portal`.  The two
+    /// `crate::wifi` and `test_nonce()` in `provisioning::portal`.  The two
     /// are complements, so they always differ and a round-trip test cannot pass
     /// by crossing the Wi-Fi and MQTT password fields.
     fn test_psk_pair() -> &'static (alloc::string::String, alloc::string::String) {
@@ -1065,9 +1065,9 @@ mod tests {
             "wifi_ssid=net&wifi_pass={}&mqtt_uri=mqtt://b.local:1883&dev_name=clock",
             test_wifi_psk()
         );
-        let config = juggler::provisioning::parse_form(
+        let config = crate::provisioning::parse_form(
             &body,
-            juggler::provisioning::SchemaProfile::WifiMqttDevice,
+            crate::provisioning::SchemaProfile::WifiMqttDevice,
         )
         .expect("ota_url is optional for WifiMqttDevice");
         assert_eq!(config.ota_url(), None);
@@ -1519,8 +1519,8 @@ mod tests {
             Some(fill::<CLIENT_ID_MAX_LEN>("c")),
         );
         ProvisioningConfig::from_storage_parts(
-            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
-            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<{ crate::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ crate::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
             fill::<OTA_URL_MAX_LEN>("o"),
             fill::<DEVICE_NAME_MAX_LEN>("d"),
             None,
@@ -1549,7 +1549,7 @@ mod tests {
         let mut buf = [0u8; 2048];
         let len = encode_record(&cfg, 7, &mut buf).expect("worst-case record encodes");
         assert_eq!(len, 508 + 640, "worst-case record is 1148 B");
-        assert!(len <= super::super::store::MAX_RECORD_LEN);
+        assert!(len <= super::super::MAX_RECORD_LEN);
 
         let decoded = decode_record(&buf[..len]).expect("worst-case record decodes");
         assert_eq!(decoded.config, cfg);
@@ -1700,8 +1700,8 @@ mod tests {
             value: fill::<EXTRA_VALUE_MAX_LEN>(test_wifi_psk()),
         });
         cfg = ProvisioningConfig::from_storage_parts(
-            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
-            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<{ crate::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ crate::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
             fill::<OTA_URL_MAX_LEN>("o"),
             fill::<DEVICE_NAME_MAX_LEN>("d"),
             None,
@@ -1726,8 +1726,8 @@ mod tests {
             });
         }
         let cfg = ProvisioningConfig::from_storage_parts(
-            fill::<{ juggler::wifi::SSID_MAX_LEN }>("s"),
-            fill::<{ juggler::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
+            fill::<{ crate::wifi::SSID_MAX_LEN }>("s"),
+            fill::<{ crate::wifi::PASSWORD_MAX_LEN }>(test_wifi_psk()),
             fill::<OTA_URL_MAX_LEN>("o"),
             fill::<DEVICE_NAME_MAX_LEN>("d"),
             None,

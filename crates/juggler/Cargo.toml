@@ -13,19 +13,14 @@ readme = "README.md"
 [package.metadata.docs.rs]
 all-features = true
 
-[package.metadata.cargo-machete]
-# `lorawan-device` is declared for the `lora` feature but its nb_device/PhyRxTx
-# bridge is not yet wired (LorawanDevice::process() returns NoUpdate); reserved
-# intentionally, tracked in the LoRa post-adoption backlog (ROADMAP). Do not remove.
-ignored = ["lorawan-device"]
-
 [features]
 default = []
 
 # Domain features — each gates exactly one src/ subdirectory
 wifi = []
 mqtt = []
-lora = ["dep:heapless", "dep:nb", "dep:lorawan-device"]
+# `sx126x` + `embedded-hal`: the shared SX1262 bring-up (`lora::sx1262`, ADR 023 rung 1).
+lora = ["dep:heapless", "dep:nb", "dep:lorawan-device", "dep:sx126x", "dep:embedded-hal"]
 espnow = []
 ota = ["dep:heapless", "dep:sha2"]
 # OTA wire contract (command, manifest, status JSON, reason codes). Needs alloc; the base `ota` feature stays alloc-free.
@@ -33,6 +28,9 @@ ota-wire = ["ota", "dep:serde", "dep:serde_json"]
 # `lora` is not implied: a Wi-Fi + MQTT device must not pull lorawan-device.
 # Enable `lora` alongside for `LoraFields::to_lora_config`.
 provisioning = ["wifi", "mqtt", "dep:heapless", "dep:zeroize"]
+# The NorFlash provisioning store (`provisioning::flash_store`): TLV records with
+# CRC and two-sector arbitration over `embedded-storage`. no_std, no alloc.
+flash-store = ["provisioning", "dep:embedded-storage"]
 
 # Mock feature — test doubles for radio and ESP-NOW drivers
 # A single shared mock feature is used because only two domains have mocks with
@@ -57,8 +55,11 @@ log = { workspace = true }
 heapless = { workspace = true, optional = true }
 nb = { workspace = true, optional = true }
 lorawan-device = { workspace = true, optional = true }
+sx126x = { workspace = true, optional = true }
+embedded-hal = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+embedded-storage = { workspace = true, optional = true }

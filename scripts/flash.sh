@@ -11,70 +11,26 @@ set -euo pipefail
 # The IDF-built v5.3.3 bootloader is used instead of the espflash-bundled one:
 # espflash 4.x bundles ESP-IDF v5.5.1, which is incompatible with v5.3.3 binaries
 # (32 KB MMU page mismatch) and produces the "efuse blk rev" boot failure.
+# Examples whose features include `ota` get the rollback-enabled bootloader
+# (<idf_dir>/bootloader/<chip>-ota.bin, see scripts/ensure-bootloader.sh --ota).
+#
+# FLASH_DRY_RUN=1 builds and resolves the bootloader as usual but prints the espflash
+# command instead of running it.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
-# Get required-features for an example from its Cargo.toml
-# Arguments: example_name crate_dir
-# Output: comma-separated features (e.g., "wifi,mqtt")
-# Exit: 1 if not found
-get_example_features_from_toml() {
-    local example_name="$1"
-    local crate_dir="$2"
-
-    if [ ! -f "$crate_dir/Cargo.toml" ]; then
-        printf 'ERROR: %s/Cargo.toml not found\n' "$crate_dir" >&2
-        return 1
+# run_espflash <espflash args...>
+# Runs espflash, or with FLASH_DRY_RUN=1 prints the quoted command and returns.
+run_espflash() {
+    if [ "${FLASH_DRY_RUN:-0}" = "1" ]; then
+        printf 'DRY RUN: espflash'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
     fi
-
-    local in_example=0 found_example=0 features=""
-
-    while IFS= read -r line; do
-        # Check if entering an [[example]] block
-        if [[ "$line" == "[[example]]" ]]; then
-            in_example=1
-            found_example=0
-            features=""
-            continue
-        fi
-
-        if [ $in_example -eq 1 ]; then
-            # Check if this is the example we want
-            if [[ "$line" =~ ^name\ =\ \"([^\"]+)\" ]]; then
-                if [ "${BASH_REMATCH[1]}" = "$example_name" ]; then
-                    found_example=1
-                else
-                    in_example=0
-                fi
-            fi
-
-            # Extract required-features if we found the right example
-            if [ $found_example -eq 1 ]; then
-                if [[ "$line" =~ ^required-features\ =\ \[(.*)\] ]]; then
-                    features="${BASH_REMATCH[1]}"
-                    break
-                fi
-            fi
-
-            # Stop if we hit another [[...]] that's not [[example]]
-            if [[ "$line" =~ ^\[\[ && ! "$line" =~ ^\[\[example\]\] ]]; then
-                in_example=0
-            fi
-        fi
-    done < "$crate_dir/Cargo.toml"
-
-    if [ -z "$features" ]; then
-        printf 'ERROR: Example "%s" not found or has no required-features in %s/Cargo.toml\n' \
-            "$example_name" "$crate_dir" >&2
-        return 1
-    fi
-
-    # Convert TOML array format to comma-separated
-    # Input: "wifi", "mqtt"  →  Output: wifi,mqtt
-    features=$(printf '%s' "$features" | tr -d '"' | tr -d ' ')
-    printf '%s' "$features"
+    espflash "$@"
 }
 
 # Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
@@ -108,29 +64,30 @@ case "$prefix" in
 
         idf_features=$(get_example_features_from_toml "$example" "$pkg_dir") || exit 1
 
-        # If this example requires OTA, apply the OTA sdkconfig overlay (rollback + custom partition table).
-        # The overlay is layered on sdkconfig.defaults via ESP_IDF_SDKCONFIG_DEFAULTS.
+        # Chip and bootloader variant: an example with the ota feature needs the rollback-enabled bootloader.
+        chip=$(printf '%s' "$example" | cut -d_ -f2)
+        bl_variant=generic
+        bl_flag=""
         if printf '%s' "$idf_features" | grep -q "ota"; then
-            # Get the workspace root (parent of this script's directory)
+            bl_variant=ota
+            bl_flag="--ota"
+        fi
+
+        # If this example requires OTA, apply the OTA sdkconfig overlay (rollback + custom partition table).
+        if printf '%s' "$idf_features" | grep -q "ota"; then
             workspace_root="$(cd "$SCRIPT_DIR/.." && pwd)"
-            ota_sdkconfig="$workspace_root/sdkconfig.ota.defaults"
-            if [ -f "$ota_sdkconfig" ]; then
-                # The partition-table path must be absolute (ESP-IDF resolves a relative one against the
-                # generated esp-idf-sys project, not the workspace), so it is written to a generated
-                # overlay instead of being hard-coded in the committed sdkconfig.ota.defaults.
-                mkdir -p "$idf_dir"
-                case "$idf_dir" in /*) idf_dir_abs="$idf_dir" ;; *) idf_dir_abs="$workspace_root/$idf_dir" ;; esac
-                ota_partitions_overlay="$idf_dir_abs/sdkconfig.ota-partitions.defaults"
-                printf 'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="%s"\n' "$workspace_root/partitions.ota.csv" > "$ota_partitions_overlay"
-                export ESP_IDF_SDKCONFIG_DEFAULTS="$workspace_root/sdkconfig.defaults;$ota_sdkconfig;$ota_partitions_overlay"
+            if apply_ota_sdkconfig "$workspace_root" "$idf_dir"; then
                 # espflash must write the same two-slot table and erase otadata, so a re-flash never
                 # boots a stale slot left over from an earlier OTA test.
                 port_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb --erase-parts otadata)
             fi
         fi
 
+        # Populate the stable bootloader cache for this chip and variant (no-op once cached).
+        # Runs before the example build: ensure-bootloader.sh cleans esp-idf-sys afterwards.
+        "$SCRIPT_DIR/ensure-bootloader.sh" ${bl_flag:+"$bl_flag"} "$chip" "$idf_dir"
+
         # Detect chip and set MCU / Cargo target
-        chip=$(printf '%s' "$example" | cut -d_ -f2)
         case "$chip" in
             c3)      mcu="esp32c3";  target="riscv32imc-esp-espidf"   ;;
             c6)      mcu="esp32c6";  target="riscv32imac-esp-espidf"  ;;
@@ -150,13 +107,13 @@ case "$prefix" in
             MCU="$mcu" cargo build --release --target "$target" --target-dir "$idf_dir" --features "$idf_features" --example "$example" -p "$pkg"
         fi
 
-        bl=$(find_idf_bootloader "$target" "$idf_dir")
-        if [ -n "$bl" ]; then
+        bl=$(bootloader_cache_path "$idf_dir" "$chip" "$bl_variant")
+        if [ -f "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
+            run_espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
         else
-            printf 'Warning: IDF-built bootloader not found, using espflash default (may fail on boot).\n' >&2
-            espflash flash "${port_args[@]}" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
+            printf 'Warning: IDF-built bootloader not cached, using espflash default (may fail on boot).\n' >&2
+            run_espflash flash "${port_args[@]}" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
         fi
         ;;
 
@@ -178,8 +135,20 @@ case "$prefix" in
             *) printf 'Unknown chip "%s" in example "%s". Name must follow hal_{c3|c6|esp32|esp32s3}_{name}.\n' "$chip" "$example" >&2; exit 1 ;;
         esac
 
-        # Ensure IDF-built bootloader is cached
-        "$SCRIPT_DIR/ensure-bootloader.sh" "$chip" "$hal_dir" "$idf_dir"
+        # An OTA example needs the same two-slot table as the IDF OTA examples, a blank
+        # otadata so a re-flash never boots a slot left over from an earlier OTA run, and the
+        # rollback-enabled bootloader so an image that never reaches mark_valid is rolled back.
+        bl_variant=generic
+        bl_flag=""
+        if printf '%s' "$hal_features" | grep -q "ota"; then
+            bl_variant=ota
+            bl_flag="--ota"
+            workspace_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+            port_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb --erase-parts otadata)
+        fi
+
+        # Ensure the stable IDF-built bootloader for this chip and variant is cached
+        "$SCRIPT_DIR/ensure-bootloader.sh" ${bl_flag:+"$bl_flag"} "$chip" "$idf_dir"
 
         printf 'Building %s for bare-metal %s (MCU=%s)...\n' "$example" "$hal_target" "$mcu"
 
@@ -193,13 +162,13 @@ case "$prefix" in
             cargo build --release -Zbuild-std=core,alloc --target "$hal_target" --target-dir "$hal_dir" --no-default-features --features "$hal_features" --example "$example" -p "$pkg"
         fi
 
-        bl=$(find_idf_bootloader "$idf_target" "$idf_dir")
-        if [ -n "$bl" ]; then
+        bl=$(bootloader_cache_path "$idf_dir" "$chip" "$bl_variant")
+        if [ -f "$bl" ]; then
             printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
+            run_espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
         else
             printf 'Warning: no IDF-built bootloader cached for %s; using espflash default (may fail on boot for some chips).\n' "$chip" >&2
-            espflash flash "${port_args[@]}" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
+            run_espflash flash "${port_args[@]}" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
         fi
         ;;
 

@@ -119,7 +119,12 @@ impl<P: embedded_hal::digital::OutputPin> StatusLed for ActiveLowLed<P> {
 // Surface that as a compile-time error rather than silently falling through to
 // the host stub when a user enables a chip feature without `embassy`.
 #[cfg(all(
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3"),
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    ),
     not(feature = "embassy")
 ))]
 compile_error!(
@@ -131,7 +136,12 @@ compile_error!(
 
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 mod driver {
     use embassy_net::{
@@ -878,12 +888,22 @@ mod driver {
 #[cfg(all(
     feature = "embassy",
     feature = "provisioning",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 pub(crate) use driver::Scheduler;
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 pub use driver::{
     ApConfigExt, AsyncWifiHandle, HalApConfig, HalWifiConfig, SoftApHandle, WiFiConfigExt,
@@ -892,13 +912,23 @@ pub use driver::{
 
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 mod link;
 
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 pub use link::{link_task, WifiLink, NETWORK_POLL_MS, SUSPEND_DISCONNECT_TIMEOUT_MS};
 
@@ -910,7 +940,12 @@ pub use link::{link_task, WifiLink, NETWORK_POLL_MS, SUSPEND_DISCONNECT_TIMEOUT_
 /// [`WiFiManager::init_softap_async`] has brought it up.
 #[cfg(all(
     feature = "embassy",
-    any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
 ))]
 pub fn softap_mac() -> [u8; 6] {
     let mac =
@@ -932,7 +967,12 @@ pub fn softap_mac() -> [u8; 6] {
     test,
     all(
         feature = "embassy",
-        any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")
+        any(
+            feature = "esp32c6",
+            feature = "esp32c3",
+            feature = "esp32s3",
+            feature = "esp32"
+        )
     )
 ))]
 pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
@@ -949,12 +989,17 @@ pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
 // The chip-without-embassy combination is rejected by the `compile_error!`
 // above, so this branch only fires when no chip feature is selected.
 
-#[cfg(not(any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")))]
+#[cfg(not(any(
+    feature = "esp32c6",
+    feature = "esp32c3",
+    feature = "esp32s3",
+    feature = "esp32"
+)))]
 mod stub {
     /// Wi-Fi error placeholder for host builds.
     #[derive(Debug)]
     pub enum WifiError {
-        /// Wi-Fi requires a chip feature (`esp32c3`, `esp32c6` or `esp32s3`) on
+        /// Wi-Fi requires a chip feature (`esp32c3`, `esp32c6`, `esp32s3` or `esp32`) on
         /// bare-metal targets.
         NotSupported,
     }
@@ -982,5 +1027,10 @@ mod stub {
     }
 }
 
-#[cfg(not(any(feature = "esp32c6", feature = "esp32c3", feature = "esp32s3")))]
+#[cfg(not(any(
+    feature = "esp32c6",
+    feature = "esp32c3",
+    feature = "esp32s3",
+    feature = "esp32"
+)))]
 pub use stub::{WiFiManager, WifiError};

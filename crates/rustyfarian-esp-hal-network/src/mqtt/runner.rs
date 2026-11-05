@@ -1,6 +1,6 @@
 //! Real MQTT implementation: builder, handle and the background runner.
 //!
-//! Compiled only with `embassy` plus a chip feature (`esp32c3`, `esp32c6`, `esp32s3`).
+//! Compiled only with `embassy` plus a chip feature (`esp32c3`, `esp32c6`, `esp32s3`, `esp32`).
 //!
 //! Delivery contract: see the `mqtt` module docs — a handle `Ok(())` is queue
 //! acceptance, and in-flight QoS 1 replay does not survive the clean-start reconnect
@@ -17,7 +17,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
-use juggler::mqtt::{MqttClient, SessionAction, SessionInput, SessionMachine};
+use juggler::mqtt::{
+    ConnectStep, ConnectWorkPlan, MqttClient, NetworkGate, SessionAction, SessionInput,
+    SessionMachine,
+};
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, PubError, Publication,
@@ -43,8 +46,6 @@ const PUBLISH_ATTEMPTS: usize = 3;
 const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound for pushing the RST out after `abort()` while the network is up.
 const RST_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
-/// Outcome string for a session ended by the network watch.
-const NETWORK_LOST: &str = "network lost";
 /// Outcome string for a session await that outlived the stall deadline.
 const TRANSPORT_STALLED: &str = "transport stalled";
 /// Tasks that [`MqttHandle::wait_connected`] wakes directly; more waiters
@@ -82,10 +83,10 @@ impl Shared {
         }
     }
 
-    /// Feeds the machine; wakes `wait_connected` when connect work made the session ready.
+    /// Feeds the machine; wakes `wait_connected` when it answers [`SessionAction::Ready`].
     fn poll(&self, input: SessionInput) -> SessionAction {
         let action = self.machine.lock(|m| m.borrow_mut().poll(input));
-        if matches!(input, SessionInput::WorkDone(_)) && self.can_publish() {
+        if action == SessionAction::Ready {
             self.connected.lock(|w| w.borrow_mut().wake_all());
         }
         action
@@ -434,6 +435,7 @@ impl MqttBuilder {
         let runner = MqttRunner {
             shared,
             stack,
+            gate: NetworkGate::new(),
             socket,
             session,
             broker,
@@ -486,6 +488,9 @@ fn build_session(
 pub struct MqttRunner {
     shared: &'static Shared,
     stack: Stack<'static>,
+    /// Turns the polled link samples into the machine's network edges; every
+    /// sample goes through it, so no edge is fed twice.
+    gate: NetworkGate,
     socket: Socket,
     session: Session<'static>,
     broker: IpEndpoint,
@@ -499,33 +504,20 @@ impl MqttRunner {
     /// Drives connect, serve and reconnect cycles forever.
     ///
     /// The shared [`SessionMachine`] decides when to connect, what to do after
-    /// CONNACK and how long to pause; this loop performs its actions.
+    /// CONNACK and how long to pause; the [`NetworkGate`] decides when the
+    /// network came or went; this loop performs the machine's actions.
     pub async fn run(mut self) -> ! {
-        let mut action = SessionAction::None;
-        // Log "waiting for network" once per wait; a disconnect line may already say it.
-        let mut announce_wait = true;
+        let edge = self.next_gate_edge().await;
+        let mut action = self.feed_edge(edge);
         loop {
             action = match action {
-                // Starting or offline: no attempt until the network is up (gate).
+                // Nothing to perform: the next input is a network edge.
                 SessionAction::None => {
-                    if !network_up(&self.stack) {
-                        if announce_wait {
-                            log::info!("[mqtt] waiting for network");
-                        }
-                        while !network_up(&self.stack) {
-                            Timer::after(NETWORK_POLL_INTERVAL).await;
-                        }
-                    }
-                    announce_wait = true;
-                    let next = self.shared.poll(SessionInput::NetworkUp);
-                    if next == SessionAction::None {
-                        // Not reachable from this loop's own transitions; never spin.
-                        Timer::after(NETWORK_POLL_INTERVAL).await;
-                    }
-                    next
+                    let edge = self.next_gate_edge().await;
+                    self.feed_edge(edge)
                 }
                 SessionAction::Connect => {
-                    let (outcome, lost) = match select(
+                    match select(
                         serve(
                             &mut self.session,
                             &mut self.socket,
@@ -536,54 +528,83 @@ impl MqttRunner {
                             self.connection_timeout,
                             self.stall,
                         ),
-                        network_lost(self.stack),
+                        next_gate_edge(&mut self.gate, &self.stack),
                     )
                     .await
                     {
-                        Either::First(outcome) => (outcome, false),
-                        Either::Second(()) => (NETWORK_LOST, true),
-                    };
-                    if lost {
-                        // The machine answers with `Close`, which the teardown below performs.
-                        self.shared.poll(SessionInput::NetworkDown);
-                    }
-                    // Report the end before awaiting the cleanup, so `is_connected()` and
-                    // `try_publish` stop accepting at once; the teardown still finishes
-                    // before the next action runs.
-                    let next = self.shared.poll(SessionInput::Disconnected);
-                    self.close().await;
-                    match next {
-                        SessionAction::Wait { ms } => log::warn!(
-                            "[mqtt] disconnected ({}), reconnecting in {} ms",
-                            outcome,
-                            ms
-                        ),
-                        _ => {
-                            log::warn!("[mqtt] disconnected ({}), waiting for network", outcome);
-                            announce_wait = false;
+                        Either::First(outcome) => {
+                            // `serve` ended on its own (transport or broker). Report the
+                            // end before awaiting the cleanup, so `is_connected()` and
+                            // `try_publish` stop accepting at once; the teardown still
+                            // finishes before the next action runs.
+                            let next = self.shared.poll(SessionInput::Disconnected);
+                            self.close().await;
+                            match next {
+                                SessionAction::Wait { ms } => log::warn!(
+                                    "[mqtt] disconnected ({}), reconnecting in {} ms",
+                                    outcome,
+                                    ms
+                                ),
+                                _ => log::warn!("[mqtt] disconnected ({})", outcome),
+                            }
+                            next
                         }
+                        // The network went: perform what the machine answers (`Close`).
+                        Either::Second(edge) => self.feed_edge(edge),
                     }
-                    next
                 }
                 SessionAction::Wait { ms } => {
-                    match select(Timer::after_millis(ms), network_lost(self.stack)).await {
+                    match select(
+                        Timer::after_millis(ms),
+                        next_gate_edge(&mut self.gate, &self.stack),
+                    )
+                    .await
+                    {
                         Either::First(()) => self.shared.poll(SessionInput::RetryElapsed),
-                        Either::Second(()) => self.shared.poll(SessionInput::NetworkDown),
+                        Either::Second(edge) => self.feed_edge(edge),
                     }
                 }
                 SessionAction::Close => {
                     self.close().await;
                     self.shared.poll(SessionInput::Disconnected)
                 }
-                // Connect work runs inside `serve`; seeing it here means the machine
-                // and the runner disagree, so tear down and start over.
-                SessionAction::ConnectWork { .. } => {
-                    log::warn!("[mqtt] connect work outside a connection, restarting");
-                    self.close().await;
-                    self.shared.poll(SessionInput::Disconnected)
+                // Connect work runs inside `serve`, which also consumes its `Ready`;
+                // seeing either here, or an ignored input, means the machine and the
+                // runner disagree, so tear down and start over.
+                SessionAction::ConnectWork { .. } | SessionAction::Ready => {
+                    log::warn!("[mqtt] {:?} outside a connection, restarting", action);
+                    self.restart().await
+                }
+                SessionAction::Ignored => {
+                    log::warn!("[mqtt] the session ignored an input, restarting");
+                    self.restart().await
                 }
             };
         }
+    }
+
+    /// Recovers from a runner/machine disagreement: closes the socket and reports
+    /// `Disconnected`. A second disagreement waits for the next network edge
+    /// instead of looping, so it can never spin.
+    async fn restart(&mut self) -> SessionAction {
+        self.close().await;
+        match self.shared.poll(SessionInput::Disconnected) {
+            SessionAction::Ignored | SessionAction::Ready => SessionAction::None,
+            next => next,
+        }
+    }
+
+    /// Waits for the next network edge; see [`next_gate_edge`].
+    async fn next_gate_edge(&mut self) -> SessionInput {
+        next_gate_edge(&mut self.gate, &self.stack).await
+    }
+
+    /// Feeds one network edge to the machine, logging the wait once per outage.
+    fn feed_edge(&self, edge: SessionInput) -> SessionAction {
+        if edge == SessionInput::NetworkDown {
+            log::info!("[mqtt] network lost, waiting for network");
+        }
+        self.shared.poll(edge)
     }
 
     /// Returns the socket to CLOSED. The RST can only leave while the network is up
@@ -640,46 +661,59 @@ async fn serve(
     let (token, subscribe) = match shared.poll(SessionInput::Connected {
         session_present: event != ConnectEvent::Connected,
     }) {
-        SessionAction::ConnectWork { token, subscribe } => (token, subscribe),
+        SessionAction::ConnectWork {
+            token, subscribe, ..
+        } => (token, subscribe),
         other => {
             log::warn!("[mqtt] CONNACK not expected by the session ({:?})", other);
             return "unexpected connack";
         }
     };
-    // Connect work order shared with ESP-IDF: subscriptions, startup message, then ready.
-    if subscribe {
-        for (topic, qos) in subscriptions {
-            let filter = TopicFilter::new(topic)
-                .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(*qos)));
-            match with_deadline(deadline, conn.subscribe(&[filter], &[])).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
-                    shared.poll(SessionInput::WorkFailed(token));
-                    return "subscribe failed";
-                }
-                Err(_) => {
-                    log::warn!("[mqtt] subscribe {} stalled", topic);
-                    shared.poll(SessionInput::WorkFailed(token));
-                    return TRANSPORT_STALLED;
+    // This tier has no connect callback, so the plan ends with the startup message.
+    let plan = ConnectWorkPlan::new(subscribe, subscriptions.len(), startup.is_some(), false);
+    for step in plan {
+        let failed = match step {
+            ConnectStep::Subscribe(index) => {
+                let (topic, qos) = subscriptions[index];
+                let filter = TopicFilter::new(topic)
+                    .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(qos)));
+                match with_deadline(deadline, conn.subscribe(&[filter], &[])).await {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => {
+                        log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
+                        Some("subscribe failed")
+                    }
+                    Err(_) => {
+                        log::warn!("[mqtt] subscribe {} stalled", topic);
+                        Some(TRANSPORT_STALLED)
+                    }
                 }
             }
-        }
-    }
-    if let Some(msg) = startup {
-        let request = PublishRequest {
-            topic: heapless::String::try_from(msg.topic).unwrap_or_default(),
-            payload: heapless::Vec::from_slice(msg.payload).unwrap_or_default(),
-            qos: msg.qos,
-            retain: msg.retain,
+            ConnectStep::PublishStartup => match startup {
+                Some(msg) => {
+                    let request = PublishRequest {
+                        topic: heapless::String::try_from(msg.topic).unwrap_or_default(),
+                        payload: heapless::Vec::from_slice(msg.payload).unwrap_or_default(),
+                        qos: msg.qos,
+                        retain: msg.retain,
+                    };
+                    publish_queued(&mut conn, shared, &request, deadline)
+                        .await
+                        .err()
+                }
+                None => None,
+            },
+            ConnectStep::RunOnConnect => None,
         };
-        if let Err(reason) = publish_queued(&mut conn, shared, &request, deadline).await {
+        if let Some(reason) = failed {
             shared.poll(SessionInput::WorkFailed(token));
             return reason;
         }
     }
 
-    shared.poll(SessionInput::WorkDone(token));
+    if shared.poll(SessionInput::WorkDone(token)) != SessionAction::Ready {
+        return "session ended during connect work";
+    }
     log::info!(
         "[mqtt] connected ({:?}, {} subscriptions{})",
         event,
@@ -796,13 +830,20 @@ fn network_up(stack: &Stack<'static>) -> bool {
     stack.is_link_up() && stack.is_config_up()
 }
 
-/// Resolves once the Wi-Fi link or the IP configuration is gone.
+/// Samples the link every [`NETWORK_POLL_INTERVAL`] and returns the first edge the
+/// gate reports: `NetworkUp` once the Wi-Fi link and the IP configuration are both up,
+/// `NetworkDown` once either is gone.
 ///
-/// Dropping the racing `serve()` future drops the `minimq` connection; the transport is
-/// aborted next and `Session::connect` resets the outbound state, so a publish cancelled
-/// here is lost (documented) but the session stays reusable.
-async fn network_lost(stack: Stack<'static>) {
-    while network_up(&stack) {
+/// Cancel-safe: the gate is updated synchronously with each sample, so dropping the
+/// future between samples loses nothing. Dropping the racing `serve()` future drops
+/// the `minimq` connection; the transport is aborted next and `Session::connect`
+/// resets the outbound state, so a publish cancelled here is lost (documented) but
+/// the session stays reusable.
+async fn next_gate_edge(gate: &mut NetworkGate, stack: &Stack<'static>) -> SessionInput {
+    loop {
+        if let Some(edge) = gate.feed(network_up(stack)) {
+            return edge;
+        }
         Timer::after(NETWORK_POLL_INTERVAL).await;
     }
 }

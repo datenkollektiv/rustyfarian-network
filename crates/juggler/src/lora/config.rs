@@ -9,6 +9,31 @@ pub enum Region {
     US915,
 }
 
+impl Region {
+    /// RF frequency the radio is tuned to during bring-up, in Hz.
+    ///
+    /// The first uplink channel of the band plan; `lorawan-device` retunes the
+    /// radio for every TX and RX window, so this only matters until the first one.
+    /// EU868 uses 868.1 MHz, the value proven on the Heltec V3 bench.
+    pub const fn default_rf_hz(self) -> u32 {
+        match self {
+            Self::EU868 => 868_100_000,
+            Self::US915 => 902_300_000,
+        }
+    }
+
+    /// Frequency whose band `CalibrateImage` calibrates the radio for, in Hz.
+    ///
+    /// Any in-band value selects the same SX126x image-calibration band
+    /// (EU868: 863–870 MHz, US915: 902–928 MHz).
+    pub const fn image_calibration_hz(self) -> u32 {
+        match self {
+            Self::EU868 => 868_100_000,
+            Self::US915 => 915_000_000,
+        }
+    }
+}
+
 /// Hardware-agnostic LoRaWAN application configuration.
 ///
 /// Contains the OTAA join credentials and application settings.
@@ -210,6 +235,21 @@ mod tests {
         assert_eq!(cfg.region, Region::EU868);
         assert_eq!(cfg.ota_port, 10);
         assert_eq!(cfg.dev_eui[7], 0x01);
+    }
+
+    #[test]
+    fn eu868_values_match_the_bench_proven_literals() {
+        assert_eq!(Region::EU868.default_rf_hz(), 868_100_000);
+        assert_eq!(Region::EU868.image_calibration_hz(), 868_100_000);
+        let band = 863_000_000..=870_000_000;
+        assert!(band.contains(&Region::EU868.image_calibration_hz()));
+    }
+
+    #[test]
+    fn us915_values_lie_in_the_us915_band() {
+        let band = 902_000_000..=928_000_000;
+        assert!(band.contains(&Region::US915.default_rf_hz()));
+        assert!(band.contains(&Region::US915.image_calibration_hz()));
     }
 
     #[test]

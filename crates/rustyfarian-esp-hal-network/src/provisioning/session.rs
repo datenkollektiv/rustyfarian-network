@@ -26,13 +26,14 @@ use juggler::provisioning::{DeviceName, PortalDefaults, ProvisioningConfig, Sche
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
-use juggler::provisioning::resolve_softap_ssid;
+use juggler::provisioning::{format_nonce, plan_portal, PortalPlanError, PortalPlanInput};
+use juggler::provisioning::{PortalAction, PortalInput, PortalMachine};
 
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
-use super::store::ProvisioningStore;
+use super::ProvisioningStore;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -280,10 +281,10 @@ impl core::fmt::Display for ProvisioningError {
 ///
 /// Extracted as a pure function gated on `cfg(any(test, all(embassy + chip)))`
 /// so it is host-testable independently of the embassy + chip feature gates.
-/// Called at the top of [`ProvisioningBuilder::start`] — before any peripheral
-/// is consumed, before the `StaticCell` is initialised, and before the nonce
-/// is generated — so the rejection is cheap and leaves the system state
-/// unchanged.
+/// [`ProvisioningBuilder::start`] passes it to
+/// `juggler::provisioning::plan_portal` as the tier's supported-profile
+/// predicate, which checks it first — before the SSID and password, before
+/// the nonce is generated, and before the `StaticCell` is initialised.
 #[cfg(any(
     test,
     all(
@@ -318,9 +319,10 @@ pub(crate) struct SharedState {
     /// Current provisioning state, protected by a critical-section mutex so the
     /// HTTP task and the caller can read/write it concurrently without an async
     /// executor.
-    pub state: embassy_sync::blocking_mutex::CriticalSectionMutex<
-        core::cell::Cell<juggler::provisioning::ProvisioningState>,
-    >,
+    ///
+    /// The cell holds the shared [`PortalMachine`], which sequences every
+    /// mutating portal request (ADR 023 rung 3).
+    pub state: embassy_sync::blocking_mutex::CriticalSectionMutex<core::cell::Cell<PortalMachine>>,
     /// Signals the session outcome once, then clears.  Consumed by
     /// [`ProvisioningSession::wait_outcome`].
     pub outcome: embassy_sync::signal::Signal<
@@ -329,13 +331,33 @@ pub(crate) struct SharedState {
     >,
     /// Per-session CSRF nonce — 8 lowercase hex characters generated from the
     /// hardware RNG at `start` time.
-    pub nonce: HS<16>,
+    pub nonce: HS<8>,
     /// IPv4 address of the SoftAP netif in network byte order (big-endian),
     /// read once during `start`.
     pub ap_ip: [u8; 4],
     /// Optional lifecycle-event callback.  `fn` pointer (not `Arc<dyn Fn>`)
     /// because `no_std` forbids heap-allocated closures.
     pub on_event: Option<fn(ProvisioningEvent)>,
+}
+
+#[cfg_attr(
+    not(all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )),
+    allow(dead_code)
+)]
+impl SharedState {
+    /// Applies one portal request to the machine under the critical section
+    /// and returns the action the HTTP task performs.
+    pub(crate) fn poll(&self, input: PortalInput) -> PortalAction {
+        self.state.lock(|cell| {
+            let mut machine = cell.get();
+            let action = machine.poll(input);
+            cell.set(machine);
+            action
+        })
+    }
 }
 
 // ── ProvisioningSession ───────────────────────────────────────────────────────
@@ -355,7 +377,7 @@ impl ProvisioningSession {
     ///
     /// Reads from the critical-section mutex without blocking.
     pub fn state(&self) -> juggler::provisioning::ProvisioningState {
-        self.shared.state.lock(|cell| cell.get())
+        self.shared.state.lock(|cell| cell.get().state())
     }
 
     /// The IPv4 address of the SoftAP netif in network byte order, read once
@@ -606,27 +628,27 @@ impl<'a> ProvisioningBuilder<'a> {
         scheduler.ensure_started();
         let scheduler = crate::wifi::Scheduler::Running;
 
-        // ── Step 0: reject unsupported profiles before consuming any resource ─
-        // Profile check must come first — before the AP password check, before
-        // the nonce is generated, and before the StaticCell is initialised — so
-        // that a caller selecting an unsupported profile gets a clean error
-        // without any side effects beyond the scheduler start above.
-        validate_profile(self.config.profile)?;
-
-        // ── Step 0b: resolve the SoftAP SSID from the AP MAC ───────────────
+        // ── Step 0: validate the portal settings before consuming a resource ─
+        // `plan_portal` checks the profile, then the SSID, then the AP
+        // password (the shared order), before the nonce is generated and the
+        // StaticCell is initialised, so a rejected configuration has no side
+        // effect beyond the scheduler start above.
         let ap_mac = crate::wifi::softap_mac();
-        let ssid = resolve_softap_ssid(self.config.ssid_override, self.config.ssid_prefix, &ap_mac)
-            .map_err(|reason| ProvisioningError::InvalidSsid { reason })?;
-        log::info!("Provisioning SSID resolved (len={})", ssid.len());
-
-        // ── Step 1: validate AP password ───────────────────────────────────
-        if let Some(pw) = self.config.ap_password {
-            if pw.len() < juggler::wifi::AP_PASSWORD_MIN_LEN {
-                return Err(ProvisioningError::PasswordTooShort {
-                    min: juggler::wifi::AP_PASSWORD_MIN_LEN,
-                });
-            }
-        }
+        let plan = plan_portal(
+            &PortalPlanInput {
+                ssid_override: self.config.ssid_override,
+                ssid_prefix: self.config.ssid_prefix,
+                ap_password: self.config.ap_password,
+                channel: self.config.channel,
+                device_name: self.config.device_name,
+                defaults: self.config.defaults,
+                profile: self.config.profile,
+            },
+            &ap_mac,
+            |p| validate_profile(p).is_ok(),
+        )
+        .map_err(plan_error)?;
+        log::info!("Provisioning SSID resolved (len={})", plan.ssid.len());
         // An open AP (no password) is warned about once, inside
         // `WiFiManager::init_softap_async` (security-checklist item 8).
 
@@ -634,12 +656,7 @@ impl<'a> ProvisioningBuilder<'a> {
         // The scheduler is already running (step -1), so `init_softap_async`
         // starts nothing; `WIFI` is consumed here even if the AP config is
         // rejected, as with `WiFiManager::init_async`.
-        let ap_config = match self.config.ap_password {
-            Some(pw) => juggler::wifi::ApConfig::wpa2(ssid.as_str(), pw),
-            None => juggler::wifi::ApConfig::open(ssid.as_str()),
-        }
-        .with_channel(self.config.channel);
-        let ap_config = crate::wifi::HalApConfig::from_ap(ap_config, scheduler, wifi);
+        let ap_config = crate::wifi::HalApConfig::from_ap(plan.ap_config(), scheduler, wifi);
         // The error value is tainted by `ap_config` (it carries the AP
         // password), so only the static reason is logged — never `e` itself.
         let ap = crate::wifi::WiFiManager::init_softap_async(ap_config).map_err(|e| {
@@ -652,16 +669,14 @@ impl<'a> ProvisioningBuilder<'a> {
         })?;
 
         // ── Step 2: generate per-session nonce (radio is active now) ───────
-        let nonce = generate_nonce(rng);
+        let nonce = format_nonce(rng.random());
 
         // ── Step 3: initialise SharedState in a StaticCell ─────────────────
         static SHARED: StaticCell<SharedState> = StaticCell::new();
         let shared: &'static SharedState = SHARED
             .try_init(SharedState {
                 state: embassy_sync::blocking_mutex::CriticalSectionMutex::new(
-                    core::cell::Cell::new(
-                        juggler::provisioning::ProvisioningState::AwaitingSubmission,
-                    ),
+                    core::cell::Cell::new(PortalMachine::new()),
                 ),
                 outcome: embassy_sync::signal::Signal::new(),
                 nonce,
@@ -687,10 +702,8 @@ impl<'a> ProvisioningBuilder<'a> {
             .min(portal::RENDER_FW_VERSION_MAX)];
         let _ = fw_ver.push_str(fw_src);
         let mut dev_name = HS::<{ portal::RENDER_DEVICE_NAME_MAX }>::new();
-        let _ = dev_name.push_str(self.config.device_name.resolve(&ap_mac).as_str());
-        if matches!(self.config.device_name, DeviceName::MacSuffixed(_))
-            && !self.config.defaults.mqtt_client.is_empty()
-        {
+        let _ = dev_name.push_str(plan.device_name.as_str());
+        if plan.client_id_override_warning {
             log::warn!("Device name is MAC-suffixed but a default MQTT client ID is set; it overrides the per-device client ID unless cleared in the portal");
         }
         log::info!(
@@ -752,29 +765,24 @@ impl<'a> ProvisioningBuilder<'a> {
 ))]
 const AP_IP: [u8; 4] = [192, 168, 4, 1];
 
-/// Generates an 8-hex-character session nonce from the hardware RNG.
+/// Maps a refused portal plan to the public error.
 ///
-/// Reads 4 bytes from `rng` and formats them as 8 lowercase hex characters.
+/// A SoftAP configuration the plan rejects beyond the password length (a
+/// password over 64 bytes, a channel out of range) is the same failure class
+/// `init_softap_async` reported before the plan existed.
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
-fn generate_nonce(rng: esp_hal::rng::Rng) -> HS<16> {
-    let value = rng.random();
-    let mut nonce = HS::<16>::new();
-    // Format 4 bytes as 8 lowercase hex characters using the nibble-at-a-time
-    // approach (no `format!` macro in no_std without `alloc`).
-    for shift in [28u32, 24, 20, 16, 12, 8, 4, 0] {
-        let nibble = ((value >> shift) & 0xF) as u8;
-        let ch = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        };
-        // SAFETY: the string is always 8 chars < capacity 16; push never fails.
-        let _ = nonce.push(ch as char);
+fn plan_error(e: PortalPlanError) -> ProvisioningError {
+    match e {
+        PortalPlanError::ProfileNotSupported(profile) => {
+            ProvisioningError::ProfileNotSupported { profile }
+        }
+        PortalPlanError::InvalidSsid(reason) => ProvisioningError::InvalidSsid { reason },
+        PortalPlanError::PasswordTooShort { min } => ProvisioningError::PasswordTooShort { min },
+        PortalPlanError::InvalidApConfig(reason) => ProvisioningError::SoftApInit { reason },
     }
-    nonce
 }
 
 /// Places `store` in a heap-allocated mutex and leaks it as a
@@ -821,13 +829,9 @@ where
 /// as an owned value; `heapless::String` fields ensure the struct is
 /// `'static`-compatible for embassy task parameters.
 ///
-/// `device_name` is the caller-supplied default that the portal substitutes
-/// into `{{DEV_NAME}}` when no stored configuration is present
-/// (`Prefill.dev_name` is empty).  Once a previous provisioning cycle has
-/// committed a configuration, the stored `dev_name` takes precedence — the
-/// renderer prefers `Prefill.dev_name` when non-empty, falling back to
-/// `device_name` here so a fresh device still surfaces the integrator's
-/// intended name in the portal header.
+/// `device_name` is the resolved pre-fill name: `Prefill::select` puts it into
+/// `{{DEV_NAME}}` on a fresh device, while a name stored by a previous
+/// provisioning cycle takes precedence.
 #[cfg(any(
     test,
     all(
@@ -884,6 +888,20 @@ pub(crate) mod portal {
                 ota_url: copy_capped(d.ota_url),
             }
         }
+
+        /// Borrows the owned defaults as the [`PortalDefaults`] view
+        /// `Prefill::select` reads; the LoRaWAN EUIs are empty.
+        pub(crate) fn as_borrowed(&self) -> PortalDefaults<'_> {
+            PortalDefaults {
+                wifi_ssid: &self.wifi_ssid,
+                mqtt_host: &self.mqtt_host,
+                mqtt_port: &self.mqtt_port,
+                mqtt_user: &self.mqtt_user,
+                mqtt_client: &self.mqtt_client,
+                ota_url: &self.ota_url,
+                ..PortalDefaults::default()
+            }
+        }
     }
 
     /// Copies `s` into a `heapless::String<N>`, truncating on a char boundary
@@ -901,10 +919,18 @@ pub(crate) mod portal {
     /// Owned, `'static`-compatible render configuration for the portal template.
     pub(crate) struct PortalRenderConfig {
         pub firmware_version: HS<RENDER_FW_VERSION_MAX>,
+        // `device_name` and `defaults` are only read by the embassy+chip-gated
+        // dispatch; on host/test builds (no chip feature) nothing consumes
+        // them, so allow dead_code there.
+        #[cfg_attr(
+            not(all(
+                feature = "embassy",
+                any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+            )),
+            allow(dead_code)
+        )]
         pub device_name: HS<RENDER_DEVICE_NAME_MAX>,
         pub profile: SchemaProfile,
-        // Only read by the embassy+chip-gated `load_prefill`; on host/test
-        // builds (no chip feature) nothing consumes it, so allow dead_code there.
         #[cfg_attr(
             not(all(
                 feature = "embassy",
@@ -932,11 +958,9 @@ pub(crate) trait PortalStore: Send + Sync {
     fn save(
         &self,
         config: &juggler::provisioning::ProvisioningConfig,
-    ) -> Result<(), super::store::StoreError>;
+    ) -> Result<(), super::StoreError>;
     /// Load the stored config, if any.
-    fn load(
-        &self,
-    ) -> Result<Option<juggler::provisioning::ProvisioningConfig>, super::store::StoreError>;
+    fn load(&self) -> Result<Option<juggler::provisioning::ProvisioningConfig>, super::StoreError>;
 }
 
 /// Blanket impl of [`PortalStore`] for a `Mutex<RefCell<ProvisioningStore<F>>>`.
@@ -954,13 +978,11 @@ where
     fn save(
         &self,
         config: &juggler::provisioning::ProvisioningConfig,
-    ) -> Result<(), super::store::StoreError> {
+    ) -> Result<(), super::StoreError> {
         self.lock(|cell| cell.borrow_mut().save(config))
     }
 
-    fn load(
-        &self,
-    ) -> Result<Option<juggler::provisioning::ProvisioningConfig>, super::store::StoreError> {
+    fn load(&self) -> Result<Option<juggler::provisioning::ProvisioningConfig>, super::StoreError> {
         self.lock(|cell| cell.borrow_mut().load())
     }
 }

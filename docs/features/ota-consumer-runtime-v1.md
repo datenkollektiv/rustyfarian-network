@@ -4,7 +4,9 @@ Requested by `rustyfarian-rgb-clock` (first consumer) and Watchtower v2 (second 
 The decision core (`decide_offer`, `reconcile`, `OtaError::code`) ships unreleased on `main`.
 Goal: lift the generic download hardening, wire contract, record store, and runtime into the library so both consumers reuse it.
 
-**Status: All sub-projects (A–D) implemented, 0.6.0 pending hardware validation.**
+**Status: All sub-projects (A–D) implemented.**
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Decomposition
 
@@ -280,13 +282,15 @@ The runtime deliberately differs from the first consumer's hand-written layer in
 
 ## Hardware Validation State
 
-**Sub-project A:** Host-tested via juggler deadline tests + IDF error mapping; hardware check pending.
+**Sub-project A:** Host-tested via juggler deadline tests + IDF error mapping.
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 **Sub-projects B–D:** Host-tested via `just test-ota` (FaultKv crash-matrix, adoption and repair, write sequences, boot reconciliation).
 Library runbook at `docs/runbooks/ota-hardware-test.md` documents the test matrix.
 The clock's own hardware passes (2026-09-28) are evidence for the clock's code, not validation of the extracted runtime.
 C and D are complete only when the clock has adopted the runtime and the runbook passes on the reference example and on both consumers, with a per-scenario result for each.
-Pending: clock adoption on real NVS + full runbook + power-loss scenarios + Watchtower v2 validation.
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Open Questions
 
@@ -312,7 +316,7 @@ Pending: clock adoption on real NVS + full runbook + power-loss scenarios + Watc
 - [x] Both consumers' preliminary review received (C/D API, hook wiring, clock adoption path).
 - [x] A hardware check (ESP32-C3 runbook: P10/P11, 2026-10-08).
 - [x] C + D hardware validation: library runbook 21/21 on ESP32-C3 (`2a3ac3f`, 2026-10-08) and rgb-clock adoption tests passed (2026-10-09).
-- [ ] Watchtower v2 hardware validation on second device.
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 - [x] `cargo semver-checks` recipe added and run against v0.5.0 before 0.6.0 release (`just release-semver-check`).
 
 ## Session Log

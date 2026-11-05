@@ -10,6 +10,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::provisioning::portal_flow::{PortalAction, PortalInput, PortalMachine};
 use crate::provisioning::ProvisioningConfig;
 use crate::provisioning::{
     resolve_wait, InvalidTransition, ProvisioningInput, ProvisioningState, WaitResolution,
@@ -39,7 +40,7 @@ pub enum SessionOutcome {
 
 /// Shared session state behind an `Arc<Mutex<…>>` plus a [`Condvar`].
 struct StateInner {
-    state: ProvisioningState,
+    machine: PortalMachine,
     committed: Option<ProvisioningConfig>,
 }
 
@@ -47,6 +48,9 @@ struct StateInner {
 ///
 /// Handle to the shared session state, cloned into every HTTP handler.
 ///
+/// The `std` `Mutex` + `Condvar` wrapper around the shared
+/// [`PortalMachine`]: the portal's request order lives in the machine, this
+/// type adds the lock, the committed payload and the waiter wake-up.
 /// `std` `Mutex`/`Condvar` are available and correct under ESP-IDF `std`.
 #[derive(Clone)]
 pub struct SessionState {
@@ -68,7 +72,7 @@ impl SessionState {
         Self {
             inner: Arc::new((
                 Mutex::new(StateInner {
-                    state: ProvisioningState::AwaitingSubmission,
+                    machine: PortalMachine::new(),
                     committed: None,
                 }),
                 Condvar::new(),
@@ -84,47 +88,76 @@ impl SessionState {
         self.inner
             .0
             .lock()
-            .map(|g| g.state)
+            .map(|g| g.machine.state())
             .unwrap_or(ProvisioningState::AwaitingSubmission)
     }
 
-    /// The one locked transition behind [`apply`](Self::apply),
-    /// [`apply_and_notify`](Self::apply_and_notify), and
-    /// [`commit`](Self::commit).
+    /// The one locked machine step behind every mutating method.
     ///
-    /// On success, `on_accept` runs under the same lock before the new state
-    /// is published, and waiters are woken if `notify` is set. A rejected
-    /// transition is logged at `warn` and changes nothing. A poisoned mutex
-    /// is reported as a rejection of `input` from the last observable state,
+    /// Polls the machine under the lock. On [`PortalAction::Committed`] the
+    /// `payload` is published and the waiters are woken in the same critical
+    /// section, so a waiter never observes `Committed` without the config
+    /// (bug 002); on [`PortalAction::ResetAccepted`] the waiters are woken. A
+    /// refused input is logged at `warn` and changes nothing. A poisoned mutex
+    /// is reported as a refusal of the input from the last observable state,
     /// so a caller never mistakes it for success.
-    fn transition(
+    fn step(
         &self,
-        input: ProvisioningInput,
-        notify: bool,
-        on_accept: impl FnOnce(&mut StateInner),
-    ) -> Result<ProvisioningState, InvalidTransition> {
+        input: PortalInput,
+        payload: Option<ProvisioningConfig>,
+    ) -> (PortalAction, ProvisioningState) {
         let mut guard = match self.inner.0.lock() {
             Ok(g) => g,
             Err(poisoned) => {
-                let state = poisoned.into_inner().state;
-                log::warn!("provisioning state machine: state mutex poisoned, rejecting {input:?}");
-                return Err(InvalidTransition { state, input });
+                let state = poisoned.into_inner().machine.state();
+                let action = match input.transition_input() {
+                    Some(input) => {
+                        log::warn!(
+                            "provisioning state machine: state mutex poisoned, rejecting {input:?}"
+                        );
+                        PortalAction::Refused(InvalidTransition { state, input })
+                    }
+                    None => PortalAction::Forbidden,
+                };
+                return (action, state);
             }
         };
-        match guard.state.apply(input) {
-            Ok(next) => {
-                on_accept(&mut guard);
-                guard.state = next;
-                if notify {
-                    self.inner.1.notify_all();
-                }
-                Ok(next)
+        let action = guard.machine.poll(input);
+        match action {
+            PortalAction::Committed => {
+                guard.committed = payload;
+                self.inner.1.notify_all();
             }
-            Err(t) => {
-                log::warn!("provisioning state machine: {t}");
-                Err(t)
-            }
+            PortalAction::ResetAccepted => self.inner.1.notify_all(),
+            PortalAction::Refused(t) => log::warn!("provisioning state machine: {t}"),
+            _ => {}
         }
+        (action, guard.machine.state())
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Applies one portal request and returns the action the handler performs
+    /// (see [`PortalMachine::poll`]).
+    ///
+    /// Use [`persist_done`](Self::persist_done) for the store result, so a
+    /// successful write publishes its config together with the state.
+    pub fn poll(&self, input: PortalInput) -> PortalAction {
+        self.step(input, None).0
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Reports the store write of a [`PortalAction::Persist`]: `Some(config)`
+    /// for a successful write, `None` for a failed one.
+    ///
+    /// Returns [`PortalAction::Committed`] after the config is published and
+    /// the waiters are woken, [`PortalAction::PersistFailed`] after the
+    /// session reopened, or [`PortalAction::Refused`] when no submission was
+    /// persisting; `config` is then dropped (and scrubbed).
+    pub fn persist_done(&self, saved: Option<ProvisioningConfig>) -> PortalAction {
+        let ok = saved.is_some();
+        self.step(PortalInput::PersistDone { ok }, saved).0
     }
 
     /// Experimental: API may change before 1.0.
@@ -132,27 +165,30 @@ impl SessionState {
     /// Drives the state machine by `input`, returning the new state.
     ///
     /// An invalid transition is logged at `warn`, changes nothing, and is
-    /// returned as `Err` so a caller can refuse the request that caused it —
-    /// the portal refuses a `/save` whose `ValidSubmission` is rejected
-    /// because the session already reached a terminal state.
+    /// returned as `Err` so a caller can refuse the request that caused it.
+    /// An accepted transition into a terminal state wakes the waiters; a
+    /// `PersistOk` applied here publishes no config (use
+    /// [`commit`](Self::commit) for that).
     pub fn apply(&self, input: ProvisioningInput) -> Result<ProvisioningState, InvalidTransition> {
-        self.transition(input, false, |_| {})
+        match self.step(PortalInput::from_transition(input), None) {
+            (PortalAction::Refused(t), _) => Err(t),
+            (_, state) => Ok(state),
+        }
     }
 
     /// Experimental: API may change before 1.0.
     ///
     /// Applies `input` to the state machine AND notifies any condvar waiters.
     ///
-    /// Use this instead of [`apply`](Self::apply) when the transition reaches a
-    /// terminal state that a [`wait_outcome`](Self::wait_outcome) caller must
-    /// observe — specifically the `FactoryReset → FactoryResetPending` path.
-    /// Waiters are woken only when the transition is accepted; returns like
-    /// [`apply`](Self::apply).
+    /// Since the machine wakes the waiters on every accepted transition into a
+    /// terminal state, this is the same as [`apply`](Self::apply); it stays
+    /// for the `FactoryReset → FactoryResetPending` call sites that name the
+    /// wake-up explicitly.
     pub fn apply_and_notify(
         &self,
         input: ProvisioningInput,
     ) -> Result<ProvisioningState, InvalidTransition> {
-        self.transition(input, true, |_| {})
+        self.apply(input)
     }
 
     /// Experimental: API may change before 1.0.
@@ -162,7 +198,8 @@ impl SessionState {
     ///
     /// Returns `Err` when the session is not `Persisting`; `config` is then
     /// dropped (and scrubbed) and the caller must not report success — see
-    /// "Terminal states win" below.
+    /// "Terminal states win" below. Equivalent to
+    /// [`persist_done`](Self::persist_done)`(Some(config))`.
     ///
     /// `wait_committed`/`wait_outcome` key on the state via [`resolve_wait`] —
     /// the state is the single source of truth for the waiter's signal, not
@@ -182,10 +219,10 @@ impl SessionState {
     /// after a factory-reset request still stored the config and the waiter
     /// resolved `Committed`; that precedence is gone.
     pub fn commit(&self, config: ProvisioningConfig) -> Result<(), InvalidTransition> {
-        self.transition(ProvisioningInput::PersistOk, true, |inner| {
-            inner.committed = Some(config);
-        })
-        .map(|_| ())
+        match self.persist_done(Some(config)) {
+            PortalAction::Refused(t) => Err(t),
+            _ => Ok(()),
+        }
     }
 
     /// Experimental: API may change before 1.0.
@@ -236,7 +273,7 @@ impl SessionState {
         };
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            if resolve_wait(guard.state) == WaitResolution::Committed {
+            if resolve_wait(guard.machine.state()) == WaitResolution::Committed {
                 let config = guard.committed.take();
                 if config.is_none() {
                     log::warn!(
@@ -308,7 +345,7 @@ impl SessionState {
             // Delegate the per-iteration terminal-state decision to the pure,
             // host-tested `resolve_wait` function so the "factory-reset unblocks
             // an indefinite wait" contract is locked by these unit tests.
-            match resolve_wait(guard.state) {
+            match resolve_wait(guard.machine.state()) {
                 WaitResolution::Committed => return SessionOutcome::Committed,
                 WaitResolution::FactoryReset => return SessionOutcome::FactoryResetRequested,
                 WaitResolution::Pending => {}
@@ -539,6 +576,55 @@ mod tests {
             .is_err());
         assert_eq!(session.current(), ProvisioningState::Committed);
         assert!(session.wait_committed(Some(Duration::ZERO)).is_some());
+    }
+
+    /// The portal's `/save` sequence through `poll` + `persist_done` commits
+    /// and delivers the config; a failed write reopens the session.
+    #[test]
+    fn poll_and_persist_done_drive_the_save_flow() {
+        let session = SessionState::new();
+        let save = PortalInput::Save {
+            nonce_ok: true,
+            form_valid: true,
+        };
+        assert_eq!(session.poll(save), PortalAction::Persist);
+        assert_eq!(session.persist_done(None), PortalAction::PersistFailed);
+        assert_eq!(session.current(), ProvisioningState::AwaitingSubmission);
+        assert_eq!(session.poll(save), PortalAction::Persist);
+        assert_eq!(
+            session.persist_done(Some(test_config())),
+            PortalAction::Committed
+        );
+        assert!(session.wait_committed(Some(Duration::ZERO)).is_some());
+        assert!(matches!(session.poll(save), PortalAction::Refused(_)));
+    }
+
+    /// A bad nonce is forbidden without touching the session.
+    #[test]
+    fn poll_bad_nonce_is_forbidden() {
+        let session = SessionState::new();
+        assert_eq!(
+            session.poll(PortalInput::FactoryReset { nonce_ok: false }),
+            PortalAction::Forbidden
+        );
+        assert_eq!(session.current(), ProvisioningState::AwaitingSubmission);
+    }
+
+    /// An accepted reset wakes a waiter without `apply_and_notify`.
+    #[test]
+    fn poll_reset_wakes_wait_outcome() {
+        let session = SessionState::new();
+        let waiter = session.clone();
+        let handle = thread::spawn(move || waiter.wait_outcome(Some(Duration::from_secs(5))));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            session.poll(PortalInput::FactoryReset { nonce_ok: true }),
+            PortalAction::ResetAccepted
+        );
+        assert_eq!(
+            handle.join().expect("waiter thread panicked"),
+            SessionOutcome::FactoryResetRequested
+        );
     }
 
     /// `wait_committed` is single-consumer: of two concurrent waiters woken by

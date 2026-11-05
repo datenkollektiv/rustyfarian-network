@@ -148,11 +148,13 @@ use std::time::Duration;
 // Re-export StatusLed and SimpleLed from pennant for convenience
 pub use pennant::{SimpleLed, StatusLed};
 
+#[allow(deprecated)]
+use juggler::mqtt::connection_wait_iterations;
 use juggler::mqtt::{
-    connection_wait_iterations, format_broker_url, in_callback, next_state, validate_broker_host,
-    validate_broker_port, validate_client_id, validate_publish_topic, validate_subscribe_filter,
-    AckOutcome, CallbackScope, MqttClient, MqttEvent, PendingAcks, PendingPublish, SessionInput,
-    SessionToken, SubscribeClient, TryClient,
+    format_broker_url, in_callback, next_state, validate_broker_host, validate_broker_port,
+    validate_client_id, validate_publish_topic, validate_subscribe_filter, AckOutcome,
+    CallbackScope, ConnectStep, ConnectWorkPlan, MqttClient, MqttEvent, PendingAcks,
+    PendingPublish, SessionInput, SessionToken, SubscribeClient, TryClient,
 };
 
 mod runner;
@@ -321,6 +323,11 @@ impl std::error::Error for PublishAckError {}
 /// When dropped, the manager signals the background thread to shut down.
 /// Use [`publish`](Self::publish) or [`publish_with`](Self::publish_with)
 /// for lifecycle messages instead of the deprecated startup/shutdown helpers.
+#[deprecated(
+    since = "0.7.0",
+    note = "use MqttBuilder (via MqttBuilder::new) instead; MqttManager has no esp-hal \
+            counterpart (ADR 022) and is slated for removal in 1.0"
+)]
 pub struct MqttManager<'a, F>
 where
     F: Fn(&str, &[u8]) + Send + 'static,
@@ -331,6 +338,7 @@ where
     _phantom: std::marker::PhantomData<F>,
 }
 
+#[allow(deprecated)]
 impl<'a, F> MqttManager<'a, F>
 where
     F: Fn(&str, &[u8]) + Send + 'static,
@@ -580,6 +588,7 @@ where
     }
 }
 
+#[allow(deprecated)]
 impl<'a, F> Drop for MqttManager<'a, F>
 where
     F: Fn(&str, &[u8]) + Send + 'static,
@@ -886,10 +895,6 @@ impl<'a> MqttBuilder<'a> {
     /// event-loop thread, it cannot hit the esp-mqtt `api_lock` deadlock
     /// described in `docs/project-lore.md` "MQTT Event Loop".
     ///
-    /// Replaces the deprecated [`MqttManager::send_startup_message`]: the
-    /// builder handles the (re)connect lifecycle automatically, so the host
-    /// no longer needs to call it manually.
-    ///
     /// A failed startup publish is logged at `warn` and does not abort the
     /// connection — the message is best-effort, not load-bearing.
     pub fn with_startup_message(mut self) -> Self {
@@ -1123,10 +1128,8 @@ impl<'a> MqttBuilder<'a> {
                                 _ => None,
                             };
                             if let Some(chunk) = chunk {
-                                let abandoned = assembler.abandoned();
                                 let outcome = assembler.feed(chunk);
-                                session_for_thread
-                                    .count_dropped(assembler.abandoned().wrapping_sub(abandoned));
+                                session_for_thread.count_dropped(assembler.dropped_by_last_feed());
                                 match outcome {
                                     Assembled::Message { topic, payload } => match on_message {
                                         Some(ref f) => f(&topic, &payload),
@@ -1135,18 +1138,12 @@ impl<'a> MqttBuilder<'a> {
                                     },
                                     Assembled::Pending => {}
                                     Assembled::TooLarge => {
-                                        session_for_thread.count_dropped(1);
                                         log::warn!(
                                             "[mqtt] dropped inbound message above {} bytes",
                                             MAX_INBOUND_PAYLOAD_LEN
                                         );
                                     }
                                     Assembled::OutOfOrder => {
-                                        // A message in progress was counted as
-                                        // abandoned above; a stray chunk counts once.
-                                        if assembler.abandoned() == abandoned {
-                                            session_for_thread.count_dropped(1);
-                                        }
                                         log::warn!("[mqtt] dropped an out-of-order inbound chunk");
                                     }
                                 }
@@ -1181,7 +1178,7 @@ impl<'a> MqttBuilder<'a> {
             config: client_config,
             handle: None,
             seed_ready,
-            session_present: false,
+            ignored_in_a_row: 0,
             subscribe_topics,
             startup_topic,
             on_connect,
@@ -1774,55 +1771,86 @@ const _: fn() = || {
     implements::<MqttHandle>();
 };
 
-/// One session's connect work on the helper thread, in the order both tiers share:
-/// subscriptions (when the machine asks), startup message, `on_connect`, then
+/// Everything one connect-work run needs besides the client, bundled so the
+/// call stays within the registers of the Xtensa call window: with eight loose
+/// arguments the LLVM backend fails to allocate registers ("Cannot scavenge
+/// register without an emergency spill slot") on esp32 and esp32s3.
+pub(super) struct ConnectWork<'a> {
+    pub(super) session: &'a Session,
+    pub(super) token: SessionToken,
+    pub(super) plan: ConnectWorkPlan,
+    pub(super) topics: &'a [(String, QoS)],
+    pub(super) startup_topic: Option<&'a str>,
+    pub(super) on_connect: Option<&'a Mutex<OnConnectCallback>>,
+    pub(super) session_present: bool,
+}
+
+/// One session's connect work on the helper thread: runs the steps of `work.plan`
+/// (the order lives in `juggler`'s [`ConnectWorkPlan`]), then reports
 /// `WorkDone`. Skips everything if the session already ended; on a failed
-/// subscribe or startup message it reports `WorkFailed` to the runner, which
-/// closes the transport, so esp-mqtt reconnects and the work runs again (bug 014).
-#[allow(clippy::too_many_arguments)]
-fn connect_work(
-    client: &mut SubscribableClient,
-    session: &Session,
-    token: SessionToken,
-    topics: Option<&[(String, QoS)]>,
-    startup_topic: Option<&str>,
-    on_connect: Option<&Mutex<OnConnectCallback>>,
-    session_present: bool,
-) {
+/// subscribe or startup message it stops and reports `WorkFailed` to the
+/// runner, which closes the transport, so esp-mqtt reconnects and the work
+/// runs again (bug 014). A failing `on_connect` is logged, not a failure.
+fn connect_work(client: &mut SubscribableClient, work: &ConnectWork<'_>) {
+    let ConnectWork {
+        session,
+        token,
+        plan,
+        topics,
+        startup_topic,
+        on_connect,
+        session_present,
+    } = work;
+    let (token, topics, startup_topic, on_connect, session_present) = (
+        *token,
+        *topics,
+        *startup_topic,
+        *on_connect,
+        *session_present,
+    );
     if !session.is_current(token) {
         log::debug!("[mqtt] connect helper: stale session, skipping its connect work");
         return;
     }
     let mut done = true;
-    for (topic, qos) in topics.unwrap_or_default() {
-        match client.subscribe_topic(topic, *qos) {
-            Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
-            Err(e) => {
-                log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e);
-                done = false;
-                break;
-            }
-        }
-    }
-    if let (true, Some(topic)) = (done, startup_topic) {
-        if let Err(e) = client.enqueue(topic, EspQoS::AtLeastOnce, false, b"1") {
-            log::warn!(
-                "[mqtt] startup-message publish to '{}' failed: {:?}",
-                topic,
-                e
-            );
-            done = false;
-        }
-    }
-    if let (true, Some(callback)) = (done, on_connect) {
-        let _scope = CallbackScope::enter();
-        match callback.lock() {
-            Ok(f) => {
-                if let Err(e) = f(&mut *client, session_present) {
-                    log::warn!("[mqtt] on_connect callback failed: {:#}", e);
+    for step in plan.clone() {
+        match step {
+            ConnectStep::Subscribe(index) => {
+                let (topic, qos) = &topics[index];
+                match client.subscribe_topic(topic, *qos) {
+                    Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
+                    Err(e) => {
+                        log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e);
+                        done = false;
+                    }
                 }
             }
-            Err(_) => log::warn!("[mqtt] on_connect callback mutex poisoned"),
+            ConnectStep::PublishStartup => {
+                let topic = startup_topic.unwrap_or_default();
+                if let Err(e) = client.enqueue(topic, EspQoS::AtLeastOnce, false, b"1") {
+                    log::warn!(
+                        "[mqtt] startup-message publish to '{}' failed: {:?}",
+                        topic,
+                        e
+                    );
+                    done = false;
+                }
+            }
+            ConnectStep::RunOnConnect => {
+                let Some(callback) = on_connect else { continue };
+                let _scope = CallbackScope::enter();
+                match callback.lock() {
+                    Ok(f) => {
+                        if let Err(e) = f(&mut *client, session_present) {
+                            log::warn!("[mqtt] on_connect callback failed: {:#}", e);
+                        }
+                    }
+                    Err(_) => log::warn!("[mqtt] on_connect callback mutex poisoned"),
+                }
+            }
+        }
+        if !done {
+            break;
         }
     }
     session.send(if done {

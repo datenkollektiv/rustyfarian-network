@@ -1,7 +1,7 @@
 //! Firmware flasher wrapping `EspOta` / `EspOtaUpdate`.
 //!
-//! `FirmwareFlasher::begin()` returns an `OtaWriter` that implements `std::io::Write`
-//! so it can be composed with any `Write`-based download loop.
+//! `FirmwareFlasher::begin()` returns an `OtaWriter`; the download loop writes
+//! each chunk with [`OtaWriter::write_chunk`].
 
 use esp_idf_svc::ota::{EspOta, EspOtaUpdate};
 use esp_idf_svc::sys::esp_ota_get_next_update_partition;
@@ -74,7 +74,7 @@ impl FirmwareFlasher {
 
 /// Active OTA write session.
 ///
-/// Write firmware data in chunks using the `std::io::Write` impl.
+/// Write firmware data in chunks with [`write_chunk`](OtaWriter::write_chunk).
 /// Call [`complete`](OtaWriter::complete) when all data has been written to
 /// set the new partition as the boot partition, or call
 /// [`abort`](OtaWriter::abort) to cancel without changing the boot slot.
@@ -136,17 +136,5 @@ impl<'a> OtaWriter<'a> {
     #[allow(dead_code)]
     pub fn bytes_written(&self) -> usize {
         self.bytes_written
-    }
-}
-
-impl std::io::Write for OtaWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_chunk(buf)
-            .map_err(|e| std::io::Error::other(format!("{e}")))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }

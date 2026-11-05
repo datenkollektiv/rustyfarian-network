@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::thread;
 
 use juggler::ota::runtime::{
-    begin_failure, blocked_report, early_update_block, failed_download, plan_offer, plan_repair,
-    plan_rollback, plan_update_gate, refresh_after_repair, refused_or_absent, repair_all,
-    retained_due, rollback_arm, rollback_undo, FailedSettle, OfferPlan, Probe, Proceed, RepairGate,
-    Retention,
+    begin_failure_outcome, blocked_report, early_update_block, failed_download, plan_offer,
+    plan_repair, plan_rollback, plan_update_gate, refresh_after_repair, refused_or_absent,
+    repair_all, repair_status, retained_due, rollback_arm, rollback_undo, BeginFailure,
+    FailedSettle, OfferPlan, Probe, Proceed, RepairGate, Retention,
 };
 use juggler::ota::{
     FailReason, FailedDownload, Manifest, OtaCommand, OtaStatus, OtaTimings, Version,
@@ -225,10 +225,9 @@ fn apply(
         Ok(id) => log::info!("[ota] attempt {id} begun"),
         Err(e) => {
             log::warn!("[ota] attempt not begun: {e}");
-            return match begin_failure(&e) {
-                OfferPlan::Blocked(reason) => blocked(ctx, retention, command, silent, reason),
-                OfferPlan::Fail(reason) => ctx.fail(reason),
-                OfferPlan::Proceed(_) => ctx.fail(FailReason::AttemptNotPersisted),
+            return match begin_failure_outcome(&e) {
+                BeginFailure::Blocked(reason) => blocked(ctx, retention, command, silent, reason),
+                BeginFailure::Fail(reason) => ctx.fail(reason),
             };
         }
     }
@@ -365,9 +364,11 @@ fn run_repair(ctx: &WorkerCtx) {
         None => log::warn!("[ota] the hardware was unreadable; the flags are unchanged"),
     }
 
-    if repaired == 0 {
-        return ctx.fail(FailReason::RepairNotNeeded);
+    match repair_status(repaired) {
+        Err(reason) => ctx.fail(reason),
+        Ok(records) => {
+            log::info!("[ota] repaired {records} record group(s)");
+            ctx.publish(&OtaStatus::Repaired { records });
+        }
     }
-    log::info!("[ota] repaired {repaired} record group(s)");
-    ctx.publish(&OtaStatus::Repaired { records: repaired });
 }

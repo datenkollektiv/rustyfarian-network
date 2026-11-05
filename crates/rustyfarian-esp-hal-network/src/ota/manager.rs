@@ -11,13 +11,17 @@ use embassy_time::{with_timeout, Duration, Instant};
 use embedded_storage::nor_flash::NorFlash;
 use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
-use esp_bootloader_esp_idf::partitions::{FlashRegion, NorFlashRegion, PARTITION_TABLE_MAX_LEN};
+use esp_bootloader_esp_idf::partitions::{
+    AppPartitionSubType, FlashRegion, NorFlashRegion, PARTITION_TABLE_MAX_LEN,
+};
 use esp_storage::FlashStorage;
+use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
 use juggler::ota::{
-    classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, OtaError,
+    classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, OtaError, SlotId,
     StreamingVerifier,
 };
 
+use super::activation::{activate_as_new, SlotControl};
 use super::http::async_client::fetch_get;
 use super::http::parse_url;
 
@@ -63,10 +67,94 @@ enum Sink<'r, 'a, 'd> {
 /// The only call site of `activate_next_partition`; the permit parameter makes
 /// a timed-out download unable to reach it.
 fn activate(updater: &mut OtaUpdater<'_, '_>, _permit: ActivationPermit) -> Result<(), OtaError> {
-    updater.activate_next_partition().map_err(|e| {
-        log::error!("activate_next_partition failed: {:?}", e);
+    activate_as_new(&mut UpdaterControl(updater)).map_err(|e| {
+        log::error!("activating the next OTA slot failed: {}", e);
         OtaError::FlashWriteFailed
     })
+}
+
+/// [`SlotControl`] over the real otadata writes.
+struct UpdaterControl<'u, 'a, 'b>(&'u mut OtaUpdater<'a, 'b>);
+
+impl SlotControl for UpdaterControl<'_, '_, '_> {
+    type Error = &'static str;
+
+    fn activate_next(&mut self) -> Result<(), Self::Error> {
+        self.0.activate_next_partition().map_err(|e| {
+            log::error!("activate_next_partition failed: {:?}", e);
+            "activate_next_partition"
+        })
+    }
+
+    fn mark_activated_new(&mut self) -> Result<(), Self::Error> {
+        self.0
+            .set_current_ota_state(OtaImageState::New)
+            .map_err(|e| {
+                log::error!("set_current_ota_state(New) failed: {:?}", e);
+                "set_current_ota_state(New)"
+            })
+    }
+}
+
+/// Writes one chunk at `offset` through the selected path.
+fn write_chunk(
+    sink: &mut Sink<'_, '_, '_>,
+    aligner: &mut ChunkAligner,
+    offset: u32,
+    chunk: &[u8],
+) -> Result<(), OtaError> {
+    match sink {
+        // `write()` is the inherent `FlashRegion` method: it erases the
+        // sector around the chunk (bug 004), which is required here
+        // because the partition is encrypted.
+        Sink::ReadModifyWrite(region) => region.write(offset, chunk).map_err(|e| {
+            log::error!("Flash write failed: {:?}", e);
+            OtaError::FlashWriteFailed
+        }),
+        // The partition is blank, so the chunk goes straight to flash;
+        // the aligner holds back a partial word for the next chunk.
+        Sink::Nor(nor) => aligner
+            .push(offset, chunk, |at, data| nor.write(at, data))
+            .map_err(|e| {
+                log::error!("Flash write failed: {:?}", e);
+                OtaError::FlashWriteFailed
+            }),
+    }
+}
+
+/// Writes the tail the aligner held back (the `NorFlash` path only).
+fn flush_tail(
+    sink: &mut Sink<'_, '_, '_>,
+    aligner: &mut ChunkAligner,
+    len: u32,
+) -> Result<(), OtaError> {
+    match sink {
+        Sink::Nor(nor) => aligner
+            .finish(len, |at, data| nor.write(at, data))
+            .map_err(|e| {
+                log::error!("OTA: final flash write failed: {:?}", e);
+                OtaError::FlashWriteFailed
+            }),
+        Sink::ReadModifyWrite(_) => Ok(()),
+    }
+}
+
+/// Feeds the last outcome and returns the machine's final result.
+fn finish(
+    machine: &mut DownloadMachine,
+    input: DownloadInput,
+    elapsed: CoreDuration,
+) -> Result<(), OtaError> {
+    match machine.poll_bounded(input, elapsed)? {
+        DownloadAction::Done(result) => result,
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// An action the loop's current phase cannot perform: an internal error.
+fn unexpected(action: &DownloadAction) -> OtaError {
+    log::error!("OTA: unexpected download step {:?}", action);
+    OtaError::DownloadFailed { status: 0 }
 }
 
 /// Experimental: API may change before 1.0.
@@ -162,10 +250,10 @@ impl<'d> EspHalOtaManager<'d> {
     /// Limit the whole [`fetch_and_apply`](Self::fetch_and_apply) call to `total`.
     ///
     /// The deadline is **cooperative**: the clock starts on entry to
-    /// `fetch_and_apply` and is checked at operation boundaries, namely after
-    /// partition lookup, after connect and headers, after every chunk read and
-    /// every flash write, after SHA-256 verification, and immediately before
-    /// `activate_next_partition`.
+    /// `fetch_and_apply` and is checked at operation boundaries, namely on
+    /// entry, after connect and headers, after partition preparation (the
+    /// erase), after every chunk read and every flash write, and immediately
+    /// before `activate_next_partition`.
     /// A failed check returns [`OtaError::DownloadTimeout`] and the new slot is
     /// not activated.
     ///
@@ -212,6 +300,15 @@ impl<'d> EspHalOtaManager<'d> {
     /// Fetch firmware from `url`, verify its SHA-256 against `expected_sha256`,
     /// write it to the inactive OTA slot, and activate that slot for next boot.
     ///
+    /// The server is contacted before the partition is prepared: a connection
+    /// or HTTP-status failure, a response without a `Content-Length` or with a
+    /// `Transfer-Encoding` (`DownloadFailed { status: 0 }`), and an image larger
+    /// than the inactive partition ([`OtaError::InsufficientSpace`]) all fail
+    /// without erasing anything; the rule is
+    /// [`check_content_length`](juggler::ota::check_content_length), and the
+    /// order of the steps is `juggler::ota::download::DownloadMachine`, shared
+    /// with the ESP-IDF tier.
+    ///
     /// The operation is streaming: the full image is never held in RAM.
     /// Bytes are written to the inactive partition as they arrive — flash
     /// **is** modified during the download, even on the failure path.
@@ -235,193 +332,249 @@ impl<'d> EspHalOtaManager<'d> {
         expected_sha256: &[u8; 32],
     ) -> Result<(), OtaError> {
         let start = Instant::now();
-        let deadline = self.deadline;
-        let per_op = CoreDuration::from_secs(self.config.timeout_secs);
         let elapsed = || to_core(start.elapsed());
-        let budget = || to_embassy(deadline.clip(per_op, elapsed()));
+        let per_op = CoreDuration::from_secs(self.config.timeout_secs);
+        let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
 
-        // 0. A zero (or already-expired) deadline fails before any network or
-        //    flash access.
-        deadline.check(elapsed())?;
-
-        // 1. Parse URL.
-        let parsed = parse_url(url).map_err(OtaError::from)?;
-
-        // 2. Create OtaUpdater borrowing the stored flash.
-        //    `OtaUpdater::new` reads the partition table to locate ota_0/ota_1.
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-
-        // 3. Find the inactive partition and its size (used as max_bytes guard).
-        let (mut region, _slot) = updater.next_partition().map_err(|e| {
-            log::error!("next_partition failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
-        // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
-        let max_bytes = region.capacity() as u64;
-        // Defensive: `region.write(offset: u32, ...)` and the per-chunk math
-        // below cast the running offset to `u32`. The real ESP32-C3/-C6 OTA
-        // partition capacity is well under 4 MiB, so this assertion is a
-        // backstop against future hardware where partitions exceed `u32::MAX`.
-        debug_assert!(
-            max_bytes <= u32::MAX as u64,
-            "OTA partition exceeds u32 offset range"
-        );
-        deadline.check(elapsed())?;
-
-        // 4. Send GET request and parse headers.
-        //    `fetch_get` validates status 200, exactly-one Content-Length,
-        //    no Transfer-Encoding, and 0 < Content-Length <= max_bytes.
-        //    The wait is `min(per-read timeout, remaining deadline)` so a
-        //    stalled server cannot hang the OTA path or outlast the deadline.
-        let http_resp = with_timeout(budget(), fetch_get(socket, &parsed, max_bytes))
-            .await
-            .map_err(|_| {
-                log::error!(
-                    "OTA: HTTP header phase timed out (per-read {}s or deadline)",
-                    self.config.timeout_secs
-                );
-                classify_read_error(true)
-            })??;
-        deadline.check(elapsed())?;
-        let content_length = http_resp.content_length;
-        log::info!("OTA: downloading {} bytes", content_length);
-
-        // 4a. Pick the write path, erasing an unencrypted partition's sectors
-        //     once here instead of once per chunk (bug 004). The span covers
-        //     the image rounded up to whole sectors, which also leaves room for
-        //     the aligner's final word padding; `Content-Length <= capacity`
-        //     holds, and a partition is a whole number of sectors, so the span
-        //     never leaves the partition.
-        let sector = FlashStorage::SECTOR_SIZE;
-        let erased_span = round_up(content_length as u32, sector).min(max_bytes as u32);
-        let mut aligner = ChunkAligner::new(<NorFlashRegion<'_, '_, '_> as NorFlash>::WRITE_SIZE);
-        // `as_nor_flash()` refuses an encrypted partition (the ROM encrypts whole
-        // sectors, so that path must keep read-modify-erase-write). It is probed
-        // first and taken again below: the borrow of a failed probe would
-        // otherwise live through the arm that needs `region` back.
-        let nor_capable = region.as_nor_flash().is_ok();
-        let mut sink = if nor_capable {
-            let mut nor = region.as_nor_flash().map_err(|e| {
-                log::error!("OTA: partition is not writable through NorFlash: {:?}", e);
-                OtaError::FlashWriteFailed
-            })?;
-            log::info!("OTA: erasing {} bytes of the target partition", erased_span);
-            nor.erase(0, erased_span).map_err(|e| {
-                log::error!("OTA: erase of the target partition failed: {:?}", e);
-                OtaError::FlashWriteFailed
-            })?;
-            Sink::Nor(nor)
-        } else {
-            Sink::ReadModifyWrite(&mut region)
+        // 1. Connect, read the headers and size the partition; nothing is
+        //    prepared yet, so an error returns without an abort.
+        let mut input = DownloadInput::Begin;
+        let len = loop {
+            let action = machine
+                .poll_bounded(input, elapsed())
+                .inspect_err(|e| log::error!("OTA: download stopped: {}", e))?;
+            input = match action {
+                DownloadAction::Connect { budget } => self.connect(socket, url, budget).await,
+                DownloadAction::Prepare { len } => break len,
+                DownloadAction::Done(result) => return result,
+                other => return Err(unexpected(&other)),
+            };
         };
-        deadline.check(elapsed())?;
+        log::info!("OTA: downloading {} bytes", len);
 
-        // 5. Stream body: each chunk feeds both the flash region and the verifier.
-        //    Each socket read waits at most `min(per-read timeout, remaining
-        //    deadline)`; a timed-out wait is `DownloadTimeout`, a socket read
-        //    error is `ServerUnreachable`.
-        let mut verifier = StreamingVerifier::new();
-        // Word-aligned so `write_nor` writes from this buffer directly; a
-        // misaligned slice would make it copy through its own 4 KiB sector
-        // buffer, on the stack, once per chunk.
-        let mut chunk_buf = ChunkBuf([0u8; CHUNK_LEN]);
-        let mut remaining = content_length;
+        // 2. Only now is the partition table read for writing.
+        //    `OtaUpdater::new` reads it to locate ota_0/ota_1.
+        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+        let mut updater = match OtaUpdater::new(&mut self.flash, &mut pt_buf) {
+            Ok(updater) => updater,
+            Err(e) => {
+                log::error!("OtaUpdater::new failed: {:?}", e);
+                return finish(
+                    &mut machine,
+                    DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
+                    elapsed(),
+                );
+            }
+        };
 
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(chunk_buf.0.len());
-            let n = with_timeout(budget(), socket.read(&mut chunk_buf.0[..to_read]))
-                .await
-                .map_err(|_| {
-                    log::error!(
-                        "OTA: body chunk read timed out (per-read {}s or deadline)",
-                        self.config.timeout_secs
+        // The region borrows `updater`, which activation needs back, so the
+        // stream runs in its own scope and hands out either the permit or the
+        // final result.
+        let streamed = {
+            let mut region = match updater.next_partition() {
+                Ok((region, _slot)) => region,
+                Err(e) => {
+                    log::error!("next_partition failed: {:?}", e);
+                    return finish(
+                        &mut machine,
+                        DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
+                        elapsed(),
                     );
-                    classify_read_error(true)
-                })?
-                .map_err(|e| {
-                    log::error!("OTA: body chunk read failed: {:?}", e);
-                    classify_read_error(false)
-                })?;
-            if n == 0 {
-                // EOF before Content-Length bytes received — peer closed the
-                // socket mid-body. This is a protocol-shape failure (server
-                // declared a length it did not deliver), not a stall, so use
-                // the `status: 0` sentinel rather than `DownloadTimeout`.
-                log::error!("OTA: short read — EOF before {} bytes remaining", remaining);
-                return Err(OtaError::DownloadFailed { status: 0 });
-            }
-            deadline.check(elapsed())?;
-            let chunk = &chunk_buf.0[..n];
-            verifier.update(chunk);
-            let offset = (content_length - remaining) as u32;
-            match &mut sink {
-                // `write()` is the inherent `FlashRegion` method: it erases the
-                // sector around the chunk (bug 004), which is required here
-                // because the partition is encrypted.
-                Sink::ReadModifyWrite(region) => {
-                    region.write(offset, chunk).map_err(|e| {
-                        log::error!("Flash write failed: {:?}", e);
-                        OtaError::FlashWriteFailed
-                    })?;
                 }
-                // The partition is blank, so the chunk goes straight to flash;
-                // the aligner holds back a partial word for the next chunk.
-                Sink::Nor(nor) => {
-                    aligner
-                        .push(offset, chunk, |at, data| nor.write(at, data))
-                        .map_err(|e| {
-                            log::error!("Flash write failed: {:?}", e);
-                            OtaError::FlashWriteFailed
-                        })?;
+            };
+
+            // 2a. Pick the write path, erasing an unencrypted partition's
+            //     sectors once here instead of once per chunk (bug 004). The
+            //     span covers the image rounded up to whole sectors, which also
+            //     leaves room for the aligner's final word padding; the machine
+            //     admitted `len <= capacity`, and a partition is a whole number
+            //     of sectors, so the span never leaves the partition.
+            let sector = FlashStorage::SECTOR_SIZE;
+            let erased_span = round_up(len, sector).min(region.capacity() as u32);
+            let mut aligner =
+                ChunkAligner::new(<NorFlashRegion<'_, '_, '_> as NorFlash>::WRITE_SIZE);
+            // `as_nor_flash()` refuses an encrypted partition (the ROM encrypts
+            // whole sectors, so that path must keep read-modify-erase-write).
+            // It is probed first and taken again below: the borrow of a failed
+            // probe would otherwise live through the arm that needs `region` back.
+            let nor_capable = region.as_nor_flash().is_ok();
+            let prepared = if nor_capable {
+                match region.as_nor_flash() {
+                    Err(e) => {
+                        log::error!("OTA: partition is not writable through NorFlash: {:?}", e);
+                        Err(OtaError::FlashWriteFailed)
+                    }
+                    Ok(mut nor) => {
+                        log::info!("OTA: erasing {} bytes of the target partition", erased_span);
+                        match nor.erase(0, erased_span) {
+                            Ok(()) => Ok(Sink::Nor(nor)),
+                            Err(e) => {
+                                log::error!("OTA: erase of the target partition failed: {:?}", e);
+                                Err(OtaError::FlashWriteFailed)
+                            }
+                        }
+                    }
                 }
+            } else {
+                Ok(Sink::ReadModifyWrite(&mut region))
+            };
+            let mut sink = match prepared {
+                Ok(sink) => sink,
+                Err(e) => {
+                    return finish(&mut machine, DownloadInput::PrepareFailed(e), elapsed());
+                }
+            };
+
+            // 3. Stream the body: each chunk feeds both the flash region and
+            //    the verifier. Each socket read waits at most `min(per-read
+            //    timeout, remaining deadline)`; a timed-out wait is
+            //    `DownloadTimeout`, a socket read error is `ServerUnreachable`.
+            let mut verifier = StreamingVerifier::new();
+            // Word-aligned so `write_nor` writes from this buffer directly; a
+            // misaligned slice would make it copy through its own 4 KiB sector
+            // buffer, on the stack, once per chunk.
+            let mut chunk_buf = ChunkBuf([0u8; CHUNK_LEN]);
+            let mut written: u32 = 0;
+            let mut input = DownloadInput::Prepared;
+            loop {
+                let action = match machine.poll_bounded(input, elapsed()) {
+                    Ok(action) => action,
+                    // Nothing on this tier needs undoing: the slot is simply
+                    // never activated.
+                    Err(e) => {
+                        log::error!("OTA: download stopped: {} — boot slot unchanged", e);
+                        break Err(e);
+                    }
+                };
+                input = match action {
+                    DownloadAction::Read { max, budget } => {
+                        let to_read = (max as usize).min(CHUNK_LEN);
+                        match with_timeout(
+                            to_embassy(budget),
+                            socket.read(&mut chunk_buf.0[..to_read]),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                log::error!(
+                                    "OTA: body chunk read timed out (per-read {}s or deadline)",
+                                    self.config.timeout_secs
+                                );
+                                DownloadInput::ReadFailed(classify_read_error(true))
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("OTA: body chunk read failed: {:?}", e);
+                                DownloadInput::ReadFailed(classify_read_error(false))
+                            }
+                            Ok(Ok(n)) => DownloadInput::Read(n),
+                        }
+                    }
+                    DownloadAction::Write { n } => {
+                        let chunk = &chunk_buf.0[..n];
+                        verifier.update(chunk);
+                        match write_chunk(&mut sink, &mut aligner, written, chunk) {
+                            Ok(()) => {
+                                written += n as u32;
+                                DownloadInput::Written
+                            }
+                            Err(e) => DownloadInput::WriteFailed(e),
+                        }
+                    }
+                    // Write the tail the aligner held back, padded with 0xFF
+                    // inside the erased span, then hand over the digest.
+                    DownloadAction::Finalize => match flush_tail(&mut sink, &mut aligner, len) {
+                        Err(e) => DownloadInput::WriteFailed(e),
+                        Ok(()) => {
+                            log::info!("OTA: download complete, verifying SHA-256");
+                            DownloadInput::Digest(
+                                core::mem::replace(&mut verifier, StreamingVerifier::new())
+                                    .finalize(),
+                            )
+                        }
+                    },
+                    // Nothing on this tier needs undoing: the slot is simply
+                    // never activated, so the boot slot stays unchanged.
+                    DownloadAction::Abort(e) => {
+                        log::error!("OTA: download failed: {} — boot slot unchanged", e);
+                        DownloadInput::Aborted
+                    }
+                    DownloadAction::Activate(permit) => break Ok(permit),
+                    // The end of an aborted download.
+                    DownloadAction::Done(Err(e)) => break Err(e),
+                    other => break Err(unexpected(&other)),
+                };
             }
-            deadline.check(elapsed())?;
-            remaining -= n as u64;
-        }
+        };
 
-        // 5a. Write the tail the aligner held back, padded with 0xFF inside the
-        //     erased span.
-        if let Sink::Nor(nor) = &mut sink {
-            aligner
-                .finish(content_length as u32, |at, data| nor.write(at, data))
-                .map_err(|e| {
-                    log::error!("OTA: final flash write failed: {:?}", e);
-                    OtaError::FlashWriteFailed
-                })?;
-            deadline.check(elapsed())?;
-        }
-
-        log::info!("OTA: download complete, verifying SHA-256");
-
-        // 6. Verify digest.
-        let computed = verifier.finalize();
-        if &computed != expected_sha256 {
-            log::error!("OTA: SHA-256 mismatch — boot slot unchanged");
-            return Err(OtaError::ChecksumMismatch);
-        }
-        log::info!("OTA: SHA-256 verified — activating next partition");
-        deadline.check(elapsed())?;
-
-        // 7. Pre-activation check: the permit is the only way to call `activate`.
-        let permit = deadline.permit_activation(elapsed()).inspect_err(|_| {
-            log::error!("OTA: deadline exceeded before activation — boot slot unchanged");
-        })?;
-
-        // 8. Activate the new slot, with nothing between the permit and this call.
+        // 4. Activate the new slot, with nothing between the permit and this call.
         //    API mapping (esp-bootloader-esp-idf 0.6.0, unchanged since 0.5.0):
         //      activate_next_partition() = commit / finalize — writes the OTA data
         //        partition so the bootloader boots the new slot on next reset.
         //      set_current_ota_state(OtaImageState::Valid)   = mark_valid / cancel rollback
         //      set_current_ota_state(OtaImageState::Invalid) = signal bootloader to rollback
-        activate(&mut updater, permit)?;
+        match streamed {
+            Ok(permit) => {
+                log::info!("OTA: SHA-256 verified — activating next partition");
+                let result = activate(&mut updater, permit);
+                if result.is_ok() {
+                    log::info!("OTA: partition swap complete — reboot to apply");
+                }
+                finish(&mut machine, DownloadInput::Activated(result), elapsed())
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        log::info!("OTA: partition swap complete — reboot to apply");
-        Ok(())
+    /// Performs [`DownloadAction::Connect`]: the GET, the headers, and the
+    /// size of the inactive partition, read only after the server answered.
+    async fn connect(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        url: &str,
+        budget: CoreDuration,
+    ) -> DownloadInput {
+        let parsed = match parse_url(url) {
+            Ok(parsed) => parsed,
+            Err(e) => return DownloadInput::ConnectFailed(OtaError::from(e)),
+        };
+        // The wait is `min(per-read timeout, remaining deadline)` so a stalled
+        // server cannot hang the OTA path or outlast the deadline.
+        let headers = match with_timeout(to_embassy(budget), fetch_get(socket, &parsed)).await {
+            Err(_) => {
+                log::error!(
+                    "OTA: HTTP header phase timed out (per-read {}s or deadline)",
+                    self.config.timeout_secs
+                );
+                return DownloadInput::ConnectFailed(classify_read_error(true));
+            }
+            Ok(Err(e)) => return DownloadInput::ConnectFailed(e),
+            Ok(Ok(headers)) => headers,
+        };
+        match self.partition_capacity() {
+            Ok(capacity) => DownloadInput::Headers {
+                content_length: headers.content_length,
+                chunked: headers.chunked,
+                capacity,
+            },
+            Err(e) => DownloadInput::ConnectFailed(e),
+        }
+    }
+
+    /// Size in bytes of the inactive OTA partition, from a short-lived
+    /// `OtaUpdater` (it only reads the partition table).
+    fn partition_capacity(&mut self) -> Result<u64, OtaError> {
+        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
+            log::error!("OtaUpdater::new failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        let (region, _slot) = updater.next_partition().map_err(|e| {
+            log::error!("next_partition failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
+        // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
+        Ok(region.capacity() as u64)
     }
 
     /// Experimental: API may change before 1.0.
@@ -444,6 +597,31 @@ impl<'d> EspHalOtaManager<'d> {
                 log::error!("mark_valid: set_current_ota_state failed: {:?}", e);
                 OtaError::FlashWriteFailed
             })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The slot the bootloader selected for this boot: `ota_0` is `SlotId(0)`,
+    /// `ota_1` is `SlotId(1)`, anything else (factory) is `SlotId(0xFF)`, the `FACTORY_SLOT` of the `ota-wire` feature.
+    ///
+    /// It is the *selected* slot, which is the running slot on every normal
+    /// boot; right after [`fetch_and_apply`](Self::fetch_and_apply) it is
+    /// already the new slot, before the reboot.
+    pub fn selected_slot(&mut self) -> Result<SlotId, OtaError> {
+        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
+            log::error!("selected_slot: OtaUpdater::new failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        let subtype = updater.selected_partition().map_err(|e| {
+            log::error!("selected_slot: selected_partition failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        Ok(match subtype {
+            AppPartitionSubType::Ota0 => SlotId(0),
+            AppPartitionSubType::Ota1 => SlotId(1),
+            _ => SlotId(0xFF),
+        })
     }
 
     /// Experimental: API may change before 1.0.

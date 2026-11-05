@@ -81,8 +81,9 @@
 //! # Radio event source (DIO1 vs SPI polling)
 //!
 //! The **primary** event source is SPI polling: each loop tick calls
-//! `device.get_radio().irq_pending()` (a `GetIrqStatus` read) and delivers
-//! `RadioEvent(Phy(()))` when a relevant IRQ is latched. The GPIO 14 DIO1
+//! `device.get_radio().irq_pending()` (a `GetIrqStatus` read) and feeds it to
+//! `juggler`'s `LorawanTicker`, which delivers `RadioEvent(Phy(()))` when a
+//! relevant IRQ is latched. The GPIO 14 DIO1
 //! rising-edge interrupt (which sets `DIO1_FLAG`) is only a **redundant early
 //! trigger** — it is consumed if present but is not relied upon.
 //!
@@ -123,6 +124,7 @@ use lorawan_device::{
 use rustyfarian_esp_idf_network::lora::{
     config::{LoraConfig, Region},
     sx1262_driver::{EspIdfLoraRadio, LoraRadioAdapter},
+    LorawanTicker, Outcome, TickEvent,
 };
 
 /// DIO1 rising-edge flag — set by ISR, cleared by main loop after delivery.
@@ -130,6 +132,12 @@ static DIO1_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// How often to send an uplink.
 const UPLINK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Time budget for the join exchange, in ms.
+const JOIN_BUDGET_MS: u32 = 60_000;
+
+/// Time budget for one uplink cycle (TX + RX1 + RX2), in ms.
+const UPLINK_BUDGET_MS: u32 = 30_000;
 
 /// Data rate used for the OTAA join.
 ///
@@ -258,27 +266,21 @@ fn main() -> anyhow::Result<()> {
     device.set_datarate(JOIN_DR);
     log::info!(target: tag, "Join data rate set to {:?} (DR5 = SF7/BW125)", JOIN_DR);
 
-    let mut response = device
+    let response = device
         .join(join_mode)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
+    // `LorawanTicker` owns the two lorawan-device rules: `TimeoutRequest(ms)` is
+    // an ABSOLUTE timestamp in the timeline starting at `start` (assign, never
+    // add elapsed), and `JoinSuccess` / `NoJoinAccept` end the exchange.
     let start = Instant::now();
-    let mut next_timeout_ms: u32 = 0;
-    if let Response::TimeoutRequest(ms) = response {
-        // `TimeoutRequest(ms)` carries an ABSOLUTE timestamp in the device's
-        // millisecond timeline (epoch ≈ TX start ≈ `start`), NOT a relative
-        // delay. Assigning it directly (rather than `elapsed + ms`) is what
-        // makes RX1/RX2 open on time; adding `elapsed` opens them ~2x too late
-        // and the join-accept is missed. See lorawan-device nb_device::Response.
-        next_timeout_ms = ms;
-        log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
-        response = Response::NoUpdate;
-    }
+    let mut ticker = LorawanTicker::new(JOIN_BUDGET_MS, 0);
+    let mut outcome = ticker.on_response(&response);
 
-    loop {
-        let elapsed_ms = start.elapsed().as_millis() as u32;
+    while outcome == Outcome::Continue {
+        let now_ms = start.elapsed().as_millis() as u32;
 
-        // Deliver a radio event when the SX1262 has a pending IRQ.
+        // Poll the SX1262 IRQ register over SPI each tick.
         //
         // We do NOT rely on the DIO1 GPIO interrupt alone: esp-idf-hal PinDriver
         // interrupts are one-shot (auto-disabled on each firing, must be re-armed
@@ -289,58 +291,51 @@ fn main() -> anyhow::Result<()> {
         // catches every RxDone/Timeout. The DIO1 flag is still consumed so a
         // delivered edge is not left pending.
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-        if dio1_edge || device.get_radio().irq_pending() {
-            log::debug!(target: tag, "radio IRQ at {}ms", elapsed_ms);
-            response = device
-                .handle_event(Event::RadioEvent(LdRadioEvent::Phy(())))
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        }
+        let irq = dio1_edge || device.get_radio().irq_pending();
 
-        // Timing tick — deliver timeout when the deadline has elapsed.
-        if elapsed_ms >= next_timeout_ms && next_timeout_ms > 0 {
-            let late_ms = elapsed_ms.saturating_sub(next_timeout_ms);
-            log::debug!(
-                target: tag,
-                "Timeout fired at {}ms (deadline {}ms, {}ms late)",
-                elapsed_ms, next_timeout_ms, late_ms
-            );
-            next_timeout_ms = 0;
-            response = device
-                .handle_event(Event::TimeoutFired)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        }
+        let event = match ticker.update(irq, now_ms) {
+            Some(TickEvent::Phy) => {
+                log::debug!(target: tag, "radio IRQ at {}ms", now_ms);
+                Event::RadioEvent(LdRadioEvent::Phy(()))
+            }
+            Some(TickEvent::TimeoutFired) => {
+                log::debug!(target: tag, "Timeout fired at {}ms", now_ms);
+                Event::TimeoutFired
+            }
+            Some(TickEvent::BudgetExceeded) => {
+                return Err(anyhow::anyhow!(
+                    "Join timed out after {} s",
+                    JOIN_BUDGET_MS / 1000
+                ));
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
 
+        let response = device
+            .handle_event(event)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         match &response {
-            Response::JoinSuccess => {
-                log::info!(target: tag, "OTAA join successful");
-                break;
-            }
-            Response::NoJoinAccept => {
-                return Err(anyhow::anyhow!("OTAA join failed — no join-accept"));
-            }
             Response::TimeoutRequest(ms) => {
-                // Absolute timestamp in the device timeline — assign, don't add.
-                next_timeout_ms = *ms;
-                log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", *ms);
-                response = Response::NoUpdate;
+                log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
             }
-            Response::JoinRequestSending => {
-                log::info!(target: tag, "Join-request on air ...");
-                response = Response::NoUpdate;
-            }
+            Response::JoinRequestSending => log::info!(target: tag, "Join-request on air ..."),
             Response::NoUpdate => {}
-            other => {
-                log::debug!(target: tag, "join response: {:?}", other);
-                response = Response::NoUpdate;
-            }
+            other => log::debug!(target: tag, "join response: {:?}", other),
         }
-
-        // Safety net — abort after 60 s.
-        if elapsed_ms > 60_000 {
-            return Err(anyhow::anyhow!("Join timed out after 60 s"));
-        }
+        outcome = ticker.on_response(&response);
 
         std::thread::sleep(Duration::from_millis(10));
+    }
+
+    match outcome {
+        Outcome::Joined => log::info!(target: tag, "OTAA join successful"),
+        Outcome::JoinFailed => {
+            return Err(anyhow::anyhow!("OTAA join failed — no join-accept"));
+        }
+        other => return Err(anyhow::anyhow!("OTAA join ended with {:?}", other)),
     }
 
     // ─── Uplink loop ──────────────────────────────────────────────────────────
@@ -374,98 +369,82 @@ fn main() -> anyhow::Result<()> {
         //
         // Signature: fn send(&mut self, data: &[u8], fport: u8, confirmed: bool)
         //            -> Result<Response, Error<R>>
-        let mut send_response = device
+        let send_response = device
             .send(&payload, 1, false)
             .map_err(|e| anyhow::anyhow!("send failed: {:?}", e))?;
 
+        // Drive the event loop until the send completes. `DownlinkReceived` is
+        // terminal: lorawan-device cancels RX2 and emits no further events (TTN
+        // routinely answers the first uplinks with a MAC-command downlink such as
+        // LinkADRReq). `LorawanTicker` encodes that and the absolute deadlines.
         let send_start = Instant::now();
-        let mut send_timeout_ms: u32 = 0;
+        let mut ticker = LorawanTicker::new(UPLINK_BUDGET_MS, 0);
+        let mut outcome = ticker.on_response(&send_response);
 
-        if let Response::TimeoutRequest(ms) = send_response {
-            // Absolute timestamp — assign, don't add elapsed.
-            send_timeout_ms = ms;
-            log::debug!(target: tag, "TX timeout scheduled at {}ms (absolute)", ms);
-            send_response = Response::NoUpdate;
-        }
-
-        // Drive the event loop until the send completes.
-        let uplink_done = loop {
-            let elapsed_ms = send_start.elapsed().as_millis() as u32;
+        while outcome == Outcome::Continue {
+            let now_ms = send_start.elapsed().as_millis() as u32;
 
             let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-            if dio1_edge || device.get_radio().irq_pending() {
-                log::debug!(target: tag, "TX radio IRQ at {}ms", elapsed_ms);
-                send_response = device
-                    .handle_event(Event::RadioEvent(LdRadioEvent::Phy(())))
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            }
+            let irq = dio1_edge || device.get_radio().irq_pending();
 
-            if elapsed_ms >= send_timeout_ms && send_timeout_ms > 0 {
-                let late_ms = elapsed_ms.saturating_sub(send_timeout_ms);
-                log::debug!(
-                    target: tag,
-                    "TX timeout fired at {}ms (deadline {}ms, {}ms late)",
-                    elapsed_ms, send_timeout_ms, late_ms
-                );
-                send_timeout_ms = 0;
-                send_response = device
-                    .handle_event(Event::TimeoutFired)
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            }
+            let event = match ticker.update(irq, now_ms) {
+                Some(TickEvent::Phy) => {
+                    log::debug!(target: tag, "TX radio IRQ at {}ms", now_ms);
+                    Event::RadioEvent(LdRadioEvent::Phy(()))
+                }
+                Some(TickEvent::TimeoutFired) => {
+                    log::debug!(target: tag, "TX timeout fired at {}ms", now_ms);
+                    Event::TimeoutFired
+                }
+                Some(TickEvent::BudgetExceeded) => {
+                    log::error!(
+                        target: tag,
+                        "Uplink event loop timed out after {} s",
+                        UPLINK_BUDGET_MS / 1000
+                    );
+                    break;
+                }
+                None => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            };
 
-            match &send_response {
+            let response = device
+                .handle_event(event)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            match &response {
                 Response::TimeoutRequest(ms) => {
-                    // Absolute timestamp — assign, don't add.
-                    send_timeout_ms = *ms;
-                    log::debug!(target: tag, "TX window at {}ms (absolute)", *ms);
-                    send_response = Response::NoUpdate;
+                    log::debug!(target: tag, "TX window at {}ms (absolute)", ms);
                 }
                 Response::UplinkSending(fcnt) => {
                     log::info!(target: tag, "Uplink on air (FCntUp={})", fcnt);
-                    send_response = Response::NoUpdate;
                 }
                 Response::DownlinkReceived(fcnt) => {
-                    // A valid RX1 downlink completes the send cycle: lorawan-device
-                    // cancels RX2 and emits no further events, so this is terminal.
-                    // (TTN routinely answers the first few uplinks with a MAC-command
-                    // downlink such as LinkADRReq — that lands here.)
                     log::info!(target: tag, "Downlink received (FCntDown={})", fcnt);
-                    break true;
                 }
-                Response::RxComplete => {
-                    log::info!(target: tag, "Uplink complete (RxComplete)");
-                    break true;
-                }
+                Response::RxComplete => log::info!(target: tag, "Uplink complete (RxComplete)"),
                 Response::ReadyToSend => {
                     log::info!(target: tag, "Uplink complete (ReadyToSend)");
-                    break true;
                 }
                 Response::NoAck => {
                     // Confirmed uplink timed out waiting for an ACK.  We use
                     // unconfirmed uplinks (confirmed=false), so this should not
                     // fire in normal operation.
                     log::warn!(target: tag, "Uplink NoAck — continuing");
-                    break true;
                 }
                 Response::SessionExpired => {
                     log::error!(target: tag, "Session expired — re-join required");
-                    break false;
                 }
                 Response::NoUpdate => {}
-                other => {
-                    log::debug!(target: tag, "TX response: {:?}", other);
-                    send_response = Response::NoUpdate;
-                }
+                other => log::debug!(target: tag, "TX response: {:?}", other),
             }
-
-            // Guard against a stuck send loop.
-            if elapsed_ms > 30_000 {
-                log::error!(target: tag, "Uplink event loop timed out after 30 s");
-                break false;
-            }
+            outcome = ticker.on_response(&response);
 
             std::thread::sleep(Duration::from_millis(10));
-        };
+        }
+
+        let uplink_done = matches!(outcome, Outcome::UplinkDone | Outcome::Downlink);
 
         if !uplink_done {
             // Session expired or unrecoverable error — stop the loop.

@@ -17,7 +17,7 @@
 /// assert_eq!(backoff.next(), Some(200));
 /// assert_eq!(backoff.next(), Some(400));
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExponentialBackoff {
     base_ms: u64,
     max_ms: u64,

@@ -125,7 +125,7 @@ clippy-ota-pure:
 # lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
 [group('build')]
 clippy-pure:
-    cargo clippy -p juggler --features mock,std,provisioning,ota-wire,espnow --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,espnow --all-targets --target {{ host_target }} -- -D warnings
 
 # check the esp-idf ota runtime (features wifi,mqtt,ota) and its hardware example
 [group('build')]
@@ -206,6 +206,7 @@ check-provisioning-hal-embassy:
 check-ota-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32c3,unstable,rt,embassy --example hal_c3_ota --target-dir {{ hal_dir }}
 
 # run the bare-metal network crate's host tests (HTTP parser, provisioning substrate, OTA, provisioning)
 [group('test & lint')]
@@ -232,6 +233,10 @@ test-ota-hal: test-hal
 [group('test & lint')]
 test-provisioning-hal: test-hal
 
+# alias for test-hal (includes the lora re-export parity guard)
+[group('test & lint')]
+test-lora-hal: test-hal
+
 # check the esp-hal lora domain cross-compiles for ESP32-C6 (bare-metal)
 [group('build')]
 check-lora-hal:
@@ -246,6 +251,7 @@ check-wifi-hal: check-hal-stub
 check-wifi-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c6,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c3,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target xtensa-esp32-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32,rt,embassy --target-dir {{ hal_dir }}
 
 # check all HAL domains of the consolidated network crate
 [group('build')]
@@ -265,6 +271,7 @@ check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-pro
 [group('build')]
 check-network-pure-no-std:
     cargo check -p juggler --no-default-features
+    cargo check -p juggler --no-default-features --features flash-store
 
 # Lints all four domains (wifi, lora, ota, provisioning) on both RISC-V targets.
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
@@ -289,6 +296,11 @@ clippy-hal:
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c6,unstable,rt,embassy --example hal_c6_espnow_sta_coordinator -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --example hal_c3_espnow_peer -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32s3,unstable,rt,embassy --example hal_esp32s3_provision_mqtt -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32c3,unstable,rt,embassy --example hal_c3_ota -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32s3,unstable,rt,embassy --example hal_esp32s3_ota -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target xtensa-esp32-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target xtensa-esp32-none-elf -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32,unstable,rt,embassy -- -D warnings
 
 # ── test & lint ───────────────────────────────────────────────────────────
 
@@ -386,6 +398,7 @@ test-ota:
 test-provisioning:
     cargo test --target {{ host_target }} -p juggler --features provisioning,std
     cargo test --target {{ host_target }} -p juggler --features provisioning,std,lora
+    cargo test --target {{ host_target }} -p juggler --features flash-store
 
 # run all platform-independent unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
@@ -411,10 +424,55 @@ examples:
 build-example example:
     scripts/build-example.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
-# ensure the IDF-built v5.3.3 bootloader is in the build cache for the given chip
+# build every example of both tier crates (discovered from examples/*.rs, common/ skipped) via build-example;
+# optional filter = example name prefix (e.g. `hal_`, `idf_c3`); stops at the first failure unless KEEP_GOING=1
 [group('examples')]
-ensure-bootloader chip:
-    scripts/ensure-bootloader.sh "{{ chip }}" "{{ hal_dir }}" "{{ idf_dir }}"
+build-all-examples filter="":
+    #!/usr/bin/env bash
+    names=()
+    for f in crates/rustyfarian-esp-idf-network/examples/*.rs crates/rustyfarian-esp-hal-network/examples/*.rs; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .rs)
+        case "$name" in
+            {{ filter }}*) names+=("$name") ;;
+        esac
+    done
+    total=${#names[@]}
+    if [ "$total" -eq 0 ]; then
+        echo "build-all-examples: no example matches prefix '{{ filter }}'" >&2
+        exit 1
+    fi
+    passed=()
+    failed=()
+    i=0
+    for name in "${names[@]}"; do
+        i=$((i + 1))
+        echo "==> [$i/$total] $name"
+        if just build-example "$name"; then
+            passed+=("$name")
+        else
+            failed+=("$name")
+            [ -n "${KEEP_GOING:-}" ] || break
+        fi
+    done
+    echo
+    echo "build-all-examples: ${#passed[@]} built, ${#failed[@]} failed, $((total - ${#passed[@]} - ${#failed[@]})) not attempted (of $total)"
+    for name in "${failed[@]}"; do
+        echo "  FAILED: $name"
+    done
+    [ ${#failed[@]} -eq 0 ]
+
+# build one Xtensa ESP-IDF wifi+mqtt example per chip (esp32, esp32s3); `just verify` compiles only RISC-V, and the Xtensa
+# LLVM backend once failed here with "Cannot scavenge register without an emergency spill slot"
+[group('examples')]
+build-xtensa-idf-mqtt:
+    just build-example idf_esp32_mqtt
+    just build-example idf_esp32s3_mqtt_lwt
+
+# ensure the IDF-built v5.3.3 bootloader is cached for the chip (variant: generic | ota)
+[group('examples')]
+ensure-bootloader chip variant="generic":
+    scripts/ensure-bootloader.sh {{ if variant == "ota" { "--ota" } else { "" } }} "{{ chip }}" "{{ idf_dir }}"
 
 # build and flash a named example (chip and crate auto-detected from example name)
 [group('examples')]
@@ -590,6 +648,30 @@ ota-burst count kind:
 [group('ota')]
 ota-sub topic="status":
     scripts/ota-mqtt.sh sub "{{ topic }}"
+
+# flash the baseline of a bare-metal OTA example: it fetches target_version's image (built by ota-image) from ota_host
+[group('ota')]
+flash-ota-baseline example baseline target_version ota_host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for v in "{{ baseline }}" "{{ target_version }}"; do
+        if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: versions must be MAJOR.MINOR.PATCH, got '$v'" >&2
+            exit 1
+        fi
+    done
+    image="target/ota/{{ example }}-v{{ target_version }}.bin"
+    if [ ! -f "$image" ]; then
+        echo "$image does not exist; run 'just ota-image {{ target_version }} {{ example }}' first" >&2
+        exit 1
+    fi
+    export FIRMWARE_VERSION="{{ baseline }}"
+    export OTA_HOST="{{ ota_host }}"
+    export OTA_PORT="${OTA_PORT:-8000}"
+    export OTA_PATH="$(basename "$image")"
+    export OTA_SHA256="$(shasum -a 256 "$image" | cut -d' ' -f1)"
+    export OTA_TARGET_VERSION="{{ target_version }}"
+    scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
 # Usage: just ota-serve              (serve at full speed)
 #        just ota-serve 10240        (throttle to 10 KB/s)

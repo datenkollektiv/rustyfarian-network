@@ -16,7 +16,7 @@
 //! [`LinkInput::Resume`], which answers [`LinkAction::Connect`] with a fresh
 //! back-off. A `Connected` that lands while suspended (a connect that was already
 //! in flight) is answered with another `Disconnect`. Duplicate suspends and
-//! resumes change nothing.
+//! resumes change nothing and are answered with [`LinkAction::Ignored`].
 //!
 //! What `Disconnect` does to the radio is tier-specific: the ESP-IDF tier stops
 //! it, the esp-hal tier only disconnects the station and the radio stays powered.
@@ -31,11 +31,15 @@
 //!
 //! # Adapter contract
 //!
-//! Inputs that do not fit the current state are ignored (a duplicate `Start`,
-//! a `Disconnected` before the first connect, a `BackoffElapsed` outside
-//! `Backoff`). The machine cannot tell an old `BackoffElapsed` from the current
-//! one, so an adapter keeps at most one back-off timer and cancels it when it
-//! sees `Connected` or issues a connect.
+//! Inputs that do not fit the current state (a duplicate `Start`, a
+//! `Disconnected` before the first connect, a `BackoffElapsed` outside
+//! `Backoff`) leave the state unchanged and are answered with
+//! [`LinkAction::Ignored`], so a tier loop can tell them from an accepted input
+//! that needs no I/O ([`LinkAction::None`]) (ADR 023 decision 5). A connect
+//! request the driver refuses is fed as [`LinkInput::ConnectFailed`]. The
+//! machine cannot tell an old `BackoffElapsed` from the current one, so an
+//! adapter keeps at most one back-off timer and cancels it when it sees
+//! `Connected` or issues a connect.
 
 use crate::backoff::ExponentialBackoff;
 
@@ -54,23 +58,28 @@ pub enum LinkInput {
     Connected,
     /// The driver reported the station gone, or a connect attempt failed.
     Disconnected,
+    /// The driver refused the connect request of the last [`LinkAction::Connect`];
+    /// backs off like [`Disconnected`](Self::Disconnected), ignored outside `Connecting`.
+    ConnectFailed,
     /// The delay of the last [`LinkAction::Wait`] has passed.
     BackoffElapsed,
     /// Park the link (for example before deep sleep); answered with [`LinkAction::Disconnect`].
     Suspend,
     /// Leave [`LinkState::Suspended`]; answered with [`LinkAction::Connect`].
     Resume,
-    /// The station has its IP configuration; ignored unless `Connected`.
+    /// The station has its IP configuration; ignored unless `Connected` and not yet up.
     NetworkUp,
-    /// The station lost its IP configuration while still associated.
+    /// The station lost its IP configuration while still associated; ignored unless up.
     NetworkDown,
 }
 
 /// Action the tier performs before polling again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkAction {
-    /// Nothing to do.
+    /// The input was accepted and needs no I/O.
     None,
+    /// The input does not fit the current state; the state is unchanged.
+    Ignored,
     /// Issue a connect request to the driver.
     Connect,
     /// Take the station down (disconnect, and on ESP-IDF stop the radio).
@@ -98,7 +107,7 @@ pub enum LinkState {
 }
 
 /// Pure reconnect policy: back-off, reset on success, suspend, ignores out-of-state inputs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LinkMachine {
     state: LinkState,
     backoff: ExponentialBackoff,
@@ -163,15 +172,18 @@ impl LinkMachine {
         use LinkState as S;
 
         let action = match (self.state, input) {
-            (S::Connected, I::NetworkUp) => {
+            (S::Connected, I::NetworkUp) if !self.network_up => {
                 self.network_up = true;
                 A::None
             }
-            (_, I::NetworkUp | I::NetworkDown) => {
+            (_, I::NetworkDown) if self.network_up => {
                 self.network_up = false;
                 A::None
             }
-            (S::Suspended, I::Suspend | I::Disconnected | I::BackoffElapsed | I::Start) => A::None,
+            (_, I::NetworkUp | I::NetworkDown) => A::Ignored,
+            (S::Suspended, I::Suspend | I::Disconnected | I::BackoffElapsed | I::Start) => {
+                A::Ignored
+            }
             (S::Suspended, I::Connected) => A::Disconnect,
             (S::Suspended, I::Resume) => {
                 self.state = S::Connecting;
@@ -194,14 +206,14 @@ impl LinkMachine {
                 self.failed_attempts = 0;
                 A::None
             }
-            (S::Connecting | S::Connected, I::Disconnected) => {
+            (S::Connecting | S::Connected, I::Disconnected) | (S::Connecting, I::ConnectFailed) => {
                 self.state = S::Backoff;
                 self.failed_attempts = self.failed_attempts.saturating_add(1);
                 A::Wait {
                     ms: self.backoff.next().unwrap_or(self.max_ms),
                 }
             }
-            _ => A::None,
+            _ => A::Ignored,
         };
         // The IP belongs to one association; it never outlives `Connected`.
         if self.state != S::Connected {
@@ -232,12 +244,46 @@ mod tests {
     fn ready_needs_the_network_after_the_association() {
         let mut m = LinkMachine::new();
         m.poll(LinkInput::Start);
-        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::Ignored);
         assert!(!m.is_ready(), "an IP before the association is stale");
         m.poll(LinkInput::Connected);
         assert!(!m.is_ready());
         assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::None);
         assert!(m.is_ready());
+    }
+
+    #[test]
+    fn duplicate_network_edges_are_ignored() {
+        let mut m = connected();
+        assert_eq!(m.poll(LinkInput::NetworkDown), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::NetworkUp), LinkAction::Ignored);
+        assert!(m.is_ready(), "a duplicate NetworkUp keeps readiness");
+        assert_eq!(m.poll(LinkInput::NetworkDown), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::NetworkDown), LinkAction::Ignored);
+        assert!(!m.is_ready());
+        assert_eq!(m.state(), LinkState::Connected);
+    }
+
+    #[test]
+    fn network_edges_outside_connected_are_ignored() {
+        for mut m in all_states() {
+            let from = m.state();
+            if from == LinkState::Connected {
+                continue;
+            }
+            for input in [LinkInput::NetworkUp, LinkInput::NetworkDown] {
+                assert_eq!(
+                    m.poll(input),
+                    LinkAction::Ignored,
+                    "{:?} in {:?}",
+                    input,
+                    from
+                );
+                assert_eq!(m.state(), from);
+                assert!(!m.is_ready());
+            }
+        }
     }
 
     #[test]
@@ -276,8 +322,9 @@ mod tests {
             LinkInput::BackoffElapsed,
             LinkInput::Resume,
             LinkInput::Connected,
+            LinkInput::ConnectFailed,
         ] {
-            assert_eq!(m.poll(input), LinkAction::None);
+            assert_eq!(m.poll(input), LinkAction::Ignored, "{:?}", input);
             assert!(m.is_ready(), "{:?} must not drop readiness", input);
         }
     }
@@ -336,7 +383,7 @@ mod tests {
         let mut m = LinkMachine::new();
         assert_eq!(m.poll(LinkInput::Connected), LinkAction::None);
         assert_eq!(m.state(), LinkState::Connected);
-        assert_eq!(m.poll(LinkInput::Start), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Start), LinkAction::Ignored);
     }
 
     #[test]
@@ -385,19 +432,19 @@ mod tests {
     }
 
     #[test]
-    fn stale_or_duplicate_inputs_are_noops() {
+    fn stale_or_duplicate_inputs_are_ignored() {
         let mut m = LinkMachine::new();
-        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::None);
-        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Idle);
         m.poll(LinkInput::Start);
-        assert_eq!(m.poll(LinkInput::Start), LinkAction::None);
-        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::None);
-        m.poll(LinkInput::Connected);
-        assert_eq!(m.poll(LinkInput::Connected), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Start), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::Connected), LinkAction::None, "accepted");
+        assert_eq!(m.poll(LinkInput::Connected), LinkAction::Ignored);
         drive_failure(&mut m);
-        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::None);
-        assert_eq!(m.poll(LinkInput::Start), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::Start), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Backoff);
     }
 
@@ -408,7 +455,7 @@ mod tests {
         drive_failure(&mut m);
         assert_eq!(m.poll(LinkInput::Connected), LinkAction::None);
         assert_eq!(m.state(), LinkState::Connected);
-        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Connected);
     }
 
@@ -460,9 +507,10 @@ mod tests {
         m.poll(LinkInput::Start);
         drive_failure(&mut m);
         m.poll(LinkInput::Suspend);
-        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::None);
-        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::None);
-        assert_eq!(m.poll(LinkInput::Start), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Disconnected), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::Start), LinkAction::Ignored);
+        assert_eq!(m.poll(LinkInput::ConnectFailed), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Suspended);
         assert_eq!(m.failed_attempts(), 1);
     }
@@ -482,13 +530,13 @@ mod tests {
     fn duplicate_suspend_and_resume_change_nothing() {
         let mut m = LinkMachine::new();
         m.poll(LinkInput::Connected);
-        assert_eq!(m.poll(LinkInput::Resume), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Resume), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Connected);
         assert_eq!(m.poll(LinkInput::Suspend), LinkAction::Disconnect);
-        assert_eq!(m.poll(LinkInput::Suspend), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Suspend), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Suspended);
         assert_eq!(m.poll(LinkInput::Resume), LinkAction::Connect);
-        assert_eq!(m.poll(LinkInput::Resume), LinkAction::None);
+        assert_eq!(m.poll(LinkInput::Resume), LinkAction::Ignored);
         assert_eq!(m.state(), LinkState::Connecting);
     }
 
@@ -501,6 +549,92 @@ mod tests {
         assert_eq!(m.poll(LinkInput::Resume), LinkAction::Connect);
         assert_eq!(m.poll(LinkInput::Connected), LinkAction::None);
         assert_eq!(m.state(), LinkState::Connected);
+    }
+
+    #[test]
+    fn connect_failed_from_connecting_backs_off() {
+        let mut m = LinkMachine::new();
+        m.poll(LinkInput::Start);
+        assert_eq!(
+            m.poll(LinkInput::ConnectFailed),
+            LinkAction::Wait {
+                ms: RECONNECT_BACKOFF_BASE_MS
+            }
+        );
+        assert_eq!(m.state(), LinkState::Backoff);
+        assert_eq!(m.failed_attempts(), 1);
+        assert_eq!(m.poll(LinkInput::BackoffElapsed), LinkAction::Connect);
+        assert_eq!(
+            m.poll(LinkInput::ConnectFailed),
+            LinkAction::Wait {
+                ms: 2 * RECONNECT_BACKOFF_BASE_MS
+            },
+            "a refused connect doubles the back-off like a link loss"
+        );
+    }
+
+    #[test]
+    fn connect_failed_elsewhere_is_ignored() {
+        for mut m in all_states() {
+            let from = m.state();
+            if from == LinkState::Connecting {
+                continue;
+            }
+            assert_eq!(
+                m.poll(LinkInput::ConnectFailed),
+                LinkAction::Ignored,
+                "from {:?}",
+                from
+            );
+            assert_eq!(m.state(), from);
+        }
+    }
+
+    const ALL_INPUTS: [LinkInput; 9] = [
+        LinkInput::Start,
+        LinkInput::Connected,
+        LinkInput::Disconnected,
+        LinkInput::ConnectFailed,
+        LinkInput::BackoffElapsed,
+        LinkInput::Suspend,
+        LinkInput::Resume,
+        LinkInput::NetworkUp,
+        LinkInput::NetworkDown,
+    ];
+
+    /// One machine per state, the suspended one included.
+    fn all_states() -> [LinkMachine; 5] {
+        let [idle, connecting, connected, backoff] = in_every_state();
+        let mut suspended = LinkMachine::new();
+        suspended.poll(LinkInput::Suspend);
+        [idle, connecting, connected, backoff, suspended]
+    }
+
+    #[test]
+    fn an_input_that_keeps_the_state_requests_no_io() {
+        for m in all_states() {
+            for input in ALL_INPUTS {
+                let mut probe = m.clone();
+                let from = probe.state();
+                let action = probe.poll(input);
+                if probe.state() != from {
+                    continue;
+                }
+                // The one exception: an association that lands while suspended is
+                // taken down again (see the module docs).
+                if (from, input) == (LinkState::Suspended, LinkInput::Connected) {
+                    assert_eq!(action, LinkAction::Disconnect);
+                    continue;
+                }
+                assert!(
+                    matches!(action, LinkAction::None | LinkAction::Ignored),
+                    "{:?} in {:?} kept the state but answered {:?}",
+                    input,
+                    from,
+                    action
+                );
+            }
+        }
     }
 
     #[test]

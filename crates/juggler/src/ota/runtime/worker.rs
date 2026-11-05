@@ -3,9 +3,10 @@
 //! The worker thread (ESP-IDF tier) executes these in order; every function here is pure or touches the store only through the generic [`OtaStore`].
 
 use crate::ota::persist::{
-    reconcile_boot, BootDisposition, BootFault, BootOutcome, HardwareFacts, HardwareReadError,
-    OtaKv, OtaStore, StoreError, UpdateSlot, FACTORY_SLOT,
+    reconcile_boot, BootOutcome, HardwareFacts, HardwareReadError, OtaKv, OtaStore, StoreError,
+    UpdateSlot, FACTORY_SLOT,
 };
+use crate::ota::runtime::health::initial_admission;
 use crate::ota::{
     decide_offer, Admission, FailReason, ImageMetadata, Manifest, OfferDecision, OtaCommand,
     SlotId, SlotState, Version,
@@ -126,13 +127,34 @@ pub fn plan_offer(
 }
 
 /// What a failing `begin_attempt` means: a store that refuses admission blocks (the offer is retained), any other failure is `attempt_not_persisted`.
+#[deprecated(
+    since = "0.7.0",
+    note = "use `begin_failure_outcome`, which cannot answer `Proceed`"
+)]
 pub fn begin_failure(e: &StoreError) -> OfferPlan {
+    match begin_failure_outcome(e) {
+        BeginFailure::Blocked(reason) => OfferPlan::Blocked(reason),
+        BeginFailure::Fail(reason) => OfferPlan::Fail(reason),
+    }
+}
+
+/// What a failing `begin_attempt` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginFailure {
+    /// The store refuses admission: retain the offer, like [`OfferPlan::Blocked`].
+    Blocked(FailReason),
+    /// Reject the offer with this reason.
+    Fail(FailReason),
+}
+
+/// What a failing `begin_attempt` means: a store that refuses admission blocks (the offer is retained), any other failure is `attempt_not_persisted`.
+pub fn begin_failure_outcome(e: &StoreError) -> BeginFailure {
     match e {
-        StoreError::NotAdmitted(by) => OfferPlan::Blocked(
+        StoreError::NotAdmitted(by) => BeginFailure::Blocked(
             FailReason::from_offer(OfferDecision::Blocked, Admission::Blocked(*by))
                 .unwrap_or(FailReason::AttemptUnresolved),
         ),
-        _ => OfferPlan::Fail(FailReason::AttemptNotPersisted),
+        _ => BeginFailure::Fail(FailReason::AttemptNotPersisted),
     }
 }
 
@@ -291,6 +313,50 @@ pub fn plan_repair(gate: &RepairGate) -> Result<(), FailReason> {
     Ok(())
 }
 
+/// The outcome of a repair that ran: no record group repaired is `repair_not_needed`, otherwise the count is reported.
+///
+/// # Errors
+///
+/// [`FailReason::RepairNotNeeded`] when `repaired` is zero.
+pub const fn repair_status(repaired: u32) -> Result<u32, FailReason> {
+    if repaired == 0 {
+        Err(FailReason::RepairNotNeeded)
+    } else {
+        Ok(repaired)
+    }
+}
+
+/// The library flags at runtime start, derived from boot reconciliation.
+///
+/// The tier copies them into its flags and performs the rollback when `roll_back_now_at_boot` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFlags {
+    /// Updates, rollbacks and repairs are admitted from the start (see [`initial_admission`]).
+    pub admission_open: bool,
+    /// The health policy counts as settled from the start; the same value as `admission_open`.
+    pub health_settled: bool,
+    /// The running image must not be marked valid.
+    pub refuse_mark_valid: bool,
+    /// The boot demanded a rollback now.
+    pub roll_back_now_at_boot: bool,
+    /// The boot ended fail-closed on a store fault (see [`BootOutcome::records_suspect`]).
+    pub records_suspect: bool,
+}
+
+impl RuntimeFlags {
+    /// Derives the flags from the boot reconciliation outcome.
+    pub fn from_boot(outcome: &BootOutcome) -> Self {
+        let admit = initial_admission(outcome);
+        Self {
+            admission_open: admit,
+            health_settled: admit,
+            refuse_mark_valid: outcome.refuse_mark_valid,
+            roll_back_now_at_boot: outcome.roll_back_now,
+            records_suspect: outcome.records_suspect(),
+        }
+    }
+}
+
 /// The library flags after a repair, and what the re-run of boot reconciliation said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshedFlags {
@@ -316,10 +382,7 @@ pub fn refresh_after_repair<K: OtaKv>(
     let hw = hw.ok()?;
     let outcome = reconcile_boot(store, Ok(hw), running_version);
     Some(RefreshedFlags {
-        records_suspect: matches!(
-            outcome.disposition,
-            BootDisposition::FailedClosed(BootFault::Store(_))
-        ),
+        records_suspect: outcome.records_suspect(),
         refuse_mark_valid: roll_back_now_at_boot || outcome.refuse_mark_valid,
         outcome,
     })
@@ -329,8 +392,8 @@ pub fn refresh_after_repair<K: OtaKv>(
 mod tests {
     use super::*;
     use crate::ota::persist::fault_kv::FaultKv;
-    use crate::ota::persist::KvError;
-    use crate::ota::BlockedBy;
+    use crate::ota::persist::{BootDisposition, BootFault, BootWarnings, KvError};
+    use crate::ota::{BlockedBy, SettleOutcome};
     use alloc::format;
     use alloc::string::String;
 
@@ -638,12 +701,12 @@ mod tests {
     #[test]
     fn begin_failures_map_to_blocked_or_not_persisted() {
         assert_eq!(
-            begin_failure(&StoreError::NotAdmitted(BlockedBy::ReportPending)),
-            OfferPlan::Blocked(FailReason::ReportPending)
+            begin_failure_outcome(&StoreError::NotAdmitted(BlockedBy::ReportPending)),
+            BeginFailure::Blocked(FailReason::ReportPending)
         );
         assert_eq!(
-            begin_failure(&StoreError::NotAdmitted(BlockedBy::AttemptUnresolved)),
-            OfferPlan::Blocked(FailReason::AttemptUnresolved)
+            begin_failure_outcome(&StoreError::NotAdmitted(BlockedBy::AttemptUnresolved)),
+            BeginFailure::Blocked(FailReason::AttemptUnresolved)
         );
         for e in [
             StoreError::Kv(KvError::new(5)),
@@ -651,10 +714,122 @@ mod tests {
             StoreError::ReportPending,
         ] {
             assert_eq!(
-                begin_failure(&e),
-                OfferPlan::Fail(FailReason::AttemptNotPersisted)
+                begin_failure_outcome(&e),
+                BeginFailure::Fail(FailReason::AttemptNotPersisted)
             );
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_begin_failure_agrees() {
+        assert_eq!(
+            begin_failure(&StoreError::NotAdmitted(BlockedBy::ReportPending)),
+            OfferPlan::Blocked(FailReason::ReportPending)
+        );
+        assert_eq!(
+            begin_failure(&StoreError::InvalidSlot),
+            OfferPlan::Fail(FailReason::AttemptNotPersisted)
+        );
+    }
+
+    #[test]
+    fn repair_status_zero_is_not_needed() {
+        assert_eq!(repair_status(0), Err(FailReason::RepairNotNeeded));
+    }
+
+    #[test]
+    fn repair_status_nonzero_ok() {
+        assert_eq!(repair_status(1), Ok(1));
+        assert_eq!(repair_status(32), Ok(32));
+    }
+
+    fn boot_outcome(disposition: BootDisposition, released: bool) -> BootOutcome {
+        BootOutcome {
+            disposition,
+            action: None,
+            slot_released: released,
+            admission_open_at_boot: false,
+            refuse_mark_valid: false,
+            roll_back_now: false,
+            report_pending: false,
+            warnings: BootWarnings::default(),
+        }
+    }
+
+    #[test]
+    fn runtime_flags_from_boot() {
+        let store_fault = BootFault::Store(StoreError::InvalidSlot);
+        let hw_fault = BootFault::Hardware(HardwareReadError::Busy);
+        let cases = [
+            (
+                BootDisposition::Settled(SettleOutcome::NoRequest),
+                true,
+                true,
+                false,
+            ),
+            (BootDisposition::AwaitHealthCheck, false, false, false),
+            (BootDisposition::RollBackNow, true, true, false),
+            (BootDisposition::ReportedRollback, true, true, false),
+            (BootDisposition::Deferred, false, false, false),
+            (
+                BootDisposition::Incomplete(StoreError::InvalidSlot),
+                true,
+                true,
+                false,
+            ),
+            (
+                BootDisposition::FailedClosed(store_fault),
+                true,
+                false,
+                true,
+            ),
+            (BootDisposition::FailedClosed(hw_fault), false, false, false),
+        ];
+        for (disposition, released, admit, suspect) in cases {
+            let outcome = boot_outcome(disposition.clone(), released);
+            let flags = RuntimeFlags::from_boot(&outcome);
+            assert_eq!(outcome.records_suspect(), suspect, "{disposition:?}");
+            assert_eq!(
+                flags,
+                RuntimeFlags {
+                    admission_open: admit,
+                    health_settled: admit,
+                    refuse_mark_valid: false,
+                    roll_back_now_at_boot: false,
+                    records_suspect: suspect,
+                },
+                "{disposition:?}"
+            );
+        }
+        let mut refused = boot_outcome(BootDisposition::RollBackNow, true);
+        refused.refuse_mark_valid = true;
+        refused.roll_back_now = true;
+        let flags = RuntimeFlags::from_boot(&refused);
+        assert!(!flags.admission_open && !flags.health_settled);
+        assert!(flags.refuse_mark_valid && flags.roll_back_now_at_boot);
+    }
+
+    #[test]
+    fn runtime_flags_agree_with_the_refresh_after_repair() {
+        let kv = FaultKv::new();
+        rolled_back_world(&kv);
+        kv.corrupt_with("att_ver", KvError::CODE_INVALID_VALUE);
+        let mut s = store(&kv);
+        let boot = reconcile_boot(&mut s, Ok(valid()), Some(V1));
+        let refreshed = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert!(RuntimeFlags::from_boot(&boot).records_suspect);
+        assert_eq!(
+            RuntimeFlags::from_boot(&refreshed.outcome).records_suspect,
+            refreshed.records_suspect
+        );
+        crate::ota::runtime::repair_all(&mut s, 32).unwrap();
+        let fixed = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert_eq!(
+            RuntimeFlags::from_boot(&fixed.outcome).records_suspect,
+            fixed.records_suspect
+        );
+        assert!(!fixed.records_suspect);
     }
 
     #[test]

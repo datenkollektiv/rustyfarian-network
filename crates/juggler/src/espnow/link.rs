@@ -27,12 +27,15 @@
 //!
 //! # Rules
 //!
-//! 1. Before [`PeerLinkEvent::Boot`] nothing happens.
+//! 1. Before [`PeerLinkEvent::Boot`] nothing happens: events are answered with
+//!    [`PeerLinkAction::Ignored`] and polls with [`PeerLinkAction::None`].
 //!    `Boot` issues the first scan; the state is [`PeerLinkState::Searching`].
+//!    A second `Boot` is [`PeerLinkAction::Ignored`].
 //! 2. At most one scan is outstanding.
 //!    No new scan is issued until [`PeerLinkEvent::ScanFound`] / [`PeerLinkEvent::ScanFailed`]
 //!    arrives with the current id.
-//!    A result with another id, or one that arrives while no scan runs, is stale and ignored.
+//!    A result with another id, or one that arrives while no scan runs, is stale: it changes
+//!    nothing and is answered with [`PeerLinkAction::Ignored`].
 //! 3. `ScanFound` links to the channel, clears the failure count and resets the retry backoff.
 //! 4. `ScanFailed` leaves `Searching` as `Searching` and `Lost` as `Lost` and schedules a retry:
 //!    [`PeerLinkAction::WaitUntil`] with `now + backoff`, after which the backoff doubles up to
@@ -43,8 +46,9 @@
 //! 5. Exception: if the coordinator was heard (`PeerHeard`) during a scan that started from
 //!    `Linked` / `Lost { last_channel }` and the scan then fails, the link returns to
 //!    `Linked { channel: last_channel }` without scheduling a retry.
-//! 6. A `Sent` whose epoch is not the current one is stale and ignored.
-//!    Sends reported while a scan runs are ignored as well.
+//! 6. A `Sent` whose epoch is not the current one is stale: it changes nothing and is answered
+//!    with [`PeerLinkAction::Ignored`].
+//!    Sends reported while a scan runs, or before `Boot`, are answered the same way.
 //! 7. `Acked` proves the link like `PeerHeard` (rule 8); `NoAck` while `Linked` increments the
 //!    failure count.
 //!    Reaching [`PeerLinkConfig::rescan_threshold`] consecutive `NoAck` outcomes moves the link
@@ -58,12 +62,20 @@
 //!    During a scan see rule 5.
 //! 9. Every `poll` returns the action currently required: `Scan` exactly once per issued scan
 //!    (polls while it runs return `None`), `WaitUntil` while a retry is pending, else `None`.
+//!    The exception is an event that was rejected (rules 1, 2 and 6): it is answered with
+//!    [`PeerLinkAction::Ignored`] (ADR 023 decision 5), never a request for I/O, and the next
+//!    `poll` with `None` returns the action currently required again.
 //! 10. Arithmetic saturates or wraps; the machine never panics.
 //!
 //! [`PeerLink::rescans`] counts every scan issued while the link is `Lost`, retries included.
 //!
 //! The machine never loops on its own: every call to [`PeerLink::poll`] returns after a bounded
 //! number of steps and never issues more than one scan.
+//!
+//! `PeerLink` is a perpetual supervisor, an explicit exception to ADR 023 decision 6: it has no
+//! terminal action, because the link to the coordinator is watched for as long as the node
+//! runs.
+//! Callers bound it instead to one `poll` per event or per tick.
 //!
 //! # Example
 //!
@@ -187,6 +199,9 @@ pub enum PeerLinkEvent {
 pub enum PeerLinkAction {
     /// Nothing to do.
     None,
+    /// The event did not fit the current state (stale, duplicate or too early) and was
+    /// dropped; the state is unchanged and nothing is to be done.
+    Ignored,
     /// Start a scan and report its result with `id`.
     Scan {
         /// Identifier to return in `ScanFound` / `ScanFailed`.
@@ -252,27 +267,26 @@ impl PeerLink {
     /// Poll with `None` when time has passed, at the latest at the deadline of a
     /// [`PeerLinkAction::WaitUntil`].
     pub fn poll(&mut self, now_ms: u64, event: Option<PeerLinkEvent>) -> PeerLinkAction {
+        if event.is_some_and(|event| self.rejects(event)) {
+            return PeerLinkAction::Ignored;
+        }
         let issued = match event {
             None => false,
-            Some(PeerLinkEvent::Boot) => !self.started && self.begin_scan(),
-            Some(PeerLinkEvent::Sent { outcome, epoch }) => self.on_sent(outcome, epoch),
+            Some(PeerLinkEvent::Boot) => self.begin_scan(),
+            Some(PeerLinkEvent::Sent { outcome, .. }) => self.on_sent(outcome),
             Some(PeerLinkEvent::PeerHeard) => {
                 self.on_peer_heard();
                 false
             }
-            Some(PeerLinkEvent::ScanFound { id, channel }) => {
-                if self.is_current_scan(id) {
-                    self.scanning = false;
-                    self.heard_during_scan = false;
-                    self.state = PeerLinkState::Linked { channel };
-                    self.reset_link_health();
-                }
+            Some(PeerLinkEvent::ScanFound { channel, .. }) => {
+                self.scanning = false;
+                self.heard_during_scan = false;
+                self.state = PeerLinkState::Linked { channel };
+                self.reset_link_health();
                 false
             }
-            Some(PeerLinkEvent::ScanFailed { id }) => {
-                if self.is_current_scan(id) {
-                    self.on_scan_failed(now_ms);
-                }
+            Some(PeerLinkEvent::ScanFailed { .. }) => {
+                self.on_scan_failed(now_ms);
                 false
             }
         };
@@ -303,6 +317,20 @@ impl PeerLink {
         self.scanning && id.0 == self.epoch
     }
 
+    /// True for an event that does not fit the current state: it changes nothing.
+    fn rejects(&self, event: PeerLinkEvent) -> bool {
+        match event {
+            PeerLinkEvent::Boot => self.started,
+            PeerLinkEvent::Sent { epoch, .. } => {
+                !self.started || self.scanning || epoch.0 != self.epoch
+            }
+            PeerLinkEvent::PeerHeard => !self.started,
+            PeerLinkEvent::ScanFound { id, .. } | PeerLinkEvent::ScanFailed { id } => {
+                !self.is_current_scan(id)
+            }
+        }
+    }
+
     fn reset_link_health(&mut self) {
         self.no_ack = 0;
         self.backoff_ms = self.config.backoff_initial_ms;
@@ -322,10 +350,8 @@ impl PeerLink {
         true
     }
 
-    fn on_sent(&mut self, outcome: SendOutcome, epoch: PeerLinkEpoch) -> bool {
-        if !self.started || self.scanning || epoch.0 != self.epoch {
-            return false;
-        }
+    /// A current-epoch send result while no scan runs (see [`Self::rejects`]).
+    fn on_sent(&mut self, outcome: SendOutcome) -> bool {
         match outcome {
             SendOutcome::Local => {
                 self.local_failures = self.local_failures.saturating_add(1);
@@ -352,10 +378,8 @@ impl PeerLink {
         }
     }
 
+    /// The coordinator was heard after `Boot` (see [`Self::rejects`]).
     fn on_peer_heard(&mut self) {
-        if !self.started {
-            return;
-        }
         match self.state {
             PeerLinkState::Searching => {}
             PeerLinkState::Linked { .. } => self.no_ack = 0,
@@ -477,10 +501,10 @@ mod tests {
         assert_eq!(link.poll(0, None), PeerLinkAction::None);
         assert_eq!(link.poll(99_999, None), PeerLinkAction::None);
         let ev = sent(&link, NO_ACK);
-        assert_eq!(link.poll(1, Some(ev)), PeerLinkAction::None);
+        assert_eq!(link.poll(1, Some(ev)), PeerLinkAction::Ignored);
         assert_eq!(
             link.poll(1, Some(PeerLinkEvent::PeerHeard)),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert_eq!(link.state(), PeerLinkState::Searching);
         assert!(!link.scanning());
@@ -506,7 +530,7 @@ mod tests {
         let epoch = link.epoch();
         assert_eq!(
             link.poll(1, Some(PeerLinkEvent::Boot)),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert_eq!(link.epoch(), epoch);
     }
@@ -558,13 +582,13 @@ mod tests {
                     channel: 3
                 })
             ),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert_eq!(link.state(), PeerLinkState::Searching);
         assert!(link.scanning());
         assert_eq!(
             link.poll(2_030, Some(PeerLinkEvent::ScanFailed { id: first })),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert!(link.scanning());
         assert_eq!(link.poll(9_999_999, None), PeerLinkAction::None);
@@ -585,12 +609,12 @@ mod tests {
         let id = link.epoch();
         assert_eq!(
             link.poll(300, Some(PeerLinkEvent::ScanFound { id, channel: 9 })),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert_eq!(link.state(), PeerLinkState::Linked { channel: 6 });
         assert_eq!(
             link.poll(300, Some(PeerLinkEvent::ScanFailed { id })),
-            PeerLinkAction::None
+            PeerLinkAction::Ignored
         );
         assert_eq!(link.state(), PeerLinkState::Linked { channel: 6 });
     }
@@ -759,7 +783,7 @@ mod tests {
                 outcome,
                 epoch: old,
             };
-            assert_eq!(link.poll(310, Some(ev)), PeerLinkAction::None);
+            assert_eq!(link.poll(310, Some(ev)), PeerLinkAction::Ignored);
         }
         assert_eq!(link.consecutive_no_ack(), 0);
         assert_eq!(link.local_failures(), 0);
@@ -776,9 +800,9 @@ mod tests {
     fn sends_during_a_scan_are_ignored() {
         let (mut link, id) = lost(cfg(2));
         let ev = sent(&link, NO_ACK);
-        assert_eq!(link.poll(210, Some(ev)), PeerLinkAction::None);
+        assert_eq!(link.poll(210, Some(ev)), PeerLinkAction::Ignored);
         let ev = sent(&link, SendOutcome::Local);
-        assert_eq!(link.poll(211, Some(ev)), PeerLinkAction::None);
+        assert_eq!(link.poll(211, Some(ev)), PeerLinkAction::Ignored);
         assert_eq!(link.local_failures(), 0);
         assert_eq!(link.consecutive_no_ack(), 2);
         assert_eq!(link.rescans(), 1);
@@ -927,5 +951,93 @@ mod tests {
             link.poll(200, Some(ev)),
             PeerLinkAction::Scan { .. }
         ));
+    }
+
+    #[test]
+    fn ignored_for_stale_scan_id() {
+        let (mut link, first) = booted(cfg(3));
+        let failed = link.poll(10, Some(PeerLinkEvent::ScanFailed { id: first }));
+        assert_eq!(failed, PeerLinkAction::WaitUntil(2_010));
+        let second = scan_id(link.poll(2_010, None));
+        for event in [
+            PeerLinkEvent::ScanFound {
+                id: first,
+                channel: 1,
+            },
+            PeerLinkEvent::ScanFailed { id: first },
+        ] {
+            assert_eq!(link.poll(2_020, Some(event)), PeerLinkAction::Ignored);
+        }
+        assert!(link.scanning());
+        let found = link.poll(
+            2_030,
+            Some(PeerLinkEvent::ScanFound {
+                id: second,
+                channel: 1,
+            }),
+        );
+        assert_eq!(found, PeerLinkAction::None);
+    }
+
+    #[test]
+    fn ignored_for_stale_send_epoch() {
+        let mut link = linked(cfg(2));
+        let old = link.epoch();
+        let id = scan_id(no_acks(&mut link, 200, 2));
+        link.poll(300, Some(PeerLinkEvent::ScanFound { id, channel: 1 }));
+        let stale = PeerLinkEvent::Sent {
+            outcome: NO_ACK,
+            epoch: old,
+        };
+        assert_eq!(link.poll(310, Some(stale)), PeerLinkAction::Ignored);
+        let current = sent(&link, NO_ACK);
+        assert_eq!(link.poll(310, Some(current)), PeerLinkAction::None);
+        assert_eq!(link.consecutive_no_ack(), 1);
+    }
+
+    #[test]
+    fn ignored_for_second_boot() {
+        let (mut link, id) = booted(cfg(3));
+        assert_eq!(
+            link.poll(1, Some(PeerLinkEvent::Boot)),
+            PeerLinkAction::Ignored
+        );
+        assert_eq!(link.epoch(), id);
+        assert!(link.scanning());
+    }
+
+    #[test]
+    fn ignored_before_boot() {
+        let mut link = PeerLink::new(cfg(3));
+        let id = link.epoch();
+        for event in [
+            PeerLinkEvent::PeerHeard,
+            PeerLinkEvent::Sent {
+                outcome: SendOutcome::Acked,
+                epoch: id,
+            },
+            PeerLinkEvent::ScanFound { id, channel: 1 },
+            PeerLinkEvent::ScanFailed { id },
+        ] {
+            assert_eq!(link.poll(0, Some(event)), PeerLinkAction::Ignored);
+        }
+        assert_eq!(link.poll(0, None), PeerLinkAction::None);
+        assert!(matches!(
+            link.poll(0, Some(PeerLinkEvent::Boot)),
+            PeerLinkAction::Scan { .. }
+        ));
+    }
+
+    #[test]
+    fn idle_poll_during_scan_is_none() {
+        let (mut link, _) = lost(cfg(2));
+        assert!(link.scanning());
+        assert_eq!(link.poll(300, None), PeerLinkAction::None);
+        assert_eq!(link.poll(90_000, None), PeerLinkAction::None);
+        // An accepted event during a scan is not ignored either.
+        assert_eq!(
+            link.poll(301, Some(PeerLinkEvent::PeerHeard)),
+            PeerLinkAction::None
+        );
     }
 }

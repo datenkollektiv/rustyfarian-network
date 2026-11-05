@@ -21,15 +21,29 @@ export FIRMWARE_VERSION="$version"
 
 # Extract chip from example name (format: {idf|hal}_<chip>_<name>)
 chip=$(printf '%s' "$example" | cut -d_ -f2)
-case "$chip" in
-    c3)      mcu="esp32c3";  target="riscv32imc-esp-espidf"   ;;
-    c6)      mcu="esp32c6";  target="riscv32imac-esp-espidf"  ;;
-    esp32)   mcu="esp32";    target="xtensa-esp32-espidf"     ;;
-    esp32s3) mcu="esp32s3";  target="xtensa-esp32s3-espidf"   ;;
-    *) echo "Unknown chip in example name: $chip" >&2; exit 1 ;;
+tier=$(printf '%s' "$example" | cut -d_ -f1)
+case "$tier" in
+    hal)
+        case "$chip" in
+            c3)      mcu="esp32c3";  target="riscv32imc-unknown-none-elf"   ;;
+            c6)      mcu="esp32c6";  target="riscv32imac-unknown-none-elf"  ;;
+            esp32)   mcu="esp32";    target="xtensa-esp32-none-elf"         ;;
+            esp32s3) mcu="esp32s3";  target="xtensa-esp32s3-none-elf"       ;;
+            *) echo "Unknown chip in example name: $chip" >&2; exit 1 ;;
+        esac
+        elf="$hal_dir/$target/release/examples/$example"
+        ;;
+    *)
+        case "$chip" in
+            c3)      mcu="esp32c3";  target="riscv32imc-esp-espidf"   ;;
+            c6)      mcu="esp32c6";  target="riscv32imac-esp-espidf"  ;;
+            esp32)   mcu="esp32";    target="xtensa-esp32-espidf"     ;;
+            esp32s3) mcu="esp32s3";  target="xtensa-esp32s3-espidf"   ;;
+            *) echo "Unknown chip in example name: $chip" >&2; exit 1 ;;
+        esac
+        elf="$idf_dir/$target/release/examples/$example"
+        ;;
 esac
-
-elf="$idf_dir/$target/release/examples/$example"
 ota_dir="target/ota"
 mkdir -p "$ota_dir"
 app_bin="$ota_dir/${example}-v${version}.bin"

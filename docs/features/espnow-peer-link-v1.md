@@ -50,13 +50,14 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 - [ ] Generic helper over the espnow-tier-parity-v1 trait
 - [ ] Peer examples on both tiers use the helper
 - [ ] Documentation updated
-- [ ] Hardware check: coordinator reboot and channel change, both mixed-tier directions
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 <details><summary>Acceptance</summary>
 
 - Host tests: unrelated received frames, recovery during backoff, stale scan results, stale send results, `Local` outcomes never trigger a scan, boot-scan retry without traffic.
 - Mutation check on the threshold counting and the stale-id guard.
-- Hardware: coordinator reboot and coordinator channel change, in both mixed-tier directions.
+- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 </details>
 

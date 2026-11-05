@@ -32,7 +32,9 @@
 //!
 //! * [`EspNowDriver::send`] blocks for the TX duration (about 1-30 ms including 802.11 retries):
 //!   `esp-radio`'s send waiter busy-spins until the send callback fired.
-//!   It ignores the MAC-layer ACK, like the IDF `send`; [`EspHalEspNow::send_and_wait`] reports it.
+//!   It ignores the MAC-layer ACK, like the IDF `send`; [`EspHalEspNow::send_and_wait`] reports it
+//!   and, like every acknowledged send on both tiers, refuses the broadcast address
+//!   ([`EspHalEspNowError::Broadcast`]).
 //!   Prefer [`EspHalEspNow::send_acked`] in embassy tasks (it needs the runner).
 //!   Both sync forms return [`EspHalEspNowError::ScanInProgress`] while a scan runs.
 //! * Only one send can be in flight.
@@ -103,7 +105,7 @@ pub use juggler::espnow::{
     ClassifySend, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig, ScanConfig,
     ScanError, ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
 };
-use juggler::espnow::{Completion, Refusal, ScanRefusal};
+use juggler::espnow::{Completion, GateRefusal, Refusal};
 pub use juggler::wifi::TxPowerLevel;
 
 #[cfg(all(
@@ -320,12 +322,14 @@ pub(crate) fn validate_frame_len(data: &[u8]) -> Result<(), EspHalEspNowError> {
         .map_err(|_| EspHalEspNowError::PayloadTooLarge { len: data.len() })
 }
 
-/// The error for a request that [`TxCore::submit`] refused.
+/// The error for a request that [`TxCore::submit`] or [`TxCore::admit_direct`] refused.
 ///
-/// `Full` only reaches here when a caller gave up waiting for a slot, hence `Timeout`.
+/// A full queue is a wait until the caller's deadline, after which the core answers `Expired`.
 pub(crate) fn refusal_error(refusal: Refusal, len: usize) -> EspHalEspNowError {
     match refusal {
-        Refusal::Full => EspHalEspNowError::Timeout,
+        Refusal::Expired => EspHalEspNowError::Timeout,
+        // Not reached: the async send parks on `Full` until its deadline.
+        Refusal::Full => EspHalEspNowError::Busy,
         Refusal::Scanning => EspHalEspNowError::ScanInProgress,
         Refusal::TooLarge => EspHalEspNowError::PayloadTooLarge { len },
         Refusal::Broadcast => EspHalEspNowError::Broadcast,
@@ -333,11 +337,12 @@ pub(crate) fn refusal_error(refusal: Refusal, len: usize) -> EspHalEspNowError {
     }
 }
 
-/// The error for a scan that [`TxCore::begin_scan`] refused.
-pub(crate) fn scan_refusal_error(refusal: ScanRefusal) -> EspHalEspNowError {
+/// The error for a scan that [`ScanGate::admit`](juggler::espnow::ScanGate::admit) refused.
+pub(crate) fn gate_refusal_error(refusal: GateRefusal) -> EspHalEspNowError {
     match refusal {
-        ScanRefusal::Busy => EspHalEspNowError::Busy,
-        ScanRefusal::NotOwned => EspHalEspNowError::ControllerNotOwned,
+        GateRefusal::Busy => EspHalEspNowError::Busy,
+        GateRefusal::NotOwned => EspHalEspNowError::ControllerNotOwned,
+        GateRefusal::Shutdown => EspHalEspNowError::Shutdown,
     }
 }
 
@@ -354,6 +359,8 @@ pub(crate) fn completion_result(
         Completion::Expired => Err(EspHalEspNowError::Timeout),
         Completion::Preempted => Err(EspHalEspNowError::ScanInProgress),
         Completion::Shutdown => Err(EspHalEspNowError::Shutdown),
+        // The caller lost track of its own request: no result to report.
+        Completion::Unknown => Err(EspHalEspNowError::Busy),
     }
 }
 
@@ -583,13 +590,18 @@ mod tests {
             refusal_error(Refusal::TooLarge, 251),
             EspHalEspNowError::PayloadTooLarge { len: 251 }
         );
-        assert_eq!(refusal_error(Refusal::Full, 3), EspHalEspNowError::Timeout);
+        assert_eq!(
+            refusal_error(Refusal::Expired, 3),
+            EspHalEspNowError::Timeout
+        );
+        assert_eq!(refusal_error(Refusal::Full, 3), EspHalEspNowError::Busy);
         assert_eq!(
             refusal_error(Refusal::Shutdown, 3),
             EspHalEspNowError::Shutdown
         );
         for refusal in [
             Refusal::Full,
+            Refusal::Expired,
             Refusal::Scanning,
             Refusal::TooLarge,
             Refusal::Broadcast,
@@ -603,14 +615,18 @@ mod tests {
     }
 
     #[test]
-    fn scan_refusals_map_to_busy_and_controller_not_owned() {
+    fn scan_refusals_map_to_busy_controller_not_owned_and_shutdown() {
         assert_eq!(
-            scan_refusal_error(ScanRefusal::Busy),
+            gate_refusal_error(GateRefusal::Busy),
             EspHalEspNowError::Busy
         );
         assert_eq!(
-            scan_refusal_error(ScanRefusal::NotOwned),
+            gate_refusal_error(GateRefusal::NotOwned),
             EspHalEspNowError::ControllerNotOwned
+        );
+        assert_eq!(
+            gate_refusal_error(GateRefusal::Shutdown),
+            EspHalEspNowError::Shutdown
         );
     }
 
@@ -625,6 +641,7 @@ mod tests {
             (Completion::Expired, EspHalEspNowError::Timeout),
             (Completion::Preempted, EspHalEspNowError::ScanInProgress),
             (Completion::Shutdown, EspHalEspNowError::Shutdown),
+            (Completion::Unknown, EspHalEspNowError::Busy),
         ] {
             let result = completion_result(completion);
             assert_eq!(result, Err(error));

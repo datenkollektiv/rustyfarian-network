@@ -11,9 +11,10 @@
 //!   network closes the transport instead of letting the driver retry blindly.
 //! - **Connect work order:** after CONNACK the tier subscribes (unless the broker
 //!   kept a session whose subscriptions all completed earlier; an incomplete or
-//!   unknown one is subscribed again), then publishes the startup message, and only then
-//!   reports [`SessionInput::WorkDone`]; the session is ready after that, never
-//!   before its subscriptions were sent.
+//!   unknown one is subscribed again), then publishes the startup message, then
+//!   runs its connect callback, and only then reports [`SessionInput::WorkDone`];
+//!   the session is ready after that, never before its subscriptions were sent.
+//!   [`ConnectWorkPlan`] yields exactly this order, so no tier spells it out.
 //! - **Stale-session guard:** every connect work carries a [`SessionToken`];
 //!   a `WorkDone` or `WorkFailed` for an older session is ignored.
 //! - **Publish gate:** [`SessionMachine::can_publish`] is `true` only while ready.
@@ -26,9 +27,16 @@
 //!   retries the driver would make on its own, and feeds [`SessionInput::Disconnected`].
 //! - After [`SessionAction::Wait`] it feeds [`SessionInput::RetryElapsed`]; it keeps
 //!   at most one retry timer.
+//! - After [`SessionAction::ConnectWork`] it runs the steps of a
+//!   [`ConnectWorkPlan`] in order and feeds [`SessionInput::WorkDone`] or, at
+//!   the first failed step, [`SessionInput::WorkFailed`].
+//! - After [`SessionAction::Ready`] it wakes the publishers waiting for the session.
 //! - A driver that retries on its own may report [`SessionInput::AttemptStarted`].
 //!
-//! Inputs that do not fit the current state are ignored.
+//! Inputs that do not fit the current state are answered with
+//! [`SessionAction::Ignored`] and leave the state unchanged (ADR 023 decision 5);
+//! `Ignored` is never a request for I/O, but a tier loop that sees it on its own
+//! transitions has fallen out of step with the machine.
 
 use super::MqttConnectionState;
 
@@ -68,18 +76,27 @@ pub enum SessionInput {
 /// Action the tier performs before polling again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
-    /// Nothing to do.
+    /// The input was accepted; nothing to do.
     None,
+    /// The input did not fit the current state and was dropped; the state is
+    /// unchanged and nothing is to be done.
+    Ignored,
     /// Open the transport and send CONNECT.
     Connect,
-    /// Subscribe if `subscribe`, then publish the startup message, then feed
+    /// Run the steps of a [`ConnectWorkPlan`] built with `subscribe`, then feed
     /// [`SessionInput::WorkDone`] or [`SessionInput::WorkFailed`] with `token`.
     ConnectWork {
         /// Session this work belongs to.
         token: SessionToken,
         /// `false` only when the broker kept a session whose subscriptions completed.
         subscribe: bool,
+        /// The broker's session-present flag of this connection, for the
+        /// tier's connect callback.
+        session_present: bool,
     },
+    /// The connect work was accepted and the session is now publishable: wake
+    /// the publishers waiting for it.
+    Ready,
     /// Tear the transport down and stop the driver's own retries, then feed
     /// [`SessionInput::Disconnected`].
     Close,
@@ -202,7 +219,7 @@ impl SessionMachine {
         use SessionInput as I;
 
         if self.phase == P::Shutdown {
-            return A::None;
+            return A::Ignored;
         }
         match (self.phase, input) {
             (_, I::Shutdown) => {
@@ -224,6 +241,7 @@ impl SessionMachine {
                 self.phase = P::Connecting;
                 A::Connect
             }
+            (_, I::NetworkUp) if self.network_up => A::Ignored,
             (_, I::NetworkUp) => {
                 self.network_up = true;
                 A::None
@@ -240,6 +258,7 @@ impl SessionMachine {
                 self.phase = P::Closing { driver_idle: true };
                 A::Close
             }
+            (_, I::NetworkDown) if !self.network_up => A::Ignored,
             (_, I::NetworkDown) => {
                 self.network_up = false;
                 A::None
@@ -263,13 +282,17 @@ impl SessionMachine {
                 if subscribe {
                     self.subscribed = false;
                 }
-                A::ConnectWork { token, subscribe }
+                A::ConnectWork {
+                    token,
+                    subscribe,
+                    session_present,
+                }
             }
             (P::Working(current), I::WorkDone(token)) if token == current => {
                 self.subscribed = true;
                 self.phase = P::Ready;
                 self.connects = self.connects.wrapping_add(1);
-                A::None
+                A::Ready
             }
             (P::Working(current), I::WorkFailed(token)) if token == current => {
                 self.phase = P::Closing { driver_idle: false };
@@ -288,8 +311,71 @@ impl SessionMachine {
                 self.phase = P::Connecting;
                 A::Connect
             }
-            _ => A::None,
+            _ => A::Ignored,
         }
+    }
+}
+
+/// One step of a session's connect work; see [`ConnectWorkPlan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// Subscribe to the tier's subscription with this index.
+    Subscribe(usize),
+    /// Publish the startup message.
+    PublishStartup,
+    /// Run the tier's connect callback.
+    RunOnConnect,
+}
+
+/// The connect work of one session, in the shared order: every subscription
+/// in index order (only when the session needs them), then the startup
+/// message, then the connect callback.
+///
+/// A tier builds it from [`SessionAction::ConnectWork`] and what it has
+/// configured, maps each [`ConnectStep`] to one driver call, and stops at the
+/// first failure.
+#[derive(Debug, Clone)]
+pub struct ConnectWorkPlan {
+    subscriptions: core::ops::Range<usize>,
+    startup: bool,
+    on_connect: bool,
+}
+
+impl ConnectWorkPlan {
+    /// The plan for one connect work.
+    ///
+    /// `subscribe` is the flag of [`SessionAction::ConnectWork`]; `subscriptions`
+    /// is how many the tier has; `startup` and `on_connect` say whether a startup
+    /// message and a connect callback are configured.
+    pub fn new(subscribe: bool, subscriptions: usize, startup: bool, on_connect: bool) -> Self {
+        Self {
+            subscriptions: 0..if subscribe { subscriptions } else { 0 },
+            startup,
+            on_connect,
+        }
+    }
+
+    /// `true` when no step is left, so the tier can report
+    /// [`SessionInput::WorkDone`] at once.
+    pub fn is_empty(&self) -> bool {
+        self.subscriptions.is_empty() && !self.startup && !self.on_connect
+    }
+}
+
+impl Iterator for ConnectWorkPlan {
+    type Item = ConnectStep;
+
+    fn next(&mut self) -> Option<ConnectStep> {
+        if let Some(index) = self.subscriptions.next() {
+            return Some(ConnectStep::Subscribe(index));
+        }
+        if core::mem::take(&mut self.startup) {
+            return Some(ConnectStep::PublishStartup);
+        }
+        if core::mem::take(&mut self.on_connect) {
+            return Some(ConnectStep::RunOnConnect);
+        }
+        None
     }
 }
 
@@ -307,7 +393,9 @@ mod tests {
 
     fn connect_work(m: &mut SessionMachine, session_present: bool) -> (SessionToken, bool) {
         match m.poll(I::Connected { session_present }) {
-            A::ConnectWork { token, subscribe } => (token, subscribe),
+            A::ConnectWork {
+                token, subscribe, ..
+            } => (token, subscribe),
             other => panic!("expected ConnectWork, got {:?}", other),
         }
     }
@@ -338,12 +426,12 @@ mod tests {
     fn no_attempt_starts_before_the_network_is_up() {
         let mut m = SessionMachine::new();
         assert_eq!(m.state(), MqttConnectionState::Connecting);
-        assert_eq!(m.poll(I::RetryElapsed), A::None);
+        assert_eq!(m.poll(I::RetryElapsed), A::Ignored);
         assert_eq!(
             m.poll(I::Connected {
                 session_present: false
             }),
-            A::None
+            A::Ignored
         );
         assert_eq!(m.poll(I::NetworkUp), A::Connect);
     }
@@ -358,7 +446,7 @@ mod tests {
             !m.can_publish(),
             "no publish before the subscriptions were sent"
         );
-        assert_eq!(m.poll(I::WorkDone(token)), A::None);
+        assert_eq!(m.poll(I::WorkDone(token)), A::Ready);
         assert_eq!(m.state(), MqttConnectionState::Connected);
         assert!(m.can_publish());
         assert_eq!(m.connect_count(), 1);
@@ -420,13 +508,13 @@ mod tests {
         m.poll(I::Disconnected);
         m.poll(I::RetryElapsed);
         let current = working(&mut m, false);
-        assert_eq!(m.poll(I::WorkDone(old)), A::None);
+        assert_eq!(m.poll(I::WorkDone(old)), A::Ignored);
         assert!(
             !m.can_publish(),
             "a stale WorkDone must not mark the new session ready"
         );
-        assert_eq!(m.poll(I::WorkFailed(old)), A::None);
-        assert_eq!(m.poll(I::WorkDone(current)), A::None);
+        assert_eq!(m.poll(I::WorkFailed(old)), A::Ignored);
+        assert_eq!(m.poll(I::WorkDone(current)), A::Ready);
         assert!(m.can_publish());
     }
 
@@ -452,7 +540,7 @@ mod tests {
         m.poll(I::NetworkUp);
         let token = working(&mut m, false);
         m.poll(I::Disconnected);
-        assert_eq!(m.poll(I::WorkDone(token)), A::None);
+        assert_eq!(m.poll(I::WorkDone(token)), A::Ignored);
         assert!(!m.can_publish());
         assert_eq!(m.connect_count(), 0);
     }
@@ -497,7 +585,7 @@ mod tests {
             "no retry without a network"
         );
         assert_eq!(m.state(), MqttConnectionState::Disconnected);
-        assert_eq!(m.poll(I::RetryElapsed), A::None);
+        assert_eq!(m.poll(I::RetryElapsed), A::Ignored);
         assert_eq!(
             m.poll(I::NetworkUp),
             A::Connect,
@@ -516,7 +604,7 @@ mod tests {
         );
         assert_eq!(m.poll(I::Disconnected), A::None);
         assert_eq!(m.state(), MqttConnectionState::Disconnected);
-        assert_eq!(m.poll(I::RetryElapsed), A::None);
+        assert_eq!(m.poll(I::RetryElapsed), A::Ignored);
         assert_eq!(m.poll(I::NetworkUp), A::Connect);
     }
 
@@ -544,7 +632,7 @@ mod tests {
         let mut m = ready();
         m.poll(I::Disconnected);
         assert_eq!(m.poll(I::Shutdown), A::Close);
-        assert_eq!(m.poll(I::AttemptStarted), A::None);
+        assert_eq!(m.poll(I::AttemptStarted), A::Ignored);
     }
 
     #[test]
@@ -614,7 +702,7 @@ mod tests {
         // `Disconnected` after `Close`, from the driver or by itself.
         let mut m = ready();
         m.poll(I::NetworkDown);
-        assert_eq!(m.poll(I::RetryElapsed), A::None);
+        assert_eq!(m.poll(I::RetryElapsed), A::Ignored);
         assert_eq!(
             m.poll(I::NetworkUp),
             A::None,
@@ -628,7 +716,7 @@ mod tests {
         assert_eq!(m.poll(I::Shutdown), A::Close);
         assert_eq!(m.state(), MqttConnectionState::ShuttingDown);
         for input in [I::Disconnected, I::NetworkUp, I::RetryElapsed, I::Shutdown] {
-            assert_eq!(m.poll(input), A::None);
+            assert_eq!(m.poll(input), A::Ignored);
         }
         assert!(!m.can_publish());
     }
@@ -637,14 +725,224 @@ mod tests {
     fn shutdown_while_offline_needs_no_close() {
         let mut m = SessionMachine::new();
         assert_eq!(m.poll(I::Shutdown), A::None);
-        assert_eq!(m.poll(I::NetworkUp), A::None);
+        assert_eq!(m.poll(I::NetworkUp), A::Ignored);
     }
 
     #[test]
     fn duplicate_network_up_while_connected_changes_nothing() {
         let mut m = ready();
-        assert_eq!(m.poll(I::NetworkUp), A::None);
+        assert_eq!(m.poll(I::NetworkUp), A::Ignored);
         assert!(m.can_publish());
         assert_eq!(m.connect_count(), 1);
+    }
+
+    #[test]
+    fn work_done_returns_ready() {
+        let mut m = SessionMachine::new();
+        m.poll(I::NetworkUp);
+        let token = working(&mut m, false);
+        assert_eq!(m.poll(I::WorkDone(token)), A::Ready);
+        assert!(m.can_publish());
+    }
+
+    #[test]
+    fn duplicate_network_up_is_ignored() {
+        let mut m = SessionMachine::new();
+        assert_eq!(m.poll(I::NetworkUp), A::Connect);
+        assert_eq!(m.poll(I::NetworkUp), A::Ignored);
+        assert_eq!(m.state(), MqttConnectionState::Connecting);
+        m.poll(I::Disconnected);
+        assert_eq!(
+            m.poll(I::NetworkUp),
+            A::Ignored,
+            "the retry pause already knows the network is up"
+        );
+    }
+
+    #[test]
+    fn network_up_that_changes_the_flag_is_accepted() {
+        // Closing after a NetworkDown: the flag flips back, nothing to do yet.
+        let mut m = ready();
+        m.poll(I::NetworkDown);
+        assert_eq!(m.poll(I::NetworkUp), A::None);
+        assert_eq!(
+            m.poll(I::Disconnected),
+            A::Wait {
+                ms: SESSION_RETRY_MS
+            },
+            "the close ends with the network up again, so a retry follows"
+        );
+    }
+
+    #[test]
+    fn duplicate_network_down_is_ignored() {
+        let mut fresh = SessionMachine::new();
+        assert_eq!(
+            fresh.poll(I::NetworkDown),
+            A::Ignored,
+            "the network was never up"
+        );
+        let mut m = ready();
+        assert_eq!(m.poll(I::NetworkDown), A::Close);
+        assert_eq!(m.poll(I::NetworkDown), A::Ignored);
+        assert_eq!(m.poll(I::Disconnected), A::None);
+        assert_eq!(m.poll(I::NetworkDown), A::Ignored);
+        assert_eq!(m.state(), MqttConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn network_down_that_changes_the_flag_is_accepted() {
+        // Closing after a failed connect work keeps the network up until told.
+        let mut m = SessionMachine::new();
+        m.poll(I::NetworkUp);
+        let token = working(&mut m, false);
+        assert_eq!(m.poll(I::WorkFailed(token)), A::Close);
+        assert_eq!(m.poll(I::NetworkDown), A::None);
+        assert_eq!(m.poll(I::Disconnected), A::None, "offline, no retry");
+    }
+
+    fn all_inputs(token: SessionToken) -> [SessionInput; 10] {
+        [
+            I::NetworkUp,
+            I::NetworkDown,
+            I::AttemptStarted,
+            I::Connected {
+                session_present: false,
+            },
+            I::Connected {
+                session_present: true,
+            },
+            I::WorkDone(token),
+            I::WorkFailed(token),
+            I::Disconnected,
+            I::RetryElapsed,
+            I::Shutdown,
+        ]
+    }
+
+    #[test]
+    fn every_input_after_shutdown_is_ignored() {
+        let mut m = SessionMachine::new();
+        m.poll(I::NetworkUp);
+        let token = working(&mut m, false);
+        assert_eq!(m.poll(I::Shutdown), A::Close);
+        for input in all_inputs(token) {
+            assert_eq!(m.poll(input), A::Ignored, "{:?}", input);
+            assert_eq!(m.state(), MqttConnectionState::ShuttingDown);
+        }
+    }
+
+    #[test]
+    fn stale_token_is_ignored() {
+        let mut m = SessionMachine::new();
+        m.poll(I::NetworkUp);
+        let old = working(&mut m, false);
+        reconnect(&mut m);
+        let current = working(&mut m, false);
+        assert_eq!(m.poll(I::WorkDone(old)), A::Ignored);
+        assert_eq!(m.poll(I::WorkFailed(old)), A::Ignored);
+        assert!(m.is_current(current), "the stale input changed nothing");
+        assert_eq!(m.poll(I::WorkDone(current)), A::Ready);
+    }
+
+    #[test]
+    fn connected_carries_session_present_into_connect_work() {
+        for session_present in [false, true] {
+            let mut m = SessionMachine::new();
+            m.poll(I::NetworkUp);
+            match m.poll(I::Connected { session_present }) {
+                A::ConnectWork {
+                    session_present: carried,
+                    ..
+                } => assert_eq!(carried, session_present),
+                other => panic!("expected ConnectWork, got {:?}", other),
+            }
+        }
+    }
+
+    /// The documented answer of a well-behaved tier to `action`, or `None`
+    /// when the action asks for nothing and the loop waits for the outside.
+    fn answer(action: SessionAction) -> Option<SessionInput> {
+        match action {
+            A::Connect => Some(I::Connected {
+                session_present: false,
+            }),
+            A::ConnectWork { token, .. } => Some(I::WorkDone(token)),
+            A::Close => Some(I::Disconnected),
+            A::Wait { .. } => Some(I::RetryElapsed),
+            A::None | A::Ready | A::Ignored => None,
+        }
+    }
+
+    #[test]
+    fn a_scripted_tier_loop_settles_within_a_bounded_number_of_polls() {
+        // Prefixes that reach every phase a tier loop can sit in, each ending
+        // with the input whose answer the loop then performs.
+        const MAX_POLLS: usize = 8;
+        let prefixes: &[&[SessionInput]] = &[
+            &[I::NetworkUp],
+            &[I::NetworkUp, I::Disconnected],
+            &[I::NetworkUp, I::NetworkDown],
+            &[I::NetworkUp, I::Disconnected, I::NetworkDown],
+            &[I::NetworkUp, I::Disconnected, I::AttemptStarted],
+            &[I::AttemptStarted],
+            &[I::NetworkUp, I::NetworkDown, I::Disconnected, I::NetworkUp],
+        ];
+        for prefix in prefixes {
+            let mut m = SessionMachine::new();
+            let mut action = A::None;
+            for input in prefix.iter() {
+                action = m.poll(*input);
+                assert_ne!(action, A::Ignored, "prefix {:?} at {:?}", prefix, input);
+            }
+            let mut polls = 0;
+            // A driver attempt the machine accepted (`AttemptStarted` while
+            // retrying) answers with the driver's own CONNACK.
+            let driver_attempt = |m: &SessionMachine| {
+                (m.state() == MqttConnectionState::Connecting).then_some(I::Connected {
+                    session_present: false,
+                })
+            };
+            while let Some(input) = answer(action).or_else(|| driver_attempt(&m)) {
+                polls += 1;
+                assert!(polls <= MAX_POLLS, "prefix {:?} did not settle", prefix);
+                action = m.poll(input);
+                assert_ne!(action, A::Ignored, "prefix {:?} after {:?}", prefix, input);
+            }
+            let settled = m.can_publish() || m.state() == MqttConnectionState::Disconnected;
+            assert!(settled, "prefix {:?} ended in {:?}", prefix, m.state());
+        }
+    }
+
+    #[test]
+    fn connect_work_plan_order() {
+        let steps: alloc::vec::Vec<ConnectStep> =
+            ConnectWorkPlan::new(true, 3, true, true).collect();
+        assert_eq!(
+            steps,
+            [
+                ConnectStep::Subscribe(0),
+                ConnectStep::Subscribe(1),
+                ConnectStep::Subscribe(2),
+                ConnectStep::PublishStartup,
+                ConnectStep::RunOnConnect,
+            ]
+        );
+    }
+
+    #[test]
+    fn kept_session_skips_subscriptions() {
+        let steps: alloc::vec::Vec<ConnectStep> =
+            ConnectWorkPlan::new(false, 3, true, false).collect();
+        assert_eq!(steps, [ConnectStep::PublishStartup]);
+    }
+
+    #[test]
+    fn empty_plan_when_nothing_to_do() {
+        assert!(ConnectWorkPlan::new(false, 3, false, false).is_empty());
+        assert!(ConnectWorkPlan::new(true, 0, false, false).is_empty());
+        assert_eq!(ConnectWorkPlan::new(true, 0, false, false).next(), None);
+        assert!(!ConnectWorkPlan::new(true, 1, false, false).is_empty());
+        assert!(!ConnectWorkPlan::new(false, 0, false, true).is_empty());
     }
 }

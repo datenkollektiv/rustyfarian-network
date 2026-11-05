@@ -33,15 +33,18 @@ pub use health::{
 };
 pub use intake::{decide_intake, IntakeDecision, SendResult};
 pub use report::{
-    rejects_delta, CompletionRetry, CompletionRetryConfig, DeliveryStep, PublishOutcome,
-    PublishStep, ReporterConfig, ReporterMachine, ViewStep,
+    rejects_delta, CompletionRetry, CompletionRetryConfig, CompletionStep, DeliveryStep,
+    PublishOutcome, PublishStep, ReporterConfig, ReporterMachine, ViewStep,
 };
 pub use store_ops::{
     ack_delivered, failed_download, repair_all, retry_completion, rollback_arm, rollback_undo,
     ArmedRollback, CompletionTry, FailedSettle, RepairError, Undone,
 };
+#[allow(deprecated)]
+pub use worker::begin_failure;
 pub use worker::{
-    begin_failure, blocked_report, early_update_block, plan_offer, plan_repair, plan_rollback,
-    plan_update_gate, refresh_after_repair, refused_or_absent, retained_due, OfferPlan, Probe,
-    Proceed, RefreshedFlags, RepairGate, Retention,
+    begin_failure_outcome, blocked_report, early_update_block, plan_offer, plan_repair,
+    plan_rollback, plan_update_gate, refresh_after_repair, refused_or_absent, repair_status,
+    retained_due, BeginFailure, OfferPlan, Probe, Proceed, RefreshedFlags, RepairGate, Retention,
+    RuntimeFlags,
 };

@@ -27,13 +27,16 @@ This repo differs from the siblings in three ways that change the wording, not t
 
 1. Shared logic takes the lowest rung that fits:
    - **Rung 1 — generic driver.** The flow lives in `juggler`, generic over `embedded-hal` or `embedded-storage` traits.
-     No shared instance exists in `juggler` today.
-     The nearest shape is tier-local: the hal `ProvisioningStore<F: NorFlash>` is generic over `embedded-storage`, but the IDF tier keeps its own store.
+     The shared instances are `juggler::lora::sx1262::init`, generic over the `embedded-hal` SPI, GPIO and `DelayNs` traits, and `juggler::provisioning::flash_store::ProvisioningStore<F: NorFlash>`, behind juggler's `flash-store` feature.
+     The hal tier uses that store through `rustyfarian_esp_hal_network::provisioning::ProvisioningStore`.
+     The IDF tier keeps its own NVS-backed store, `rustyfarian_esp_idf_network::provisioning::ProvisioningStore`, as a tier-local store.
+     That store reuses juggler's record logic through the `ProvisioningKv` port.
    - **Rung 2 — event machine.** The core decodes samples: `update(sample, now) -> Option<Event>`.
      A tier, an ISR, or an `embedded-hal` adapter feeds it.
-     No rung-2 instance exists today.
+     The instances are `juggler::lora::LorawanTicker`, with `update(irq_pending, now_ms) -> Option<TickEvent>`, and `juggler::mqtt::NetworkGate`, with `feed(ready) -> Option<SessionInput>`.
+     `NetworkGate` takes no clock because it only turns readiness edges into events.
    - **Rung 3 — action machine.** The core emits I/O requests: `poll(&mut self, input) -> Action`, and a thin loop per tier performs them.
-     Examples are `LinkMachine` (`juggler::wifi::link`), `SessionMachine` (`mqtt::session`), `ScanMachine` (`espnow::scan`), and `HealthMachine` and `ReporterMachine` (`ota::runtime`).
+     Examples are `LinkMachine` (`juggler::wifi::link`), `SessionMachine` (`juggler::mqtt::session`), `ScanMachine` (`juggler::espnow::scan`), `HealthMachine` and `ReporterMachine` (`juggler::ota::runtime`), `DownloadMachine` (`juggler::ota::download`), `PortalMachine` (`juggler::provisioning::portal_flow`), and `PeerLink` (`juggler::espnow::link`).
 2. Rung 3 is used only when a flow meets one of these triggers:
    - It must run under more than one execution model, such as threads, events, or cancel-safe async.
    - The tiers perform I/O outside `embedded-hal`, such as `esp_wifi_*` or esp-radio calls, but must share the order of the steps.
@@ -42,7 +45,7 @@ This repo differs from the siblings in three ways that change the wording, not t
    Wake-ups are injected the same way.
 5. A rung-3 machine answers out-of-phase input with an explicit no-op action, so a host test of a tier loop can detect it.
    `LinkAction::None` and `SessionAction::None` currently mean both "nothing to do" and "input ignored".
-   The rule applies to new machines; an existing machine adopts it when a change touches it, with no retrofit now.
+   The ladder retrofit before the next release brings every existing machine onto this rule.
 6. Every rung-3 flow reaches a terminal action, and the tier loop bounds its iterations or its time budget.
    A machine that follows decision 5 lets the loop treat the no-op action as an error exit.
 7. Review rule (from [ADR 022](022-tier-parity-one-async-api.md) decision 10): a branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
@@ -51,7 +54,8 @@ This repo differs from the siblings in three ways that change the wording, not t
 9. Tier-specific facts stay in the adapters: esp-mqtt `api_lock` and callback threading ([ADR 017](017-mqtt-callback-threading-contract.md)), worker threads, radio register calls, and provider selection ([ADR 021](021-binary-owned-providers.md)).
 10. A port trait is narrow: one driver call or one event mapping per method, with no decisions.
     A generic runner over a wide port is not used, because the port would have to model the whole flow.
-11. Moving a flow up a rung is demand-driven: the first change that needs it pays for it.
+11. A one-time retrofit applies the ladder to all existing code before the next release, followed by one hardware run across the affected flows.
+    After the retrofit, moving a flow up a rung is demand-driven: the first change that needs it pays for it.
 
 ## Consequences
 

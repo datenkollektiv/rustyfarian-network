@@ -52,8 +52,9 @@
 //! # DIO1 interrupt
 //!
 //! GPIO 14 is set up with a rising-edge interrupt that sets `DIO1_FLAG`.
-//! The main loop polls this flag and delivers `RadioEvent(Phy(()))` to the
-//! lorawan-device state machine when it fires.
+//! The main loop feeds this flag, OR-ed with an SPI `irq_pending()` poll, into
+//! `juggler`'s `LorawanTicker`, which decides when to deliver `RadioEvent(Phy(()))`
+//! or `TimeoutFired` to the lorawan-device state machine.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -73,6 +74,7 @@ use lorawan_device::{
 use rustyfarian_esp_idf_network::lora::{
     config::{LoraConfig, Region},
     sx1262_driver::{EspIdfLoraRadio, LoraRadioAdapter},
+    LorawanTicker, Outcome, TickEvent,
 };
 
 /// DIO1 rising-edge flag — set by ISR, cleared by main loop after delivery.
@@ -90,6 +92,9 @@ static DIO1_FLAG: AtomicBool = AtomicBool::new(false);
 /// prefer `DR0` (SF12) and ensure the gateway schedules the accept on RX2, or accept that
 /// RX1 will not complete at long range.
 const JOIN_DR: region::DR = region::DR::_5;
+
+/// Time budget for the whole join exchange, in ms.
+const JOIN_BUDGET_MS: u32 = 60_000;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -200,27 +205,21 @@ fn main() -> anyhow::Result<()> {
     device.set_datarate(JOIN_DR);
     log::info!(target: tag, "Join data rate set to {:?} (DR5 = SF7/BW125)", JOIN_DR);
 
-    let mut response = device
+    let response = device
         .join(join_mode)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
+    // `LorawanTicker` owns the two lorawan-device rules: `TimeoutRequest(ms)` is
+    // an ABSOLUTE timestamp in the timeline starting at `start` (assign, never
+    // add elapsed), and `JoinSuccess` / `NoJoinAccept` end the exchange.
     let start = Instant::now();
-    let mut next_timeout_ms: u32 = 0;
-    if let Response::TimeoutRequest(ms) = response {
-        // `TimeoutRequest(ms)` carries an ABSOLUTE timestamp in the device's
-        // millisecond timeline (epoch ≈ TX start ≈ `start`), NOT a relative
-        // delay. Assigning it directly (rather than `elapsed + ms`) is what
-        // makes RX1/RX2 open on time; adding `elapsed` opens them ~2x too late
-        // and the join-accept is missed. See lorawan-device nb_device::Response.
-        next_timeout_ms = ms;
-        log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
-        response = Response::NoUpdate;
-    }
+    let mut ticker = LorawanTicker::new(JOIN_BUDGET_MS, 0);
+    let mut outcome = ticker.on_response(&response);
 
-    loop {
-        let elapsed_ms = start.elapsed().as_millis() as u32;
+    while outcome == Outcome::Continue {
+        let now_ms = start.elapsed().as_millis() as u32;
 
-        // Deliver a radio event when the SX1262 has a pending IRQ.
+        // Poll the SX1262 IRQ register over SPI each tick.
         //
         // We do NOT rely on the DIO1 GPIO interrupt alone: esp-idf-hal PinDriver
         // interrupts are one-shot (auto-disabled on each firing, must be re-armed
@@ -231,60 +230,48 @@ fn main() -> anyhow::Result<()> {
         // catches every RxDone/Timeout. The DIO1 flag is still consumed so a
         // delivered edge is not left pending.
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-        if dio1_edge || device.get_radio().irq_pending() {
-            log::debug!(target: tag, "radio IRQ at {}ms", elapsed_ms);
-            response = device
-                .handle_event(Event::RadioEvent(LdRadioEvent::Phy(())))
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        }
+        let irq = dio1_edge || device.get_radio().irq_pending();
 
-        // Timing tick — deliver timeout when the deadline has elapsed.
-        if elapsed_ms >= next_timeout_ms && next_timeout_ms > 0 {
-            let late_ms = elapsed_ms.saturating_sub(next_timeout_ms);
-            log::debug!(
-                target: tag,
-                "Timeout fired at {}ms (deadline {}ms, {}ms late)",
-                elapsed_ms, next_timeout_ms, late_ms
-            );
-            next_timeout_ms = 0;
-            response = device
-                .handle_event(Event::TimeoutFired)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        }
+        let event = match ticker.update(irq, now_ms) {
+            Some(TickEvent::Phy) => {
+                log::debug!(target: tag, "radio IRQ at {}ms", now_ms);
+                Event::RadioEvent(LdRadioEvent::Phy(()))
+            }
+            Some(TickEvent::TimeoutFired) => {
+                log::debug!(target: tag, "Timeout fired at {}ms", now_ms);
+                Event::TimeoutFired
+            }
+            Some(TickEvent::BudgetExceeded) => {
+                log::error!(target: tag, "Join timed out after {} s", JOIN_BUDGET_MS / 1000);
+                break;
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
 
+        let response = device
+            .handle_event(event)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         match &response {
-            Response::JoinSuccess => {
-                log::info!(target: tag, "OTAA join successful");
-                break;
-            }
-            Response::NoJoinAccept => {
-                log::error!(target: tag, "OTAA join failed — no join-accept");
-                break;
-            }
             Response::TimeoutRequest(ms) => {
-                // Absolute timestamp in the device timeline — assign, don't add.
-                next_timeout_ms = *ms;
-                log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", *ms);
-                response = Response::NoUpdate;
+                log::debug!(target: tag, "RX window scheduled at {}ms (absolute)", ms);
             }
-            Response::JoinRequestSending => {
-                log::info!(target: tag, "Join-request on air ...");
-                response = Response::NoUpdate;
-            }
+            Response::JoinRequestSending => log::info!(target: tag, "Join-request on air ..."),
             Response::NoUpdate => {}
-            other => {
-                log::debug!(target: tag, "response: {:?}", other);
-                response = Response::NoUpdate;
-            }
+            other => log::debug!(target: tag, "response: {:?}", other),
         }
-
-        // Safety net — abort after 60 s.
-        if elapsed_ms > 60_000 {
-            log::error!(target: tag, "Join timed out after 60 s");
-            break;
-        }
+        outcome = ticker.on_response(&response);
 
         std::thread::sleep(Duration::from_millis(10));
+    }
+
+    match outcome {
+        Outcome::Joined => log::info!(target: tag, "OTAA join successful"),
+        Outcome::JoinFailed => log::error!(target: tag, "OTAA join failed — no join-accept"),
+        Outcome::Continue => {}
+        other => log::warn!(target: tag, "join ended with {:?}", other),
     }
 
     Ok(())

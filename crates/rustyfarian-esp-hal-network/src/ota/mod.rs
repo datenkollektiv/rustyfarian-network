@@ -29,26 +29,42 @@
 // Module is private; no item in this module is part of the public API.
 mod http;
 
+// Activation order (host-tested); used by the manager.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32",
+            feature = "esp32s3"
+        )
+    )
+))]
+mod activation;
+
 // Re-export the full public surface of `juggler::ota` for domain parity with the
 // `wifi`/`espnow` modules, so OTA consumers import metadata/version types from
 // this crate rather than adding a redundant direct `juggler` dependency.
 pub use juggler::ota::{
-    bytes_to_hex, classify_read_error, decide_offer, decide_update, hex_to_bytes, reconcile,
-    ActivationPermit, Admission, AttemptRecord, BlockedBy, BootFacts, Deadline, ImageMetadata,
-    OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState, StreamingVerifier,
-    UpdateDecision, Version,
+    bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
+    hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy, BootFacts,
+    Deadline, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState,
+    StreamingVerifier, UpdateDecision, Version,
 };
 
 // The wire contract needs `alloc` + serde, so on this tier it is opt-in via `ota-wire`.
 #[cfg(any(feature = "ota-wire", test))]
 pub use juggler::ota::{
-    note_boot_slot, reconcile_boot, slot_for_partition, slot_from_label, slot_label,
-    BootDisposition, BootFault, BootOutcome, BootWarnings, BusyTally, CommandError, CorruptRecord,
-    Delivery, FailReason, FailedDownload, HardwareFacts, HardwareReadError, KvError, KvStr,
-    Manifest, ManifestError, NoteBoot, NoteBootError, OtaCommand, OtaKv, OtaStatus, OtaStore,
-    PendingReport, PendingReportView, ReasonNote, RefusalNote, RepairedRecord, ReportRecord,
-    RollbackNoted, RollbackReason, RollbackRequest, SettleOutcome, StatusError, StoreError,
-    StoredAttempt, UpdateSlot, FACTORY_SLOT, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
+    note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition, slot_from_label,
+    slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings, BusyRetry, BusyTally,
+    CommandError, CorruptRecord, Delivery, FailReason, FailedDownload, HardwareFacts,
+    HardwareReadError, KvError, KvStr, Manifest, ManifestError, NoteBoot, NoteBootError,
+    OtaCommand, OtaKv, OtaStatus, OtaStore, PendingReport, PendingReportView, ReasonNote,
+    RefusalNote, RepairedRecord, ReportRecord, RollbackNoted, RollbackReason, RollbackRequest,
+    SettleOutcome, StatusError, StoreError, StoredAttempt, UpdateSlot, FACTORY_SLOT,
+    MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
 };
 
 // The consumer runtime's pure state machines and configuration (feature `ota-wire`).
@@ -110,18 +126,19 @@ mod reexport_parity_guard {
     #[test]
     fn ota_public_surface_is_reexported_from_this_crate() {
         use crate::ota::{
-            bytes_to_hex, classify_read_error, decide_offer, decide_update, hex_to_bytes,
-            reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy, BootFacts, Deadline,
-            ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState,
-            StreamingVerifier, UpdateDecision, Version,
+            bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
+            hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy,
+            BootFacts, Deadline, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction,
+            SlotId, SlotState, StreamingVerifier, UpdateDecision, Version,
         };
         use crate::ota::{
-            note_boot_slot, reconcile_boot, slot_for_partition, slot_from_label, slot_label,
-            BootDisposition, BootFault, BootOutcome, BootWarnings, BusyTally, CorruptRecord,
-            Delivery, FailedDownload, HardwareFacts, HardwareReadError, KvError, KvStr, NoteBoot,
-            NoteBootError, OtaKv, OtaStore, PendingReport, PendingReportView, ReasonNote,
-            RefusalNote, RepairedRecord, ReportRecord, RollbackNoted, RollbackRequest,
-            SettleOutcome, StoreError, StoredAttempt, UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
+            note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition,
+            slot_from_label, slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings,
+            BusyRetry, BusyTally, CorruptRecord, Delivery, FailedDownload, HardwareFacts,
+            HardwareReadError, KvError, KvStr, NoteBoot, NoteBootError, OtaKv, OtaStore,
+            PendingReport, PendingReportView, ReasonNote, RefusalNote, RepairedRecord,
+            ReportRecord, RollbackNoted, RollbackRequest, SettleOutcome, StoreError, StoredAttempt,
+            UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
         };
         use crate::ota::{
             CommandError, FailReason, Manifest, ManifestError, OtaCommand, OtaStatus,
@@ -207,6 +224,10 @@ mod reexport_parity_guard {
                 .unwrap_err(),
             OtaError::DownloadTimeout
         );
+        assert_eq!(
+            check_content_length(None, false, 4096),
+            Err(OtaError::DownloadFailed { status: 0 })
+        );
         assert_eq!(classify_read_error(true), OtaError::DownloadTimeout);
         assert_eq!(classify_read_error(false), OtaError::ServerUnreachable);
         assert_exported::<OtaCommand>();
@@ -238,6 +259,11 @@ mod reexport_parity_guard {
         assert_exported::<Delivery>();
         assert_exported::<RollbackNoted>();
         assert_exported::<BusyTally>();
+        assert_eq!(BusyRetry::default().tries, 5);
+        assert_eq!(
+            read_with_busy_retry(BusyRetry::default(), || Ok::<u8, (i32, bool)>(1), |_| {}),
+            Ok(1)
+        );
         assert_exported::<CorruptRecord>();
         assert_exported::<HardwareFacts>();
         assert_exported::<HardwareReadError>();

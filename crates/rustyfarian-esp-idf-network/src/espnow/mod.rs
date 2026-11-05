@@ -539,8 +539,9 @@ impl EspIdfEspNow {
     ///   that a stale entry does not abort the probe loop with
     ///   `ESP_ERR_ESPNOW_EXIST`.  The peer is left registered with the
     ///   discovered channel on success and removed on failure.
-    /// - A probe that has started is waited out however long its callback takes, so
-    ///   [`ScanConfig::probe_timeout`] bounds nothing on this tier.
+    /// - [`ScanConfig::probe_timeout`] bounds a probe's queue wait only: a probe that has not
+    ///   started by then is never sent and counts as a local failure, while one that has started
+    ///   is waited out however long its callback takes.
     ///
     /// # Errors
     ///

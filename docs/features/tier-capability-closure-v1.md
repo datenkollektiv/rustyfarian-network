@@ -1,6 +1,5 @@
 ---
-gate: hardware
-gate-note: CrowPanel S3 bench for startup message and wait_suspended; a C3 or C6 bench for hal DNS and runtime subscribe
+gate: none
 desk-work: available
 ---
 
@@ -25,7 +24,7 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 - The sync `suspend` and `resume` stay; `wait_suspended` is additive.
 - Hal DNS and runtime subscribe stay behind the existing `mqtt` feature and add no default dependency.
 - Each item ends with `just fmt`, `just verify`, and `just clippy-hal` or the touched crate's recipe.
-- The feature completes only when both bench gates pass.
+- The feature completes only when its bench items pass in the release 0.7.0 hardware run.
 - The stale "MQTT reconnect after link-up" row is removed first; the Step 9 doc already does so.
 
 ## Open Questions
@@ -42,7 +41,8 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 - [ ] `NetworkLink::wait_suspended` on both tiers
 - [ ] Hal runtime `MqttHandle::subscribe`
 - [ ] Hal DNS resolution
-- [ ] Bench: S3 startup message and `wait_suspended`; C3 or C6 DNS and subscribe
+
+Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-11-03 — Feature doc created from the Step 9 capability-gap review.

@@ -31,22 +31,17 @@ use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::http::Method;
 
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
-use juggler::provisioning::templates::{LORAWAN_PORTAL_HTML, RESUBMIT_HINT, WIFI_MQTT_PORTAL_HTML};
+use juggler::provisioning::templates::{
+    template_for, COMMITTED_HTML, FACTORY_RESET_HTML, PROBE_PATHS, RESUBMIT_HINT,
+    SESSION_FINISHED_BODY,
+};
 use juggler::provisioning::{
-    parse_form, Field, FieldErrors, PortalDefaults, ProvisioningConfig, ProvisioningInput,
-    SchemaProfile,
+    body_nonce_matches, parse_form, Field, FieldErrors, PortalAction, PortalDefaults, PortalInput,
+    Prefill, ProvisioningConfig, SchemaProfile,
 };
 
 use crate::provisioning::store::ProvisioningStore;
 use crate::provisioning::{ProvisioningEvent, SharedState};
-
-/// Selects the shared template for `profile`.
-fn template_for(profile: SchemaProfile) -> &'static str {
-    match profile {
-        SchemaProfile::LorawanFieldDevice => LORAWAN_PORTAL_HTML,
-        SchemaProfile::WifiMqttDevice => WIFI_MQTT_PORTAL_HTML,
-    }
-}
 
 /// HTTP port the portal listens on.
 const HTTP_PORT: u16 = 80;
@@ -63,19 +58,6 @@ const MAX_URI_HANDLERS: usize = 12;
 /// Largest POST body the portal will buffer (bytes). A well-formed submission
 /// is well under 1 KB; 2 KB is a generous cap. Larger bodies get `413`.
 const MAX_BODY_LEN: usize = 2048;
-
-/// OS captive-portal probe paths answered with a `302` to the portal root.
-///
-/// This list is illustrative and expected to evolve as OS behaviour changes; it
-/// is not a frozen contract.
-const PROBE_PATHS: [&str; 6] = [
-    "/generate_204",
-    "/gen_204",
-    "/hotspot-detect.html",
-    "/ncsi.txt",
-    "/connecttest.txt",
-    "/canonical.html",
-];
 
 /// Builds and starts the portal HTTP server.
 ///
@@ -112,7 +94,9 @@ pub(crate) fn start(
         let defaults_for_load = defaults.clone();
         let device_name = device_name.clone();
         server.fn_handler("/", Method::Get, move |request| {
-            let prefill = load_prefill(&store_for_load, profile, &defaults_for_load, &device_name);
+            let stored = load_stored(&store_for_load);
+            let defaults = defaults_for_load.as_borrowed();
+            let prefill = Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
             let html = render_form(profile, &nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
@@ -137,10 +121,14 @@ pub(crate) fn start(
             let body = match read_body(&mut request) {
                 BodyRead::Ok(b) => b,
                 BodyRead::TooLarge => {
+                    let stored = load_stored(&store);
+                    let defaults = defaults.as_borrowed();
+                    let prefill =
+                        Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
                     let html = render_form_with_banner(
                         profile,
                         &nonce,
-                        &load_prefill(&store, profile, &defaults, &device_name),
+                        &prefill,
                         "Request body too large — please try again.",
                     );
                     let mut response = request.into_status_response(413)?;
@@ -155,73 +143,82 @@ pub(crate) fn start(
                 }
             };
 
-            if !nonce_matches(&body, &nonce) {
-                log::warn!("POST /save rejected: nonce mismatch");
-                let mut response = request.into_status_response(403)?;
-                response.write_all(b"Forbidden: session token mismatch.")?;
-                return Ok(());
-            }
-
-            match parse_form(&body, profile) {
-                Ok(config) => {
-                    // Gate before touching NVS: once the session is Committed,
-                    // FactoryResetPending, or already Persisting another
-                    // submission, the first terminal event stands and this
-                    // one must not be written or reported as saved.
-                    if let Err(t) = state.apply(ProvisioningInput::ValidSubmission) {
-                        log::warn!("POST /save refused: session already {:?}", t.state);
-                        let mut response = request.into_status_response(409)?;
-                        response.write_all(SESSION_FINISHED_BODY)?;
-                        return Ok(());
-                    }
+            // The form is parsed only behind a valid nonce; `PortalMachine`
+            // sequences the rest (nonce → gate → persist → commit).
+            let nonce_ok = body_nonce_matches(body.as_bytes(), &nonce);
+            let parsed = nonce_ok.then(|| parse_form(&body, profile));
+            let form_valid = matches!(parsed, Some(Ok(_)));
+            match (
+                state.poll(PortalInput::Save {
+                    nonce_ok,
+                    form_valid,
+                }),
+                parsed,
+            ) {
+                (PortalAction::Forbidden, _) => {
+                    log::warn!("POST /save rejected: nonce mismatch");
+                    let mut response = request.into_status_response(403)?;
+                    response.write_all(b"Forbidden: session token mismatch.")?;
+                }
+                (PortalAction::RejectForm, Some(Err(errors))) => {
+                    (on_event)(ProvisioningEvent::SubmissionRejected);
+                    log::info!("POST /save rejected: {} field error(s)", errors.len());
+                    let stored = load_stored(&store);
+                    let defaults = defaults.as_borrowed();
+                    let prefill =
+                        Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
+                    let html = render_form(profile, &nonce, &prefill, &errors);
+                    let mut response = request.into_status_response(400)?;
+                    response.write_all(html.as_bytes())?;
+                }
+                (PortalAction::Persist, Some(Ok(config))) => {
                     let persist = store
                         .lock()
                         .map_err(|_| anyhow::anyhow!("store mutex poisoned"))
                         .and_then(|mut s| s.save(&config));
-                    match persist {
-                        Ok(()) => {
-                            // Unreachable with the gate above (only this
-                            // handler leaves Persisting), but never report a
-                            // commit the session did not accept.
-                            if let Err(t) = state.commit(config) {
-                                log::error!(
-                                    "POST /save: persisted but commit refused from {:?}",
-                                    t.state
-                                );
-                                let mut response = request.into_status_response(409)?;
-                                response.write_all(SESSION_FINISHED_BODY)?;
-                                return Ok(());
-                            }
+                    let saved = match persist {
+                        Ok(()) => Some(config),
+                        Err(e) => {
+                            log::error!("POST /save persist failed: {e:#}");
+                            None
+                        }
+                    };
+                    match state.persist_done(saved) {
+                        PortalAction::Committed => {
                             (on_event)(ProvisioningEvent::Committed);
                             let mut response = request.into_ok_response()?;
                             response.write_all(COMMITTED_HTML.as_bytes())?;
                         }
-                        Err(e) => {
-                            log::error!("POST /save persist failed: {e:#}");
-                            // Persisting always accepts PersistFailed; a
-                            // rejection is already logged by the session.
-                            let _ = state.apply(ProvisioningInput::PersistFailed);
+                        PortalAction::PersistFailed => {
+                            let stored = load_stored(&store);
+                            let defaults = defaults.as_borrowed();
+                            let prefill =
+                                Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
                             let html = render_form_with_banner(
                                 profile,
                                 &nonce,
-                                &load_prefill(&store, profile, &defaults, &device_name),
+                                &prefill,
                                 "Could not save credentials to flash. Please try again.",
                             );
                             let mut response = request.into_status_response(500)?;
                             response.write_all(html.as_bytes())?;
                         }
+                        other => {
+                            log::error!("POST /save: persisted but the session answered {other:?}");
+                            let mut response = request.into_status_response(409)?;
+                            response.write_all(SESSION_FINISHED_BODY.as_bytes())?;
+                        }
                     }
                 }
-                Err(errors) => {
-                    // Nothing is persisted on this path, so a rejection (the
-                    // session already finished) only needs the session's log.
-                    let _ = state.apply(ProvisioningInput::InvalidSubmission);
-                    (on_event)(ProvisioningEvent::SubmissionRejected);
-                    log::info!("POST /save rejected: {} field error(s)", errors.len());
-                    let prefill = load_prefill(&store, profile, &defaults, &device_name);
-                    let html = render_form(profile, &nonce, &prefill, &errors);
-                    let mut response = request.into_status_response(400)?;
-                    response.write_all(html.as_bytes())?;
+                (PortalAction::Refused(t), _) => {
+                    log::warn!("POST /save refused: session already {:?}", t.state);
+                    let mut response = request.into_status_response(409)?;
+                    response.write_all(SESSION_FINISHED_BODY.as_bytes())?;
+                }
+                (other, _) => {
+                    log::error!("POST /save: unexpected portal action {other:?}");
+                    let mut response = request.into_status_response(500)?;
+                    response.write_all(b"Internal error.")?;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -275,25 +272,34 @@ pub(crate) fn start(
                     return Ok(());
                 }
             };
-            if !nonce_matches(&body, &nonce) {
-                log::warn!("POST /factory-reset rejected: nonce mismatch");
-                let mut response = request.into_status_response(403)?;
-                response.write_all(b"Forbidden: session token mismatch.")?;
-                return Ok(());
+            match state.poll(PortalInput::FactoryReset {
+                nonce_ok: body_nonce_matches(body.as_bytes(), &nonce),
+            }) {
+                PortalAction::Forbidden => {
+                    log::warn!("POST /factory-reset rejected: nonce mismatch");
+                    let mut response = request.into_status_response(403)?;
+                    response.write_all(b"Forbidden: session token mismatch.")?;
+                }
+                PortalAction::ResetAccepted => {
+                    (on_event)(ProvisioningEvent::FactoryResetRequested);
+                    log::info!("Factory reset requested via portal");
+                    let mut response = request.into_ok_response()?;
+                    response.write_all(FACTORY_RESET_HTML.as_bytes())?;
+                }
+                // A reset after a commit, or while a submission is being
+                // persisted, is refused: the saved credentials stand and the
+                // host is never told a reset was requested.
+                PortalAction::Refused(t) => {
+                    log::warn!("POST /factory-reset refused: session already {:?}", t.state);
+                    let mut response = request.into_status_response(409)?;
+                    response.write_all(SESSION_FINISHED_BODY.as_bytes())?;
+                }
+                other => {
+                    log::error!("POST /factory-reset: unexpected portal action {other:?}");
+                    let mut response = request.into_status_response(500)?;
+                    response.write_all(b"Internal error.")?;
+                }
             }
-            // A reset after a commit, or while a submission is being
-            // persisted, is refused: the saved credentials stand and the host
-            // is never told a reset was requested.
-            if let Err(t) = state.apply_and_notify(ProvisioningInput::FactoryReset) {
-                log::warn!("POST /factory-reset refused: session already {:?}", t.state);
-                let mut response = request.into_status_response(409)?;
-                response.write_all(SESSION_FINISHED_BODY)?;
-                return Ok(());
-            }
-            (on_event)(ProvisioningEvent::FactoryResetRequested);
-            log::info!("Factory reset requested via portal");
-            let mut response = request.into_ok_response()?;
-            response.write_all(FACTORY_RESET_HTML.as_bytes())?;
             Ok::<(), anyhow::Error>(())
         })?;
     }
@@ -344,62 +350,6 @@ fn read_body<R: Read>(request: &mut R) -> BodyRead {
     BodyRead::Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Extracts the raw `_nonce` value from a form body and compares it to the
-/// session nonce.
-///
-/// The pure parser ignores underscore-prefixed keys, so the nonce is read here
-/// from the raw body before parsing. This defends against blind cross-client
-/// request forgery on an open AP: a third party on the same network cannot
-/// forge a mutating POST without first reading the per-session token from the
-/// form.
-fn nonce_matches(body: &str, expected: &str) -> bool {
-    for pair in body.split('&') {
-        if let Some(raw) = pair.strip_prefix("_nonce=") {
-            // Today's nonces are 8 lowercase hex characters that need no
-            // decoding, but the rest of the form is percent-decoded — keeping
-            // this path consistent removes a foot-gun if the nonce alphabet
-            // ever changes (e.g. base64 with `+` or `/`). Bounded length: a
-            // legitimate _nonce never exceeds a few bytes; anything longer is
-            // a malformed body and won't match anyway.
-            let Some(decoded) = percent_decode_simple(raw) else {
-                return false;
-            };
-            return decoded == expected;
-        }
-    }
-    false
-}
-
-/// Percent-decodes an `application/x-www-form-urlencoded` value (`+` → space,
-/// `%XX` → byte) into a `String`. Returns `None` if any `%` is not followed by
-/// two valid hex digits. Used only for the per-request nonce; the main form
-/// parser has its own buffered, bounded decoder.
-fn percent_decode_simple(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-            }
-            b'%' => return None,
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
 /// Owned, non-secret pre-fill defaults threaded from [`PortalConfig`].
 ///
 /// Seeds the form on a fresh / factory-reset device (empty store). Non-secret
@@ -438,164 +388,43 @@ impl PortalDefaultsOwned {
             ota_url: d.ota_url.to_string(),
         }
     }
-}
 
-/// Recomposes an `mqtt://host:port` URI from separate host and port components
-/// (the inverse of the parse-time split).
-///
-/// Returns an empty string when either component is empty — a host-only or
-/// port-only value is not a usable broker URI (and would fail `parse_form`), so
-/// emitting a partial `mqtt://host:` would only mislead. Shared by the
-/// stored-config and `.env`-defaults prefill paths so the two cannot diverge
-/// (parity with the esp-hal `compose_mqtt_uri`).
-fn compose_mqtt_uri(host: &str, port: &str) -> String {
-    if host.is_empty() || port.is_empty() {
-        return String::new();
-    }
-    format!("mqtt://{host}:{port}")
-}
-
-/// Non-secret pre-fill values for the form.
-///
-/// Carries the union of both profiles' non-secret inputs; only the active
-/// profile's placeholders are substituted, so the unused fields stay empty.
-/// Secret inputs — `wifi_pass`, `app_key`, and `mqtt_pass` — are deliberately
-/// absent: they are never pre-filled and must be re-entered on every
-/// submission.
-struct Prefill {
-    wifi_ssid: String,
-    dev_eui: String,
-    join_eui: String,
-    mqtt_uri: String,
-    mqtt_user: String,
-    mqtt_client: String,
-    ota_url: String,
-    dev_name: String,
-}
-
-impl Prefill {
-    /// An all-empty pre-fill, the base the defaults path fills in.
-    fn empty() -> Self {
-        Self {
-            wifi_ssid: String::new(),
-            dev_eui: String::new(),
-            join_eui: String::new(),
-            mqtt_uri: String::new(),
-            mqtt_user: String::new(),
-            mqtt_client: String::new(),
-            ota_url: String::new(),
-            dev_name: String::new(),
+    /// Borrows the owned defaults as the [`PortalDefaults`] view
+    /// [`Prefill::select`] reads.
+    pub(crate) fn as_borrowed(&self) -> PortalDefaults<'_> {
+        PortalDefaults {
+            wifi_ssid: &self.wifi_ssid,
+            dev_eui: &self.dev_eui,
+            join_eui: &self.join_eui,
+            mqtt_host: &self.mqtt_host,
+            mqtt_port: &self.mqtt_port,
+            mqtt_user: &self.mqtt_user,
+            mqtt_client: &self.mqtt_client,
+            ota_url: &self.ota_url,
         }
     }
-
-    /// Builds a pre-fill from caller-supplied non-secret defaults for `profile`.
-    ///
-    /// Used as the empty-store fallback (fresh / factory-reset device) so the
-    /// portal form comes up pre-populated. Only the active profile's fields are
-    /// filled; `mqtt_uri` is recomposed from the separate `mqtt_host` +
-    /// `mqtt_port` defaults (mirroring the stored-config path). `dev_name` is the
-    /// caller's configured `device_name` — `PortalDefaults` intentionally has no
-    /// device-name field. No secret is ever sourced — `PortalDefaultsOwned`
-    /// carries none.
-    fn from_defaults(
-        defaults: &PortalDefaultsOwned,
-        profile: SchemaProfile,
-        device_name: &str,
-    ) -> Self {
-        let mut prefill = Prefill::empty();
-        // Common to every profile.
-        prefill.wifi_ssid = defaults.wifi_ssid.clone();
-        prefill.ota_url = defaults.ota_url.clone();
-        prefill.dev_name = device_name.to_string();
-        match profile {
-            SchemaProfile::LorawanFieldDevice => {
-                prefill.dev_eui = defaults.dev_eui.clone();
-                prefill.join_eui = defaults.join_eui.clone();
-            }
-            SchemaProfile::WifiMqttDevice => {
-                prefill.mqtt_uri = compose_mqtt_uri(&defaults.mqtt_host, &defaults.mqtt_port);
-                prefill.mqtt_user = defaults.mqtt_user.clone();
-                prefill.mqtt_client = defaults.mqtt_client.clone();
-            }
-        }
-        prefill
-    }
 }
 
-/// Loads non-secret pre-fill values from NVS for `profile`.
+/// Reads the stored record for the form pre-fill.
 ///
-/// A stored configuration for the active profile takes precedence. Otherwise —
-/// when unprovisioned, when the stored profile doesn't match, or on a store /
-/// mutex error — falls back to the caller-supplied non-secret `defaults`
-/// (seeded from `.env` on a fresh / factory-reset device) and the configured
-/// `device_name`, so the form still comes up pre-populated.
-///
+/// A store or mutex error reads as "no record", so the form still comes up
+/// pre-filled from the defaults; [`Prefill::select`] then picks the source.
 /// Also used to re-render the form after a rejected `POST /save`: the rejected
 /// submission itself is deliberately not round-tripped (no secret is ever
 /// echoed), but the form shows the stored / default values instead of blanks.
-///
-/// For the `WifiMqttDevice` profile the `mqtt_uri` field is recomposed from the
-/// stored `mqtt_host` + `mqtt_port` (the inverse of the parse-time split). The
-/// `mqtt_pass` secret is never read into the prefill — it joins `wifi_pass` and
-/// `app_key` in the no-prefill set.
-fn load_prefill(
-    store: &Arc<std::sync::Mutex<ProvisioningStore>>,
-    profile: SchemaProfile,
-    defaults: &PortalDefaultsOwned,
-    device_name: &str,
-) -> Prefill {
-    let stored = match store.lock() {
+fn load_stored(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Option<ProvisioningConfig> {
+    match store.lock() {
         Ok(guard) => match guard.load() {
             Ok(cfg) => cfg,
             Err(e) => {
-                log::debug!("load_prefill: store.load() failed, rendering defaults: {e:#}");
+                log::debug!("load_stored: store.load() failed, rendering defaults: {e:#}");
                 None
             }
         },
         Err(_) => {
-            log::warn!("load_prefill: store mutex poisoned, rendering defaults");
+            log::warn!("load_stored: store mutex poisoned, rendering defaults");
             None
         }
-    };
-    prefill_for(stored, profile, defaults, device_name)
-}
-
-/// Chooses the pre-fill source: `stored` when it belongs to the active
-/// `profile`, otherwise the caller's `defaults` plus the configured
-/// `device_name`.
-///
-/// A stored record under the *other* profile must not pre-fill this form (its
-/// fields do not map), so it is treated like an empty store.
-fn prefill_for(
-    stored: Option<ProvisioningConfig>,
-    profile: SchemaProfile,
-    defaults: &PortalDefaultsOwned,
-    device_name: &str,
-) -> Prefill {
-    match stored {
-        Some(cfg) if cfg.profile() == profile => {
-            let lora = cfg.lora();
-            let mqtt = cfg.mqtt();
-            let mut prefill = Prefill {
-                wifi_ssid: cfg.wifi_ssid().to_owned(),
-                dev_eui: lora.map(|l| l.dev_eui_hex().to_owned()).unwrap_or_default(),
-                join_eui: lora
-                    .map(|l| l.join_eui_hex().to_owned())
-                    .unwrap_or_default(),
-                mqtt_uri: String::new(),
-                mqtt_user: mqtt.and_then(|m| m.username()).unwrap_or("").to_owned(),
-                mqtt_client: mqtt.and_then(|m| m.client_id()).unwrap_or("").to_owned(),
-                ota_url: cfg.ota_url().unwrap_or("").to_owned(),
-                dev_name: cfg.device_name().to_owned(),
-            };
-            if profile == SchemaProfile::WifiMqttDevice {
-                if let Some(m) = mqtt {
-                    prefill.mqtt_uri = compose_mqtt_uri(m.host(), &m.port().to_string());
-                }
-            }
-            prefill
-        }
-        _ => Prefill::from_defaults(defaults, profile, device_name),
     }
 }
 
@@ -607,7 +436,7 @@ fn prefill_for(
 fn render_form(
     profile: SchemaProfile,
     nonce: &str,
-    prefill: &Prefill,
+    prefill: &Prefill<'_>,
     errors: &FieldErrors,
 ) -> String {
     render_template(profile, nonce, prefill, &render_errors(errors))
@@ -620,7 +449,7 @@ fn render_form(
 fn render_form_with_banner(
     profile: SchemaProfile,
     nonce: &str,
-    prefill: &Prefill,
+    prefill: &Prefill<'_>,
     message: &str,
 ) -> String {
     render_template(profile, nonce, prefill, &render_banner(message))
@@ -629,7 +458,7 @@ fn render_form_with_banner(
 fn render_template(
     profile: SchemaProfile,
     nonce: &str,
-    prefill: &Prefill,
+    prefill: &Prefill<'_>,
     errors_html: &str,
 ) -> String {
     // Every profile shares the Core/OTA placeholders; the profile-specific
@@ -640,14 +469,14 @@ fn render_template(
     template_for(profile)
         .replace("{{NONCE}}", &html_escape(nonce))
         .replace("{{ERRORS}}", errors_html)
-        .replace("{{WIFI_SSID}}", &html_escape(&prefill.wifi_ssid))
-        .replace("{{DEV_EUI}}", &html_escape(&prefill.dev_eui))
-        .replace("{{JOIN_EUI}}", &html_escape(&prefill.join_eui))
+        .replace("{{WIFI_SSID}}", &html_escape(prefill.wifi_ssid))
+        .replace("{{DEV_EUI}}", &html_escape(prefill.dev_eui))
+        .replace("{{JOIN_EUI}}", &html_escape(prefill.join_eui))
         .replace("{{MQTT_URI}}", &html_escape(&prefill.mqtt_uri))
-        .replace("{{MQTT_USER}}", &html_escape(&prefill.mqtt_user))
-        .replace("{{MQTT_CLIENT}}", &html_escape(&prefill.mqtt_client))
-        .replace("{{OTA_URL}}", &html_escape(&prefill.ota_url))
-        .replace("{{DEV_NAME}}", &html_escape(&prefill.dev_name))
+        .replace("{{MQTT_USER}}", &html_escape(prefill.mqtt_user))
+        .replace("{{MQTT_CLIENT}}", &html_escape(prefill.mqtt_client))
+        .replace("{{OTA_URL}}", &html_escape(prefill.ota_url))
+        .replace("{{DEV_NAME}}", &html_escape(prefill.dev_name))
 }
 
 /// Renders a freeform banner (`<div class="errors">…</div>`) used when the
@@ -777,37 +606,9 @@ fn json_escape(input: &str) -> String {
     out
 }
 
-/// Page shown after a successful commit.
-const COMMITTED_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Provisioned</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
-<h1>Provisioned</h1><p>Credentials saved. The device will restart and join your network.</p>\
-</body></html>";
-
-/// Page shown after a factory-reset request.
-const FACTORY_RESET_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory reset</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
-<h1>Factory reset requested</h1><p>The host application will complete the reset.</p>\
-</body></html>";
-
-/// `409` body for a `/save` or `/factory-reset` that arrives after the session
-/// already reached a terminal state (or while a submission is being saved):
-/// the first terminal event stands and nothing was changed.
-const SESSION_FINISHED_BODY: &[u8] =
-    b"Conflict: this provisioning session has already finished or is saving \
-      another submission; nothing was changed. Wait for the device to restart.";
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-
-    #[test]
-    fn nonce_matches_extracts_raw_value() {
-        assert!(nonce_matches("_nonce=abc123&wifi_ssid=x", "abc123"));
-        assert!(!nonce_matches("_nonce=wrong&wifi_ssid=x", "abc123"));
-        assert!(!nonce_matches("wifi_ssid=x", "abc123"));
-    }
 
     #[test]
     fn error_blocks_carry_resubmit_hint() {
@@ -868,64 +669,6 @@ pub(super) mod tests {
         assert!(json.contains("\"profile\":\"wifi_mqtt\""));
     }
 
-    #[test]
-    fn from_defaults_populates_active_profile_only() {
-        // Wi-Fi+MQTT: mqtt_uri recomposed from host+port; EUIs stay empty.
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
-            wifi_ssid: "HomeNet",
-            dev_eui: "0102030405060708",
-            join_eui: "70B3D57ED0000000",
-            mqtt_host: "broker.local",
-            mqtt_port: "1883",
-            mqtt_user: "sensor",
-            mqtt_client: "c3-01",
-            ota_url: "http://ota.local/fw.bin",
-        });
-
-        let wifi = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
-        assert_eq!(wifi.wifi_ssid, "HomeNet");
-        assert_eq!(wifi.mqtt_uri, "mqtt://broker.local:1883");
-        assert_eq!(wifi.mqtt_user, "sensor");
-        assert_eq!(wifi.mqtt_client, "c3-01");
-        assert_eq!(wifi.ota_url, "http://ota.local/fw.bin");
-        assert!(
-            wifi.dev_eui.is_empty(),
-            "EUIs must not fill the Wi-Fi+MQTT form"
-        );
-        assert!(wifi.join_eui.is_empty());
-
-        // LoRaWAN: EUIs fill; MQTT stays empty.
-        let lora = Prefill::from_defaults(&owned, SchemaProfile::LorawanFieldDevice, "");
-        assert_eq!(lora.wifi_ssid, "HomeNet");
-        assert_eq!(lora.dev_eui, "0102030405060708");
-        assert_eq!(lora.join_eui, "70B3D57ED0000000");
-        assert!(
-            lora.mqtt_uri.is_empty(),
-            "MQTT must not fill the LoRaWAN form"
-        );
-        assert!(lora.mqtt_user.is_empty());
-    }
-
-    #[test]
-    fn from_defaults_empty_yields_empty_prefill() {
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
-        assert!(p.wifi_ssid.is_empty());
-        assert!(p.mqtt_uri.is_empty());
-        assert!(p.ota_url.is_empty());
-    }
-
-    #[test]
-    fn from_defaults_partial_mqtt_uri_omitted() {
-        // Host without port (or vice versa) is not a usable broker URI.
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
-            mqtt_host: "broker.local",
-            ..PortalDefaults::default()
-        });
-        let p = Prefill::from_defaults(&owned, SchemaProfile::WifiMqttDevice, "");
-        assert!(p.mqtt_uri.is_empty());
-    }
-
     /// Runtime-generated secret fixture (16 hex digits from a fresh
     /// `RandomState`), so no string literal flows into a password field — see
     /// `test_psk()` in `juggler::wifi` for why.
@@ -975,50 +718,26 @@ pub(super) mod tests {
         )
     }
 
+    /// Pre-fill selection is tested in `juggler::provisioning::portal`; this
+    /// checks the render keeps the configured device name and never a secret.
     #[test]
-    fn empty_store_prefills_configured_device_name() {
+    fn empty_store_renders_configured_device_name() {
         let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let defaults = owned.as_borrowed();
         for profile in [
             SchemaProfile::WifiMqttDevice,
             SchemaProfile::LorawanFieldDevice,
         ] {
-            let p = prefill_for(None, profile, &owned, "rgb-clock");
-            assert_eq!(p.dev_name, "rgb-clock");
+            let p = Prefill::select(None, profile, &defaults, "rgb-clock");
             let html = render_form(profile, &test_nonce(), &p, &FieldErrors::new());
             assert!(html.contains("value=\"rgb-clock\""));
         }
     }
 
     #[test]
-    fn stored_device_name_wins_over_configured() {
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let p = prefill_for(
-            Some(stored_wifi_mqtt("user-renamed")),
-            SchemaProfile::WifiMqttDevice,
-            &owned,
-            "rgb-clock",
-        );
-        assert_eq!(p.dev_name, "user-renamed");
-        assert_eq!(p.wifi_ssid, "StoredNet");
-        assert_eq!(p.mqtt_uri, "mqtt://stored.local:8883");
-    }
-
-    #[test]
-    fn other_profile_record_falls_back_to_configured_device_name() {
-        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
-        let p = prefill_for(
-            Some(stored_wifi_mqtt("user-renamed")),
-            SchemaProfile::LorawanFieldDevice,
-            &owned,
-            "rgb-clock",
-        );
-        assert_eq!(p.dev_name, "rgb-clock");
-        assert!(p.wifi_ssid.is_empty());
-    }
-
-    #[test]
     fn stored_prefill_never_renders_secrets() {
         let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults::default());
+        let defaults = owned.as_borrowed();
         let stored = stored_wifi_mqtt("dev");
         let wifi_password = stored.wifi_password().to_owned();
         let mqtt_pass = stored
@@ -1026,10 +745,10 @@ pub(super) mod tests {
             .and_then(|m| m.password())
             .unwrap_or_default()
             .to_owned();
-        let p = prefill_for(
-            Some(stored),
+        let p = Prefill::select(
+            Some(&stored),
             SchemaProfile::WifiMqttDevice,
-            &owned,
+            &defaults,
             "rgb-clock",
         );
         let html = render_form(
@@ -1040,16 +759,7 @@ pub(super) mod tests {
         );
         assert!(!html.contains(&wifi_password));
         assert!(!html.contains(&mqtt_pass));
-    }
-
-    #[test]
-    fn compose_mqtt_uri_requires_both_host_and_port() {
-        assert_eq!(
-            compose_mqtt_uri("broker.local", "1883"),
-            "mqtt://broker.local:1883"
-        );
-        assert_eq!(compose_mqtt_uri("broker.local", ""), "");
-        assert_eq!(compose_mqtt_uri("", "1883"), "");
+        assert!(html.contains("mqtt://stored.local:8883"));
     }
 
     #[test]

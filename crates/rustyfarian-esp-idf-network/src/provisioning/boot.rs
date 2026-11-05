@@ -32,12 +32,15 @@ mod inner {
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
     use juggler::mqtt::resolve_client_id;
-    use juggler::provisioning::{gate_reentry, ReentryGate, ReentryRequest};
+    use juggler::provisioning::{
+        classify_wifi_mqtt, gate_reentry, portal_outcome, ClassifyError, ReentryGate,
+        ReentryRequest, WifiMqttClass,
+    };
     use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
 
     use crate::mqtt::MqttConfig;
     use crate::provisioning::store::ProvisioningStore;
-    use crate::provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningEvent, SessionWait};
+    use crate::provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningEvent};
     use crate::wifi::WiFiConfig;
 
     /// Experimental: API may change before 1.0.
@@ -181,27 +184,28 @@ mod inner {
             store: &ProvisioningStore,
             client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
         ) -> anyhow::Result<WifiMqttLoadOutcome> {
-            let cfg = match store.load()? {
-                None => return Ok(WifiMqttLoadOutcome::NotProvisioned),
-                Some(c) => c,
-            };
-
-            if cfg.mqtt().is_none() {
-                return Ok(WifiMqttLoadOutcome::OtherProfile(cfg.profile()));
+            let stored = store.load()?;
+            let class = classify_wifi_mqtt(stored.as_ref(), client_id_fn).map_err(|e| match e {
+                ClassifyError::ClientId(e) => e,
+                invalid @ ClassifyError::InvalidClientId(_) => {
+                    anyhow::anyhow!("{invalid}")
+                }
+            })?;
+            match (class, stored) {
+                (WifiMqttClass::NotProvisioned, _) => Ok(WifiMqttLoadOutcome::NotProvisioned),
+                (WifiMqttClass::OtherProfile(p), _) => Ok(WifiMqttLoadOutcome::OtherProfile(p)),
+                // `cfg` is moved, never cloned, and boxed exactly once here so
+                // the ~1.3 KB record leaves the stack (bug 002).
+                (WifiMqttClass::Ready(client_id), Some(cfg)) => {
+                    Ok(WifiMqttLoadOutcome::Ready(WifiMqttBoot {
+                        config: Box::new(cfg),
+                        mqtt_client_id: client_id,
+                    }))
+                }
+                (WifiMqttClass::Ready(_), None) => {
+                    anyhow::bail!("provisioning record classified ready but not loaded")
+                }
             }
-
-            let client_id = client_id_fn(&cfg)?;
-            // Validate the override's output — reject early rather than letting
-            // MqttConfig or the broker surface an opaque error later.
-            juggler::mqtt::validate_client_id(&client_id)
-                .map_err(|e| anyhow::anyhow!("client-id validation failed: {}", e))?;
-
-            // `cfg` is moved, never cloned, and boxed exactly once here so the
-            // ~1.3 KB record leaves the stack (bug 002).
-            Ok(WifiMqttLoadOutcome::Ready(WifiMqttBoot {
-                config: Box::new(cfg),
-                mqtt_client_id: client_id,
-            }))
         }
 
         /// Test-only constructor that bypasses NVS.
@@ -317,25 +321,10 @@ mod inner {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// The outcome of [`run_wifi_mqtt_portal`].
-    #[non_exhaustive]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum PortalOutcome {
-        /// The portal received a valid submission; the device is now provisioned.
-        ///
-        /// The session has been shut down.  The caller should restart into the
-        /// normal boot path.
-        JustProvisioned,
-        /// The portal's factory-reset button was pressed.
-        ///
-        /// The caller should erase the NVS provisioning namespace (via
-        /// [`ProvisioningStore::erase_all`]) and restart.
-        FactoryResetRequested,
-        /// The portal timed out without a committed submission.
-        ///
-        /// The caller decides whether to restart, retry, or take another action.
-        PortalExitedWithoutCommit,
-    }
+    /// The outcome of [`run_wifi_mqtt_portal`]; the shared
+    /// [`juggler::provisioning::PortalOutcome`]. On `FactoryResetRequested`
+    /// erase the store via [`ProvisioningStore::erase_all`].
+    pub use juggler::provisioning::PortalOutcome;
 
     /// Experimental: API may change before 1.0.
     ///
@@ -405,28 +394,11 @@ mod inner {
             .start(modem, sys_loop, nvs)
             .context("failed to start provisioning portal")?;
 
-        match session.wait_outcome(config.portal_timeout) {
-            SessionWait::Committed => {
-                // Commit-durability rule: return JustProvisioned even if shutdown
-                // errors; the caller restarts anyway.
-                if let Err(e) = session.shutdown() {
-                    log::warn!("[boot] commit_shutdown_degraded: portal shutdown after commit errored: {e:#}");
-                }
-                Ok(PortalOutcome::JustProvisioned)
-            }
-            SessionWait::FactoryResetRequested => {
-                session
-                    .shutdown()
-                    .context("portal shutdown after factory-reset failed")?;
-                Ok(PortalOutcome::FactoryResetRequested)
-            }
-            SessionWait::TimedOut => {
-                session
-                    .shutdown()
-                    .context("portal shutdown after timeout failed")?;
-                Ok(PortalOutcome::PortalExitedWithoutCommit)
-            }
-        }
+        let outcome = session.wait_outcome(config.portal_timeout);
+        // Commit-durability rule (in `portal_outcome`): a shutdown error after
+        // a commit is logged and `JustProvisioned` returned; on every other
+        // outcome it is propagated.
+        portal_outcome(outcome, session.shutdown()).context("portal shutdown failed")
     }
 }
 

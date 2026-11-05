@@ -24,12 +24,13 @@ impl OtaHandle {
     /// `healthy` is the app's predicate (for example a fresh tick, MQTT connected, an IPv4 address); the library adds the minimum dwell, the refusal flag and the deadline.
     ///
     /// The policy:
-    /// - reads the running slot every `slot_retry`; a busy OTA handle never counts toward giving up, and it gives up (`SlotUnreadable`) only after `slot_min_attempts` failed reads AND the failure deadline, touching nothing;
+    /// - reads the running slot every `slot_retry`; it gives up (`SlotUnreadable`) only after `slot_min_attempts` reads AND the failure deadline, touching nothing (failed reads count for a failed read, failed and busy reads together for a busy one);
     /// - does nothing for a slot that is not pending verification (`NothingToVerify`) and opens update admission;
     /// - for a pending slot polls every `poll_interval`: once the dwell has passed, the refusal flag is clear and `healthy()` is true, it marks the image valid, records the completed attempt (retried `complete_attempts` times) and publishes `applied`; if the record still cannot be cleared `applied` is published anyway (`ApplyNotRecorded`) and the reporter thread keeps retrying with backoff until the record is cleared;
     /// - at the failure deadline notes the rollback reason, then rolls back with bounded retries (`DeadlineAction::Rollback`), or notes the reason and calls the app's restart callback (`DeadlineAction::NoteAndRestart`).
     ///
     /// A second call returns [`HealthVerdict::AlreadyRunning`] without doing anything.
+    /// If the policy machine ignores an event (a driver bug; the action is never replayed), or the policy runs past its time bound, it stops fail-closed with [`HealthVerdict::SlotUnreadable`].
     ///
     /// If `open_records` or `OtaRuntime::start` failed there is no handle and no health policy: a pending image is then NOT marked valid and the bootloader aborts it at the next reset.
     /// That is deliberate; a degraded policy that marked the image valid without attempt bookkeeping would hide the failure.
@@ -42,14 +43,23 @@ impl OtaHandle {
             return HealthVerdict::AlreadyRunning;
         }
         let timings = &self.cfg.settings.timings;
-        let mut machine = HealthMachine::new(HealthConfig::from(timings));
+        let config = HealthConfig::from(timings);
+        let mut machine = HealthMachine::new(config);
         let single_read = BusyRetry {
             tries: 1,
             delay: Duration::ZERO,
         };
-        let mut running_slot: Option<SlotId> = None;
+        // Every path of the machine finishes within the time bound; past it the driver stops fail-closed (ADR 023 decision 6).
+        let time_bound = config.time_bound();
+        let started = Instant::now();
         let mut event = HealthEvent::Begin;
         loop {
+            if started.elapsed() > time_bound {
+                log::error!(
+                    "[ota] the health policy ran past its time bound; stopping fail-closed"
+                );
+                return self.finish(HealthVerdict::SlotUnreadable);
+            }
             let action = machine.step(boot.elapsed(), self.flags.refuse_mark_valid(), event);
             if let Some(failures) = machine.take_warning() {
                 log::warn!("[ota] cannot read the running OTA slot ({failures} failed reads)");
@@ -57,9 +67,8 @@ impl OtaHandle {
             event = match action {
                 HealthAction::ReadSlot => match read_hardware_facts(single_read) {
                     Ok(hardware) => {
-                        running_slot = Some(hardware.running_slot);
                         HealthEvent::Slot(if hardware.running_state == SlotState::PendingVerify {
-                            SlotReading::PendingVerify
+                            SlotReading::PendingVerify(hardware.running_slot)
                         } else {
                             SlotReading::NotPending
                         })
@@ -74,8 +83,8 @@ impl OtaHandle {
                 HealthAction::Evaluate => HealthEvent::Healthy(healthy()),
                 HealthAction::MarkValid => HealthEvent::Marked(self.mark_valid()),
                 HealthAction::CompleteAttempt => HealthEvent::Completed(self.complete_attempt()),
-                HealthAction::NoteRollback(reason) => {
-                    self.note_rollback(running_slot, reason);
+                HealthAction::NoteRollback(reason, slot) => {
+                    self.note_rollback(slot, reason);
                     HealthEvent::Noted
                 }
                 HealthAction::Rollback => HealthEvent::RollbackReturned(self.rollback()),
@@ -84,12 +93,18 @@ impl OtaHandle {
                     (self.cfg.restart)();
                     HealthEvent::RestartReturned
                 }
-                HealthAction::Finish(verdict) => {
-                    self.settle(verdict);
-                    return verdict;
+                HealthAction::Finish(verdict) => return self.finish(verdict),
+                HealthAction::Ignored => {
+                    log::error!("[ota] the health policy ignored {event:?}; stopping fail-closed");
+                    return self.finish(HealthVerdict::SlotUnreadable);
                 }
             };
         }
+    }
+
+    fn finish(&self, verdict: HealthVerdict) -> HealthVerdict {
+        self.settle(verdict);
+        verdict
     }
 
     fn session(&self) -> Option<OtaSession> {
@@ -137,11 +152,7 @@ impl OtaHandle {
         }
     }
 
-    fn note_rollback(&self, slot: Option<SlotId>, reason: juggler::ota::RollbackReason) {
-        let Some(slot) = slot else {
-            log::warn!("[ota] no running slot is known; the rollback reason is not recorded");
-            return;
-        };
+    fn note_rollback(&self, slot: SlotId, reason: juggler::ota::RollbackReason) {
         match self.records.with(|store| store.note_rollback(reason, slot)) {
             Ok(ReasonNote::Written(_)) => log::info!("[ota] rollback reason {reason:?} recorded"),
             Ok(ReasonNote::KeptFirst) => {

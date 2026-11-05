@@ -4,9 +4,11 @@
 //! and not part of the crate's public API.
 //! It may be removed if a workspace HTTP dependency arrives later.
 //!
-//! The client accepts **only** `HTTP/1.1 200 OK` responses with exactly one
-//! valid, non-zero `Content-Length` header.  Everything else is an explicit error before
-//! any flash partition is touched.
+//! The client accepts **only** `HTTP/1.1 200 OK` responses with at most one
+//! valid `Content-Length` header and hands the length and any
+//! `Transfer-Encoding` on as raw facts; the admission rule (missing, chunked,
+//! zero, too large) is `juggler::ota::check_content_length`, applied by
+//! `juggler::ota::download::DownloadMachine` before any flash partition is touched.
 
 // When building without the embassy + chip features, the parsing types and
 // functions defined here are only used in the `#[cfg(test)]` block below.
@@ -37,18 +39,10 @@ pub(crate) enum HttpError {
     BadStatusLine,
     /// Status code was present and valid but not 200.
     NonSuccess { status: u16 },
-    /// `Content-Length` header was absent.
-    MissingContentLength,
     /// `Content-Length` header appeared more than once.
     DuplicateContentLength,
     /// `Content-Length` value could not be parsed as a decimal `u64`.
     InvalidContentLength,
-    /// `Transfer-Encoding` header was present (any value — we reject it all).
-    TransferEncodingPresent,
-    /// The declared `Content-Length` exceeds the caller-supplied `max_bytes` limit.
-    BodyTooLarge,
-    /// The declared `Content-Length` is `0` — there is no image to flash.
-    EmptyBody,
     /// I/O error reading from the socket.
     Io,
     /// Connection closed before the full response header was received.
@@ -60,7 +54,7 @@ pub(crate) enum HttpError {
 impl From<HttpError> for OtaError {
     fn from(e: HttpError) -> OtaError {
         // The public `OtaError` surface collapses several internal variants
-        // (BadStatusLine, MissingContentLength, Io, BadUrl, …) into
+        // (BadStatusLine, Io, BadUrl, …) into
         // `ServerUnreachable`. Log the original variant before collapsing so
         // root cause survives in `espflash monitor` output.
         log::warn!("OTA HTTP error: {:?}", e);
@@ -69,42 +63,30 @@ impl From<HttpError> for OtaError {
             // callers can log the exact code.
             HttpError::NonSuccess { status } => OtaError::DownloadFailed { status },
 
-            // `Transfer-Encoding` present means the server is not speaking the
-            // strict subset we accept — treat as a generic download failure with
-            // status 0 so callers know it was a protocol-shape rejection rather
-            // than a network error.
-            HttpError::TransferEncodingPresent => OtaError::DownloadFailed { status: 0 },
-
-            // A zero-length image is a protocol-shape rejection too; the
-            // ESP-IDF tier maps it the same way. Without this, an empty body
-            // would reach the SHA-256 check with nothing written to the slot.
-            HttpError::EmptyBody => OtaError::DownloadFailed { status: 0 },
-
             // Structural parse failures: the TCP endpoint answered but did not
             // speak recognisable HTTP/1.1 — treat as server unreachable.
             HttpError::BadStatusLine
-            | HttpError::MissingContentLength
             | HttpError::DuplicateContentLength
             | HttpError::InvalidContentLength
             | HttpError::EarlyEof
             | HttpError::Io
             | HttpError::BadUrl => OtaError::ServerUnreachable,
-
-            // The image is bigger than the inactive OTA partition.
-            HttpError::BodyTooLarge => OtaError::InsufficientSpace,
         }
     }
 }
 
 // ── Parsed HTTP response descriptor ─────────────────────────────────────────
 
-/// The validated header data produced by the HTTP parser.
+/// The header facts the download admission needs (see
+/// `juggler::ota::check_content_length`).
 ///
 /// Internal — not part of the crate's public API.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct HttpResponse {
-    /// Exact byte count declared in `Content-Length`.
-    pub content_length: u64,
+pub(crate) struct ResponseHeaders {
+    /// Byte count declared in `Content-Length`, `None` when absent.
+    pub content_length: Option<u64>,
+    /// A `Transfer-Encoding` header was present (any value).
+    pub chunked: bool,
 }
 
 // ── URL parser ───────────────────────────────────────────────────────────────
@@ -299,7 +281,7 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 ///
 /// Call [`HeaderState::feed`] for each `Name: value\r\n` line (excluding the
 /// status line and the blank separator line).  Call [`HeaderState::finish`]
-/// after the blank line to retrieve the validated [`HttpResponse`].
+/// after the blank line to retrieve the [`ResponseHeaders`].
 pub(crate) struct HeaderState {
     content_length: Option<u64>,
     has_transfer_encoding: bool,
@@ -344,19 +326,13 @@ impl HeaderState {
         Ok(())
     }
 
-    /// Validate and produce an [`HttpResponse`] after all headers have been fed.
-    pub(crate) fn finish(self, max_bytes: u64) -> Result<HttpResponse, HttpError> {
-        if self.has_transfer_encoding {
-            return Err(HttpError::TransferEncodingPresent);
+    /// The header facts after all headers have been fed; the download machine
+    /// applies the admission rule to them.
+    pub(crate) fn finish(self) -> ResponseHeaders {
+        ResponseHeaders {
+            content_length: self.content_length,
+            chunked: self.has_transfer_encoding,
         }
-        let content_length = self.content_length.ok_or(HttpError::MissingContentLength)?;
-        if content_length == 0 {
-            return Err(HttpError::EmptyBody);
-        }
-        if content_length > max_bytes {
-            return Err(HttpError::BodyTooLarge);
-        }
-        Ok(HttpResponse { content_length })
     }
 }
 
@@ -364,7 +340,7 @@ impl HeaderState {
 
 #[cfg(feature = "embassy")]
 pub(crate) mod async_client {
-    use super::{parse_status_line, HeaderState, HttpError, HttpResponse, ParsedUrl};
+    use super::{parse_status_line, HeaderState, HttpError, ParsedUrl, ResponseHeaders};
     use embassy_net::tcp::TcpSocket;
 
     /// Read the HTTP response headers line by line into `header_buf`.
@@ -405,13 +381,12 @@ pub(crate) mod async_client {
     /// On success, the socket's read cursor is positioned immediately after
     /// the blank header separator — the caller can stream the body directly.
     ///
-    /// `max_bytes` is the inactive OTA partition size; the parser rejects any
-    /// `Content-Length` that exceeds it with `OtaError::InsufficientSpace`.
+    /// The returned facts are not yet admitted: the caller passes them to the
+    /// download machine, which applies `check_content_length`.
     pub(crate) async fn fetch_get(
         socket: &mut TcpSocket<'_>,
         parsed: &ParsedUrl<'_>,
-        max_bytes: u64,
-    ) -> Result<HttpResponse, super::super::OtaError> {
+    ) -> Result<ResponseHeaders, super::super::OtaError> {
         // 1. Send the request.
         let mut req_buf = [0u8; 256];
         // Format: GET /path HTTP/1.1\r\nHost: host[:port]\r\nConnection: close\r\n\r\n
@@ -460,11 +435,9 @@ pub(crate) mod async_client {
             state.feed(line).map_err(super::super::OtaError::from)?;
         }
 
-        // 5. Finalise — enforces Content-Length exactly-once, no Transfer-Encoding,
-        //    and body-size <= max_bytes.
-        state
-            .finish(max_bytes)
-            .map_err(super::super::OtaError::from)
+        // 5. Hand the Content-Length and Transfer-Encoding facts on; duplicate
+        //    and malformed lengths were already rejected by `feed`.
+        Ok(state.finish())
     }
 
     /// Split the raw header block into the first line and the remainder.
@@ -599,6 +572,7 @@ fn write_u16_decimal(buf: &mut [u8], pos: &mut usize, n: u16) -> Result<(), ()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use juggler::ota::check_content_length;
 
     // ── Status line ──────────────────────────────────────────────────────────
 
@@ -685,14 +659,20 @@ mod tests {
     fn header_content_length_present() {
         let mut state = HeaderState::new();
         state.feed(b"Content-Length: 1024").unwrap();
-        let resp = state.finish(u64::MAX).unwrap();
-        assert_eq!(resp.content_length, 1024);
+        let resp = state.finish();
+        assert_eq!(resp.content_length, Some(1024));
+        assert!(!resp.chunked);
     }
 
     #[test]
     fn header_content_length_missing() {
-        let state = HeaderState::new();
-        assert_eq!(state.finish(u64::MAX), Err(HttpError::MissingContentLength));
+        let resp = HeaderState::new().finish();
+        assert_eq!(resp.content_length, None);
+        // The shared admission rule maps it like the ESP-IDF tier does.
+        assert_eq!(
+            check_content_length(resp.content_length, resp.chunked, u64::MAX),
+            Err(OtaError::DownloadFailed { status: 0 })
+        );
     }
 
     #[test]
@@ -709,9 +689,12 @@ mod tests {
     fn header_content_length_zero_rejected() {
         let mut state = HeaderState::new();
         state.feed(b"Content-Length: 0").unwrap();
-        assert_eq!(state.finish(u64::MAX), Err(HttpError::EmptyBody));
-        let ota_err: OtaError = HttpError::EmptyBody.into();
-        assert_eq!(ota_err, OtaError::DownloadFailed { status: 0 });
+        let resp = state.finish();
+        assert_eq!(resp.content_length, Some(0));
+        assert_eq!(
+            check_content_length(resp.content_length, resp.chunked, u64::MAX),
+            Err(OtaError::DownloadFailed { status: 0 })
+        );
     }
 
     #[test]
@@ -738,16 +721,16 @@ mod tests {
         // RFC 7230: header field names are case-insensitive.
         let mut state = HeaderState::new();
         state.feed(b"content-length: 1024").unwrap();
-        let resp = state.finish(u64::MAX).unwrap();
-        assert_eq!(resp.content_length, 1024);
+        let resp = state.finish();
+        assert_eq!(resp.content_length, Some(1024));
     }
 
     #[test]
     fn header_content_length_mixed_case() {
         let mut state = HeaderState::new();
         state.feed(b"CONTENT-LENGTH: 512").unwrap();
-        let resp = state.finish(u64::MAX).unwrap();
-        assert_eq!(resp.content_length, 512);
+        let resp = state.finish();
+        assert_eq!(resp.content_length, Some(512));
     }
 
     #[test]
@@ -756,9 +739,11 @@ mod tests {
         let mut state = HeaderState::new();
         state.feed(b"Transfer-Encoding: chunked").unwrap();
         state.feed(b"Content-Length: 1024").unwrap();
+        let resp = state.finish();
+        assert!(resp.chunked);
         assert_eq!(
-            state.finish(u64::MAX),
-            Err(HttpError::TransferEncodingPresent)
+            check_content_length(resp.content_length, resp.chunked, u64::MAX),
+            Err(OtaError::DownloadFailed { status: 0 })
         );
     }
 
@@ -768,10 +753,7 @@ mod tests {
         let mut state = HeaderState::new();
         state.feed(b"Transfer-Encoding: identity").unwrap();
         state.feed(b"Content-Length: 100").unwrap();
-        assert_eq!(
-            state.finish(u64::MAX),
-            Err(HttpError::TransferEncodingPresent)
-        );
+        assert!(state.finish().chunked);
     }
 
     #[test]
@@ -825,13 +807,14 @@ mod tests {
 
     #[test]
     fn oversized_body_rejected() {
-        // max_bytes = 100 but Content-Length = 200 → InsufficientSpace via BodyTooLarge.
+        // Capacity 100 but Content-Length = 200 → InsufficientSpace.
         let mut state = HeaderState::new();
         state.feed(b"Content-Length: 200").unwrap();
-        assert_eq!(state.finish(100), Err(HttpError::BodyTooLarge));
-        // Verify the mapping to OtaError.
-        let ota_err: OtaError = HttpError::BodyTooLarge.into();
-        assert_eq!(ota_err, OtaError::InsufficientSpace);
+        let resp = state.finish();
+        assert_eq!(
+            check_content_length(resp.content_length, resp.chunked, 100),
+            Err(OtaError::InsufficientSpace)
+        );
     }
 
     // ── URL parsing ──────────────────────────────────────────────────────────

@@ -25,6 +25,11 @@
 //!
 //! LoRaWAN profile additional placeholders:
 //! - `{{DEV_EUI}}`, `{{JOIN_EUI}}`
+//!
+//! The module also holds the fixed response bodies and the OS probe paths both
+//! tiers serve, so the two portals cannot drift apart in wording or routing.
+
+use super::SchemaProfile;
 
 /// The Wi-Fi + MQTT profile portal HTML template.
 ///
@@ -53,9 +58,103 @@ pub const LORAWAN_PORTAL_HTML: &str = include_str!("assets/portal_lorawan.html")
 pub const RESUBMIT_HINT: &str =
     "The form shows the saved or default values, not your submission. Re-enter your changes and any passwords.";
 
+/// Experimental: API may change before 1.0.
+///
+/// The portal template for `profile`.
+///
+/// A tier that serves only some profiles rejects the others before the portal
+/// starts (see [`plan_portal`](super::plan_portal)); this selection itself is
+/// total.
+pub fn template_for(profile: SchemaProfile) -> &'static str {
+    match profile {
+        SchemaProfile::LorawanFieldDevice => LORAWAN_PORTAL_HTML,
+        SchemaProfile::WifiMqttDevice => WIFI_MQTT_PORTAL_HTML,
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Well-known paths probed by phone and desktop OSes to detect a captive
+/// portal.
+///
+/// The portal answers each with a `302` redirect to its root; the OS gets
+/// unexpected content and opens the captive-portal browser. The list is
+/// illustrative and expected to evolve as OS behaviour changes; it is not a
+/// frozen contract.
+pub const PROBE_PATHS: [&str; 6] = [
+    "/generate_204",
+    "/gen_204",
+    "/hotspot-detect.html",
+    "/ncsi.txt",
+    "/connecttest.txt",
+    "/canonical.html",
+];
+
+/// Experimental: API may change before 1.0.
+///
+/// Page shown after a successful commit.
+pub const COMMITTED_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Provisioned</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
+<h1>Provisioned</h1>\
+<p>Credentials saved. The device will restart and join your network.</p>\
+</body></html>";
+
+/// Experimental: API may change before 1.0.
+///
+/// Page shown after a factory-reset request.
+pub const FACTORY_RESET_HTML: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory reset</title></head><body style=\"font-family:system-ui,sans-serif;padding:1rem\">\
+<h1>Factory reset requested</h1>\
+<p>The host application will complete the reset.</p>\
+</body></html>";
+
+/// Experimental: API may change before 1.0.
+///
+/// `409` body for a `/save` or `/factory-reset` that arrives after the session
+/// already reached a terminal state (or while a submission is being saved):
+/// the first terminal event stands and nothing was changed.
+pub const SESSION_FINISHED_BODY: &str =
+    "Conflict: this provisioning session has already finished or is saving \
+     another submission; nothing was changed. Wait for the device to restart.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_for_selects_each_profile() {
+        assert_eq!(
+            template_for(SchemaProfile::WifiMqttDevice),
+            WIFI_MQTT_PORTAL_HTML
+        );
+        assert_eq!(
+            template_for(SchemaProfile::LorawanFieldDevice),
+            LORAWAN_PORTAL_HTML
+        );
+    }
+
+    #[test]
+    fn probe_paths_contains_the_known_android_apple_windows_paths() {
+        for path in [
+            "/generate_204",
+            "/hotspot-detect.html",
+            "/ncsi.txt",
+            "/connecttest.txt",
+        ] {
+            assert!(PROBE_PATHS.contains(&path), "{path} missing");
+        }
+        assert!(PROBE_PATHS.iter().all(|p| p.starts_with('/')));
+    }
+
+    #[test]
+    fn response_bodies_need_no_escaping_and_are_complete() {
+        assert!(COMMITTED_HTML.ends_with("</body></html>"));
+        assert!(FACTORY_RESET_HTML.ends_with("</body></html>"));
+        assert!(SESSION_FINISHED_BODY.starts_with("Conflict:"));
+        assert!(!SESSION_FINISHED_BODY.contains(['<', '>', '&']));
+    }
 
     /// Tiers embed the hint verbatim inside HTML, so it must need no escaping.
     #[test]

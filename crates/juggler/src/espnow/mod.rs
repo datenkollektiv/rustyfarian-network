@@ -13,7 +13,10 @@
 //! - [`TxCore`] — sans-IO send queue: request ids, deadlines, cancellation, scan exclusion
 //! - [`ScanJobSlot`], [`InFlightMarker`] and `DeadlineSet` (`std`) — the sans-IO parts of a worker-thread driver:
 //!   the scan job hand-off, the awaited send callback and the caller deadlines
-//! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers
+//! - [`ScanMachine`] — clock-injected `scan_for_peer` state machine shared by both tiers, with its
+//!   borrow-free [`ScanTeardown`]
+//! - [`ScanGate`] — the scan-exclusion lifecycle on a [`TxCore`]: admission, cancellation,
+//!   the teardown deferred behind a probe on the air, release
 //! - [`mock::MockEspNowDriver`], [`mock::MockEspNowLink`] — test doubles for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -47,11 +50,15 @@ pub use link::{
     PeerLink, PeerLinkAction, PeerLinkConfig, PeerLinkEpoch, PeerLinkEvent, PeerLinkState,
 };
 pub use link_trait::{ClassifySend, EspNowLink};
-pub use scan::{ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, SendOutcome};
-pub use scan_job::{Cancelled, GateRefusal, JobEpoch, ScanGate, ScanJobSlot};
+pub use scan::{
+    ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, ScanTeardown, SendOutcome,
+};
+pub use scan_job::{CancelOutcome, Cancelled, GateRefusal, JobEpoch, ScanGate, ScanJobSlot};
 pub use tracker::PeerTracker;
+#[allow(deprecated)]
+pub use tx::DeferredRestore;
 pub use tx::{
-    Abandon, Completion, DeferredRestore, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId,
+    Abandon, Completed, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId,
     PROBE_RESERVED_SLOTS,
 };
 
@@ -315,11 +322,10 @@ pub struct ScanConfig<'a> {
     pub probe_data: &'a [u8],
     /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
     ///
-    /// On esp-hal it bounds queueing and the start of a probe: a probe that did not start in time
-    /// is never sent and counts as a local failure.
-    /// A probe that has started is waited out, and its real MAC-layer result is used.
-    /// On ESP-IDF a started probe is waited out too (fail-closed) and probes are not queued
-    /// behind other frames, so this field bounds nothing there.
+    /// On both tiers it bounds queueing and the start of a probe: a probe that did not start in
+    /// time is never sent and counts as a local failure.
+    /// A probe that has started is waited out (fail-closed), and its real MAC-layer result is
+    /// used.
     pub probe_timeout: core::time::Duration,
     /// Total burst timeout (default: [`DEFAULT_BURST_TIMEOUT`] = 3 s).
     ///
