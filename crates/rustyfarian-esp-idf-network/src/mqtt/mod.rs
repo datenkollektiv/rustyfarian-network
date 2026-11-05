@@ -889,9 +889,10 @@ impl<'a> MqttBuilder<'a> {
     ///
     /// When enabled, the builder publishes `"1"` to `iot/{client_id}/startup`
     /// with [`QoS::AtLeastOnce`] (not retained) from the per-connect helper
-    /// thread, before [`on_connect`](Self::on_connect) runs and before the
-    /// SUBSCRIBE packets sent for [`MqttBuilder::subscribe`] topics; it is
-    /// best-effort (not load-bearing). Because it never runs on the
+    /// thread, after the SUBSCRIBE packets sent for [`MqttBuilder::subscribe`]
+    /// topics and before [`on_connect`](Self::on_connect) runs (the shared
+    /// `juggler::mqtt::ConnectWorkPlan` order); it is best-effort (not
+    /// load-bearing). Because it never runs on the
     /// event-loop thread, it cannot hit the esp-mqtt `api_lock` deadlock
     /// described in `docs/project-lore.md` "MQTT Event Loop".
     ///

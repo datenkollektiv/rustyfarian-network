@@ -10,7 +10,7 @@
 //!   `embedded-hal` and shared by both tiers.
 //! - [`LorawanPhy<R>`] — the `lorawan-device` `PhyRxTx + Timings` bridge over a
 //!   [`LoraRadio`] port.
-//! - Rung 2: [`LorawanTicker`] — decodes IRQ and clock samples into the events
+//! - Flat rules: [`LorawanTimeline`], [`requested_deadline`] and [`classify_response`] decide the events
 //!   that drive `lorawan-device`'s `nb_device::Device`.
 //! - [`LoraRadio`] — the narrow, hardware-agnostic radio port
 //! - [`mock::MockLoraRadio`] — test double for host-side unit tests
@@ -41,7 +41,7 @@ pub use lorawan::{
     Downlink, LorawanDevice, LorawanError, LorawanResponse, LorawanSessionData, LorawanState,
 };
 pub use phy::{map_rf_config, LorawanPhy};
-pub use ticker::{LorawanTicker, Outcome, TickEvent};
+pub use ticker::{classify_response, requested_deadline, LorawanTimeline, Outcome, TickEvent};
 
 // ─── RX window timing defaults ────────────────────────────────────────────────
 

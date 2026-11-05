@@ -60,13 +60,12 @@ mod worker;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, SendStatus};
 use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::sys::esp;
+use esp_idf_svc::sys::{esp, EspError};
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
 };
@@ -79,7 +78,7 @@ pub use juggler::espnow::{
 };
 use juggler::wait_list::WaitList;
 
-use worker::{block_on, TxShared};
+use worker::{block_on, Worker};
 
 /// The channel [`EspIdfEspNow::init_with_radio`] starts its SoftAP on, which is the pin at start.
 const SOFTAP_CHANNEL: u8 = 1;
@@ -349,10 +348,9 @@ pub struct EspIdfEspNow {
     _esp_now: EspNow<'static>,
     rx: Arc<RxQueue>,
     _wifi: Option<EspWifi<'static>>,
-    /// The send queue, the pin and the scan slot, shared with the worker and the send callback.
-    shared: Arc<TxShared>,
-    /// The `espnow-tx` thread; joined in [`Drop`] before `esp_now` is dropped.
-    worker: Option<JoinHandle<()>>,
+    /// The `espnow-tx` worker: the send queue, the pin and the scan slot, and the thread that
+    /// serves them; joined in [`Drop`] before `esp_now` is dropped.
+    worker: Worker,
     /// Explicit state for the three radio-management modes the driver supports.
     ///
     /// The driver internally tracks which of the three init paths was taken.
@@ -563,8 +561,7 @@ impl EspIdfEspNow {
         mac: &MacAddress,
         config: &ScanConfig<'_>,
     ) -> Result<ScanResult, EspIdfEspNowError> {
-        let ticket = self.shared.admit_scan(*mac, config)?;
-        self.shared.finish_scan(ticket).await
+        worker::scan_for_peer(&self.worker, mac, config).await
     }
 
     /// Blocking form of [`scan_for_peer`](Self::scan_for_peer): the calling thread parks until
@@ -601,7 +598,7 @@ impl EspIdfEspNow {
     /// station of [`init_with_radio_sta`](Self::init_with_radio_sta) sets no channel, and the
     /// caller-managed radio of [`init`](Self::init) cannot scan).
     pub fn pinned_channel(&self) -> Option<u8> {
-        self.shared.pinned_channel()
+        self.worker.pinned_channel()
     }
 
     /// Initialise ESP-NOW, start the radio, and scan for a peer.
@@ -677,10 +674,8 @@ impl EspIdfEspNow {
         data: &[u8],
         timeout: Duration,
     ) -> Result<(), EspIdfEspNowError> {
-        let outcome = self
-            .shared
-            .run_frame(mac, data, Some(timeout), SendKind::App)
-            .await?;
+        let outcome =
+            worker::run_frame(&self.worker, mac, data, Some(timeout), SendKind::App).await?;
         worker::require_ack(outcome)
     }
 
@@ -720,6 +715,18 @@ impl EspIdfEspNow {
             .map_err(EspIdfEspNowError::into_anyhow)
     }
 
+    /// Stops the driver's asynchronous machinery without dropping it; idempotent, never blocks.
+    ///
+    /// Queued and in-flight requests end as [`EspIdfEspNowError::Shutdown`], a running scan is
+    /// aborted without a teardown, and every later send or scan is refused with the same error.
+    /// A frame already on the air still finishes and its result is ignored.
+    /// The `espnow-tx` thread ends on its own; dropping the driver joins it and deinitialises
+    /// ESP-NOW (the drop calls this first).
+    /// Same name and semantics as `EspHalEspNow::shutdown` (ADR 022).
+    pub fn shutdown(&self) {
+        self.worker.shutdown();
+    }
+
     fn init_inner(
         capacity: usize,
         wifi: Option<EspWifi<'static>>,
@@ -737,21 +744,19 @@ impl EspIdfEspNow {
 
         // One send callback for the driver's lifetime; the worker is the only sender, so it
         // always belongs to the frame in flight.
-        let shared = Arc::new(TxShared::new(mode, initial_pin));
-        let callback_shared = Arc::clone(&shared);
+        let worker = worker::spawn(mode, initial_pin)?;
+        let events = worker.events();
         esp_now
             .register_send_cb(move |mac, status| {
-                callback_shared.on_send_done(mac, matches!(status, SendStatus::SUCCESS));
+                events.send_done(mac, matches!(status, SendStatus::SUCCESS));
             })
             .context("failed to register ESP-NOW send callback")?;
-        let worker = worker::spawn(Arc::clone(&shared))?;
 
         Ok(Self {
             _esp_now: esp_now,
             rx,
             _wifi: wifi,
-            shared,
-            worker: Some(worker),
+            worker,
             mode,
         })
     }
@@ -768,17 +773,12 @@ impl Drop for EspIdfEspNow {
     /// as they were at that moment (no probe may be on the air while they change); ESP-NOW is
     /// deinitialised right after.
     fn drop(&mut self) {
-        self.shared.begin_shutdown();
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                log::error!("the espnow-tx thread panicked");
-            }
-        }
+        self.worker.stop();
     }
 }
 
 /// Registers `config` as an ESP-NOW peer.
-fn peer_add(config: &PeerConfig) -> Result<(), EspIdfEspNowError> {
+fn peer_add_raw(config: &PeerConfig) -> Result<(), EspError> {
     let peer_info = PeerInfo {
         peer_addr: config.mac,
         channel: config.channel,
@@ -792,14 +792,24 @@ fn peer_add(config: &PeerConfig) -> Result<(), EspIdfEspNowError> {
     // SAFETY: plain FFI call; `peer_info` is a fully initialised `esp_now_peer_info_t` that
     // lives for the duration of the call, and ESP-NOW copies it.
     esp!(unsafe { esp_idf_svc::sys::esp_now_add_peer(&peer_info) })
+}
+
+/// [`peer_add_raw`] with the driver error the public API reports.
+fn peer_add(config: &PeerConfig) -> Result<(), EspIdfEspNowError> {
+    peer_add_raw(config)
         .context("failed to add ESP-NOW peer")
         .map_err(EspIdfEspNowError::Driver)
 }
 
 /// Removes the ESP-NOW peer `mac`.
-fn peer_del(mac: &MacAddress) -> Result<(), EspIdfEspNowError> {
+fn peer_del_raw(mac: &MacAddress) -> Result<(), EspError> {
     // SAFETY: plain FFI call; `mac` points to 6 bytes that live for the duration of the call.
     esp!(unsafe { esp_idf_svc::sys::esp_now_del_peer(mac.as_ptr()) })
+}
+
+/// [`peer_del_raw`] with the driver error the public API reports.
+fn peer_del(mac: &MacAddress) -> Result<(), EspIdfEspNowError> {
+    peer_del_raw(mac)
         .context("failed to remove ESP-NOW peer")
         .map_err(EspIdfEspNowError::Driver)
 }
@@ -830,7 +840,8 @@ impl EspNowDriver for EspIdfEspNow {
     /// polled once and then left unpolled on that thread keep their queue slots until polled or
     /// dropped, so the call can only end with `Timeout`.
     fn send(&self, mac: &MacAddress, data: &[u8]) -> Result<(), Self::Error> {
-        let outcome = block_on(self.shared.run_frame(
+        let outcome = block_on(worker::run_frame(
+            &self.worker,
             mac,
             data,
             Some(SEND_QUEUE_DEADLINE),
@@ -869,6 +880,10 @@ impl EspNowLink for EspIdfEspNow {
     fn pinned_channel(&self) -> Option<u8> {
         EspIdfEspNow::pinned_channel(self)
     }
+
+    fn shutdown(&self) {
+        EspIdfEspNow::shutdown(self);
+    }
 }
 
 /// Tier parity check (ADR 022): fails to compile if `EspIdfEspNow` stops implementing `EspNowLink`.
@@ -879,4 +894,6 @@ const _: fn() = || {
     {
     }
     implements::<EspIdfEspNow>();
+    // The inherent `shutdown` keeps the name and shape of the esp-hal tier's (ADR 022).
+    let _: fn(&EspIdfEspNow) = EspIdfEspNow::shutdown;
 };

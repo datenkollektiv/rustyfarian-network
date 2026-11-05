@@ -53,7 +53,7 @@
 //!
 //! GPIO 14 is set up with a rising-edge interrupt that sets `DIO1_FLAG`.
 //! The main loop feeds this flag, OR-ed with an SPI `irq_pending()` poll, into
-//! `juggler`'s `LorawanTicker`, which decides when to deliver `RadioEvent(Phy(()))`
+//! `juggler`'s `LorawanTimeline`, which decides when to deliver `RadioEvent(Phy(()))`
 //! or `TimeoutFired` to the lorawan-device state machine.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,9 +72,11 @@ use lorawan_device::{
 };
 
 use rustyfarian_esp_idf_network::lora::{
+    classify_response,
     config::{LoraConfig, Region},
+    requested_deadline,
     sx1262_driver::{EspIdfLoraRadio, LoraRadioAdapter},
-    LorawanTicker, Outcome, TickEvent,
+    LorawanTimeline, Outcome, TickEvent,
 };
 
 /// DIO1 rising-edge flag — set by ISR, cleared by main loop after delivery.
@@ -209,12 +211,13 @@ fn main() -> anyhow::Result<()> {
         .join(join_mode)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    // `LorawanTicker` owns the two lorawan-device rules: `TimeoutRequest(ms)` is
+    // `LorawanTimeline` and the helpers beside it own the two lorawan-device rules: `TimeoutRequest(ms)` is
     // an ABSOLUTE timestamp in the timeline starting at `start` (assign, never
     // add elapsed), and `JoinSuccess` / `NoJoinAccept` end the exchange.
     let start = Instant::now();
-    let mut ticker = LorawanTicker::new(JOIN_BUDGET_MS, 0);
-    let mut outcome = ticker.on_response(&response);
+    let timeline = LorawanTimeline::new(JOIN_BUDGET_MS, 0);
+    let mut deadline = requested_deadline(&response);
+    let mut outcome = classify_response(&response);
 
     while outcome == Outcome::Continue {
         let now_ms = start.elapsed().as_millis() as u32;
@@ -232,13 +235,14 @@ fn main() -> anyhow::Result<()> {
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
         let irq = dio1_edge || device.get_radio().irq_pending();
 
-        let event = match ticker.update(irq, now_ms) {
+        let event = match timeline.next_event(irq, now_ms, deadline) {
             Some(TickEvent::Phy) => {
                 log::debug!(target: tag, "radio IRQ at {}ms", now_ms);
                 Event::RadioEvent(LdRadioEvent::Phy(()))
             }
             Some(TickEvent::TimeoutFired) => {
                 log::debug!(target: tag, "Timeout fired at {}ms", now_ms);
+                deadline = None;
                 Event::TimeoutFired
             }
             Some(TickEvent::BudgetExceeded) => {
@@ -262,7 +266,8 @@ fn main() -> anyhow::Result<()> {
             Response::NoUpdate => {}
             other => log::debug!(target: tag, "response: {:?}", other),
         }
-        outcome = ticker.on_response(&response);
+        deadline = requested_deadline(&response).or(deadline);
+        outcome = classify_response(&response);
 
         std::thread::sleep(Duration::from_millis(10));
     }

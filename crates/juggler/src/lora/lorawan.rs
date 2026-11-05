@@ -148,7 +148,7 @@ impl<E: core::fmt::Debug + core::fmt::Display> core::fmt::Display for LorawanErr
 // The enum is only ever returned from a function, never stored in collections.
 #[allow(clippy::large_enum_variant)]
 #[deprecated(
-    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTicker}"
+    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTimeline}"
 )]
 #[derive(Debug)]
 pub enum LorawanResponse {
@@ -199,9 +199,9 @@ pub struct Downlink {
 /// All other parts of the beekeeper firmware continue to function normally.
 ///
 /// Deprecated: no code drives this stub. Drive `lorawan-device`'s
-/// `nb_device::Device` with [`super::LorawanPhy`] and [`super::LorawanTicker`].
+/// `nb_device::Device` with [`super::LorawanPhy`] and [`super::LorawanTimeline`].
 #[deprecated(
-    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTicker}"
+    note = "use lorawan_device::nb_device::Device with juggler::lora::{LorawanPhy, LorawanTimeline}"
 )]
 pub struct LorawanDevice<R: LoraRadio> {
     radio: R,

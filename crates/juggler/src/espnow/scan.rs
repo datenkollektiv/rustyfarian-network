@@ -839,6 +839,37 @@ impl<'a> ScanMachine<'a> {
     }
 }
 
+/// Decide whether a TX-power read-back confirms the restore after a scan.
+///
+/// `saved` is the level read before [`ScanAction::BoostTxPower`] (`None` when the
+/// save failed, so no restore was attempted) and `read_back` is the level read after
+/// [`ScanAction::RestoreTxPower`] (`None` when the read failed).
+/// Returns `true` when there is nothing to verify or the levels match, and `false`
+/// only when both are known and differ, so the caller can log the mismatch.
+#[must_use]
+pub const fn restore_matches(saved: Option<i8>, read_back: Option<i8>) -> bool {
+    match (saved, read_back) {
+        (Some(s), Some(r)) => s == r,
+        _ => true,
+    }
+}
+
+/// Check the TX-power read-back after [`ScanAction::RestoreTxPower`] and log a mismatch.
+///
+/// Both tiers call this with the level saved before the boost and the level read from the
+/// radio afterwards, so the warning reads the same everywhere.
+/// The restore is advisory: the scan result is never changed.
+/// Returns the value of [`restore_matches`].
+pub fn warn_on_restore_mismatch(saved: Option<i8>, read_back: Option<i8>) -> bool {
+    let ok = restore_matches(saved, read_back);
+    if !ok {
+        log::warn!(
+            "ESP-NOW scan: TX power not restored (saved {saved:?}, radio reports {read_back:?} quarter dBm)"
+        );
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,6 +1660,25 @@ mod tests {
             ScanAction::RestoreTxPower
         );
         assert_eq!(m.poll(D::ZERO, ScanInput::Failed), ScanAction::RemovePeer);
+    }
+
+    // ── TX power read-back ────────────────────────────────────────────────
+
+    #[test]
+    fn restore_matches_accepts_an_equal_read_back() {
+        assert!(restore_matches(Some(78), Some(78)));
+    }
+
+    #[test]
+    fn restore_matches_rejects_a_level_left_boosted() {
+        assert!(!restore_matches(Some(34), Some(80)));
+    }
+
+    #[test]
+    fn restore_matches_has_nothing_to_verify_without_a_saved_or_read_level() {
+        assert!(restore_matches(None, Some(80)));
+        assert!(restore_matches(Some(34), None));
+        assert!(restore_matches(None, None));
     }
 
     // ── burst expiry flag ─────────────────────────────────────────────────

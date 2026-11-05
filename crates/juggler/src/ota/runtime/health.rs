@@ -1,11 +1,15 @@
-//! The health policy of the running image as a state machine.
+//! The health policy of the running image as pure decisions.
 //!
 //! The policy decides when a freshly activated image proves itself healthy, and what happens when it does not.
 //! It never touches a slot that is not pending verification, so a normally booted image cannot restart itself because the broker happens to be down.
 //!
-//! [`HealthMachine::step`] is a function of the elapsed time, the refusal flag and the outcome of the previous action.
-//! The driver (on the app's main thread) executes the returned [`HealthAction`] and feeds the result back; the machine never sleeps, reads a slot, marks valid, rolls back or restarts by itself.
+//! One tier runs it, on one thread (the app's main thread), so it is flat logic (ADR 023 decision 3): the driver reads the slot, sleeps, asks the app predicate, marks valid, records the attempt, rolls back or restarts in plain sequential code, and asks these functions only for the decisions.
+//! [`SlotReads::busy`] and [`SlotReads::failed`] decide whether an unreadable slot is retried or ends the policy, [`poll_decision`] and [`after_unhealthy`] decide whether to evaluate, wait or give up at the deadline, and [`deadline_plan`] says what the deadline does.
 //! Elapsed time is measured from the boot instant the app captured at the very start of `main`, not from Wi-Fi association.
+//!
+//! [`HealthMachine`] is the earlier action machine over the same decisions; it is deprecated and kept for one release.
+
+#![allow(deprecated)]
 
 use core::time::Duration;
 
@@ -38,24 +42,6 @@ pub struct HealthConfig {
     pub rollback_retry: Duration,
     /// What happens at the deadline.
     pub deadline_action: DeadlineAction,
-}
-
-impl HealthConfig {
-    /// Slack added to [`time_bound`](Self::time_bound) for sleeps and slow slot reads.
-    pub const TIME_BOUND_SLACK: Duration = Duration::from_secs(60);
-
-    /// The longest a driver loop may run [`HealthMachine`] before it must stop fail-closed (ADR 023 decision 6).
-    ///
-    /// Every path of the machine finishes within `failure_deadline + healthy_dwell`, the rollback retries (`rollback_retry * rollback_attempts`), the completion retries (`complete_retry * complete_attempts`) and [`TIME_BOUND_SLACK`](Self::TIME_BOUND_SLACK).
-    /// The sum saturates instead of overflowing.
-    /// The driver measures its own elapsed time and compares it against this value.
-    pub fn time_bound(&self) -> Duration {
-        self.failure_deadline
-            .saturating_add(self.healthy_dwell)
-            .saturating_add(self.rollback_retry.saturating_mul(self.rollback_attempts))
-            .saturating_add(self.complete_retry.saturating_mul(self.complete_attempts))
-            .saturating_add(Self::TIME_BOUND_SLACK)
-    }
 }
 
 impl From<&OtaTimings> for HealthConfig {
@@ -92,6 +78,12 @@ pub enum SlotReading {
 }
 
 /// The outcome of the previous action, fed to [`HealthMachine::step`].
+///
+/// Deprecated with [`HealthMachine`].
+#[deprecated(
+    since = "0.7.0",
+    note = "flat logic since ADR 023: drive the policy in sequential code with `poll_decision`, `after_unhealthy`, `SlotReads` and `deadline_plan`"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthEvent {
     /// The first call.
@@ -115,6 +107,12 @@ pub enum HealthEvent {
 }
 
 /// What the driver must do next.
+///
+/// Deprecated with [`HealthMachine`].
+#[deprecated(
+    since = "0.7.0",
+    note = "flat logic since ADR 023: drive the policy in sequential code with `poll_decision`, `after_unhealthy`, `SlotReads` and `deadline_plan`"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthAction {
     /// Read the running slot once, without retrying a busy handle, and answer with [`HealthEvent::Slot`].
@@ -209,6 +207,116 @@ pub fn initial_admission(outcome: &BootOutcome) -> bool {
         && !matches!(outcome.disposition, BootDisposition::FailedClosed(_))
 }
 
+/// What the poll loop does next while the image is pending verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollStep {
+    /// Dwell passed and nothing refuses: ask the app predicate.
+    Evaluate,
+    /// Not yet, and the deadline is not reached: sleep this long, then decide again.
+    Wait(Duration),
+    /// The failure deadline is reached: apply [`deadline_plan`].
+    Deadline,
+}
+
+/// The next step of the poll loop at `elapsed` since boot, with `refuse` the library's refusal flag.
+///
+/// The image is evaluated only once the healthy dwell has passed and nothing refuses it; otherwise the loop waits for `poll_interval`, until the failure deadline.
+pub fn poll_decision(cfg: &HealthConfig, elapsed: Duration, refuse: bool) -> PollStep {
+    if !refuse && elapsed >= cfg.healthy_dwell {
+        PollStep::Evaluate
+    } else {
+        after_unhealthy(cfg, elapsed)
+    }
+}
+
+/// The next step after the predicate said no or `mark_valid` failed: wait, or the deadline.
+///
+/// Never returns [`PollStep::Evaluate`].
+pub fn after_unhealthy(cfg: &HealthConfig, elapsed: Duration) -> PollStep {
+    if elapsed < cfg.failure_deadline {
+        PollStep::Wait(cfg.poll_interval)
+    } else {
+        PollStep::Deadline
+    }
+}
+
+/// What to do after a slot read that did not say whether the slot is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRetry {
+    /// Read again after `pause`; `warn` is `Some(failed reads)` when this failure falls on the warning cadence.
+    Sleep {
+        /// How long to wait before the next read.
+        pause: Duration,
+        /// Log a warning with this many failed reads.
+        warn: Option<u32>,
+    },
+    /// Give up: end the policy with [`HealthVerdict::SlotUnreadable`], touching nothing.
+    GiveUp,
+}
+
+/// The unreadable-slot reads of the start-up loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotReads {
+    failed: u32,
+    busy: u32,
+}
+
+impl SlotReads {
+    /// A busy read (the OTA handle is held by another thread): says nothing about the slot.
+    ///
+    /// Gives up once the failure deadline has passed and `slot_min_attempts` reads (busy or failed) were made.
+    pub fn busy(&mut self, cfg: &HealthConfig, elapsed: Duration) -> SlotRetry {
+        self.busy = self.busy.saturating_add(1);
+        let reads = self.busy.saturating_add(self.failed);
+        if reads >= cfg.slot_min_attempts && elapsed >= cfg.failure_deadline {
+            SlotRetry::GiveUp
+        } else {
+            SlotRetry::Sleep {
+                pause: cfg.slot_retry,
+                warn: None,
+            }
+        }
+    }
+
+    /// A failed read.
+    ///
+    /// Gives up once the failure deadline has passed and `slot_min_attempts` failed reads were made; busy reads do not count here.
+    pub fn failed(&mut self, cfg: &HealthConfig, elapsed: Duration) -> SlotRetry {
+        self.failed = self.failed.saturating_add(1);
+        if self.failed >= cfg.slot_min_attempts && elapsed >= cfg.failure_deadline {
+            return SlotRetry::GiveUp;
+        }
+        let every = cfg.slot_warn_every.max(1);
+        SlotRetry::Sleep {
+            pause: cfg.slot_retry,
+            warn: (self.failed % every == 1 % every).then_some(self.failed),
+        }
+    }
+}
+
+/// What the failure deadline does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlinePlan {
+    /// The reason to note for the running slot (the first reason of a boot wins).
+    pub reason: RollbackReason,
+    /// `true` to call the app's restart callback after noting, `false` to roll back with bounded retries.
+    pub restart: bool,
+}
+
+/// The deadline behaviour configured in `cfg`.
+pub fn deadline_plan(cfg: &HealthConfig) -> DeadlinePlan {
+    match cfg.deadline_action {
+        DeadlineAction::Rollback => DeadlinePlan {
+            reason: RollbackReason::HealthDeadline,
+            restart: false,
+        },
+        DeadlineAction::NoteAndRestart(reason) => DeadlinePlan {
+            reason,
+            restart: true,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     ReadSlot,
@@ -224,14 +332,19 @@ enum Phase {
     Done(HealthVerdict),
 }
 
-/// The health policy.
+/// The health policy as an action machine.
+///
+/// Deprecated: the policy runs on one thread of one tier, so the decisions are pure functions and the driver is sequential (ADR 023 decisions 2 and 3).
+#[deprecated(
+    since = "0.7.0",
+    note = "flat logic since ADR 023: drive the policy in sequential code with `poll_decision`, `after_unhealthy`, `SlotReads` and `deadline_plan`"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct HealthMachine {
     cfg: HealthConfig,
     phase: Phase,
     slot: Option<SlotId>,
-    failed_reads: u32,
-    busy_reads: u32,
+    reads: SlotReads,
     warn: Option<u32>,
     complete_tries: u32,
     rollback_tries: u32,
@@ -244,8 +357,7 @@ impl HealthMachine {
             cfg,
             phase: Phase::ReadSlot,
             slot: None,
-            failed_reads: 0,
-            busy_reads: 0,
+            reads: SlotReads { failed: 0, busy: 0 },
             warn: None,
             complete_tries: 0,
             rollback_tries: 0,
@@ -332,66 +444,57 @@ impl HealthMachine {
     }
 
     fn on_slot(&mut self, elapsed: Duration, refuse: bool, reading: SlotReading) -> HealthAction {
-        match reading {
-            SlotReading::NotPending => self.finish(HealthVerdict::NothingToVerify),
+        let retry = match reading {
+            SlotReading::NotPending => return self.finish(HealthVerdict::NothingToVerify),
             SlotReading::PendingVerify(slot) => {
                 self.slot = Some(slot);
                 self.phase = Phase::Poll;
-                self.poll_tick(elapsed, refuse)
+                return self.poll_tick(elapsed, refuse);
             }
-            SlotReading::Busy => {
-                self.busy_reads = self.busy_reads.saturating_add(1);
-                let reads = self.busy_reads.saturating_add(self.failed_reads);
-                if reads >= self.cfg.slot_min_attempts && elapsed >= self.cfg.failure_deadline {
-                    self.finish(HealthVerdict::SlotUnreadable)
-                } else {
-                    HealthAction::Sleep(self.cfg.slot_retry)
+            SlotReading::Busy => self.reads.busy(&self.cfg, elapsed),
+            SlotReading::Failed => self.reads.failed(&self.cfg, elapsed),
+        };
+        match retry {
+            SlotRetry::Sleep { pause, warn } => {
+                if warn.is_some() {
+                    self.warn = warn;
                 }
+                HealthAction::Sleep(pause)
             }
-            SlotReading::Failed => {
-                self.failed_reads += 1;
-                if self.failed_reads % self.cfg.slot_warn_every.max(1)
-                    == 1 % self.cfg.slot_warn_every.max(1)
-                {
-                    self.warn = Some(self.failed_reads);
-                }
-                if self.failed_reads >= self.cfg.slot_min_attempts
-                    && elapsed >= self.cfg.failure_deadline
-                {
-                    self.finish(HealthVerdict::SlotUnreadable)
-                } else {
-                    HealthAction::Sleep(self.cfg.slot_retry)
-                }
-            }
+            SlotRetry::GiveUp => self.finish(HealthVerdict::SlotUnreadable),
         }
     }
 
     fn poll_tick(&mut self, elapsed: Duration, refuse: bool) -> HealthAction {
-        if !refuse && elapsed >= self.cfg.healthy_dwell {
-            self.phase = Phase::Evaluating;
-            HealthAction::Evaluate
-        } else {
-            self.after_unhealthy(elapsed)
-        }
+        let step = poll_decision(&self.cfg, elapsed, refuse);
+        self.apply(step)
     }
 
     fn after_unhealthy(&mut self, elapsed: Duration) -> HealthAction {
-        if elapsed < self.cfg.failure_deadline {
-            self.phase = Phase::Poll;
-            return HealthAction::Sleep(self.cfg.poll_interval);
-        }
-        // Only a pending slot reaches the deadline, and it was read at start.
-        let Some(slot) = self.slot else {
-            return self.finish(HealthVerdict::SlotUnreadable);
-        };
-        match self.cfg.deadline_action {
-            DeadlineAction::Rollback => {
-                self.phase = Phase::Noting { restart: false };
-                HealthAction::NoteRollback(RollbackReason::HealthDeadline, slot)
+        let step = after_unhealthy(&self.cfg, elapsed);
+        self.apply(step)
+    }
+
+    fn apply(&mut self, step: PollStep) -> HealthAction {
+        match step {
+            PollStep::Evaluate => {
+                self.phase = Phase::Evaluating;
+                HealthAction::Evaluate
             }
-            DeadlineAction::NoteAndRestart(reason) => {
-                self.phase = Phase::Noting { restart: true };
-                HealthAction::NoteRollback(reason, slot)
+            PollStep::Wait(pause) => {
+                self.phase = Phase::Poll;
+                HealthAction::Sleep(pause)
+            }
+            PollStep::Deadline => {
+                // Only a pending slot reaches the deadline, and it was read at start.
+                let Some(slot) = self.slot else {
+                    return self.finish(HealthVerdict::SlotUnreadable);
+                };
+                let plan = deadline_plan(&self.cfg);
+                self.phase = Phase::Noting {
+                    restart: plan.restart,
+                };
+                HealthAction::NoteRollback(plan.reason, slot)
             }
         }
     }
@@ -411,32 +514,150 @@ mod tests {
         HealthConfig::from(&OtaTimings::default())
     }
 
-    #[test]
-    fn time_bound_sums_every_phase_and_the_slack() {
-        let c = HealthConfig {
-            healthy_dwell: secs(10),
-            failure_deadline: secs(100),
-            rollback_attempts: 3,
-            rollback_retry: secs(5),
-            complete_attempts: 4,
-            complete_retry: secs(2),
-            ..cfg()
-        };
-        assert_eq!(
-            c.time_bound(),
-            secs(100 + 10 + 3 * 5 + 4 * 2) + HealthConfig::TIME_BOUND_SLACK
-        );
-        assert_eq!(HealthConfig::TIME_BOUND_SLACK, secs(60));
+    fn at_boot_plus(t: u64) -> Duration {
+        secs(t)
     }
 
     #[test]
-    fn time_bound_saturates_instead_of_overflowing() {
+    fn poll_decision_evaluates_only_after_the_dwell_and_without_a_refusal() {
         let c = HealthConfig {
-            rollback_attempts: u32::MAX,
-            rollback_retry: Duration::MAX,
+            healthy_dwell: secs(30),
+            failure_deadline: secs(120),
+            poll_interval: secs(1),
             ..cfg()
         };
-        assert_eq!(c.time_bound(), Duration::MAX);
+        assert_eq!(
+            poll_decision(&c, at_boot_plus(29), false),
+            PollStep::Wait(secs(1))
+        );
+        assert_eq!(
+            poll_decision(&c, at_boot_plus(30), false),
+            PollStep::Evaluate
+        );
+        assert_eq!(
+            poll_decision(&c, at_boot_plus(60), true),
+            PollStep::Wait(secs(1)),
+            "a refusal keeps the image unevaluated"
+        );
+        assert_eq!(
+            poll_decision(&c, at_boot_plus(120), true),
+            PollStep::Deadline
+        );
+    }
+
+    #[test]
+    fn after_unhealthy_waits_until_the_deadline_and_never_evaluates() {
+        let c = HealthConfig {
+            failure_deadline: secs(120),
+            poll_interval: secs(2),
+            ..cfg()
+        };
+        assert_eq!(
+            after_unhealthy(&c, at_boot_plus(119)),
+            PollStep::Wait(secs(2))
+        );
+        assert_eq!(after_unhealthy(&c, at_boot_plus(120)), PollStep::Deadline);
+        assert_eq!(after_unhealthy(&c, at_boot_plus(900)), PollStep::Deadline);
+    }
+
+    #[test]
+    fn unreadable_slot_gives_up_only_after_the_deadline_and_enough_reads() {
+        let c = HealthConfig {
+            failure_deadline: secs(120),
+            slot_min_attempts: 3,
+            slot_retry: Duration::from_millis(200),
+            ..cfg()
+        };
+        let mut reads = SlotReads::default();
+        let sleep = |warn| SlotRetry::Sleep {
+            pause: Duration::from_millis(200),
+            warn,
+        };
+        assert_eq!(
+            reads.busy(&c, secs(500)),
+            sleep(None),
+            "one read is not enough"
+        );
+        assert_eq!(reads.busy(&c, secs(500)), sleep(None));
+        assert_eq!(
+            reads.busy(&c, secs(119)),
+            sleep(None),
+            "deadline not reached"
+        );
+        assert_eq!(reads.busy(&c, secs(120)), SlotRetry::GiveUp);
+    }
+
+    #[test]
+    fn busy_reads_count_toward_a_failed_give_up_but_not_the_reverse() {
+        let c = HealthConfig {
+            failure_deadline: secs(10),
+            slot_min_attempts: 3,
+            ..cfg()
+        };
+        let sleeps = |r: SlotRetry| matches!(r, SlotRetry::Sleep { .. });
+
+        let mut reads = SlotReads::default();
+        assert!(sleeps(reads.failed(&c, secs(100))));
+        assert!(sleeps(reads.busy(&c, secs(100))));
+        assert_eq!(
+            reads.busy(&c, secs(100)),
+            SlotRetry::GiveUp,
+            "a busy read counts the failed reads too"
+        );
+
+        let mut reads = SlotReads::default();
+        assert!(sleeps(reads.busy(&c, secs(100))));
+        assert!(sleeps(reads.busy(&c, secs(100))));
+        assert!(
+            sleeps(reads.failed(&c, secs(100))),
+            "a failed read does not count the busy ones"
+        );
+        assert!(sleeps(reads.failed(&c, secs(100))));
+        assert_eq!(reads.failed(&c, secs(100)), SlotRetry::GiveUp);
+    }
+
+    #[test]
+    fn failed_reads_warn_on_the_first_and_every_nth() {
+        let c = HealthConfig {
+            slot_warn_every: 3,
+            slot_min_attempts: 1_000,
+            ..cfg()
+        };
+        let mut reads = SlotReads::default();
+        let mut warns = [None; 7];
+        for slot in &mut warns {
+            *slot = match reads.failed(&c, secs(0)) {
+                SlotRetry::Sleep { warn, .. } => warn,
+                SlotRetry::GiveUp => panic!("must not give up"),
+            };
+        }
+        assert_eq!(warns, [Some(1), None, None, Some(4), None, None, Some(7)]);
+    }
+
+    #[test]
+    fn deadline_plan_follows_the_configured_action() {
+        let rollback = HealthConfig {
+            deadline_action: DeadlineAction::Rollback,
+            ..cfg()
+        };
+        assert_eq!(
+            deadline_plan(&rollback),
+            DeadlinePlan {
+                reason: RollbackReason::HealthDeadline,
+                restart: false
+            }
+        );
+        let restart = HealthConfig {
+            deadline_action: DeadlineAction::NoteAndRestart(RollbackReason::Unhealthy),
+            ..cfg()
+        };
+        assert_eq!(
+            deadline_plan(&restart),
+            DeadlinePlan {
+                reason: RollbackReason::Unhealthy,
+                restart: true
+            }
+        );
     }
 
     fn started() -> HealthMachine {

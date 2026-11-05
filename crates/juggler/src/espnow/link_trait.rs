@@ -125,6 +125,17 @@ where
 
     /// The channel the driver pinned (by a scan or at start), or `None` if it has none.
     fn pinned_channel(&self) -> Option<u8>;
+
+    /// Stops the driver's asynchronous machinery; idempotent and never blocking.
+    ///
+    /// Queued and in-flight requests end with the tier's shutdown error, a running scan is
+    /// aborted without a teardown (the channel, TX power and peer table stay as they are), and
+    /// every later request is refused with the same error.
+    /// A frame already on the air still finishes; its result is ignored.
+    /// On the ESP-IDF tier this is what dropping the driver does first (the drop also joins the
+    /// worker thread); on the esp-hal tier the handle is usually `'static`, so this is the only
+    /// way to stop it, and the sender runner returns once it was called.
+    fn shutdown(&self);
 }
 
 #[cfg(test)]
@@ -203,6 +214,21 @@ mod tests {
         let result = block_on(link.send_acked(&PEER, b"x", Duration::ZERO));
         assert_eq!(SendOutcome::of(&result), SendOutcome::Local);
         assert!(link.sent_messages().is_empty());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_through_the_trait() {
+        fn stop<L: EspNowLink>(link: &L)
+        where
+            L::Error: ClassifySend,
+        {
+            link.shutdown();
+            link.shutdown();
+        }
+        let link = MockEspNowLink::new();
+        assert!(!link.is_shut_down());
+        stop(&link);
+        assert!(link.is_shut_down());
     }
 
     #[test]

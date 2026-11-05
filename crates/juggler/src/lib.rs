@@ -73,7 +73,7 @@
 //! Each domain module re-exports its primary types at the crate root for ergonomic imports:
 //! - `wifi::*` exports [`WiFiConfig`](wifi::WiFiConfig), [`WifiDriver`](wifi::WifiDriver), etc.
 //! - `mqtt::*` exports [`MqttConnectionState`](mqtt::MqttConnectionState), validation functions, etc.
-//! - `lora::*` exports [`LoraRadio`](lora::LoraRadio), [`LorawanPhy`](lora::LorawanPhy), [`LorawanTicker`](lora::LorawanTicker), etc.
+//! - `lora::*` exports [`LoraRadio`](lora::LoraRadio), [`LorawanPhy`](lora::LorawanPhy), [`LorawanTimeline`](lora::LorawanTimeline), etc.
 //! - `espnow::*` exports [`EspNowDriver`](espnow::EspNowDriver), [`PeerTracker`](espnow::PeerTracker), etc.
 //! - `ota::*` exports [`OtaError`](ota::OtaError), [`StreamingVerifier`](ota::StreamingVerifier), etc.
 //! - `provisioning::*` exports [`ProvisioningState`](provisioning::ProvisioningState), [`SchemaProfile`](provisioning::SchemaProfile), etc.

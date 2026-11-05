@@ -212,6 +212,7 @@ struct LinkState {
     scan_script: VecDeque<Result<ScanResult, MockLinkError>>,
     last_timeout: Option<Duration>,
     pinned: Option<u8>,
+    shut_down: bool,
 }
 
 /// Mock implementation of [`EspNowLink`] (and [`EspNowDriver`]) for host-side tests.
@@ -241,6 +242,7 @@ impl MockEspNowLink {
                 scan_script: VecDeque::new(),
                 last_timeout: None,
                 pinned: None,
+                shut_down: false,
             }),
         }
     }
@@ -273,6 +275,11 @@ impl MockEspNowLink {
     /// Copies the registered peers as `(mac, interface)` pairs.
     pub fn peer_list(&self) -> Vec<(MacAddress, WifiInterface)> {
         self.driver.peer_list()
+    }
+
+    /// True once [`shutdown`](EspNowLink::shutdown) was called.
+    pub fn is_shut_down(&self) -> bool {
+        self.state.borrow().shut_down
     }
 
     /// The timeout passed to the latest [`send_acked`](EspNowLink::send_acked), if any.
@@ -362,5 +369,9 @@ impl EspNowLink for MockEspNowLink {
 
     fn pinned_channel(&self) -> Option<u8> {
         self.state.borrow().pinned
+    }
+
+    fn shutdown(&self) {
+        self.state.borrow_mut().shut_down = true;
     }
 }

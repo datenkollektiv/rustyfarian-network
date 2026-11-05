@@ -102,6 +102,8 @@ pub struct EspHalEspNow {
     tx: Mutex<CriticalSectionRawMutex, RefCell<TxState>>,
     /// Wakes the runner after a submission (latched, so a wake-up is never lost).
     runner_wake: Signal<CriticalSectionRawMutex, ()>,
+    /// Wakes a scan's timed wait when [`EspHalEspNow::shutdown`] is called.
+    shutdown_wake: Signal<CriticalSectionRawMutex, ()>,
     /// Set while [`EspHalEspNow::run_sender`] is being polled.
     runner_active: SharedCopy<bool>,
     /// Serialises [`EspHalEspNow::receive`] callers: `esp-radio` keeps one receive waker.
@@ -228,6 +230,7 @@ impl EspHalEspNow {
                 scan: ScanGate::new(),
             })),
             runner_wake: Signal::new(),
+            shutdown_wake: Signal::new(),
             runner_active: SharedCopy::new(false),
             receive_gate: Gate::new(),
             oversize: OversizeLog::new(),
@@ -348,11 +351,14 @@ impl EspHalEspNow {
     /// ([`EspHalEspNowError::Timeout`]); a transmission that has started always runs to its end,
     /// and a caller whose deadline passes meanwhile waits for its real result.
     ///
+    /// Returns once [`EspHalEspNow::shutdown`] was called (after the frame on the air, if any,
+    /// has finished); it never returns otherwise.
+    ///
     /// Spawn it exactly once, in an `embassy_executor::task` that is never cancelled:
     ///
     /// ```ignore
     /// #[embassy_executor::task]
-    /// async fn espnow_sender(espnow: &'static EspHalEspNow) -> ! {
+    /// async fn espnow_sender(espnow: &'static EspHalEspNow) {
     ///     espnow.run_sender().await
     /// }
     /// ```
@@ -380,7 +386,7 @@ impl EspHalEspNow {
     ///
     /// Only one runner may run per handle: a second concurrent call logs an error and then does
     /// nothing, forever. It consumes no request and signals no result.
-    pub async fn run_sender(&self) -> ! {
+    pub async fn run_sender(&self) {
         let Some(_active) = Singleton::acquire(&self.runner_active) else {
             log::error!("ESP-NOW: a sender runner is already running; this one does nothing");
             loop {
@@ -388,6 +394,9 @@ impl EspHalEspNow {
             }
         };
         loop {
+            if self.is_shut_down() {
+                return;
+            }
             match self.take_next() {
                 Ok(frame) => {
                     let result = self.transmit(&frame).await;
@@ -401,6 +410,33 @@ impl EspHalEspNow {
                 Err(None) => self.runner_wake.wait().await,
             }
         }
+    }
+
+    /// Stops the driver's asynchronous machinery; idempotent, never blocks.
+    ///
+    /// Queued and in-flight requests end as [`EspHalEspNowError::Shutdown`], a running
+    /// [`EspHalEspNow::scan_for_peer`] is aborted without a teardown (the channel, TX power and
+    /// peer table stay as they are, `ScanError::Aborted`), every later send or scan is refused
+    /// with the same error, and [`EspHalEspNow::run_sender`] returns after the frame on the air
+    /// (if any) has finished; its result is ignored.
+    /// Callers waiting for a free slot or for the air to clear are woken and fail the same way.
+    /// Same name and semantics as `EspIdfEspNow::shutdown` (ADR 022).
+    ///
+    /// There is no `Drop` counterpart: every future of this handle borrows it, so the handle
+    /// cannot be dropped while anything is pending, and a `'static` handle is never dropped.
+    /// Call this method to stop it.
+    pub fn shutdown(&self) {
+        self.with_tx(|state, wakes| {
+            state.core.shutdown(&mut |waker| wakes.push(waker));
+            state.full_waiters.drain_into(wakes);
+            state.idle_waiters.drain_into(wakes);
+        });
+        self.runner_wake.signal(());
+        self.shutdown_wake.signal(());
+    }
+
+    fn is_shut_down(&self) -> bool {
+        self.with_tx(|state, _| state.core.is_shut_down())
     }
 
     /// Runs `f` on the send queue under its lock, then wakes whoever it collected.
@@ -586,6 +622,8 @@ impl EspHalEspNow {
         if self.set_max_tx_power(previous).is_err() {
             log::warn!("ESP-NOW scan: could not restore TX power to {previous} quarter dBm");
         }
+        // The shadow value only says what this handle asked for; ask the radio.
+        juggler::espnow::warn_on_restore_mismatch(Some(previous), radio_max_tx_power());
     }
 
     /// Waits for `run_sender` to be polled for the first time, bounded by `deadline` and
@@ -612,6 +650,9 @@ impl EspHalEspNow {
             .unwrap_or(embassy_time::Instant::MAX);
         let give_up = runner_wait_deadline(deadline, grace_end);
         while !self.runner_active.get() {
+            if self.is_shut_down() {
+                return Err(EspHalEspNowError::Shutdown);
+            }
             if expired(Some(give_up), embassy_time::Instant::now()) {
                 return Err(EspHalEspNowError::NoSenderRunner);
             }
@@ -636,6 +677,9 @@ impl EspHalEspNow {
         kind: SendKind,
     ) -> TxResult {
         validate_frame_len(data)?;
+        if self.is_shut_down() {
+            return Err(EspHalEspNowError::Shutdown);
+        }
         self.await_runner(deadline).await?;
         let id = self.enqueue(mac, data, deadline, kind).await?;
         // No await sits between the queue accepting the request and this guard.
@@ -894,6 +938,10 @@ impl EspHalEspNow {
         let mut input = ScanInput::Start;
         let result = loop {
             let now = Duration::from_micros(start.elapsed().as_micros());
+            // Shutdown ends the scan at once without a teardown, like the ESP-IDF worker.
+            if input != ScanInput::Start && self.is_shut_down() {
+                input = ScanInput::Shutdown;
+            }
             let action = match machine.poll_bounded(now, input) {
                 Ok(action) => action,
                 Err(e) => break Err(e),
@@ -918,7 +966,11 @@ impl EspHalEspNow {
                     ScanInput::Sent(outcome)
                 }
                 ScanAction::WaitUntil(deadline) => {
-                    embassy_time::Timer::at(start + to_embassy(deadline)).await;
+                    let _ = embassy_time::with_deadline(
+                        start + to_embassy(deadline),
+                        self.shutdown_wake.wait(),
+                    )
+                    .await;
                     ScanInput::Completed
                 }
                 ScanAction::Done(result) => break result,
@@ -1057,6 +1109,10 @@ impl EspNowLink for EspHalEspNow {
     fn pinned_channel(&self) -> Option<u8> {
         EspHalEspNow::pinned_channel(self)
     }
+
+    fn shutdown(&self) {
+        EspHalEspNow::shutdown(self);
+    }
 }
 
 /// Tier parity check (ADR 022): fails to compile if `EspHalEspNow` stops implementing `EspNowLink`.
@@ -1067,6 +1123,8 @@ const _: fn() = || {
     {
     }
     implements::<EspHalEspNow>();
+    // The inherent `shutdown` keeps the name and shape of the ESP-IDF tier's (ADR 022).
+    let _: fn(&EspHalEspNow) = EspHalEspNow::shutdown;
 };
 
 /// Abandons a request when its caller is dropped before the result was taken.
@@ -1202,4 +1260,17 @@ fn map_error(error: EspNowError) -> EspHalEspNowError {
             Raw::Other(code) => RadioError::Other(code),
         }),
     }
+}
+
+/// Reads the radio's actual maximum TX power in quarter dBm, `None` when the driver refuses.
+fn radio_max_tx_power() -> Option<i8> {
+    extern "C" {
+        fn esp_wifi_get_max_tx_power(power: *mut i8) -> i32;
+    }
+    let mut power: i8 = 0;
+    // SAFETY: `esp_wifi_get_max_tx_power` is provided by esp-wifi-sys, always linked by every
+    // esp-radio build, and writes the current level to the valid `&mut i8` passed in.
+    // It fails with an error code (read as `None`) when Wi-Fi is not started.
+    let rc = unsafe { esp_wifi_get_max_tx_power(&mut power) };
+    (rc == 0).then_some(power)
 }

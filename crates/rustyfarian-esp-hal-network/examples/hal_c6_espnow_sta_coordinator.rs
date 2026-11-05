@@ -154,7 +154,7 @@ async fn main(spawner: Spawner) {
 
 /// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
 #[embassy_executor::task]
-async fn sender_task(espnow: &'static EspHalEspNow) -> ! {
+async fn sender_task(espnow: &'static EspHalEspNow) {
     espnow.run_sender().await
 }
 

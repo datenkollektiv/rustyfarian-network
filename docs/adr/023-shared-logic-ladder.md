@@ -3,6 +3,8 @@
 ## Status
 
 Accepted (2026-11-04).
+Decisions 5 and 6 amended (2026-11-05): decision 5 for the explicit `Ignored` variants, decision 6 to cover finite and persistent lifecycles; the closure evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
+Decisions 1 and 10 amended (2026-11-05): decision 1 for the flattened machines and the IDF ESP-NOW worker core, decision 10 for the port instance.
 Refines [ADR 022](022-tier-parity-one-async-api.md) decision 10; it does not supersede it.
 The review rule and the ports-and-adapters split stand, and "behaviour lives in sans-IO machines" becomes "behaviour lives in `juggler` on the lowest rung that fits".
 `rustyfarian-power` ADR-004 and `rustyfarian-peripherals` ADR-010 adopt the same ladder.
@@ -18,7 +20,8 @@ Much of `juggler` is flat logic (`decide_offer`, `reconcile`, `ChunkAligner`, MQ
 This repo differs from the siblings in three ways that change the wording, not the ideas.
 
 - There is no standard trait for Wi-Fi, MQTT or ESP-NOW, so the cores take narrow custom ports.
-  `LinkSupervisor<R: LinkRadio>` has an IDF port, `IdfRadio`, that maps four `esp_wifi_*` calls, and it is host-tested against `MockRadio`; `TxCore<R, N>` follows the same shape.
+  `LinkSupervisor<R: LinkRadio>` has an IDF port, `IdfRadio`, that maps four `esp_wifi_*` calls, and it is host-tested against `MockRadio`.
+  `EspNowWorker<R: EspNowRadio>` follows the same shape: the IDF ESP-NOW `IdfRadio` maps six one-call methods, and the worker is host-tested against a mock radio.
 - The cores that drive the machines may hold injected wake-up primitives (`embassy-sync`, stored `Waker`s), as [ADR 022](022-tier-parity-one-async-api.md) decision 10 already allows.
   The machines themselves stay free of async.
 - `juggler` uses `alloc` (the MQTT outbox, chunk reassembly), so "allocation-free" applies to the machines only where practical.
@@ -33,10 +36,21 @@ This repo differs from the siblings in three ways that change the wording, not t
      That store reuses juggler's record logic through the `ProvisioningKv` port.
    - **Rung 2 — event machine.** The core decodes samples: `update(sample, now) -> Option<Event>`.
      A tier, an ISR, or an `embedded-hal` adapter feeds it.
-     The instances are `juggler::lora::LorawanTicker`, with `update(irq_pending, now_ms) -> Option<TickEvent>`, and `juggler::mqtt::NetworkGate`, with `feed(ready) -> Option<SessionInput>`.
+     The instances are `juggler::mqtt::NetworkGate`, with `feed(ready) -> Option<SessionInput>`, and two IDF-only decoders.
+     `ManifestBody::feed(n, elapsed) -> Feed` (`juggler/src/ota/runtime/fetch.rs`) takes the time as an input, the same shape as `update(sample, now)`.
+     `ChunkAssembler::feed(chunk) -> Assembled` (`juggler/src/mqtt/chunks.rs`) takes no clock, as `NetworkGate` does.
      `NetworkGate` takes no clock because it only turns readiness edges into events.
    - **Rung 3 — action machine.** The core emits I/O requests: `poll(&mut self, input) -> Action`, and a thin loop per tier performs them.
-     Examples are `LinkMachine` (`juggler::wifi::link`), `SessionMachine` (`juggler::mqtt::session`), `ScanMachine` (`juggler::espnow::scan`), `HealthMachine` and `ReporterMachine` (`juggler::ota::runtime`), `DownloadMachine` (`juggler::ota::download`), `PortalMachine` (`juggler::provisioning::portal_flow`), and `PeerLink` (`juggler::espnow::link`).
+     Examples are `LinkMachine` (`juggler::wifi::link`), `SessionMachine` (`juggler::mqtt::session`), `ScanMachine` and `ScanGate` (`juggler::espnow::scan`, `juggler::espnow::scan_job`), `DownloadMachine` (`juggler::ota::download`), `PortalMachine` (`juggler::provisioning::portal_flow`), `PeerLink` (`juggler::espnow::link`) and `TxCore` (`juggler::espnow::tx`).
+   - Dated 2026-11-05: the closure audit re-judged five flows against the decision 2 triggers, and three of them are flat logic now, not machines.
+     The LoRaWAN event tick runs in one blocking loop on one tier (the IDF examples), so `LorawanTicker` became the stateless `juggler::lora::LorawanTimeline::next_event` with the pure `classify_response` and `requested_deadline`; it was never released.
+     The post-update health policy runs on the app's main thread of the IDF tier only, so `HealthMachine` became the pure `poll_decision`, `after_unhealthy`, `deadline_plan` and `SlotReads`, driven by sequential code.
+     The `rolled_back` report delivery and the completion retry run on the IDF reporter thread only, so `ReporterMachine` and `CompletionRetry` became the plain-data `ReportPace` and `CompletionBackoff` with the pure `after_publish` and `completion_step`.
+     The released machines (`HealthMachine`, `ReporterMachine`, `CompletionRetry`, with `HealthAction`, `HealthEvent` and `ViewStep`) stay as deprecated wrappers over the same functions for one release.
+     `ScanGate` and `PortalMachine` stay at rung 3: the IDF tier runs both from threads (the `espnow-tx` worker and `httpd` handlers) and the hal tier from cooperative async, so decision 2 trigger one holds; the evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
+   - Dated 2026-11-05: the IDF ESP-NOW transmit and scan loop moved into `juggler::espnow::EspNowWorker<R: EspNowRadio>` (`std`), so the IDF adapter keeps only its one-call port.
+     The worker runs on the IDF tier alone, as `LinkSupervisor` does, but it sits on `TxCore`, `ScanGate` and `ScanMachine`, which the hal tier also runs under its cooperative runner.
+     Decision 2 trigger one therefore holds for the shared core, and the worker is its thread-side driver.
 2. Rung 3 is used only when a flow meets one of these triggers:
    - It must run under more than one execution model, such as threads, events, or cancel-safe async.
    - The tiers perform I/O outside `embedded-hal`, such as `esp_wifi_*` or esp-radio calls, but must share the order of the steps.
@@ -46,14 +60,29 @@ This repo differs from the siblings in three ways that change the wording, not t
 5. A rung-3 machine answers out-of-phase input with an explicit no-op action, so a host test of a tier loop can detect it.
    `LinkAction::None` and `SessionAction::None` currently mean both "nothing to do" and "input ignored".
    The ladder retrofit before the next release brings every existing machine onto this rule.
-6. Every rung-3 flow reaches a terminal action, and the tier loop bounds its iterations or its time budget.
-   A machine that follows decision 5 lets the loop treat the no-op action as an error exit.
+   Dated 2026-11-05: the retrofit added explicit `Ignored` variants to `LinkAction`, `SessionAction`, `ScanAction` and others (see the CHANGELOG), so `None` no longer means "input ignored" on those enums; `TxCore` has no `Ignored` variant yet, which stays open in [ladder-closure-v1](../features/ladder-closure-v1.md).
+   `ScanGate` has no `Ignored` variant either: a stale epoch answers `Cancelled::Stale` and changes nothing, admission answers `GateRefusal`, and a stale `release` does nothing.
+6. Every rung-3 flow has a defined lifecycle, and its tier loop bounds every wait.
+   A loop-driven finite flow reaches a terminal action, such as `DownloadMachine` `Done` or `ScanMachine` `Done`; its loop treats a no-op after that action as an error exit.
+   `ScanGate` is finite per scan: its exclusion ends on `finish`, `cancel` or `release`.
+   `PortalMachine` is request-driven, so each request is one `poll` and there is no loop bound.
+   Its terminal states (`Committed`, `FactoryResetPending`) answer later input with `Refused`, which both tiers map to HTTP 409, and a bad nonce answers `Forbidden`.
+   A persistent service never terminates, such as `LinkMachine` (Wi-Fi), `SessionMachine` (MQTT) or `TxCore` (ESP-NOW worker), but every iteration between waits is bounded by a tick, a timeout or a budget, such as the 500 ms `NETWORK_POLL_MS` and `POLL_TICK` ticks or the Wi-Fi back-off deadline.
+   Tier loops differ on `Ignored`: the IDF MQTT runner counts it and logs at 16 in a row, the esp-hal runner restarts; see [ladder-closure-v1](../features/ladder-closure-v1.md).
+   Four waits are exceptions: a frame already on the air is waited out with no bound (ADR 020, on both ESP-NOW tiers), the IDF Wi-Fi and ESP-NOW workers block on their event source while idle, which relies on the driver event contract, and the esp-hal `run_sender` blocks on its wake signal with no deadline while the queue is empty.
+   Dated 2026-11-05: on esp-hal, `shutdown` wakes `run_sender`, which returns after the frame on the air has finished, so it is the one esp-hal persistent service with a defined exit; the esp-hal MQTT runner and `WifiLink::run` never return.
+   On ESP-IDF the MQTT runner closes the session and returns when its last handle drops or its inputs close, `EspNowWorker::stop` joins the `espnow-tx` thread (also on drop), and `LinkSupervisor` joins its worker on drop.
+   A second `run_sender` parks forever by design, after it logs an error.
+   The exceptions and the open gaps are listed in [ladder-closure-v1](../features/ladder-closure-v1.md).
 7. Review rule (from [ADR 022](022-tier-parity-one-async-api.md) decision 10): a branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
 8. Per-chip behaviour is a runtime value passed in by the tier, not a `cfg` gate inside a machine.
    The ESP32-C3 TX-power clamp lives in the hal adapter, and the SoftAP gate (`esp_idf_esp_wifi_softap_support`) is tier build configuration.
+   Dated 2026-11-05: no C3-specific clamp exists, because the hal adapter calls `set_tx_power_or_log` on every chip, always on the AP path and on the STA path only when `tx_power` is not the default; the drift is recorded in [ladder-closure-v1](../features/ladder-closure-v1.md).
 9. Tier-specific facts stay in the adapters: esp-mqtt `api_lock` and callback threading ([ADR 017](017-mqtt-callback-threading-contract.md)), worker threads, radio register calls, and provider selection ([ADR 021](021-binary-owned-providers.md)).
 10. A port trait is narrow: one driver call or one event mapping per method, with no decisions.
     A generic runner over a wide port is not used, because the port would have to model the whole flow.
+    Dated 2026-11-05: `EspNowRadio` (`juggler::espnow::worker`) is the IDF ESP-NOW instance, with six methods (`send`, `set_channel`, `tx_power`, `set_tx_power`, `add_peer` and `remove_peer`) that each make one driver call, except that `send` with `repin` lets the tier wrap the send in its chip-specific re-pin bracket (a tier fact, ADR 023 decision 9).
+    `IdfRadio` in the IDF adapter implements it.
 11. A one-time retrofit applies the ladder to all existing code before the next release, followed by one hardware run across the affected flows.
     After the retrofit, moving a flow up a rung is demand-driven: the first change that needs it pays for it.
 

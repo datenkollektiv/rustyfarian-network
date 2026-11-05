@@ -387,6 +387,7 @@ test-lora:
 # run platform-independent ESP-NOW unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
 test-espnow: test-wifi
+    cargo test --target {{ host_target }} -p juggler --features espnow,mock,std espnow::worker
 
 # run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]

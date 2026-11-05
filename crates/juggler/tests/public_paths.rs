@@ -365,14 +365,15 @@ fn lora_public_paths() {
     // We name the type in a phantom way to confirm the import compiles.
     fn _accepts_device<R: LoraRadio>(_: &LorawanDevice<R>) {}
 
-    // Shared-logic ladder (ADR 023): flat rules, rung-1 bring-up, PHY bridge, rung-2 ticker.
+    // Shared-logic ladder (ADR 023): flat rules, rung-1 bring-up, PHY bridge, event-loop rules.
     use juggler::lora::sx1262::{
         init, irq_flags, InitError, InitStep, BRING_UP_ORDER, DEFAULT_BUSY_POLL_BOUND,
     };
     use juggler::lora::{
-        classify_irq, ldro_required, map_rf_config, IrqOutcome, LorawanPhy, LorawanTicker, Outcome,
-        RadioErrorKind, TickEvent, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED, LORAWAN_PREAMBLE_LEN,
-        LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
+        classify_irq, ldro_required, map_rf_config, IrqOutcome, LorawanPhy, LorawanTimeline,
+        Outcome, RadioErrorKind, TickEvent, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED,
+        LORAWAN_PREAMBLE_LEN, LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, UPLINK_CRC_ON,
+        UPLINK_IQ_INVERTED,
     };
     let _: u32 = Region::EU868.default_rf_hz();
     let _: u32 = Region::EU868.image_calibration_hz();
@@ -396,8 +397,12 @@ fn lora_public_paths() {
     );
     let _: Option<InitError> = None;
     let _: Option<InitStep> = None;
-    let mut ticker = LorawanTicker::new(1_000, 0);
-    let _: Option<TickEvent> = ticker.update(false, 0);
+    let timeline = LorawanTimeline::new(1_000, 0);
+    let _: Option<TickEvent> = timeline.next_event(false, 0, None);
+    let _ = (
+        juggler::lora::requested_deadline,
+        juggler::lora::classify_response,
+    );
     let _: Outcome = Outcome::Continue;
     fn _accepts_phy<R: LoraRadio>(_: &LorawanPhy<R>)
     where
@@ -652,11 +657,13 @@ fn ota_persist_public_paths() {
 #[test]
 fn ota_runtime_public_paths() {
     use core::time::Duration;
+    use juggler::ota::runtime::CompletionTry;
     use juggler::ota::runtime::{
-        decide_intake, plan_rollback, rejects_delta, DeliveryStep, Feed, HealthAction,
-        HealthConfig, HealthEvent, HealthMachine, IntakeDecision, ManifestBody, OfferPlan,
-        PublishOutcome, PublishStep, ReporterConfig, ReporterMachine, Retention, SendResult,
-        ViewStep,
+        after_publish, after_unhealthy, completion_step, deadline_plan, decide_intake,
+        plan_rollback, poll_decision, rejects_delta, CompletionBackoff, CompletionRetryConfig,
+        CompletionStep, DeliveryStep, Feed, HealthConfig, IntakeDecision, ManifestBody, OfferPlan,
+        PollStep, PublishOutcome, PublishStep, ReportPace, ReporterConfig, Retention, SendResult,
+        SlotReads, SlotRetry,
     };
     use juggler::ota::{
         ConfigError, DeadlineAction, FailReason, HealthVerdict, OtaCommand, OtaSettings, OtaStacks,
@@ -682,21 +689,58 @@ fn ota_runtime_public_paths() {
     assert_eq!(decision, IntakeDecision::Queued);
 
     let timings = OtaTimings::default();
-    let mut health = HealthMachine::new(HealthConfig::from(&timings));
+    let health = HealthConfig::from(&timings);
     assert_eq!(
-        health.step(Duration::ZERO, false, HealthEvent::Begin),
-        HealthAction::ReadSlot
+        poll_decision(&health, Duration::ZERO, false),
+        PollStep::Wait(health.poll_interval)
     );
+    assert_eq!(
+        poll_decision(&health, health.healthy_dwell, false),
+        PollStep::Evaluate
+    );
+    assert_eq!(
+        after_unhealthy(&health, health.failure_deadline),
+        PollStep::Deadline
+    );
+    assert!(matches!(
+        SlotReads::default().busy(&health, Duration::ZERO),
+        SlotRetry::Sleep { .. }
+    ));
+    assert!(!deadline_plan(&health).restart);
     assert!(HealthVerdict::Applied.publishes_applied());
 
-    let mut reporter = ReporterMachine::new(ReporterConfig::from(&timings));
-    assert!(reporter.report_due(Duration::ZERO));
-    assert_eq!(reporter.on_view(Duration::ZERO, true), ViewStep::Publish);
+    let reporter = ReporterConfig::from(&timings);
+    let pace = ReportPace::new();
+    assert!(pace.due(Duration::ZERO));
     assert_eq!(
-        reporter.on_publish(Duration::ZERO, PublishOutcome::Acked),
+        after_publish(PublishOutcome::Acked),
         PublishStep::MarkDelivered
     );
-    let _ = DeliveryStep::Done;
+    let (step, _) = pace.delivered(&reporter, Duration::ZERO, juggler::ota::Delivery::Marked);
+    assert_eq!(step, DeliveryStep::Done);
+    let completion = CompletionRetryConfig::from(&timings);
+    let backoff = CompletionBackoff::armed(&completion, Duration::ZERO);
+    assert!(backoff.wait(Duration::ZERO) > Duration::ZERO);
+    assert_eq!(
+        completion_step(CompletionTry::Completed),
+        CompletionStep::Stop
+    );
+
+    // The deprecated action machines stay reachable for one release.
+    #[allow(deprecated)]
+    {
+        use juggler::ota::runtime::{
+            HealthAction, HealthEvent, HealthMachine, ReporterMachine, ViewStep,
+        };
+        let mut machine = HealthMachine::new(health);
+        assert_eq!(
+            machine.step(Duration::ZERO, false, HealthEvent::Begin),
+            HealthAction::ReadSlot
+        );
+        let mut machine = ReporterMachine::new(reporter);
+        assert!(machine.report_due(Duration::ZERO));
+        assert_eq!(machine.on_view(Duration::ZERO, true), ViewStep::Publish);
+    }
     assert_eq!(rejects_delta(3, 1), 2);
 
     let mut body = ManifestBody::new(Duration::from_secs(10));

@@ -12,10 +12,10 @@ pub use juggler::lora::config;
 pub use juggler::lora::lorawan;
 pub use juggler::lora::sx1262;
 pub use juggler::lora::{
-    classify_irq, ldro_required, map_rf_config, IrqOutcome, LorawanPhy, LorawanTicker, Outcome,
-    RadioErrorKind, TickEvent, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED, IRQ_CRC_ERR, IRQ_RX_DONE,
-    IRQ_TIMEOUT, IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN, LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX,
-    UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
+    classify_irq, classify_response, ldro_required, map_rf_config, requested_deadline, IrqOutcome,
+    LorawanPhy, LorawanTimeline, Outcome, RadioErrorKind, TickEvent, DOWNLINK_CRC_ON,
+    DOWNLINK_IQ_INVERTED, IRQ_CRC_ERR, IRQ_RX_DONE, IRQ_TIMEOUT, IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN,
+    LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
 };
 pub use juggler::lora::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,

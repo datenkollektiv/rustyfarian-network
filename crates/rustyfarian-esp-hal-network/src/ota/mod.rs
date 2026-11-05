@@ -282,8 +282,8 @@ mod reexport_parity_guard {
         assert_exported::<StoreError>();
         assert_exported::<StoredAttempt>();
         use crate::ota::runtime::{
-            decide_intake, HealthConfig, HealthEvent, HealthMachine, IntakeDecision, ManifestBody,
-            ReporterConfig, ReporterMachine, Retention, SendResult,
+            decide_intake, poll_decision, HealthConfig, IntakeDecision, ManifestBody, PollStep,
+            ReportPace, ReporterConfig, Retention, SendResult,
         };
         use crate::ota::{
             ConfigError, DeadlineAction, HealthVerdict, OtaSettings, OtaStacks, OtaTimings,
@@ -310,10 +310,15 @@ mod reexport_parity_guard {
             ),
             IntakeDecision::Queued
         ));
-        let mut health = HealthMachine::new(HealthConfig::from(&settings.timings));
-        let _first = health.step(core::time::Duration::ZERO, false, HealthEvent::Begin);
+        let health = HealthConfig::from(&settings.timings);
+        assert!(matches!(
+            poll_decision(&health, core::time::Duration::ZERO, false),
+            PollStep::Wait(_)
+        ));
         assert!(HealthVerdict::Applied.publishes_applied());
-        let _reporter = ReporterMachine::new(ReporterConfig::from(&settings.timings));
+        let reporter = ReporterConfig::from(&settings.timings);
+        assert!(ReportPace::new().due(core::time::Duration::ZERO));
+        assert!(reporter.retry > core::time::Duration::ZERO);
         let _body = ManifestBody::new(core::time::Duration::from_secs(10));
 
         let mut store = OtaStore::open(NeverKv, || 1);

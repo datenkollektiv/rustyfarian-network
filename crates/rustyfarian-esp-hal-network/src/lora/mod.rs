@@ -4,7 +4,7 @@
 //! [`juggler::lora::LoraRadio`] trait using `esp-hal` SPI and GPIO peripherals.
 //!
 //! The shared surface — config, LoRaWAN types, the [`LorawanPhy`] bridge, the
-//! [`LorawanTicker`], the [`sx1262`] bring-up and the PHY rules — is re-exported
+//! [`LorawanTimeline`], the [`sx1262`] bring-up and the PHY rules — is re-exported
 //! from [`juggler::lora`] under the same paths as `rustyfarian_esp_idf_network::lora`
 //! (ADR 022), so consumer code swaps between the tiers.
 //!
@@ -28,10 +28,10 @@ pub use juggler::lora::config;
 pub use juggler::lora::lorawan;
 pub use juggler::lora::sx1262;
 pub use juggler::lora::{
-    classify_irq, ldro_required, map_rf_config, IrqOutcome, LorawanPhy, LorawanTicker, Outcome,
-    RadioErrorKind, TickEvent, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED, IRQ_CRC_ERR, IRQ_RX_DONE,
-    IRQ_TIMEOUT, IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN, LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX,
-    UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
+    classify_irq, classify_response, ldro_required, map_rf_config, requested_deadline, IrqOutcome,
+    LorawanPhy, LorawanTimeline, Outcome, RadioErrorKind, TickEvent, DOWNLINK_CRC_ON,
+    DOWNLINK_IQ_INVERTED, IRQ_CRC_ERR, IRQ_RX_DONE, IRQ_TIMEOUT, IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN,
+    LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
 };
 pub use juggler::lora::{
     Bandwidth, CodingRate, LoraRadio, RxConfig, RxQuality, RxWindow, SpreadingFactor, TxConfig,
@@ -55,14 +55,14 @@ pub use driver::{EspHalLoraRadio, LoraError};
 #[allow(deprecated)]
 mod reexport_parity_guard {
     use super::{
-        classify_irq, commands, config, ldro_required, lorawan, map_rf_config, sx1262, Bandwidth,
-        CodingRate, Downlink, EspHalLoraRadio, HeltecV3Pins, IrqOutcome, LoraConfig, LoraError,
-        LoraRadio, LorawanDevice, LorawanError, LorawanPhy, LorawanResponse, LorawanSessionData,
-        LorawanState, LorawanTicker, Outcome, RadioErrorKind, Region, RxConfig, RxQuality,
-        RxWindow, SpreadingFactor, TickEvent, TxConfig, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED,
-        IRQ_CRC_ERR, IRQ_RX_DONE, IRQ_TIMEOUT, IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN,
-        LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX, RX_WINDOW_DURATION_MS, RX_WINDOW_OFFSET_MS,
-        UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
+        classify_irq, classify_response, commands, config, ldro_required, lorawan, map_rf_config,
+        requested_deadline, sx1262, Bandwidth, CodingRate, Downlink, EspHalLoraRadio, HeltecV3Pins,
+        IrqOutcome, LoraConfig, LoraError, LoraRadio, LorawanDevice, LorawanError, LorawanPhy,
+        LorawanResponse, LorawanSessionData, LorawanState, LorawanTimeline, Outcome,
+        RadioErrorKind, Region, RxConfig, RxQuality, RxWindow, SpreadingFactor, TickEvent,
+        TxConfig, DOWNLINK_CRC_ON, DOWNLINK_IQ_INVERTED, IRQ_CRC_ERR, IRQ_RX_DONE, IRQ_TIMEOUT,
+        IRQ_TX_DONE, LORAWAN_PREAMBLE_LEN, LORAWAN_PUBLIC_SYNC_WORD, RX_PAYLOAD_MAX,
+        RX_WINDOW_DURATION_MS, RX_WINDOW_OFFSET_MS, UPLINK_CRC_ON, UPLINK_IQ_INVERTED,
     };
 
     #[test]
@@ -83,7 +83,8 @@ mod reexport_parity_guard {
         assert_exported::<LorawanResponse>();
         assert_exported::<LorawanSessionData>();
         assert_exported::<LorawanState>();
-        assert_exported::<LorawanTicker>();
+        assert_exported::<LorawanTimeline>();
+        let _ = (classify_response, requested_deadline);
         assert_exported::<TickEvent>();
         assert_exported::<Outcome>();
         assert_exported::<IrqOutcome>();

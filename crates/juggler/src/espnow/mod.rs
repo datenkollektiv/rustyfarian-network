@@ -17,6 +17,8 @@
 //!   borrow-free [`ScanTeardown`]
 //! - [`ScanGate`] — the scan-exclusion lifecycle on a [`TxCore`]: admission, cancellation,
 //!   the teardown deferred behind a probe on the air, release
+//! - `EspNowWorker` (`std`) — the thread-based transmit worker of the ESP-IDF tier behind the narrow
+//!   `EspNowRadio` port, the ESP-NOW counterpart of `wifi::LinkSupervisor`
 //! - [`mock::MockEspNowDriver`], [`mock::MockEspNowLink`] — test doubles for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -38,6 +40,8 @@ pub mod scan;
 pub mod scan_job;
 pub mod tracker;
 pub mod tx;
+#[cfg(feature = "std")]
+pub mod worker;
 
 pub use callback::InFlightMarker;
 pub use command::{
@@ -50,6 +54,7 @@ pub use link::{
     PeerLink, PeerLinkAction, PeerLinkConfig, PeerLinkEpoch, PeerLinkEvent, PeerLinkState,
 };
 pub use link_trait::{ClassifySend, EspNowLink};
+pub use scan::{restore_matches, warn_on_restore_mismatch};
 pub use scan::{
     ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, ScanTeardown, SendOutcome,
 };
@@ -60,6 +65,10 @@ pub use tx::DeferredRestore;
 pub use tx::{
     Abandon, Completed, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId,
     PROBE_RESERVED_SLOTS,
+};
+#[cfg(feature = "std")]
+pub use worker::{
+    EspNowRadio, EspNowWorker, SendEvents, TxOutcome, WorkerConfig, WorkerError, TX_SLOTS,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────

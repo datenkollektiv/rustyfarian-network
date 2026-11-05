@@ -57,7 +57,7 @@
 //!   and the config types shared with the bare-metal tier — [`mqtt::QoS`],
 //!   [`mqtt::MqttConfig`], [`mqtt::LwtConfig`], [`mqtt::TryPublishError`]; raw
 //!   `EspMqttClient` calls convert QoS with [`mqtt::to_esp_qos`]
-//! - `lora::*` exports [`lora::LoraRadio`], [`lora::LorawanPhy`], [`lora::LorawanTicker`], [`lora::Region`], etc. from `juggler::lora`
+//! - `lora::*` exports [`lora::LoraRadio`], [`lora::LorawanPhy`], [`lora::LorawanTimeline`], [`lora::Region`], etc. from `juggler::lora`
 //! - `espnow::*` exports [`espnow::EspNowDriver`], [`espnow::ScanConfig`], etc. from `juggler::espnow`
 //! - `ota::*` exports [`ota::OtaError`], [`ota::StreamingVerifier`], etc. from `juggler::ota`
 //! - `provisioning::*` exports [`provisioning::ProvisioningState`], [`provisioning::SchemaProfile`], etc. from `juggler::provisioning`

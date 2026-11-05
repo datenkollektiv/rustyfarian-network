@@ -1,12 +1,15 @@
 //! Delivery of the `rolled_back` report: when to try, what an outcome means, and the retry schedule.
 //!
-//! The reporter thread (ESP-IDF tier) owns the loop and the effects; this machine only decides.
+//! The reporter thread (ESP-IDF tier) owns the loop and the effects.
+//! One tier runs it on one thread, so it is flat logic (ADR 023 decision 3): the thread performs the view, publish and delivery steps in plain sequential code, and asks [`ReportPace`], [`after_publish`], [`CompletionBackoff`] and [`completion_step`] only for the decisions.
 //! Time is `Duration` since the reporter started.
 //!
-//! One pass runs view → publish → delivery. A call out of that order leaves the machine unchanged and is answered with an explicit `Ignored` step, so a loop can treat it as a desync and leave the pass (ADR 023 decisions 5 and 6).
-//! [`ReporterMachine::on_disconnected`] and [`ReporterMachine::on_store_error`] end the pass from any phase.
-//!
 //! The wait of the reporter is ALWAYS bounded by the retry interval, even when nothing is pending, so a report re-armed by a repair, or one that appears after boot, is picked up within one interval, and the thread notices a closed runtime.
+//!
+//! [`ReporterMachine`] and [`CompletionRetry`] are the earlier action machines over the same decisions; they are deprecated and kept for one release.
+//! The `Ignored` variants of the step enums are returned only by those machines.
+
+#![allow(deprecated)]
 
 use core::time::Duration;
 
@@ -65,6 +68,9 @@ pub enum PublishStep {
 }
 
 /// What the pending-report view said.
+///
+/// Deprecated with [`ReporterMachine`].
+#[deprecated(since = "0.7.0", note = "flat logic since ADR 023: use `ReportPace`")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewStep {
     /// A report is ready: publish it.
@@ -97,12 +103,116 @@ enum Awaiting {
     Delivery,
 }
 
-/// The reporter's schedule and bookkeeping.
+/// When the next report pass is due and how many immediate follow-up passes ran.
+///
+/// Plain data: every transition returns the next value, so the reporter thread keeps one `ReportPace` and replaces it after each pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportPace {
+    next_due: Duration,
+    other_passes: u32,
+}
+
+impl Default for ReportPace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReportPace {
+    /// A pace whose first pass is due immediately.
+    pub const fn new() -> Self {
+        Self {
+            next_due: Duration::ZERO,
+            other_passes: 0,
+        }
+    }
+
+    /// How long the loop may wait for a queued rejection: never longer than the retry interval.
+    pub fn wait(&self, cfg: &ReporterConfig, now: Duration) -> Duration {
+        self.next_due.saturating_sub(now).min(cfg.retry)
+    }
+
+    /// The report check is due.
+    pub fn due(&self, now: Duration) -> bool {
+        now >= self.next_due
+    }
+
+    /// The broker is not connected: look again soon, without reading the store.
+    #[must_use]
+    pub fn disconnected(self, cfg: &ReporterConfig, now: Duration) -> Self {
+        Self {
+            next_due: now + cfg.connect_poll,
+            ..self
+        }
+    }
+
+    /// The pass ended with nothing to publish, or the store could not be read or written: try again at the next window.
+    #[must_use]
+    pub fn pass_ended(self, cfg: &ReporterConfig, now: Duration) -> Self {
+        Self {
+            next_due: now + cfg.retry,
+            other_passes: 0,
+        }
+    }
+
+    /// The publish did not end with an acknowledgement: keep the report and try again at the next window.
+    #[must_use]
+    pub fn publish_failed(self, cfg: &ReporterConfig, now: Duration) -> Self {
+        Self {
+            next_due: now + cfg.retry,
+            ..self
+        }
+    }
+
+    /// The delivery mark was written (or found nothing to do).
+    ///
+    /// A different pending report is followed by at most `max_other_passes` immediate passes ([`DeliveryStep::PublishNext`]), then by the normal window ([`DeliveryStep::Done`]).
+    #[must_use]
+    pub fn delivered(
+        self,
+        cfg: &ReporterConfig,
+        now: Duration,
+        delivery: Delivery,
+    ) -> (DeliveryStep, Self) {
+        if let Delivery::OtherReport { .. } = delivery {
+            if self.other_passes < cfg.max_other_passes {
+                return (
+                    DeliveryStep::PublishNext,
+                    Self {
+                        next_due: now,
+                        other_passes: self.other_passes + 1,
+                    },
+                );
+            }
+        }
+        (DeliveryStep::Done, self.pass_ended(cfg, now))
+    }
+}
+
+/// What to do after a publish ended with `outcome`.
+///
+/// Only an acknowledgement marks the report delivered; every other outcome keeps it, and a call from inside an MQTT callback is a bug worth an error log.
+pub fn after_publish(outcome: PublishOutcome) -> PublishStep {
+    if outcome == PublishOutcome::Acked {
+        PublishStep::MarkDelivered
+    } else {
+        PublishStep::RetryLater {
+            loud: outcome == PublishOutcome::WrongThread,
+        }
+    }
+}
+
+/// The report pass as an action machine.
+///
+/// Deprecated: the reporter runs on one thread of one tier, so the schedule is plain data and the order is sequential code (ADR 023 decisions 2 and 3).
+#[deprecated(
+    since = "0.7.0",
+    note = "flat logic since ADR 023: keep a `ReportPace` and call `after_publish`"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReporterMachine {
     cfg: ReporterConfig,
-    next_due: Duration,
-    other_passes: u32,
+    pace: ReportPace,
     awaiting: Awaiting,
 }
 
@@ -111,26 +221,25 @@ impl ReporterMachine {
     pub const fn new(cfg: ReporterConfig) -> Self {
         Self {
             cfg,
-            next_due: Duration::ZERO,
-            other_passes: 0,
+            pace: ReportPace::new(),
             awaiting: Awaiting::View,
         }
     }
 
     /// How long the loop may wait for a queued rejection: never longer than the retry interval.
     pub fn next_wait(&self, now: Duration) -> Duration {
-        self.next_due.saturating_sub(now).min(self.cfg.retry)
+        self.pace.wait(&self.cfg, now)
     }
 
     /// The report check is due.
     pub fn report_due(&self, now: Duration) -> bool {
-        now >= self.next_due
+        self.pace.due(now)
     }
 
     /// The broker is not connected: end the pass and look again soon, without reading the store.
     pub fn on_disconnected(&mut self, now: Duration) {
         self.awaiting = Awaiting::View;
-        self.next_due = now + self.cfg.connect_poll;
+        self.pace = self.pace.disconnected(&self.cfg, now);
     }
 
     /// The store was read: `ready` says a report is waiting.
@@ -144,8 +253,7 @@ impl ReporterMachine {
             self.awaiting = Awaiting::Publish;
             ViewStep::Publish
         } else {
-            self.other_passes = 0;
-            self.next_due = now + self.cfg.retry;
+            self.pace = self.pace.pass_ended(&self.cfg, now);
             ViewStep::Idle
         }
     }
@@ -153,8 +261,7 @@ impl ReporterMachine {
     /// The store could not be read or written, or the pass was abandoned: end it and try again at the next window.
     pub fn on_store_error(&mut self, now: Duration) {
         self.awaiting = Awaiting::View;
-        self.other_passes = 0;
-        self.next_due = now + self.cfg.retry;
+        self.pace = self.pace.pass_ended(&self.cfg, now);
     }
 
     /// The publish ended with `outcome`.
@@ -164,15 +271,14 @@ impl ReporterMachine {
         if self.awaiting != Awaiting::Publish {
             return PublishStep::Ignored;
         }
-        if outcome == PublishOutcome::Acked {
+        let step = after_publish(outcome);
+        if step == PublishStep::MarkDelivered {
             self.awaiting = Awaiting::Delivery;
-            return PublishStep::MarkDelivered;
+        } else {
+            self.awaiting = Awaiting::View;
+            self.pace = self.pace.publish_failed(&self.cfg, now);
         }
-        self.awaiting = Awaiting::View;
-        self.next_due = now + self.cfg.retry;
-        PublishStep::RetryLater {
-            loud: outcome == PublishOutcome::WrongThread,
-        }
+        step
     }
 
     /// The delivery mark was written (or found nothing to do).
@@ -184,16 +290,9 @@ impl ReporterMachine {
             return DeliveryStep::Ignored;
         }
         self.awaiting = Awaiting::View;
-        if let Delivery::OtherReport { .. } = delivery {
-            if self.other_passes < self.cfg.max_other_passes {
-                self.other_passes += 1;
-                self.next_due = now;
-                return DeliveryStep::PublishNext;
-            }
-        }
-        self.other_passes = 0;
-        self.next_due = now + self.cfg.retry;
-        DeliveryStep::Done
+        let (step, pace) = self.pace.delivered(&self.cfg, now, delivery);
+        self.pace = pace;
+        step
     }
 }
 
@@ -226,21 +325,66 @@ impl From<&OtaTimings> for CompletionRetryConfig {
     }
 }
 
-/// The background retry of `complete_attempt` after the health policy ended with `ApplyNotRecorded`.
+/// The schedule of the background retry of `complete_attempt` after the health policy ended with `ApplyNotRecorded`.
 ///
-/// The image is already valid and `applied` already published; this only keeps trying to clear the attempt record so admission reopens without a reset.
-/// The reporter thread owns the loop (no sleep happens under the store lock); this machine owns the schedule.
+/// The image is already valid and `applied` already published; the retry only keeps trying to clear the attempt record so admission reopens without a reset.
+/// The reporter thread owns the loop (no sleep happens under the store lock) and keeps an `Option<CompletionBackoff>`: `None` while not armed.
 /// Time is `Duration` since the reporter started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionBackoff {
+    next_due: Duration,
+    delay: Duration,
+}
+
+impl CompletionBackoff {
+    /// Arms the retry; the first attempt is due after `initial`.
+    pub fn armed(cfg: &CompletionRetryConfig, now: Duration) -> Self {
+        Self {
+            next_due: now + cfg.initial,
+            delay: cfg.initial,
+        }
+    }
+
+    /// How long the loop may wait before the next attempt.
+    pub fn wait(&self, now: Duration) -> Duration {
+        self.next_due.saturating_sub(now)
+    }
+
+    /// An attempt is due.
+    pub fn due(&self, now: Duration) -> bool {
+        now >= self.next_due
+    }
+
+    /// An attempt failed: the delay doubles up to the cap.
+    #[must_use]
+    pub fn failed(self, cfg: &CompletionRetryConfig, now: Duration) -> Self {
+        let delay = self.delay.saturating_mul(2).min(cfg.cap);
+        Self {
+            next_due: now + delay,
+            delay,
+        }
+    }
+}
+
+/// What to do after a background completion attempt: success or a vanished attempt stops the retry ([`CompletionStep::Stop`]), a failure keeps it armed ([`CompletionStep::Retry`]).
+pub fn completion_step(result: CompletionTry) -> CompletionStep {
+    match result {
+        CompletionTry::Completed | CompletionTry::Gone => CompletionStep::Stop,
+        CompletionTry::StillFailing => CompletionStep::Retry,
+    }
+}
+
+/// The background completion retry as an action machine.
+///
+/// Deprecated: the reporter thread keeps an `Option<CompletionBackoff>` instead (ADR 023 decisions 2 and 3).
+#[deprecated(
+    since = "0.7.0",
+    note = "flat logic since ADR 023: keep an `Option<CompletionBackoff>` and call `completion_step`"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionRetry {
     cfg: CompletionRetryConfig,
-    armed: Option<Schedule>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Schedule {
-    next_due: Duration,
-    delay: Duration,
+    armed: Option<CompletionBackoff>,
 }
 
 impl CompletionRetry {
@@ -259,41 +403,33 @@ impl CompletionRetry {
     /// Arming an armed machine changes nothing, so a repeated request cannot reset the backoff.
     pub fn arm(&mut self, now: Duration) {
         if self.armed.is_none() {
-            self.armed = Some(Schedule {
-                next_due: now + self.cfg.initial,
-                delay: self.cfg.initial,
-            });
+            self.armed = Some(CompletionBackoff::armed(&self.cfg, now));
         }
     }
 
     /// How long the loop may wait before the next attempt, or `None` when not armed.
     pub fn next_wait(&self, now: Duration) -> Option<Duration> {
-        self.armed.map(|s| s.next_due.saturating_sub(now))
+        self.armed.map(|b| b.wait(now))
     }
 
     /// An attempt is due.
     pub fn due(&self, now: Duration) -> bool {
-        self.armed.is_some_and(|s| now >= s.next_due)
+        self.armed.is_some_and(|b| b.due(now))
     }
 
     /// An attempt ended: success or a vanished attempt disarms, a failure doubles the delay up to the cap.
     ///
     /// Answered with [`CompletionStep::Ignored`] when the retry is not armed.
     pub fn on_result(&mut self, now: Duration, result: CompletionTry) -> CompletionStep {
-        let Some(s) = self.armed.as_mut() else {
+        let Some(backoff) = self.armed else {
             return CompletionStep::Ignored;
         };
-        match result {
-            CompletionTry::Completed | CompletionTry::Gone => {
-                self.armed = None;
-                CompletionStep::Stop
-            }
-            CompletionTry::StillFailing => {
-                s.delay = s.delay.saturating_mul(2).min(self.cfg.cap);
-                s.next_due = now + s.delay;
-                CompletionStep::Retry
-            }
-        }
+        let step = completion_step(result);
+        self.armed = match step {
+            CompletionStep::Retry => Some(backoff.failed(&self.cfg, now)),
+            _ => None,
+        };
+        step
     }
 }
 
@@ -334,7 +470,108 @@ mod tests {
     }
 
     fn snapshot(m: &ReporterMachine) -> (Duration, u32, Awaiting) {
-        (m.next_due, m.other_passes, m.awaiting)
+        (m.pace.next_due, m.pace.other_passes, m.awaiting)
+    }
+
+    fn cfg() -> ReporterConfig {
+        ReporterConfig::from(&OtaTimings::default())
+    }
+
+    fn other() -> Delivery {
+        Delivery::OtherReport { pending_id: 9 }
+    }
+
+    #[test]
+    fn a_new_pace_is_due_immediately_and_its_wait_is_bounded_by_the_retry() {
+        let pace = ReportPace::new();
+        assert!(pace.due(Duration::ZERO));
+        assert_eq!(pace.wait(&cfg(), Duration::ZERO), Duration::ZERO);
+        let later = pace.pass_ended(&cfg(), secs(100));
+        assert!(!later.due(secs(100)));
+        assert_eq!(later.wait(&cfg(), secs(100)), cfg().retry);
+        let soon = pace.disconnected(&cfg(), secs(100));
+        assert_eq!(
+            soon.wait(&cfg(), secs(100)),
+            cfg().connect_poll.min(cfg().retry)
+        );
+        assert!(soon.due(secs(100) + cfg().connect_poll));
+    }
+
+    #[test]
+    fn only_an_acked_publish_marks_delivered() {
+        assert_eq!(
+            after_publish(PublishOutcome::Acked),
+            PublishStep::MarkDelivered
+        );
+        for outcome in [
+            PublishOutcome::Timeout,
+            PublishOutcome::Disconnected,
+            PublishOutcome::Other,
+        ] {
+            assert_eq!(
+                after_publish(outcome),
+                PublishStep::RetryLater { loud: false }
+            );
+        }
+        assert_eq!(
+            after_publish(PublishOutcome::WrongThread),
+            PublishStep::RetryLater { loud: true }
+        );
+    }
+
+    #[test]
+    fn a_failed_publish_keeps_the_follow_up_count_a_finished_pass_resets_it() {
+        let c = cfg();
+        let (step, pace) = ReportPace::new().delivered(&c, secs(0), other());
+        assert_eq!(step, DeliveryStep::PublishNext);
+        assert!(pace.due(secs(0)), "the follow-up pass is immediate");
+        let pace = pace.publish_failed(&c, secs(1));
+        assert_eq!(pace.other_passes, 1);
+        assert_eq!(pace.wait(&c, secs(1)), c.retry);
+        assert_eq!(pace.disconnected(&c, secs(2)).other_passes, 1);
+        assert_eq!(pace.pass_ended(&c, secs(3)).other_passes, 0);
+    }
+
+    #[test]
+    fn another_pending_report_is_followed_by_at_most_max_other_passes() {
+        let c = cfg();
+        let mut pace = ReportPace::new();
+        for _ in 0..c.max_other_passes {
+            let (step, next) = pace.delivered(&c, secs(5), other());
+            assert_eq!(step, DeliveryStep::PublishNext);
+            pace = next;
+        }
+        let (step, pace) = pace.delivered(&c, secs(5), other());
+        assert_eq!(step, DeliveryStep::Done);
+        assert_eq!(pace.wait(&c, secs(5)), c.retry);
+        assert_eq!(pace.other_passes, 0);
+        let (step, _) = ReportPace::new().delivered(&c, secs(5), Delivery::Marked);
+        assert_eq!(step, DeliveryStep::Done);
+    }
+
+    #[test]
+    fn the_completion_backoff_doubles_to_the_cap_and_stops_on_success() {
+        let c = CompletionRetryConfig {
+            initial: secs(2),
+            cap: secs(10),
+        };
+        let b = CompletionBackoff::armed(&c, secs(100));
+        assert_eq!(b.wait(secs(100)), secs(2));
+        assert!(!b.due(secs(101)));
+        assert!(b.due(secs(102)));
+        let b = b.failed(&c, secs(102));
+        assert_eq!(b.wait(secs(102)), secs(4));
+        let b = b.failed(&c, secs(106)).failed(&c, secs(114));
+        assert_eq!(b.wait(secs(114)), secs(10), "capped");
+        assert_eq!(
+            completion_step(CompletionTry::StillFailing),
+            CompletionStep::Retry
+        );
+        assert_eq!(
+            completion_step(CompletionTry::Completed),
+            CompletionStep::Stop
+        );
+        assert_eq!(completion_step(CompletionTry::Gone), CompletionStep::Stop);
     }
 
     #[test]
