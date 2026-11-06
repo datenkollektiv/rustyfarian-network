@@ -2,7 +2,7 @@
 //!
 //! Exercises both paths that deadlocked the client before 0.5.1:
 //!
-//! - **Connect path** — `with_startup_message()` plus an `on_connect` that publishes a retained "online" status through its `client` argument.
+//! - **Connect path** — `with_startup_message(..)` plus an `on_connect` that publishes a retained "online" status through its `client` argument.
 //!   Pass: `is_connected()` becomes `true` and the heartbeat loop starts.
 //! - **Message path** — the device subscribes to `{client_id}/echo` and publishes to it from the main loop every 2 s.
 //!   `on_message` then deliberately calls `MqttHandle::try_publish` and `MqttHandle::publish`, which must fail fast with `PublishAckError::WrongThread` instead of hanging.
@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
 
     let handle = MqttBuilder::new(mqtt_config)
         .subscribe(&echo_topic, QoS::AtLeastOnce)
-        .with_startup_message()
+        .with_startup_message("guard/startup", b"1", QoS::AtLeastOnce, false)
         .on_connect(move |client: &mut EspMqttClient<'_>, session_present: bool| {
             client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
             log::info!("[guard] on_connect published status=online (session_present={session_present})");

@@ -31,7 +31,7 @@ pub fn wifi_pass() -> &'static str {
     option_env!("WIFI_PASS").unwrap_or_default()
 }
 
-/// MQTT broker address; an IPv4 literal on this tier (no DNS yet, ADR 019).
+/// MQTT broker address; an IPv4 literal or DNS name (resolved through the DHCP-provided DNS server; IPv6 not supported).
 #[allow(dead_code)]
 pub const MQTT_HOST: &str = env_or!("MQTT_HOST", "");
 

@@ -66,7 +66,17 @@ pub use juggler::wifi::{
 /// Promoted from a magic `4` in the second-pass PR review of #72 so the
 /// invariant is enforced at the source rather than via parallel comments
 /// in the example and the driver.
-pub const SUBSTRATE_SOCKET_COUNT: usize = 4;
+///
+/// With the `mqtt` feature `embassy-net/dns` is on, and `embassy-net` then adds
+/// one permanent DNS socket to every stack, so the count is one higher; the
+/// spare slot stays free.
+pub const SUBSTRATE_SOCKET_COUNT: usize = 4 + cfg!(feature = "mqtt") as usize;
+
+/// `embassy-net` `StackResources<N>` size for the station stack.
+///
+/// DHCP, one TCP and one UDP socket, plus the permanent DNS socket that
+/// `embassy-net` adds when the `mqtt` feature enables its `dns` feature.
+pub const STA_SOCKET_COUNT: usize = 3 + cfg!(feature = "mqtt") as usize;
 
 pub use pennant::{NoLed, SimpleLed, StatusLed};
 
@@ -363,7 +373,10 @@ mod driver {
         ///
         /// The `embassy-net` stack is sized with `StackResources<3>`, which
         /// covers DHCP plus one TCP and one UDP socket — the baseline used by
-        /// `embassy-net`'s own examples.  Applications that need more
+        /// `embassy-net`'s own examples.  With the `mqtt` feature the size is 4:
+        /// `embassy-net`'s `dns` feature adds a permanent DNS socket to every
+        /// stack, and the extra slot keeps the one TCP and one UDP socket free
+        /// (the MQTT client itself takes the TCP one).  Applications that need more
         /// concurrent sockets must build their own stack on top of the
         /// station `Interface` singleton:
         ///
@@ -554,8 +567,9 @@ mod driver {
 
             // 5. Build the embassy-net stack on top of the STA interface.
             //    DHCP + one TCP + one UDP baseline (matches embassy-net examples).
-            static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-            let resources = RESOURCES.init(StackResources::<3>::new());
+            static RESOURCES: StaticCell<StackResources<{ super::STA_SOCKET_COUNT }>> =
+                StaticCell::new();
+            let resources = RESOURCES.init(StackResources::<{ super::STA_SOCKET_COUNT }>::new());
 
             // Seed the stack's local-port RNG from the monotonic clock.
             // This is not cryptographic — it is used only by `embassy-net` for
@@ -823,7 +837,7 @@ mod driver {
 
             // 5. Build the embassy-net stack with a static AP IP.
             //    The capacity is `SUBSTRATE_SOCKET_COUNT` (DHCP UDP + DNS UDP +
-            //    HTTP TCP + one spare); see the crate-root constant for the full
+            //    HTTP TCP + one spare, plus the resolver socket under `mqtt`); see the crate-root constant for the full
             //    coupling rationale.  A future fourth substrate task that opens
             //    a socket must bump the constant in lockstep.
             let resources =

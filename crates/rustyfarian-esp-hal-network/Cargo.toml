@@ -50,6 +50,8 @@ mqtt = [
     "dep:minimq",
     "dep:embassy-futures",
     "embassy",
+    # Broker host names are resolved with `Stack::dns_query`; `dns` is gated independently.
+    "embassy-net?/dns",
 ]
 
 # espnow: ESP-NOW over esp-radio `esp_now` (ADR 020). Implies `wifi` (the radio, `esp_rtos`,
@@ -113,6 +115,7 @@ embassy = [
     "embassy-net?/tcp",
     "embassy-net?/medium-ethernet",
     "dep:embassy-time",
+    "dep:embedded-io-async",
     "dep:static_cell",
     "esp-rtos?/embassy",
 ]
@@ -225,6 +228,7 @@ embassy-executor        = { workspace = true, optional = true }
 embassy-futures         = { workspace = true, optional = true }
 embassy-net             = { workspace = true, optional = true }
 embassy-time            = { workspace = true, optional = true }
+embedded-io-async       = { version = "0.7", optional = true }
 static_cell             = { workspace = true, optional = true }
 
 rustyfarian-esp-hal-ws2812 = { workspace = true, optional = true }
@@ -238,6 +242,9 @@ minimq                  = { workspace = true, optional = true }
 [dev-dependencies]
 embassy-executor = { workspace = true }
 embassy-time     = { workspace = true }
+embedded-io-async = "0.7"
+# `hal_c3_espnow_peer` gate scenarios join several `send_acked` futures.
+embassy-futures  = { workspace = true }
 # Activate juggler sub-features needed by the host-side unit tests embedded in
 # the ota, provisioning, session, and lora module files.  These are unified with the
 # [dependencies] entry so that `cfg(test)` compilation with --no-default-features
@@ -248,6 +255,13 @@ juggler = { workspace = true, default-features = false, features = ["ota", "ota-
 # The examples are the firmware: they carry `esp-println` (console) and `esp-backtrace`
 # (panic handler) themselves. The target triple is the only place that can carry the chip
 # feature now that the library forwards none; the host test build never sees these crates.
+
+# Host-only mock clock so the portal phase-budget tests can expire a `with_timeout`; the
+# bare-metal targets get their time driver from esp-rtos.
+# `espidf` is excluded: workspace clippy builds this crate for it next to `esp-idf-svc`, whose own
+# `embassy-time-driver` would unify with the mock driver.
+[target.'cfg(not(any(target_os = "none", target_os = "espidf")))'.dev-dependencies]
+embassy-time = { workspace = true, features = ["mock-driver", "generic-queue-16"] }
 
 # ESP32-C3
 [target.riscv32imc-unknown-none-elf.dev-dependencies]

@@ -24,7 +24,7 @@
 //! |:------------------|:-----------------------|:--------------------------------------|
 //! | `WIFI_SSID`       | (required)             | Wi-Fi SSID                            |
 //! | `WIFI_PASS`       | (required)             | Wi-Fi password                        |
-//! | `MQTT_HOST`       | (required)             | Broker **IPv4 literal** (no DNS yet)  |
+//! | `MQTT_HOST`       | (required)             | Broker IPv4 literal or DNS name (IPv6 not supported) |
 //! | `MQTT_PORT`       | `1883`                 | Broker port                           |
 //! | `MQTT_CLIENT_ID`  | `hal-c3-mqtt`          | Client id (≤ 23 bytes)                |
 //! | `MQTT_USER`       | unset                  | Optional username                     |
@@ -51,7 +51,6 @@ use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttRunner, QoS};
 use rustyfarian_esp_hal_network::wifi::{
     link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
-    SUSPEND_DISCONNECT_TIMEOUT_MS,
 };
 use static_cell::StaticCell;
 
@@ -182,7 +181,6 @@ async fn main(spawner: Spawner) {
     let cfg = lwt_app::LwtAppConfig {
         tick_topic,
         suspend_demo: env::mqtt_suspend_demo(),
-        suspend_timeout_ms: SUSPEND_DISCONNECT_TIMEOUT_MS,
         free_heap,
     };
     lwt_app::run(&LINK, &mqtt, &cfg).await;

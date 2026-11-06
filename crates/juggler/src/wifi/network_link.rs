@@ -44,4 +44,15 @@ pub trait NetworkLink {
 
     /// Completes once the station is associated and has its IP configuration.
     async fn wait_connected(&self);
+
+    /// Completes once a requested [`suspend`](Self::suspend) has taken effect,
+    /// that is when [`is_suspended`](Self::is_suspended) is `true`.
+    ///
+    /// Has no timeout of its own: wrap it in the executor's timeout if the
+    /// caller needs a bound. On ESP-IDF the suspend finishes before
+    /// `suspend` returns, so this completes at once; on esp-hal it completes
+    /// when the supervisor has finished the disconnect, which is already
+    /// bounded. It stays pending if nothing was suspended, or if
+    /// [`resume`](Self::resume) overtakes the suspend before it completed.
+    async fn wait_suspended(&self);
 }

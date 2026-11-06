@@ -11,6 +11,7 @@
 use core::fmt::Write as _;
 
 use embassy_futures::join::join3;
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
 use juggler::mqtt::{MqttClient, MqttMessage, TryPublishError};
 use juggler::wifi::NetworkLink;
@@ -23,8 +24,8 @@ pub const HEAP_LOG_SECS: u64 = 60;
 pub const SUSPEND_EVERY_SECS: u64 = 60;
 /// Suspend demo: twenty seconds suspended.
 pub const SUSPEND_FOR_SECS: u64 = 20;
-/// Poll period of the bounded wait for `is_suspended`.
-const SUSPEND_POLL_MS: u64 = 10;
+/// Suspend demo: upper bound on `wait_suspended`, so a suspend that never completes cannot stall the tick loop.
+pub const SUSPEND_WAIT_SECS: u64 = 5;
 /// Stack buffer for the tick payload.
 const PAYLOAD_CAPACITY: usize = 96;
 
@@ -34,8 +35,6 @@ pub struct LwtAppConfig<'a> {
     pub tick_topic: &'a str,
     /// Runs the suspend and resume demo once per minute.
     pub suspend_demo: bool,
-    /// Upper bound on the wait for a completed suspend after `suspend()`.
-    pub suspend_timeout_ms: u64,
     /// Tier heap reporter; the value is logged and sent in the tick payload.
     pub free_heap: fn() -> usize,
 }
@@ -65,6 +64,7 @@ async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtApp
     let mut last_state = mqtt.state();
     let mut was_connected = false;
     let mut secs_since_heap_log: u64 = 0;
+    let mut demo_suspended = false;
 
     loop {
         Timer::after(Duration::from_secs(TICK_SECS)).await;
@@ -74,16 +74,31 @@ async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtApp
 
         if cfg.suspend_demo && uptime % SUSPEND_EVERY_SECS == 0 {
             log::info!("[app] demo: suspend for {} s", SUSPEND_FOR_SECS);
-            if let Err(e) = link.suspend() {
-                log::warn!("[app] suspend failed: {:?}", e);
+            let suspend = link.suspend();
+            demo_suspended = suspend.is_ok();
+            match suspend {
+                Err(e) => log::warn!("[app] suspend failed: {:?}", e),
+                Ok(()) => match select(
+                    link.wait_suspended(),
+                    Timer::after(Duration::from_secs(SUSPEND_WAIT_SECS)),
+                )
+                .await
+                {
+                    Either::First(()) => log::info!(
+                        "[app] demo: wait_suspended returned, is_suspended = {}",
+                        link.is_suspended()
+                    ),
+                    Either::Second(()) => log::warn!(
+                        "[app] demo: wait_suspended timed out after {} s",
+                        SUSPEND_WAIT_SECS
+                    ),
+                },
             }
-            let mut waited_ms = 0;
-            while !link.is_suspended() && waited_ms < cfg.suspend_timeout_ms {
-                Timer::after(Duration::from_millis(SUSPEND_POLL_MS)).await;
-                waited_ms += SUSPEND_POLL_MS;
-            }
-            log::info!("[app] demo: is_suspended = {}", link.is_suspended());
-        } else if cfg.suspend_demo && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS {
+        } else if cfg.suspend_demo
+            && demo_suspended
+            && uptime % SUSPEND_EVERY_SECS == SUSPEND_FOR_SECS
+        {
+            demo_suspended = false;
             log::info!("[app] demo: resume");
             if let Err(e) = link.resume() {
                 log::warn!("[app] resume failed: {:?}", e);

@@ -196,6 +196,57 @@ pub fn irq_flags(irq: IrqStatus) -> u16 {
     flags
 }
 
+/// Failure of [`take_irq_status`], by SPI command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeIrqError {
+    /// `GetIrqStatus` failed.
+    Read,
+    /// `ClearIrqStatus` failed.
+    Clear,
+}
+
+/// The mask of every flag set in `irq`, so a clear touches nothing else.
+pub fn irq_read_mask(irq: IrqStatus) -> IrqMask {
+    let bits = [
+        (irq.tx_done(), IrqMaskBit::TxDone),
+        (irq.rx_done(), IrqMaskBit::RxDone),
+        (irq.preamble_detected(), IrqMaskBit::PreambleDetected),
+        (irq.syncword_valid(), IrqMaskBit::SyncwordValid),
+        (irq.header_valid(), IrqMaskBit::HeaderValid),
+        (irq.header_error(), IrqMaskBit::HeaderError),
+        (irq.crc_err(), IrqMaskBit::CrcErr),
+        (irq.cad_done(), IrqMaskBit::CadDone),
+        (irq.cad_detected(), IrqMaskBit::CadDetected),
+        (irq.timeout(), IrqMaskBit::Timeout),
+    ];
+    bits.into_iter()
+        .filter(|(set, _)| *set)
+        .fold(IrqMask::none(), |mask, (_, bit)| mask.combine(bit))
+}
+
+/// Read the IRQ register and clear exactly the flags that were read.
+///
+/// Clearing with `IrqMask::all()` would also wipe a flag (for example `TxDone`)
+/// that latches between the read and the clear, so a poll loop would never see
+/// it. The returned status is what the caller classifies.
+pub fn take_irq_status<SPI, NRST, BUSY, ANT, DIO1, PINERR>(
+    radio: &mut SX126x<SPI, NRST, BUSY, ANT, DIO1>,
+) -> Result<IrqStatus, TakeIrqError>
+where
+    SPI: SpiDevice,
+    NRST: OutputPin<Error = PINERR>,
+    BUSY: InputPin<Error = PINERR>,
+    ANT: OutputPin<Error = PINERR>,
+    DIO1: InputPin<Error = PINERR>,
+    PINERR: core::fmt::Debug,
+{
+    let irq = radio.get_irq_status().map_err(|_| TakeIrqError::Read)?;
+    radio
+        .clear_irq_status(irq_read_mask(irq))
+        .map_err(|_| TakeIrqError::Clear)?;
+    Ok(irq)
+}
+
 /// RF frequency word for `SetRfFrequency`, for a frequency in Hz.
 pub fn rf_freq_word(freq_hz: u32) -> u32 {
     calc_rf_freq(freq_hz as f32, XTAL_HZ as f32)
@@ -650,5 +701,52 @@ mod tests {
         let irq = IrqStatus::from(IRQ_CRC_ERR | IRQ_RX_DONE | (1 << 2));
         assert_eq!(irq_flags(irq), IRQ_CRC_ERR | IRQ_RX_DONE);
         assert_eq!(classify_irq(irq_flags(irq)), IrqOutcome::CrcError);
+    }
+
+    /// SPI model of the IRQ register: `latch_after_read` is set into the
+    /// register right after each `GetIrqStatus`, like a flag that latches
+    /// between the read and the clear.
+    struct IrqSpi {
+        reg: u16,
+        latch_after_read: u16,
+    }
+
+    impl ErrorType for IrqSpi {
+        type Error = Infallible;
+    }
+
+    impl SpiDevice for IrqSpi {
+        fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Infallible> {
+            let mut opcode = 0;
+            for op in operations.iter_mut() {
+                match op {
+                    Operation::Write(buf) if buf.len() == 1 => opcode = buf[0],
+                    Operation::Write(buf) if opcode == 0x02 => {
+                        self.reg &= !u16::from_be_bytes([buf[0], buf[1]]);
+                    }
+                    Operation::Read(buf) if opcode == 0x12 => {
+                        buf[1..3].copy_from_slice(&self.reg.to_be_bytes());
+                        self.reg |= self.latch_after_read;
+                        self.latch_after_read = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn take_irq_status_keeps_flag_latched_between_read_and_clear() {
+        let spi = IrqSpi {
+            reg: 1 << 2,
+            latch_after_read: IRQ_TX_DONE,
+        };
+        let mut radio = SX126x::new(spi, (MockPin, MockPin, MockPin, MockPin));
+        let first = take_irq_status(&mut radio).unwrap();
+        assert!(first.preamble_detected());
+        assert!(!first.tx_done());
+        let next = take_irq_status(&mut radio).unwrap();
+        assert!(next.tx_done(), "TxDone latched mid-poll was cleared");
     }
 }

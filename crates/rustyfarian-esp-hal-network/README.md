@@ -171,7 +171,7 @@ async fn mqtt_task(runner: MqttRunner) -> ! {
 ```
 
 Everything the builder keeps must be `'static`; the example builds its topics into `StaticCell`s.
-The broker host is an IPv4 literal (no DNS in v1), payloads are capped at 256 bytes, and all buffers are static — no heap use.
+The broker host is an IPv4 literal (connected directly) or a DNS name (resolved on every connect, IPv6 is not supported), runtime topics are added with `MqttHandle::subscribe` (up to 8, re-subscribed after each reconnect), payloads are capped at 256 bytes, and all buffers are static — no heap use.
 The hardware procedure lives in `docs/runbooks/esp-hal-mqtt-hardware-test.md` (T5 covers Wi-Fi loss with an AP power-off and a router-pause variant).
 
 ## Example: ESP-NOW (coordinator and peer)
@@ -269,16 +269,14 @@ The tiers share one API ([ADR 022](https://github.com/datenkollektiv/rustyfarian
 The differences below are capabilities, not API differences.
 Design detail: [Wi-Fi suspend, resume and deep sleep](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/wifi-suspend-and-deep-sleep.md).
 
-| Capability                   | `rustyfarian-esp-idf-network`                                  | `rustyfarian-esp-hal-network`                  |
-|:-----------------------------|:---------------------------------------------------------------|:-----------------------------------------------|
-| Radio while suspended        | Stopped (`esp_wifi_stop`)                                      | Powered, station disconnected                  |
-| Broker address               | Hostname or IPv4 (DNS via lwIP)                                | IPv4 literal only (no DNS yet)                 |
-| Subscriptions                | Build time and runtime                                         | Build time only                                |
-| Inbound messages             | Callback and/or the `receive()` queue                          | `receive()` channel; no callback               |
-| Inbound retain and QoS       | Not reported (retain is always false, QoS always `AtMostOnce`) | Reported                                       |
-| Executor                     | std threads; `block_on` for the async app                      | `esp-rtos` plus the embassy executor           |
-| Startup message              | `on_connect` closure plus `enqueue`                            | `with_startup_message`                         |
-| Suspend call                 | Blocking; the radio is stopped when it returns                 | Non-blocking signal; wait for `is_suspended()` |
+| Capability             | `rustyfarian-esp-idf-network`                                                          | `rustyfarian-esp-hal-network`                                    |
+|:-----------------------|:---------------------------------------------------------------------------------------|:-----------------------------------------------------------------|
+| Radio while suspended  | Stopped (`esp_wifi_stop`)                                                              | Powered, station disconnected                                    |
+| Broker address         | Hostname or IPv4 (DNS via lwIP)                                                        | IPv4 literal or DNS name (no IPv6)                               |
+| Inbound messages       | Callback and/or the `receive()` queue                                                  | `receive()` channel; no callback                                 |
+| Inbound retain and QoS | Not reported (retain is always false, QoS always `AtMostOnce`)                         | Reported                                                         |
+| Executor               | std threads; `block_on` for the async app                                              | `esp-rtos` plus the embassy executor                             |
+| Suspend call           | Blocking; the radio is stopped when it returns, so `wait_suspended()` is ready at once | Non-blocking signal; `wait_suspended()` completes once suspended |
 
 ## Integration with juggler
 

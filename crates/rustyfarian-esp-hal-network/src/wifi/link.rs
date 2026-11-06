@@ -29,10 +29,11 @@
 //!
 //! ```ignore
 //! LINK.suspend();
-//! let deadline = Instant::now() + Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS);
-//! while !LINK.is_suspended() && Instant::now() < deadline {
-//!     Timer::after_millis(10).await;
-//! }
+//! let _ = with_timeout(
+//!     Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS),
+//!     LINK.wait_suspended(),
+//! )
+//! .await;
 //! ```
 //!
 //! # Lifecycle
@@ -84,6 +85,8 @@ pub struct WifiLink {
     wake: Signal<CriticalSectionRawMutex, ()>,
     /// Tasks in [`wait_connected`](Self::wait_connected); a full set refuses, never mass-wakes.
     ready_wakers: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<READY_WAITERS>>>,
+    /// Tasks in [`wait_suspended`](Self::wait_suspended); woken when a park ends.
+    suspend_wakers: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<READY_WAITERS>>>,
 }
 
 impl WifiLink {
@@ -93,6 +96,7 @@ impl WifiLink {
             handover: Mutex::new(RefCell::new(LinkHandover::new())),
             wake: Signal::new(),
             ready_wakers: Mutex::new(RefCell::new(WakerSlots::new())),
+            suspend_wakers: Mutex::new(RefCell::new(WakerSlots::new())),
         }
     }
 
@@ -110,6 +114,11 @@ impl WifiLink {
     /// `true` once a [`suspend`](Self::suspend) has taken the station down: the
     /// disconnect finished or gave up after [`SUSPEND_DISCONNECT_TIMEOUT_MS`].
     /// Turns `false` again on [`resume`](Self::resume).
+    ///
+    /// `true` therefore does not prove the association ended: when the disconnect timed
+    /// out, the station may still be associated (the supervisor logs a warning for that
+    /// case). Use it as "the supervisor stopped reconnecting", not as "the radio is off
+    /// the air".
     pub fn is_suspended(&self) -> bool {
         self.with(|h| h.is_suspended())
     }
@@ -136,6 +145,39 @@ impl WifiLink {
                     .ready_wakers
                     .lock(|w| w.borrow_mut().register(cx.waker()));
                 match poll_ready(registered, self.is_ready()) {
+                    ReadyPoll::Ready => Poll::Ready(true),
+                    ReadyPoll::Waiting => Poll::Pending,
+                    ReadyPoll::Full => Poll::Ready(false),
+                }
+            })
+            .await;
+            if woken {
+                return;
+            }
+            Timer::after_millis(NETWORK_POLL_MS).await;
+        }
+    }
+
+    /// Completes once a [`suspend`](Self::suspend) has taken the station down,
+    /// that is when [`is_suspended`](Self::is_suspended) is `true`.
+    ///
+    /// Returning does not prove the association ended: if the disconnect timed out after
+    /// [`SUSPEND_DISCONNECT_TIMEOUT_MS`] the supervisor parks anyway, with the station
+    /// possibly still associated.
+    ///
+    /// Has no timeout of its own: the disconnect it waits for is bounded by
+    /// [`SUSPEND_DISCONNECT_TIMEOUT_MS`]. Stays pending if nothing was suspended,
+    /// or if [`resume`](Self::resume) overtakes the suspend before the supervisor
+    /// parked. Up to four waiting tasks are woken directly; further ones re-check
+    /// every [`NETWORK_POLL_MS`].
+    pub async fn wait_suspended(&self) {
+        loop {
+            let woken = core::future::poll_fn(|cx| {
+                // Register first, then check: a park that ends in between still wakes us.
+                let registered = self
+                    .suspend_wakers
+                    .lock(|w| w.borrow_mut().register(cx.waker()));
+                match poll_ready(registered, self.is_suspended()) {
                     ReadyPoll::Ready => Poll::Ready(true),
                     ReadyPoll::Waiting => Poll::Pending,
                     ReadyPoll::Full => Poll::Ready(false),
@@ -305,11 +347,13 @@ impl WifiLink {
                         Ok(Ok(info)) => log::info!("[wifi] suspended — {:?}", info.reason),
                         Ok(Err(e)) => log::info!("[wifi] suspended ({:?})", e),
                         Err(_) => log::warn!(
-                            "[wifi] suspended — disconnect gave up after {} ms",
+                            "[wifi] suspended — disconnect gave up after {} ms; \
+                             reporting suspended although the station may still be associated",
                             SUSPEND_DISCONNECT_TIMEOUT_MS
                         ),
                     }
                     self.with(|h| h.end_park(epoch));
+                    self.suspend_wakers.lock(|w| w.borrow_mut().wake_all());
                     LinkAction::None
                 }
                 LinkAction::Wait { ms } => {
@@ -442,6 +486,10 @@ impl NetworkLink for WifiLink {
 
     async fn wait_connected(&self) {
         WifiLink::wait_connected(self).await
+    }
+
+    async fn wait_suspended(&self) {
+        WifiLink::wait_suspended(self).await
     }
 }
 

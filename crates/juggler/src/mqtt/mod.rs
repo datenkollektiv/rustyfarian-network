@@ -4,19 +4,26 @@
 pub mod chunks;
 mod client;
 mod gate;
+mod host;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 #[cfg(feature = "std")]
 pub mod outbox;
 pub mod session;
+mod subscriptions;
 
 pub use client::{MqttClient, MqttMessage};
 pub use gate::NetworkGate;
+pub use host::{classify_broker_host, BrokerHost, MAX_HOSTNAME_LEN};
 #[cfg(feature = "std")]
 pub use outbox::{Outbox, PendingPublish, TryClient};
 pub use session::{
     ConnectStep, ConnectWorkPlan, SessionAction, SessionInput, SessionMachine, SessionToken,
     SESSION_RETRY_MS,
+};
+pub use subscriptions::{
+    admit_subscription, AckStatus, SubscribeWindow, SubscriptionAdmission, SubscriptionTracker,
+    TrackedRequest, SUBSCRIBE_WINDOW,
 };
 
 /// Returns the number of 100 ms poll iterations needed to cover `timeout_ms`.
@@ -462,7 +469,7 @@ impl<'a> LwtConfig<'a> {
 /// (`Some("<redacted>")`) to prevent them from appearing in log files.
 #[derive(Clone)]
 pub struct MqttConfig<'a> {
-    /// MQTT broker hostname or IP address (the bare-metal tier accepts IPv4 literals only).
+    /// MQTT broker hostname or IP address (a name is resolved through the DHCP-provided DNS server on the bare-metal tier; IPv6 is not supported).
     pub host: &'a str,
     /// MQTT broker port (typically 1883 for unencrypted)
     pub port: u16,

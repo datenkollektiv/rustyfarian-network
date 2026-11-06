@@ -6,13 +6,27 @@
 use std::time::Duration;
 
 use embedded_svc::http::Headers;
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
+use esp_idf_svc::sys::{esp, esp_http_client_set_timeout_ms};
 
-use juggler::ota::{classify_read_error, OtaError};
+use juggler::ota::{capped_read_len, classify_read_error, OtaError};
 
 /// Buffer size for downloading firmware chunks.
 pub(super) const DOWNLOAD_BUFFER_SIZE: usize = 4096;
+
+/// Receive buffer of the HTTP client, in bytes.
+///
+/// `esp_http_client_read` loops over `esp_transport_read`, each call asking for
+/// at most this many bytes and waiting up to the client timeout.
+/// TCP returns whatever has arrived, so a partial read waits again: one call can
+/// make one wait per partial segment, up to this many waits against a server
+/// that trickles bytes.
+/// [`FirmwareResponse::read`] requests no more than this per call, which limits
+/// that worst case but does not make a call one wait.
+/// It also bounds one response header line.
+pub(super) const HTTP_RX_BUFFER_SIZE: usize = 1024;
 
 /// `true` when an `esp_http_client_read` failure code means "the read timed out".
 ///
@@ -128,12 +142,39 @@ impl FirmwareResponse {
         self.chunked
     }
 
-    /// Read the next body bytes into `buf`; `Ok(0)` is the end of the stream.
+    /// Read the next body bytes into `buf`, waiting at most `timeout`;
+    /// `Ok(0)` is the end of the stream.
+    ///
+    /// `timeout` replaces the connection's timeout for this read, so the
+    /// caller can clip it to the time left of a total deadline.
+    /// The request is capped to the client's receive buffer, which does NOT
+    /// make a call one transport wait: `esp_http_client_read` waits again
+    /// (up to `timeout` each time) whenever a read returns fewer bytes than
+    /// requested, so a server that trickles bytes can keep one call going for
+    /// up to [`HTTP_RX_BUFFER_SIZE`] waits.
+    /// Drive it through `juggler::ota::read_bounded` to keep a call
+    /// inside the time left of a deadline.
     ///
     /// A read that fails because its wait elapsed (`ESP_ERR_HTTP_EAGAIN`) is
     /// `DownloadTimeout`; any other read failure is `ServerUnreachable`
     /// (see [`classify_read_error`]).
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, OtaError> {
+    pub fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, OtaError> {
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let want = capped_read_len(
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            buf.len(),
+            HTTP_RX_BUFFER_SIZE,
+        );
+        let buf = &mut buf[..want];
+        // SAFETY: the handle is the live `esp_http_client` owned by `self.client`,
+        // which outlives the call; `esp_http_client_set_timeout_ms` only stores
+        // the value in it.
+        esp!(unsafe { esp_http_client_set_timeout_ms(self.client.handle(), timeout_ms) }).map_err(
+            |e| {
+                log::error!("Could not set the read timeout: {:?}", e);
+                OtaError::ServerUnreachable
+            },
+        )?;
         self.client.read(buf).map_err(|e| {
             log::error!("Read error during firmware download: {:?}", e);
             classify_read_error(is_read_timeout(e.code()))
@@ -167,6 +208,7 @@ pub fn create_http_connection(
 
     let config = Configuration {
         timeout: Some(timeout),
+        buffer_size: Some(HTTP_RX_BUFFER_SIZE),
         ..Default::default()
     };
 

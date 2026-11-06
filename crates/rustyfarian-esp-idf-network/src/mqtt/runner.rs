@@ -134,8 +134,8 @@ pub(super) struct Runner {
     pub(super) seed_ready: bool,
     /// Inputs the machine ignored in a row; see [`IGNORED_IN_A_ROW_LIMIT`].
     pub(super) ignored_in_a_row: u32,
-    pub(super) subscribe_topics: Vec<(String, juggler::mqtt::QoS)>,
-    pub(super) startup_topic: Option<String>,
+    pub(super) subs: Arc<super::Subscriptions>,
+    pub(super) startup: Option<super::StartupMessage>,
     pub(super) on_connect: Option<Arc<std::sync::Mutex<super::OnConnectCallback>>>,
 }
 
@@ -199,6 +199,12 @@ impl Runner {
 
     /// Feeds one input to the machine and performs its action.
     fn act(&mut self, input: SessionInput, retry_at: &mut Option<Instant>) {
+        if matches!(
+            input,
+            SessionInput::Disconnected | SessionInput::NetworkDown
+        ) {
+            self.subs.go_offline();
+        }
         let action = self.session.poll(input);
         if action == SessionAction::Ignored {
             log::debug!("[mqtt] session ignored {:?}", input);
@@ -258,10 +264,11 @@ impl Runner {
 
     /// Runs one session's connect work on the helper thread (ADR 017).
     fn connect_work(&mut self, token: SessionToken, subscribe: bool, session_present: bool) {
+        self.subs.begin_connect(subscribe);
         let plan = ConnectWorkPlan::new(
             subscribe,
-            self.subscribe_topics.len(),
-            self.startup_topic.is_some(),
+            self.subs.len(),
+            self.startup.is_some(),
             self.on_connect.is_some(),
         );
         if plan.is_empty() {
@@ -271,8 +278,8 @@ impl Runner {
 
         let session = Arc::clone(&self.session);
         let outbox = Arc::clone(self.session.outbox());
-        let topics = self.subscribe_topics.clone();
-        let startup_topic = self.startup_topic.clone();
+        let subs = Arc::clone(&self.subs);
+        let startup = self.startup.clone();
         let on_connect = self.on_connect.clone();
 
         // The helper does the connect work under one hold of the outbox's
@@ -291,8 +298,8 @@ impl Runner {
                             session: &session,
                             token,
                             plan,
-                            topics: &topics,
-                            startup_topic: startup_topic.as_deref(),
+                            subs: &subs,
+                            startup: startup.as_ref(),
                             on_connect: on_connect.as_deref(),
                             session_present,
                         },

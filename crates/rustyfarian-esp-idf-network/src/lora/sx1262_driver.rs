@@ -214,6 +214,8 @@ pub enum LoraError {
     BusyTimeout,
     /// Could not read the IRQ status register after DIO1 fired.
     IrqStatusReadFailed,
+    /// A `Phy` event arrived while the frame was still on air (not a radio fault).
+    TxInProgress,
 }
 
 impl core::fmt::Display for LoraError {
@@ -227,6 +229,7 @@ impl core::fmt::Display for LoraError {
             Self::Timeout => write!(f, "radio timeout"),
             Self::BusyTimeout => write!(f, "radio busy timeout"),
             Self::IrqStatusReadFailed => write!(f, "IRQ status read failed"),
+            Self::TxInProgress => write!(f, "TX still on air"),
         }
     }
 }
@@ -234,6 +237,10 @@ impl core::fmt::Display for LoraError {
 impl RadioErrorKind for LoraError {
     fn invalid_rf_config() -> Self {
         Self::InvalidRfConfig
+    }
+
+    fn tx_in_progress() -> Self {
+        Self::TxInProgress
     }
 
     fn is_rx_timeout(&self) -> bool {
@@ -448,13 +455,10 @@ where
     /// The main loop clears `DIO1_FLAG` before delivering the `Phy` event, so
     /// this function reads IRQ status directly rather than re-checking the flag.
     fn transmit(&mut self) -> nb::Result<u32, LoraError> {
-        let irq = self
-            .radio
-            .get_irq_status()
-            .map_err(|_| nb::Error::Other(LoraError::IrqStatusReadFailed))?;
-        self.radio
-            .clear_irq_status(IrqMask::all())
-            .map_err(|_| nb::Error::Other(LoraError::TransmitFailed))?;
+        let irq = sx1262::take_irq_status(&mut self.radio).map_err(|e| match e {
+            sx1262::TakeIrqError::Read => nb::Error::Other(LoraError::IrqStatusReadFailed),
+            sx1262::TakeIrqError::Clear => nb::Error::Other(LoraError::TransmitFailed),
+        })?;
 
         match classify_irq(irq_flags(irq)) {
             IrqOutcome::Timeout => {
@@ -548,7 +552,7 @@ where
             irq.timeout()
         );
         self.radio
-            .clear_irq_status(IrqMask::all())
+            .clear_irq_status(sx1262::irq_read_mask(irq))
             .map_err(|_| nb::Error::Other(LoraError::ReceiveFailed))?;
 
         match classify_irq(irq_flags(irq)) {

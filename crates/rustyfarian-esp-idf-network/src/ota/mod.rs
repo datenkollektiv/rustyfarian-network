@@ -136,9 +136,10 @@ mod target_chip_guard {
 
 use std::time::{Duration, Instant};
 
-use downloader::{FirmwareDownloader, FirmwareResponse, DOWNLOAD_BUFFER_SIZE};
+use downloader::{FirmwareDownloader, FirmwareResponse, DOWNLOAD_BUFFER_SIZE, HTTP_RX_BUFFER_SIZE};
 use flasher::{FirmwareFlasher, OtaWriter};
 use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
+use juggler::ota::read_bounded;
 
 pub use downloader::url_for_log;
 
@@ -199,11 +200,24 @@ impl OtaSession {
     /// Finalization is the exception: once the permit is granted and
     /// finalization starts, its result is returned even if it finishes after
     /// the deadline.
-    /// Network waits are bounded only by the per-read timeout
-    /// (`OtaSessionConfig::timeout_secs`) fixed at connection creation, so the
-    /// worst-case overrun is one network phase (connect plus headers, which
-    /// includes DNS resolution not covered by that timeout, or one read) or one
-    /// flash operation (erase, write, finalization), whichever is longer.
+    /// Each network wait is clipped to `min(per-read timeout
+    /// (`OtaSessionConfig::timeout_secs`), remaining deadline)`, as on the
+    /// esp-hal tier: the connect budget sets the connection's timeout when it
+    /// is created and the read budget is applied before every read, in whole
+    /// milliseconds rounded up (`Deadline::budget_millis`).
+    /// Each read request is capped to the HTTP client's receive buffer and,
+    /// once less than one per-read timeout is left, split by
+    /// `juggler::ota::read_bounded` into a one-byte read with the whole budget
+    /// and a follow-up of the rest with a 1 ms wait, sized to fit the time
+    /// left; an idle follow-up returns the bytes read so far.
+    /// A read is not one transport wait: `esp_http_client_read` waits again
+    /// whenever a read returns fewer bytes than requested, so while more than
+    /// one per-read timeout is left, a server that trickles bytes can keep one
+    /// call going for up to one wait per requested byte (at most the receive
+    /// buffer, 1024 waits of the per-read timeout).
+    /// The worst-case overrun is therefore the DNS resolution inside connect
+    /// (not covered by that timeout), that trickling read, or one flash
+    /// operation (erase, write, finalization), whichever is longer.
     ///
     /// The deadline is expired when `elapsed >= total`.
     /// `Duration::ZERO` therefore fails with `DownloadTimeout` before any
@@ -280,7 +294,6 @@ impl OtaSession {
         let start = Instant::now();
         let per_op = Duration::from_secs(self.config.timeout_secs);
         let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
-        let downloader = FirmwareDownloader::new(url).with_timeout(per_op);
 
         // Until `Prepare`, nothing is open that needs an abort.
         let mut connected: Option<(FirmwareResponse, FirmwareFlasher)> = None;
@@ -290,19 +303,21 @@ impl OtaSession {
                 .poll_bounded(input, start.elapsed())
                 .inspect_err(|e| log::error!("OTA download stopped: {}", e))?;
             input = match action {
-                // The per-read timeout is fixed at connection creation, so the budget is not applied here.
-                DownloadAction::Connect { .. } => match connect(&downloader) {
-                    Ok((response, flasher, capacity)) => {
-                        let headers = DownloadInput::Headers {
-                            content_length: response.content_length(),
-                            chunked: response.chunked(),
-                            capacity,
-                        };
-                        connected = Some((response, flasher));
-                        headers
+                // The connection's timeout is `min(per-read timeout, remaining deadline)`.
+                DownloadAction::Connect { budget } => {
+                    match connect(&FirmwareDownloader::new(url).with_timeout(wait_for(budget))) {
+                        Ok((response, flasher, capacity)) => {
+                            let headers = DownloadInput::Headers {
+                                content_length: response.content_length(),
+                                chunked: response.chunked(),
+                                capacity,
+                            };
+                            connected = Some((response, flasher));
+                            headers
+                        }
+                        Err(e) => DownloadInput::ConnectFailed(e),
                     }
-                    Err(e) => DownloadInput::ConnectFailed(e),
-                },
+                }
                 DownloadAction::Prepare { len } => match connected.take() {
                     Some((response, flasher)) => break (len, response, flasher),
                     None => return Err(unexpected(&action)),
@@ -340,9 +355,17 @@ impl OtaSession {
                 }
             };
             input = match action {
-                DownloadAction::Read { max, .. } => {
-                    let want = (max as usize).min(DOWNLOAD_BUFFER_SIZE);
-                    match response.read(&mut buffer[..want]) {
+                DownloadAction::Read { max, budget } => {
+                    let began = Instant::now();
+                    match read_bounded(
+                        &mut buffer,
+                        max,
+                        HTTP_RX_BUFFER_SIZE,
+                        budget,
+                        per_op,
+                        || began.elapsed(),
+                        |buf, wait| response.read(buf, wait_for(wait)),
+                    ) {
                         Ok(n) => DownloadInput::Read(n),
                         Err(e) => DownloadInput::ReadFailed(e),
                     }
@@ -394,6 +417,30 @@ impl OtaSession {
 
     /// Experimental: API may change before 1.0.
     ///
+    /// Whether the previous update was rolled back: ESP-IDF knows a last invalid
+    /// partition (`esp_ota_get_last_invalid_partition`, an `Aborted` or `Invalid` otadata entry).
+    ///
+    /// A firmware that fetches a fixed target version calls this before fetching, so a rolled-back
+    /// image is not downloaded again on every boot.
+    /// The esp-hal tier has the same method on `EspHalOtaManager`.
+    pub fn previous_update_rolled_back(&mut self) -> Result<bool, OtaError> {
+        let ota = EspOta::new().map_err(|e| {
+            log::error!(
+                "Failed to acquire EspOta handle for previous_update_rolled_back: {:?}",
+                e
+            );
+            OtaError::FlashWriteFailed
+        })?;
+        ota.get_last_invalid_slot()
+            .map(|slot| slot.is_some())
+            .map_err(|e| {
+                log::error!("get_last_invalid_slot failed: {:?}", e);
+                OtaError::FlashWriteFailed
+            })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
     /// Revert to the previous OTA slot and reboot.
     ///
     /// This function does not return on success — the device reboots into the
@@ -436,6 +483,11 @@ fn connect(
     let flasher = FirmwareFlasher::new()?;
     let capacity = flasher.update_partition_capacity()? as u64;
     Ok((response, flasher, capacity))
+}
+
+/// The HTTP client wait for a download budget (whole milliseconds, at least 1).
+fn wait_for(budget: Duration) -> Duration {
+    Duration::from_millis(u64::from(Deadline::budget_millis(budget)))
 }
 
 /// Feed the last outcome and return the machine's final result.

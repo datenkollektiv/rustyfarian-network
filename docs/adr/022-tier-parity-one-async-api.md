@@ -127,7 +127,7 @@ That feature lets embassy-time work on both tiers.
 
 - Answered 2026-11-02: the IDF examples use esp-idf-hal `block_on`, and the firmware chooses its executor (ADR 021); `embassy-executor` with `arch-std` on IDF is untested.
 - Answered 2026-11-01: `embassy-time-driver 0.2.2` from `esp-idf-svc` unifies in the IDF graph, with one copy and no duplicate embassy crates (Step 2 spike).
-- Open: is each of the three breaking items a break or a deprecation? Settled per step in Steps 10 and 11; `MqttBuilder::build(&wifi)` is the one 0.x break approved so far (Step 8b-2).
+- Open: is each of the three breaking items a break or a deprecation? Settled per step in Steps 10 and 11; `MqttBuilder::build(&wifi)` (Step 8b-2) and, for 0.7.0, the IDF `MqttBuilder::with_startup_message` signature and the two required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended` are the 0.x breaks approved so far.
 - Open: does the blocking IDF API become thin wrappers over the async one?
 - Answered 2026-11-01: the IDF async foundation is async wrappers over the existing worker threads (decision 2).
 

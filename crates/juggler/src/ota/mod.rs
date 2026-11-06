@@ -31,7 +31,10 @@ pub use deadline::{ActivationPermit, Deadline};
 pub use decision::{
     decide_offer, decide_update, Admission, BlockedBy, OfferDecision, UpdateDecision,
 };
-pub use download::check_content_length;
+pub use download::{
+    bounded_read_request, capped_read_len, check_content_length, classify_follow_up, read_bounded,
+    FollowUp, ReadRequest, FOLLOW_UP_WAIT,
+};
 pub use error::{classify_read_error, OtaError};
 pub use metadata::ImageMetadata;
 #[cfg(feature = "ota-wire")]

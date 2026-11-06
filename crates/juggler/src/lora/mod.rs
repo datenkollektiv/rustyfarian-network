@@ -325,6 +325,13 @@ pub trait RadioErrorKind {
     /// The error for an RF configuration the radio cannot represent.
     fn invalid_rf_config() -> Self;
 
+    /// The error for a `Phy` event delivered while the TX is still on air.
+    ///
+    /// `lorawan-device` 0.12 panics on any successful radio response but `TxDone` while it
+    /// waits for the end of a TX, so [`LorawanPhy`] reports an early event as this error;
+    /// the device then stays in that wait and the real `TxDone` completes it later.
+    fn tx_in_progress() -> Self;
+
     /// Return `true` when the error is an RX window that closed with no packet.
     fn is_rx_timeout(&self) -> bool;
 }

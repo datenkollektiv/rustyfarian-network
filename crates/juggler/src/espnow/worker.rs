@@ -1022,13 +1022,23 @@ impl<E: Debug> Shared<E> {
                 ScanAction::BoostTxPower => {
                     // Auto-burst: boost TX power to maximum during channel scanning to maximise
                     // discovery range; the machine asks for the restore of the previous level.
-                    if let Ok(current) = radio.tx_power() {
-                        saved_tx_power = Some(current);
-                    }
-                    if radio.set_tx_power(self.config.burst_tx_power).is_err() {
-                        log::warn!(
-                            "Failed to boost TX power for scanning — continuing at current level"
-                        );
+                    // Without a readable level there is nothing to restore, so the power is
+                    // left alone rather than boosted for good (as the esp-hal tier does).
+                    match radio.tx_power() {
+                        Ok(current) => {
+                            saved_tx_power = Some(current);
+                            if radio.set_tx_power(self.config.burst_tx_power).is_err() {
+                                log::warn!(
+                                    "Failed to boost TX power for scanning — \
+                                     continuing at current level"
+                                );
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "ESP-NOW scan: TX power unreadable ({:?}) — not boosting, \
+                             since it could not be restored",
+                            e
+                        ),
                     }
                     ScanInput::Completed
                 }
@@ -2012,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_tx_power_is_not_restored() {
+    fn an_unknown_tx_power_is_not_boosted_or_restored() {
         let fixture = Fixture::new(SOFTAP);
         fixture.edit(|state| {
             state.auto = Auto::PeerOn(6);
@@ -2025,7 +2035,10 @@ mod tests {
             .into_iter()
             .filter(|call| matches!(call, Call::SetTxPower(_)))
             .collect();
-        assert_eq!(writes, [Call::SetTxPower(78)]);
+        assert!(
+            writes.is_empty(),
+            "no level to restore, so the power is not touched: {writes:?}"
+        );
     }
 
     #[test]

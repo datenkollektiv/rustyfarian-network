@@ -45,9 +45,20 @@
 //! * **After `resume`:** the runner connects as soon as the link and DHCP are up,
 //!   republishes the startup message and bumps [`MqttHandle::connect_count`].
 //!
-//! Limitations in v1: the broker host must be an IPv4 literal, publishes are
-//! QoS 0/1, subscriptions are fixed at build time, and payloads are capped at
-//! [`MAX_PAYLOAD_LEN`] bytes. All buffers are `static` — nothing is heap-allocated.
+//! Subscriptions: [`MqttBuilder::subscribe`] registers the ones known at build time;
+//! [`MqttHandle::subscribe`] adds more while the client runs, up to
+//! [`MAX_RUNTIME_SUBSCRIPTIONS`], with the signature of the ESP-IDF handle.
+//! The runner copies the filter (at most [`MAX_TOPIC_LEN`] bytes), subscribes on the live
+//! session, and re-issues runtime topics after every reconnect that needs
+//! subscriptions, after the builder ones, in registration order.
+//!
+//! The broker host is an IPv4 literal (connected directly, no DNS query) or a DNS name
+//! (resolved with the embassy-net DNS client on every connect, bounded by the connection
+//! timeout; a failed lookup is a connect failure that goes through the reconnect back-off).
+//! IPv6 is not supported.
+//!
+//! Limitations in v1: publishes are
+//! QoS 0/1, and payloads are capped at [`MAX_PAYLOAD_LEN`] bytes. All buffers are `static` — nothing is heap-allocated.
 //!
 //! ```ignore
 //! use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttConfig, QoS};
@@ -65,9 +76,11 @@
 //! [`WiFiManager::init_async`]: crate::wifi::WiFiManager::init_async
 
 use core::fmt;
-use core::net::Ipv4Addr;
-use core::str::FromStr;
 
+use juggler::mqtt::{
+    admit_subscription, classify_broker_host, BrokerHost, SubscriptionAdmission,
+    SubscriptionTracker, TrackedRequest,
+};
 pub use juggler::mqtt::{
     topic_matches_filter, validate_broker_port, validate_client_id, validate_publish_topic,
     validate_subscribe_filter, LwtConfig, MqttConfig, MqttConnectionState, QoS,
@@ -79,6 +92,8 @@ pub const MAX_TOPIC_LEN: usize = 64;
 pub const MAX_PAYLOAD_LEN: usize = 256;
 /// Subscriptions a builder accepts.
 pub const MAX_SUBSCRIPTIONS: usize = 8;
+/// Subscriptions [`MqttHandle::subscribe`] accepts, on top of the builder's.
+pub const MAX_RUNTIME_SUBSCRIPTIONS: usize = 8;
 /// Outbound publishes buffered between the application and the runner.
 pub const PUBLISH_QUEUE_DEPTH: usize = 4;
 /// Inbound messages buffered between the runner and the application.
@@ -115,6 +130,8 @@ pub enum MqttError {
     InvalidTopic(&'static str),
     /// More than [`MAX_SUBSCRIPTIONS`] topics were passed to the builder.
     TooManySubscriptions,
+    /// [`MAX_RUNTIME_SUBSCRIPTIONS`] runtime subscriptions are already registered.
+    RuntimeSubscriptionsFull,
 }
 
 impl fmt::Display for MqttError {
@@ -128,6 +145,11 @@ impl fmt::Display for MqttError {
             Self::TooManySubscriptions => {
                 write!(f, "more than {} subscriptions", MAX_SUBSCRIPTIONS)
             }
+            Self::RuntimeSubscriptionsFull => write!(
+                f,
+                "more than {} runtime subscriptions",
+                MAX_RUNTIME_SUBSCRIPTIONS
+            ),
         }
     }
 }
@@ -217,15 +239,114 @@ impl PublishRequest {
     }
 }
 
-/// Parses the broker host as an IPv4 literal (v1 has no DNS; ADR 019 §2).
-pub(crate) fn parse_broker_ipv4(host: &str) -> Result<Ipv4Addr, MqttError> {
-    Ipv4Addr::from_str(host.trim())
-        .map_err(|_| MqttError::InvalidConfig("host must be an IPv4 literal on the esp-hal tier"))
+/// Subscriptions added through [`MqttHandle::subscribe`]; the runner reads them.
+///
+/// Entries are never removed, so an index stays valid.
+/// This type stores the topics; which entries the current session still owes is
+/// decided by `juggler::mqtt::SubscriptionTracker` (ADR 023).
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeSubscriptions {
+    topics: heapless::Vec<heapless::String<MAX_TOPIC_LEN>, MAX_RUNTIME_SUBSCRIPTIONS>,
+    tracker: SubscriptionTracker<MAX_RUNTIME_SUBSCRIPTIONS>,
+}
+
+impl RuntimeSubscriptions {
+    pub(crate) const fn new() -> Self {
+        Self {
+            topics: heapless::Vec::new(),
+            tracker: SubscriptionTracker::new(),
+        }
+    }
+
+    /// Validates and admits one request (`juggler::mqtt::admit_subscription`).
+    ///
+    /// `Ok(true)` means an entry is pending and the runner must be woken.
+    pub(crate) fn admit(
+        &mut self,
+        fixed: &[(&'static str, QoS)],
+        topic: &str,
+        qos: QoS,
+    ) -> Result<bool, MqttError> {
+        validate_subscribe_filter(topic).map_err(MqttError::InvalidTopic)?;
+        let filter = heapless::String::<MAX_TOPIC_LEN>::try_from(topic)
+            .map_err(|_| MqttError::TopicTooLong)?;
+        let qos = clamp_qos(qos);
+        let admission = admit_subscription(
+            fixed.iter().copied(),
+            self.topics
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.as_str(), self.tracker.qos(i).unwrap_or(qos))),
+            topic,
+            qos,
+            MAX_RUNTIME_SUBSCRIPTIONS,
+        );
+        let added = admission == SubscriptionAdmission::Added;
+        match self.tracker.apply(admission, qos) {
+            TrackedRequest::Unchanged => Ok(false),
+            TrackedRequest::Full => Err(MqttError::RuntimeSubscriptionsFull),
+            TrackedRequest::Stored | TrackedRequest::SendNow => {
+                if added && self.topics.push(filter).is_err() {
+                    return Err(MqttError::RuntimeSubscriptionsFull);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.topics.len()
+    }
+
+    /// Copy of entry `index`, for use across an await.
+    pub(crate) fn get(&self, index: usize) -> Option<(heapless::String<MAX_TOPIC_LEN>, QoS)> {
+        let topic = self.topics.get(index)?;
+        Some((topic.clone(), self.tracker.qos(index)?))
+    }
+
+    /// First entry at or after `start` the session still has to receive.
+    pub(crate) fn next_pending_from(
+        &self,
+        start: usize,
+    ) -> Option<(usize, heapless::String<MAX_TOPIC_LEN>, QoS)> {
+        let (index, qos) = self.tracker.next_pending_from(start)?;
+        Some((index, self.topics.get(index)?.clone(), qos))
+    }
+
+    /// First entry the session still has to receive (host tests only).
+    #[cfg(test)]
+    pub(crate) fn next_pending(&self) -> Option<(usize, heapless::String<MAX_TOPIC_LEN>, QoS)> {
+        self.next_pending_from(0)
+    }
+
+    /// A connect work starts; a session that needs every subscription is owed every entry.
+    pub(crate) fn begin_connect(&mut self, resubscribe_all: bool) {
+        self.tracker.begin_connect(resubscribe_all);
+    }
+
+    /// Records that `qos` was sent for entry `index`; a QoS changed since stays pending.
+    pub(crate) fn mark_sent(&mut self, index: usize, qos: QoS) {
+        self.tracker.mark_sent(index, qos);
+    }
+}
+
+/// QoS 2 is not offered on this tier; requests are downgraded to QoS 1.
+pub(crate) fn clamp_qos(qos: QoS) -> QoS {
+    match qos {
+        QoS::ExactlyOnce => QoS::AtLeastOnce,
+        other => other,
+    }
+}
+
+/// Classifies the broker host as an IPv4 literal (no DNS query) or a DNS name
+/// (resolved by the runner on every connect); the rule is shared in `juggler`.
+pub(crate) fn parse_broker_host(host: &str) -> Result<BrokerHost<'_>, MqttError> {
+    classify_broker_host(host).map_err(MqttError::InvalidConfig)
 }
 
 /// Build-time validation shared by the runner and the host tests.
 pub(crate) fn validate_config(config: &MqttConfig<'_>) -> Result<(), MqttError> {
-    parse_broker_ipv4(config.host)?;
+    parse_broker_host(config.host)?;
     validate_broker_port(config.port).map_err(MqttError::InvalidConfig)?;
     validate_client_id(config.client_id).map_err(MqttError::InvalidConfig)?;
     if let Some(lwt) = config.lwt() {
@@ -301,21 +422,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn broker_host_must_be_an_ipv4_literal() {
+    fn broker_host_is_a_literal_or_a_name() {
         assert_eq!(
-            parse_broker_ipv4("192.168.31.5"),
-            Ok(Ipv4Addr::new(192, 168, 31, 5))
+            parse_broker_host("192.168.31.5"),
+            Ok(BrokerHost::Ipv4(core::net::Ipv4Addr::new(192, 168, 31, 5)))
         );
         assert_eq!(
-            parse_broker_ipv4(" 10.0.0.1 "),
-            Ok(Ipv4Addr::new(10, 0, 0, 1))
+            parse_broker_host("broker.local"),
+            Ok(BrokerHost::Name("broker.local"))
         );
         assert!(matches!(
-            parse_broker_ipv4("broker.local"),
+            parse_broker_host("::1"),
             Err(MqttError::InvalidConfig(_))
         ));
         assert!(matches!(
-            parse_broker_ipv4("::1"),
+            parse_broker_host("999.1.1.1"),
             Err(MqttError::InvalidConfig(_))
         ));
     }
@@ -328,7 +449,11 @@ mod tests {
 
     #[test]
     fn validate_config_rejects_bad_fields() {
-        assert!(validate_config(&MqttConfig::new("broker", 1883, "id")).is_err());
+        assert!(validate_config(&MqttConfig::new("", 1883, "id")).is_err());
+        assert_eq!(
+            validate_config(&MqttConfig::new("broker", 1883, "id")),
+            Ok(())
+        );
         assert!(validate_config(&MqttConfig::new("10.0.0.2", 0, "id")).is_err());
         assert!(validate_config(&MqttConfig::new("10.0.0.2", 1883, "")).is_err());
         let zero_keep_alive = MqttConfig::new("10.0.0.2", 1883, "id").with_keep_alive(0);
@@ -368,6 +493,103 @@ mod tests {
             PublishRequest::new("t", &big, QoS::AtMostOnce, false).map(|_| ()),
             Err(MqttError::PayloadTooLarge)
         );
+    }
+
+    fn filter_of_len(len: usize) -> heapless::String<{ MAX_TOPIC_LEN + 1 }> {
+        let mut s = heapless::String::new();
+        for _ in 0..len {
+            s.push('a').unwrap();
+        }
+        s
+    }
+
+    fn numbered(i: usize) -> heapless::String<8> {
+        let mut s = heapless::String::new();
+        core::fmt::write(&mut s, format_args!("t/{i}")).unwrap();
+        s
+    }
+
+    const Q0: QoS = QoS::AtMostOnce;
+    const Q1: QoS = QoS::AtLeastOnce;
+
+    #[test]
+    fn runtime_subscribe_copies_the_filter_and_marks_it_pending() {
+        let mut subs = RuntimeSubscriptions::new();
+        assert_eq!(subs.admit(&[], "knob/cmd/#", Q1), Ok(true));
+        let (index, topic, qos) = subs.next_pending().unwrap();
+        assert_eq!((index, topic.as_str(), qos), (0, "knob/cmd/#", Q1));
+        subs.mark_sent(index, qos);
+        assert!(subs.next_pending().is_none());
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[test]
+    fn runtime_subscribe_refuses_long_and_invalid_filters() {
+        let mut subs = RuntimeSubscriptions::new();
+        let long = filter_of_len(MAX_TOPIC_LEN + 1);
+        assert_eq!(subs.admit(&[], &long, Q1), Err(MqttError::TopicTooLong));
+        assert!(matches!(
+            subs.admit(&[], "a/#/b", Q1),
+            Err(MqttError::InvalidTopic(_))
+        ));
+        assert!(matches!(
+            subs.admit(&[], "", Q1),
+            Err(MqttError::InvalidTopic(_))
+        ));
+        let exact = filter_of_len(MAX_TOPIC_LEN);
+        assert_eq!(subs.admit(&[], &exact, Q1), Ok(true));
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[test]
+    fn runtime_subscribe_is_bounded_and_keeps_registration_order() {
+        let mut subs = RuntimeSubscriptions::new();
+        for i in 0..MAX_RUNTIME_SUBSCRIPTIONS {
+            assert_eq!(subs.admit(&[], &numbered(i), Q1), Ok(true));
+        }
+        assert_eq!(
+            subs.admit(&[], "t/extra", Q1),
+            Err(MqttError::RuntimeSubscriptionsFull)
+        );
+        for i in 0..MAX_RUNTIME_SUBSCRIPTIONS {
+            assert_eq!(subs.get(i).unwrap().0.as_str(), numbered(i).as_str());
+        }
+        assert_eq!(subs.admit(&[], "t/3", Q1), Ok(false));
+    }
+
+    #[test]
+    fn runtime_subscribe_dedupes_against_the_builder_list_and_clamps_qos() {
+        let fixed = [("cmd/#", Q1)];
+        let mut subs = RuntimeSubscriptions::new();
+        assert_eq!(subs.admit(&fixed, "cmd/#", Q1), Ok(false));
+        assert_eq!(subs.admit(&fixed, "cmd/#", Q0), Ok(true));
+        assert_eq!(subs.admit(&[], "x", QoS::ExactlyOnce), Ok(true));
+        assert_eq!(subs.get(1).unwrap().1, Q1);
+    }
+
+    #[test]
+    fn a_changed_qos_is_pending_again_and_a_stale_ack_does_not_clear_it() {
+        let mut subs = RuntimeSubscriptions::new();
+        subs.admit(&[], "a", Q0).unwrap();
+        subs.mark_sent(0, Q0);
+        assert_eq!(subs.admit(&[], "a", Q1), Ok(true));
+        subs.mark_sent(0, Q0);
+        assert_eq!(subs.next_pending().map(|(i, _, q)| (i, q)), Some((0, Q1)));
+        subs.mark_sent(0, Q1);
+        assert!(subs.next_pending().is_none());
+    }
+
+    #[test]
+    fn a_failed_live_send_is_still_owed_after_a_kept_session_reconnect() {
+        let mut subs = RuntimeSubscriptions::new();
+        subs.begin_connect(true);
+        assert_eq!(subs.admit(&[], "a", Q1), Ok(true));
+        assert_eq!(subs.next_pending().map(|(i, _, q)| (i, q)), Some((0, Q1)));
+        subs.begin_connect(false);
+        let (index, topic, qos) = subs.next_pending().unwrap();
+        assert_eq!((index, topic.as_str(), qos), (0, "a", Q1));
+        subs.mark_sent(index, qos);
+        assert!(subs.next_pending().is_none());
     }
 
     #[test]

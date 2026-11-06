@@ -22,7 +22,7 @@
 //!
 //! let handle = MqttBuilder::new(config)
 //!     .subscribe("commands/#", QoS::AtLeastOnce)
-//!     .with_startup_message()
+//!     .with_startup_message("device/status", b"online", QoS::AtLeastOnce, true)
 //!     .on_disconnect(|| log::warn!("MQTT disconnected"))
 //!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
 //!     .build(&wifi)?;
@@ -159,6 +159,7 @@ use juggler::mqtt::{
 
 mod runner;
 mod session;
+mod subscriptions;
 use crate::wifi::WiFiManager;
 use juggler::mqtt::chunks::{Assembled, Chunk, ChunkAssembler};
 use runner::{ClientConfig, Msg, Runner};
@@ -166,6 +167,8 @@ use session::Session;
 pub use session::{
     InboundMessage, INBOUND_QUEUE_DEPTH, MAX_INBOUND_PAYLOAD_LEN, PUBLISH_QUEUE_DEPTH,
 };
+pub use subscriptions::MAX_RUNTIME_SUBSCRIPTIONS;
+use subscriptions::{Admitted, Subscriptions};
 
 // Shared with the bare-metal tier (ADR 019). `DEFAULT_MQTT_TASK_STACK_SIZE`
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
@@ -222,7 +225,7 @@ const BUILDER_EVENT_LOOP_STACK_SIZE: usize = 12 * 1024;
 /// Stack size for the per-connect helper thread.
 ///
 /// Spawned once per connect/reconnect to run, off the event-loop thread: the
-/// startup-message publish (if `with_startup_message()` was used), then
+/// startup-message publish (if `with_startup_message(..)` was used), then
 /// `on_connect`, then `subscribe()` for every registered topic — see
 /// `docs/project-lore.md` "MQTT Event Loop" for why none of this can run on
 /// the event-loop thread itself.  12 KiB accounts for `on_connect` callback
@@ -551,7 +554,7 @@ where
     ///
     /// Publishes "1" to `iot/{client_id}/startup`.
     #[deprecated(
-        note = "use MqttBuilder::with_startup_message() for automatic startup notifications on every (re)connect, or publish() / publish_with() for custom lifecycle messages"
+        note = "use MqttBuilder::with_startup_message(topic, payload, qos, retain) for automatic startup notifications on every (re)connect, or publish() / publish_with() for custom lifecycle messages"
     )]
     pub fn send_startup_message(&mut self) -> anyhow::Result<()> {
         let topic = format!("iot/{}/startup", self.client_id);
@@ -717,7 +720,7 @@ pub struct MqttBuilder<'a> {
     on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
     on_message: Option<OnMessageCallback>,
     subscribe_topics: Vec<(String, QoS)>,
-    with_startup_message: bool,
+    startup: Option<StartupSpec>,
 }
 
 impl<'a> MqttBuilder<'a> {
@@ -729,7 +732,7 @@ impl<'a> MqttBuilder<'a> {
             on_disconnect: None,
             on_message: None,
             subscribe_topics: Vec::new(),
-            with_startup_message: false,
+            startup: None,
         }
     }
 
@@ -780,7 +783,7 @@ impl<'a> MqttBuilder<'a> {
     ///
     /// Runs on a per-connect helper thread, after the builder's
     /// [`subscribe`](Self::subscribe) topics and the startup message (if
-    /// [`with_startup_message()`](Self::with_startup_message) is enabled).
+    /// [`with_startup_message()`](Self::with_startup_message) is configured).
     /// The `client` parameter may be used for `enqueue()` — e.g. a retained
     /// "online" status — and `subscribe()`; do **not** call any
     /// [`MqttHandle`] method from it, such a call returns
@@ -878,28 +881,63 @@ impl<'a> MqttBuilder<'a> {
         self
     }
 
-    /// Opts in to publishing a startup notification on every MQTT (re)connect.
+    /// Publishes a message on every MQTT (re)connect, e.g. a retained "online"
+    /// flag that pairs with an `offline` last will.
     ///
-    /// **Fires on every broker `Connected` transition — both the initial
-    /// connection and every automatic reconnection — not only at device boot.**
+    /// Same signature and semantics as the esp-hal tier's
+    /// `MqttBuilder::with_startup_message`.
+    ///
+    /// **Fires on every broker `Connected` transition: both the initial
+    /// connection and every automatic reconnection, not only at device boot.**
     /// Despite the "startup" name, the publish repeats on each reconnect by
     /// design, so a downstream broker (or its consumers) always sees a fresh
-    /// liveness ping after a network blip without the host needing to wire
+    /// liveness message after a network blip without the host wiring
     /// reconnect bookkeeping itself.
     ///
-    /// When enabled, the builder publishes `"1"` to `iot/{client_id}/startup`
-    /// with [`QoS::AtLeastOnce`] (not retained) from the per-connect helper
-    /// thread, after the SUBSCRIBE packets sent for [`MqttBuilder::subscribe`]
-    /// topics and before [`on_connect`](Self::on_connect) runs (the shared
-    /// `juggler::mqtt::ConnectWorkPlan` order); it is best-effort (not
-    /// load-bearing). Because it never runs on the
+    /// The message goes out from the per-connect helper thread, after the
+    /// SUBSCRIBE packets sent for [`MqttBuilder::subscribe`] topics and before
+    /// [`on_connect`](Self::on_connect) runs (the shared
+    /// `juggler::mqtt::ConnectWorkPlan` order). Because it never runs on the
     /// event-loop thread, it cannot hit the esp-mqtt `api_lock` deadlock
-    /// described in `docs/project-lore.md` "MQTT Event Loop".
+    /// described in `docs/project-lore.md` "MQTT Event Loop". A failed publish
+    /// is logged at `warn`, and the session then retries its connect work.
     ///
-    /// A failed startup publish is logged at `warn` and does not abort the
-    /// connection — the message is best-effort, not load-bearing.
-    pub fn with_startup_message(mut self) -> Self {
-        self.with_startup_message = true;
+    /// A second call replaces the first. An invalid `topic` makes
+    /// [`build`](Self::build) fail.
+    ///
+    /// ```no_run
+    /// use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, MqttConfig, QoS};
+    ///
+    /// let builder = MqttBuilder::new(MqttConfig::new("192.168.1.10", 1883, "node-1"))
+    ///     .with_startup_message("node-1/status", b"online", QoS::AtLeastOnce, true);
+    /// ```
+    pub fn with_startup_message(
+        mut self,
+        topic: &'static str,
+        payload: &'static [u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Self {
+        self.startup = Some(StartupSpec::Custom(StartupMessage {
+            topic: topic.to_string(),
+            payload: payload.to_vec(),
+            qos,
+            retain,
+        }));
+        self
+    }
+
+    /// Publishes `"1"` to `iot/{client_id}/startup` (QoS 1, not retained) on
+    /// every (re)connect; the behaviour the no-argument
+    /// `with_startup_message()` had before 0.7.0.
+    ///
+    /// Replaces any message set by [`with_startup_message`](Self::with_startup_message).
+    #[deprecated(
+        since = "0.7.0",
+        note = "use with_startup_message(topic, payload, qos, retain), which the esp-hal tier shares"
+    )]
+    pub fn with_default_startup_message(mut self) -> Self {
+        self.startup = Some(StartupSpec::Default);
         self
     }
 
@@ -933,6 +971,10 @@ impl<'a> MqttBuilder<'a> {
         for (topic, _) in &self.subscribe_topics {
             validate_subscribe_filter(topic.as_str())
                 .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
+        }
+        if let Some(StartupSpec::Custom(message)) = &self.startup {
+            validate_publish_topic(&message.topic)
+                .map_err(|e| anyhow::anyhow!("invalid startup-message topic: {}", e))?;
         }
 
         // Owned copies of everything the client needs: it is created later, on
@@ -1006,10 +1048,16 @@ impl<'a> MqttBuilder<'a> {
             self.on_connect.map(|f| Arc::new(Mutex::new(f)));
         let on_disconnect = self.on_disconnect;
         let on_message = self.on_message;
-        let subscribe_topics = self.subscribe_topics;
-        let startup_topic: Option<String> = self
-            .with_startup_message
-            .then(|| format!("iot/{}/startup", client_id));
+        let subs = Arc::new(Subscriptions::new(self.subscribe_topics));
+        let startup: Option<StartupMessage> = self.startup.map(|spec| match spec {
+            StartupSpec::Default => StartupMessage {
+                topic: format!("iot/{}/startup", client_id),
+                payload: b"1".to_vec(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+            },
+            StartupSpec::Custom(message) => message,
+        });
 
         // The runner creates the client and hands its event connection over here,
         // so this thread does nothing until the station has an IP (bug 010).
@@ -1180,14 +1228,15 @@ impl<'a> MqttBuilder<'a> {
             handle: None,
             seed_ready,
             ignored_in_a_row: 0,
-            subscribe_topics,
-            startup_topic,
+            subs: Arc::clone(&subs),
+            startup,
             on_connect,
         })?;
 
         Ok(MqttHandle {
             session,
             pending,
+            subs,
             _alive: alive,
         })
     }
@@ -1289,6 +1338,8 @@ pub struct MqttHandle {
     // Registry correlating in-flight acked publishes to their PUBACK; shared
     // with the event-loop thread, which resolves entries on `Published`.
     pending: PendingAcks,
+    // Builder and runtime subscriptions; the runner re-sends them after every connect.
+    subs: Arc<Subscriptions>,
     // Keeps the session alive.  When the last clone is dropped the Arc refcount
     // reaches zero, and the runner's `Weak::upgrade()` returns None, so it stops
     // the client and exits.
@@ -1570,6 +1621,12 @@ impl MqttHandle {
 
     /// Subscribes to a topic.
     ///
+    /// Accepted at any time, like the esp-hal handle: while the session is not
+    /// connected the request is stored and sent after the connect work of the
+    /// builder topics, and again after every reconnect.
+    /// A duplicate at the same QoS is a no-op; at most
+    /// [`MAX_RUNTIME_SUBSCRIPTIONS`] runtime topics are kept.
+    ///
     /// # Important
     ///
     /// Do **not** call this from inside any callback (`on_connect`,
@@ -1578,21 +1635,51 @@ impl MqttHandle {
     /// helper thread while it already holds the client mutex (a self-deadlock
     /// hazard). Such a call returns an error carrying
     /// [`PublishAckError::WrongThread`] instead of hanging. Instead, call
-    /// `subscribe()` after `build()` once [`is_connected`] returns `true`, or
-    /// register the topic on the builder via [`MqttBuilder::subscribe`].
+    /// `subscribe()` after `build()`, or register the topic on the builder via
+    /// [`MqttBuilder::subscribe`].
     pub fn subscribe(&self, topic: &str, qos: QoS) -> anyhow::Result<()> {
         self.ensure_not_in_callback()
             .context("subscribe rejected")?;
         validate_subscribe_filter(topic)
             .map_err(|e| anyhow::anyhow!("invalid subscribe filter: {}", e))?;
-        log::debug!("[mqtt] subscribing to '{}'", topic);
-        let subscribed = self
-            .session
-            .outbox()
-            .with_client_mut(|client| client.subscribe(topic, to_esp_qos(qos)))
-            .ok_or_else(|| anyhow::anyhow!("MQTT client is not started yet (no network)"))?;
-        subscribed?;
-        Ok(())
+        match self.subs.admit(topic, qos)? {
+            Admitted::Stored => {
+                log::debug!(
+                    "[mqtt] subscription to '{}' stored for the next connect",
+                    topic
+                );
+                Ok(())
+            }
+            Admitted::SendNow => {
+                log::debug!("[mqtt] subscribing to '{}'", topic);
+                // Transmit what is owed at the time the client lock is held, not the
+                // QoS this call was admitted with: two callers changing one topic can
+                // reach the lock in the opposite order of their admissions.
+                let sent = self.session.outbox().with_client_mut(|client| {
+                    let mut outcome = Ok(());
+                    self.subs.send_owed_topic(topic, |owed| {
+                        match client.subscribe_topic(topic, owed) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                outcome = Err(e);
+                                false
+                            }
+                        }
+                    });
+                    outcome
+                });
+                match sent {
+                    Some(Ok(())) => Ok(()),
+                    // The link dropped after the request was admitted: the entry
+                    // stays pending and goes out with the next connect work.
+                    Some(Err(_)) | None if !self.is_connected() => Ok(()),
+                    Some(Err(e)) => Err(e),
+                    None => Err(anyhow::anyhow!(
+                        "MQTT client is not started yet (no network)"
+                    )),
+                }
+            }
+        }
     }
 
     /// Returns `true` if the MQTT transport is connected and the `on_connect`
@@ -1735,6 +1822,11 @@ impl MqttClient for MqttHandle {
         MqttHandle::try_publish_with(self, topic, payload, qos, retain)
     }
 
+    /// Stores or sends a subscription, see [`MqttHandle::subscribe`].
+    fn subscribe(&self, topic: &str, qos: QoS) -> anyhow::Result<()> {
+        MqttHandle::subscribe(self, topic, qos)
+    }
+
     /// Waits until the outbox has room, then hands the message over.
     ///
     /// Never evicts a queued message (unlike the synchronous
@@ -1772,6 +1864,24 @@ const _: fn() = || {
     implements::<MqttHandle>();
 };
 
+/// The message published on every (re)connect, owned so the connect helper can
+/// borrow it for each run.
+#[derive(Debug, Clone)]
+pub(super) struct StartupMessage {
+    pub(super) topic: String,
+    pub(super) payload: Vec<u8>,
+    pub(super) qos: QoS,
+    pub(super) retain: bool,
+}
+
+/// What the builder was asked to publish on connect; the default form needs
+/// the client id, so it is resolved in `build`.
+#[derive(Debug, Clone)]
+enum StartupSpec {
+    Default,
+    Custom(StartupMessage),
+}
+
 /// Everything one connect-work run needs besides the client, bundled so the
 /// call stays within the registers of the Xtensa call window: with eight loose
 /// arguments the LLVM backend fails to allocate registers ("Cannot scavenge
@@ -1780,8 +1890,8 @@ pub(super) struct ConnectWork<'a> {
     pub(super) session: &'a Session,
     pub(super) token: SessionToken,
     pub(super) plan: ConnectWorkPlan,
-    pub(super) topics: &'a [(String, QoS)],
-    pub(super) startup_topic: Option<&'a str>,
+    pub(super) subs: &'a Subscriptions,
+    pub(super) startup: Option<&'a StartupMessage>,
     pub(super) on_connect: Option<&'a Mutex<OnConnectCallback>>,
     pub(super) session_present: bool,
 }
@@ -1797,18 +1907,13 @@ fn connect_work(client: &mut SubscribableClient, work: &ConnectWork<'_>) {
         session,
         token,
         plan,
-        topics,
-        startup_topic,
+        subs,
+        startup,
         on_connect,
         session_present,
     } = work;
-    let (token, topics, startup_topic, on_connect, session_present) = (
-        *token,
-        *topics,
-        *startup_topic,
-        *on_connect,
-        *session_present,
-    );
+    let (token, subs, startup, on_connect, session_present) =
+        (*token, *subs, *startup, *on_connect, *session_present);
     if !session.is_current(token) {
         log::debug!("[mqtt] connect helper: stale session, skipping its connect work");
         return;
@@ -1817,9 +1922,14 @@ fn connect_work(client: &mut SubscribableClient, work: &ConnectWork<'_>) {
     for step in plan.clone() {
         match step {
             ConnectStep::Subscribe(index) => {
-                let (topic, qos) = &topics[index];
-                match client.subscribe_topic(topic, *qos) {
-                    Ok(()) => log::info!("[mqtt] subscribed to '{}'", topic),
+                let Some((topic, qos)) = subs.get(index) else {
+                    continue;
+                };
+                match client.subscribe_topic(&topic, qos) {
+                    Ok(()) => {
+                        subs.mark_sent(index, qos);
+                        log::info!("[mqtt] subscribed to '{}'", topic);
+                    }
                     Err(e) => {
                         log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e);
                         done = false;
@@ -1827,11 +1937,16 @@ fn connect_work(client: &mut SubscribableClient, work: &ConnectWork<'_>) {
                 }
             }
             ConnectStep::PublishStartup => {
-                let topic = startup_topic.unwrap_or_default();
-                if let Err(e) = client.enqueue(topic, EspQoS::AtLeastOnce, false, b"1") {
+                let Some(message) = startup else { continue };
+                if let Err(e) = client.enqueue(
+                    &message.topic,
+                    to_esp_qos(message.qos),
+                    message.retain,
+                    &message.payload,
+                ) {
                     log::warn!(
                         "[mqtt] startup-message publish to '{}' failed: {:?}",
-                        topic,
+                        message.topic,
                         e
                     );
                     done = false;
@@ -1853,6 +1968,20 @@ fn connect_work(client: &mut SubscribableClient, work: &ConnectWork<'_>) {
         if !done {
             break;
         }
+    }
+    // Runtime requests the plan did not cover (stored while disconnected on a
+    // kept session, or admitted meanwhile) go out before the session is live.
+    if done {
+        done = subs.catch_up_and_go_live(|topic, qos| match client.subscribe_topic(topic, qos) {
+            Ok(()) => {
+                log::info!("[mqtt] subscribed to '{}'", topic);
+                true
+            }
+            Err(e) => {
+                log::warn!("[mqtt] subscribe to '{}' failed: {:#}", topic, e);
+                false
+            }
+        });
     }
     session.send(if done {
         SessionInput::WorkDone(token)

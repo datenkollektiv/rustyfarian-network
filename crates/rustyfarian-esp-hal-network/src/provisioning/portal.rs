@@ -106,7 +106,7 @@ use juggler::provisioning::parse_form;
 use juggler::provisioning::{
     body_nonce_matches,
     templates::{COMMITTED_HTML, FACTORY_RESET_HTML, PROBE_PATHS, SESSION_FINISHED_BODY},
-    PortalAction, PortalInput, ProvisioningConfig,
+    PortalAction, PortalInput, PortalPhase, ProvisioningConfig,
 };
 #[cfg(any(
     test,
@@ -158,17 +158,19 @@ const DEFAULT_RX_BUF: usize = 1024;
 /// a smaller buffer would trip the [`MINIMAL_500`] fallback on every portal GET.
 const DEFAULT_TX_BUF: usize = 6144;
 
-/// Deadline for draining an unread request body after the response is written
-/// and before `socket.close()` is called.
-const REQUEST_BODY_DRAIN_DEADLINE_MS: u64 = 500;
-
-/// Deadline for receiving the request headers after `accept`.
+/// The budget of one connection phase as an embassy duration.
 ///
-/// A phone may open speculative idle connections; without this bound one that
-/// never sends the header terminator would hold the single accept socket and
-/// block the portal.  IDF httpd has its own receive timeout, so this budget is
-/// a bare-metal adapter fact.
-const REQUEST_HEADER_TIMEOUT_MS: u64 = 5_000;
+/// The values live in `juggler::provisioning::PortalPhase` (shared with the ESP-IDF
+/// tier's `httpd` timeouts, host-tested); this is only the unit conversion.
+/// A phone may open speculative idle connections, and this portal serves one
+/// connection at a time, so every phase of a connection has its own bound.
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
+fn phase_budget(phase: juggler::provisioning::PortalPhase) -> embassy_time::Duration {
+    embassy_time::Duration::from_millis(u64::from(phase.budget_ms()))
+}
 
 // ── Page content ─────────────────────────────────────────────────────────────
 
@@ -1275,7 +1277,7 @@ pub(crate) async fn run_portal_dyn(
         // or fill the buffer, within the header deadline: a client that never
         // finishes its headers must not hold the single accept socket.
         let filled = match embassy_time::with_timeout(
-            embassy_time::Duration::from_millis(REQUEST_HEADER_TIMEOUT_MS),
+            phase_budget(PortalPhase::Headers),
             read_request(&mut socket, &mut req_buf, DEFAULT_REQUEST_SIZE_CAP),
         )
         .await
@@ -1284,10 +1286,10 @@ pub(crate) async fn run_portal_dyn(
             Err(_) => {
                 log::debug!(
                     "Portal: no request headers within {} ms; closing",
-                    REQUEST_HEADER_TIMEOUT_MS
+                    PortalPhase::Headers.budget_ms()
                 );
                 socket.abort();
-                let _ = socket.flush().await;
+                flush_bounded(&mut socket).await;
                 // SECURITY: a partial request may hold credential bytes.
                 req_buf.fill(0xFF);
                 continue;
@@ -1327,23 +1329,43 @@ pub(crate) async fn run_portal_dyn(
                     // will see a truncated form and the nonce / parse_form
                     // checks will reject a valid submission.
                     //
-                    // Bounded by `DEFAULT_REQUEST_SIZE_CAP` (the same value
-                    // `parse_request` already capped `Content-Length` against),
-                    // so a malicious or misbehaving client cannot stall here
-                    // indefinitely.
+                    // The byte cap (`DEFAULT_REQUEST_SIZE_CAP`, the value
+                    // `parse_request` already capped `Content-Length` against)
+                    // bounds how MUCH is read, not for how LONG: a client that
+                    // sends valid headers and then no body would hold the single
+                    // accept loop forever.  The `PortalPhase::Body` deadline
+                    // bounds the time; on expiry the connection is aborted
+                    // without a response and the loop returns to accept.
                     let mut total = n;
+                    let mut body_stalled = false;
                     if matches!(req.method, Method::Post) {
                         if let Some(cl) = req.headers.content_length {
                             let need =
                                 body_read_target(hdr_end, cl as usize, DEFAULT_REQUEST_SIZE_CAP);
-                            while total < need {
-                                match socket.read(&mut req_buf[total..need]).await {
-                                    Ok(0) => break, // peer closed early
-                                    Ok(extra) => total += extra,
-                                    Err(_) => break, // best-effort; dispatch handles short body
-                                }
+                            match read_body_bounded(
+                                &mut socket,
+                                &mut req_buf,
+                                total,
+                                need,
+                                phase_budget(PortalPhase::Body),
+                            )
+                            .await
+                            {
+                                Ok(filled) => total = filled,
+                                Err(Stalled) => body_stalled = true,
                             }
                         }
+                    }
+                    if body_stalled {
+                        log::debug!(
+                            "Portal: request body not complete within {} ms; closing",
+                            PortalPhase::Body.budget_ms()
+                        );
+                        socket.abort();
+                        flush_bounded(&mut socket).await;
+                        // SECURITY: a partial body may hold credential bytes.
+                        req_buf.fill(0xFF);
+                        continue;
                     }
                     let body_in_buf = &req_buf[hdr_end..total];
 
@@ -1378,34 +1400,49 @@ pub(crate) async fn run_portal_dyn(
             }
         };
 
-        // Write the response (partial-write safe loop).
-        if resp_len > 0 {
-            let mut written = 0;
-            while written < resp_len {
-                match socket.write(&resp_buf[written..resp_len]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => written += n,
-                }
-            }
+        // Write the response (partial-write safe loop) and flush it, within the
+        // response deadline: a client that stops reading must not hold the loop.
+        let response_stalled = write_bounded(
+            &mut socket,
+            &resp_buf[..resp_len],
+            phase_budget(PortalPhase::Response),
+        )
+        .await
+        .is_err();
+        if response_stalled {
+            log::debug!(
+                "Portal: response not delivered within {} ms; closing",
+                PortalPhase::Response.budget_ms()
+            );
+            socket.abort();
+            flush_bounded(&mut socket).await;
+            req_buf.fill(0xFF);
+            continue;
         }
-
-        let _ = socket.flush().await;
 
         // Drain remaining request body before close to avoid RST.
         if let Some((content_length, already_in_buf)) = body_drain_target {
             if content_length > already_in_buf {
                 let remaining = content_length - already_in_buf;
-                drain_body_with_deadline(
-                    &mut socket,
-                    remaining,
-                    embassy_time::Duration::from_millis(REQUEST_BODY_DRAIN_DEADLINE_MS),
-                )
-                .await;
+                drain_body_with_deadline(&mut socket, remaining, phase_budget(PortalPhase::Drain))
+                    .await;
             }
         }
 
+        // Close and flush the FIN within the close deadline; a peer that never
+        // acknowledges it is reset instead of holding the loop.
         socket.close();
-        let _ = socket.flush().await;
+        if close_bounded(&mut socket, phase_budget(PortalPhase::Close))
+            .await
+            .is_err()
+        {
+            log::debug!(
+                "Portal: close not acknowledged within {} ms; aborting",
+                PortalPhase::Close.budget_ms()
+            );
+            socket.abort();
+            flush_bounded(&mut socket).await;
+        }
 
         // SECURITY: early drop of credential buffers — overwrite req_buf with
         // 0xFF before the loop iterates so any credentials read into the buffer
@@ -1446,6 +1483,108 @@ async fn read_request(
             return Ok(filled);
         }
     }
+}
+
+/// A portal phase did not finish within its budget.
+#[cfg(any(
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ),
+    test
+))]
+#[derive(Debug, PartialEq, Eq)]
+struct Stalled;
+
+/// Read the rest of a request body into `buf[total..need]`, within `budget`.
+///
+/// Returns the filled length.
+/// A peer close or read error ends the read early (best effort, `dispatch_request` handles a
+/// short body); only running out of `budget` is [`Stalled`].
+#[cfg(any(
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ),
+    test
+))]
+async fn read_body_bounded<R: embedded_io_async::Read>(
+    io: &mut R,
+    buf: &mut [u8],
+    mut total: usize,
+    need: usize,
+    budget: embassy_time::Duration,
+) -> Result<usize, Stalled> {
+    let read_body = async {
+        while total < need {
+            match io.read(&mut buf[total..need]).await {
+                Ok(0) | Err(_) => break,
+                Ok(extra) => total += extra,
+            }
+        }
+        total
+    };
+    embassy_time::with_timeout(budget, read_body)
+        .await
+        .map_err(|_| Stalled)
+}
+
+/// Write all of `data` (partial-write safe) and flush it, within `budget`.
+///
+/// A write error or a zero-length write ends the send early; only running out of `budget` is
+/// [`Stalled`].
+#[cfg(any(
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ),
+    test
+))]
+async fn write_bounded<W: embedded_io_async::Write>(
+    io: &mut W,
+    data: &[u8],
+    budget: embassy_time::Duration,
+) -> Result<(), Stalled> {
+    let send = async {
+        let mut written = 0;
+        while written < data.len() {
+            match io.write(&data[written..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => written += n,
+            }
+        }
+        let _ = io.flush().await;
+    };
+    embassy_time::with_timeout(budget, send)
+        .await
+        .map_err(|_| Stalled)
+}
+
+/// Flush the FIN of an already closed connection, within `budget`.
+#[cfg(any(
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    ),
+    test
+))]
+async fn close_bounded<W: embedded_io_async::Write>(
+    io: &mut W,
+    budget: embassy_time::Duration,
+) -> Result<(), Stalled> {
+    embassy_time::with_timeout(budget, io.flush())
+        .await
+        .map(|_| ())
+        .map_err(|_| Stalled)
+}
+
+/// Flush after an `abort`: the reset is already queued, so the short abort budget is ample.
+#[cfg(all(
+    feature = "embassy",
+    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+))]
+async fn flush_bounded(socket: &mut embassy_net::tcp::TcpSocket<'_>) {
+    let _ = embassy_time::with_timeout(phase_budget(PortalPhase::Abort), socket.flush()).await;
 }
 
 /// Read and discard up to `remaining` bytes from `socket`, honouring `deadline`.
@@ -1502,6 +1641,84 @@ mod tests {
             hasher.write_u8(0);
             alloc::format!("{:08x}", hasher.finish() as u32)
         })
+    }
+
+    // ── bounded per-phase waits (ADR 023 decision 4) ──────────────────────────
+
+    // The mock time driver is a host-only dev-dependency (not on `espidf`, see `Cargo.toml`).
+    #[cfg(not(target_os = "espidf"))]
+    mod bounded {
+        use super::super::{close_bounded, read_body_bounded, write_bounded, Stalled};
+        use core::convert::Infallible;
+        use core::future::Future;
+        use core::pin::pin;
+        use core::task::{Context, Poll, Waker};
+        use embassy_time::{Duration, MockDriver};
+
+        /// An I/O peer that never becomes ready for read, write or flush.
+        struct Never;
+
+        impl embedded_io_async::ErrorType for Never {
+            type Error = Infallible;
+        }
+
+        impl embedded_io_async::Read for Never {
+            async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Infallible> {
+                core::future::pending().await
+            }
+        }
+
+        impl embedded_io_async::Write for Never {
+            async fn write(&mut self, _buf: &[u8]) -> Result<usize, Infallible> {
+                core::future::pending().await
+            }
+            async fn flush(&mut self) -> Result<(), Infallible> {
+                core::future::pending().await
+            }
+        }
+
+        /// Poll `fut` once, advance the mock clock past `budget`, poll again.
+        ///
+        /// Returns the first poll's readiness and the second poll's result.
+        fn run_past_budget<F: Future>(fut: F, budget: Duration) -> (bool, Poll<F::Output>) {
+            let driver = MockDriver::get();
+            let mut fut = pin!(fut);
+            let mut cx = Context::from_waker(Waker::noop());
+            let first_ready = fut.as_mut().poll(&mut cx).is_ready();
+            driver.advance(budget + Duration::from_millis(1));
+            (first_ready, fut.as_mut().poll(&mut cx))
+        }
+
+        #[test]
+        fn body_read_stalls_on_silent_peer() {
+            let budget = Duration::from_millis(5_000);
+            let mut buf = [0u8; 16];
+            let (early, out) = run_past_budget(
+                read_body_bounded(&mut Never, &mut buf, 4, 16, budget),
+                budget,
+            );
+            assert!(!early, "must wait for the peer, not finish at once");
+            assert_eq!(out, Poll::Ready(Err(Stalled)));
+        }
+
+        #[test]
+        fn response_write_stalls_on_peer_that_stops_reading() {
+            let budget = Duration::from_millis(5_000);
+            let (early, out) = run_past_budget(
+                write_bounded(&mut Never, b"HTTP/1.1 200 OK", budget),
+                budget,
+            );
+            assert!(!early);
+            assert_eq!(out, Poll::Ready(Err(Stalled)));
+        }
+
+        #[test]
+        fn close_stalls_on_peer_that_never_acks_the_fin() {
+            let budget = Duration::from_millis(1_000);
+            let (early, out) = run_past_budget(close_bounded(&mut Never, budget), budget);
+            assert!(!early);
+            assert_eq!(out, Poll::Ready(Err(Stalled)));
+        }
     }
 
     // ── body_read_target (pure host-testable arithmetic) ──────────────────────

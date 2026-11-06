@@ -25,6 +25,8 @@ fn main() {
     // the example keeps the value it was last compiled with.
     println!("cargo:rerun-if-env-changed=MQTT_SUSPEND_DEMO");
     println!("cargo:rerun-if-env-changed=OTA_URL");
+    // Health override of the OTA examples (`just ota-image-unhealthy`).
+    println!("cargo:rerun-if-env-changed=OTA_DEMO_UNHEALTHY");
     // Remaining non-secret keys in the shared `PortalDefaults` vocabulary
     // (`juggler::provisioning::PortalDefaults`). The bare-metal tier serves
     // only the `WifiMqttDevice` profile today, so no current example reads

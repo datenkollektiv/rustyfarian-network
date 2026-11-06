@@ -20,8 +20,27 @@
 //! |:------------------|:-------------------------------------------------------------------|
 //! | `ESPNOW_PEER_MAC` | Coordinator STA MAC, `aa:bb:cc:dd:ee:ff` (required; printed by it)  |
 //! | `ESPNOW_CHANNEL`  | Optional first guess for the pinned channel (1..=13)               |
+//! | `ESPNOW_SCENARIO` | Optional gate scenario, see below (default `default`, the behaviour above) |
 //!
 //! No credentials are involved.
+//!
+//! # Gate scenarios
+//!
+//! `ESPNOW_SCENARIO` selects a hardware gate scenario of
+//! `docs/runbooks/release-0.7.0-hardware-test.md`.
+//! Each scenario logs lines that start with `ESPNOW-GATE <gate> PASS` or `ESPNOW-GATE <gate> FAIL`.
+//!
+//! | `ESPNOW_SCENARIO` | Gate   | What it does                                                                  |
+//! |:------------------|:-------|:------------------------------------------------------------------------------|
+//! | `cancel`          | C3-H6  | Drops `scan_for_peer` mid-run (delay cycles 3 to 250 ms), then scans again    |
+//! | `flood`           | C3-H7  | Eight concurrent `send_acked` (1 ms and 400 ms deadlines), then one more send |
+//! | `shutdown`        | C3-H8  | Queues sends, starts a scan, calls `shutdown` mid-scan, sends and scans again |
+//! | `shutdown-queued` | C3-H8  | Queues sends and calls `shutdown` before any scan, sends and scans again      |
+//! | `txpower`         | C3-H9  | Reads the radio TX power before and after each scan and compares them         |
+//!
+//! `shutdown` and `shutdown-queued` end the driver for good, so each runs one check and then
+//! parks; reset the board to repeat it.
+//! Run `cancel` first with the coordinator powered off to see the not-found scans, then power it on.
 //!
 //! # Build and flash
 //!
@@ -35,16 +54,19 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::string::String;
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_futures::join::{join3, join_array};
+use embassy_time::{with_timeout, Duration, Instant, Ticker, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use rustyfarian_esp_hal_network::espnow::{
     EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, MacAddress, PeerConfig,
-    ScanConfig, TxPowerLevel,
+    ScanConfig, ScanError, TxPowerLevel,
 };
 use static_cell::StaticCell;
 
@@ -60,6 +82,24 @@ const PROBE: &[u8] = b"scan";
 
 /// Echoed frames received; written by `rx_task` only (ESP32-C3 has no atomic read-modify-write).
 static RX_ECHOES: AtomicU32 = AtomicU32::new(0);
+
+/// Set by `sender_task` once `run_sender` has returned (gate C3-H8).
+static SENDER_RETURNED: AtomicBool = AtomicBool::new(false);
+
+/// Gate scenario selected at build time; `default` keeps the plain peer behaviour.
+const SCENARIO: &str = match option_env!("ESPNOW_SCENARIO") {
+    Some(s) => s,
+    None => "default",
+};
+
+const SCENARIOS: [&str; 6] = [
+    "default",
+    "cancel",
+    "flood",
+    "shutdown",
+    "shutdown-queued",
+    "txpower",
+];
 
 const PEER_MAC: Option<MacAddress> = match option_env!("ESPNOW_PEER_MAC") {
     Some(s) => parse_mac(s),
@@ -167,7 +207,27 @@ async fn main(spawner: Spawner) {
     spawner.spawn(sender_task(espnow).unwrap());
     spawner.spawn(rx_task(espnow).unwrap());
 
+    if !SCENARIOS.contains(&SCENARIO) {
+        println!(
+            "FATAL: unknown ESPNOW_SCENARIO={}, expected one of {:?}",
+            SCENARIO, SCENARIOS
+        );
+        halt().await
+    }
+    println!("ESPNOW_SCENARIO={}", SCENARIO);
+    if SCENARIO == "cancel" {
+        scenario_cancel(espnow, &coordinator).await
+    }
+
     scan_until_found(espnow, &coordinator).await;
+
+    match SCENARIO {
+        "flood" => scenario_flood(espnow, &coordinator).await,
+        "shutdown" => scenario_shutdown(espnow, &coordinator, true).await,
+        "shutdown-queued" => scenario_shutdown(espnow, &coordinator, false).await,
+        "txpower" => scenario_txpower(espnow, &coordinator).await,
+        _ => {}
+    }
 
     let mut ticker = Ticker::every(Duration::from_millis(SEND_PERIOD_MS));
     let mut seq: u32 = 0;
@@ -252,7 +312,8 @@ async fn scan_until_found(espnow: &EspHalEspNow, coordinator: &MacAddress) {
 /// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
 #[embassy_executor::task]
 async fn sender_task(espnow: &'static EspHalEspNow) {
-    espnow.run_sender().await
+    espnow.run_sender().await;
+    SENDER_RETURNED.store(true, Ordering::Relaxed);
 }
 
 /// Counts frames the coordinator echoes back (reported in the periodic stats, never logged per
@@ -270,5 +331,380 @@ async fn rx_task(espnow: &'static EspHalEspNow) {
 async fn halt() -> ! {
     loop {
         Timer::after(Duration::from_secs(3600)).await;
+    }
+}
+
+// ── Gate scenarios (test harness, not library) ──────────────────────────────
+
+/// Logs the single PASS or FAIL line a runbook gate checks.
+fn gate(id: &str, ok: bool, detail: core::fmt::Arguments<'_>) {
+    println!(
+        "ESPNOW-GATE {} {}: {}",
+        id,
+        if ok { "PASS" } else { "FAIL" },
+        detail
+    );
+}
+
+/// Short name of a send result for the scenario logs.
+fn class(result: &Result<(), EspHalEspNowError>) -> &'static str {
+    match result {
+        Ok(()) => "Ok",
+        Err(EspHalEspNowError::SendFailed) => "SendFailed",
+        Err(EspHalEspNowError::Timeout) => "Timeout",
+        Err(EspHalEspNowError::Busy) => "Busy",
+        Err(EspHalEspNowError::ScanInProgress) => "ScanInProgress",
+        Err(EspHalEspNowError::Shutdown) => "Shutdown",
+        Err(EspHalEspNowError::NoSenderRunner) => "NoSenderRunner",
+        Err(_) => "Other",
+    }
+}
+
+/// Reads the radio's maximum TX power in quarter dBm, `None` when the driver refuses.
+fn radio_tx_power() -> Option<i8> {
+    extern "C" {
+        fn esp_wifi_get_max_tx_power(power: *mut i8) -> i32;
+    }
+    let mut power: i8 = 0;
+    // SAFETY: `esp_wifi_get_max_tx_power` is provided by esp-wifi-sys, always linked by every
+    // esp-radio build, and writes the current level to the valid `&mut i8` passed in.
+    // It fails with an error code (read as `None`) when Wi-Fi is not started.
+    let rc = unsafe { esp_wifi_get_max_tx_power(&mut power) };
+    (rc == 0).then_some(power)
+}
+
+/// The radio state a cancelled or not-found scan must leave as it was.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct RadioState {
+    pinned: Option<u8>,
+    shadow_power: Option<i8>,
+    radio_power: Option<i8>,
+    peer: bool,
+}
+
+fn radio_state(espnow: &EspHalEspNow, coordinator: &MacAddress) -> RadioState {
+    RadioState {
+        pinned: espnow.pinned_channel(),
+        shadow_power: espnow.tx_power_quarter_dbm(),
+        radio_power: radio_tx_power(),
+        peer: espnow.peer_exists(coordinator),
+    }
+}
+
+/// C3-H6: scan, cancel a scan by dropping its future, scan again.
+///
+/// The cancel delay cycles through short values so that some cancels land mid-probe.
+/// A cancelled or not-found scan must leave the pinned channel, TX power and peer as they were
+/// (after the deferred teardown of a probe on the air had time to run), and a scan after a cancel
+/// must find the coordinator on the channel it was found on before.
+async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
+    const DELAYS_MS: [u64; 6] = [3, 10, 25, 60, 120, 250];
+    let scan = ScanConfig::new(PROBE);
+    let mut known: Option<u8> = None;
+    let mut cycle = 0usize;
+    loop {
+        let delay = DELAYS_MS[cycle % DELAYS_MS.len()];
+        cycle += 1;
+
+        let before = radio_state(espnow, coordinator);
+        let cancelled = with_timeout(
+            Duration::from_millis(delay),
+            espnow.scan_for_peer(coordinator, &scan),
+        )
+        .await;
+        match cancelled {
+            Err(_) => {
+                // A probe on the air defers the teardown to the sender runner.
+                Timer::after(Duration::from_millis(50)).await;
+                let after = radio_state(espnow, coordinator);
+                gate(
+                    "C3-H6",
+                    before == after,
+                    format_args!(
+                        "scan cancelled after {} ms, state {:?} -> {:?}",
+                        delay, before, after
+                    ),
+                );
+            }
+            Ok(_) => println!(
+                "[C3-H6] scan ended within {} ms, before the cancel; not a cancel sample",
+                delay
+            ),
+        }
+
+        let before = radio_state(espnow, coordinator);
+        match espnow.scan_for_peer(coordinator, &scan).await {
+            Ok(found) => {
+                let ok = known.is_none_or(|k| k == found.channel);
+                gate(
+                    "C3-H6",
+                    ok,
+                    format_args!(
+                        "scan after cancel found the coordinator on channel {} (earlier {:?})",
+                        found.channel, known
+                    ),
+                );
+                known = Some(found.channel);
+            }
+            Err(EspHalEspNowError::Scan(e @ ScanError::NotFound { .. })) => {
+                let after = radio_state(espnow, coordinator);
+                gate(
+                    "C3-H6",
+                    known.is_none() && before == after,
+                    format_args!(
+                        "not-found scan ended ({:?}), state {:?} -> {:?}, coordinator earlier on {:?}",
+                        e, before, after, known
+                    ),
+                );
+            }
+            Err(e) => gate(
+                "C3-H6",
+                false,
+                format_args!("scan after cancel failed: {}", e),
+            ),
+        }
+        Timer::after(Duration::from_secs(2)).await;
+    }
+}
+
+/// One send of the flood: returns its index, deadline, elapsed time and result.
+async fn timed_send(
+    espnow: &EspHalEspNow,
+    coordinator: &MacAddress,
+    idx: usize,
+    timeout_ms: u64,
+) -> (usize, u64, u64, Result<(), EspHalEspNowError>) {
+    let start = Instant::now();
+    let result = espnow
+        .send_acked(
+            coordinator,
+            b"flood",
+            core::time::Duration::from_millis(timeout_ms),
+        )
+        .await;
+    (idx, timeout_ms, start.elapsed().as_millis(), result)
+}
+
+/// C3-H7: more concurrent `send_acked` futures than queue slots, with short and long deadlines.
+///
+/// Passes when the flood ends without a hang, every result is a real result or a `Timeout`
+/// delivered close to its deadline, and a later send still runs, which shows the sender runner
+/// is alive.
+async fn scenario_flood(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
+    // Twice the driver's four send slots.
+    const FLOOD: usize = 8;
+    const SLACK_MS: u64 = 100;
+    loop {
+        let flood = with_timeout(
+            Duration::from_secs(10),
+            join_array::<_, FLOOD>(core::array::from_fn(|i| {
+                let timeout_ms = if i % 2 == 0 { 400 } else { 1 };
+                timed_send(espnow, coordinator, i, timeout_ms)
+            })),
+        )
+        .await;
+        match flood {
+            Err(_) => gate(
+                "C3-H7",
+                false,
+                format_args!("the flood did not end within 10 s (hang)"),
+            ),
+            Ok(results) => {
+                let mut problems = String::new();
+                let mut summary = String::new();
+                for (idx, timeout_ms, elapsed, result) in &results {
+                    let c = class(result);
+                    let _ = write!(summary, " #{}:{}@{}ms/{}", idx, c, elapsed, timeout_ms);
+                    let allowed = matches!(c, "Ok" | "SendFailed" | "Timeout" | "Busy");
+                    let late = c == "Timeout" && *elapsed > *timeout_ms + SLACK_MS;
+                    if !allowed || late {
+                        let _ = write!(
+                            problems,
+                            " #{} {} after {} ms (deadline {} ms);",
+                            idx, c, elapsed, timeout_ms
+                        );
+                    }
+                }
+                let after = espnow
+                    .send_acked(
+                        coordinator,
+                        b"after-flood",
+                        core::time::Duration::from_millis(500),
+                    )
+                    .await;
+                if !matches!(class(&after), "Ok" | "SendFailed") {
+                    let _ = write!(problems, " send after the flood ended {};", class(&after));
+                }
+                gate(
+                    "C3-H7",
+                    problems.is_empty(),
+                    format_args!(
+                        "flood of {}:{}; after-flood send {}; problems:{}",
+                        FLOOD,
+                        summary,
+                        class(&after),
+                        problems
+                    ),
+                );
+            }
+        }
+        Timer::after(Duration::from_secs(2)).await;
+    }
+}
+
+/// C3-H8: shut the driver down with sends queued (and, with `with_scan`, a scan running).
+///
+/// A send that was queued when the scan began is dropped by the scan as `ScanInProgress`;
+/// that is accepted in the `shutdown` variant, and `shutdown-queued` expects `Shutdown`.
+/// A frame that was already on the air may report its real result.
+/// Afterwards a send must return `Shutdown`, a scan must end without touching the radio, and
+/// `run_sender` must have returned.
+async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with_scan: bool) -> ! {
+    const SENDS: usize = 8;
+    const CHANNELS: [u8; 65] = {
+        let mut list = [0u8; 65];
+        let mut i = 0;
+        while i < list.len() {
+            list[i] = (i % 13) as u8 + 1;
+            i += 1;
+        }
+        list
+    };
+    // No peer owns this address, so every probe fails and the scan keeps going.
+    let silent: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let scan_config = ScanConfig::new(PROBE).with_channels(&CHANNELS);
+
+    let outcome = with_timeout(Duration::from_secs(10), async {
+        let sends = join_array::<_, SENDS>(core::array::from_fn(|i| {
+            timed_send(espnow, coordinator, i, 5000)
+        }));
+        let scan = async {
+            if with_scan {
+                Some(espnow.scan_for_peer(&silent, &scan_config).await)
+            } else {
+                None
+            }
+        };
+        let killer = async {
+            if with_scan {
+                Timer::after(Duration::from_millis(15)).await;
+            } else {
+                embassy_futures::yield_now().await;
+            }
+            espnow.shutdown();
+        };
+        join3(sends, scan, killer).await
+    })
+    .await;
+    let Ok((sends, scan, ())) = outcome else {
+        gate(
+            "C3-H8",
+            false,
+            format_args!("queued requests did not end within 10 s of shutdown (hang)"),
+        );
+        halt().await
+    };
+
+    let mut problems = String::new();
+    let mut summary = String::new();
+    for (idx, _, elapsed, result) in &sends {
+        let c = class(result);
+        let _ = write!(summary, " #{}:{}@{}ms", idx, c, elapsed);
+        let ok = match c {
+            "Shutdown" => true,
+            "ScanInProgress" => with_scan,
+            "Ok" | "SendFailed" => *idx == 0,
+            _ => false,
+        };
+        if !ok {
+            let _ = write!(problems, " #{} ended {};", idx, c);
+        }
+    }
+    if let Some(scan) = &scan {
+        if !matches!(scan, Err(EspHalEspNowError::Scan(ScanError::Aborted))) {
+            let _ = write!(problems, " scan did not end Aborted: {:?};", scan.is_ok());
+        }
+    }
+
+    let before = radio_state(espnow, coordinator);
+    let started = Instant::now();
+    let later_send = espnow
+        .send_acked(coordinator, b"late", core::time::Duration::from_millis(100))
+        .await;
+    let send_ms = started.elapsed().as_millis();
+    if !matches!(later_send, Err(EspHalEspNowError::Shutdown)) || send_ms > 50 {
+        let _ = write!(
+            problems,
+            " later send ended {} after {} ms;",
+            class(&later_send),
+            send_ms
+        );
+    }
+    let later_scan = espnow
+        .scan_for_peer(coordinator, &ScanConfig::new(PROBE))
+        .await;
+    let after = radio_state(espnow, coordinator);
+    if later_scan.is_ok() || before != after {
+        let _ = write!(
+            problems,
+            " later scan ok={} state {:?} -> {:?};",
+            later_scan.is_ok(),
+            before,
+            after
+        );
+    }
+    // Give the runner time to finish the frame on the air.
+    Timer::after(Duration::from_millis(500)).await;
+    if !SENDER_RETURNED.load(Ordering::Relaxed) {
+        let _ = write!(problems, " run_sender did not return;");
+    }
+    espnow.shutdown();
+    gate(
+        "C3-H8",
+        problems.is_empty(),
+        format_args!(
+            "shutdown{}: sends{}; later send {}; later scan {}; run_sender returned={}; problems:{}",
+            if with_scan {
+                " mid-scan"
+            } else {
+                " with queued sends"
+            },
+            summary,
+            class(&later_send),
+            if later_scan.is_err() { "refused" } else { "ran" },
+            SENDER_RETURNED.load(Ordering::Relaxed),
+            problems
+        ),
+    );
+    halt().await
+}
+
+/// C3-H9: the radio TX power must be the same before and after each scan.
+async fn scenario_txpower(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
+    let scan = ScanConfig::new(PROBE);
+    let mut scans = 0u32;
+    loop {
+        scans += 1;
+        let shadow_before = espnow.tx_power_quarter_dbm();
+        let before = radio_tx_power();
+        let result = espnow.scan_for_peer(coordinator, &scan).await;
+        let after = radio_tx_power();
+        let shadow_after = espnow.tx_power_quarter_dbm();
+        let ok =
+            before.is_some() && before == after && shadow_before == shadow_after && result.is_ok();
+        gate(
+            "C3-H9",
+            ok,
+            format_args!(
+                "scan {} ({}): radio TX power {:?} -> {:?}, handle {:?} -> {:?} quarter dBm",
+                scans,
+                if result.is_ok() { "found" } else { "failed" },
+                before,
+                after,
+                shadow_before,
+                shadow_after
+            ),
+        );
+        Timer::after(Duration::from_secs(2)).await;
     }
 }

@@ -9,8 +9,12 @@
 //! 1. Log the selected slot and the running version.
 //! 2. Wait for the Wi-Fi link (associated with an IP), then mark the running image valid
 //!    (the health check is "Wi-Fi came up", so a rollback-capable bootloader keeps this slot).
+//!    An image built with `OTA_DEMO_UNHEALTHY=1` (`just ota-image-unhealthy`) never marks itself
+//!    valid, so the next reset makes the bootloader roll it back.
 //! 3. Compare the running version with `OTA_TARGET_VERSION`: only a strictly newer target is
 //!    fetched (`decide_update`), so the updated image does not update itself again.
+//!    After a rollback boot (the other slot's otadata entry is `Aborted` or `Invalid`) the
+//!    update is skipped, so the baseline does not fetch the rolled-back image again.
 //! 4. Download `http://OTA_HOST:OTA_PORT/OTA_PATH` into the inactive slot, verify `OTA_SHA256`,
 //!    activate the slot and reset.
 //!
@@ -66,6 +70,11 @@ const OTA_TARGET_VERSION: &str = match option_env!("OTA_TARGET_VERSION") {
     None => "",
 };
 
+/// `OTA_DEMO_UNHEALTHY`: `1` makes this image skip `mark_valid`, so the bootloader rolls it back
+/// on the next reset; unset or empty is healthy, anything else is a startup error (the same
+/// contract as the ESP-IDF example `idf_c3_ota_runtime`).
+const DEMO_UNHEALTHY: Option<&str> = option_env!("OTA_DEMO_UNHEALTHY");
+
 const SOCKET_RX_LEN: usize = 4096;
 const SOCKET_TX_LEN: usize = 1024;
 
@@ -89,19 +98,48 @@ pub async fn run(link: &'static WifiLink, stack: Stack<'static>, flash: FLASH<'s
         Err(e) => log::warn!("[ota] could not read the selected slot: {}", e),
     }
 
+    let unhealthy = match DEMO_UNHEALTHY {
+        None | Some("") => false,
+        Some("1") => true,
+        Some(other) => fatal(
+            "OTA_DEMO_UNHEALTHY",
+            &format_args!("must be 1 or unset, got '{other}'"),
+        ),
+    };
+
     log::info!("[ota] waiting for the link (associated with an IP)...");
     link.wait_connected().await;
     stack.wait_config_up().await;
     Timer::after(Duration::from_secs(HEALTH_DWELL_SECS)).await;
-    match manager.mark_valid() {
-        Ok(()) => log::info!("[ota] running image marked valid"),
-        Err(e) => log::warn!(
-            "[ota] mark_valid failed (first boot of a fresh table?): {}",
-            e
-        ),
+    if unhealthy {
+        log::error!(
+            "[ota] *** OTA_DEMO_UNHEALTHY=1: this image never marks itself valid; reset the board and the bootloader rolls it back ***"
+        );
+    } else {
+        match manager.mark_valid() {
+            Ok(()) => log::info!("[ota] running image marked valid"),
+            Err(e) => log::warn!(
+                "[ota] mark_valid failed (first boot of a fresh table?): {}",
+                e
+            ),
+        }
     }
 
-    match plan() {
+    let rolled_back = match manager.previous_update_rolled_back() {
+        Ok(rolled_back) => rolled_back,
+        Err(e) => {
+            log::warn!("[ota] could not read the rollback state: {}", e);
+            false
+        }
+    };
+    if rolled_back {
+        log::warn!(
+            "[ota] previous update was rolled back; not retrying {}",
+            OTA_TARGET_VERSION
+        );
+    }
+
+    match plan(rolled_back) {
         Plan::Idle(why) => log::info!("[ota] nothing to do: {}", why),
         Plan::Fetch { url, sha256 } => {
             static RX: StaticCell<[u8; SOCKET_RX_LEN]> = StaticCell::new();
@@ -144,7 +182,10 @@ enum Plan {
 }
 
 /// Decides from the build-time configuration whether to fetch.
-fn plan() -> Plan {
+fn plan(rolled_back: bool) -> Plan {
+    if rolled_back {
+        return Plan::Idle("the previous update was rolled back");
+    }
     if OTA_HOST.is_empty() || OTA_PATH.is_empty() || OTA_SHA256.is_empty() {
         return Plan::Idle("OTA_HOST, OTA_PATH and OTA_SHA256 are not configured");
     }

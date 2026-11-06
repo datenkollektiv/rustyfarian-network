@@ -53,6 +53,7 @@ pub struct MockMqttClient {
     connects: Cell<u32>,
     published: RefCell<Vec<MockMessage>>,
     inbound: RefCell<VecDeque<MockMessage>>,
+    subscribed: RefCell<Vec<(String, QoS)>>,
     /// When `true`, `try_publish*` refuse with `WouldBlock` even while connected.
     pub busy: Cell<bool>,
     /// When `true`, `publish` fails with [`MockMqttError`].
@@ -67,6 +68,7 @@ impl MockMqttClient {
             connects: Cell::new(0),
             published: RefCell::new(Vec::new()),
             inbound: RefCell::new(VecDeque::new()),
+            subscribed: RefCell::new(Vec::new()),
             busy: Cell::new(false),
             fail_publish: Cell::new(false),
         }
@@ -96,6 +98,11 @@ impl MockMqttClient {
     /// Everything published so far, oldest first.
     pub fn published(&self) -> Vec<MockMessage> {
         self.published.borrow().clone()
+    }
+
+    /// Every `subscribe` the mock accepted, oldest first, one entry per filter.
+    pub fn subscribed(&self) -> Vec<(String, QoS)> {
+        self.subscribed.borrow().clone()
     }
 
     fn record(&self, topic: &str, payload: &[u8], qos: QoS, retain: bool) {
@@ -151,6 +158,15 @@ impl MqttClient for MockMqttClient {
             return Err(MockMqttError);
         }
         self.record(topic, payload, qos, retain);
+        Ok(())
+    }
+
+    fn subscribe(&self, topic: &str, qos: QoS) -> Result<(), Self::Error> {
+        let mut subscribed = self.subscribed.borrow_mut();
+        match subscribed.iter_mut().find(|(filter, _)| filter == topic) {
+            Some(entry) => entry.1 = qos,
+            None => subscribed.push((topic.to_string(), qos)),
+        }
         Ok(())
     }
 

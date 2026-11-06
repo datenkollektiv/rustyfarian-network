@@ -52,7 +52,7 @@
 //! # DIO1 interrupt
 //!
 //! GPIO 14 is set up with a rising-edge interrupt that sets `DIO1_FLAG`.
-//! The main loop feeds this flag, OR-ed with an SPI `irq_pending()` poll, into
+//! The main loop feeds this flag, and an SPI IRQ poll, through `phy_due` (which withholds an IRQ that does not end a TX in progress), into
 //! `juggler`'s `LorawanTimeline`, which decides when to deliver `RadioEvent(Phy(()))`
 //! or `TimeoutFired` to the lorawan-device state machine.
 
@@ -233,7 +233,7 @@ fn main() -> anyhow::Result<()> {
         // catches every RxDone/Timeout. The DIO1 flag is still consumed so a
         // delivered edge is not left pending.
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-        let irq = dio1_edge || device.get_radio().irq_pending();
+        let irq = device.get_radio().phy_due(dio1_edge);
 
         let event = match timeline.next_event(irq, now_ms, deadline) {
             Some(TickEvent::Phy) => {

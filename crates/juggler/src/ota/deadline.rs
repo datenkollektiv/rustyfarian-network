@@ -63,6 +63,18 @@ impl Deadline {
         self.total.map(|total| total.saturating_sub(elapsed))
     }
 
+    /// A wait budget as the whole milliseconds an `esp_http_client`-style timeout takes.
+    ///
+    /// Rounds up, never returns `0` (which such clients read as "use the
+    /// default", a longer wait than the budget), and caps at `i32::MAX`, the
+    /// signed 32-bit range of their `timeout_ms`.
+    /// Apply it to the budget of a download action, which is already
+    /// `min(per-read timeout, remaining deadline)` by [`clip`](Self::clip).
+    pub fn budget_millis(budget: Duration) -> u32 {
+        let ms = budget.as_nanos().div_ceil(1_000_000);
+        u32::try_from(ms).map_or(i32::MAX as u32, |ms| ms.clamp(1, i32::MAX as u32))
+    }
+
     /// The wait to use for one operation: `min(per_op, remaining)`, or `per_op`
     /// without a limit.
     pub fn clip(&self, per_op: Duration, elapsed: Duration) -> Duration {
@@ -146,6 +158,26 @@ mod tests {
         assert_eq!(d.remaining(ms(30)), Some(ms(70)));
         assert_eq!(d.remaining(ms(100)), Some(Duration::ZERO));
         assert_eq!(d.remaining(ms(500)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_one_second_remainder_clips_a_sixty_second_wait_to_one_second() {
+        let d = Deadline::after(ms(100_000));
+        let budget = d.clip(ms(60_000), ms(99_000));
+        assert_eq!(Deadline::budget_millis(budget), 1_000);
+    }
+
+    #[test]
+    fn budget_millis_rounds_up_and_never_reaches_zero() {
+        assert_eq!(Deadline::budget_millis(Duration::ZERO), 1);
+        assert_eq!(Deadline::budget_millis(Duration::from_micros(1)), 1);
+        assert_eq!(Deadline::budget_millis(Duration::from_micros(1_001)), 2);
+        assert_eq!(Deadline::budget_millis(ms(30_000)), 30_000);
+    }
+
+    #[test]
+    fn budget_millis_fits_a_signed_32_bit_timeout() {
+        assert_eq!(Deadline::budget_millis(Duration::MAX), i32::MAX as u32);
     }
 
     #[test]

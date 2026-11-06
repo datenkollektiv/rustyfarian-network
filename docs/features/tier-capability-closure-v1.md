@@ -19,7 +19,7 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 | Four items, one doc, one PR each                                  | Shared ADR 022 goal and one bench campaign; items land independently | Four feature docs                              |
 
 ## Constraints
-- ADR 022 holds: additive or deprecating changes only, and the traits keep one name per role.
+- ADR 022 holds: additive or deprecating changes only, and the traits keep one name per role; the approved 0.7.0 exceptions are the IDF `with_startup_message` signature and the required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended`, all recorded as BREAKING in the CHANGELOG.
 - ADR 021 holds: libraries select no executor, console, panic handler, critical section or scheduler.
 - The sync `suspend` and `resume` stay; `wait_suspended` is additive.
 - Hal DNS and runtime subscribe stay behind the existing `mqtt` feature and add no default dependency.
@@ -30,19 +30,23 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 ## Open Questions
 - [ ] Who files the esp-radio request for `WifiController::{stop, start}`?
 - [ ] Who files the esp-idf-svc request to expose `retain` and `qos` in `EventPayload::Received`?
-- [ ] Runtime subscribe on hal: copy the topic into `heapless` or require `&'static str` like the builder?
-- [ ] Does `wait_suspended` need its own timeout, or is the hal's bounded supervisor transition enough?
-- [ ] Do the four items ship in one 0.x minor or as separate releases?
+- [x] Runtime subscribe on hal: copy the topic into `heapless` or require `&'static str` like the builder?
+  Answered 2026-11-05: the topic is copied into a bounded `heapless` buffer (64 bytes), and a filter that is too long or invalid is refused with an error.
+- [x] Does `wait_suspended` need its own timeout, or is the hal's bounded supervisor transition enough?
+  Answered 2026-11-05: `wait_suspended` has no timeout of its own, and the hal supervisor's bounded transition (500 ms) is the only bound.
+- [x] Do the four items ship in one 0.x minor or as separate releases?
+  Answered 2026-11-05: all four ship in 0.7.0.
 
 ## State
 - [x] Design approved
-- [ ] Corrected capability table in both READMEs
-- [ ] IDF `with_startup_message(topic, payload, qos, retain)`
-- [ ] `NetworkLink::wait_suspended` on both tiers
-- [ ] Hal runtime `MqttHandle::subscribe`
-- [ ] Hal DNS resolution
+- [x] Corrected capability table in both READMEs
+- [x] IDF `with_startup_message(topic, payload, qos, retain)`
+- [x] `NetworkLink::wait_suspended` on both tiers
+- [x] Hal runtime `MqttHandle::subscribe`
+- [x] Hal DNS resolution
 
 Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Session Log
 - 2026-11-03 — Feature doc created from the Step 9 capability-gap review.
+- 2026-11-05 — All four items landed in code, checked by host tests, `just verify`, `just clippy-hal` and example builds; the IDF `wait_suspended` returns at once, and the hardware runs of S3-B2 and C6-H5 are open in the release 0.7.0 runbook.

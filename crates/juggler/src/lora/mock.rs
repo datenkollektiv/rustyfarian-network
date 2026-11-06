@@ -37,7 +37,8 @@ pub struct RxResponse {
 /// - Records all `prepare_tx` + `transmit` calls for assertion.
 /// - Serves pre-programmed RX responses (via [`queue_rx_response`][Self::queue_rx_response]).
 /// - `receive()` returns `nb::Error::WouldBlock` until a response is queued.
-/// - `transmit()` immediately returns `Ok(0)` (zero on-air ms).
+/// - `transmit()` immediately returns `Ok(0)` (zero on-air ms) once
+///   [`tx_busy_polls`][Self::tx_busy_polls] calls have reported the frame still on air.
 /// - `receive()` reports a closed RX window once after
 ///   [`inject_rx_timeout`][Self::inject_rx_timeout].
 /// - `irq_pending()` returns [`irq_latched`][Self::irq_latched];
@@ -59,6 +60,9 @@ pub struct MockLoraRadio {
     pub irq_latched: bool,
     /// Number of `cancel_rx()` calls made.
     pub cancel_count: usize,
+    /// Number of `transmit()` calls that still report the frame on air
+    /// (`nb::Error::WouldBlock`) before one completes; each call uses one up.
+    pub tx_busy_polls: usize,
     current_freq_hz: u32,
     rx_timeout_pending: bool,
 }
@@ -75,6 +79,7 @@ impl MockLoraRadio {
             rx_window_duration: super::RX_WINDOW_DURATION_MS,
             irq_latched: false,
             cancel_count: 0,
+            tx_busy_polls: 0,
             current_freq_hz: 0,
             rx_timeout_pending: false,
         }
@@ -136,6 +141,8 @@ pub enum MockRadioError {
     Timeout,
     /// The RF configuration has no `juggler::lora` equivalent.
     InvalidRfConfig,
+    /// A `Phy` event arrived while the frame was still on air.
+    TxInProgress,
 }
 
 impl core::fmt::Display for MockRadioError {
@@ -144,6 +151,7 @@ impl core::fmt::Display for MockRadioError {
             Self::CapacityExhausted => write!(f, "mock radio capacity exhausted"),
             Self::Timeout => write!(f, "mock radio timeout"),
             Self::InvalidRfConfig => write!(f, "unsupported RF config (SF/BW/CR)"),
+            Self::TxInProgress => write!(f, "TX still on air"),
         }
     }
 }
@@ -151,6 +159,10 @@ impl core::fmt::Display for MockRadioError {
 impl RadioErrorKind for MockRadioError {
     fn invalid_rf_config() -> Self {
         Self::InvalidRfConfig
+    }
+
+    fn tx_in_progress() -> Self {
+        Self::TxInProgress
     }
 
     fn is_rx_timeout(&self) -> bool {
@@ -174,6 +186,10 @@ impl LoraRadio for MockLoraRadio {
 
     fn transmit(&mut self) -> nb::Result<u32, MockRadioError> {
         self.transmit_count += 1;
+        if self.tx_busy_polls > 0 {
+            self.tx_busy_polls -= 1;
+            return Err(nb::Error::WouldBlock);
+        }
         Ok(0) // 0 ms on-air (instant in mock)
     }
 

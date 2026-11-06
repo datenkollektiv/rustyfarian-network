@@ -95,4 +95,16 @@ impl NetworkLink for MockLink {
         })
         .await
     }
+
+    async fn wait_suspended(&self) {
+        core::future::poll_fn(|cx| {
+            if self.suspended.get() {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await
+    }
 }

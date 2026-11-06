@@ -12,7 +12,7 @@
 //! let mut outcome = classify_response(&first_response);
 //! while outcome == Outcome::Continue {
 //!     let now_ms = start.elapsed().as_millis() as u32;
-//!     let irq = device.get_radio().irq_pending();
+//!     let irq = device.get_radio().phy_due(false);
 //!     let event = match timeline.next_event(irq, now_ms, deadline) {
 //!         Some(TickEvent::Phy) => Event::RadioEvent(radio::Event::Phy(())),
 //!         Some(TickEvent::TimeoutFired) => {

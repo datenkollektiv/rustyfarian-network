@@ -9,10 +9,10 @@ use core::time::Duration as CoreDuration;
 use embassy_net::tcp::TcpSocket;
 use embassy_time::{with_timeout, Duration, Instant};
 use embedded_storage::nor_flash::NorFlash;
-use esp_bootloader_esp_idf::ota::OtaImageState;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
 use esp_bootloader_esp_idf::partitions::{
-    AppPartitionSubType, FlashRegion, NorFlashRegion, PARTITION_TABLE_MAX_LEN,
+    read_partition_table, AppPartitionSubType, DataPartitionSubType, FlashRegion, NorFlashRegion,
+    PartitionType, PARTITION_TABLE_MAX_LEN,
 };
 use esp_storage::FlashStorage;
 use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
@@ -21,7 +21,7 @@ use juggler::ota::{
     StreamingVerifier,
 };
 
-use super::activation::{activate_as_new, SlotControl};
+use super::activation::{self, Entry, OtadataSectors};
 use super::http::async_client::fetch_get;
 use super::http::parse_url;
 
@@ -62,37 +62,123 @@ enum Sink<'r, 'a, 'd> {
     Nor(NorFlashRegion<'r, 'a, 'd>),
 }
 
-/// Selects the next OTA slot for boot.
+/// Number of OTA app slots in the partition table.
+fn ota_app_count(table: &esp_bootloader_esp_idf::partitions::PartitionTable<'_>) -> usize {
+    table
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.partition_type(),
+                PartitionType::App(sub)
+                    if sub != AppPartitionSubType::Factory && sub != AppPartitionSubType::Test
+            )
+        })
+        .count()
+}
+
+/// Selects OTA slot `next_app` for boot in state `New` with one otadata entry write.
 ///
-/// The only call site of `activate_next_partition`; the permit parameter makes
+/// The only place that changes the boot selection; the permit parameter makes
 /// a timed-out download unable to reach it.
-fn activate(updater: &mut OtaUpdater<'_, '_>, _permit: ActivationPermit) -> Result<(), OtaError> {
-    activate_as_new(&mut UpdaterControl(updater)).map_err(|e| {
-        log::error!("activating the next OTA slot failed: {}", e);
+/// `pt_buf` is free again once the `OtaUpdater` that borrowed it is dropped.
+fn activate(
+    flash: &mut FlashStorage<'_>,
+    pt_buf: &mut [u8; PARTITION_TABLE_MAX_LEN],
+    next_app: u8,
+    _permit: ActivationPermit,
+) -> Result<(), OtaError> {
+    let table = read_partition_table(flash, pt_buf).map_err(|e| {
+        log::error!(
+            "OTA: activation could not read the partition table: {:?}",
+            e
+        );
+        OtaError::PartitionNotFound
+    })?;
+    let ota_count = ota_app_count(&table);
+    let otadata = table
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            log::error!("OTA: activation found no otadata partition");
+            OtaError::PartitionNotFound
+        })?;
+    let mut region = otadata.as_flash_region(flash);
+    if region.capacity() < OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN {
+        log::error!(
+            "OTA: otadata partition is too small: {} bytes",
+            region.capacity()
+        );
+        return Err(OtaError::PartitionNotFound);
+    }
+    activation::activate_as_new(&mut Otadata(&mut region), ota_count, next_app).map_err(|f| {
+        log::error!(
+            "OTA: activating the next slot failed: {:?}; restore of the otadata sector: {:?}; \
+             the previous selection was never overwritten",
+            f.cause,
+            f.restore
+        );
         OtaError::FlashWriteFailed
     })
 }
 
-/// [`SlotControl`] over the real otadata writes.
-struct UpdaterControl<'u, 'a, 'b>(&'u mut OtaUpdater<'a, 'b>);
+/// Sets the state of the otadata entry the bootloader selects.
+///
+/// Used by `mark_valid` and `rollback` instead of
+/// `OtaUpdater::set_current_ota_state`, which writes to the highest sequence
+/// even when that entry is `Aborted` or `Invalid` (the situation after a
+/// rollback) and so would mark the aborted image `Valid`.
+fn set_selected_state(
+    flash: &mut FlashStorage<'_>,
+    state: u32,
+    what: &str,
+) -> Result<(), OtaError> {
+    let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+    let table = read_partition_table(flash, &mut pt_buf).map_err(|e| {
+        log::error!("{what}: could not read the partition table: {:?}", e);
+        OtaError::PartitionNotFound
+    })?;
+    let otadata = table
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            log::error!("{what}: found no otadata partition");
+            OtaError::PartitionNotFound
+        })?;
+    let mut region = otadata.as_flash_region(flash);
+    if region.capacity() < OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN {
+        log::error!("{what}: otadata partition is too small");
+        return Err(OtaError::PartitionNotFound);
+    }
+    activation::set_selected_state(&mut Otadata(&mut region), state).map_err(|f| {
+        log::error!(
+            "{what}: setting the otadata state failed: {:?}; restore of the selected otadata \
+             sector: {:?}",
+            f.cause,
+            f.restore
+        );
+        OtaError::FlashWriteFailed
+    })
+}
 
-impl SlotControl for UpdaterControl<'_, '_, '_> {
-    type Error = &'static str;
+/// Start of the two otadata select entries, relative to the partition.
+const OTADATA_SECTOR_OFFSETS: [u32; 2] = [0x0000, 0x1000];
 
-    fn activate_next(&mut self) -> Result<(), Self::Error> {
-        self.0.activate_next_partition().map_err(|e| {
-            log::error!("activate_next_partition failed: {:?}", e);
-            "activate_next_partition"
-        })
+/// [`OtadataSectors`] over the otadata partition's flash region.
+struct Otadata<'r, 'a, 'd>(&'r mut FlashRegion<'a, 'd>);
+
+impl OtadataSectors for Otadata<'_, '_, '_> {
+    type Error = esp_bootloader_esp_idf::partitions::Error;
+
+    fn read_entry(&mut self, index: usize) -> Result<Entry, Self::Error> {
+        let mut entry = [0u8; activation::ENTRY_LEN];
+        self.0.read(OTADATA_SECTOR_OFFSETS[index], &mut entry)?;
+        Ok(entry)
     }
 
-    fn mark_activated_new(&mut self) -> Result<(), Self::Error> {
-        self.0
-            .set_current_ota_state(OtaImageState::New)
-            .map_err(|e| {
-                log::error!("set_current_ota_state(New) failed: {:?}", e);
-                "set_current_ota_state(New)"
-            })
+    fn write_entry(&mut self, index: usize, entry: &Entry) -> Result<(), Self::Error> {
+        self.0.write(OTADATA_SECTOR_OFFSETS[index], entry)
     }
 }
 
@@ -253,7 +339,7 @@ impl<'d> EspHalOtaManager<'d> {
     /// `fetch_and_apply` and is checked at operation boundaries, namely on
     /// entry, after connect and headers, after partition preparation (the
     /// erase), after every chunk read and every flash write, and immediately
-    /// before `activate_next_partition`.
+    /// before the otadata activation write.
     /// A failed check returns [`OtaError::DownloadTimeout`] and the new slot is
     /// not activated.
     ///
@@ -316,8 +402,17 @@ impl<'d> EspHalOtaManager<'d> {
     /// **not** activated and the boot slot is left unchanged, so the device
     /// continues to boot the running image; the inactive partition is left in
     /// an undefined state and will be overwritten on the next OTA attempt.
-    /// Power loss between mid-download and `activate_next_partition` likewise
-    /// leaves the boot slot unchanged.
+    /// Power loss between mid-download and the activation likewise leaves the
+    /// boot slot unchanged.
+    ///
+    /// Activation is a single 32-byte write of the new `ota_seq`, the `New`
+    /// state and their CRC into the otadata sector that is *not* selected, so
+    /// the boot selection changes only together with the armed rollback; a
+    /// failed or interrupted write leaves the previous selection in place.
+    /// After a write error or a read-back mismatch the previous bytes of that
+    /// sector are written back, the original error is returned as
+    /// [`OtaError::FlashWriteFailed`], and whether the restore worked is
+    /// logged.
     ///
     /// After this function returns `Ok(())` the caller must reboot the device.
     /// Once the new image has passed its health check, call [`mark_valid`].
@@ -370,9 +465,16 @@ impl<'d> EspHalOtaManager<'d> {
         // The region borrows `updater`, which activation needs back, so the
         // stream runs in its own scope and hands out either the permit or the
         // final result.
+        let next_app: u8;
         let streamed = {
             let mut region = match updater.next_partition() {
-                Ok((region, _slot)) => region,
+                Ok((region, slot)) => {
+                    // `ota_app_number` is crate-private; the discriminants are
+                    // `Ota0 + n`, and anything else wraps out of range, which
+                    // the activation plan refuses.
+                    next_app = (slot as u8).wrapping_sub(AppPartitionSubType::Ota0 as u8);
+                    region
+                }
                 Err(e) => {
                     log::error!("next_partition failed: {:?}", e);
                     return finish(
@@ -507,15 +609,17 @@ impl<'d> EspHalOtaManager<'d> {
         };
 
         // 4. Activate the new slot, with nothing between the permit and this call.
-        //    API mapping (esp-bootloader-esp-idf 0.6.0, unchanged since 0.5.0):
-        //      activate_next_partition() = commit / finalize — writes the OTA data
-        //        partition so the bootloader boots the new slot on next reset.
-        //      set_current_ota_state(OtaImageState::Valid)   = mark_valid / cancel rollback
-        //      set_current_ota_state(OtaImageState::Invalid) = signal bootloader to rollback
+        //    One otadata entry write carries the new sequence number, the `New`
+        //    state and the CRC (see `activation`); the updater's own
+        //    `activate_next_partition` + `set_current_ota_state(New)` pair is two
+        //    writes and is not used.
         match streamed {
             Ok(permit) => {
                 log::info!("OTA: SHA-256 verified — activating next partition");
-                let result = activate(&mut updater, permit);
+                // The updater only located the slots and has no `Drop`; its
+                // borrow of the flash and the table buffer ended with its
+                // last use above.
+                let result = activate(&mut self.flash, &mut pt_buf, next_app, permit);
                 if result.is_ok() {
                     log::info!("OTA: partition swap complete — reboot to apply");
                 }
@@ -584,19 +688,10 @@ impl<'d> EspHalOtaManager<'d> {
     /// Call after the new firmware has passed its health check (e.g. Wi-Fi
     /// associated + 30 s dwell — see ADR 011 §4).
     ///
-    /// Uses `OtaUpdater::set_current_ota_state(OtaImageState::Valid)`.
+    /// Sets the state of the otadata entry the bootloader selects (not the
+    /// highest sequence, which can be an aborted entry after a rollback).
     pub fn mark_valid(&mut self) -> Result<(), OtaError> {
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("mark_valid: OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        updater
-            .set_current_ota_state(OtaImageState::Valid)
-            .map_err(|e| {
-                log::error!("mark_valid: set_current_ota_state failed: {:?}", e);
-                OtaError::FlashWriteFailed
-            })
+        set_selected_state(&mut self.flash, activation::STATE_VALID, "mark_valid")
     }
 
     /// Experimental: API may change before 1.0.
@@ -604,24 +699,60 @@ impl<'d> EspHalOtaManager<'d> {
     /// The slot the bootloader selected for this boot: `ota_0` is `SlotId(0)`,
     /// `ota_1` is `SlotId(1)`, anything else (factory) is `SlotId(0xFF)`, the `FACTORY_SLOT` of the `ota-wire` feature.
     ///
-    /// It is the *selected* slot, which is the running slot on every normal
-    /// boot; right after [`fetch_and_apply`](Self::fetch_and_apply) it is
+    /// It is the slot of the otadata entry the bootloader selects (an `Aborted`
+    /// or `Invalid` entry is skipped, as after a rollback), which is the
+    /// running slot on every normal boot; right after [`fetch_and_apply`](Self::fetch_and_apply) it is
     /// already the new slot, before the reboot.
     pub fn selected_slot(&mut self) -> Result<SlotId, OtaError> {
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("selected_slot: OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        let subtype = updater.selected_partition().map_err(|e| {
-            log::error!("selected_slot: selected_partition failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        Ok(match subtype {
-            AppPartitionSubType::Ota0 => SlotId(0),
-            AppPartitionSubType::Ota1 => SlotId(1),
-            _ => SlotId(0xFF),
+        let (entries, ota_count) = self.read_otadata("selected_slot")?;
+        Ok(match activation::selected_app(&entries, ota_count) {
+            Some(app) => SlotId(app),
+            None => SlotId(0xFF),
         })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Whether the previous update was rolled back: the bootloader selected a slot and the other
+    /// slot's otadata entry is intact but `Aborted` or `Invalid`.
+    ///
+    /// A firmware that fetches a fixed target version calls this before fetching, so a rolled-back
+    /// image is not downloaded again on every boot.
+    /// The evidence stays until the next update overwrites that otadata sector.
+    /// The ESP-IDF tier has the same method on `OtaSession` (`esp_ota_get_last_invalid_partition`).
+    pub fn previous_update_rolled_back(&mut self) -> Result<bool, OtaError> {
+        let (entries, _) = self.read_otadata("previous_update_rolled_back")?;
+        Ok(activation::rolled_back(&entries))
+    }
+
+    /// Reads both otadata entries and the OTA app slot count; `what` names the caller in logs.
+    fn read_otadata(&mut self, what: &str) -> Result<([activation::Entry; 2], usize), OtaError> {
+        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+        let table = read_partition_table(&mut self.flash, &mut pt_buf).map_err(|e| {
+            log::error!("{}: could not read the partition table: {:?}", what, e);
+            OtaError::PartitionNotFound
+        })?;
+        let ota_count = ota_app_count(&table);
+        let otadata = table
+            .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                log::error!("{}: found no otadata partition", what);
+                OtaError::PartitionNotFound
+            })?;
+        let mut region = otadata.as_flash_region(&mut self.flash);
+        if region.capacity() < OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN {
+            log::error!("{}: otadata partition is too small", what);
+            return Err(OtaError::PartitionNotFound);
+        }
+        let mut otadata = Otadata(&mut region);
+        let entries = [otadata.read_entry(0), otadata.read_entry(1)];
+        let [Ok(first), Ok(second)] = entries else {
+            log::error!("{}: reading the otadata failed", what);
+            return Err(OtaError::PartitionNotFound);
+        };
+        Ok(([first, second], ota_count))
     }
 
     /// Experimental: API may change before 1.0.
@@ -632,18 +763,8 @@ impl<'d> EspHalOtaManager<'d> {
     /// This function returns `Ok(())` — the actual reboot is the caller's
     /// responsibility (use `esp_hal::system::software_reset()` or equivalent).
     ///
-    /// Uses `OtaUpdater::set_current_ota_state(OtaImageState::Invalid)`.
+    /// Sets the state of the otadata entry the bootloader selects.
     pub fn rollback(&mut self) -> Result<(), OtaError> {
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("rollback: OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        updater
-            .set_current_ota_state(OtaImageState::Invalid)
-            .map_err(|e| {
-                log::error!("rollback: set_current_ota_state failed: {:?}", e);
-                OtaError::FlashWriteFailed
-            })
+        set_selected_state(&mut self.flash, activation::STATE_INVALID, "rollback")
     }
 }

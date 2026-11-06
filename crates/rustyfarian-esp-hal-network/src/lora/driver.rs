@@ -32,6 +32,8 @@ pub enum LoraError {
     BusyTimeout,
     /// Could not read the IRQ status register after DIO1 fired.
     IrqStatusReadFailed,
+    /// A `Phy` event arrived while the frame was still on air (not a radio fault).
+    TxInProgress,
 }
 
 impl core::fmt::Display for LoraError {
@@ -45,6 +47,7 @@ impl core::fmt::Display for LoraError {
             Self::Timeout => write!(f, "radio timeout"),
             Self::BusyTimeout => write!(f, "radio busy timeout"),
             Self::IrqStatusReadFailed => write!(f, "IRQ status read failed"),
+            Self::TxInProgress => write!(f, "TX still on air"),
         }
     }
 }
@@ -52,6 +55,10 @@ impl core::fmt::Display for LoraError {
 impl RadioErrorKind for LoraError {
     fn invalid_rf_config() -> Self {
         Self::InvalidRfConfig
+    }
+
+    fn tx_in_progress() -> Self {
+        Self::TxInProgress
     }
 
     fn is_rx_timeout(&self) -> bool {

@@ -10,30 +10,32 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Poll;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, IpEndpoint, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
 use juggler::mqtt::{
-    ConnectStep, ConnectWorkPlan, MqttClient, NetworkGate, SessionAction, SessionInput,
-    SessionMachine,
+    AckStatus, BrokerHost, ConnectStep, ConnectWorkPlan, MqttClient, NetworkGate, SessionAction,
+    SessionInput, SessionMachine, SubscribeWindow, SUBSCRIBE_WINDOW,
 };
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use minimq::{
-    Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, PubError, Publication,
-    Session, SubscriptionOptions, TopicFilter, Will,
+    Buffers, ConfigBuilder, ConnectEvent, Connection, Error as MinimqError, InboundPublish, Op,
+    PubError, Publication, ResourceError, Session, SubscriptionOptions, TopicFilter, Will,
 };
 use static_cell::StaticCell;
 
 use super::{
-    parse_broker_ipv4, socket_timeout_ms, stall_timeout_ms, validate_config, InboundMessage,
-    MqttConfig, MqttConnectionState, MqttError, PublishRequest, QoS, TryPublishError,
-    DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS, DEFAULT_RECONNECT_TIMEOUT_MS,
-    INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER, MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH,
-    TCP_RX_BUFFER, TCP_TX_BUFFER,
+    clamp_qos, parse_broker_host, socket_timeout_ms, stall_timeout_ms, validate_config,
+    InboundMessage, MqttConfig, MqttConnectionState, MqttError, PublishRequest, QoS,
+    RuntimeSubscriptions, TryPublishError, DEFAULT_CONNECTION_TIMEOUT_MS, DEFAULT_KEEP_ALIVE_SECS,
+    DEFAULT_RECONNECT_TIMEOUT_MS, INBOUND_QUEUE_DEPTH, MAX_SUBSCRIPTIONS, MQTT_RX_BUFFER,
+    MQTT_TX_BUFFER, PUBLISH_QUEUE_DEPTH, TCP_RX_BUFFER, TCP_TX_BUFFER,
 };
 
 /// Attempts to publish one queued message before dropping it when the TX arena is full.
@@ -57,6 +59,9 @@ const CONNECTED_WAITER_POLL: Duration = Duration::from_millis(500);
 type Socket = TcpSocket<'static>;
 type Conn<'a> = Connection<'a, 'static, &'a mut Socket>;
 type TransportError = embassy_net::tcp::Error;
+/// SUBSCRIBE packets sent and not yet acknowledged; the handle is the `minimq`
+/// operation and the QoS that went out.
+type SubWindow = SubscribeWindow<(Op, QoS), SUBSCRIBE_WINDOW>;
 
 /// State shared between the handle and the runner; lives in a `StaticCell`.
 struct Shared {
@@ -67,17 +72,29 @@ struct Shared {
     machine: Mutex<CriticalSectionRawMutex, RefCell<SessionMachine>>,
     /// Tasks in [`MqttHandle::wait_connected`]; a full set refuses, never mass-wakes.
     connected: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<CONNECTED_WAITERS>>>,
+    /// The builder's subscriptions, read by [`MqttHandle::subscribe`] for de-duplication.
+    fixed_subscriptions: heapless::Vec<(&'static str, QoS), MAX_SUBSCRIPTIONS>,
+    /// Subscriptions added at runtime; see [`RuntimeSubscriptions`].
+    runtime_subscriptions: Mutex<CriticalSectionRawMutex, RefCell<RuntimeSubscriptions>>,
+    /// Raised when a runtime subscription became pending; the runner's live loop awaits it.
+    subscriptions_changed: Signal<CriticalSectionRawMutex, ()>,
     dropped_inbound: AtomicU32,
     dropped_publish: AtomicU32,
 }
 
 impl Shared {
-    fn new(retry_ms: u64) -> Self {
+    fn new(
+        retry_ms: u64,
+        fixed_subscriptions: heapless::Vec<(&'static str, QoS), MAX_SUBSCRIPTIONS>,
+    ) -> Self {
         Self {
             publish_q: Channel::new(),
             inbound_q: Channel::new(),
             machine: Mutex::new(RefCell::new(SessionMachine::with_retry(retry_ms))),
             connected: Mutex::new(RefCell::new(WakerSlots::new())),
+            fixed_subscriptions,
+            runtime_subscriptions: Mutex::new(RefCell::new(RuntimeSubscriptions::new())),
+            subscriptions_changed: Signal::new(),
             dropped_inbound: AtomicU32::new(0),
             dropped_publish: AtomicU32::new(0),
         }
@@ -255,7 +272,34 @@ impl MqttHandle {
         Ok(())
     }
 
-    /// Waits for the next inbound message on any builder subscription.
+    /// Subscribes to a topic filter while the client runs.
+    ///
+    /// Same name, arguments and return shape as the ESP-IDF `MqttHandle::subscribe`;
+    /// only the error type differs. Never blocks.
+    /// `Ok(())` means the request was accepted: the runner subscribes on the live
+    /// session, or right after the next connect when there is none, and re-issues
+    /// the topic after every reconnect that needs subscriptions, after the builder's.
+    /// A filter already subscribed at the same QoS is a no-op, and QoS 2 is downgraded to QoS 1.
+    ///
+    /// The filter is copied into a [`MAX_TOPIC_LEN`](super::MAX_TOPIC_LEN)-byte
+    /// buffer, so the argument need not be `'static`.
+    /// Errors: [`MqttError::InvalidTopic`] for a malformed filter,
+    /// [`MqttError::TopicTooLong`] above the cap, and
+    /// [`MqttError::RuntimeSubscriptionsFull`] once
+    /// [`MAX_RUNTIME_SUBSCRIPTIONS`](super::MAX_RUNTIME_SUBSCRIPTIONS) topics are registered.
+    /// A broker refusal surfaces as a session restart, like a failed builder subscription.
+    pub fn subscribe(&self, topic: &str, qos: QoS) -> Result<(), MqttError> {
+        let wake = self.shared.runtime_subscriptions.lock(|subs| {
+            subs.borrow_mut()
+                .admit(&self.shared.fixed_subscriptions, topic, qos)
+        })?;
+        if wake {
+            self.shared.subscriptions_changed.signal(());
+        }
+        Ok(())
+    }
+
+    /// Waits for the next inbound message on any subscription.
     pub async fn receive(&self) -> InboundMessage {
         self.shared.inbound_q.receive().await
     }
@@ -286,6 +330,10 @@ impl MqttClient for MqttHandle {
         retain: bool,
     ) -> Result<(), TryPublishError> {
         MqttHandle::try_publish_with(self, topic, payload, qos, retain)
+    }
+
+    fn subscribe(&self, topic: &str, qos: QoS) -> Result<(), MqttError> {
+        MqttHandle::subscribe(self, topic, qos)
     }
 
     async fn publish(
@@ -389,10 +437,15 @@ impl MqttBuilder {
         if let Some(startup) = &self.startup {
             super::validate_publish_topic(startup.topic).map_err(MqttError::InvalidTopic)?;
         }
-        let broker = IpEndpoint::new(
-            IpAddress::Ipv4(parse_broker_ipv4(self.config.host)?),
-            self.config.port,
-        );
+        let broker = match parse_broker_host(self.config.host)? {
+            BrokerHost::Ipv4(ip) => {
+                BrokerAddr::Literal(IpEndpoint::new(IpAddress::Ipv4(ip), self.config.port))
+            }
+            BrokerHost::Name(name) => BrokerAddr::Name {
+                host: name,
+                port: self.config.port,
+            },
+        };
 
         static SHARED: StaticCell<Shared> = StaticCell::new();
         static TCP_RX: StaticCell<[u8; TCP_RX_BUFFER]> = StaticCell::new();
@@ -405,7 +458,7 @@ impl MqttBuilder {
             .reconnect_timeout_ms
             .unwrap_or(DEFAULT_RECONNECT_TIMEOUT_MS);
         let shared: &'static Shared = SHARED
-            .try_init(Shared::new(reconnect_ms))
+            .try_init(Shared::new(reconnect_ms, self.subscriptions.clone()))
             .ok_or(MqttError::AlreadyBuilt)?;
         let tcp_rx = TCP_RX.init([0u8; TCP_RX_BUFFER]);
         let tcp_tx = TCP_TX.init([0u8; TCP_TX_BUFFER]);
@@ -493,7 +546,7 @@ pub struct MqttRunner {
     gate: NetworkGate,
     socket: Socket,
     session: Session<'static>,
-    broker: IpEndpoint,
+    broker: BrokerAddr,
     subscriptions: heapless::Vec<(&'static str, QoS), MAX_SUBSCRIPTIONS>,
     startup: Option<StartupMessage>,
     connection_timeout: Duration,
@@ -522,6 +575,7 @@ impl MqttRunner {
                             &mut self.session,
                             &mut self.socket,
                             self.shared,
+                            &self.stack,
                             self.broker,
                             &self.subscriptions,
                             self.startup,
@@ -618,7 +672,15 @@ impl MqttRunner {
     }
 }
 
-/// One connection lifetime: TCP connect, MQTT handshake, startup work, then the
+/// Where the runner connects: an IPv4 literal is used as is, a name is resolved on
+/// every connect (the address may change between sessions).
+#[derive(Clone, Copy)]
+enum BrokerAddr {
+    Literal(IpEndpoint),
+    Name { host: &'static str, port: u16 },
+}
+
+/// One connection lifetime: DNS lookup (names only), TCP connect, MQTT handshake, startup work, then the
 /// poll/publish loop until the session drops. Returns the reason it ended.
 ///
 /// Every session await is bounded by a stall deadline, re-armed before each
@@ -632,12 +694,30 @@ async fn serve(
     session: &mut Session<'static>,
     socket: &mut Socket,
     shared: &'static Shared,
-    broker: IpEndpoint,
+    stack: &Stack<'static>,
+    broker: BrokerAddr,
     subscriptions: &[(&'static str, QoS)],
     startup: Option<StartupMessage>,
     connection_timeout: Duration,
     stall: Duration,
 ) -> &'static str {
+    let broker = match broker {
+        BrokerAddr::Literal(endpoint) => endpoint,
+        BrokerAddr::Name { host, port } => {
+            match with_timeout(connection_timeout, stack.dns_query(host, DnsQueryType::A)).await {
+                Ok(Ok(addrs)) => match addrs.first() {
+                    Some(addr) => IpEndpoint::new(*addr, port),
+                    None => return "dns lookup returned no address",
+                },
+                Ok(Err(e)) => {
+                    log::warn!("[mqtt] dns lookup of {} failed: {:?}", host, e);
+                    return "dns lookup failed";
+                }
+                Err(_) => return "dns lookup timed out",
+            }
+        }
+    };
+
     match with_timeout(connection_timeout, socket.connect(broker)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -670,36 +750,71 @@ async fn serve(
         }
     };
     // This tier has no connect callback, so the plan ends with the startup message.
-    let plan = ConnectWorkPlan::new(subscribe, subscriptions.len(), startup.is_some(), false);
+    // Builder subscriptions come first, then the runtime ones in registration order;
+    // a runtime entry added after this count is picked up by the live loop below.
+    let fixed = subscriptions.len();
+    let total = fixed
+        + shared.runtime_subscriptions.lock(|s| {
+            let mut subs = s.borrow_mut();
+            subs.begin_connect(subscribe);
+            subs.len()
+        });
+    let plan = ConnectWorkPlan::new(subscribe, total, startup.is_some(), false);
+    let mut window = SubWindow::new();
     for step in plan {
         let failed = match step {
-            ConnectStep::Subscribe(index) => {
+            ConnectStep::Subscribe(index) if index < fixed => {
                 let (topic, qos) = subscriptions[index];
-                let filter = TopicFilter::new(topic)
-                    .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(qos)));
-                match with_deadline(deadline, conn.subscribe(&[filter], &[])).await {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(e)) => {
-                        log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
-                        Some("subscribe failed")
-                    }
-                    Err(_) => {
-                        log::warn!("[mqtt] subscribe {} stalled", topic);
-                        Some(TRANSPORT_STALLED)
-                    }
+                subscribe_paced(
+                    &mut conn,
+                    shared,
+                    &mut window,
+                    fixed,
+                    index,
+                    topic,
+                    qos,
+                    deadline,
+                )
+                .await
+                .err()
+            }
+            ConnectStep::Subscribe(index) => {
+                let entry = shared
+                    .runtime_subscriptions
+                    .lock(|s| s.borrow().get(index - fixed));
+                match entry {
+                    Some((topic, qos)) => subscribe_paced(
+                        &mut conn,
+                        shared,
+                        &mut window,
+                        fixed,
+                        index,
+                        topic.as_str(),
+                        qos,
+                        deadline,
+                    )
+                    .await
+                    .err(),
+                    None => None,
                 }
             }
             ConnectStep::PublishStartup => match startup {
                 Some(msg) => {
-                    let request = PublishRequest {
-                        topic: heapless::String::try_from(msg.topic).unwrap_or_default(),
-                        payload: heapless::Vec::from_slice(msg.payload).unwrap_or_default(),
-                        qos: msg.qos,
-                        retain: msg.retain,
-                    };
-                    publish_queued(&mut conn, shared, &request, deadline)
-                        .await
-                        .err()
+                    match drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline).await
+                    {
+                        Err(reason) => Some(reason),
+                        Ok(()) => {
+                            let request = PublishRequest {
+                                topic: heapless::String::try_from(msg.topic).unwrap_or_default(),
+                                payload: heapless::Vec::from_slice(msg.payload).unwrap_or_default(),
+                                qos: msg.qos,
+                                retain: msg.retain,
+                            };
+                            publish_queued(&mut conn, shared, &request, deadline)
+                                .await
+                                .err()
+                        }
+                    }
                 }
                 None => None,
             },
@@ -709,6 +824,12 @@ async fn serve(
             shared.poll(SessionInput::WorkFailed(token));
             return reason;
         }
+    }
+    // Ready only once the broker has answered every SUBSCRIBE.
+    if let Err(reason) = drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline).await
+    {
+        shared.poll(SessionInput::WorkFailed(token));
+        return reason;
     }
 
     if shared.poll(SessionInput::WorkDone(token)) != SessionAction::Ready {
@@ -721,42 +842,229 @@ async fn serve(
         if subscribe { "" } else { " kept" }
     );
 
+    // A request whose send failed in an earlier session is still owed, and a kept
+    // session's plan skips it; send it before waiting for a new request.
+    if let Err(reason) = send_pending_subscriptions(&mut conn, shared, stall).await {
+        return reason;
+    }
+
     loop {
         deadline = Instant::now() + stall;
-        match select(
+        match select3(
             with_deadline(deadline, conn.poll()),
             shared.publish_q.receive(),
+            shared.subscriptions_changed.wait(),
         )
         .await
         {
-            Either::First(Ok(Ok(Some(inbound)))) => {
-                match InboundMessage::copy_from(
-                    inbound.topic(),
-                    inbound.payload(),
-                    inbound.retained(),
-                    from_minimq_qos(inbound.qos()),
-                ) {
-                    Some(msg) => shared.push_inbound(msg),
-                    None => {
-                        bump(&shared.dropped_inbound);
-                        log::warn!("[mqtt] dropped oversized inbound on {}", inbound.topic());
-                    }
-                }
-            }
-            Either::First(Ok(Ok(None))) => {}
-            Either::First(Ok(Err(e))) => {
+            Either3::First(Ok(Ok(Some(inbound)))) => forward_inbound(shared, &inbound),
+            Either3::First(Ok(Ok(None))) => {}
+            Either3::First(Ok(Err(e))) => {
                 log::warn!("[mqtt] session error: {:?}", e);
                 return "session error";
             }
-            Either::First(Err(_)) => {
+            Either3::First(Err(_)) => {
                 log::warn!("[mqtt] session stalled for {} ms", stall.as_millis());
                 return TRANSPORT_STALLED;
             }
-            Either::Second(request) => {
+            Either3::Second(request) => {
                 if let Err(reason) = publish_queued(&mut conn, shared, &request, deadline).await {
                     return reason;
                 }
             }
+            Either3::Third(()) => {
+                if let Err(reason) = send_pending_subscriptions(&mut conn, shared, stall).await {
+                    return reason;
+                }
+            }
+        }
+    }
+}
+
+/// Why one SUBSCRIBE was not sent.
+enum SubscribeError {
+    /// `minimq` has no room for another unacknowledged packet right now.
+    NoRoom,
+    /// The session must end, for this reason.
+    Failed(&'static str),
+}
+
+/// Copies one inbound publish into the receive channel, counting an oversized one.
+fn forward_inbound(shared: &Shared, inbound: &InboundPublish<'_>) {
+    match InboundMessage::copy_from(
+        inbound.topic(),
+        inbound.payload(),
+        inbound.retained(),
+        from_minimq_qos(inbound.qos()),
+    ) {
+        Some(msg) => shared.push_inbound(msg),
+        None => {
+            bump(&shared.dropped_inbound);
+            log::warn!("[mqtt] dropped oversized inbound on {}", inbound.topic());
+        }
+    }
+}
+
+/// Sends every runtime subscription the session still owes, paced by the SUBACKs.
+///
+/// An entry stays pending until its SUBACK arrived, so a failed session sends it again.
+async fn send_pending_subscriptions(
+    conn: &mut Conn<'_>,
+    shared: &Shared,
+    stall: Duration,
+) -> Result<(), &'static str> {
+    let mut window = SubWindow::new();
+    loop {
+        let deadline = Instant::now() + stall;
+        let mut cursor = 0;
+        let mut sent_any = false;
+        loop {
+            let next = shared
+                .runtime_subscriptions
+                .lock(|s| s.borrow().next_pending_from(cursor));
+            let Some((index, topic, qos)) = next else {
+                break;
+            };
+            subscribe_paced(
+                conn,
+                shared,
+                &mut window,
+                0,
+                index,
+                topic.as_str(),
+                qos,
+                deadline,
+            )
+            .await?;
+            cursor = index + 1;
+            sent_any = true;
+        }
+        drain_subscriptions(conn, shared, &mut window, 0, deadline).await?;
+        if !sent_any {
+            return Ok(());
+        }
+    }
+}
+
+/// Sends one SUBSCRIBE once the window has room and tracks it under `tag`.
+///
+/// `runtime_base` is the tag of the first runtime entry (the count of builder
+/// entries); a runtime entry is marked sent when its SUBACK arrives.
+/// While the window is full, or `minimq` reports no room, the connection is driven
+/// and inbound publishes keep flowing to the receive channel.
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_paced(
+    conn: &mut Conn<'_>,
+    shared: &Shared,
+    window: &mut SubWindow,
+    runtime_base: usize,
+    tag: usize,
+    topic: &str,
+    qos: QoS,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    loop {
+        while !window.has_room() {
+            subscription_progress(conn, shared, window, runtime_base, deadline).await?;
+        }
+        match subscribe_filter(conn, topic, qos, deadline).await {
+            Ok(op) => {
+                window.track(tag, (op, qos));
+                return Ok(());
+            }
+            Err(SubscribeError::NoRoom) => {
+                subscription_progress(conn, shared, window, runtime_base, deadline).await?;
+            }
+            Err(SubscribeError::Failed(reason)) => return Err(reason),
+        }
+    }
+}
+
+/// Drives the connection until every sent SUBSCRIBE is acknowledged.
+async fn drain_subscriptions(
+    conn: &mut Conn<'_>,
+    shared: &Shared,
+    window: &mut SubWindow,
+    runtime_base: usize,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    while !window.is_empty() {
+        subscription_progress(conn, shared, window, runtime_base, deadline).await?;
+    }
+    Ok(())
+}
+
+/// One bounded step of session progress while SUBACKs are outstanding.
+///
+/// A refused subscription surfaces as the session error of `poll()`, which ends the
+/// session like a failed send. Inbound publishes that arrive meanwhile are forwarded.
+async fn subscription_progress(
+    conn: &mut Conn<'_>,
+    shared: &Shared,
+    window: &mut SubWindow,
+    runtime_base: usize,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    match with_deadline(deadline, conn.poll()).await {
+        Ok(Ok(Some(inbound))) => forward_inbound(shared, &inbound),
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => {
+            log::warn!("[mqtt] subscribe not acknowledged: {:?}", e);
+            return Err("subscribe failed");
+        }
+        Err(_) => {
+            log::warn!("[mqtt] subscribe acknowledgement stalled");
+            return Err(TRANSPORT_STALLED);
+        }
+    }
+    window
+        .settle(
+            |(op, _)| {
+                if conn.is_complete(op) {
+                    AckStatus::Complete
+                } else if conn.is_invalidated(op) {
+                    AckStatus::Lost
+                } else {
+                    AckStatus::Pending
+                }
+            },
+            |tag, (_, qos)| {
+                if let Some(index) = tag.checked_sub(runtime_base) {
+                    shared
+                        .runtime_subscriptions
+                        .lock(|s| s.borrow_mut().mark_sent(index, qos));
+                }
+            },
+        )
+        .map_err(|_| "subscribe failed")
+}
+
+/// Sends one SUBSCRIBE and returns its operation handle, bounded by `deadline`.
+///
+/// It does **not** wait for the SUBACK: `minimq` only enqueues and flushes the packet,
+/// which then occupies one of its in-flight slots until the broker answers. The caller
+/// tracks the handle in a [`SubWindow`] and drives the connection until it completes;
+/// a refusal shows up there as a session error.
+async fn subscribe_filter(
+    conn: &mut Conn<'_>,
+    topic: &str,
+    qos: QoS,
+    deadline: Instant,
+) -> Result<Op, SubscribeError> {
+    let filter = TopicFilter::new(topic)
+        .options(SubscriptionOptions::default().maximum_qos(to_minimq_qos(qos)));
+    match with_deadline(deadline, conn.subscribe(&[filter], &[])).await {
+        Ok(Ok(op)) => Ok(op),
+        Ok(Err(MinimqError::Resource(ResourceError::InflightExhausted))) => {
+            Err(SubscribeError::NoRoom)
+        }
+        Ok(Err(e)) => {
+            log::warn!("[mqtt] subscribe {} failed: {:?}", topic, e);
+            Err(SubscribeError::Failed("subscribe failed"))
+        }
+        Err(_) => {
+            log::warn!("[mqtt] subscribe {} stalled", topic);
+            Err(SubscribeError::Failed(TRANSPORT_STALLED))
         }
     }
 }
@@ -845,13 +1153,6 @@ async fn next_gate_edge(gate: &mut NetworkGate, stack: &Stack<'static>) -> Sessi
             return edge;
         }
         Timer::after(NETWORK_POLL_INTERVAL).await;
-    }
-}
-
-fn clamp_qos(qos: QoS) -> QoS {
-    match qos {
-        QoS::ExactlyOnce => QoS::AtLeastOnce,
-        other => other,
     }
 }
 

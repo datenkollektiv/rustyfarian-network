@@ -6,6 +6,8 @@
 //! * CONNECT carries an LWT `offline` (retained, QoS 1) on `<prefix>/status`.
 //! * Every (re)connect publishes the retained startup message `online` there.
 //! * `<prefix>/cmd` is subscribed; each inbound message is logged by `rx_task`.
+//! * `<prefix>/runtime` is subscribed at runtime with `MqttHandle::subscribe` once the
+//!   first session is up, and re-subscribed by the runner after every reconnect.
 //! * Every 5 s the main loop `try_publish`es a tick on `<prefix>/tick`;
 //!   `WouldBlock` is logged and skipped, never retried in place.
 //! * Free heap is logged after connect and once a minute for soak runs.
@@ -16,7 +18,7 @@
 //! |:------------------|:-----------------------|:--------------------------------------|
 //! | `WIFI_SSID`       | (required)             | Wi-Fi SSID                            |
 //! | `WIFI_PASS`       | (required)             | Wi-Fi password                        |
-//! | `MQTT_HOST`       | (required)             | Broker **IPv4 literal** (no DNS yet)  |
+//! | `MQTT_HOST`       | (required)             | Broker IPv4 literal or DNS name (IPv6 not supported) |
 //! | `MQTT_PORT`       | `1883`                 | Broker port                           |
 //! | `MQTT_CLIENT_ID`  | `hal-c6-mqtt`          | Client id (≤ 23 bytes)                |
 //! | `MQTT_USER`       | unset                  | Optional username                     |
@@ -160,9 +162,11 @@ async fn main(spawner: Spawner) {
     static STATUS_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
     static CMD_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
     static TICK_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
+    static RUNTIME_TOPIC: StaticCell<heapless::String<64>> = StaticCell::new();
     let status_topic = static_topic(&STATUS_TOPIC, "status");
     let cmd_topic = static_topic(&CMD_TOPIC, "cmd");
     let tick_topic = static_topic(&TICK_TOPIC, "tick");
+    let runtime_topic = static_topic(&RUNTIME_TOPIC, "runtime");
 
     let lwt = LwtConfig::new(status_topic, b"offline", QoS::AtLeastOnce, true);
     let mut mqtt_config = MqttConfig::new(MQTT_HOST, MQTT_PORT, MQTT_CLIENT_ID)
@@ -186,11 +190,11 @@ async fn main(spawner: Spawner) {
         }
     };
     spawner.spawn(mqtt_task(mqtt_runner).unwrap());
-    spawner.spawn(rx_task(mqtt).unwrap());
+    spawner.spawn(rx_task(mqtt, runtime_topic).unwrap());
 
     println!(
-        "[example] topics: status={} cmd={} tick={}",
-        status_topic, cmd_topic, tick_topic
+        "[example] topics: status={} cmd={} tick={} runtime={}",
+        status_topic, cmd_topic, tick_topic, runtime_topic
     );
 
     let mut tick: u32 = 0;
@@ -253,7 +257,15 @@ async fn mqtt_task(runner: MqttRunner) -> ! {
 }
 
 #[embassy_executor::task]
-async fn rx_task(mqtt: MqttHandle) {
+async fn rx_task(mqtt: MqttHandle, runtime_topic: &'static str) {
+    mqtt.wait_connected().await;
+    match mqtt.subscribe(runtime_topic, QoS::AtLeastOnce) {
+        Ok(()) => println!("[example] runtime subscribe {} accepted", runtime_topic),
+        Err(e) => println!(
+            "[example] runtime subscribe {} failed: {}",
+            runtime_topic, e
+        ),
+    }
     loop {
         let msg = mqtt.receive().await;
         match core::str::from_utf8(msg.payload.as_slice()) {

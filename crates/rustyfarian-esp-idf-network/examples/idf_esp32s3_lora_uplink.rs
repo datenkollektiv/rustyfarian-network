@@ -81,7 +81,7 @@
 //! # Radio event source (DIO1 vs SPI polling)
 //!
 //! The **primary** event source is SPI polling: each loop tick calls
-//! `device.get_radio().irq_pending()` (a `GetIrqStatus` read) and feeds it to
+//! `device.get_radio().phy_due(dio1_edge)` (a `GetIrqStatus` read, withheld while a TX is on air) and feeds it to
 //! `juggler`'s `LorawanTimeline`, which delivers `RadioEvent(Phy(()))` when a
 //! relevant IRQ is latched. The GPIO 14 DIO1
 //! rising-edge interrupt (which sets `DIO1_FLAG`) is only a **redundant early
@@ -294,7 +294,7 @@ fn main() -> anyhow::Result<()> {
         // catches every RxDone/Timeout. The DIO1 flag is still consumed so a
         // delivered edge is not left pending.
         let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-        let irq = dio1_edge || device.get_radio().irq_pending();
+        let irq = device.get_radio().phy_due(dio1_edge);
 
         let event = match timeline.next_event(irq, now_ms, deadline) {
             Some(TickEvent::Phy) => {
@@ -391,7 +391,7 @@ fn main() -> anyhow::Result<()> {
             let now_ms = send_start.elapsed().as_millis() as u32;
 
             let dio1_edge = DIO1_FLAG.swap(false, Ordering::AcqRel);
-            let irq = dio1_edge || device.get_radio().irq_pending();
+            let irq = device.get_radio().phy_due(dio1_edge);
 
             let event = match timeline.next_event(irq, now_ms, deadline) {
                 Some(TickEvent::Phy) => {

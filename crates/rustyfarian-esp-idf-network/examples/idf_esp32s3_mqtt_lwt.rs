@@ -6,7 +6,7 @@
 //! This file is setup only: Wi-Fi, the MQTT builder and one `block_on` that runs the shared app.
 //!
 //! * CONNECT carries an LWT `offline` (retained, QoS 1) on `<prefix>/status`.
-//! * Every (re)connect publishes the retained `online` there from `on_connect`.
+//! * Every (re)connect publishes the retained `online` there as the builder's startup message.
 //! * `<prefix>/cmd` is subscribed; inbound messages reach `MqttHandle::receive`, which the
 //!   shared app drains.
 //! * Everything else — the 5 s tick on `<prefix>/tick`, link and MQTT state logs, the free
@@ -34,9 +34,8 @@
 //! ```
 
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::mqtt::client::EspMqttClient;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, QoS};
+use rustyfarian_esp_idf_network::mqtt::{LwtConfig, MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 
 #[path = "common/env.rs"]
@@ -46,7 +45,6 @@ mod lwt_app;
 
 const KEEP_ALIVE_SECS: u64 = 30;
 const WIFI_FIRST_CONNECT_WAIT_MS: u64 = 30_000;
-const SUSPEND_TIMEOUT_MS: u64 = 500;
 
 fn free_heap() -> usize {
     // SAFETY: plain FFI query with no arguments or side effects.
@@ -97,23 +95,10 @@ fn main() -> anyhow::Result<()> {
         };
     }
 
-    let online_topic = status_topic.clone();
+    let status_topic_static: &'static str = format!("{prefix}/status").leak();
     let mqtt = MqttBuilder::new(mqtt_config)
         .subscribe(&cmd_topic, QoS::AtLeastOnce)
-        .on_connect(
-            move |client: &mut EspMqttClient<'_>, session_present: bool| {
-                client.enqueue(&online_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-                log::info!(
-                    "[mqtt] connected ({}) — published retained online",
-                    if session_present {
-                        "session resumed"
-                    } else {
-                        "clean session"
-                    }
-                );
-                Ok(())
-            },
-        )
+        .with_startup_message(status_topic_static, b"online", QoS::AtLeastOnce, true)
         .build(&wifi)?;
 
     log::info!(
@@ -126,7 +111,6 @@ fn main() -> anyhow::Result<()> {
     let cfg = lwt_app::LwtAppConfig {
         tick_topic: &tick_topic,
         suspend_demo: env::mqtt_suspend_demo(),
-        suspend_timeout_ms: SUSPEND_TIMEOUT_MS,
         free_heap,
     };
     esp_idf_svc::hal::task::block_on(lwt_app::run(&wifi, &mqtt, &cfg));

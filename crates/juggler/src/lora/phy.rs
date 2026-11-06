@@ -5,6 +5,11 @@
 //! [`LoraRadio`] port calls and owns the RX buffer that `get_received_packet`
 //! hands back. Both tiers use it: the ESP-IDF tier names it `LoraRadioAdapter`.
 //!
+//! [`LorawanPhy::phy_due`] is the filter the event loop asks before it delivers a `Phy` event:
+//! `lorawan-device` 0.12 panics on any response but `TxDone` while a TX is on air, so an IRQ
+//! that does not end the TX is withheld, and a stray event that gets through anyway is
+//! rejected with [`RadioErrorKind::tx_in_progress`] instead of a `Txing` response.
+//!
 //! A `Phy` event that arrives while no TX or RX is in progress is out of phase.
 //! Internally it is a [`PhyOutcome::Ignored`], distinct from a closed RX window;
 //! both become `Response::Idle` only at the `lorawan-device` boundary, and
@@ -66,8 +71,6 @@ enum RadioOp {
 /// What a `Phy` event did, before it is mapped to a `lorawan-device` response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhyOutcome {
-    /// The TX is still on air.
-    StillTxing,
     /// The TX finished after `on_air_ms`.
     TxDone(u32),
     /// The RX window is still listening.
@@ -87,6 +90,8 @@ pub struct LorawanPhy<R: LoraRadio> {
     rx_len: usize,
     op: RadioOp,
     ignored: u32,
+    /// The finished TX poll made by [`LorawanPhy::phy_due`], consumed by the `Phy` event.
+    tx_polled: Option<Result<u32, R::Error>>,
 }
 
 impl<R: LoraRadio> LorawanPhy<R> {
@@ -98,6 +103,7 @@ impl<R: LoraRadio> LorawanPhy<R> {
             rx_len: 0,
             op: RadioOp::Idle,
             ignored: 0,
+            tx_polled: None,
         }
     }
 
@@ -106,6 +112,29 @@ impl<R: LoraRadio> LorawanPhy<R> {
     /// The event loop calls this each tick; a failed IRQ read counts as "nothing pending".
     pub fn irq_pending(&mut self) -> bool {
         self.radio.irq_pending().unwrap_or(false)
+    }
+
+    /// Return `true` when the loop should deliver `Event::RadioEvent(Phy(()))` now.
+    ///
+    /// `hint` is any other sign of an IRQ, such as a DIO1 edge flag.
+    /// While a TX is on air, a pending IRQ only counts once the radio reports the frame
+    /// finished (or failed): `lorawan-device` 0.12 panics on any other response in that wait,
+    /// so an IRQ that does not end the TX (stale, or one a TX does not wait for) is withheld.
+    /// Otherwise it is [`irq_pending`][Self::irq_pending] or `hint`.
+    pub fn phy_due(&mut self, hint: bool) -> bool {
+        if self.tx_polled.is_some() {
+            return true;
+        }
+        let pending = hint || self.irq_pending();
+        if !pending || self.op != RadioOp::Txing {
+            return pending;
+        }
+        match self.radio.transmit() {
+            Ok(on_air_ms) => self.tx_polled = Some(Ok(on_air_ms)),
+            Err(nb::Error::WouldBlock) => return false,
+            Err(nb::Error::Other(e)) => self.tx_polled = Some(Err(e)),
+        }
+        true
     }
 
     /// Number of `Phy` events that arrived while no TX or RX was in progress.
@@ -133,14 +162,26 @@ impl<R: LoraRadio> LorawanPhy<R> {
         R::Error: RadioErrorKind,
     {
         match self.op {
-            RadioOp::Txing => match self.radio.transmit() {
-                Ok(on_air_ms) => {
-                    self.op = RadioOp::Idle;
-                    Ok(PhyOutcome::TxDone(on_air_ms))
+            RadioOp::Txing => {
+                let polled = match self.tx_polled.take() {
+                    Some(Ok(on_air_ms)) => Ok(on_air_ms),
+                    Some(Err(e)) => Err(nb::Error::Other(e)),
+                    None => self.radio.transmit(),
+                };
+                match polled {
+                    Ok(on_air_ms) => {
+                        self.op = RadioOp::Idle;
+                        Ok(PhyOutcome::TxDone(on_air_ms))
+                    }
+                    // `lorawan-device` 0.12 panics on any success but `TxDone` while it waits
+                    // for the end of a TX, so an early event is an error, never `Txing`.
+                    Err(nb::Error::WouldBlock) => {
+                        log::debug!("lorawan-phy: Phy event while the TX is on air — rejected");
+                        Err(R::Error::tx_in_progress())
+                    }
+                    Err(nb::Error::Other(e)) => Err(e),
                 }
-                Err(nb::Error::WouldBlock) => Ok(PhyOutcome::StillTxing),
-                Err(nb::Error::Other(e)) => Err(e),
-            },
+            }
             RadioOp::Rxing => match self.radio.receive(&mut self.rx_buf) {
                 Ok((len, quality)) => {
                     self.rx_len = len;
@@ -215,6 +256,7 @@ where
                     power_dbm: tx_config.pw,
                 };
                 self.radio.prepare_tx(config, buf)?;
+                self.tx_polled = None;
                 self.op = RadioOp::Txing;
                 Ok(LdRadioResponse::Txing)
             }
@@ -245,12 +287,12 @@ where
                     log::debug!("lorawan-phy: cancel_rx failed: {:?}", e);
                 }
                 self.rx_len = 0;
+                self.tx_polled = None;
                 self.op = RadioOp::Idle;
                 Ok(LdRadioResponse::Idle)
             }
 
             LdRadioEvent::Phy(()) => Ok(match self.on_phy()? {
-                PhyOutcome::StillTxing => LdRadioResponse::Txing,
                 PhyOutcome::TxDone(on_air_ms) => LdRadioResponse::TxDone(on_air_ms),
                 PhyOutcome::StillRxing => LdRadioResponse::Rxing,
                 PhyOutcome::RxDone { rssi, snr } => {
@@ -469,5 +511,135 @@ mod tests {
         let phy = LorawanPhy::new(radio);
         assert_eq!(phy.get_rx_window_offset_ms(), -123);
         assert_eq!(phy.get_rx_window_duration_ms(), 456);
+    }
+
+    // ─── Driving the real `lorawan_device` Device ─────────────────────────────
+
+    use lorawan_device::{
+        default_crypto::DefaultFactory,
+        nb_device::{Device, Event as DevEvent, Response as DevResponse},
+        region::{Configuration, Region},
+        AppSKey, DevAddr, JoinMode, NewSKey, RngCore,
+    };
+
+    struct TestRng(u64);
+
+    impl RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (self.0 >> 32) as u32
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32())
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            rand_core::impls::fill_bytes_via_next(self, dest);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    type TestDevice = Device<LorawanPhy<MockLoraRadio>, DefaultFactory, TestRng, 256>;
+
+    /// An ABP-joined device whose uplink is on air: the `SendingData` wait.
+    fn device_with_uplink_on_air(busy_polls: usize) -> TestDevice {
+        let mut radio = MockLoraRadio::new();
+        radio.tx_busy_polls = busy_polls;
+        let mut device = Device::new(
+            Configuration::new(Region::EU868),
+            LorawanPhy::new(radio),
+            TestRng(7),
+        );
+        let joined = device.join(JoinMode::ABP {
+            newskey: NewSKey::from([0u8; 16]),
+            appskey: AppSKey::from([0u8; 16]),
+            devaddr: DevAddr::from(0),
+        });
+        assert!(matches!(joined, Ok(DevResponse::JoinSuccess)));
+        let sent = device.send(b"hi", 1, false);
+        assert!(matches!(sent, Ok(DevResponse::UplinkSending(_))));
+        device
+    }
+
+    fn deliver_phy(device: &mut TestDevice) -> bool {
+        matches!(
+            device.handle_event(DevEvent::RadioEvent(LdRadioEvent::Phy(()))),
+            Ok(DevResponse::TimeoutRequest(_))
+        )
+    }
+
+    #[test]
+    fn a_premature_phy_event_during_an_uplink_does_not_panic_the_device() {
+        let mut device = device_with_uplink_on_air(2);
+        for _ in 0..2 {
+            let early = device.handle_event(DevEvent::RadioEvent(LdRadioEvent::Phy(())));
+            assert!(
+                matches!(
+                    early,
+                    Err(lorawan_device::nb_device::Error::Radio(
+                        MockRadioError::TxInProgress
+                    ))
+                ),
+                "an early event is an error the device survives"
+            );
+        }
+        assert!(
+            deliver_phy(&mut device),
+            "the real TxDone still completes the uplink and schedules RX1"
+        );
+    }
+
+    #[test]
+    fn the_loop_filter_withholds_an_irq_that_does_not_end_the_tx() {
+        let mut device = device_with_uplink_on_air(1);
+        device.get_radio().radio_mut().irq_latched = true;
+        let phy = device.get_radio();
+        assert!(
+            !phy.phy_due(false),
+            "a stale IRQ while the frame is on air is withheld"
+        );
+        assert!(phy.phy_due(true), "the next sample sees the TX finished");
+        assert!(
+            phy.phy_due(false),
+            "the finished poll stays due until delivered"
+        );
+        assert!(deliver_phy(&mut device));
+        assert_eq!(
+            device.get_radio().radio().transmit_count,
+            2,
+            "the filter's poll is the one the event consumes, not a second transmit"
+        );
+    }
+
+    #[test]
+    fn the_loop_filter_passes_a_dio1_hint_only_once_the_tx_ended() {
+        let mut device = device_with_uplink_on_air(1);
+        let phy = device.get_radio();
+        assert!(
+            !phy.phy_due(true),
+            "an edge hint during the TX is checked, not trusted"
+        );
+        assert!(phy.phy_due(true));
+        assert!(deliver_phy(&mut device));
+    }
+
+    #[test]
+    fn the_loop_filter_leaves_other_states_alone() {
+        let mut phy = LorawanPhy::new(MockLoraRadio::new());
+        assert!(!phy.phy_due(false));
+        assert!(phy.phy_due(true));
+        phy.radio_mut().irq_latched = true;
+        assert!(phy.phy_due(false));
+        start_rx(&mut phy);
+        assert!(phy.phy_due(false));
+        assert_eq!(phy.radio().transmit_count, 0);
     }
 }

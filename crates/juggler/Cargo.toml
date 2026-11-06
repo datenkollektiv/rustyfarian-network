@@ -63,3 +63,7 @@ zeroize = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 embedded-storage = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The RNG the real `lorawan_device` `Device` needs in the LoRa PHY bridge tests.
+rand_core = { workspace = true }

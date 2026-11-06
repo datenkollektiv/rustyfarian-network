@@ -320,8 +320,388 @@ impl DownloadMachine {
     }
 }
 
+/// Experimental: API may change before 1.0.
+///
+/// The size of one read request, capped to what the transport and the caller's buffer hold.
+///
+/// This does NOT make a read one transport wait.
+/// ESP-IDF's `esp_http_client_read` loops: while the request is not filled and the body has
+/// data left, it calls `esp_transport_read` again with the full client timeout, and TCP `recv`
+/// returns whatever has arrived, so a read that returns fewer bytes than asked for simply
+/// waits again.
+/// A request of `n` bytes can therefore take up to `n` transport waits (a server that sends one
+/// byte shortly before each timeout), and the cap `min(max, buffer, transport_rx)` only limits
+/// that worst case to `transport_rx` waits.
+/// Use [`bounded_read_request`] to keep a call inside the time left of a deadline.
+/// Never returns 0 for a positive `max`, `buffer` and `transport_rx`.
+///
+/// ```
+/// use juggler::ota::capped_read_len;
+///
+/// assert_eq!(capped_read_len(1_000_000, 4096, 1024), 1024);
+/// assert_eq!(capped_read_len(100, 4096, 1024), 100);
+/// ```
+pub const fn capped_read_len(max: u32, buffer: usize, transport_rx: usize) -> usize {
+    let mut len = max as usize;
+    if buffer < len {
+        len = buffer;
+    }
+    if transport_rx < len {
+        len = transport_rx;
+    }
+    len
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// The wait of the follow-up read inside one [`read_bounded`] call, once the deadline is near.
+///
+/// The follow-up only collects bytes that have already arrived behind the first one, so it must
+/// not wait for new data: a short wait lets a fast peer fill the buffer while an idle one returns
+/// at once.
+/// `esp_http_client_read` itself returns the bytes read so far when a later wait elapses
+/// (`if (ridx) return ridx;`) and `-ESP_ERR_HTTP_EAGAIN` only when none arrived (ESP-IDF v5.3.3
+/// `components/esp_http_client/esp_http_client.c`, `esp_http_client_read`, the
+/// `ERR_TCP_TRANSPORT_CONNECTION_TIMEOUT` branch), so the wait costs at most this much per
+/// transport read.
+/// 1 ms is the finest timeout the transport takes (`esp_http_client_set_timeout_ms`), so the
+/// follow-up never waits longer than needed, and a follow-up of a whole 1024-byte chunk fits
+/// once a little over one second of the budget is left.
+pub const FOLLOW_UP_WAIT: Duration = Duration::from_millis(1);
+
+/// Experimental: API may change before 1.0.
+///
+/// One read request: how many bytes to ask for and how long the transport waits may last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadRequest {
+    /// The most bytes one read action returns.
+    pub len: usize,
+    /// The wait of the first transport read; the tier rounds it to the transport's granularity.
+    pub wait: Duration,
+    /// `Some` when the deadline is near: the first read asks for ONE byte and the rest of `len`
+    /// is a follow-up read with this wait (see [`read_bounded`]); `None` is a single read of `len`.
+    pub follow_up_wait: Option<Duration>,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Sizes one blocking read so that, once the deadline is closer than one per-read timeout, the
+/// whole call fits the time left.
+///
+/// `budget` is the [`DownloadAction::Read`] budget, `min(per_op, remaining)`, and `per_op` the
+/// configured per-read timeout.
+/// While `budget >= per_op` the request is [`capped_read_len`] with a wait of `budget`: a slow
+/// server may stall for a full `per_op` before the read fails, so the waits are not shortened.
+/// That leaves a RESIDUAL OVERRUN: a call that makes one wait per partial segment (up to
+/// `len` waits against a server that trickles bytes) can run past the deadline.
+/// Once `budget < per_op` the deadline is near: the first read is ONE byte with a wait of the
+/// whole `budget` (one transport wait, and an idle gap shorter than the budget cannot fail the
+/// read early, because `esp_http_client_read` returns `-ESP_ERR_HTTP_EAGAIN` when a wait ends
+/// with no bytes and the machine treats a failed read as final), and the other `len - 1` bytes
+/// are a follow-up with [`FOLLOW_UP_WAIT`], so a fast peer still delivers chunk-sized reads.
+///
+/// ```
+/// use core::time::Duration;
+/// use juggler::ota::{bounded_read_request, FOLLOW_UP_WAIT};
+///
+/// let per_op = Duration::from_secs(10);
+/// let near = bounded_read_request(1_000_000, 4096, 1024, Duration::from_secs(2), per_op);
+/// assert_eq!(near.len, 1024);
+/// assert_eq!(near.wait, Duration::from_secs(2));
+/// assert_eq!(near.follow_up_wait, Some(FOLLOW_UP_WAIT));
+/// ```
+pub fn bounded_read_request(
+    max: u32,
+    buffer: usize,
+    transport_rx: usize,
+    budget: Duration,
+    per_op: Duration,
+) -> ReadRequest {
+    let len = capped_read_len(max, buffer, transport_rx);
+    let near = budget < per_op && len > 1;
+    ReadRequest {
+        len,
+        wait: budget,
+        follow_up_wait: near.then_some(FOLLOW_UP_WAIT),
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// How one follow-up read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUp {
+    /// `n > 0` more bytes arrived.
+    Bytes(usize),
+    /// Nothing more is available right now: keep the bytes read so far.
+    ///
+    /// This is a timeout (`-ESP_ERR_HTTP_EAGAIN`, no bytes yet), which is not a failure of a
+    /// follow-up, and a zero read (end of stream, which the next read action reports itself).
+    Idle,
+    /// A real read failure: it ends the download.
+    Failed(OtaError),
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Classifies the result of a follow-up read (see [`FollowUp`]).
+///
+/// ```
+/// use juggler::ota::{classify_follow_up, FollowUp, OtaError};
+///
+/// assert_eq!(classify_follow_up(Ok(7)), FollowUp::Bytes(7));
+/// assert_eq!(classify_follow_up(Err(OtaError::DownloadTimeout)), FollowUp::Idle);
+/// assert_eq!(
+///     classify_follow_up(Err(OtaError::ServerUnreachable)),
+///     FollowUp::Failed(OtaError::ServerUnreachable)
+/// );
+/// ```
+pub fn classify_follow_up(read: Result<usize, OtaError>) -> FollowUp {
+    match read {
+        Ok(0) | Err(OtaError::DownloadTimeout) => FollowUp::Idle,
+        Ok(n) => FollowUp::Bytes(n),
+        Err(e) => FollowUp::Failed(e),
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Performs one [`DownloadAction::Read`] against `read`, a blocking transport read of `buf`
+/// with a wait, and returns the bytes now at the start of `buf`.
+///
+/// `elapsed` is the time since this call began.
+/// The first read follows [`bounded_read_request`].
+/// Near the deadline a first read of one byte is followed by a read of the rest with
+/// [`FOLLOW_UP_WAIT`], sized so that even a peer delivering a byte per wait ends inside what is
+/// left of `budget` (`esp_http_client_read` makes at most one more wait than it returns bytes);
+/// an idle follow-up returns what was read ([`FollowUp::Idle`]) instead of an error, so the
+/// flash write stays chunk-sized.
+///
+/// ```
+/// use core::time::Duration;
+/// use juggler::ota::read_bounded;
+///
+/// let mut buf = [0u8; 8];
+/// let n = read_bounded(&mut buf, 8, 8, Duration::from_secs(1), Duration::from_secs(10),
+///     || Duration::ZERO, |b, _| { b.fill(1); Ok(b.len()) }).unwrap();
+/// assert_eq!(n, 8);
+/// ```
+///
+/// # Errors
+///
+/// The error of the first read, or of a follow-up that is not [`FollowUp::Idle`].
+pub fn read_bounded<R, C>(
+    buf: &mut [u8],
+    max: u32,
+    transport_rx: usize,
+    budget: Duration,
+    per_op: Duration,
+    mut elapsed: C,
+    mut read: R,
+) -> Result<usize, OtaError>
+where
+    R: FnMut(&mut [u8], Duration) -> Result<usize, OtaError>,
+    C: FnMut() -> Duration,
+{
+    let request = bounded_read_request(max, buf.len(), transport_rx, budget, per_op);
+    let Some(follow_up_wait) = request.follow_up_wait else {
+        return read(&mut buf[..request.len], request.wait);
+    };
+    let first = read(&mut buf[..1], request.wait)?;
+    if first == 0 {
+        return Ok(0);
+    }
+    let remaining = budget.saturating_sub(elapsed());
+    let wait = follow_up_wait.min(remaining);
+    let waits = if wait.is_zero() {
+        0
+    } else {
+        usize::try_from(remaining.as_nanos() / wait.as_nanos()).unwrap_or(usize::MAX)
+    };
+    let more = request
+        .len
+        .saturating_sub(first)
+        .min(waits.saturating_sub(1));
+    if more == 0 {
+        return Ok(first);
+    }
+    match classify_follow_up(read(&mut buf[first..first + more], wait)) {
+        FollowUp::Bytes(n) => Ok(first + n),
+        FollowUp::Idle => Ok(first),
+        FollowUp::Failed(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_read_never_asks_for_more_than_one_transport_buffer() {
+        use super::capped_read_len;
+        assert_eq!(capped_read_len(u32::MAX, 4096, 1024), 1024);
+        assert_eq!(capped_read_len(4096, 4096, 512), 512);
+        assert_eq!(capped_read_len(700, 4096, 1024), 700);
+        assert_eq!(capped_read_len(10, 4, 1024), 4);
+        assert_eq!(capped_read_len(0, 4096, 1024), 0);
+    }
+
+    use core::cell::Cell;
+
+    /// A model of `esp_http_client_read` over a peer with `avail` bytes ready and `trickle`
+    /// more arriving one per millisecond; time passes only inside the model.
+    struct Peer {
+        now: Cell<Duration>,
+        avail: Cell<usize>,
+        trickle: bool,
+        fail_after_first: bool,
+        calls: Cell<usize>,
+        waits: Cell<Duration>,
+    }
+
+    impl Peer {
+        fn new(avail: usize, trickle: bool) -> Self {
+            Peer {
+                now: Cell::new(Duration::ZERO),
+                avail: Cell::new(avail),
+                trickle,
+                fail_after_first: false,
+                calls: Cell::new(0),
+                waits: Cell::new(Duration::ZERO),
+            }
+        }
+
+        fn read(&self, buf: &mut [u8], wait: Duration) -> Result<usize, OtaError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail_after_first && self.calls.get() > 1 {
+                return Err(OtaError::ServerUnreachable);
+            }
+            let mut got = 0;
+            while got < buf.len() {
+                if self.avail.get() > 0 {
+                    self.avail.set(self.avail.get() - 1);
+                    got += 1;
+                } else if self.trickle && wait >= Duration::from_millis(1) {
+                    self.now.set(self.now.get() + Duration::from_millis(1));
+                    got += 1;
+                } else {
+                    self.now.set(self.now.get() + wait);
+                    self.waits.set(self.waits.get() + wait);
+                    return if got > 0 {
+                        Ok(got)
+                    } else {
+                        Err(OtaError::DownloadTimeout)
+                    };
+                }
+            }
+            Ok(got)
+        }
+
+        fn run(&self, budget: Duration) -> Result<usize, OtaError> {
+            let mut buf = [0u8; 4096];
+            read_bounded(
+                &mut buf,
+                u32::MAX,
+                1024,
+                budget,
+                Duration::from_secs(10),
+                || self.now.get(),
+                |b, w| self.read(b, w),
+            )
+        }
+    }
+
+    #[test]
+    fn a_fast_peer_near_the_deadline_still_fills_a_whole_chunk() {
+        let peer = Peer::new(4096, false);
+        assert_eq!(peer.run(Duration::from_secs(2)), Ok(1024));
+        assert_eq!(peer.calls.get(), 2);
+    }
+
+    #[test]
+    fn an_idle_follow_up_returns_the_bytes_read_so_far_not_an_error() {
+        let peer = Peer::new(10, false);
+        assert_eq!(peer.run(Duration::from_secs(2)), Ok(10));
+        assert!(peer.now.get() <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_silent_peer_fails_after_exactly_the_budget() {
+        let peer = Peer::new(0, false);
+        let budget = Duration::from_millis(1_500);
+        assert_eq!(peer.run(budget), Err(OtaError::DownloadTimeout));
+        assert_eq!(peer.now.get(), budget);
+    }
+
+    #[test]
+    fn a_trickling_peer_cannot_push_one_call_past_the_budget() {
+        for budget_ms in [3u64, 4, 5, 20, 50, 400, 2_000] {
+            let peer = Peer::new(0, true);
+            let budget = Duration::from_millis(budget_ms);
+            assert!(peer.run(budget).is_ok(), "budget {budget_ms}");
+            assert!(peer.now.get() <= budget, "budget {budget_ms}");
+        }
+    }
+
+    #[test]
+    fn a_read_failure_after_the_first_byte_is_not_hidden() {
+        let mut peer = Peer::new(100, false);
+        peer.fail_after_first = true;
+        assert_eq!(
+            peer.run(Duration::from_secs(2)),
+            Err(OtaError::ServerUnreachable)
+        );
+    }
+
+    #[test]
+    fn a_full_budget_is_one_plain_read() {
+        let peer = Peer::new(4096, false);
+        assert_eq!(peer.run(Duration::from_secs(10)), Ok(1024));
+        assert_eq!(peer.calls.get(), 1);
+    }
+
+    #[test]
+    fn the_follow_up_classification() {
+        assert_eq!(classify_follow_up(Ok(3)), FollowUp::Bytes(3));
+        assert_eq!(classify_follow_up(Ok(0)), FollowUp::Idle);
+        assert_eq!(
+            classify_follow_up(Err(OtaError::DownloadTimeout)),
+            FollowUp::Idle
+        );
+        assert_eq!(
+            classify_follow_up(Err(OtaError::ServerUnreachable)),
+            FollowUp::Failed(OtaError::ServerUnreachable)
+        );
+    }
+
+    #[test]
+    fn a_read_near_the_deadline_is_one_byte_then_a_short_follow_up() {
+        let per_op = Duration::from_secs(10);
+        let budget = Duration::from_millis(9_999);
+        assert_eq!(
+            bounded_read_request(u32::MAX, 4096, 1024, budget, per_op),
+            ReadRequest {
+                len: 1024,
+                wait: budget,
+                follow_up_wait: Some(FOLLOW_UP_WAIT)
+            }
+        );
+        let one = bounded_read_request(1, 4096, 1024, budget, per_op);
+        assert_eq!((one.len, one.follow_up_wait), (1, None));
+    }
+
+    #[test]
+    fn a_read_with_a_full_per_op_budget_keeps_the_whole_wait() {
+        let per_op = Duration::from_secs(10);
+        assert_eq!(
+            bounded_read_request(u32::MAX, 4096, 1024, per_op, per_op),
+            ReadRequest {
+                len: 1024,
+                wait: per_op,
+                follow_up_wait: None
+            }
+        );
+        assert_eq!(bounded_read_request(10, 4096, 1024, per_op, per_op).len, 10);
+    }
+
     use super::*;
     use DownloadInput as I;
 

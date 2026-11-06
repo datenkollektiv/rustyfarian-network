@@ -187,6 +187,8 @@ pub struct WiFiManager {
     // before the driver it calls into is destroyed.
     link: LinkWorker,
     wifi: BlockingWifi<EspWifi<'static>>,
+    /// Tasks parked in [`NetworkLink::wait_suspended`]; woken once a suspend took effect.
+    suspend_wakers: std::sync::Mutex<Vec<core::task::Waker>>,
 }
 
 impl WiFiManager {
@@ -325,7 +327,11 @@ impl WiFiManager {
             (None, _) => log::info!("WiFi connect requested (non-blocking)"),
         }
 
-        Ok(Self { link, wifi })
+        Ok(Self {
+            link,
+            wifi,
+            suspend_wakers: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     /// Creates a new Wi-Fi manager without an LED driver.
@@ -556,7 +562,17 @@ impl WiFiManager {
         self.link
             .supervisor
             .suspend()
-            .map_err(|e| anyhow::Error::from(e).context("failed to stop WiFi for suspend"))
+            .map_err(|e| anyhow::Error::from(e).context("failed to stop WiFi for suspend"))?;
+        let wakers = std::mem::take(
+            &mut *self
+                .suspend_wakers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for waker in wakers {
+            waker.wake();
+        }
+        Ok(())
     }
 
     /// Starts the radio and connects again with a fresh back-off.
@@ -672,6 +688,34 @@ impl NetworkLink for WiFiManager {
 
     async fn wait_connected(&self) {
         self.wait_ready().await
+    }
+
+    /// Completes once a [`WiFiManager::suspend`] has stopped the radio, and stays
+    /// pending while nothing is suspended (the `NetworkLink` contract), also after a
+    /// suspend whose stop failed.
+    /// `suspend` stops the radio before it returns, so after a successful suspend
+    /// this completes at once.
+    async fn wait_suspended(&self) {
+        core::future::poll_fn(|cx| {
+            if self.is_suspended() {
+                return core::task::Poll::Ready(());
+            }
+            let mut wakers = self
+                .suspend_wakers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                wakers.push(cx.waker().clone());
+            }
+            drop(wakers);
+            // A suspend that finished between the check and the registration.
+            if self.is_suspended() {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await
     }
 }
 

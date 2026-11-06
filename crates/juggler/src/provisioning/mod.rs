@@ -37,6 +37,7 @@ pub mod html_json_escape;
 #[cfg(feature = "std")]
 pub mod kv_store;
 pub mod portal;
+pub mod portal_deadlines;
 pub mod portal_flow;
 pub mod profile;
 pub mod reentry;
@@ -65,6 +66,7 @@ pub use portal::{
     body_nonce_matches, compose_mqtt_uri, format_nonce, nonce_matches, plan_portal, PortalPlan,
     PortalPlanError, PortalPlanInput, Prefill,
 };
+pub use portal_deadlines::{worst_case_connection_ms, PortalPhase, IDF_HTTPD_SOCKET_TIMEOUT_MS};
 pub use portal_flow::{PortalAction, PortalInput, PortalMachine};
 pub use profile::{LoraFields, MqttFields, SchemaProfile};
 pub use reentry::{gate_reentry, ReentryGate, ReentryRequest};

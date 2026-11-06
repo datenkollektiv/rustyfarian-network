@@ -87,6 +87,19 @@ pub trait MqttClient {
         retain: bool,
     ) -> Result<(), Self::Error>;
 
+    /// Subscribes to a topic filter at runtime, without waiting for the broker.
+    ///
+    /// `Ok(())` means the request was accepted: it is sent on the live session
+    /// (or after the next connect when there is none) and re-sent after every
+    /// connect that needs it, like a builder subscription.
+    /// Messages arrive through [`receive`](Self::receive).
+    /// Subscribing to a filter that is already subscribed at the same QoS is a no-op.
+    ///
+    /// Do not call it from a tier's connect or message callback; see the tier docs.
+    /// Tiers bound what they store: a filter that is too long, or a full
+    /// subscription list, is refused with a tier error.
+    fn subscribe(&self, topic: &str, qos: QoS) -> Result<(), Self::Error>;
+
     /// Completes once the session is `Connected`.
     ///
     /// Any number of tasks may wait concurrently; the tier wakes all of them.
@@ -144,6 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_goes_through_the_trait_and_keeps_one_entry_per_filter() {
+        use alloc::string::ToString;
+        let mqtt = MockMqttClient::new();
+        mqtt.subscribe("t/cmd", QoS::AtMostOnce).unwrap();
+        mqtt.subscribe("t/other", QoS::AtLeastOnce).unwrap();
+        mqtt.subscribe("t/cmd", QoS::AtLeastOnce).unwrap();
+        assert_eq!(
+            mqtt.subscribed(),
+            [
+                ("t/cmd".to_string(), QoS::AtLeastOnce),
+                ("t/other".to_string(), QoS::AtLeastOnce)
+            ]
+        );
+    }
+
+    #[test]
     fn publish_and_receive_complete_through_the_trait() {
         let mqtt = MockMqttClient::new();
         mqtt.deliver("t/cmd", b"hello");
@@ -193,6 +222,35 @@ mod tests {
             link.fail_calls.set(true);
             assert!(link.suspend().is_err());
             assert_eq!(link.connect_count(), 1);
+        }
+
+        #[test]
+        fn wait_suspended_completes_once_the_suspend_took_effect() {
+            use core::future::Future;
+            use core::task::{Context, Poll, Waker};
+
+            let link = MockLink::new();
+            link.associate();
+            let mut wait = core::pin::pin!(link.wait_suspended());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+            link.suspend().unwrap();
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+            block_on(link.wait_suspended());
+        }
+
+        #[test]
+        fn wait_suspended_stays_pending_after_a_resume() {
+            use core::future::Future;
+            use core::task::{Context, Poll, Waker};
+
+            let link = MockLink::new();
+            link.associate();
+            link.suspend().unwrap();
+            link.resume().unwrap();
+            let mut wait = core::pin::pin!(link.wait_suspended());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
         }
     }
 }

@@ -76,8 +76,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hal_c3_ota` and `hal_esp32s3_ota` run the direct HTTP OTA check and need a server on a 192.168.31.x host.
 - Just recipes `build-all-examples` (optional prefix, `KEEP_GOING=1` to continue past failures), `build-xtensa-idf-mqtt` (builds `idf_esp32_mqtt` and `idf_esp32s3_mqtt_lwt`) and `flash-ota-baseline` (flashes the baseline of a bare-metal OTA example).
 
+- `rustyfarian-esp-hal-network` `MqttHandle::subscribe(topic, qos)` adds a runtime subscription with the same name and arguments as the ESP-IDF `MqttHandle::subscribe`.
+  The topic is copied into a bounded 64-byte buffer, a filter that is too long or invalid is refused, up to `MAX_RUNTIME_SUBSCRIPTIONS` (8) runtime entries are kept, and each entry is subscribed again after every reconnect.
+- `juggler::mqtt::MqttClient::subscribe(topic, qos)` joins the shared trait, and `juggler::mqtt::{admit_subscription, SubscriptionAdmission}` give both tiers one admission rule (added, changed, unchanged or full).
+- `rustyfarian-esp-hal-network` `mqtt` feature accepts a DNS name as the broker host, resolved on every connect; an IPv4 literal still connects with no DNS query.
+  `juggler::mqtt::{classify_broker_host, BrokerHost, MAX_HOSTNAME_LEN}` classify the host for the esp-hal tier (ESP-IDF hands the host to esp-mqtt unchanged), and IPv6 literals are rejected.
+- `juggler::wifi::NetworkLink::wait_suspended()` completes once the link is suspended, and `rustyfarian-esp-hal-network` `WifiLink::wait_suspended()` implements it with a waker.
+  The ESP-IDF `WiFiManager` returns at once, because its `suspend` has already stopped the radio.
+- `rustyfarian-esp-idf-network` `MqttBuilder::with_startup_message(topic, payload, qos, retain)` publishes a startup message on every connect, with the same signature as the esp-hal tier; the topic is validated in `build()`.
+- `ESPNOW_SCENARIO` compile-time selector on `idf_c3_espnow_scout` and `hal_c3_espnow_peer` (`cancel`, `flood`, `shutdown`, `shutdown-queued` and `txpower`), which logs `ESPNOW-GATE <gate> PASS` or `FAIL` lines for the 0.7.0 ESP-NOW hardware gates.
+- Runbook gates `HV-I1` (ESP-IDF OTAA join and uplink) and `HV-H1` (esp-hal SX1262 bring-up) for the Heltec V3 ESP32-S3 in `docs/runbooks/release-0.7.0-hardware-test.md`.
+- `juggler::ota::{bounded_read_request, capped_read_len, ReadRequest}`: the pure read sizing of the ESP-IDF firmware download.
+  A `ReadRequest` gives the length of one read and the waits it may take, capped at the transport buffer.
+  Near the deadline `juggler::ota::read_bounded` reads one byte with a wait of the whole remaining budget, then the rest of the chunk with a 1 ms follow-up wait (`FOLLOW_UP_WAIT`, `FollowUp`, `classify_follow_up`), sized to fit the time left; an idle follow-up returns the bytes read so far instead of an error.
+  `juggler::ota::Deadline::budget_millis` rounds a remaining budget up to whole milliseconds, with a floor of 1 ms.
+- `previous_update_rolled_back()` on `rustyfarian-esp-hal-network` `EspHalOtaManager` and `rustyfarian-esp-idf-network` `OtaSession`: whether the other slot's otadata entry is `Aborted` or `Invalid` (the last update was rolled back).
+- `juggler::lora::sx1262::{take_irq_status, irq_read_mask}`: read the IRQ status and clear only the flags that were read, so a flag that latches after the read survives to the next poll.
+- `juggler::mqtt::{SubscribeWindow, AckStatus, SUBSCRIBE_WINDOW}` and `SubscriptionTracker::{next_pending_from, send_owed}`: the window of eight that paces subscriptions, the SUBACK verdict per entry, and the send of the newest owed QoS.
+
 ### Changed
 
+- BREAKING: `rustyfarian-esp-idf-network` `MqttBuilder::with_startup_message` takes `(topic, payload, qos, retain)` instead of no arguments, matching the esp-hal tier.
+  The old behaviour moved to `with_default_startup_message()`, which is deprecated.
+- BREAKING: `rustyfarian-esp-hal-network` `MqttError` gains `RuntimeSubscriptionsFull`, so exhaustive matches need an arm.
+- BREAKING: `juggler::mqtt::MqttClient` gains the required method `subscribe(topic, qos)`, so external implementors must add it.
+- BREAKING: `juggler::wifi::NetworkLink` gains the required method `wait_suspended()`, so external implementors must add it.
+- `rustyfarian-esp-hal-network` `MqttConfig::host` and `MqttBuilder::build` accept DNS names, while IPv6 literals and malformed IPv4 literals are still rejected.
+- `idf_c3_mqtt_callback_guard` publishes its startup message to `guard/startup` instead of `iot/{client_id}/startup`, so runbook watches on the old topic need updating.
 - `juggler::wifi::LinkAction` gains `Ignored` (exhaustive enum).
   `LinkMachine::poll` returns it instead of `None` for a `NetworkUp` outside `Connected`, a duplicate `NetworkUp`, and a `NetworkDown` while already down.
   Both tiers re-export the enum unchanged.
@@ -102,6 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - BREAKING: `juggler::lora::LoraRadio` gains the required methods `cancel_rx` and `irq_pending`, so external implementors must add them.
   The generic bridge needs `juggler::lora::RadioErrorKind` on the radio error.
 - BREAKING: `juggler::lora::MockRadioError` gains `Timeout` and `InvalidRfConfig`, and `rustyfarian-esp-hal-network` `lora::LoraError` gains `InvalidRfConfig`.
+- BREAKING: `juggler::lora::RadioErrorKind` gains the required method `tx_in_progress`, so external implementors must add it.
+- BREAKING: the `LoraError` of both tiers and `juggler::lora::MockRadioError` gain `TxInProgress` (a radio event arrived while the transmission was still on air), so exhaustive matches need an arm.
+- BREAKING: `juggler::provisioning::PortalPhase` gains `Abort`, so exhaustive matches need an arm.
 - `rustyfarian-esp-idf-network` `EspIdfLoraRadio::cancel_rx` and `irq_pending` are now `LoraRadio` trait methods that return `Result`.
   `LoraRadioAdapter` is a type alias for `juggler::lora::LorawanPhy<EspIdfLoraRadio<'d, ANT>>` at the same path, adds `ignored_events()`, `radio()`, `radio_mut()` and `into_radio()`, and the `lora-modulation` dependency is dropped.
 - Behaviour: IDF `WiFiManager::new` (blocking, with or without LED), `get_ip` and `wait_connected` now wait for supervisor readiness (association plus the station's DHCP IP event) instead of polling `is_connected()` and `wait_netif_up()`.
@@ -321,7 +349,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The esp-hal `SoftAP configured` log line is now a fixed message: CodeQL reports every value read from the AP config, including the channel and the SSID length, as cleartext credential logging because the config carries the password; an open AP still logs its own warning, and the provisioning layer logs the resolved SSID length.
 - `rustyfarian-esp-hal-network`: the hal examples `hal_c3_provision_mqtt` and `hal_c6_provision_mqtt` restart via `esp_hal::system::software_reset()` 200 ms after a committed submission, like the IDF provisioning examples, instead of idling until a manual reset; the library itself still never reboots.
 
+- BREAKING: `juggler::lora::RadioErrorKind` gains the required method `tx_in_progress()`, so external radio drivers must implement it.
+  The IDF and esp-hal `LoraError` enums and `MockRadioError` gain a `TxInProgress` variant, so exhaustive matches need an arm.
+- `juggler::lora::LorawanPhy::phy_due` decides when a DIO1 hint or a polled IRQ may reach the LoRaWAN device; the ESP-IDF join and uplink examples call it in place of `dio1_edge || irq_pending()`.
+- `juggler::mqtt::{SubscribeWindow, AckStatus, SUBSCRIBE_WINDOW}` and `SubscriptionTracker::{next_pending_from, send_owed}` are new public items.
+- `juggler::provisioning::{PortalPhase, IDF_HTTPD_SOCKET_TIMEOUT_MS, worst_case_connection_ms}` are new public items.
+
 ### Deprecated
+
+- `rustyfarian-esp-idf-network` `MqttBuilder::with_default_startup_message()`: use `with_startup_message(topic, payload, qos, retain)`.
+  The old call publishes `1` to `iot/{client_id}/startup` at QoS 1, not retained.
 
 - `rustyfarian-esp-idf-network` `mqtt::MqttManager`: deprecated since 0.7.0 and kept, not removed; use `MqttBuilder` and `MqttHandle`.
 - `juggler::mqtt::SessionPhase` and `juggler::mqtt::connection_wait_iterations`: deprecated since 0.7.0 and kept; use `SessionMachine` and `MqttHandle::state()`.
@@ -336,6 +373,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- esp-hal OTA activation: `plan_activation` picked a wrong sequence number across the wrap at sequence 0 when the number of OTA slots does not divide 2^32 (3 slots: the bootloader booted slot 0 instead of slot 1).
+  The increment is now searched without the wrap.
+- ESP-IDF OTA download: near the deadline a read asked for one byte, so the last per-read timeout of a healthy download ran one `esp_http_client_read`, SHA update and flash write per byte and could time out.
+  It now reads one byte with the whole budget and the rest of the chunk with a 1 ms follow-up wait, so writes stay chunk-sized and the call still fits the time left.
+- `rustyfarian-esp-hal-network` OTA examples (`hal_c3_ota`, `hal_esp32s3_ota`) skip the update after a rollback boot and log `previous update was rolled back; not retrying <version>`, so the baseline no longer downloads the rolled-back image again.
+  They read `OTA_DEMO_UNHEALTHY=1` like `idf_c3_ota_runtime`, so `just ota-image-unhealthy` builds an image that never marks itself valid.
+- The `embassy-time` mock-driver dev-dependency of `rustyfarian-esp-hal-network` no longer applies to the `espidf` target, where it unified with the `embassy-time-driver` of `esp-idf-svc` in workspace clippy.
 - `juggler::espnow::TxCore` keeps one slot for the scan's probe, so application callers can no longer fill the queue and starve the probe of a scan admitted afterwards: ESP-IDF scans could report `NotFound` with the peer present, because a refused probe counted as a local failure and the channel was skipped.
   Application sends now have `TX_SLOTS - 1` (3) slots on both tiers; `TxCore::new` needs at least two slots.
 - esp-hal `scan_for_peer`: cancelling the future while a probe is on the air no longer changes the channel, the peer table or the TX power under that frame.
@@ -373,6 +417,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-hal-network` ESP-NOW: an async send or scan probe issued right after spawning `run_sender` no longer fails with `NoSenderRunner`.
   The runner marks itself active on its first poll, which a task spawned behind it can precede; the sender now waits for it, polling every millisecond on an `embassy_time` timer, for at most 100 ms or its own deadline, and only then returns `NoSenderRunner`.
   The boot scan of a peer that spawned the runner and a sending task together no longer reports `peer not found after probing 0 of 13 configured channels`.
+- esp-hal OTA slot activation wrote the new slot selection and its `New` state in two otadata writes, so an interruption between them could select a slot without the state that arms its rollback.
+  Activation is now one 32-byte write of the selection, the `New` state and the CRC into the non-selected otadata sector, read back to verify; on a write error or a read-back mismatch the previous sector bytes are restored and read back, and the original error is returned.
+- ESP-IDF OTA download: the connect and read waits were bounded only by the configured timeout, so they could run past the remaining download deadline.
+  Each wait is now clipped to the remaining deadline through `juggler::ota::Deadline::budget_millis`, and every read sets its own timeout.
+  DNS resolution inside the connect is still not bounded by this timeout.
+- esp-hal MQTT subscriptions: the ninth subscription failed the session on every connect, because the `minimq` SUBSCRIBE window holds eight entries.
+  Subscriptions are now paced in a window of eight, and a refused SUBACK ends the session before readiness is announced.
+  Runtime subscriptions are marked sent on their SUBACK, so an unacknowledged one is sent again on the next session.
+- ESP-IDF `MqttHandle::subscribe`: two calls for one topic with different QoS could leave the broker on the older QoS while the tracker recorded the newer one as complete.
+  The newest QoS is now always the one sent last.
+- esp-hal provisioning portal: a client that stalled while sending the request body or reading the response held the single accept loop.
+  Every portal phase now has a bound (5 s each for headers, body and response, matching the ESP-IDF httpd socket timeout; 500 ms for drain; 1 s for close), and a timed-out connection is aborted so the portal returns to accept.
+  A request body that times out now gets no `400` response, where a short body used to get one.
+- ESP-IDF LoRaWAN send: a radio event that arrived while a transmission was still on air made `lorawan-device` panic in `SendingData`.
+  `juggler::lora::LorawanPhy` now refuses such an event until the transmission ends, and the `TxDone` completes the send.
+- ESP-IDF ESP-NOW scan: a failed TX-power read no longer boosts the radio, so a scan can no longer leave it boosted; the power is left alone, as on esp-hal.
+- The shared `lwt_app` example logged `demo: resume` during the first minute of a run, before any suspend; the resume branch now runs only after a suspend.
+- The esp-hal `WifiLink::is_suspended` and `wait_suspended` docs now say that `true` or a return does not prove the association ended when the 500 ms disconnect times out.
+- esp-hal OTA `mark_valid`, `rollback` and `selected_slot` now act on the entry the bootloader selects, and follow the bootloader's validity rule: an `UNDEFINED` entry is selected, `ABORTED` and `INVALID` entries are skipped, and the sequence arithmetic wraps as the bootloader's does instead of panicking at sequence 0.
+- ESP-IDF OTA download: the HTTP receive buffer is 1024 bytes (`buffer_size`), each read is capped at that size, and a read near the deadline makes one wait for the whole remaining budget instead of splitting it.
+  Near the deadline a read asks for one byte, so the last part of a download is slower.
+- ESP-IDF LoRa `transmit` and `receive` clear only the IRQ flags they read (`juggler::lora::sx1262::take_irq_status` and `irq_read_mask`), so a TxDone or RxDone that latches between the read and the clear is seen on the next poll; `cancel_rx` still clears every flag.
 
 ## [0.6.0] - 2026-10-09
 
