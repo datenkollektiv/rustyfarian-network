@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The bench re-runs that the retrofit needs are mapped to gates in `docs/runbooks/release-0.7.0-hardware-test.md`.
 - `juggler::wifi::LinkHandover::{start, idle_wait, take_ready_change}` and the enum `juggler::wifi::IdleWait` (`Link`, `Park`, `Restart`), re-exported from `juggler::wifi`.
   `juggler::wifi::ConnectMode::effective_timeout_secs` returns the connect timeout that both tiers share.
+- `juggler::wifi::ApSelection` (`Strongest`, the default, and `FirstFound`) with `WiFiConfig::with_ap_selection`, re-exported by both tiers; each tier maps it to its station scan.
+- Both tiers log the joined AP on every association, with the shared `juggler::wifi::JoinedAp` text: esp-hal `[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, ESP-IDF `WiFi associated — bssid …, ch N, rssi -NN dBm`.
 - `Clone` on `juggler::wifi::LinkMachine`, `juggler::wifi::LinkHandover` and `juggler::backoff::ExponentialBackoff`.
 - `juggler::mqtt::{ConnectWorkPlan, ConnectStep}`: the ordered connect work (subscriptions, startup message and `on_connect`) that both tiers run.
   `ChunkAssembler::dropped_by_last_feed()` reports how many messages the last feed dropped.
@@ -96,6 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The `idf_c3_provision_mqtt` re-entry hook watches BOOT for 2 s after its `press BOOT now` line instead of reading it once about 0.6 s after reset, which was too short to hit by hand (as `rustyfarian-rgb-clock` found on esp-hal); a normal boot now waits those 2 s.
+- BREAKING: `juggler::wifi::WiFiConfig` gains the public field `ap_selection`, so code that builds `WiFiConfig` as a struct literal must add it (`WiFiConfig::new` is unaffected).
 - BREAKING: `rustyfarian-esp-idf-network` `MqttBuilder::with_startup_message` takes `(topic, payload, qos, retain)` instead of no arguments, matching the esp-hal tier.
   The old behaviour moved to `with_default_startup_message()`, which is deprecated.
 - BREAKING: `rustyfarian-esp-hal-network` `MqttError` gains `RuntimeSubscriptionsFull`, so exhaustive matches need an arm.
@@ -373,6 +377,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ESP-IDF provisioning portal: the httpd stack grows from 10 KB to 16 KB, because `POST /save` overflowed it in the shared `parse_form` (4.5 KB frame) on the first submit, so the device rebooted before committing and reopened the portal on every boot.
+- esp-hal Wi-Fi station now joins the strongest AP of the SSID, as the ESP-IDF tier does: both tiers take the scan from the shared `ApSelection` instead of their driver's default.
+  esp-radio's default fast scan joined the first AP found by channel; on a mesh SSID the CrowPanel S3 joined a -89 dBm node next to a -20 dBm one, got an IP, and every TCP connect to the broker timed out.
+  esp-hal connects take slightly longer because every channel is scanned; `ApSelection::FirstFound` restores the fast scan.
 - esp-hal OTA activation: `plan_activation` picked a wrong sequence number across the wrap at sequence 0 when the number of OTA slots does not divide 2^32 (3 slots: the bootloader booted slot 0 instead of slot 1).
   The increment is now searched without the wrap.
 - ESP-IDF OTA download: near the deadline a read asked for one byte, so the last per-read timeout of a healthy download ran one `esp_http_client_read`, SHA update and flash write per byte and could time out.

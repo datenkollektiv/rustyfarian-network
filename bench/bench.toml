@@ -1,0 +1,28 @@
+# Bench definition for rustyfarian-bench (`just bench <target>`).
+# Scenarios live in bench/<board>/*.toml; see bench/README.md.
+# First iteration: single-board Wi-Fi and MQTT smoke per chip-matrix cell, plus the C3 BOOT re-entry hook.
+
+[commands]
+build = ["just", "build-example", "{example}"]
+# `just flash` takes no port; scripts/detect-port.sh reads ESPFLASH_PORT, so the detected port is pinned that way.
+flash = ["env", "ESPFLASH_PORT={port}", "just", "flash", "{example}"]
+
+[boards.c3]
+chip = "esp32c3"
+name = "ESP32-C3 Super Mini"
+checks = ["connect", "mqtt-lwt", "mqtt"]   # first, in this order; the rest follow by name
+
+[boards.c6]
+chip = "esp32c6"
+name = "ESP32-C6-DevKitC-1 (WS2812 on GPIO8)"
+checks = ["connect", "mqtt-lwt", "mqtt"]
+
+[boards.s3]
+chip = "esp32s3"
+name = "CrowPanel 1.28\" HMI (ESP32-S3)"
+checks = ["connect", "mqtt-lwt"]
+
+[boards.esp32]
+chip = "esp32"
+name = "ESP32 WROOM-32 DevKit / Adafruit Feather V2"
+checks = ["connect", "mqtt-lwt", "mqtt"]

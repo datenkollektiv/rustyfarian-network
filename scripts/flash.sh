@@ -33,16 +33,6 @@ run_espflash() {
     espflash "$@"
 }
 
-# Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
-# usbmodem/usbserial (macOS) or ttyUSB/ttyACM (Linux) device — espflash's own
-# auto-detect picks Bluetooth devices on Macs with headphones paired and fails
-# with the generic "Error while connecting to device".  See scripts/detect-port.sh.
-port_args=()
-detected_port="$("$SCRIPT_DIR/detect-port.sh")"
-if [ -n "$detected_port" ]; then
-    port_args=(--port "$detected_port")
-fi
-
 if [ $# -lt 1 ]; then
     printf 'Usage: %s <example>\n  example: idf_{chip}_{feature} or hal_{chip}_{name}\n  e.g. idf_c3_connect, idf_c3_mqtt, idf_esp32_mqtt, hal_c3_connect_async, hal_esp32s3_join\n' "$0" >&2
     exit 2
@@ -51,6 +41,24 @@ fi
 example="$1"
 hal_dir="${2:-target/hal}"
 idf_dir="${3:-target/idf}"
+
+# Pick the USB serial port: $ESPFLASH_PORT wins; otherwise prefer the unique
+# usbmodem/usbserial (macOS) or ttyUSB/ttyACM (Linux) device — espflash's own
+# auto-detect picks Bluetooth devices on Macs with headphones paired and fails
+# with the generic "Error while connecting to device".  With several attached,
+# the chip from the example name selects the board.  See scripts/detect-port.sh.
+case "$(printf '%s' "$example" | cut -d_ -f2)" in
+    c3) port_chip=esp32c3 ;;
+    c6) port_chip=esp32c6 ;;
+    esp32) port_chip=esp32 ;;
+    esp32s3) port_chip=esp32s3 ;;
+    *) port_chip="" ;;
+esac
+port_args=()
+detected_port="$("$SCRIPT_DIR/detect-port.sh" "$port_chip")"
+if [ -n "$detected_port" ]; then
+    port_args=(--port "$detected_port")
+fi
 
 # Extract prefix to determine HAL type
 prefix=$(printf '%s' "$example" | cut -d_ -f1)

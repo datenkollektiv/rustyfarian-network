@@ -14,13 +14,11 @@
 //!    this example erases the record (via [`ProvisioningStore::erase_all`])
 //!    and continues into the portal in the same boot.
 //!
-//!    Timing: GPIO9 is a strapping pin, and the hook samples it once, shortly
-//!    after reset.
-//!    Release RESET (or power on) with BOOT up, then press and hold BOOT
-//!    right away, within about the first half second.
-//!    The console's "press BOOT now" line marks the sample point.
+//!    Timing: GPIO9 is a strapping pin, so release RESET (or power on) with
+//!    BOOT up, then press BOOT once the console shows "press BOOT now"; the
+//!    hook watches for `BOOT_WINDOW_MS` (2 s) after that line.
 //!    Holding BOOT through reset enters ROM download mode instead, and a press
-//!    after the sample is ignored.
+//!    after the window is ignored.
 //! 2. If not provisioned (or re-entry was requested), an indicator thread is
 //!    spawned (placeholder for a WS2812/LED animation), then
 //!    [`run_wifi_mqtt_portal`] starts the SoftAP captive portal and blocks
@@ -91,18 +89,26 @@ const BOOT_HOLD_MS: u64 = 3000;
 /// single noisy read on GPIO9 does not open the portal.
 const BOOT_DEBOUNCE_MS: u64 = 20;
 
-/// The re-entry hook: samples the BOOT button (GPIO9, active low) once, after
-/// boot.
+/// How long the hook watches for a BOOT press after its "press BOOT now" line.
+///
+/// One read about 0.6 s after reset left a window too short to hit by hand on a
+/// C3 (bench 2026-11-08), as rgb-clock found on esp-hal; a person needs about
+/// 2 s after a visible prompt.
+const BOOT_WINDOW_MS: u64 = 2000;
+
+/// The re-entry hook: watches the BOOT button (GPIO9, active low) for
+/// [`BOOT_WINDOW_MS`] after boot.
 ///
 /// GPIO9 is a strapping pin: press BOOT after releasing RESET, not during it
-/// (holding it through reset enters ROM download mode), and before this hook
-/// samples it, within about the first half second.
+/// (holding it through reset enters ROM download mode), once the console shows
+/// "press BOOT now".
 ///
-/// Returns [`ReentryRequest::None`] immediately when the button is up, so a
-/// normal boot is not delayed.  A low read is confirmed after
-/// [`BOOT_DEBOUNCE_MS`]; if the second read is high it answers `None`.  While the button is held it blocks, then
-/// answers [`ReentryRequest::FactoryReset`] for a hold of at least
-/// [`BOOT_HOLD_MS`] and [`ReentryRequest::Portal`] for a shorter one.
+/// Without a press the window runs out and the hook answers
+/// [`ReentryRequest::None`], so a normal boot waits [`BOOT_WINDOW_MS`].  A low
+/// read counts once it is still low after [`BOOT_DEBOUNCE_MS`].  While the
+/// button is held it blocks, then answers [`ReentryRequest::FactoryReset`] for
+/// a hold of at least [`BOOT_HOLD_MS`] and [`ReentryRequest::Portal`] for a
+/// shorter one.
 ///
 /// The hook cannot fail the boot: if the pin cannot be configured it logs and
 /// answers `None`.  The `PinDriver` is dropped on return, releasing GPIO9.
@@ -115,12 +121,19 @@ fn boot_button_reentry(pin: impl InputPin) -> ReentryRequest {
         }
     };
 
-    if button.is_high() {
-        return ReentryRequest::None;
-    }
-    std::thread::sleep(Duration::from_millis(BOOT_DEBOUNCE_MS));
-    if button.is_high() {
-        return ReentryRequest::None;
+    let window_start = Instant::now();
+    let window = Duration::from_millis(BOOT_WINDOW_MS);
+    loop {
+        if button.is_low() {
+            std::thread::sleep(Duration::from_millis(BOOT_DEBOUNCE_MS));
+            if button.is_low() {
+                break;
+            }
+        }
+        if window_start.elapsed() >= window {
+            return ReentryRequest::None;
+        }
+        std::thread::sleep(Duration::from_millis(BOOT_DEBOUNCE_MS));
     }
 
     log::info!(
@@ -159,7 +172,8 @@ fn main() -> anyhow::Result<()> {
     // The hook runs before the store is read; the load never claims the modem.
     let gpio9 = peripherals.pins.gpio9;
     log::info!(
-        "Re-entry: press BOOT now to reopen the portal (hold {} ms to factory-reset).",
+        "Re-entry: press BOOT now (within {} ms) to reopen the portal (hold {} ms to factory-reset).",
+        BOOT_WINDOW_MS,
         BOOT_HOLD_MS
     );
     let loaded = WifiMqttBoot::load_with_reentry(

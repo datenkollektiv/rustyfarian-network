@@ -40,8 +40,8 @@
 #[allow(deprecated)]
 pub use juggler::wifi::{
     credentials_hint, reason_suggests_credentials, validate_password, validate_ssid,
-    wifi_disconnect_reason_name, ApConfig, ConnectMode, DisconnectReason, LinkAction, LinkInput,
-    LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
+    wifi_disconnect_reason_name, ApConfig, ApSelection, ConnectMode, DisconnectReason, LinkAction,
+    LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
     DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
     RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
@@ -160,14 +160,15 @@ mod driver {
     };
     use esp_hal::timer::timg::TimerGroup;
     use esp_radio::wifi::ap::AccessPointConfig;
-    use esp_radio::wifi::sta::StationConfig;
+    // `ScanMethod` and `with_scan_method` are esp-radio `unstable` API; recheck on every esp-radio bump.
+    use esp_radio::wifi::sta::{ScanMethod, StationConfig};
     use esp_radio::wifi::{
         AuthenticationMethodConfig, Config, ControllerConfig, Interface, Password, PowerSaveMode,
         Ssid, WifiController,
     };
     use juggler::wifi::{
-        validate_ap_config, validate_password, validate_ssid, ApConfig, TxPowerLevel, WiFiConfig,
-        WifiPowerSave,
+        validate_ap_config, validate_password, validate_ssid, ApConfig, ApSelection, TxPowerLevel,
+        WiFiConfig, WifiPowerSave,
     };
     use static_cell::StaticCell;
 
@@ -211,6 +212,7 @@ mod driver {
         password: &'a str,
         power_save: WifiPowerSave,
         tx_power: TxPowerLevel,
+        ap_selection: ApSelection,
         ampdu: bool,
         scheduler: Scheduler,
         wifi: esp_hal::peripherals::WIFI<'static>,
@@ -227,6 +229,7 @@ mod driver {
                 password: config.password,
                 power_save: config.power_save,
                 tx_power: config.tx_power,
+                ap_selection: config.ap_selection,
                 ampdu: true,
                 scheduler,
                 wifi,
@@ -309,6 +312,16 @@ mod driver {
                 Self::ConfigureFailed => write!(f, "Wi-Fi configuration failed"),
                 Self::Driver(inner) => write!(f, "Wi-Fi driver error: {:?}", inner),
             }
+        }
+    }
+
+    /// Maps the shared [`ApSelection`] to the station scan, so the driver default never decides.
+    ///
+    /// esp-radio always sorts by signal, which takes effect only with an all-channel scan.
+    fn map_ap_selection(selection: ApSelection) -> ScanMethod {
+        match selection {
+            ApSelection::Strongest => ScanMethod::AllChannels,
+            ApSelection::FirstFound => ScanMethod::Fast,
         }
     }
 
@@ -495,13 +508,16 @@ mod driver {
             //    `StationConfig::default()` selected in 0.18 (and still does), it
             //    doubles as the minimum security level for scanning, and it keeps
             //    STA behaviour identical to the ESP-IDF tier.
+            //    The scan method comes from the shared `ApSelection`, never from
+            //    esp-radio's default (a fast scan, unlike the ESP-IDF tier).
             let ssid = Ssid::try_from(config.ssid).map_err(WifiError::Driver)?;
             let authentication = AuthenticationMethodConfig::Wpa2Personal(
                 Password::try_from(config.password).map_err(WifiError::Driver)?,
             );
             let station = StationConfig::default()
                 .with_ssid(ssid)
-                .with_authentication(authentication);
+                .with_authentication(authentication)
+                .with_scan_method(map_ap_selection(config.ap_selection));
             controller
                 .set_config(&Config::Station(station))
                 .map_err(WifiError::Driver)?;

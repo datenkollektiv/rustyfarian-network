@@ -59,7 +59,8 @@ use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use juggler::wifi::{
-    IdleWait, LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink, CREDENTIALS_HINT,
+    IdleWait, JoinedAp, LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink,
+    CREDENTIALS_HINT,
 };
 
 /// Upper bound on the disconnect that [`WifiLink::suspend`] triggers (milliseconds);
@@ -267,27 +268,30 @@ impl WifiLink {
         });
     }
 
-    /// Feeds an association to the machine and logs it.
-    fn link_up(&self, how: &str) -> LinkAction {
+    /// Feeds an association to the machine and logs it with the joined AP.
+    fn link_up(&self, how: &str, ap: Option<JoinedAp>) -> LinkAction {
         let action = self.poll(LinkInput::Connected);
-        self.log_association(how);
+        self.log_association(how, ap);
         action
     }
 
     /// Restarts supervision through [`LinkHandover::start`] and returns the first action.
-    fn start(&self, associated: bool) -> LinkAction {
+    fn start(&self, associated: bool, ap: Option<JoinedAp>) -> LinkAction {
         let (action, change) = self.with(|h| (h.start(associated), h.take_ready_change()));
         self.report_ready(change);
         if associated {
-            self.log_association(" (adopted)");
+            self.log_association(" (adopted)", ap);
         }
         action
     }
 
-    /// Logs an association the machine was just told about.
-    fn log_association(&self, how: &str) {
+    /// Logs an association the machine was just told about, with the AP when the driver reports it.
+    fn log_association(&self, how: &str, ap: Option<JoinedAp>) {
         if self.state() == LinkState::Connected {
-            log::info!("[wifi] link up #{}{}", self.connect_count(), how);
+            match ap {
+                Some(ap) => log::info!("[wifi] link up #{}{} — {}", self.connect_count(), how, ap),
+                None => log::info!("[wifi] link up #{}{}", self.connect_count(), how),
+            }
         } else {
             log::info!("[wifi] associated while suspended, disconnecting again");
         }
@@ -303,7 +307,7 @@ impl WifiLink {
         // A cancelled earlier `run` may have left the machine mid-attempt; keep a
         // suspend the firmware already asked for.
         self.wake.reset();
-        let mut action = self.start(controller.is_connected());
+        let mut action = self.start(controller.is_connected(), joined_ap(&controller));
         loop {
             action = match action {
                 LinkAction::Connect if controller.is_connected() => {
@@ -312,28 +316,36 @@ impl WifiLink {
                     self.poll(LinkInput::Connected)
                 }
                 LinkAction::Connect => {
-                    let mut connect = pin!(controller.connect_async());
-                    loop {
-                        match select(self.handed_over(), connect.as_mut()).await {
-                            Either::First(handed) => match handed {
-                                LinkAction::Disconnect => break LinkAction::Disconnect,
-                                // A resume right after a suspend, or nothing (`None`,
-                                // `Ignored`): keep the attempt in flight.
-                                _ => continue,
-                            },
-                            Either::Second(Ok(_)) => break self.link_up(""),
-                            Either::Second(Err(e)) => {
-                                // A refused association arrives here, not as a
-                                // disconnect event, so the hint belongs on this
-                                // line too (bug 011).
-                                log::warn!(
-                                    "[wifi] connect failed: {:?}{}",
-                                    e,
-                                    connect_failure_hint(&e)
-                                );
-                                break self.poll(LinkInput::ConnectFailed);
+                    // `Ok` once associated; the AP is read after the attempt has
+                    // released the controller.
+                    let outcome = {
+                        let mut connect = pin!(controller.connect_async());
+                        loop {
+                            match select(self.handed_over(), connect.as_mut()).await {
+                                Either::First(handed) => match handed {
+                                    LinkAction::Disconnect => break Err(LinkAction::Disconnect),
+                                    // A resume right after a suspend, or nothing (`None`,
+                                    // `Ignored`): keep the attempt in flight.
+                                    _ => continue,
+                                },
+                                Either::Second(Ok(_)) => break Ok(()),
+                                Either::Second(Err(e)) => {
+                                    // A refused association arrives here, not as a
+                                    // disconnect event, so the hint belongs on this
+                                    // line too (bug 011).
+                                    log::warn!(
+                                        "[wifi] connect failed: {:?}{}",
+                                        e,
+                                        connect_failure_hint(&e)
+                                    );
+                                    break Err(self.poll(LinkInput::ConnectFailed));
+                                }
                             }
                         }
+                    };
+                    match outcome {
+                        Ok(()) => self.link_up("", joined_ap(&controller)),
+                        Err(action) => action,
                     }
                 }
                 LinkAction::Disconnect => {
@@ -432,7 +444,9 @@ impl WifiLink {
                                 Either::First(handed) => handed,
                                 // Not reachable while `run` owns the machine from its own
                                 // start; start again rather than stall.
-                                Either::Second(()) => self.start(controller.is_connected()),
+                                Either::Second(()) => {
+                                    self.start(controller.is_connected(), joined_ap(&controller))
+                                }
                             }
                         }
                     }
@@ -524,4 +538,14 @@ fn connect_failure_hint(error: &ConnectionError) -> &'static str {
         ConnectionError::Failed(info) => hal_disconnect_hint(&info.reason),
         _ => "",
     }
+}
+
+/// The AP the station is associated with, for the link-up line; `None` when not associated.
+fn joined_ap(controller: &WifiController<'static>) -> Option<JoinedAp> {
+    let info = controller.ap_info().ok()?;
+    Some(JoinedAp {
+        bssid: info.bssid,
+        channel: info.channel,
+        rssi: info.signal_strength,
+    })
 }

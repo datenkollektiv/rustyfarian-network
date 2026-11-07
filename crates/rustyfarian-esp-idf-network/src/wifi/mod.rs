@@ -79,8 +79,11 @@ use esp_idf_svc::handle::RawHandle as _;
 use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{esp, EspError};
-use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent};
-use juggler::wifi::{LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
+use esp_idf_svc::wifi::{
+    BlockingWifi, ClientConfiguration, Configuration, EspWifi, ScanMethod, ScanSortMethod,
+    WifiEvent,
+};
+use juggler::wifi::{JoinedAp, LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
 // Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
 // (where `SoftApManager` is cfg'd out) does not warn on unused imports.
 #[cfg(esp_idf_esp_wifi_softap_support)]
@@ -93,11 +96,11 @@ use rgb::RGB8;
 #[allow(deprecated)]
 pub use juggler::wifi::{
     credentials_hint, reason_suggests_credentials, validate_ap_config, validate_password,
-    validate_ssid, wifi_disconnect_reason_name, ApConfig, ConnectMode, DisconnectReason,
-    LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver,
-    WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS,
-    PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS,
-    SSID_MAX_LEN,
+    validate_ssid, wifi_disconnect_reason_name, ApConfig, ApSelection, ConnectMode,
+    DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig,
+    WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN,
+    DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
+    RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -118,6 +121,7 @@ pub struct IdfWifiConfig<'a> {
     connect_mode: ConnectMode,
     power_save: WifiPowerSave,
     tx_power: TxPowerLevel,
+    ap_selection: ApSelection,
     modem: Modem<'static>,
     sys_loop: EspSystemEventLoop,
     nvs: Option<EspDefaultNvsPartition>,
@@ -148,11 +152,33 @@ impl<'a> WiFiConfigExt<'a> for WiFiConfig<'a> {
             connect_mode: self.connect_mode,
             power_save: self.power_save,
             tx_power: self.tx_power,
+            ap_selection: self.ap_selection,
             modem,
             sys_loop,
             nvs,
         }
     }
+}
+
+/// Maps the shared [`ApSelection`] to the station scan, so the driver default never decides.
+fn map_ap_selection(selection: ApSelection) -> ScanMethod {
+    match selection {
+        ApSelection::Strongest => ScanMethod::CompleteScan(ScanSortMethod::Signal),
+        ApSelection::FirstFound => ScanMethod::FastScan,
+    }
+}
+
+/// The AP the station is associated with, for the association line; `None` when not associated.
+fn joined_ap() -> Option<JoinedAp> {
+    // SAFETY: an all-zero `wifi_ap_record_t` is a valid value of this plain C struct.
+    let mut record: esp_idf_svc::sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `record` is a valid, writable `wifi_ap_record_t`; the call only fills it.
+    let rc = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut record) };
+    (rc == esp_idf_svc::sys::ESP_OK).then_some(JoinedAp {
+        bssid: record.bssid,
+        channel: record.primary,
+        rssi: record.rssi,
+    })
 }
 
 /// A no-op LED implementation used by [`WiFiManager::new_without_led`].
@@ -209,6 +235,7 @@ impl WiFiManager {
             connect_mode: config.connect_mode,
             power_save: config.power_save,
             tx_power: config.tx_power,
+            ap_selection: config.ap_selection,
         };
         Self::new_without_led(config.modem, config.sys_loop, config.nvs, wifi_config)
     }
@@ -269,6 +296,7 @@ impl WiFiManager {
         wifi.set_configuration(&Configuration::Client(ClientConfiguration {
             ssid,
             password,
+            scan_method: map_ap_selection(config.ap_selection),
             ..Default::default()
         }))?;
 
@@ -625,7 +653,14 @@ impl LinkWorker {
         let events = supervisor.events();
         let subscription = sys_loop
             .subscribe::<WifiEvent, _>(move |event: WifiEvent<'_>| match event {
-                WifiEvent::StaConnected(_) => events.send(LinkEvent::Connected),
+                WifiEvent::StaConnected(_) => {
+                    // The shared line names the AP, so a weak or far one shows in the log.
+                    match joined_ap() {
+                        Some(ap) => log::info!("WiFi associated — {}", ap),
+                        None => log::info!("WiFi associated"),
+                    }
+                    events.send(LinkEvent::Connected)
+                }
                 WifiEvent::StaStopped => events.send(LinkEvent::Stopped),
                 WifiEvent::StaDisconnected(info) => {
                     // The shared line names the reason and adds the credentials

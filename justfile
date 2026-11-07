@@ -26,12 +26,19 @@ idf_target := "riscv32imac-esp-espidf"
 
 # serial port for espflash; honoured verbatim if set, otherwise scripts/detect-port.sh
 # narrows espflash auto-detect to USB serial devices (usbmodem/usbserial on macOS,
-# ttyUSB/ttyACM on Linux) so paired Bluetooth ports do not get picked.
+# ttyUSB/ttyACM on Linux) so paired Bluetooth ports do not get picked; with several
+# boards attached, `just flash`/`run` pick the one whose chip matches the example name
+# and the monitor reuses the port flashed last (remembered in target/espflash-ports).
 export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
 
 ramdisk := "/Volumes/RustBuilds"
 hal_dir := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
 idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
+
+# Guided bench runner: a local rustyfarian-bench checkout if RUSTYFARIAN_BENCH points at one,
+# otherwise the pinned release from GitHub (the scenarios need >= v0.3.0 for `attended`).
+bench_dir := env("RUSTYFARIAN_BENCH", "")
+bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.3.0 rustyfarian-bench" }
 
 # ── env ───────────────────────────────────────────────────────────────────
 
@@ -521,25 +528,49 @@ ports:
         scripts/espflash.sh board-info
     fi
 
-# watch every topic under the bare-metal MQTT examples' prefix (MQTT_* from the dotenv file)
+# guided hardware check: `just bench c3 mqtt-lwt`, `just bench hal_esp32s3_mqtt_lwt`, `just bench c3` (see bench/README.md)
 [group('examples')]
-mqtt-watch:
-    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/#" -v
+bench target *args:
+    {{ bench }} --repo . run "{{ target }}" {{ args }}
 
-# publish one message to <prefix>/<topic> on the dotenv broker, e.g. `just mqtt-pub cmd hello`
+# list the bench scenarios
 [group('examples')]
-mqtt-pub topic message:
-    mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/{{ topic }}" -m "{{ message }}"
+bench-list:
+    {{ bench }} --repo . list
 
-# publish <count> numbered messages (msg-1 … msg-N) to <prefix>/<topic> back to back, a message-load test, e.g. `just mqtt-burst cmd 50`
+# probe the connected boards (chip and MAC per port)
 [group('examples')]
-mqtt-burst topic count:
-    seq 1 {{ count }} | sed 's/^/msg-/' | mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/{{ topic }}" -l
+bench-detect:
+    {{ bench }} detect
 
-# print the retained <prefix>/status value once (expects `online` while the device is up)
+# watch an MQTT example's topics with timestamps (MQTT_* from the dotenv file); target: hal (default), idf, all, a prefix such as a client id, or a filter with + or #; seconds > 0 stops after that long, e.g. `just mqtt-watch idf 30`
 [group('examples')]
-mqtt-status:
-    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "${MQTT_TOPIC_PREFIX:-rustyfarian/hal-mqtt}/status" -C 1 -W 5
+mqtt-watch target="" seconds="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    prefix="$(scripts/mqtt-topic.sh "{{ target }}")"
+    case "$prefix" in *[+#]*) filter="$prefix" ;; *) filter="$prefix/#" ;; esac
+    stop=()
+    [ "{{ seconds }}" != "0" ] && stop=(-W "{{ seconds }}")
+    rc=0
+    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$filter" -F '%I %t %p' ${stop[@]+"${stop[@]}"} || rc=$?
+    # -W ends with code 27 when the time is up; that is the expected end of a timed watch.
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 27 ] || exit "$rc"
+
+# publish one message to <prefix>/<topic> on the dotenv broker; target as for mqtt-watch, e.g. `just mqtt-pub cmd hello` or `just mqtt-pub cmd ping idf`
+[group('examples')]
+mqtt-pub topic message target="":
+    mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$(scripts/mqtt-topic.sh "{{ target }}")/{{ topic }}" -m "{{ message }}"
+
+# publish <count> numbered messages (msg-1 … msg-N) to <prefix>/<topic> back to back, a message-load test; target as for mqtt-watch, e.g. `just mqtt-burst cmd 50`
+[group('examples')]
+mqtt-burst topic count target="":
+    seq 1 {{ count }} | sed 's/^/msg-/' | mosquitto_pub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$(scripts/mqtt-topic.sh "{{ target }}")/{{ topic }}" -l
+
+# print the retained <prefix>/status value once (expects `online` while the device is up); target as for mqtt-watch, e.g. `just mqtt-status idf`
+[group('examples')]
+mqtt-status target="":
+    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$(scripts/mqtt-topic.sh "{{ target }}")/status" -C 1 -W 5
 
 # submit the provisioning form with x_* extras to a running SoftAP portal (WIFI_*, MQTT_*, OTA_URL, DEVICE_NAME from the dotenv file); positional args, e.g. `just portal-save 192.168.4.1 8 13 64`; extras 9, key_len 14 or value_len 65 exceed the caps and return 400; key_len must be at least 5
 [group('examples')]

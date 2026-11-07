@@ -1,0 +1,29 @@
+# BOOT re-entry hook outcomes, ESP-IDF tier (runbook C3-I4).
+# Needs a provisioned board: run `just run idf_c3_provision_mqtt` once and submit the portal form.
+# The hook watches BOOT (GPIO9, a strapping pin) for 2 s after its `press BOOT now` line: holding
+# BOOT through the reset enters download mode instead, and a press after the window is ignored.
+# The factory-reset step runs last because it erases the record; provision again afterwards.
+examples = ["idf_c3_provision_mqtt"]
+
+[[step]]
+say = "Wait for the stored record to load (untouched boot)"
+expect = ['Loaded provisioned config', 'Device identity']
+reject = 'portal requested|factory reset requested|Not provisioned'
+timeout = 20
+arm = false       # printed during the reset, before the step
+
+[[step]]
+say = "Press and release EN/RST; when `press BOOT now` appears, press BOOT and let go within 2 s"
+arm = false
+attended = true   # a person presses RST and BOOT
+expect = ['BOOT released early', 'Re-entry: portal requested']
+reject = 'factory reset requested|namespace erased|PANIC|panicked|Guru Meditation'
+timeout = 60
+
+[[step]]
+say = "Press and release EN/RST; when `press BOOT now` appears, press BOOT and hold it for 4 s"
+arm = false
+attended = true   # a person presses RST and BOOT
+expect = ['BOOT held for \d+ ms', 'Re-entry factory reset: NVS provisioning namespace erased']
+reject = 'BOOT released early|PANIC|panicked|Guru Meditation'
+timeout = 60

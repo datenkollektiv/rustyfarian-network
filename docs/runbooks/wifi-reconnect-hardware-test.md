@@ -11,6 +11,7 @@ Both S3 LWT examples compile the same application body (`examples-shared/lwt_app
 
 - Everything under "Prerequisites" and "Environment variables" in `docs/runbooks/esp-hal-mqtt-hardware-test.md`; the IDF twin reads the same keys.
 - Default client id and prefix differ per tier (`hal-s3-mqtt` / `rustyfarian/hal-mqtt` and `idf-s3-mqtt` / `rustyfarian/idf-mqtt`), so both can share one broker.
+- `just mqtt-watch` watches the hal prefix; use `just mqtt-watch idf` for the IDF twin.
 - A router that can pause one device (per-device Wi-Fi block, parental control or MAC filter) for about 3 minutes.
 
 ## Build, flash, monitor

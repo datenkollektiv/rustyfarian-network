@@ -46,9 +46,14 @@ use crate::provisioning::{ProvisioningEvent, SharedState};
 /// HTTP port the portal listens on.
 const HTTP_PORT: u16 = 80;
 
-/// httpd worker stack size (bytes). The form handler parses a small body and
-/// touches NVS; 10 KB is comfortable headroom over the ESP-IDF default.
-const HTTPD_STACK_SIZE: usize = 10240;
+/// httpd worker stack size (bytes); the stack exists only while the portal runs.
+///
+/// `POST /save` needs about 12 KB: the handler frame (1.7 KB) plus the shared
+/// `juggler` `parse_form` (4.5 KB of fixed-size field buffers) on top of httpd's
+/// own frames. The earlier 10 KB overflowed on the first submit on a C3
+/// (stack protection fault in `parse_form`, bench 2026-11-08), so the device
+/// rebooted before committing and reopened the portal every boot.
+const HTTPD_STACK_SIZE: usize = 16384;
 
 /// Explicit URI-handler budget. Counted against the registrations below
 /// (4 functional + 6 probe routes = 10); 12 leaves headroom for one or two

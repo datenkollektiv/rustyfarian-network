@@ -178,6 +178,52 @@ pub enum WifiPowerSave {
     MaxModem,
 }
 
+// ─── ApSelection ────────────────────────────────────────────────────────────
+
+/// How the station picks an access point when several broadcast the SSID.
+///
+/// Both tiers map this value explicitly, so neither falls back to its driver
+/// library's default: esp-radio defaults to a fast scan, `embedded-svc`'s
+/// `ClientConfiguration` (re-exported by `esp-idf-svc`) to a complete scan, and on a mesh network the fast scan joined a -89 dBm node
+/// next to a -20 dBm one (bench 2026-11-07).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ApSelection {
+    /// Scan all channels and join the strongest AP of the SSID.
+    #[default]
+    Strongest,
+    /// Join the first AP of the SSID found, sweeping channels upwards.
+    ///
+    /// Connects faster on a single-AP network; on a mesh it may join a far node.
+    FirstFound,
+}
+
+// ─── JoinedAp ───────────────────────────────────────────────────────────────
+
+/// The AP a station associated with, as both tiers log it on every link up.
+///
+/// `Display` gives the shared text, e.g. `bssid 72:d7:9a:ca:b9:44, ch 11, rssi -21 dBm`,
+/// so a weak or far AP shows in the log rather than only in the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinedAp {
+    /// BSSID (the AP radio's MAC address).
+    pub bssid: [u8; 6],
+    /// Primary channel.
+    pub channel: u8,
+    /// Signal strength in dBm at association.
+    pub rssi: i8,
+}
+
+impl core::fmt::Display for JoinedAp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [a, b, c, d, e, g] = self.bssid;
+        write!(
+            f,
+            "bssid {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}, ch {}, rssi {} dBm",
+            self.channel, self.rssi
+        )
+    }
+}
+
 // ─── TxPowerLevel ──────────────────────────────────────────────────────────
 
 /// Transmit power level for the Wi-Fi radio.
@@ -245,7 +291,8 @@ impl TxPowerLevel {
 ///     .with_timeout(60)                        // optional: override the 30 s default
 ///     .connect_nonblocking()                   // optional: return immediately from new()
 ///     .with_power_save(WifiPowerSave::MinModem) // optional: modem sleep for battery savings
-///     .with_tx_power(TxPowerLevel::Low);       // optional: reduce transmit power
+///     .with_tx_power(TxPowerLevel::Low)        // optional: reduce transmit power
+///     .with_ap_selection(ApSelection::FirstFound); // optional: faster join, first AP found
 /// ```
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
@@ -257,6 +304,8 @@ pub struct WiFiConfig<'a> {
     pub connect_mode: ConnectMode,
     pub power_save: WifiPowerSave,
     pub tx_power: TxPowerLevel,
+    /// How the station picks an AP when several broadcast the SSID.
+    pub ap_selection: ApSelection,
 }
 
 impl<'a> WiFiConfig<'a> {
@@ -270,6 +319,7 @@ impl<'a> WiFiConfig<'a> {
             connect_mode: ConnectMode::default(),
             power_save: WifiPowerSave::default(),
             tx_power: TxPowerLevel::default(),
+            ap_selection: ApSelection::default(),
         }
     }
 
@@ -317,6 +367,14 @@ impl<'a> WiFiConfig<'a> {
     /// The exact dBm mapping depends on the chip — see [`TxPowerLevel`].
     pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
         self.tx_power = level;
+        self
+    }
+
+    /// Sets how the station picks an AP when several broadcast the SSID.
+    ///
+    /// Defaults to [`ApSelection::Strongest`] on both tiers.
+    pub fn with_ap_selection(mut self, selection: ApSelection) -> Self {
+        self.ap_selection = selection;
         self
     }
 }
@@ -824,6 +882,30 @@ mod tests {
     fn wifi_config_with_tx_power() {
         let config = test_config().with_tx_power(TxPowerLevel::Lowest);
         assert_eq!(config.tx_power, TxPowerLevel::Lowest);
+    }
+
+    #[test]
+    fn joined_ap_display_is_the_shared_log_text() {
+        let ap = JoinedAp {
+            bssid: [0x72, 0xd7, 0x9a, 0x0c, 0xb9, 0x04],
+            channel: 11,
+            rssi: -21,
+        };
+        assert_eq!(
+            alloc::format!("{ap}"),
+            "bssid 72:d7:9a:0c:b9:04, ch 11, rssi -21 dBm"
+        );
+    }
+
+    #[test]
+    fn wifi_config_default_ap_selection_is_strongest() {
+        assert_eq!(test_config().ap_selection, ApSelection::Strongest);
+    }
+
+    #[test]
+    fn wifi_config_with_ap_selection() {
+        let config = test_config().with_ap_selection(ApSelection::FirstFound);
+        assert_eq!(config.ap_selection, ApSelection::FirstFound);
     }
 
     #[test]

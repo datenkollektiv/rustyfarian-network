@@ -246,6 +246,12 @@ When `embassy_executor` is unresolved, the `#[embassy_executor::task]` attribute
 Hit 2026-06-18 when resuming `hal_c3_connect_async` validation: `rustyfarian-esp-hal-network` declared `embassy-net` + `static_cell` but never `embassy-executor` / `embassy-time`, so all three async examples failed to compile.
 Fix: the library doesn't use these crates — only the examples do — so add `embassy-executor` + `embassy-time` as `[dev-dependencies]` (workspace-pinned), not as `embassy`-feature optional deps. Read the *first* error (the unresolved import), not the cascade.
 
+**esp-radio's `StationConfig::default()` uses `ScanMethod::Fast`, so the esp-hal station joins the first AP of the SSID by channel, not the strongest; the ESP-IDF tier's `embedded-svc` default is `CompleteScan(Signal)`.**
+esp-radio hard-codes `WIFI_CONNECT_AP_BY_SIGNAL`, but ESP-IDF applies that sort only to an all-channel scan, so the setting looks right and does nothing.
+On the `iot` mesh SSID (2026-11-07) the CrowPanel S3 joined a -89 dBm node next to a -20 dBm AP: it got an IP, or sometimes associated without a DHCP lease, every TCP connect to the broker timed out, and it did not answer ping, even after a fresh boot, which looked like the router blocking it.
+Fix: both tiers now map the shared `juggler::wifi::ApSelection` (default `Strongest`) to their scan method explicitly, so neither driver default decides (esp-radio's `with_scan_method` needs its `unstable` feature, already on).
+Since 2026-11-08 both tiers log the joined AP on association (`[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, IDF `WiFi associated — …`), and the bench warns below -75 dBm; before that only the router's client view showed it.
+
 ---
 
 ## Flashing & Serial (espflash 4.x)
@@ -676,6 +682,11 @@ Fix: round the read up to `F::READ_SIZE` and decode the `record_len` prefix; `Mo
 **One board broadcasts a different `{prefix}-{MAC}` provisioning SSID under esp-hal and ESP-IDF, because the two stacks derive the AP MAC differently.**
 ESP-IDF `esp_read_mac(ESP_MAC_WIFI_SOFTAP)` adds one to the last base-MAC byte (`a0:..:c4:f5`), while `esp_hal::efuse::interface_mac_address(AccessPoint)` sets the locally-administered bit in the first byte (`a2:..:c4:f4`), and esp-radio uses the same esp-hal function for the AP it brings up.
 Each suffix matches its own stack's real BSSID, so this is parity of format, not of bytes; do not "fix" the hal side to mimic ESP-IDF or the suffix stops matching the broadcast MAC.
+
+**An IDF device that "reopens the portal on every boot" can be a portal crash, not a lost record: `POST /save` overflowed the 10 KB httpd stack in the shared `juggler` `parse_form`.**
+`parse_form` keeps fixed-size field buffers on the stack (a 4.5 KB frame), and with the 1.7 KB handler frame `/save` needs about 12 KB, so the task hit a stack protection fault before the commit and the next boot found no record.
+Fix (2026-11-08): `HTTPD_STACK_SIZE` 16384 in `crates/rustyfarian-esp-idf-network/src/provisioning/portal.rs`; measure frames from the ELF prologues (`llvm-objdump -d`, `addi sp, sp, -N`, a large frame spans several) instead of guessing.
+The panic's "Stack memory" dump printed the submitted form, Wi-Fi password included, so treat a pasted httpd panic as a credential leak.
 
 ---
 

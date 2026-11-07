@@ -1,0 +1,41 @@
+# Wi-Fi connect and reconnect after the board is blocked on the router, esp-hal tier (C3 matrix smoke).
+# Prints `Wi-Fi connected — IP: …` once and `Wi-Fi link ups: N` every 10 s; while blocked the library repeats `[wifi] connect failed` / `reconnecting in`.
+examples = ["hal_c3_connect_async"]
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+# The association line names the AP: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm` (hal)
+# or `WiFi associated — …` (IDF). It passes unless that RSSI is below -75 dBm, a far mesh node.
+expect = '(link up #1|WiFi associated)(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150   # a device still blocked from a previous run backs off up to 30 s
+optional = true
+arm = false       # printed during the reset, before the step
+
+[[step]]
+say = "Wait for the DHCP lease (unblock the device on the router first if a previous run left it blocked)"
+expect = 'Wi-Fi connected \W+ IP: '
+timeout = 150   # a device still blocked from a previous run backs off up to 30 s
+arm = false       # printed during the reset, before the step
+
+[[step]]
+say = "Leave it running for 20 s"
+arm = false
+duration = 20
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('   # ESP-ROM / rst: is a reboot
+
+[[step]]
+say = "Once the device is online, please block it on the router, now (MAC as detected)"
+arm = false
+attended = true   # a person acts on the router
+expect = '\[wifi\] (disconnected|connect failed|reconnecting in)'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)'   # no ESP-ROM/rst: --attended skips the boot step, so this step reads the reset banner
+timeout = 150
+
+[[step]]
+say = "Please unblock the device, now"
+arm = false
+attended = true
+expect = 'Wi-Fi link ups: [2-9]'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 240

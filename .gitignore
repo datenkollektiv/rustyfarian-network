@@ -19,6 +19,10 @@ CLAUDE.md
 # Local cargo config (use .cargo/config.toml.dist as template)
 .cargo/config.toml
 
+# bench run artefacts (rustyfarian-bench): per-run serial logs and results (results record board MACs)
+bench/*/logs/
+bench/*/results.jsonl
+
 # Tool output captures
 .output.txt
 
