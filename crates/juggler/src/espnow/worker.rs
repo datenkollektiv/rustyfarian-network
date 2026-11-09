@@ -86,6 +86,12 @@
 //!   radio action happens at all.
 //! - After the scan finished: the unread result is discarded.
 //!
+//! A scan started right after the cancel does not fail: [`ScanGate::admit`] answers
+//! [`GateRefusal::Unwinding`] while the cancelled scan holds the slot, and
+//! [`Worker::scan_for_peer`] waits on the [`WaitList`] until the worker has ended the cancelled
+//! scan (probe waited out, restore done, [`ScanGate::finish`] or [`ScanGate::release`], which
+//! wakes the list) and then admits again.
+//!
 //! Shutdown ends the wait for a callback that never fires, and the worker feeds
 //! [`ScanInput::Shutdown`]: the machine finishes at once without a teardown, so no channel,
 //! TX-power or peer call follows.
@@ -371,7 +377,9 @@ fn map_completion<E>(completion: Completion<TxOutcome<E>>) -> Result<TxOutcome<E
 fn map_gate_refusal<E>(refusal: GateRefusal) -> WorkerError<E> {
     match refusal {
         GateRefusal::Shutdown => WorkerError::Shutdown,
-        GateRefusal::Busy => WorkerError::Busy,
+        // `Unwinding` is waited out by `admit_scan` and never reaches a caller; `Busy` is the
+        // conservative answer if it ever does.
+        GateRefusal::Busy | GateRefusal::Unwinding => WorkerError::Busy,
         GateRefusal::NotOwned => WorkerError::RadioNotOwned,
     }
 }
@@ -601,12 +609,13 @@ impl<E> Shared<E> {
         map_completion(completion)
     }
 
-    fn admit_scan(
+    /// One admission attempt: `None` while a cancelled scan still unwinds (wait and retry).
+    ///
+    /// `job` stays in place on `None`; it is consumed by an admission or by any other refusal.
+    fn try_admit_scan(
         &self,
-        mac: MacAddress,
-        config: &ScanConfig<'_>,
-    ) -> Result<ScanTicket<'_, E>, WorkerError<E>> {
-        let job = ScanJob::new(mac, config);
+        job: &mut Option<ScanJob>,
+    ) -> Option<Result<ScanTicket<'_, E>, WorkerError<E>>> {
         let mut preempted = false;
         let admitted = {
             let mut guard = self.lock();
@@ -616,26 +625,44 @@ impl<E> Shared<E> {
             state.scan.admit(
                 &mut state.core,
                 self.config.owns_radio,
-                job,
+                job.take()?,
                 &mut |_waker| preempted = true,
             )
         };
         let epoch = match admitted {
             Ok(epoch) => epoch,
-            Err((refusal, job)) => {
-                drop(job);
-                return Err(map_gate_refusal(refusal));
+            Err((GateRefusal::Unwinding, refused)) => {
+                *job = Some(refused);
+                return None;
+            }
+            Err((refusal, refused)) => {
+                drop(refused);
+                return Some(Err(map_gate_refusal(refusal)));
             }
         };
         self.wake.notify_all();
         if preempted {
             self.waiters.wake_all();
         }
-        Ok(ScanTicket {
+        Some(Ok(ScanTicket {
             shared: self,
             epoch,
             consumed: AtomicBool::new(false),
-        })
+        }))
+    }
+
+    /// Admits a scan; a scan cancelled just before still unwinds (its probe on the air, then
+    /// the restore), so this waits on the wait list until the worker ends it
+    /// ([`Shared::finish_scan_job`] wakes the list) and then admits again.
+    /// Shutdown wakes the list too and the gate answers it as [`WorkerError::Shutdown`].
+    /// The lock is never held across the await.
+    async fn admit_scan(
+        &self,
+        mac: MacAddress,
+        config: &ScanConfig<'_>,
+    ) -> Result<ScanTicket<'_, E>, WorkerError<E>> {
+        let mut job = Some(ScanJob::new(mac, config));
+        self.waiters.wait(|| self.try_admit_scan(&mut job)).await
     }
 
     // -- worker side -------------------------------------------------------------------------
@@ -1236,14 +1263,16 @@ impl<R: EspNowRadio> EspNowWorker<R> {
     ///
     /// # Errors
     ///
-    /// [`WorkerError::Busy`] while a scan runs, [`WorkerError::RadioNotOwned`] for a
-    /// caller-managed radio, [`WorkerError::Shutdown`], or [`WorkerError::Scan`].
+    /// [`WorkerError::Busy`] while another caller's scan runs or its result is untaken (a scan
+    /// started right after a cancelled one waits for the cancelled scan's restore instead),
+    /// [`WorkerError::RadioNotOwned`] for a caller-managed radio, [`WorkerError::Shutdown`], or
+    /// [`WorkerError::Scan`].
     pub async fn scan_for_peer(
         &self,
         mac: &MacAddress,
         config: &ScanConfig<'_>,
     ) -> Result<ScanResult, WorkerError<R::Error>> {
-        let ticket = self.shared.admit_scan(*mac, config)?;
+        let ticket = self.shared.admit_scan(*mac, config).await?;
         self.shared.waiters.wait(|| ticket.poll()).await
     }
 
@@ -2136,6 +2165,45 @@ mod tests {
             fixture.frame_after_scan(&OTHER),
             Ok(TxOutcome::Acked)
         ));
+    }
+
+    #[test]
+    fn a_scan_started_right_after_a_cancel_waits_for_the_restore_and_finds_the_peer() {
+        let fixture = Fixture::new(SOFTAP);
+        let config = scan_config(&[6]);
+        let mut first = fixture.scan(&config);
+        first.poll_once();
+        fixture.wait_for_sends(1);
+        // The cancelled scan's probe is still on the air: its restore cannot have run.
+        drop(first);
+        let mut second = fixture.scan(&config);
+        assert!(
+            second.stays_pending(),
+            "the second scan waits for the unwinding one instead of failing with Busy"
+        );
+        assert_eq!(fixture.sends(), 1, "no probe of the second scan yet");
+
+        fixture.edit(|state| state.auto = Auto::PeerOn(6));
+        fixture.callback(&MAC, false);
+        let found = second
+            .result()
+            .expect("the second scan is admitted after the restore");
+        assert_eq!(found.channel, 6);
+        assert_eq!(fixture.worker.pinned_channel(), Some(6));
+    }
+
+    #[test]
+    fn shutdown_ends_the_wait_for_an_unwinding_scan() {
+        let fixture = Fixture::new(SOFTAP);
+        let config = scan_config(&[6]);
+        let mut first = fixture.scan(&config);
+        first.poll_once();
+        fixture.wait_for_sends(1);
+        drop(first);
+        let mut second = fixture.scan(&config);
+        assert!(second.stays_pending());
+        fixture.worker.shutdown();
+        assert!(matches!(second.result(), Err(WorkerError::Shutdown)));
     }
 
     #[test]

@@ -1,7 +1,6 @@
 # esp-hal MQTT scenarios T1 to T5 on the C6 (runbook C6-H2; T6 is the `soak` check).
 # Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md; serial lines and broker messages are judged here.
-# Uses `setup`, `run`, `probe` and `serial_reject`, which no rustyfarian-bench release has yet:
-# run with RUSTYFARIAN_BENCH pointing at a rustyfarian-bench checkout that has them.
+# Uses `setup`, `run`, `probe` and `serial_reject` (rustyfarian-bench v0.5.0 or later).
 # Probe output comes from `just mqtt-watch hal` (`retain=1` is the replay at subscribe, `retain=0` a live message)
 # and `just mqtt-status` (the retained status).
 # A broker check that judges an attended action (unplug, router pause) is `attended` too,
@@ -10,7 +9,7 @@
 # Still a person: the unplug and the router pause.
 # The broker is the local one from `just mosquitto` (T4 restarts it), so MQTT_HOST must be this machine's
 # LAN IPv4 that the board can reach, at build time and for the recipes; a shell variable wins over `.env`:
-#   MQTT_HOST=<this machine> MQTT_PORT=1883 RUSTYFARIAN_BENCH=<bench checkout> just bench c6 mqtt-scenarios
+#   MQTT_HOST=<this machine> MQTT_PORT=1883 just bench c6 mqtt-scenarios
 examples = ["hal_c6_mqtt_lwt"]
 # `just mqtt-pub` exits non-zero when MQTT_HOST is unreachable; `just mqtt-status` would also fail on a
 # fresh broker that holds no retained status yet.
@@ -110,7 +109,7 @@ timeout = 10
 # so switching one AP off is no outage; the per-device pause covers link loss, will, back-off and recovery.
 
 [[step]]
-say = "T5b: Pause the board on the router (MAC as detected) and keep it paused"
+say = "T5b: Pause the board on the router (MAC {mac}) and keep it paused"
 attended = true   # a person acts on the router
 arm = false       # watch from the end of the previous step: the action may come at any time
 # The network watch, not the socket timeout, must end the session: cause `network lost`.

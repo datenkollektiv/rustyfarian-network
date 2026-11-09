@@ -1,0 +1,20 @@
+# ESP-NOW shutdown mid-scan with queued sends on ESP-IDF
+# Runbook gate C3-I9; ESP-IDF scout `idf_c3_espnow_scout` with `ESPNOW_SCENARIO=shutdown`, against a running
+# ESP-NOW coordinator (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
+# Both variables are read at build time; set them in the shell for the run, or the scout runs its default loop:
+#   ESPNOW_SCENARIO=shutdown COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-shutdown --port <c3 port>
+# The first step reads the boot, so only the later steps reject a reboot. No person needed.
+examples = ["idf_c3_espnow_scout"]
+
+[[step]]
+say = "Shutdown 15 ms into a scan ends queued and in-flight requests at once"
+expect = ['ESPNOW-GATE C3-I9 PASS: shutdown mid-scan: ']
+reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 120
+arm = false
+
+[[step]]
+say = "The process stays up after the shutdown: no reboot, no second report"
+duration = 10
+reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \(|ESPNOW-GATE C3-I9'
+arm = false

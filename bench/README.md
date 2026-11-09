@@ -1,10 +1,9 @@
 # Bench
 
 Guided, rerunnable hardware checks for both tiers ([ADR 024](../docs/adr/024-adopt-rustyfarian-bench.md)).
-The runner is [`rustyfarian-bench`](https://github.com/datenkollektiv/rustyfarian-bench) (Python + uv); `just bench` runs the release pinned in the `justfile` (v0.3.0) through `uvx`, or a local checkout when `RUSTYFARIAN_BENCH` points at one.
-Bumping the pin is how this repo opts into a new runner release; the scenarios need v0.3.0 or later for `attended`.
-`c6/mqtt-scenarios` uses `setup`, `teardown`, `run`, `probe` and `serial_reject`, which no runner release has yet: until the pin moves, set `RUSTYFARIAN_BENCH` to a checkout that has them, because an older runner rejects the keys and loads no check at all.
-It drives the local broker from `just mosquitto`, so `MQTT_HOST` must be this machine's LAN IPv4 and the board's network must reach it on TCP 1883; set it in the shell for the run, which wins over the dotenv file.
+The runner is [`rustyfarian-bench`](https://github.com/datenkollektiv/rustyfarian-bench) (Python + uv); `just bench` runs the release pinned in the `justfile` (v0.5.0) through `uvx`, or a local checkout when `RUSTYFARIAN_BENCH` points at one.
+Bumping the pin is how this repo opts into a new runner release; the scenarios need v0.5.0 or later for `probe`, `run`, `setup`/`teardown`, `serial_reject` and the `{mac}` placeholder in prompts, and an older runner rejects those keys and loads no check at all.
+`c6/mqtt-scenarios` drives the local broker from `just mosquitto`, so `MQTT_HOST` must be this machine's LAN IPv4 and the board's network must reach it on TCP 1883; set it in the shell for the run, which wins over the dotenv file.
 A probe reads `just mqtt-status` or `just mqtt-watch hal`, whose lines carry `retain=1` for the replay at subscribe and `retain=0` for a live message.
 The checks cover the single-board cells of the [release 0.7.0 hardware runbook](../docs/runbooks/release-0.7.0-hardware-test.md); the runbook stays the authority for every gate.
 

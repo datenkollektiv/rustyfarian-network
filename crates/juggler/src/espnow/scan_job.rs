@@ -103,6 +103,13 @@ impl<J, R> ScanJobSlot<J, R> {
         epoch.0 == self.epoch && matches!(self.state, State::Running { .. })
     }
 
+    /// True while the running job was cancelled by its caller and the worker has not ended it
+    /// yet: the slot is held only by an unwinding scan, whose result will be discarded.
+    #[must_use]
+    pub fn is_unwinding(&self) -> bool {
+        matches!(self.state, State::Running { cancel: true })
+    }
+
     /// True while an admitted job waits for the worker.
     #[must_use]
     pub fn has_pending(&self) -> bool {
@@ -203,9 +210,14 @@ pub enum CancelOutcome<J, R, T> {
 pub enum GateRefusal {
     /// The [`TxCore`] was shut down.
     Shutdown,
-    /// A job is pending or running, or the result of the previous one has not been taken, or the
+    /// A job is pending or running (not cancelled), or the result of the previous one has not been taken, or the
     /// [`TxCore`] already holds a scan.
     Busy,
+    /// The slot is held by a cancelled scan that is still unwinding (its probe on the air, or its
+    /// restore not yet run).
+    /// It ends on its own, so a caller waits for the release and admits again; it is an internal
+    /// wait state and no public error.
+    Unwinding,
     /// The driver does not own the radio.
     NotOwned,
 }
@@ -258,7 +270,10 @@ impl<J, R, T> ScanGate<J, R, T> {
 
     /// Admits `job`: claims the radio on `core` and stores the job, atomically.
     ///
-    /// Checked in this order: shutdown, a job or an untaken result in the slot, then
+    /// Checked in this order: shutdown, a job or an untaken result in the slot
+    /// ([`GateRefusal::Unwinding`] for a cancelled job that is still unwinding or whose teardown
+    /// is deferred, [`GateRefusal::Busy`] for a job nobody cancelled or an untaken result; a
+    /// cancelled job whose result was discarded leaves the slot empty and does not refuse), then
     /// [`TxCore::begin_scan`] (not owned, already scanning).
     /// Nothing is changed on a refusal, in particular no queued application request is preempted.
     /// On success those requests were completed as `Preempted` and their wakers went to `wake`.
@@ -277,6 +292,12 @@ impl<J, R, T> ScanGate<J, R, T> {
             return Err((GateRefusal::Shutdown, job));
         }
         if !self.slot.is_empty() {
+            // A cancelled job still unwinding (its cancel is requested, or its teardown waits in
+            // the gate for the probe) frees the slot on its own: the caller may wait.
+            // A running job nobody cancelled and an untaken result stay `Busy`.
+            if self.slot.is_unwinding() || self.deferred.is_some() {
+                return Err((GateRefusal::Unwinding, job));
+            }
             return Err((GateRefusal::Busy, job));
         }
         if let Err(refusal) = core.begin_scan(owns_radio, wake) {
@@ -836,11 +857,68 @@ mod tests {
             gate.cancel_running(&mut core, epoch, "restore");
             assert_eq!(
                 gate.admit(&mut core, true, (), &mut |_| {}),
-                Err((GateRefusal::Busy, ()))
+                Err((GateRefusal::Unwinding, ()))
             );
             core.complete(probe, 1);
             let (due, _) = gate.on_probe_complete(&core).unwrap();
             gate.release(&mut core, due);
+            assert!(gate.admit(&mut core, true, (), &mut |_| {}).is_ok());
+        }
+
+        #[test]
+        fn admit_tells_an_unwinding_scan_from_a_busy_one() {
+            // Running, not cancelled: Busy.
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Busy, ()))
+            );
+            // Cancel requested with clear air (teardown runs now): Unwinding until release.
+            assert_eq!(
+                gate.cancel_running(&mut core, epoch, "restore"),
+                CancelOutcome::RunNow("restore")
+            );
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Unwinding, ()))
+            );
+            gate.release(&mut core, epoch);
+            assert!(gate.admit(&mut core, true, (), &mut |_| {}).is_ok());
+        }
+
+        #[test]
+        fn a_deferred_teardown_is_unwinding_and_an_untaken_result_is_busy() {
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            let probe = probe_on_the_air(&mut core);
+            gate.cancel_running(&mut core, epoch, "restore");
+            assert!(gate.has_deferred());
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Unwinding, ()))
+            );
+            core.complete(probe, 1);
+            let (due, _) = gate.on_probe_complete(&core).unwrap();
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Unwinding, ()))
+            );
+            gate.release(&mut core, due);
+            assert!(gate.admit(&mut core, true, (), &mut |_| {}).is_ok());
+
+            // An untaken finished result stays Busy; cancelling it frees the slot.
+            let mut gate = Own::new();
+            let mut core = Core::new();
+            let epoch = running(&mut gate, &mut core);
+            assert_eq!(gate.finish(&mut core, epoch, ()), None);
+            assert_eq!(
+                gate.admit(&mut core, true, (), &mut |_| {}),
+                Err((GateRefusal::Busy, ()))
+            );
+            assert_eq!(gate.cancel(&mut core, epoch), Cancelled::Result(()));
             assert!(gate.admit(&mut core, true, (), &mut |_| {}).is_ok());
         }
 

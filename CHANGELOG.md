@@ -385,6 +385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ESP-NOW `scan_for_peer` started right after a cancelled (dropped) scan now waits for the cancelled scan's restore and then runs, on both tiers, instead of failing with `Busy` ("ESP-NOW radio is busy"); `Busy` stays for another caller's running scan and for an untaken result.
+  `juggler::espnow::ScanGate::admit` reports the waiting case as the new `GateRefusal::Unwinding`; see `docs/bugs/016-espnow-rescan-busy-after-cancel-2026-11-10.md`.
 - ESP-IDF provisioning portal: the httpd stack grows from 10 KB to 16 KB, because `POST /save` overflowed it in the shared `parse_form` (4.5 KB frame) on the first submit, so the device rebooted before committing and reopened the portal on every boot.
 - esp-hal Wi-Fi station now joins the strongest AP of the SSID, as the ESP-IDF tier does: both tiers take the scan from the shared `ApSelection` instead of their driver's default.
   esp-radio's default fast scan joined the first AP found by channel; on a mesh SSID the CrowPanel S3 joined a -89 dBm node next to a -20 dBm one, got an IP, and every TCP connect to the broker timed out.

@@ -340,7 +340,8 @@ pub(crate) fn refusal_error(refusal: Refusal, len: usize) -> EspHalEspNowError {
 /// The error for a scan that [`ScanGate::admit`](juggler::espnow::ScanGate::admit) refused.
 pub(crate) fn gate_refusal_error(refusal: GateRefusal) -> EspHalEspNowError {
     match refusal {
-        GateRefusal::Busy => EspHalEspNowError::Busy,
+        // `Unwinding` is waited out by `scan_for_peer`; `Busy` is the conservative answer.
+        GateRefusal::Busy | GateRefusal::Unwinding => EspHalEspNowError::Busy,
         GateRefusal::NotOwned => EspHalEspNowError::ControllerNotOwned,
         GateRefusal::Shutdown => EspHalEspNowError::Shutdown,
     }

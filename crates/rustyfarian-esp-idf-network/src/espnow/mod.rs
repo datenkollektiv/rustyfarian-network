@@ -545,7 +545,9 @@ impl EspIdfEspNow {
     ///
     /// * [`EspIdfEspNowError::RadioNotOwned`] for a driver created via [`init()`](Self::init) /
     ///   [`init_with_capacity()`](Self::init_with_capacity).
-    /// * [`EspIdfEspNowError::Busy`] while another scan runs.
+    /// * [`EspIdfEspNowError::Busy`] while another caller's scan runs or its result is untaken.
+    ///   A scan started right after a cancelled one does not fail: it waits for the cancelled
+    ///   scan's restore and then runs.
     /// * [`EspIdfEspNowError::Scan`] when the peer does not respond on any scanned channel, or
     ///   another scan failure.
     /// * [`EspIdfEspNowError::Driver`] with the ESP-IDF error behind a registration failure.

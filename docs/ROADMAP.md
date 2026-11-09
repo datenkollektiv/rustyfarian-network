@@ -46,7 +46,8 @@ timeline
               : Tier capability closure — close the remaining API-capability gaps after ADR 022 Step 9, IDF with_startup_message, async wait_suspended on NetworkLink, hal runtime subscribe, hal DNS, plus upstream asks for esp-radio WifiController stop and start, and for esp-idf-svc inbound retain and QoS (feature-doc)
               : Shared disconnect-reason vocabulary — one juggler wifi DisconnectReason enum with name and code that both tiers and consumer code match on, esp-hal maps esp-radio reasons through a local table, follow-up from the bug 011 review (feature-doc)
 
-    Near term : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
+    Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 gates HV-I1 (ESP-IDF OTAA join and uplink on TTN EU868) and HV-H1 (esp-hal SX1262 bring-up), plus bug 007 (LoRa forces a critical-section provider) with its provider variant
+              : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
               : juggler scope ADR — document the cross-cutting catch-all rule for the consolidated pure crate
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors

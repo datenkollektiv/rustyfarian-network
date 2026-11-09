@@ -1,0 +1,21 @@
+# ESP-NOW send-queue saturation and deadlines on ESP-IDF
+# Runbook gate C3-I8; ESP-IDF scout `idf_c3_espnow_scout` with `ESPNOW_SCENARIO=flood`, against a running
+# ESP-NOW coordinator (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
+# Both variables are read at build time; set them in the shell for the run, or the scout runs its default loop:
+#   ESPNOW_SCENARIO=flood COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-flood --port <c3 port>
+# The first step reads the boot, so only the later steps reject a reboot. No person needed.
+examples = ["idf_c3_espnow_scout"]
+
+[[step]]
+say = "The first flood of 8 ends without a hang, followed by a good send"
+expect = ['ESPNOW-GATE C3-I8 PASS: flood of 8: .*after-flood send (Ok|NoAck)']
+reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 120
+arm = false
+
+[[step]]
+say = "Two more floods pass, with no reboot in between"
+expect = ['ESPNOW-GATE C3-I8 PASS: flood of 8: .*after-flood send (Ok|NoAck)', 'ESPNOW-GATE C3-I8 PASS: flood of 8: .*after-flood send (Ok|NoAck)']
+reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+arm = false

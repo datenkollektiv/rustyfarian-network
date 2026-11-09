@@ -4,10 +4,10 @@
 # the C6, because `erase-flash` takes the first matching port:
 #   ESPFLASH_PORT=<c6 port> just --yes erase-flash
 # Build with a fixed SoftAP name so the operator knows which network to join; a shell variable wins over `.env`:
-#   PORTAL_SSID_OVERRIDE=bench-c6-portal RUSTYFARIAN_BENCH=<bench checkout> just bench c6 provision --port <c6 port>
+#   PORTAL_SSID_OVERRIDE=bench-c6-portal just bench c6 provision --port <c6 port>
 # `just portal-save` reads WIFI_SSID, MQTT_HOST and the optional MQTT_* and DEVICE_NAME (default hal-extras-test).
 # A person joins the SoftAP from this machine, rejoins the normal Wi-Fi afterwards, and replugs the board.
-# Uses `run`, which no rustyfarian-bench release has yet. No step waits for Enter.
+# Uses `run` (rustyfarian-bench v0.5.0 or later). No step waits for Enter.
 examples = ["hal_c6_provision_mqtt"]
 
 [[step]]

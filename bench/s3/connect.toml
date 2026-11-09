@@ -25,7 +25,7 @@ duration = 20
 reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('   # ESP-ROM / rst: is a reboot
 
 [[step]]
-say = "Once the device is online, please block it on the router, now (MAC as detected)"
+say = "Once the device is online, please block it on the router, now (MAC {mac})"
 arm = false
 attended = true   # a person acts on the router
 expect = '\[wifi\] (disconnected|connect failed|reconnecting in)'

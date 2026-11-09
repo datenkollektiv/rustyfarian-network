@@ -14,10 +14,10 @@ use esp_radio::esp_now::{
 };
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use juggler::espnow::{
-    CancelOutcome, Completed, Completion, EspNowDriver, EspNowEvent, EspNowLink, JobEpoch,
-    MacAddress, Next, OversizeLog, PeerConfig, Refusal, ScanAction, ScanConfig, ScanError,
-    ScanGate, ScanInput, ScanMachine, ScanResult, ScanTeardown, SendKind, SendOutcome, TxCore,
-    TxId, WifiInterface,
+    CancelOutcome, Completed, Completion, EspNowDriver, EspNowEvent, EspNowLink, GateRefusal,
+    JobEpoch, MacAddress, Next, OversizeLog, PeerConfig, Refusal, ScanAction, ScanConfig,
+    ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, ScanTeardown, SendKind, SendOutcome,
+    TxCore, TxId, WifiInterface,
 };
 use juggler::wifi::TxPowerLevel;
 
@@ -52,7 +52,7 @@ const FULL_WAITERS: usize = 4;
 /// Concurrent `receive` callers that park; one more re-polls itself until its turn.
 const RECEIVE_WAITERS: usize = 4;
 /// Wakers one locked operation can collect: every slot, every parked waiter, the scan gate.
-const WAKE_CAPACITY: usize = TX_SLOTS + FULL_WAITERS + 2;
+const WAKE_CAPACITY: usize = TX_SLOTS + FULL_WAITERS + 3;
 
 type TxResult = Result<(), EspHalEspNowError>;
 type Wakes = Wakeups<WAKE_CAPACITY>;
@@ -64,6 +64,9 @@ struct TxState {
     full_waiters: WaiterList<FULL_WAITERS>,
     /// The scan, waiting for the frame on the air to finish before its first radio action.
     idle_waiters: WaiterList<1>,
+    /// A scan started right after a cancelled one, waiting for the cancelled scan's restore
+    /// ([`GateRefusal::Unwinding`](juggler::espnow::GateRefusal::Unwinding)).
+    unwind_waiters: WaiterList<1>,
     /// The scan exclusion of `core`, and the teardown of a scan that was cancelled while its
     /// probe was still on the air: the runner runs it right after that frame's completion, and
     /// only then ends the exclusion.
@@ -227,6 +230,7 @@ impl EspHalEspNow {
                 core: TxCore::new(),
                 full_waiters: WaiterList::new(),
                 idle_waiters: WaiterList::new(),
+                unwind_waiters: WaiterList::new(),
                 scan: ScanGate::new(),
             })),
             runner_wake: Signal::new(),
@@ -430,6 +434,7 @@ impl EspHalEspNow {
             state.core.shutdown(&mut |waker| wakes.push(waker));
             state.full_waiters.drain_into(wakes);
             state.idle_waiters.drain_into(wakes);
+            state.unwind_waiters.drain_into(wakes);
         });
         self.runner_wake.signal(());
         self.shutdown_wake.signal(());
@@ -521,8 +526,13 @@ impl EspHalEspNow {
     }
 
     /// Ends the exclusion of scan `epoch`; call it only after its teardown has run.
+    ///
+    /// Also wakes a scan that waits for this one to unwind.
     fn release_scan(&self, epoch: JobEpoch) {
-        self.with_tx(|state, _| state.scan.release(&mut state.core, epoch));
+        self.with_tx(|state, wakes| {
+            state.scan.release(&mut state.core, epoch);
+            state.unwind_waiters.drain_into(wakes);
+        });
     }
 
     /// Runs the teardown of a scan that can no longer drive its machine (a dropped future).
@@ -906,8 +916,12 @@ impl EspHalEspNow {
     /// # Errors
     ///
     /// * [`EspHalEspNowError::ControllerNotOwned`] on a [`EspHalEspNow::from_controller`] handle.
-    /// * [`EspHalEspNowError::Busy`] while another `scan_for_peer` call is running; scans are
-    ///   serialized.
+    /// * [`EspHalEspNowError::Busy`] while another caller's `scan_for_peer` is running or its
+    ///   result is untaken; scans are serialized.
+    ///   A scan started right after a cancelled one does not fail: it waits for the cancelled
+    ///   scan's restore (one probe on the air plus the teardown) and then runs.
+    /// * [`EspHalEspNowError::Shutdown`] after [`EspHalEspNow::shutdown`], also while waiting
+    ///   for a cancelled scan's restore.
     /// * [`EspHalEspNowError::Scan`] with the [`ScanError`](juggler::espnow::ScanError) reported
     ///   by the machine.
     pub async fn scan_for_peer(
@@ -915,15 +929,29 @@ impl EspHalEspNow {
         mac: &MacAddress,
         config: &ScanConfig<'_>,
     ) -> Result<ScanResult, EspHalEspNowError> {
-        let epoch = self
-            .with_tx(|state, wakes| {
-                state
-                    .scan
-                    .admit(&mut state.core, self.owns_controller, (), &mut |waker| {
-                        wakes.push(waker)
-                    })
+        // A scan cancelled just before still unwinds (probe on the air, restore pending): wait
+        // for `release_scan` (or shutdown) to wake us, then admit again.
+        let epoch = poll_fn(|cx| {
+            self.with_tx(|state, wakes| {
+                let admitted =
+                    state
+                        .scan
+                        .admit(&mut state.core, self.owns_controller, (), &mut |waker| {
+                            wakes.push(waker)
+                        });
+                match admitted {
+                    Ok(epoch) => Poll::Ready(Ok(epoch)),
+                    Err((GateRefusal::Unwinding, ())) => {
+                        if !state.unwind_waiters.register(cx.waker()) {
+                            cx.waker().wake_by_ref();
+                        }
+                        Poll::Pending
+                    }
+                    Err((refusal, ())) => Poll::Ready(Err(gate_refusal_error(refusal))),
+                }
             })
-            .map_err(|(refusal, ())| gate_refusal_error(refusal))?;
+        })
+        .await?;
         let mut machine = ScanMachine::new(*mac, *config, self.pinned.get());
         // Holds the exclusion and, on drop, runs the teardown of the machine's last state
         // (immediately, or after the probe on the air when the future was cancelled mid-probe).

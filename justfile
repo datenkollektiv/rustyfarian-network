@@ -36,9 +36,9 @@ hal_dir := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targ
 idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
 
 # Guided bench runner: a local rustyfarian-bench checkout if RUSTYFARIAN_BENCH points at one,
-# otherwise the pinned release from GitHub (the scenarios need >= v0.3.0 for `attended`).
+# otherwise the pinned release from GitHub (the scenarios need >= v0.5.0 for `probe`, `run`, `setup`/`teardown` and prompt placeholders).
 bench_dir := env("RUSTYFARIAN_BENCH", "")
-bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.3.0 rustyfarian-bench" }
+bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.5.0 rustyfarian-bench" }
 
 # ── env ───────────────────────────────────────────────────────────────────
 
