@@ -1,0 +1,21 @@
+# esp-hal broker hostname that does not resolve, on the C6 (runbook C6-H5, failure half).
+# Build with a name the board's DNS server answers NXDOMAIN for; a shell variable wins over `.env`:
+#   MQTT_HOST=no-such-broker.invalid MQTT_PORT=1883 RUSTYFARIAN_BENCH=<bench checkout> just bench c6 dns-unresolvable
+# No broker is needed, so there is no setup. No person needed.
+examples = ["hal_c6_mqtt_lwt"]
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150
+optional = true
+arm = false
+
+[[step]]
+say = "The lookup fails and the runner retries on its back-off"
+# Two failed lookups 10 s apart prove the retry; the firmware never connects and never reboots.
+expect = ['\[mqtt\] dns lookup of \S+ failed', '\[mqtt\] disconnected — dns lookup failed', '\[mqtt\] reconnecting in 10000 ms', '\[mqtt\] dns lookup of \S+ failed']
+reject = '\[mqtt\] connected|\[app\] tick #\d+ (queued|failed)|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+arm = false       # the first lookup runs during the reset

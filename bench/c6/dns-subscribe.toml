@@ -1,0 +1,50 @@
+# esp-hal broker hostname and runtime subscribe on the C6 (runbook C6-H5, hostname half).
+# Build and recipes use a LAN hostname for the local `just mosquitto` broker, which the board resolves through its
+# DHCP DNS server; a shell variable wins over `.env`:
+#   MQTT_HOST=bench-broker MQTT_PORT=1883 RUSTYFARIAN_BENCH=<bench checkout> just bench c6 dns-subscribe
+# The unresolvable half is `c6/dns-unresolvable`; the IPv4-literal case is every other MQTT check.
+# Uses `setup`, `run` and `teardown`, which no rustyfarian-bench release has yet. No person needed.
+examples = ["hal_c6_mqtt_lwt"]
+# `just mqtt-pub` exits non-zero when MQTT_HOST does not resolve or the broker is unreachable.
+setup = [["just", "mosquitto", "up"], ["just", "mqtt-pub", "bench-ping", "1"]]
+teardown = [["just", "mosquitto", "up"]]
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150
+optional = true
+arm = false
+
+[[step]]
+say = "The firmware connects to the broker by its hostname and subscribes at runtime"
+# The configured line must name the host, not an address, so the session below came through DNS.
+expect = ['\[mqtt\] configured broker [A-Za-z][\w.-]*[A-Za-z]:\d+ ', '\[mqtt\] connected \(session present: no, \d+ subscriptions\)', '\[app\] runtime subscribe \S+/runtime accepted']
+reject = '\[mqtt\] dns lookup of|\[app\] runtime subscribe \S+ failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+arm = false       # printed during the reset
+
+[[step]]
+say = "A message on the runtime topic reaches the firmware"
+run = ["just", "mqtt-pub", "runtime", "hello-runtime"]
+arm = false
+expect = '\[app\] rx topic=\S+/runtime payload=hello-runtime retained=false'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 20
+
+[[step]]
+say = "Restart the broker; the firmware resolves the name again and reconnects"
+run = ["just", "mosquitto", "restart"]
+arm = false
+expect = ['\[mqtt\] disconnected — session error', '\[mqtt\] reconnecting in 10000 ms', '\[mqtt\] connected \(session present: no, \d+ subscriptions\)']
+reject = '\[mqtt\] dns lookup of|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+[[step]]
+say = "The runtime subscription survives the broker restart"
+run = ["just", "mqtt-pub", "runtime", "hello-again"]
+arm = false
+expect = '\[app\] rx topic=\S+/runtime payload=hello-again retained=false'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 20
