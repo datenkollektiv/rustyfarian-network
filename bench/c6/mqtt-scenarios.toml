@@ -1,0 +1,155 @@
+# esp-hal MQTT scenarios T1 to T5 on the C6 (runbook C6-H2; T6 is the `soak` check).
+# Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md; serial lines and broker messages are judged here.
+# Uses `setup`, `run`, `probe` and `serial_reject`, which no rustyfarian-bench release has yet:
+# run with RUSTYFARIAN_BENCH pointing at a rustyfarian-bench checkout that has them.
+# Probe output comes from `just mqtt-watch hal` (`retain=1` is the replay at subscribe, `retain=0` a live message)
+# and `just mqtt-status` (the retained status).
+# A broker check that judges an attended action (unplug, router pause) is `attended` too,
+# so --attended and --unattended keep the action and its check together.
+# No step waits for Enter: each watches from the end of the previous step, so an action may come at any time.
+# Still a person: the unplug and the router pause.
+# The broker is the local one from `just mosquitto` (T4 restarts it), so MQTT_HOST must be this machine's
+# LAN IPv4 that the board can reach, at build time and for the recipes; a shell variable wins over `.env`:
+#   MQTT_HOST=<this machine> MQTT_PORT=1883 RUSTYFARIAN_BENCH=<bench checkout> just bench c6 mqtt-scenarios
+examples = ["hal_c6_mqtt_lwt"]
+# `just mqtt-pub` exits non-zero when MQTT_HOST is unreachable; `just mqtt-status` would also fail on a
+# fresh broker that holds no retained status yet.
+setup = [["just", "mosquitto", "up"], ["just", "mqtt-pub", "bench-ping", "1"]]
+# A failed T4 must not leave the broker stopped.
+teardown = [["just", "mosquitto", "up"]]
+
+# ── T1: connect and retained online flag ────────────────────────────────────
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+# The association line names the AP on both tiers: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm`.
+# It passes unless that RSSI is below -75 dBm, a far mesh node.
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150   # a device still blocked from a previous run backs off up to 30 s
+optional = true
+arm = false       # printed during the reset, before the step
+
+[[step]]
+say = "T1: first broker session and two queued ticks"
+expect = ['Wi-Fi connected \W+ IP: ', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #1 free heap: \d+ B', '\[app\] tick #\d+ queued', '\[app\] tick #\d+ queued']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+arm = false       # Wi-Fi and the first CONNACK arrive during the reset
+
+[[step]]
+say = "T1: the broker holds `online` retained and receives live ticks"
+# The retained status is replayed at subscribe (`retain=1`), then the ticks arrive live (`retain=0`).
+probe = ["just", "mqtt-watch", "hal"]
+arm = false
+expect = ['/status retain=1 online', '/tick retain=0 \{"tick":\d+', '/tick retain=0 \{"tick":\d+']
+reject = '/status retain=0 offline'
+serial_reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 15
+
+# ── T2: inbound subscription ────────────────────────────────────────────────
+
+[[step]]
+say = "T2: publish `hello` on the cmd topic; the firmware receives it"
+run = ["just", "mqtt-pub", "cmd", "hello"]
+arm = false
+expect = '\[app\] rx topic=\S+/cmd payload=hello retained=false'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 20
+
+# ── T3: LWT on power cut ────────────────────────────────────────────────────
+
+[[step]]
+say = "T3: wait until the board is online (the attended run skips T1)"
+attended = true   # the precondition for the unplug: without a broker session there is no will
+arm = false
+expect = '\[app\] tick #\d+ queued'
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+
+[[step]]
+say = "T3: Unplug the board's USB cable; plug it back in once the broker shows `offline`"
+# The will comes within 1.5 × keep-alive (45 s) plus the broker's check interval; after the replug the fresh
+# session publishes `online` live. Serial is down meanwhile, and the replug is a fresh boot by design.
+attended = true
+probe = ["just", "mqtt-watch", "hal"]
+arm = false
+expect = ['/status retain=0 offline', '/status retain=0 online']
+timeout = 180
+
+# ── T4: broker restart, reconnect and resubscribe ───────────────────────────
+
+[[step]]
+say = "T4: restart the broker; the firmware reports the loss and reconnects"
+# A process stop gives an immediate reset (`session error`); the runner retries after 10 s, so at least one
+# tick lands in the gap.
+run = ["just", "mosquitto", "restart"]
+arm = false
+expect = ['\[mqtt\] disconnected — session error', '\[mqtt\] reconnecting in 10000 ms', '\[app\] tick #\d+ would block \(mqtt Disconnected\)', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] tick #\d+ queued']
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+[[step]]
+say = "T4: publish `hello` again; the re-issued subscription delivers it"
+run = ["just", "mqtt-pub", "cmd", "hello"]
+arm = false
+expect = '\[app\] rx topic=\S+/cmd payload=hello retained=false'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 20
+
+[[step]]
+say = "T4: the broker holds `online` again after the restart"
+probe = ["just", "mqtt-status"]
+arm = false
+expect = '^online$'
+serial_reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 10
+
+# ── T5b: per-device pause on the router for 3 minutes ───────────────────────
+# T5a (whole AP off) is not part of this check: on a mesh the board roams to another AP of the same SSID,
+# so switching one AP off is no outage; the per-device pause covers link loss, will, back-off and recovery.
+
+[[step]]
+say = "T5b: Pause the board on the router (MAC as detected) and keep it paused"
+attended = true   # a person acts on the router
+arm = false       # watch from the end of the previous step: the action may come at any time
+# The network watch, not the socket timeout, must end the session: cause `network lost`.
+expect = ['\[wifi\] disconnected', '\[mqtt\] disconnected — network lost', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 150
+
+[[step]]
+say = "T5b: the broker publishes the will (a half-open router path may delay it; a miss is a warning)"
+attended = true
+probe = ["just", "mqtt-watch", "hal"]
+arm = false
+expect = '/status retain=[01] offline'
+serial_reject = '\[app\] tick #\d+ (queued|failed)|\[mqtt\] connected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 90
+optional = true
+
+[[step]]
+say = "T5b: keep the board paused for another 90 s"
+arm = false
+attended = true
+duration = 90     # with the will step, the pause lasts about 3 minutes
+# While down: no tick is queued, none fails, MQTT never connects and the Wi-Fi back-off never exceeds 30000 ms.
+reject = '\[app\] tick #\d+ (queued|failed)|\[mqtt\] connected|\[wifi\] reconnecting in (?!30000 )([3-9]\d{4}|\d{6,}) ms|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "T5b: Unpause the board on the router; it reconnects"
+attended = true
+arm = false
+# The next back-off attempt comes at most 30 s after the unpause; MQTT follows the link-up line within 15 s.
+expect = ['\[wifi\] link up #[2-9]', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] tick #\d+ queued']
+reject = '\[mqtt\] waiting for network|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 120
+
+[[step]]
+say = "T5b: the broker holds `online` again"
+attended = true
+probe = ["just", "mqtt-status"]
+arm = false
+expect = '^online$'
+serial_reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 10

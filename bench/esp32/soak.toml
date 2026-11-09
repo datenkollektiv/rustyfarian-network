@@ -22,7 +22,8 @@ timeout = 150   # a device still blocked from a previous run backs off up to 30 
 arm = false       # Wi-Fi and the first CONNACK arrive during the reset
 
 [[step]]
-say = "Soak: leave it connected; Enter keeps the full 10 min, or type a shorter length in seconds"
-duration = 600   # T6; the prompt takes a shorter length for a quick pass, recorded as `(scenario: 600 s)`
+say = "Soak: leave it connected for 10 min (Ctrl-C ends it early)"
+arm = false       # no prompt: the soak starts as soon as the session is up
+duration = 600   # T6
 # Stricter than T6's 15 s gap rule: any tick that is not queued fails, as does any drop or reboot.
 reject = '\] tick #\d+ (would block|failed)|\] mqtt state Connected -> |\[wifi\] disconnected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('

@@ -39,6 +39,8 @@
 - 2026-11-08 — C3 bench: gap 44 resolved and gap 4 half resolved (hal connect); runbook gates C3-I4 and C3-H4 recorded as passed; hardware run.
 - 2026-11-08 — Classic ESP32 bench (Feather V2, UART0 console): ES-I1, ES-H1 and ES-H2 passed on both tiers; the esp-hal soak held 28 152 B flat; hardware run.
 - 2026-11-09 — C6 bench (full guided run): C6-I2 passed, gap 41 resolved, `hal_c6_mqtt_lwt` smoke and T6 soak passed (heap flat at 52 464 B); C6-H2 still needs T1 to T5; hardware run.
+- 2026-11-09 — C3-H1 passed (hal record with two extras survives a power cycle); the hal portal saved a browser form and a `portal-save` post without the IDF `parse_form` stack overflow; hardware run.
+- 2026-11-09 — C3-I3 partial: the workspace example passed the boot and both form prefill checks; the rgb-clock 8000 B build stays open; hardware run.
 
 ## Scope and evidence basis
 
@@ -167,7 +169,7 @@ Every item is open, because no 0.7.0 gate has a result in `docs/runbooks/release
 - [ ] C3-I3 (provisioning boot at a small stack) and C3-I4 (BOOT re-entry outcomes).
 - [ ] C3-I5 (OTA scenario matrix P1 to P21) and C3-I6 (Watchtower v2 on a second device).
   The flattened health and reporter loops need the rows P2, P7, P13, P14 and P17 rerun.
-- [ ] C3-H1 (provisioning record with extras across a reboot).
+- [x] C3-H1 (provisioning record with extras across a reboot); passed 2026-11-09 on `c4d3879`, the stalled-client step is still not runnable.
 - [ ] C3-H2 (owned-radio ESP-NOW peer, 30 minutes, and channel scan) and C3-H3 (mixed fleet, peer link, blocked on `PeerSession`).
 - [ ] C3-H6 (esp-hal ESP-NOW scan cancel and not-found restore; the `ESPNOW_SCENARIO=cancel` trigger exists).
 - [ ] C3-H7 (esp-hal ESP-NOW send-queue saturation and deadlines; the `ESPNOW_SCENARIO=flood` trigger exists).

@@ -27,8 +27,20 @@ reject = 'heartbeat publish failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-
 timeout = 45
 
 [[step]]
-say = "On the broker, run `just mqtt-watch esp32-mqtt` (or the client_id from the `Config` boot line) and check status and heartbeat"
-confirm = "Retained status 'online' and heartbeats arriving?"
+say = "The broker holds the retained status `online`"
+probe = ["just", "mqtt-status", "{example}"]
+arm = false
+expect = '^online$'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 10
+
+[[step]]
+say = "Live heartbeats reach the broker"
+probe = ["just", "mqtt-watch", "{example}"]
+arm = false
+expect = ['/heartbeat retain=0 ', '/heartbeat retain=0 ']
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 15
 
 [[step]]
 say = "Once the device is online, please block it on the router, now (MAC as detected)"

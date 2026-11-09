@@ -5,8 +5,9 @@ No wiring: the WS2812 on GPIO8 is on board; connect the USB port wired to the ch
 | Check      | Examples                                                    | Verdict                                                         |
 |:-----------|:------------------------------------------------------------|:----------------------------------------------------------------|
 | `connect`  | `hal_c6_connect_async_led`, `idf_c6_connect_nonblocking_rgb` | DHCP lease, LED colours confirmed, 20 s without a reboot       |
-| `mqtt-lwt` | `hal_c6_mqtt_lwt`                                           | connect #1, ticks, `mqtt-watch` confirmed, connect #2 after a router block |
-| `soak`     | `hal_c6_mqtt_lwt` | 10 min (shorter at the prompt), every tick queued; heap trend read from the log |
+| `mqtt-lwt` | `hal_c6_mqtt_lwt`                                           | connect #1, ticks, retained `online` and live ticks probed at the broker, connect #2 after a router block |
+| `mqtt-scenarios` | `hal_c6_mqtt_lwt`                                     | C6-H2 T1 to T5: connect, inbound, LWT on power cut, broker restart and router pause (T5a, AP off, is not run on a mesh); T1, T2 and T4 unattended against the local `just mosquitto` broker; needs a newer runner and `MQTT_HOST` set to this machine (see [../README.md](../README.md)) |
+| `soak`     | `hal_c6_mqtt_lwt` | 10 min (Ctrl-C ends it early), every tick queued; heap trend read from the log |
 | `mqtt`     | `idf_c6_mqtt`                                               | retained `online`, heartbeats, reconnect after a router block        |
 
 ```sh

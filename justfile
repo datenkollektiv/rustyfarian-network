@@ -543,7 +543,7 @@ bench-list:
 bench-detect:
     {{ bench }} detect
 
-# watch an MQTT example's topics with timestamps (MQTT_* from the dotenv file); target: hal (default), idf, all, a prefix such as a client id, or a filter with + or #; seconds > 0 stops after that long, e.g. `just mqtt-watch idf 30`
+# watch an MQTT example's topics with timestamps and the retain flag (`retain=1` is a replay at subscribe, `retain=0` a live message; MQTT_* from the dotenv file); target: hal (default), idf, all, a prefix such as a client id, or a filter with + or #; seconds > 0 stops after that long, e.g. `just mqtt-watch idf 30`
 [group('examples')]
 mqtt-watch target="" seconds="0":
     #!/usr/bin/env bash
@@ -553,7 +553,7 @@ mqtt-watch target="" seconds="0":
     stop=()
     [ "{{ seconds }}" != "0" ] && stop=(-W "{{ seconds }}")
     rc=0
-    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$filter" -F '%I %t %p' ${stop[@]+"${stop[@]}"} || rc=$?
+    mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$filter" -F '%I %t retain=%r %p' ${stop[@]+"${stop[@]}"} || rc=$?
     # -W ends with code 27 when the time is up; that is the expected end of a timed watch.
     [ "$rc" -eq 0 ] || [ "$rc" -eq 27 ] || exit "$rc"
 
