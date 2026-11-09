@@ -47,14 +47,9 @@ pub async fn rx() {
         let message = INBOUND.receive().await;
         let n = RECEIVED_INBOUND.fetch_add(1, Ordering::Relaxed) + 1;
         match std::str::from_utf8(&message.payload) {
-            Ok(text) => log::info!(
-                "[example] rx #{} topic={} payload={}",
-                n,
-                message.topic,
-                text
-            ),
+            Ok(text) => log::info!("[app] rx #{} topic={} payload={}", n, message.topic, text),
             Err(_) => log::info!(
-                "[example] rx #{} topic={} payload={} bytes (binary)",
+                "[app] rx #{} topic={} payload={} bytes (binary)",
                 n,
                 message.topic,
                 message.payload.len()
@@ -118,7 +113,7 @@ pub fn heap_free() -> u32 {
 /// Logs heap, per-task stack high-water marks and the inbound counters.
 pub fn log_resources(variant: &str, connects: u32, worker_tasks: &[&CStr]) {
     log::info!(
-        "[example] {} heap free: {} B, min free: {} B, connects: {}, rx: {}, dropped rx: {}",
+        "[app] {} heap free: {} B, min free: {} B, connects: {}, rx: {}, dropped rx: {}",
         variant,
         free_heap(),
         min_free_heap(),
@@ -129,13 +124,13 @@ pub fn log_resources(variant: &str, connects: u32, worker_tasks: &[&CStr]) {
     for name in [c"main"].iter().chain(worker_tasks) {
         match stack_high_water(name) {
             Some(free) => log::info!(
-                "[example] {} stack high-water {}: {} B unused",
+                "[app] {} stack high-water {}: {} B unused",
                 variant,
                 name.to_string_lossy(),
                 free
             ),
             None => log::info!(
-                "[example] {} stack high-water {}: no such task",
+                "[app] {} stack high-water {}: no such task",
                 variant,
                 name.to_string_lossy()
             ),

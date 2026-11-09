@@ -4,9 +4,9 @@ examples = ["hal_c6_connect_async_led", "idf_c6_connect_nonblocking_rgb"]
 
 [[step]]
 say = "Check the signal of the joined AP (warns below -75 dBm)"
-# The association line names the AP: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm` (hal)
-# or `WiFi associated — …` (IDF). It passes unless that RSSI is below -75 dBm, a far mesh node.
-expect = '(link up #1|WiFi associated)(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+# The association line names the AP on both tiers: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm`.
+# It passes unless that RSSI is below -75 dBm, a far mesh node.
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
 reject = 'rssi -(7[6-9]|[89]\d) dBm'
 timeout = 150   # a device still blocked from a previous run backs off up to 30 s
 optional = true

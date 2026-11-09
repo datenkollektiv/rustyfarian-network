@@ -84,6 +84,7 @@ fn mqtt_state(epoch: &ConnectionEpoch) -> MqttConnectionState {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
     let boot = Instant::now();
 
     let client_id = env::mqtt_client_id("idf-c3-async-b");
@@ -144,13 +145,13 @@ fn main() -> anyhow::Result<()> {
         // Proper order (bug 010): MQTT starts only once the station has an IP.
         wifi.start().await?;
         join_with_backoff(&mut wifi).await;
-        log::info!("[example] wifi up after {} ms", boot.elapsed().as_millis());
+        log::info!("[app] wifi up after {} ms", boot.elapsed().as_millis());
 
         let (client, mut connection) = EspAsyncMqttClient::new(&url, &mqtt_config)?;
         let client = Mutex::<CriticalSectionRawMutex, _>::new(client);
         let epoch = ConnectionEpoch::new();
         log::info!(
-            "[example] variant B, topics: status={} cmd={} tick={}",
+            "[app] variant B, topics: status={} cmd={} tick={}",
             status_topic,
             cmd_topic,
             tick_topic
@@ -183,7 +184,7 @@ async fn join_with_backoff(wifi: &mut AsyncWifi<EspWifi<'static>>) {
             }
             Err(e) => {
                 log::warn!(
-                    "[example] wifi connect failed: {:?}, retry in {} ms",
+                    "[app] wifi connect failed: {:?}, retry in {} ms",
                     e,
                     backoff_ms
                 );
@@ -198,12 +199,12 @@ async fn join_with_backoff(wifi: &mut AsyncWifi<EspWifi<'static>>) {
 async fn keep_link(wifi: &mut AsyncWifi<EspWifi<'static>>) {
     loop {
         if let Err(e) = wifi.wifi_wait(|w| w.is_connected(), None).await {
-            log::warn!("[example] wifi wait failed: {:?}", e);
+            log::warn!("[app] wifi wait failed: {:?}", e);
         }
         LINK_UP.store(false, Ordering::Release);
-        log::warn!("[example] wifi link down");
+        log::warn!("[app] wifi link down");
         join_with_backoff(wifi).await;
-        log::info!("[example] wifi link up");
+        log::info!("[app] wifi link up");
     }
 }
 
@@ -213,7 +214,7 @@ async fn mqtt_events(connection: &mut EspAsyncMqttConnection, epoch: &Connection
         let event = match connection.next().await {
             Ok(event) => event,
             Err(_) => {
-                log::info!("[example] mqtt connection closed");
+                log::info!("[app] mqtt connection closed");
                 return;
             }
         };
@@ -255,16 +256,16 @@ async fn sessions(
             .await;
         drop(client);
         if let (Err(e), _) | (_, Err(e)) = (&subscribed, &online) {
-            log::warn!("[example] connect work failed: {:?}", e);
+            log::warn!("[app] connect work failed: {:?}", e);
             continue;
         }
         if epoch.confirm(token) {
             let connects = CONNECTS.fetch_add(1, Ordering::AcqRel) + 1;
             if connects == 1 {
-                log::info!("[example] mqtt up after {} ms", boot.elapsed().as_millis());
+                log::info!("[app] mqtt up after {} ms", boot.elapsed().as_millis());
             }
         } else {
-            log::info!("[example] session dropped during its connect work, not marked ready");
+            log::info!("[app] session dropped during its connect work, not marked ready");
         }
     }
 }
@@ -285,12 +286,12 @@ async fn app(
 
         let link = LINK_UP.load(Ordering::Acquire);
         if link != last_link {
-            log::info!("[example] wifi link up {} -> {}", last_link, link);
+            log::info!("[app] wifi link up {} -> {}", last_link, link);
             last_link = link;
         }
         let state = mqtt_state(epoch);
         if state != last_state {
-            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
+            log::info!("[app] mqtt state {:?} -> {:?}", last_state, state);
             last_state = state;
         }
 
@@ -308,14 +309,14 @@ async fn app(
                 .await;
             match published {
                 Ok(_) => log::info!(
-                    "[example] tick #{} published in {} ms",
+                    "[app] tick #{} published in {} ms",
                     tick,
                     started.elapsed().as_millis()
                 ),
-                Err(e) => log::warn!("[example] tick #{} failed: {:?}", tick, e),
+                Err(e) => log::warn!("[app] tick #{} failed: {:?}", tick, e),
             }
         } else {
-            log::info!("[example] tick #{} would block (mqtt {:?})", tick, state);
+            log::info!("[app] tick #{} would block (mqtt {:?})", tick, state);
         }
 
         if secs_since_resource_log >= RESOURCE_LOG_SECS {

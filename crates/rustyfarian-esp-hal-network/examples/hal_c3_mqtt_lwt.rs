@@ -91,6 +91,7 @@ fn static_topic(
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Info);
+    log::info!("[app] start {} (esp-hal)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("hal-c3-mqtt");
     let prefix = env::mqtt_topic_prefix("rustyfarian/hal-mqtt");
@@ -172,7 +173,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mqtt_task(mqtt_runner).unwrap());
 
     log::info!(
-        "[example] topics: status={} cmd={} tick={}",
+        "[app] topics: status={} cmd={} tick={}",
         status_topic,
         cmd_topic,
         tick_topic

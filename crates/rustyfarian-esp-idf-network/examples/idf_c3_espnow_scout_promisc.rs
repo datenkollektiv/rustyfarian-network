@@ -77,6 +77,7 @@ fn parse_mac(s: &str) -> anyhow::Result<MacAddress> {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let coordinator_mac = parse_mac(COORDINATOR_MAC_STR)
         .with_context(|| format!("failed to parse COORDINATOR_MAC={COORDINATOR_MAC_STR:?}"))?;

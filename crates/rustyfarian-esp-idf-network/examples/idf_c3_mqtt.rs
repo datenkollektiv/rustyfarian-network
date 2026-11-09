@@ -52,6 +52,7 @@ mod env;
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("esp32c3-mqtt");
     env::log_config(client_id);
@@ -87,21 +88,21 @@ fn main() -> anyhow::Result<()> {
         .on_connect(
             move |client: &mut EspMqttClient<'_>, session_present: bool| {
                 if session_present {
-                    log::info!("[mqtt] connected — session resumed");
+                    log::info!("[app] mqtt connected — session resumed");
                 } else {
-                    log::info!("[mqtt] connected — clean session");
+                    log::info!("[app] mqtt connected — clean session");
                 }
                 client.enqueue(&status_topic, to_esp_qos(QoS::AtLeastOnce), true, b"online")?;
-                log::info!("[mqtt] published retained status=online");
+                log::info!("[app] published retained status=online");
                 Ok(())
             },
         )
         .on_disconnect(|| {
-            log::warn!("[mqtt] disconnected — will reconnect automatically");
+            log::warn!("[app] mqtt disconnected — will reconnect automatically");
         })
         .on_message(|topic, payload| {
             let body = std::str::from_utf8(payload).unwrap_or("<non-utf8>");
-            log::info!("[mqtt] message on '{}': {}", topic, body);
+            log::info!("[app] message on '{}': {}", topic, body);
             let suffix = topic.rsplit('/').next().unwrap_or(topic);
             match suffix {
                 "reboot" => log::info!("[cmd] reboot requested"),
@@ -124,9 +125,9 @@ fn main() -> anyhow::Result<()> {
 
         let payload = counter.to_string();
         if let Err(e) = handle.publish(&heartbeat_topic, &payload) {
-            log::warn!("[mqtt] heartbeat publish failed: {:#}", e);
+            log::warn!("[app] heartbeat publish failed: {:#}", e);
         } else {
-            log::info!("[mqtt] heartbeat {} sent", counter);
+            log::info!("[app] heartbeat {} sent", counter);
         }
         counter += 1;
         std::thread::sleep(std::time::Duration::from_secs(5));

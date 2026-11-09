@@ -21,6 +21,7 @@ mod link_mock;
 pub mod mock;
 
 pub mod handover;
+pub mod lines;
 pub mod link;
 pub mod network_link;
 #[cfg(feature = "std")]
@@ -574,7 +575,7 @@ pub fn credentials_hint(reason: u16) -> &'static str {
 /// text (bug 011).
 ///
 /// ```ignore
-/// log::warn!("WiFi disconnected — {}", DisconnectReason(info.reason()));
+/// log::warn!("[wifi] disconnected — {}", DisconnectReason(info.reason()));
 /// ```
 pub struct DisconnectReason(pub u16);
 

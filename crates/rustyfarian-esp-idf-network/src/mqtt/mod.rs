@@ -162,6 +162,7 @@ mod session;
 mod subscriptions;
 use crate::wifi::WiFiManager;
 use juggler::mqtt::chunks::{Assembled, Chunk, ChunkAssembler};
+use juggler::mqtt::lines::{Connected, Disconnected};
 use runner::{ClientConfig, Msg, Runner};
 use session::Session;
 pub use session::{
@@ -984,6 +985,10 @@ impl<'a> MqttBuilder<'a> {
         // the first connect. No Box::leak required.
         let url = format_broker_url(config.host, config.port);
         let client_id = config.client_id.to_string();
+        // Kept apart from `ClientConfig`, which carries the credentials, so the
+        // `connecting to` line reads only these two values.
+        let broker_host = config.host.to_string();
+        let broker_port = config.port;
         // Fixed message: CodeQL's rust/cleartext-logging taints every field read
         // through a config that carries credentials, so the broker URL and client id
         // are logged by the caller from its own values (see the examples' env.rs).
@@ -1048,6 +1053,7 @@ impl<'a> MqttBuilder<'a> {
             self.on_connect.map(|f| Arc::new(Mutex::new(f)));
         let on_disconnect = self.on_disconnect;
         let on_message = self.on_message;
+        let subscription_count = self.subscribe_topics.len();
         let subs = Arc::new(Subscriptions::new(self.subscribe_topics));
         let startup: Option<StartupMessage> = self.startup.map(|spec| match spec {
             StartupSpec::Default => StartupMessage {
@@ -1120,8 +1126,11 @@ impl<'a> MqttBuilder<'a> {
                             if let Some(next) = next_state(state, MqttEvent::Connected) {
                                 state = next;
                                 log::info!(
-                                    "[mqtt] connected (session_present={})",
-                                    session_present
+                                    "{}",
+                                    Connected {
+                                        session_present,
+                                        subscriptions: subscription_count
+                                    }
                                 );
                             }
                             // The runner decides the connect work from this input:
@@ -1140,7 +1149,7 @@ impl<'a> MqttBuilder<'a> {
                             session_for_thread.send(SessionInput::Disconnected);
                             if let Some(next) = next_state(state, MqttEvent::Disconnected) {
                                 state = next;
-                                log::info!("[mqtt] disconnected");
+                                log::info!("{}", Disconnected { cause: None });
                                 // Fail every in-flight acked publish: a dropped
                                 // session must never masquerade as a PUBACK, and a
                                 // waiter should not spin to its full timeout.
@@ -1225,6 +1234,8 @@ impl<'a> MqttBuilder<'a> {
             connection: connection_tx,
             alive: Arc::downgrade(&alive),
             config: client_config,
+            broker_host,
+            broker_port,
             handle: None,
             seed_ready,
             ignored_in_a_row: 0,

@@ -54,6 +54,7 @@ fn free_heap() -> usize {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("idf-s3-mqtt");
     let prefix = env::mqtt_topic_prefix("rustyfarian/idf-mqtt");
@@ -102,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         .build(&wifi)?;
 
     log::info!(
-        "[example] topics: status={} cmd={} tick={}",
+        "[app] topics: status={} cmd={} tick={}",
         status_topic,
         cmd_topic,
         tick_topic

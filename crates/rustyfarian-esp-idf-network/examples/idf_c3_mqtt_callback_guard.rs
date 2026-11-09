@@ -55,6 +55,7 @@ fn is_wrong_thread(e: &anyhow::Error) -> bool {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("esp32c3-guard");
     env::log_config(client_id);

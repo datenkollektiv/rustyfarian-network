@@ -87,6 +87,7 @@ fn show(display: &mut Option<Oled>, lines: &[&str]) {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("c3-button");
     env::log_config(client_id);
@@ -150,10 +151,10 @@ fn main() -> anyhow::Result<()> {
     // ── MQTT (non-blocking) ───────────────────────────────────────────────
     let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
         .on_connect(|_client, _session_present| {
-            log::info!("[mqtt] connected");
+            log::info!("[app] mqtt connected");
             Ok(())
         })
-        .on_disconnect(|| log::warn!("[mqtt] disconnected"))
+        .on_disconnect(|| log::warn!("[app] mqtt disconnected"))
         .build(&wifi)?;
 
     log::info!(

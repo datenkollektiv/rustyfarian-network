@@ -74,6 +74,7 @@ static TX_FAILED: AtomicU32 = AtomicU32::new(0);
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Info);
+    log::info!("[app] start {} (esp-hal)", env!("CARGO_CRATE_NAME"));
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 

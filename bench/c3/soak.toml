@@ -1,15 +1,15 @@
 # 10-minute MQTT soak (T6), esp-hal tier.
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
-# Log prefix is `[app]` (examples-shared/lwt_app.rs) or `[example]` (hal_c6_mqtt_lwt); ticks every 5 s, heap every 60 s.
+# Log prefix is `[app]`; ticks every 5 s, heap every 60 s.
 # Unattended on purpose (`--unattended` runs it at full length): read the heap trend afterwards from the
 # `heap free` lines in the run log; T6 wants them within 1 KiB, the last one is the heap after soak.
 examples = ["hal_c3_mqtt_lwt"]
 
 [[step]]
 say = "Check the signal of the joined AP (warns below -75 dBm)"
-# The association line names the AP: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm` (hal)
-# or `WiFi associated — …` (IDF). It passes unless that RSSI is below -75 dBm, a far mesh node.
-expect = '(link up #1|WiFi associated)(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+# The association line names the AP on both tiers: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm`.
+# It passes unless that RSSI is below -75 dBm, a far mesh node.
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
 reject = 'rssi -(7[6-9]|[89]\d) dBm'
 timeout = 150   # a device still blocked from a previous run backs off up to 30 s
 optional = true
@@ -17,7 +17,7 @@ arm = false       # printed during the reset, before the step
 
 [[step]]
 say = "Wait for the first broker session (unblock the device on the router first if a previous run left it blocked)"
-expect = ['Wi-Fi connected \W+ IP: ', '\[(app|example)\] connect #1 ']
+expect = ['Wi-Fi connected \W+ IP: ', '\[app\] connect #1 ']
 timeout = 150   # a device still blocked from a previous run backs off up to 30 s
 arm = false       # Wi-Fi and the first CONNACK arrive during the reset
 
@@ -25,4 +25,4 @@ arm = false       # Wi-Fi and the first CONNACK arrive during the reset
 say = "Soak: leave it connected; Enter keeps the full 10 min, or type a shorter length in seconds"
 duration = 600   # T6; the prompt takes a shorter length for a quick pass, recorded as `(scenario: 600 s)`
 # Stricter than T6's 15 s gap rule: any tick that is not queued fails, as does any drop or reboot.
-reject = '\] tick #\d+ (would block|failed)|\] mqtt state Connected -> |(\[wifi\]|WiFi) disconnected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+reject = '\] tick #\d+ (would block|failed)|\] mqtt state Connected -> |\[wifi\] disconnected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('

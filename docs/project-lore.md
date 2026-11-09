@@ -250,7 +250,7 @@ Fix: the library doesn't use these crates — only the examples do — so add `e
 esp-radio hard-codes `WIFI_CONNECT_AP_BY_SIGNAL`, but ESP-IDF applies that sort only to an all-channel scan, so the setting looks right and does nothing.
 On the `iot` mesh SSID (2026-11-07) the CrowPanel S3 joined a -89 dBm node next to a -20 dBm AP: it got an IP, or sometimes associated without a DHCP lease, every TCP connect to the broker timed out, and it did not answer ping, even after a fresh boot, which looked like the router blocking it.
 Fix: both tiers now map the shared `juggler::wifi::ApSelection` (default `Strongest`) to their scan method explicitly, so neither driver default decides (esp-radio's `with_scan_method` needs its `unstable` feature, already on).
-Since 2026-11-08 both tiers log the joined AP on association (`[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, IDF `WiFi associated — …`), and the bench warns below -75 dBm; before that only the router's client view showed it.
+Since 2026-11-08 both tiers log the joined AP on association (`[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, the same text on both tiers), and the bench warns below -75 dBm; before that only the router's client view showed it.
 
 ---
 

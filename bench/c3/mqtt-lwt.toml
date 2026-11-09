@@ -1,13 +1,13 @@
 # MQTT smoke with a router block, esp-hal tier (runbook C3-H4).
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
-# Log prefix is `[app]` (examples-shared/lwt_app.rs) or `[example]` (hal_c6_mqtt_lwt).
+# Log prefix is `[app]`.
 examples = ["hal_c3_mqtt_lwt"]
 
 [[step]]
 say = "Check the signal of the joined AP (warns below -75 dBm)"
-# The association line names the AP: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm` (hal)
-# or `WiFi associated — …` (IDF). It passes unless that RSSI is below -75 dBm, a far mesh node.
-expect = '(link up #1|WiFi associated)(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+# The association line names the AP on both tiers: `[wifi] link up #1 — bssid …, ch N, rssi -NN dBm`.
+# It passes unless that RSSI is below -75 dBm, a far mesh node.
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
 reject = 'rssi -(7[6-9]|[89]\d) dBm'
 timeout = 150   # a device still blocked from a previous run backs off up to 30 s
 optional = true
@@ -15,7 +15,7 @@ arm = false       # printed during the reset, before the step
 
 [[step]]
 say = "Wait for the first broker session (unblock the device on the router first if a previous run left it blocked)"
-expect = ['Wi-Fi connected \W+ IP: ', '\[(app|example)\] connect #1 ']
+expect = ['Wi-Fi connected \W+ IP: ', '\[app\] connect #1 ']
 timeout = 150   # a device still blocked from a previous run backs off up to 30 s
 arm = false       # Wi-Fi and the first CONNACK arrive during the reset
 
@@ -34,7 +34,7 @@ confirm = "Retained status 'online' and a tick JSON every 5 s?"
 say = "Once the device is online, please block it on the router, now (MAC as detected)"
 arm = false
 attended = true   # a person acts on the router
-expect = ['(\[wifi\]|WiFi) disconnected', '\] tick #\d+ would block \(mqtt Disconnected\)']
+expect = ['\[wifi\] disconnected', '\] tick #\d+ would block \(mqtt Disconnected\)']
 reject = 'PANIC|panicked|Guru Meditation|abort\(\)'   # no ESP-ROM/rst: --attended skips the boot step, so this step reads the reset banner
 timeout = 150
 

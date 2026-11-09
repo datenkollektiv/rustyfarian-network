@@ -120,6 +120,7 @@ fn static_topic(cell: &'static StaticCell<heapless::String<64>>, suffix: &str) -
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Info);
+    log::info!("[app] start {} (esp-hal)", env!("CARGO_CRATE_NAME"));
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -193,7 +194,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(rx_task(mqtt, runtime_topic).unwrap());
 
     println!(
-        "[example] topics: status={} cmd={} tick={} runtime={}",
+        "[app] topics: status={} cmd={} tick={} runtime={}",
         status_topic, cmd_topic, tick_topic, runtime_topic
     );
 
@@ -208,12 +209,12 @@ async fn main(spawner: Spawner) {
 
         let state = mqtt.state();
         if state != last_state {
-            println!("[example] mqtt state {:?} -> {:?}", last_state, state);
+            println!("[app] mqtt state {:?} -> {:?}", last_state, state);
             last_state = state;
         }
         if mqtt.is_connected() && !was_connected {
             println!(
-                "[example] connect #{} free heap: {} B",
+                "[app] connect #{} free heap: {} B",
                 mqtt.connect_count(),
                 esp_alloc::HEAP.free()
             );
@@ -231,17 +232,17 @@ async fn main(spawner: Spawner) {
             ),
         );
         match mqtt.try_publish(tick_topic, payload.as_bytes()) {
-            Ok(()) => println!("[example] tick #{} queued", tick),
+            Ok(()) => println!("[app] tick #{} queued", tick),
             Err(TryPublishError::WouldBlock) => {
-                println!("[example] tick #{} would block (mqtt {:?})", tick, state)
+                println!("[app] tick #{} would block (mqtt {:?})", tick, state)
             }
-            Err(TryPublishError::Other(e)) => println!("[example] tick #{} failed: {}", tick, e),
+            Err(TryPublishError::Other(e)) => println!("[app] tick #{} failed: {}", tick, e),
         }
 
         if secs_since_heap_log >= HEAP_LOG_SECS {
             secs_since_heap_log = 0;
             println!(
-                "[example] heap free: {} B, connects: {}, dropped rx/tx: {}/{}",
+                "[app] heap free: {} B, connects: {}, dropped rx/tx: {}/{}",
                 esp_alloc::HEAP.free(),
                 mqtt.connect_count(),
                 mqtt.dropped_inbound(),
@@ -260,23 +261,20 @@ async fn mqtt_task(runner: MqttRunner) -> ! {
 async fn rx_task(mqtt: MqttHandle, runtime_topic: &'static str) {
     mqtt.wait_connected().await;
     match mqtt.subscribe(runtime_topic, QoS::AtLeastOnce) {
-        Ok(()) => println!("[example] runtime subscribe {} accepted", runtime_topic),
-        Err(e) => println!(
-            "[example] runtime subscribe {} failed: {}",
-            runtime_topic, e
-        ),
+        Ok(()) => println!("[app] runtime subscribe {} accepted", runtime_topic),
+        Err(e) => println!("[app] runtime subscribe {} failed: {}", runtime_topic, e),
     }
     loop {
         let msg = mqtt.receive().await;
         match core::str::from_utf8(msg.payload.as_slice()) {
             Ok(text) => println!(
-                "[example] rx topic={} payload={} retained={}",
+                "[app] rx topic={} payload={} retained={}",
                 msg.topic.as_str(),
                 text,
                 msg.retained
             ),
             Err(_) => println!(
-                "[example] rx topic={} payload={} bytes (binary)",
+                "[app] rx topic={} payload={} bytes (binary)",
                 msg.topic.as_str(),
                 msg.payload.len()
             ),

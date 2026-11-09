@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::wifi::LinkHandover::{start, idle_wait, take_ready_change}` and the enum `juggler::wifi::IdleWait` (`Link`, `Park`, `Restart`), re-exported from `juggler::wifi`.
   `juggler::wifi::ConnectMode::effective_timeout_secs` returns the connect timeout that both tiers share.
 - `juggler::wifi::ApSelection` (`Strongest`, the default, and `FirstFound`) with `WiFiConfig::with_ap_selection`, re-exported by both tiers; each tier maps it to its station scan.
-- Both tiers log the joined AP on every association, with the shared `juggler::wifi::JoinedAp` text: esp-hal `[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, ESP-IDF `WiFi associated — bssid …, ch N, rssi -NN dBm`.
+- Both tiers log the joined AP on every association, with the shared `juggler::wifi::JoinedAp` text: `[wifi] link up #N — bssid …, ch N, rssi -NN dBm` on both.
+- `juggler::wifi::lines` and `juggler::mqtt::lines` (`no_std`, host-tested): the Wi-Fi and MQTT log lines both tiers print are `Display` types, so one text serves both.
+  `juggler::wifi::LinkHandover::failed_attempts` is now public, and `juggler::wifi::LinkRadio::joined_ap` (default `None`) lets a supervisor name the AP in the `link up` line.
 - `Clone` on `juggler::wifi::LinkMachine`, `juggler::wifi::LinkHandover` and `juggler::backoff::ExponentialBackoff`.
 - `juggler::mqtt::{ConnectWorkPlan, ConnectStep}`: the ordered connect work (subscriptions, startup message and `on_connect`) that both tiers run.
   `ChunkAssembler::dropped_by_last_feed()` reports how many messages the last feed dropped.
@@ -98,6 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Both tiers now print the same Wi-Fi and MQTT lifecycle log lines, and every example uses the `[app]` prefix (was `[example]`) and logs `[app] start <example> (esp-hal|esp-idf)` as its first line, the only place the tier appears.
+  Wi-Fi: `[wifi] link up #N`, `[wifi] network ready — ip A.B.C.D`, `[wifi] disconnected — <reason>`, `[wifi] reconnecting in N ms (attempt K)`, `[wifi] suspend requested`, `[wifi] suspended`, `[wifi] resume requested`; the ESP-IDF tier's other lines (`WiFi started`, `WiFi connect requested`, ...) and a few esp-hal ones take the lowercase `[wifi]` prefix.
+  MQTT: `[mqtt] waiting for network`, `[mqtt] connecting to H:P`, `[mqtt] connected (session present: yes|no, N subscriptions)`, `[mqtt] disconnected — <cause>`, `[mqtt] reconnecting in N ms`.
+  The ESP-IDF tier now logs `WiFi associated` as `[wifi] link up #N` (from the shared supervisor, once per association), and the esp-hal tier logs the attempt number, the address and the pause as separate lines; the old `[mqtt] disconnected (<cause>), reconnecting in N ms` is two lines.
+  The example-owned MQTT lines of `idf_c3_mqtt`, `idf_c6_mqtt`, `idf_esp32_mqtt` and the OLED/LED-grid examples moved from `[mqtt]` to `[app]`.
+  Scripts that match log text need the new wording (the `bench/` scenarios are updated); no public API changed.
 - The `idf_c3_provision_mqtt` re-entry hook watches BOOT for 2 s after its `press BOOT now` line instead of reading it once about 0.6 s after reset, which was too short to hit by hand (as `rustyfarian-rgb-clock` found on esp-hal); a normal boot now waits those 2 s.
 - BREAKING: `juggler::wifi::WiFiConfig` gains the public field `ap_selection`, so code that builds `WiFiConfig` as a struct literal must add it (`WiFiConfig::new` is unaffected).
 - BREAKING: `rustyfarian-esp-idf-network` `MqttBuilder::with_startup_message` takes `(topic, payload, qos, retain)` instead of no arguments, matching the esp-hal tier.

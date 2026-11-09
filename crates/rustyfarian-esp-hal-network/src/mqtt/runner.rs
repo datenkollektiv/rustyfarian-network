@@ -19,6 +19,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
+use juggler::mqtt::lines::{Connected, Connecting, Disconnected, Reconnecting, WaitingForNetwork};
 use juggler::mqtt::{
     AckStatus, BrokerHost, ConnectStep, ConnectWorkPlan, MqttClient, NetworkGate, SessionAction,
     SessionInput, SessionMachine, SubscribeWindow, SUBSCRIBE_WINDOW,
@@ -570,6 +571,18 @@ impl MqttRunner {
                     self.feed_edge(edge)
                 }
                 SessionAction::Connect => {
+                    match self.broker {
+                        BrokerAddr::Literal(endpoint) => log::info!(
+                            "{}",
+                            Connecting {
+                                host: endpoint.addr,
+                                port: endpoint.port
+                            }
+                        ),
+                        BrokerAddr::Name { host, port } => {
+                            log::info!("{}", Connecting { host, port });
+                        }
+                    }
                     match select(
                         serve(
                             &mut self.session,
@@ -593,13 +606,14 @@ impl MqttRunner {
                             // finishes before the next action runs.
                             let next = self.shared.poll(SessionInput::Disconnected);
                             self.close().await;
-                            match next {
-                                SessionAction::Wait { ms } => log::warn!(
-                                    "[mqtt] disconnected ({}), reconnecting in {} ms",
-                                    outcome,
-                                    ms
-                                ),
-                                _ => log::warn!("[mqtt] disconnected ({})", outcome),
+                            log::warn!(
+                                "{}",
+                                Disconnected {
+                                    cause: Some(outcome)
+                                }
+                            );
+                            if let SessionAction::Wait { ms } = next {
+                                log::warn!("{}", Reconnecting { ms });
                             }
                             next
                         }
@@ -620,6 +634,12 @@ impl MqttRunner {
                 }
                 SessionAction::Close => {
                     self.close().await;
+                    log::warn!(
+                        "{}",
+                        Disconnected {
+                            cause: Some("network lost")
+                        }
+                    );
                     self.shared.poll(SessionInput::Disconnected)
                 }
                 // Connect work runs inside `serve`, which also consumes its `Ready`;
@@ -656,7 +676,7 @@ impl MqttRunner {
     /// Feeds one network edge to the machine, logging the wait once per outage.
     fn feed_edge(&self, edge: SessionInput) -> SessionAction {
         if edge == SessionInput::NetworkDown {
-            log::info!("[mqtt] network lost, waiting for network");
+            log::info!("{}", WaitingForNetwork);
         }
         self.shared.poll(edge)
     }
@@ -836,10 +856,11 @@ async fn serve(
         return "session ended during connect work";
     }
     log::info!(
-        "[mqtt] connected ({:?}, {} subscriptions{})",
-        event,
-        subscriptions.len(),
-        if subscribe { "" } else { " kept" }
+        "{}",
+        Connected {
+            session_present: event != ConnectEvent::Connected,
+            subscriptions: subscriptions.len()
+        }
     );
 
     // A request whose send failed in an earlier session is still owed, and a kept

@@ -58,6 +58,7 @@ const SUBSCRIBE_TOPIC: &str = "c3-button/events";
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("c3-leds");
     env::log_config(client_id);
@@ -94,13 +95,13 @@ fn main() -> anyhow::Result<()> {
     let handle = MqttBuilder::new(env::mqtt_config(client_id)?)
         .subscribe(SUBSCRIBE_TOPIC, QoS::AtLeastOnce)
         .on_connect(|_client: &mut EspMqttClient<'_>, _session_present: bool| {
-            log::info!("[mqtt] connected");
+            log::info!("[app] mqtt connected");
             Ok(())
         })
-        .on_disconnect(|| log::warn!("[mqtt] disconnected"))
+        .on_disconnect(|| log::warn!("[app] mqtt disconnected"))
         .on_message(move |topic, _payload| {
             let n = msg_count_cb.fetch_add(1, Ordering::Relaxed) + 1;
-            log::info!("[mqtt] message #{} on '{}'", n, topic);
+            log::info!("[app] message #{} on '{}'", n, topic);
         })
         .build(&wifi)?;
 

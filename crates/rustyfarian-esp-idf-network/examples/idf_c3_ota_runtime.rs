@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
     let boot = Instant::now();
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let client_id = env::mqtt_client_id("esp32c3-ota");
     env::log_config(client_id);

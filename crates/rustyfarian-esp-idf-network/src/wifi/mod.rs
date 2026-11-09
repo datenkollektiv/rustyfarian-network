@@ -83,6 +83,7 @@ use esp_idf_svc::wifi::{
     BlockingWifi, ClientConfiguration, Configuration, EspWifi, ScanMethod, ScanSortMethod,
     WifiEvent,
 };
+use juggler::wifi::lines::{Disconnected, NetworkReady};
 use juggler::wifi::{JoinedAp, LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
 // Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
 // (where `SoftApManager` is cfg'd out) does not warn on unused imports.
@@ -168,7 +169,7 @@ fn map_ap_selection(selection: ApSelection) -> ScanMethod {
     }
 }
 
-/// The AP the station is associated with, for the association line; `None` when not associated.
+/// The AP the station is associated with, for the `link up` line; `None` when not associated.
 fn joined_ap() -> Option<JoinedAp> {
     // SAFETY: an all-zero `wifi_ap_record_t` is a valid value of this plain C struct.
     let mut record: esp_idf_svc::sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
@@ -267,7 +268,7 @@ impl WiFiManager {
         L: StatusLed,
         L::Error: std::fmt::Debug,
     {
-        log::info!("Connecting to WiFi SSID (len={})", config.ssid.len());
+        log::info!("[wifi] connecting to ssid (len={})", config.ssid.len());
 
         // Clone before sys_loop is consumed by BlockingWifi::wrap; used for the
         // optional disconnect-event subscription in non-blocking mode.
@@ -309,19 +310,19 @@ impl WiFiManager {
         };
         esp_idf_svc::sys::esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_ps(ps_mode) })
             .context("failed to set WiFi power save mode")?;
-        log::info!("WiFi started, power save: {:?}", config.power_save);
+        log::info!("[wifi] started, power save: {:?}", config.power_save);
 
         let tx_power = config.tx_power.to_quarter_dbm();
         match esp_idf_svc::sys::esp!(unsafe {
             esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power)
         }) {
             Ok(()) => log::info!(
-                "WiFi TX power set to {:?} ({} quarter-dBm)",
+                "[wifi] tx power set to {:?} ({} quarter-dBm)",
                 config.tx_power,
                 tx_power
             ),
             Err(e) => log::warn!(
-                "Failed to set WiFi TX power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
+                "[wifi] failed to set tx power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
                 config.tx_power,
                 tx_power,
                 e
@@ -339,7 +340,7 @@ impl WiFiManager {
         let has_indicator = led.is_some();
         if matches!(config.connect_mode, ConnectMode::NonBlocking) && has_indicator {
             log::warn!(
-                "Non-blocking connection requested but LED driver is present; \
+                "[wifi] non-blocking connection requested but LED driver is present; \
                  falling back to blocking with {}s timeout",
                 DEFAULT_TIMEOUT_SECS
             );
@@ -352,7 +353,7 @@ impl WiFiManager {
                 Self::connect_with_led(&link, led_driver, timeout_secs)?;
             }
             (Some(timeout_secs), None) => Self::wait_for_connection(&link, timeout_secs)?,
-            (None, _) => log::info!("WiFi connect requested (non-blocking)"),
+            (None, _) => log::info!("[wifi] connect requested (non-blocking)"),
         }
 
         Ok(Self {
@@ -384,13 +385,13 @@ impl WiFiManager {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
-        log::info!("WiFi connecting...");
+        log::info!("[wifi] connecting...");
 
         // The link worker issues (and retries) the connect; this loop only waits.
         loop {
             // Check for timeout
             if start_time.elapsed() >= timeout {
-                log::error!("WiFi connection timeout after {} seconds", timeout_secs);
+                log::error!("[wifi] connection timeout after {} seconds", timeout_secs);
 
                 // Brief red pulse to indicate failure before returning error
                 for _ in 0..20 {
@@ -407,7 +408,7 @@ impl WiFiManager {
 
             // Ready means associated and the station's IP reported (supervisor).
             if link.supervisor.is_ready() {
-                log::info!("WiFi connected and netif up");
+                log::info!("[wifi] connected and netif up");
                 break;
             }
 
@@ -428,7 +429,7 @@ impl WiFiManager {
         let start_time = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
-        log::info!("WiFi connecting (timeout: {}s)...", timeout_secs);
+        log::info!("[wifi] connecting (timeout: {}s)...", timeout_secs);
 
         // The link worker issues (and retries) the connect; this loop only waits.
         loop {
@@ -447,7 +448,7 @@ impl WiFiManager {
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
 
-        log::info!("WiFi connected and netif up");
+        log::info!("[wifi] connected and netif up");
 
         Ok(())
     }
@@ -486,7 +487,7 @@ impl WiFiManager {
             if self.link.supervisor.is_ready() {
                 match self.wifi.wifi().sta_netif().get_ip_info() {
                     Ok(ip_info) if !ip_info.ip.is_unspecified() => {
-                        log::info!("WiFi IP: {:?}", ip_info.ip);
+                        log::debug!("[wifi] ip {}", ip_info.ip);
                         return Ok(Some(ip_info.ip));
                     }
                     Ok(_) => {}
@@ -495,7 +496,7 @@ impl WiFiManager {
             }
 
             if start.elapsed() >= timeout {
-                log::warn!("Timeout waiting for WiFi IP address");
+                log::warn!("[wifi] timeout waiting for ip address");
                 return Ok(None);
             }
 
@@ -654,11 +655,8 @@ impl LinkWorker {
         let subscription = sys_loop
             .subscribe::<WifiEvent, _>(move |event: WifiEvent<'_>| match event {
                 WifiEvent::StaConnected(_) => {
-                    // The shared line names the AP, so a weak or far one shows in the log.
-                    match joined_ap() {
-                        Some(ap) => log::info!("WiFi associated — {}", ap),
-                        None => log::info!("WiFi associated"),
-                    }
+                    // The supervisor prints the shared `link up` line, with the AP from
+                    // `IdfRadio::joined_ap`, once the machine has counted the association.
                     events.send(LinkEvent::Connected)
                 }
                 WifiEvent::StaStopped => events.send(LinkEvent::Stopped),
@@ -666,7 +664,13 @@ impl LinkWorker {
                     // The shared line names the reason and adds the credentials
                     // hint only for reasons that point at them (bug 011), so a
                     // router deauth or our own suspend no longer blames them.
-                    log::warn!("WiFi disconnected — {}", DisconnectReason(info.reason()));
+                    log::warn!(
+                        "{}",
+                        Disconnected {
+                            reason: DisconnectReason(info.reason()),
+                            hint: ""
+                        }
+                    );
                     events.send(LinkEvent::Disconnected);
                 }
                 _ => {}
@@ -684,7 +688,15 @@ impl LinkWorker {
                     return;
                 }
                 match event {
-                    IpEvent::DhcpIpAssigned(_) => events.send(LinkEvent::NetworkUp),
+                    IpEvent::DhcpIpAssigned(assignment) => {
+                        log::info!(
+                            "{}",
+                            NetworkReady {
+                                ip: Some(assignment.ip())
+                            }
+                        );
+                        events.send(LinkEvent::NetworkUp);
+                    }
                     IpEvent::DhcpIpDeassigned(_) => events.send(LinkEvent::NetworkDown),
                     _ => {}
                 }
@@ -782,6 +794,10 @@ impl LinkRadio for IdfRadio {
     fn stop(&mut self) -> Result<(), EspError> {
         esp!(unsafe { esp_idf_svc::sys::esp_wifi_stop() })
     }
+
+    fn joined_ap(&self) -> Option<JoinedAp> {
+        joined_ap()
+    }
 }
 
 /// Reads the SoftAP factory MAC address from efuse.
@@ -854,7 +870,7 @@ impl SoftApManager {
             anyhow::anyhow!("AP config invalid (ssid len={}): {}", config.ssid.len(), e)
         })?;
 
-        log::info!("Starting SoftAP (ssid len={})", config.ssid.len());
+        log::info!("[wifi] starting softap (ssid len={})", config.ssid.len());
 
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)?;
 
@@ -899,12 +915,12 @@ impl SoftApManager {
             esp_idf_svc::sys::esp_wifi_set_max_tx_power(tx_power)
         }) {
             Ok(()) => log::info!(
-                "SoftAP TX power set to {:?} ({} quarter-dBm)",
+                "[wifi] softap tx power set to {:?} ({} quarter-dBm)",
                 config.tx_power,
                 tx_power
             ),
             Err(e) => log::warn!(
-                "Failed to set SoftAP TX power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
+                "[wifi] failed to set softap tx power to {:?} ({} quarter-dBm), continuing at radio default: {:?}",
                 config.tx_power,
                 tx_power,
                 e

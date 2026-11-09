@@ -55,6 +55,7 @@ const WORKER_TASKS: [&std::ffi::CStr; 3] = [c"wifi-link", c"mqtt-events", c"mqtt
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
     let boot = Instant::now();
 
     let client_id = env::mqtt_client_id("idf-c3-async-a");
@@ -87,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
     log::info!(
-        "[example] wifi up after {} ms, ip {}",
+        "[app] wifi up after {} ms, ip {}",
         boot.elapsed().as_millis(),
         ip
     );
@@ -122,7 +123,7 @@ fn main() -> anyhow::Result<()> {
     spike::name_next_threads(None);
 
     log::info!(
-        "[example] variant A, topics: status={} cmd={} tick={}",
+        "[app] variant A, topics: status={} cmd={} tick={}",
         status_topic,
         cmd_topic,
         tick_topic
@@ -141,7 +142,7 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
 
 async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &str) {
     wait_until(|| mqtt.is_connected()).await;
-    log::info!("[example] mqtt up after {} ms", boot.elapsed().as_millis());
+    log::info!("[app] mqtt up after {} ms", boot.elapsed().as_millis());
 
     let mut tick: u32 = 0;
     let mut last_link = wifi.state();
@@ -154,12 +155,12 @@ async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &
 
         let link = wifi.state();
         if link != last_link {
-            log::info!("[example] wifi link {:?} -> {:?}", last_link, link);
+            log::info!("[app] wifi link {:?} -> {:?}", last_link, link);
             last_link = link;
         }
         let state = mqtt.state();
         if state != last_state {
-            log::info!("[example] mqtt state {:?} -> {:?}", last_state, state);
+            log::info!("[app] mqtt state {:?} -> {:?}", last_state, state);
             last_state = state;
         }
 
@@ -169,12 +170,12 @@ async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &
             spike::heap_free()
         );
         match mqtt.try_publish(tick_topic, &payload) {
-            Ok(()) => log::info!("[example] tick #{} queued", tick),
+            Ok(()) => log::info!("[app] tick #{} queued", tick),
             Err(TryPublishError::WouldBlock) => {
-                log::info!("[example] tick #{} would block (mqtt {:?})", tick, state)
+                log::info!("[app] tick #{} would block (mqtt {:?})", tick, state)
             }
             Err(TryPublishError::Other(e)) => {
-                log::warn!("[example] tick #{} failed: {:#}", tick, e)
+                log::warn!("[app] tick #{} failed: {:#}", tick, e)
             }
         }
 

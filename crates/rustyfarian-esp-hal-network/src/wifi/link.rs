@@ -45,6 +45,7 @@
 //! suspend issued before `run` starts is kept.
 
 use core::cell::RefCell;
+use core::net::Ipv4Addr;
 use core::pin::pin;
 use core::task::Poll;
 
@@ -58,6 +59,7 @@ use esp_radio::wifi::ConnectionError;
 use esp_radio::wifi::DisconnectReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
+use juggler::wifi::lines::{ByDebug, Disconnected, Lifecycle, LinkUp, NetworkReady, Reconnecting};
 use juggler::wifi::{
     IdleWait, JoinedAp, LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink,
     CREDENTIALS_HINT,
@@ -205,9 +207,9 @@ impl WifiLink {
     pub fn suspend(&self) {
         // Readiness falls before the station goes down, as on the ESP-IDF tier.
         let (woken, change) = self.with(|h| (h.suspend(), h.take_ready_change()));
-        self.report_ready(change);
+        self.report_ready(change, None);
         if woken {
-            log::info!("[wifi] suspend requested");
+            log::info!("{}", Lifecycle::SuspendRequested);
             self.wake.signal(());
         }
     }
@@ -219,9 +221,9 @@ impl WifiLink {
     /// keeps an association that is still up, or the attempt still in flight.
     pub fn resume(&self) {
         let (woken, change) = self.with(|h| (h.resume(), h.take_ready_change()));
-        self.report_ready(change);
+        self.report_ready(change, None);
         if woken {
-            log::info!("[wifi] resume requested");
+            log::info!("{}", Lifecycle::ResumeRequested);
             self.wake.signal(());
         }
     }
@@ -232,15 +234,20 @@ impl WifiLink {
 
     /// Feeds an input observed by `run` and reports the readiness edge it caused.
     fn poll(&self, input: LinkInput) -> LinkAction {
+        self.poll_with_ip(input, None)
+    }
+
+    /// [`poll`](Self::poll), naming the station's address in the readiness line.
+    fn poll_with_ip(&self, input: LinkInput, ip: Option<Ipv4Addr>) -> LinkAction {
         let (action, change) = self.with(|h| (h.poll(input), h.take_ready_change()));
-        self.report_ready(change);
+        self.report_ready(change, ip);
         action
     }
 
     /// Hands a readiness edge from [`LinkHandover::take_ready_change`] to the waiters.
-    fn report_ready(&self, change: Option<bool>) {
+    fn report_ready(&self, change: Option<bool>, ip: Option<Ipv4Addr>) {
         if change == Some(true) {
-            log::info!("[wifi] network ready");
+            log::info!("{}", NetworkReady { ip });
             self.ready_wakers.lock(|w| w.borrow_mut().wake_all());
         }
     }
@@ -261,37 +268,45 @@ impl WifiLink {
         if up == self.is_ready() {
             return;
         }
-        self.poll(if up {
-            LinkInput::NetworkUp
-        } else {
-            LinkInput::NetworkDown
-        });
+        let ip = stack.config_v4().map(|config| config.address.address());
+        self.poll_with_ip(
+            if up {
+                LinkInput::NetworkUp
+            } else {
+                LinkInput::NetworkDown
+            },
+            ip,
+        );
     }
 
     /// Feeds an association to the machine and logs it with the joined AP.
-    fn link_up(&self, how: &str, ap: Option<JoinedAp>) -> LinkAction {
+    fn link_up(&self, adopted: bool, ap: Option<JoinedAp>) -> LinkAction {
         let action = self.poll(LinkInput::Connected);
-        self.log_association(how, ap);
+        self.log_association(adopted, ap);
         action
     }
 
     /// Restarts supervision through [`LinkHandover::start`] and returns the first action.
     fn start(&self, associated: bool, ap: Option<JoinedAp>) -> LinkAction {
         let (action, change) = self.with(|h| (h.start(associated), h.take_ready_change()));
-        self.report_ready(change);
+        self.report_ready(change, None);
         if associated {
-            self.log_association(" (adopted)", ap);
+            self.log_association(true, ap);
         }
         action
     }
 
     /// Logs an association the machine was just told about, with the AP when the driver reports it.
-    fn log_association(&self, how: &str, ap: Option<JoinedAp>) {
+    fn log_association(&self, adopted: bool, ap: Option<JoinedAp>) {
         if self.state() == LinkState::Connected {
-            match ap {
-                Some(ap) => log::info!("[wifi] link up #{}{} — {}", self.connect_count(), how, ap),
-                None => log::info!("[wifi] link up #{}{}", self.connect_count(), how),
-            }
+            log::info!(
+                "{}",
+                LinkUp {
+                    count: self.connect_count(),
+                    adopted,
+                    ap
+                }
+            );
         } else {
             log::info!("[wifi] associated while suspended, disconnecting again");
         }
@@ -344,7 +359,7 @@ impl WifiLink {
                         }
                     };
                     match outcome {
-                        Ok(()) => self.link_up("", joined_ap(&controller)),
+                        Ok(()) => self.link_up(false, joined_ap(&controller)),
                         Err(action) => action,
                     }
                 }
@@ -356,20 +371,35 @@ impl WifiLink {
                     )
                     .await
                     {
-                        Ok(Ok(info)) => log::info!("[wifi] suspended — {:?}", info.reason),
-                        Ok(Err(e)) => log::info!("[wifi] suspended ({:?})", e),
-                        Err(_) => log::warn!(
-                            "[wifi] suspended — disconnect gave up after {} ms; \
-                             reporting suspended although the station may still be associated",
-                            SUSPEND_DISCONNECT_TIMEOUT_MS
-                        ),
+                        Ok(Ok(info)) => {
+                            log::debug!("[wifi] disconnect reason: {:?}", info.reason);
+                            log::info!("{}", Lifecycle::Suspended);
+                        }
+                        Ok(Err(e)) => {
+                            log::debug!("[wifi] disconnect error: {:?}", e);
+                            log::info!("{}", Lifecycle::Suspended);
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "[wifi] disconnect gave up after {} ms; \
+                                 reporting suspended although the station may still be associated",
+                                SUSPEND_DISCONNECT_TIMEOUT_MS
+                            );
+                            log::info!("{}", Lifecycle::Suspended);
+                        }
                     }
                     self.with(|h| h.end_park(epoch));
                     self.suspend_wakers.lock(|w| w.borrow_mut().wake_all());
                     LinkAction::None
                 }
                 LinkAction::Wait { ms } => {
-                    log::info!("[wifi] reconnecting in {} ms", ms);
+                    log::info!(
+                        "{}",
+                        Reconnecting {
+                            ms,
+                            attempt: self.with(|h| h.failed_attempts())
+                        }
+                    );
                     let mut timer = pin!(Timer::after_millis(ms));
                     loop {
                         match select(self.handed_over(), timer.as_mut()).await {
@@ -412,13 +442,19 @@ impl WifiLink {
                                             // form; the credentials hint is the one both
                                             // tiers share (bug 011).
                                             Ok(info) => log::warn!(
-                                                "[wifi] disconnected — {:?}{}",
-                                                info.reason,
-                                                hal_disconnect_hint(&info.reason)
+                                                "{}",
+                                                Disconnected {
+                                                    reason: ByDebug(&info.reason),
+                                                    hint: hal_disconnect_hint(&info.reason)
+                                                }
                                             ),
-                                            Err(e) => {
-                                                log::warn!("[wifi] disconnected — {:?}", e)
-                                            }
+                                            Err(e) => log::warn!(
+                                                "{}",
+                                                Disconnected {
+                                                    reason: ByDebug(&e),
+                                                    hint: ""
+                                                }
+                                            ),
                                         }
                                         break self.poll(LinkInput::Disconnected);
                                     }

@@ -565,13 +565,13 @@ mod driver {
 
             if config.password.is_empty() {
                 log::warn!(
-                    "Wi-Fi password is empty — auth will fail on WPA2/WPA3 networks; \
+                    "[wifi] password is empty — auth will fail on WPA2/WPA3 networks; \
                      set WIFI_PASS at build time (option_env! captures at compile time, not runtime)"
                 );
             }
 
             log::info!(
-                "Wi-Fi configured (SSID len={}, password: {}), power save: {:?}",
+                "[wifi] configured (ssid len={}, password: {}), power save: {:?}",
                 config.ssid.len(),
                 if config.password.is_empty() {
                     "absent"
@@ -849,7 +849,7 @@ mod driver {
             // (even the channel or the SSID length) as cleartext credential
             // logging. The provisioning layer logs the SSID length from the
             // resolver output, and an open AP emits its own warning above.
-            log::info!("SoftAP configured");
+            log::info!("[wifi] softap configured");
 
             // 5. Build the embassy-net stack with a static AP IP.
             //    The capacity is `SUBSTRATE_SOCKET_COUNT` (DHCP UDP + DNS UDP +
@@ -1008,7 +1008,7 @@ pub fn softap_mac() -> [u8; 6] {
 pub(crate) fn warn_if_open_ap(ap_password: Option<&str>) {
     if ap_password.is_none() {
         log::warn!(
-            "SoftAP is open (no WPA2 password) — anyone in radio range can reach \
+            "[wifi] softap is open (no WPA2 password) — anyone in radio range can reach \
              the portal endpoints; set a password for any deployment outside a lab"
         );
     }

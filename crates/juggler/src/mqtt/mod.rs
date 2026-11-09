@@ -5,6 +5,7 @@ pub mod chunks;
 mod client;
 mod gate;
 mod host;
+pub mod lines;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 #[cfg(feature = "std")]

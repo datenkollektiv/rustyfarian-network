@@ -117,6 +117,7 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let mut delay = Delay::new();
 
+    println!("[app] start {} (esp-hal)", env!("CARGO_CRATE_NAME"));
     println!("hal_esp32s3_join: SX1262 bring-up starting");
 
     // --- GPIO setup ---------------------------------------------------------

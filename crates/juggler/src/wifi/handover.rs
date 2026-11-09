@@ -175,8 +175,7 @@ impl LinkHandover {
     }
 
     /// Consecutive failed attempts (see [`LinkMachine::failed_attempts`]).
-    #[cfg(feature = "std")]
-    pub(crate) fn failed_attempts(&self) -> u32 {
+    pub fn failed_attempts(&self) -> u32 {
         self.machine.failed_attempts()
     }
 }

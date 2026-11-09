@@ -41,6 +41,7 @@ use esp_idf_svc::handle::RawHandle as _;
 use esp_idf_svc::mqtt::client::{
     EspMqttClient, EspMqttConnection, LwtConfiguration, MqttClientConfiguration,
 };
+use juggler::mqtt::lines::{Connecting, Reconnecting, WaitingForNetwork};
 use juggler::mqtt::{ConnectWorkPlan, NetworkGate, SessionAction, SessionInput, SessionToken};
 
 use super::session::Session;
@@ -127,6 +128,10 @@ pub(super) struct Runner {
     /// `None` once every handle is gone; the runner then shuts the session down.
     pub(super) alive: Weak<()>,
     pub(super) config: ClientConfig,
+    /// Broker host and port for the shared `connecting to` line; separate from
+    /// `config`, which also carries the credentials.
+    pub(super) broker_host: String,
+    pub(super) broker_port: u16,
     /// Raw `esp_mqtt_client_handle_t` of the live client, as an address because
     /// raw pointers are not `Send` (same idiom as the station netif handle).
     pub(super) handle: Option<usize>,
@@ -156,7 +161,6 @@ impl Runner {
         // in between is already queued and is applied after the seed.
         let mut gate = NetworkGate::new();
         let mut retry_at: Option<Instant> = None;
-        let mut announced_wait = false;
 
         if let Some(input) = gate.feed(self.seed_ready) {
             self.act(input, &mut retry_at);
@@ -178,11 +182,7 @@ impl Runner {
                 Ok(Msg::Ready(ready)) => {
                     if let Some(input) = gate.feed(ready) {
                         if input == SessionInput::NetworkDown {
-                            log::info!("[mqtt] waiting for network");
-                            announced_wait = true;
-                        } else if announced_wait {
-                            announced_wait = false;
-                            log::info!("[mqtt] network up, connecting");
+                            log::info!("{}", WaitingForNetwork);
                         }
                         self.act(input, &mut retry_at);
                     }
@@ -229,7 +229,7 @@ impl Runner {
             } => self.connect_work(token, subscribe, session_present),
             SessionAction::Close => self.close(),
             SessionAction::Wait { ms } => {
-                log::warn!("[mqtt] reconnecting in {} ms", ms);
+                log::warn!("{}", Reconnecting { ms });
                 *retry_at = Some(Instant::now() + Duration::from_millis(ms));
             }
         }
@@ -237,6 +237,13 @@ impl Runner {
 
     /// Creates the client on the first attempt, reconnects it afterwards.
     fn connect(&mut self) {
+        log::info!(
+            "{}",
+            Connecting {
+                host: self.broker_host.as_str(),
+                port: self.broker_port
+            }
+        );
         match self.handle {
             Some(handle) => kick(handle),
             None => self.create_client(),

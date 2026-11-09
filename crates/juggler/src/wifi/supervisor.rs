@@ -35,7 +35,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::handover::LinkHandover;
+use super::lines::{Lifecycle, LinkUp, Reconnecting};
 use super::link::{LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_MAX_MS};
+use super::JoinedAp;
 use crate::wait_list::{Wait, WaitList};
 
 /// Machine polls one input may take: the action, plus one more after a refused
@@ -54,6 +56,11 @@ pub trait LinkRadio: Send + 'static {
     fn disconnect(&mut self) -> Result<(), Self::Error>;
     /// Stops the radio; the driver then posts [`LinkEvent::Stopped`].
     fn stop(&mut self) -> Result<(), Self::Error>;
+    /// The AP the station is associated with, for the `link up` line; `None` when the
+    /// driver cannot say. Called on the worker thread right after an association.
+    fn joined_ap(&self) -> Option<JoinedAp> {
+        None
+    }
 }
 
 /// A driver event, delivered through [`LinkEvents`] in the order the driver posted it.
@@ -150,7 +157,7 @@ impl<R: LinkRadio> Core<R> {
         }
         // Not connected (yet) is fine: the stop aborts an attempt as well.
         if let Err(e) = self.radio.disconnect() {
-            log::debug!("WiFi disconnect before stop: {:?}", e);
+            log::debug!("[wifi] disconnect before stop: {:?}", e);
         }
         self.radio.stop()?;
         self.radio_started = false;
@@ -291,7 +298,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         if !effective && !core.radio_started {
             return Ok(());
         }
-        log::info!("WiFi suspending");
+        log::info!("{}", Lifecycle::SuspendRequested);
         // Report before the stop: the machine is already `Suspended`, so consumers
         // must hear that the link is gone before the driver tears it down, including
         // when the stop then fails. This is a notification, not a handshake — a
@@ -300,7 +307,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
         // (runbook R3). Guaranteeing a clean close would need an acknowledgement.
         core.report_ready();
         core.radio_down()?;
-        log::info!("WiFi suspended");
+        log::info!("{}", Lifecycle::Suspended);
         Ok(())
     }
 
@@ -316,14 +323,14 @@ impl<R: LinkRadio> LinkSupervisor<R> {
             return Ok(());
         }
         core.backoff_at = None;
+        log::info!("{}", Lifecycle::ResumeRequested);
         match core.connect() {
             Ok(()) => {
-                log::info!("WiFi resumed, connect requested");
                 core.report_ready();
                 Ok(())
             }
             Err(e) => {
-                log::warn!("WiFi resume: connect request failed: {:?}", e);
+                log::warn!("[wifi] resume: connect request failed: {:?}", e);
                 // Schedule the retry under the same lock, then let the worker
                 // pick up the new deadline.
                 step(&mut core, LinkInput::ConnectFailed);
@@ -361,7 +368,7 @@ impl<R: LinkRadio> Drop for LinkSupervisor<R> {
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
-                log::warn!("WiFi link worker panicked");
+                log::warn!("[wifi] link worker panicked");
             }
         }
     }
@@ -403,7 +410,7 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>, ready: &W
                     continue;
                 }
                 Some(Msg::Event(event)) if core.fence_up() => {
-                    log::debug!("WiFi {:?} predates the last stop, dropped", event);
+                    log::debug!("[wifi] {:?} predates the last stop, dropped", event);
                     continue;
                 }
                 Some(Msg::Event(LinkEvent::Connected)) => LinkInput::Connected,
@@ -412,7 +419,23 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>, ready: &W
                 Some(Msg::Event(LinkEvent::NetworkDown)) => LinkInput::NetworkDown,
                 Some(Msg::Input(input)) => input,
             };
+            let connects = core.handover.connect_count();
             step(&mut core, input);
+            // Counted by the machine, so an ignored duplicate or an association
+            // that landed while suspended logs nothing.
+            if core.handover.connect_count() != connects
+                && core.handover.state() == LinkState::Connected
+            {
+                let ap = core.radio.joined_ap();
+                log::info!(
+                    "{}",
+                    LinkUp {
+                        count: core.handover.connect_count(),
+                        adopted: false,
+                        ap
+                    }
+                );
+            }
             core.report_ready();
             core.handover.is_ready()
         };
@@ -421,7 +444,7 @@ fn run_worker<R: LinkRadio>(rx: &Receiver<Msg>, core: &Mutex<Core<R>>, ready: &W
             ready.wake_all();
         }
     }
-    log::debug!("WiFi link worker exited");
+    log::debug!("[wifi] link worker exited");
 }
 
 /// Feeds one input to the machine and performs the resulting actions, at most
@@ -433,12 +456,12 @@ fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
         match action {
             LinkAction::None => {}
             LinkAction::Ignored => {
-                log::debug!("WiFi {:?} ignored in {:?}", input, core.handover.state());
+                log::debug!("[wifi] {:?} ignored in {:?}", input, core.handover.state());
             }
             LinkAction::Connect => match core.connect() {
-                Ok(()) => log::info!("WiFi connect requested"),
+                Ok(()) => log::info!("[wifi] connect requested"),
                 Err(e) => {
-                    log::warn!("WiFi connect request failed: {:?}", e);
+                    log::warn!("[wifi] connect request failed: {:?}", e);
                     action = core.handover.poll(LinkInput::ConnectFailed);
                     continue;
                 }
@@ -446,14 +469,16 @@ fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
             LinkAction::Disconnect => {
                 // An association that landed after `suspend`.
                 if let Err(e) = core.radio_down() {
-                    log::warn!("WiFi stop while suspended failed: {:?}", e);
+                    log::warn!("[wifi] stop while suspended failed: {:?}", e);
                 }
             }
             LinkAction::Wait { ms } => {
                 log::info!(
-                    "WiFi reconnect in {} ms (attempt {})",
-                    ms,
-                    core.handover.failed_attempts()
+                    "{}",
+                    Reconnecting {
+                        ms,
+                        attempt: core.handover.failed_attempts()
+                    }
                 );
                 core.backoff_at = Some(Instant::now() + Duration::from_millis(ms));
             }
@@ -467,7 +492,7 @@ fn step<R: LinkRadio>(core: &mut Core<R>, input: LinkInput) {
     if !settled {
         // The machine kept asking for I/O; never let the worker spin under the lock.
         log::error!(
-            "WiFi link step for {:?} did not settle in {} rounds (last {:?}); pausing {} ms",
+            "[wifi] link step for {:?} did not settle in {} rounds (last {:?}); pausing {} ms",
             input,
             STEP_ROUNDS,
             action,

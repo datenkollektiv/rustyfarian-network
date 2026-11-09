@@ -101,6 +101,7 @@ const JOIN_BUDGET_MS: u32 = 60_000;
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    log::info!("[app] start {} (esp-idf)", env!("CARGO_CRATE_NAME"));
 
     let tag = "idf_esp32s3_join";
 
