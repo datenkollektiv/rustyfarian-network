@@ -20,7 +20,7 @@ checks = ["connect", "mqtt-lwt", "mqtt"]
 [boards.s3]
 chip = "esp32s3"
 name = "CrowPanel 1.28\" HMI (ESP32-S3)"
-checks = ["connect", "mqtt-lwt"]
+checks = ["connect", "mqtt-lwt", "mqtt-scenarios", "suspend"]   # then provision and soak by name
 
 [boards.esp32]
 chip = "esp32"

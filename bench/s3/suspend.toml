@@ -1,0 +1,113 @@
+# Suspend/resume demo (R3) and `wait_suspended` on the CrowPanel S3, both tiers (runbook S3-B1 R3 and the
+# `wait_suspended` half of S3-B2). Both examples run examples-shared/lwt_app.rs (log prefix `[app]`).
+# Steps follow R3 of docs/runbooks/wifi-reconnect-hardware-test.md: the app suspends 20 s at every full
+# minute of uptime; three cycles are judged, the second one at the broker (the will at the client-id takeover
+# and `online` right after), the first and third on serial. A probe step consumes the serial lines meanwhile,
+# which is why the broker cycle judges no serial lines.
+# Build WITH the demo; a shell variable wins over the dotenv file:
+#   MQTT_SUSPEND_DEMO=1 MQTT_HOST=<this machine> MQTT_PORT=1883 just bench s3 suspend --port <s3 port>
+# Uses `probe` and `serial_reject` (rustyfarian-bench v0.5.0 or later). Unattended: no person acts.
+# The hal 500 ms bound on `wait_suspended` is approximated by the 2 s step timeout (the hal log has no
+# timestamps); the IDF return is immediate by design. The `[app] heap free` lines are read by eye afterwards.
+examples = ["hal_esp32s3_mqtt_lwt", "idf_esp32s3_mqtt_lwt"]
+setup = [["just", "mosquitto", "up"], ["just", "mqtt-pub", "bench-ping", "1"]]
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150
+optional = true
+arm = false
+
+[[step]]
+say = "First broker session and a queued tick"
+expect = ['Wi-Fi connected \W+ IP: ', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #1 free heap: \d+ B', '\[app\] tick #\d+ queued']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+arm = false
+
+# ── cycle 1 (uptime 60 s), judged on serial ─────────────────────────────────
+
+[[step]]
+say = "Cycle 1: the demo suspends at the first full minute"
+arm = false
+expect = '\[app\] demo: suspend for 20 s'
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 75
+
+[[step]]
+say = "Cycle 1: wait_suspended returns promptly (hal within about 500 ms, IDF at once)"
+arm = false
+expect = '\[app\] demo: wait_suspended returned, is_suspended = true'
+reject = 'wait_suspended timed out|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 2
+
+[[step]]
+say = "Cycle 1: the radio stops, MQTT drops within a second, the link and session states follow, ticks would block"
+# IDF prints its `[wifi] disconnected — reason 8` and one `[mqtt] error` here; both are expected.
+arm = false
+expect = ['\[wifi\] suspended', '\[mqtt\] disconnected', '\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 15
+
+[[step]]
+say = "Cycle 1: while suspended no reconnect, no connect attempt, no queued tick"
+arm = false
+duration = 8
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[mqtt\] reconnecting in|\[mqtt\] connecting to|\[mqtt\] connected|Error transport connect|\[app\] tick #\d+ (queued|failed)|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Cycle 1: resume brings exactly one connect, MQTT back and a queued tick"
+arm = false
+expect = ['\[app\] demo: resume', '\[wifi\] resume requested', '\[wifi\] link up #2', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #2 free heap: \d+ B', '\[app\] tick #\d+ queued']
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+# ── cycle 2 (uptime 120 s), judged at the broker ────────────────────────────
+
+[[step]]
+say = "Cycle 2: the broker replays `online`, publishes the will at the reconnect and gets `online` right after"
+# The 20 s suspend is shorter than the 45 s will timeout, so the broker drops the old session on the client-id
+# takeover and publishes the will right before the fresh `online`.
+probe = ["just", "mqtt-watch", "{example}", "100"]
+arm = false
+expect = ['/status retain=1 online', '/status retain=0 offline', '/status retain=0 online']
+serial_reject = 'wait_suspended timed out|\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 100
+
+# ── cycle 3 (uptime 180 s), judged on serial ────────────────────────────────
+
+[[step]]
+say = "Cycle 3: the demo suspends at the third full minute"
+arm = false
+expect = '\[app\] demo: suspend for 20 s'
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 75
+
+[[step]]
+say = "Cycle 3: wait_suspended returns promptly"
+arm = false
+expect = '\[app\] demo: wait_suspended returned, is_suspended = true'
+reject = 'wait_suspended timed out|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 2
+
+[[step]]
+say = "Cycle 3: the radio stops, MQTT drops, states follow, ticks would block"
+arm = false
+expect = ['\[wifi\] suspended', '\[mqtt\] disconnected', '\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 15
+
+[[step]]
+say = "Cycle 3: while suspended no reconnect, no connect attempt, no queued tick"
+arm = false
+duration = 8
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[mqtt\] reconnecting in|\[mqtt\] connecting to|\[mqtt\] connected|Error transport connect|\[app\] tick #\d+ (queued|failed)|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Cycle 3: resume brings the fourth connect and a queued tick; the minute heap line is read by eye"
+arm = false
+expect = ['\[app\] demo: resume', '\[wifi\] resume requested', '\[wifi\] link up #4', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #4 free heap: \d+ B', '\[app\] tick #\d+ queued']
+reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
