@@ -97,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `previous_update_rolled_back()` on `rustyfarian-esp-hal-network` `EspHalOtaManager` and `rustyfarian-esp-idf-network` `OtaSession`: whether the other slot's otadata entry is `Aborted` or `Invalid` (the last update was rolled back).
 - `juggler::lora::sx1262::{take_irq_status, irq_read_mask}`: read the IRQ status and clear only the flags that were read, so a flag that latches after the read survives to the next poll.
 - `juggler::mqtt::{SubscribeWindow, AckStatus, SUBSCRIBE_WINDOW}` and `SubscriptionTracker::{next_pending_from, send_owed}`: the window of eight that paces subscriptions, the SUBACK verdict per entry, and the send of the newest owed QoS.
+- `juggler::espnow::{ProbeFrame, ProbeReply, TAG_PROBE, TAG_PROBE_REPLY}` (`no_std`, no alloc): the scan probe `[0xF3, seq, tx_channel]` and its reply `[0xF4, seq, tx_channel, home_channel]`, with `encode`, `parse` (wrong tag or length rejected) and `ProbeReply::answering`, so a coordinator can state the channel it is parked on instead of relying on the MAC-layer ACK (bug 018).
 
 ### Changed
 
@@ -385,6 +386,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- esp-hal OTA: `EspHalOtaManager::fetch_and_apply` now opens the TCP connection to the image server itself; before, it wrote the `GET` onto the caller's unconnected socket and every fetch failed at once as `ServerUnreachable` with nothing in the server log.
+  The host must be an IPv4 literal (no DNS on this tier); a failed connect logs the embassy-net error, a connect timeout is `DownloadTimeout`, and the connect time comes off the header-phase budget.
+  The status-line parser also accepts `HTTP/1.0`, which `just ota-serve` (Python's `http.server`) answers with; it rejected it as `BadStatusLine` before; see `docs/bugs/archive/020-hal-ota-never-connects-the-socket-2026-11-11.md`.
 - ESP-NOW `scan_for_peer` started right after a cancelled (dropped) scan now waits for the cancelled scan's restore and then runs, on both tiers, instead of failing with `Busy` ("ESP-NOW radio is busy"); `Busy` stays for another caller's running scan and for an untaken result.
   `juggler::espnow::ScanGate::admit` reports the waiting case as the new `GateRefusal::Unwinding`; see `docs/bugs/016-espnow-rescan-busy-after-cancel-2026-11-10.md`.
 - ESP-IDF provisioning portal: the httpd stack grows from 10 KB to 16 KB, because `POST /save` overflowed it in the shared `parse_form` (4.5 KB frame) on the first submit, so the device rebooted before committing and reopened the portal on every boot.

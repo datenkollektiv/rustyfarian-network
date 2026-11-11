@@ -1,14 +1,17 @@
-# ESP-NOW shutdown with queued sends and no scan on ESP-IDF
-# Runbook gate C3-I9; ESP-IDF scout `idf_c3_espnow_scout` with `ESPNOW_SCENARIO=shutdown-queued`, against a running
+# ESP-NOW shutdown with queued sends and no scan on both tiers
+# Runbook gates C3-I9 (ESP-IDF scout `idf_c3_espnow_scout`) and C3-H8 (hal peer `hal_c3_espnow_peer`), both with
+# `ESPNOW_SCENARIO=shutdown-queued`, against a running
 # ESP-NOW coordinator (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
+# The hal peer reads the coordinator MAC from `ESPNOW_PEER_MAC`, so set both MAC variables;
+# `just bench idf_c3_espnow_scout` or `just bench hal_c3_espnow_peer` runs one tier only.
 # Both variables are read at build time; set them in the shell for the run, or the scout runs its default loop:
-#   ESPNOW_SCENARIO=shutdown-queued COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-shutdown-queued --port <c3 port>
+#   ESPNOW_SCENARIO=shutdown-queued COORDINATOR_MAC=<mac> ESPNOW_PEER_MAC=<mac> just bench c3 espnow-shutdown-queued --port <c3 port>
 # The first step reads the boot, so only the later steps reject a reboot. No person needed.
-examples = ["idf_c3_espnow_scout"]
+examples = ["idf_c3_espnow_scout", "hal_c3_espnow_peer"]
 
 [[step]]
 say = "Shutdown right after queueing ends every queued send with Shutdown"
-expect = ['ESPNOW-GATE C3-I9 PASS: shutdown with queued sends: ']
+expect = ['ESPNOW-GATE C3-(I9|H8) PASS: shutdown with queued sends: ']
 reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 120
 arm = false
@@ -16,5 +19,5 @@ arm = false
 [[step]]
 say = "The process stays up after the shutdown: no reboot, no second report"
 duration = 10
-reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \(|ESPNOW-GATE C3-I9'
+reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \(|ESPNOW-GATE C3-(I9|H8)'
 arm = false

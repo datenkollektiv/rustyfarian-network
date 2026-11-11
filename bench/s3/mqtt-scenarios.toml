@@ -1,13 +1,14 @@
-# Shared-app MQTT scenarios on the CrowPanel S3, both tiers (runbook S3-H1 T5a/T5b, S3-B1 R1, and the
+# Shared-app MQTT scenarios on the CrowPanel S3, both tiers (runbook S3-H1 T5b, S3-B1 R1, and the
 # startup-message half of S3-B2); the suspend demo (R3, `wait_suspended`) is the `suspend` check.
 # Both examples run examples-shared/lwt_app.rs, so one set of steps judges both tiers (log prefix `[app]`).
-# Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md (T1, T4, T5a, T5b) and
+# Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md (T1, T4, T5b) and
 # docs/runbooks/wifi-reconnect-hardware-test.md (R1); serial lines and broker messages are judged here.
 # Uses `setup`, `run`, `probe` and `serial_reject` (rustyfarian-bench v0.5.0 or later).
 # Probe output comes from `just mqtt-watch {example}` (`retain=1` is the replay at subscribe, `retain=0` a live
 # message) and `just mqtt-status {example}` (the retained status).
 # No step waits for Enter: each watches from the end of the previous step, so an action may come at any time.
-# Still a person: the router pause and the AP switch-off.
+# Still a person: the router pause. T5a (AP off) is not run: on a mesh the board roams to another node of
+# the same SSID, and the per-device pause covers the same link-loss path (as on the C6).
 # The broker is the local one from `just mosquitto` (T4 restarts it), so MQTT_HOST must be this machine's
 # LAN IPv4 (or a LAN hostname for the hal DNS line of S3-B2) that the board can reach, at build time and for
 # the recipes; a shell variable wins over the dotenv file:
@@ -70,6 +71,14 @@ timeout = 10
 # ── T5b / R1: per-device pause on the router for 3 minutes ──────────────────
 
 [[step]]
+say = "T5b/R1: wait until the board is online (the attended run skips T1 and reads the reset banner here)"
+attended = true   # the precondition for the pause: without a broker session there is no will
+arm = false
+expect = '\[app\] tick #\d+ queued'
+reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+
+[[step]]
 say = "T5b/R1: Pause the board on the router (MAC {mac}) and keep it paused"
 attended = true   # a person acts on the router
 arm = false       # watch from the end of the previous step: the action may come at any time
@@ -104,48 +113,12 @@ attended = true
 arm = false
 # The next back-off attempt comes at most 30 s after the unpause; MQTT follows the link-up line within 15 s
 # on hal and at esp-mqtt's next retry on IDF.
-expect = ['\[wifi\] link up #[2-9]', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #3 free heap: \d+ B', '\[app\] tick #\d+ queued']
+expect = ['\[wifi\] link up #[2-9]', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #\d+ free heap: \d+ B', '\[app\] tick #\d+ queued']
 reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 120
 
 [[step]]
 say = "T5b/R1: the startup message `online` is retained again after the Wi-Fi blip (S3-B2)"
-attended = true
-probe = ["just", "mqtt-status", "{example}"]
-arm = false
-expect = '^online$'
-serial_reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
-timeout = 10
-
-# ── T5a: AP off for at least 90 s ───────────────────────────────────────────
-# On a mesh the board roams to another node of the same SSID, so switch the whole Wi-Fi network off
-# (or pause it) rather than one node; the criteria are those of T5b.
-
-[[step]]
-say = "T5a: Switch the AP off (on a mesh: pause the whole Wi-Fi network) and keep it off"
-attended = true   # a person acts on the AP
-arm = false
-expect = ['\[wifi\] disconnected', '\[mqtt\] disconnected', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
-reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
-timeout = 150
-
-[[step]]
-say = "T5a: keep the AP off for 90 s"
-arm = false
-attended = true
-duration = 90
-reject = '\[app\] tick #\d+ (queued|failed)|\[mqtt\] connected|Error transport connect|\[wifi\] reconnecting in (?!30000 )([3-9]\d{4}|\d{6,}) ms|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
-
-[[step]]
-say = "T5a: Switch the AP on again; it reconnects without a reboot"
-attended = true
-arm = false
-expect = ['\[wifi\] link up #[3-9]', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #4 free heap: \d+ B', '\[app\] tick #\d+ queued']
-reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
-timeout = 180   # an AP takes longer to come back than a router unpause
-
-[[step]]
-say = "T5a: the startup message `online` is retained again"
 attended = true
 probe = ["just", "mqtt-status", "{example}"]
 arm = false

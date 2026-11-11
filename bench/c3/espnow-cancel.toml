@@ -1,18 +1,21 @@
-# ESP-NOW scan cancel and not-found restore on ESP-IDF.
-# Runbook gate C3-I7; ESP-IDF scout `idf_c3_espnow_scout` with `ESPNOW_SCENARIO=cancel`, against an ESP-NOW
-# coordinator on another board (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
+# ESP-NOW scan cancel and not-found restore on both tiers.
+# Runbook gates C3-I7 (ESP-IDF scout `idf_c3_espnow_scout`) and C3-H6 (hal peer `hal_c3_espnow_peer`), both with
+# `ESPNOW_SCENARIO=cancel`, against an ESP-NOW coordinator on another board (an IDF C3 `idf_c3_espnow_coordinator`
+# or the hal C6 `hal_c6_espnow_sta_coordinator`); the hal peer reads the MAC from `ESPNOW_PEER_MAC`, so set both.
 # Power the coordinator OFF before starting: the gate first watches two minutes of not-found scans.
-#   ESPNOW_SCENARIO=cancel COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-cancel --port <c3 port>
-# Each cycle cancels a scan after 3, 10, 25, 60, 120 or 250 ms, then scans fully; the scout logs
-# `ESPNOW-GATE C3-I7 PASS|FAIL` per check. Once found, the coordinator must stay up and on its channel.
+#   ESPNOW_SCENARIO=cancel COORDINATOR_MAC=<mac> ESPNOW_PEER_MAC=<mac> just bench c3 espnow-cancel --port <c3 port>
+# (`just bench idf_c3_espnow_scout` or `just bench hal_c3_espnow_peer` runs one tier only.)
+# Each cycle cancels a scan after 3, 10, 25, 60, 120 or 250 ms, then scans fully; the example logs
+# `ESPNOW-GATE C3-I7 PASS|FAIL` (scout) or `ESPNOW-GATE C3-H6 PASS|FAIL` (hal peer) per check; the scout reports the
+# pinned channel, the hal peer its whole `RadioState`. Once found, the coordinator must stay up and on its channel.
 # A person powers the coordinator on once; no step waits for Enter.
-examples = ["idf_c3_espnow_scout"]
+examples = ["idf_c3_espnow_scout", "hal_c3_espnow_peer"]
 
 [[step]]
 say = "With the coordinator off, a cancelled scan keeps the pinned channel and a full scan ends not-found"
 attended = true   # needs the coordinator powered off
 arm = false       # the first cycle starts during the boot
-expect = ['ESPNOW-GATE C3-I7 PASS: scan cancelled after \d+ ms, pinned channel (?P<pin>\S+) -> (?P=pin)', 'ESPNOW-GATE C3-I7 PASS: not-found scan ended']
+expect = ['ESPNOW-GATE C3-(I7|H6) PASS: scan cancelled after \d+ ms, (pinned channel (?P<pin>\S+) -> (?P=pin)|state (?P<st>RadioState \{[^}]*\}) -> (?P=st))', 'ESPNOW-GATE C3-(I7|H6) PASS: not-found scan ended']
 reject = 'ESPNOW-GATE \S+ FAIL|scan after cancel found|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 120
 
@@ -27,7 +30,7 @@ reject = 'ESPNOW-GATE \S+ FAIL|scan after cancel found|TX power not restored|PAN
 say = "Power the coordinator on; the scout finds it"
 attended = true   # a person powers the coordinator on
 arm = false
-expect = 'ESPNOW-GATE C3-I7 PASS: scan after cancel found the coordinator on channel (?P<ch>\d+) \(earlier None\)'
+expect = 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P<ch>\d+) \(earlier None\)'
 reject = 'ESPNOW-GATE \S+ FAIL|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 180
 
@@ -35,7 +38,7 @@ timeout = 180
 say = "Cancelled scans keep the pinned channel, and every later scan finds the coordinator on the same channel"
 attended = true   # judges the coordinator that was just powered on
 arm = false
-# Three more cycles; the scout itself fails a scan that lands on another channel than the first find.
-expect = ['ESPNOW-GATE C3-I7 PASS: scan cancelled after \d+ ms', 'ESPNOW-GATE C3-I7 PASS: scan after cancel found the coordinator on channel (?P=ch) \(earlier Some\((?P=ch)\)\)', 'ESPNOW-GATE C3-I7 PASS: scan after cancel found the coordinator on channel (?P=ch)', 'ESPNOW-GATE C3-I7 PASS: scan after cancel found the coordinator on channel (?P=ch)']
+# Three more cycles; the example itself fails a scan that lands on another channel than the first find.
+expect = ['ESPNOW-GATE C3-(I7|H6) PASS: scan cancelled after \d+ ms', 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P=ch) \(earlier Some\((?P=ch)\)\)', 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P=ch)', 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P=ch)']
 reject = 'ESPNOW-GATE \S+ FAIL|not-found scan ended|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 90

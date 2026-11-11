@@ -1,0 +1,49 @@
+# esp-hal broker hostname on the CrowPanel S3 (runbook S3-B2, the esp-hal DNS line), following c6/dns-subscribe.
+# Build and recipes use a LAN hostname for the local `just mosquitto` broker, which the board resolves through its
+# DHCP DNS server; a shell variable wins over the dotenv file:
+#   MQTT_HOST=bench-broker MQTT_PORT=1883 just bench s3 dns-subscribe --port <s3 port>
+# The shared app (examples-shared/lwt_app.rs) has no runtime subscribe, so the broker side is judged by probes.
+# The unresolvable half is `s3/dns-unresolvable`; the IPv4-literal case is every other S3 MQTT check.
+# Uses `setup`, `run`, `probe` and `teardown` (rustyfarian-bench v0.5.0 or later). No person needed.
+examples = ["hal_esp32s3_mqtt_lwt"]
+# `just mqtt-pub` exits non-zero when MQTT_HOST does not resolve or the broker is unreachable.
+setup = [["just", "mosquitto", "up"], ["just", "mqtt-pub", "bench-ping", "1"]]
+teardown = [["just", "mosquitto", "up"]]
+
+[[step]]
+say = "Check the signal of the joined AP (warns below -75 dBm)"
+expect = 'link up #1(?! .*rssi -(7[6-9]|[89]\d) dBm)'
+reject = 'rssi -(7[6-9]|[89]\d) dBm'
+timeout = 150
+optional = true
+arm = false
+
+[[step]]
+say = "The firmware connects to the broker by its hostname"
+# The configured line must name the host, not an address, so the session below came through DNS.
+expect = ['\[mqtt\] configured broker [A-Za-z][\w.-]*[A-Za-z]:\d+ ', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #1 free heap: \d+ B', '\[app\] tick #\d+ queued']
+reject = '\[mqtt\] dns lookup of|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 150
+arm = false       # printed during the reset
+
+[[step]]
+say = "The startup message `online` is retained at the broker and live ticks arrive through the resolved session"
+probe = ["just", "mqtt-watch", "{example}"]
+arm = false
+expect = ['/status retain=1 online', '/tick retain=0 \{"tick":\d+']
+timeout = 30
+
+[[step]]
+say = "Restart the broker; the firmware resolves the name again and reconnects"
+run = ["just", "mosquitto", "restart"]
+arm = false
+expect = ['\[mqtt\] disconnected', '\[mqtt\] connected \(session present: no, 1 subscriptions\)', '\[app\] connect #2 free heap: \d+ B', '\[app\] tick #\d+ queued']
+reject = '\[mqtt\] dns lookup of|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+[[step]]
+say = "The startup message `online` is retained again after the broker restart"
+probe = ["just", "mqtt-status", "{example}"]
+arm = false
+expect = '^online$'
+timeout = 20

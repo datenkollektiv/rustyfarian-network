@@ -6,7 +6,9 @@
 
 use core::time::Duration as CoreDuration;
 
+use core::net::Ipv4Addr;
 use embassy_net::tcp::TcpSocket;
+use embassy_net::{IpAddress, IpEndpoint};
 use embassy_time::{with_timeout, Duration, Instant};
 use embedded_storage::nor_flash::NorFlash;
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
@@ -641,6 +643,38 @@ impl<'d> EspHalOtaManager<'d> {
             Ok(parsed) => parsed,
             Err(e) => return DownloadInput::ConnectFailed(OtaError::from(e)),
         };
+        // Open the TCP connection here: the caller hands over an unconnected
+        // socket, and this tier resolves no names, so the host must be an
+        // IPv4 literal. The connect shares the budget with the header phase.
+        let ip: Ipv4Addr = match parsed.host.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                log::error!(
+                    "OTA: host {:?} is not an IPv4 literal (no DNS on this tier)",
+                    parsed.host
+                );
+                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
+            }
+        };
+        let endpoint = IpEndpoint::new(IpAddress::Ipv4(ip), parsed.port);
+        let connect_started = Instant::now();
+        match with_timeout(to_embassy(budget), socket.connect(endpoint)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("OTA: tcp connect to {}:{} failed: {:?}", ip, parsed.port, e);
+                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
+            }
+            Err(_) => {
+                log::error!(
+                    "OTA: tcp connect to {}:{} timed out (per-op {}s or deadline)",
+                    ip,
+                    parsed.port,
+                    self.config.timeout_secs
+                );
+                return DownloadInput::ConnectFailed(classify_read_error(true));
+            }
+        }
+        let budget = budget.saturating_sub(to_core(connect_started.elapsed()));
         // The wait is `min(per-read timeout, remaining deadline)` so a stalled
         // server cannot hang the OTA path or outlast the deadline.
         let headers = match with_timeout(to_embassy(budget), fetch_get(socket, &parsed)).await {

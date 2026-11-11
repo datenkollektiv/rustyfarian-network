@@ -705,6 +705,32 @@ flash-ota-baseline example baseline target_version ota_host:
     export OTA_TARGET_VERSION="{{ target_version }}"
     scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
+# bench OTA round trip: build the served image (unhealthy when the check name contains `rollback`), export the
+# baseline's build-time variables for the runner's build step, then run the bench check, e.g.
+# `just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 192.168.40.146 --port /dev/cu.usbmodem2101`
+[group('ota')]
+bench-ota board check example baseline target_version ota_host *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for v in "{{ baseline }}" "{{ target_version }}"; do
+        if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: versions must be MAJOR.MINOR.PATCH, got '$v'" >&2
+            exit 1
+        fi
+    done
+    case "{{ check }}" in
+        *rollback*) just ota-image-unhealthy "{{ target_version }}" "" "{{ example }}" ;;
+        *) just ota-image "{{ target_version }}" "{{ example }}" ;;
+    esac
+    image="target/ota/{{ example }}-v{{ target_version }}.bin"
+    export FIRMWARE_VERSION="{{ baseline }}"
+    export OTA_HOST="{{ ota_host }}"
+    export OTA_PORT="${OTA_PORT:-8000}"
+    export OTA_PATH="$(basename "$image")"
+    export OTA_SHA256="$(shasum -a 256 "$image" | cut -d' ' -f1)"
+    export OTA_TARGET_VERSION="{{ target_version }}"
+    just bench "{{ board }}" "{{ check }}" {{ args }}
+
 # Usage: just ota-serve              (serve at full speed)
 #        just ota-serve 10240        (throttle to 10 KB/s)
 #        just ota-serve 0 102400     (full speed, then stall after 100 KiB: download_timeout test)

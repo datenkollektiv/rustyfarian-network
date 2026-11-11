@@ -44,10 +44,12 @@ reject = 'wait_suspended timed out|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 2
 
 [[step]]
-say = "Cycle 1: the radio stops, MQTT drops within a second, the link and session states follow, ticks would block"
+say = "Cycle 1: the link state follows, MQTT drops within a second, the session state follows, ticks would block"
+# `[wifi] suspended` precedes the `wait_suspended` line and is consumed by the step above.
 # IDF prints its `[wifi] disconnected — reason 8` and one `[mqtt] error` here; both are expected.
+# The tick issued in the same loop pass as the suspend request may still be `queued`; the next one would block.
 arm = false
-expect = ['\[wifi\] suspended', '\[mqtt\] disconnected', '\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+expect = ['\[app\] wifi link Connected -> Suspended', '\[mqtt\] disconnected', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
 reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 15
 
@@ -95,7 +97,7 @@ timeout = 2
 [[step]]
 say = "Cycle 3: the radio stops, MQTT drops, states follow, ticks would block"
 arm = false
-expect = ['\[wifi\] suspended', '\[mqtt\] disconnected', '\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+expect = ['\[app\] wifi link Connected -> Suspended', '\[mqtt\] disconnected', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
 reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 15
 

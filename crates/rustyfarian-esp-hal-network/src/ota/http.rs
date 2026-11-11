@@ -178,16 +178,20 @@ pub(crate) fn parse_url(url: &str) -> Result<ParsedUrl<'_>, HttpError> {
 
 // ── Pure parsing functions (always compile, no I/O) ─────────────────────────
 
-/// Parse an HTTP/1.1 status line and return the three-digit status code.
+/// Parse an HTTP/1.x status line and return the three-digit status code.
 ///
 /// Accepts:
 /// - `HTTP/1.1 NNN reason\r\n`
 /// - `HTTP/1.1 NNN\r\n`  (reason phrase is optional per RFC 7230 §3.1.2)
+/// - the same with `HTTP/1.0`: an HTTP/1.1 client processes a 1.0 response
+///   (RFC 7230 §2.6), and Python's `http.server` (`just ota-serve`) answers
+///   with `HTTP/1.0`; a 1.0 response without `Content-Length` still fails
+///   `check_content_length` as before.
 ///
-/// Rejects anything that does not start with exactly `HTTP/1.1 `.
+/// Rejects anything that does not start with exactly `HTTP/1.1 ` or `HTTP/1.0 `.
 pub(crate) fn parse_status_line(line: &[u8]) -> Result<u16, HttpError> {
     // Minimum: "HTTP/1.1 NNN\r\n" = 14 bytes
-    if !line.starts_with(b"HTTP/1.1 ") {
+    if !line.starts_with(b"HTTP/1.1 ") && !line.starts_with(b"HTTP/1.0 ") {
         return Err(HttpError::BadStatusLine);
     }
     let after_prefix = &line[b"HTTP/1.1 ".len()..];
@@ -599,11 +603,10 @@ mod tests {
     }
 
     #[test]
-    fn status_line_wrong_version_http10() {
-        assert_eq!(
-            parse_status_line(b"HTTP/1.0 200 OK"),
-            Err(HttpError::BadStatusLine)
-        );
+    fn status_line_http10_is_accepted() {
+        // `just ota-serve` (Python's `http.server`) answers `HTTP/1.0`; bug 020.
+        assert_eq!(parse_status_line(b"HTTP/1.0 200 OK"), Ok(200));
+        assert_eq!(parse_status_line(b"HTTP/1.0 404 Not Found\r\n"), Ok(404));
     }
 
     #[test]

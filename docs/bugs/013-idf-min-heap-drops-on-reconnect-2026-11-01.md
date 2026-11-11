@@ -28,3 +28,4 @@ low
 ## Session Log
 - 2026-11-01 — Observation captured via /bug dialog from the Step 2 variant A outage test; compare with variant B and repeat the outage to check for a trend
 - 2026-11-01 — Updated: variant B comparison (588 B drop) points at the per-connect helper thread
+- 2026-11-11 — S3 bench figures (`idf_esp32s3_mqtt_lwt`, free heap, not the minimum): the `suspend` run lost 860 B across three suspend/resume reconnects (`connect #1` 206 760 B → `connect #4` 205 900 B), and the 2026-11-08 10-min soak drifted 2136 B with no reconnect; the fix is still open

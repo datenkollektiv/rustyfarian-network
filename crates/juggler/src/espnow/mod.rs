@@ -45,8 +45,8 @@ pub mod worker;
 
 pub use callback::InFlightMarker;
 pub use command::{
-    parse_frame, parse_system_command, CommandFrame, SystemCommand, TAG_IDENTIFY, TAG_PING,
-    TAG_SELF_TEST,
+    parse_frame, parse_system_command, CommandFrame, ProbeFrame, ProbeReply, SystemCommand,
+    TAG_IDENTIFY, TAG_PING, TAG_PROBE, TAG_PROBE_REPLY, TAG_SELF_TEST,
 };
 #[cfg(any(test, feature = "std"))]
 pub use deadlines::{DeadlineFull, DeadlineId, DeadlineSet, DeadlineStorage};

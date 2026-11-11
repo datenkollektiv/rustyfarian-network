@@ -292,6 +292,12 @@ The bottleneck is not the harvest operation itself (~12 s warm cache), but the f
 The stable cache is `<idf_dir>/bootloader/<chip>.bin` (generic) and `<chip>-ota.bin` (rollback-enabled), written by `scripts/ensure-bootloader.sh` and read by `flash.sh` without globbing; it still lives under `idf_dir`, so it does not survive a RAM-disk detach. A copy outside the RAM disk, keyed by chip and IDF version, remains unimplemented.
 Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
 
+**An ESP-IDF program's last console line can sit in the USB Serial/JTAG TX FIFO and never reach the host when nothing is written after it.**
+The secondary USB Serial/JTAG console (`usb_serial_jtag_vfs.c` without the driver) hands a partial 64-byte packet to the host only on a flush; `esp-idf-svc`'s logger `fwrite`s to newlib stdout, and the trailing packet of a long final line stayed queued, so the bench waited 120 s for a `ESPNOW-GATE … PASS` line the firmware had written (bug 019, 2026-11-11).
+It looks like a hang with no panic, watchdog or reboot; a JTAG halt (`openocd -f board/esp32c3-builtin.cfg` plus `riscv32-esp-elf-gdb`, both under `~/.espressif/tools`) showed `main` parked after the scenario, and each `reset run` over JTAG delivered the previous boot's line first.
+Fix: a scenario whose gate line is its last write calls `esp_idf_svc::sys::fsync(1)` (`console_fsync` flushes the FIFO and waits for the host) and logs a heartbeat afterwards; scenarios that keep logging never show this.
+See `docs/bugs/archive/019-idf-espnow-shutdown-mid-scan-hang-2026-11-11.md`.
+
 ---
 
 ## ESP-IDF Event Loop (`esp-idf-svc`)
@@ -520,6 +526,13 @@ A permissive parser paired with a stricter upstream cache becomes a request-smug
 Similarly, RFC 7230 §3.2.4 forbids whitespace between header name and colon — accepting `Content-Length\t: 0` makes the name fail case-insensitive comparison and silently disables the duplicate-CL check.
 Both rejections live in `crates/rustyfarian-esp-hal-network/src/ota/http.rs::parse_header` and `HeaderState::feed`; the dedicated host tests cover both vectors.
 
+**An immediate `[ota] update failed … Update server unreachable` with nothing in the server log means the esp-hal OTA client never connected the socket, not that the network dropped it.**
+`EspHalOtaManager::fetch_and_apply` takes a fresh `TcpSocket` and, until bug 020, wrote the `GET` onto it without a `connect`; embassy-net fails the write at once and `fetch_get` folds every write error into `ServerUnreachable` without a log line.
+Tell the cases apart by timing: a blocked route times out after `timeout_secs` (30 s in the examples), a missing connect fails in the same second as the `fetching` line.
+Fix: the manager connects inside its `DownloadAction::Connect` step (IPv4 literal only, embassy-net `ConnectError` logged), and a hal OTA run needs the router rule for the image port just like the broker port.
+The next layer bit too: `parse_status_line` accepted only `HTTP/1.1 `, while Python's `http.server` behind `just ota-serve` answers `HTTP/1.0 200 OK` (`OTA HTTP error: BadStatusLine`); an HTTP/1.1 client processes 1.0 responses, so the parser takes both.
+See `docs/bugs/archive/020-hal-ota-never-connects-the-socket-2026-11-11.md`.
+
 **Logging URLs that may contain RFC 3986 userinfo leaks credentials.**
 Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS is rejected; logging the URL verbatim spills credentials into `espflash monitor` output.
 Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
@@ -608,6 +621,9 @@ Super Mini boards have no UART bridge, only the USB-Serial-JTAG port; the `uart`
 `auto` checks the USB SOF flag at runtime and falls back to UART0.
 `auto` excludes `uart` and `jtag-serial`, and zero consoles is rejected too (`assert_unique_used_features!` panics with `Currently enabled: none`); the knob's own `auto` collided with the `esp32s3` feature's `uart`, so since 2026-10-31 `rustyfarian-esp-hal-network` depends on neither `esp-println` nor `esp-backtrace` (ADR 021): the firmware selects the console and the panic handler, the examples take both crates from per-target-triple dev-dependencies (only a target triple can carry the chip), and lib-only checks never compile them.
 A day-long interim that kept both crates as optional deps of `wifi` and `lora` and passed the console on the command line (`--features ...,esp-println/auto` in `just check-hal` / `clippy-hal` and the docs.rs metadata, plus a `cfg(target_os = "none")` dev-dependency for the examples) was reverted the same day, because it still forced `esp-backtrace`'s panic handler into every `wifi` firmware.
+
+**A scan interrupted by `shutdown()` ends as `Err(Shutdown)` or `Err(Scan(Aborted))`, and a harness must accept both.**
+The worker publishes `Aborted` for the running scan, but a caller polling its `ScanTicket` sees the shutdown flag first and returns `Shutdown`; the juggler host test accepts the pair, and the IDF scout's shutdown scenario failed its own check until it did too (2026-11-11, found in the bug 019 lines).
 
 ---
 

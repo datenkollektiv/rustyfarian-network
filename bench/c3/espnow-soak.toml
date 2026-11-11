@@ -1,0 +1,73 @@
+# Owned-radio ESP-NOW peer for 30 minutes at 100 ms, then a channel scan (runbook gate C3-H2, G-E1).
+# `hal_c3_espnow_peer` in its default scenario against the hal C6 coordinator `hal_c6_espnow_sta_coordinator`
+# (or an IDF C3 `idf_c3_espnow_coordinator`); the coordinator follows its access point's channel.
+# The peer sends an 8-byte frame every 100 ms and prints its counters every 10 s:
+#   [espnow] sent=N acked=N failed=N fail_rate=0.NN% echoes=N channel=Some(N) oversize_dropped=N
+# The MAC is read at build time; set it in the shell and leave ESPNOW_SCENARIO unset (or `default`):
+#   ESPNOW_SCENARIO=default ESPNOW_PEER_MAC=<coordinator STA MAC> just bench c3 espnow-soak --port <c3 port>
+# `--unattended` runs the 30-minute soak and the final rate check; `--attended` runs the channel scan half,
+# where a person moves the router (or hotspot) to channels 1, 6 and 11 in turn and the peer rescans after
+# 20 unacknowledged sends. The gate text asks for channel 6 during the soak; the run records the channel.
+examples = ["hal_c3_espnow_peer"]
+
+[[step]]
+say = "The peer boots on the owned radio in the default scenario"
+arm = false       # printed during the reset
+expect = ['ESP-NOW up on owned radio, tx power Some\(\d+\) quarter-dBm', 'ESPNOW_SCENARIO=default']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "The first scan finds the coordinator (power it on if it is off)"
+arm = false
+expect = '\[espnow\] coordinator found on channel (?P<ch>\d+)'
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 180
+
+[[step]]
+say = "The first counter line arrives on the pinned channel"
+arm = false
+expect = '\[espnow\] sent=\d+ acked=\d+ failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\((?P=ch)\)'
+reject = '\[espnow\] send error:|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+[[step]]
+say = "Soak: 30 minutes at 100 ms (G-E1); a cumulative failure rate of 5 % or more, a send error or a reboot fails it"
+arm = false
+duration = 1800
+# The 1 % criterion is judged on the final counter line below; here only a gross failure ends the run early.
+reject = 'fail_rate=(?!0\.|[1-4]\.)\d+\.\d\d%|\[espnow\] send error:|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Final counters: at least 17 000 sends and a failure rate below 1 % over the soak"
+arm = false
+# 30 min at 100 ms is 18 000 sends; rescans and the scan steps cost a few hundred.
+expect = '\[espnow\] sent=(1[7-9]\d{3}|[2-9]\d{4}|\d{6,}) acked=\d+ failed=\d+ fail_rate=0\.\d\d% echoes=\d+ channel=Some\(\d+\)'
+reject = '\[espnow\] send error:|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+# ── channel scan: the router moves, the coordinator follows, the peer rescans ───────────────────
+
+[[step]]
+say = "Move the router (or hotspot) to channel 1; the peer rescans and finds the coordinator there"
+attended = true   # a person changes the router channel
+arm = false
+expect = ['\[espnow\] \d+ sends unacknowledged - rescanning', '\[espnow\] coordinator found on channel 1(?!\d)']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 300
+
+[[step]]
+say = "Move the router to channel 6; the peer finds the coordinator there"
+attended = true
+arm = false
+expect = ['\[espnow\] \d+ sends unacknowledged - rescanning', '\[espnow\] coordinator found on channel 6(?!\d)']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 300
+
+[[step]]
+say = "Move the router to channel 11; the peer finds the coordinator there and the counters resume"
+attended = true
+arm = false
+expect = ['\[espnow\] \d+ sends unacknowledged - rescanning', '\[espnow\] coordinator found on channel 11(?!\d)', '\[espnow\] sent=\d+ acked=\d+ failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\(11\)']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 300

@@ -190,7 +190,7 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 
 - [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
 - [ ] The new `mqtt-net` runner thread (4 KiB) is part of the measuring scope.
-- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion.
+- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion; the 2026-11-08 bench soak (S3-I1) drifted 2136 B (206 564 → 204 428 B) with every tick on time, the same picture before the fix.
 
 - Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
 - Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md

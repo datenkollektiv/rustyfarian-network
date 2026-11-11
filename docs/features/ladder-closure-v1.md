@@ -157,35 +157,36 @@ Each box is ticked only where a host test, a compile check or a build result exi
 
 ## Hardware closure
 
-Every item is open, because no 0.7.0 gate has a result in `docs/runbooks/release-0.7.0-hardware-test.md`.
+An item is ticked once every gate it names has a pass (or an N/A waiver) in `docs/runbooks/release-0.7.0-hardware-test.md`.
 
 - [x] ES-I1 (ESP32 classic, ESP-IDF, MQTT smoke with AP off and on); passed on the bench 2026-11-08 with a router block as the outage.
 - [x] ES-H1 and ES-H2 (ESP32 classic, esp-hal, Wi-Fi and MQTT smoke); passed on the bench 2026-11-08 with a router block as the outage.
 - [ ] C3-I1 (ESP-NOW coordinator power cycle) and C3-I2 (ESP-NOW scan on channels 1, 6 and 11).
 - [ ] C3-I7 (IDF ESP-NOW scan cancel and not-found restore; the `ESPNOW_SCENARIO=cancel` trigger exists).
-- [ ] C3-I8 (IDF ESP-NOW send-queue saturation and queued versus in-flight deadlines; the `ESPNOW_SCENARIO=flood` trigger exists).
-- [ ] C3-I9 (IDF ESP-NOW shutdown with queued and in-flight requests; the `ESPNOW_SCENARIO=shutdown` and `shutdown-queued` triggers exist).
-- [ ] C3-I10 (IDF ESP-NOW TX-power read-back after a scan; a success line is a prerequisite).
+- [x] C3-I8 (IDF ESP-NOW send-queue saturation and queued versus in-flight deadlines); passed on the bench 2026-11-10.
+- [x] C3-I9 (IDF ESP-NOW shutdown with queued and in-flight requests); both variants passed on the bench 2026-11-10.
+- [x] C3-I10 (IDF ESP-NOW TX-power read-back after a scan); passed on the bench 2026-11-10.
 - [ ] C3-I3 (provisioning boot at a small stack) and C3-I4 (BOOT re-entry outcomes).
 - [ ] C3-I5 (OTA scenario matrix P1 to P21) and C3-I6 (Watchtower v2 on a second device).
   The flattened health and reporter loops need the rows P2, P7, P13, P14 and P17 rerun.
 - [x] C3-H1 (provisioning record with extras across a reboot); passed 2026-11-09 on `c4d3879`, the stalled-client step is still not runnable.
 - [ ] C3-H2 (owned-radio ESP-NOW peer, 30 minutes, and channel scan) and C3-H3 (mixed fleet, peer link, blocked on `PeerSession`).
 - [ ] C3-H6 (esp-hal ESP-NOW scan cancel and not-found restore; the `ESPNOW_SCENARIO=cancel` trigger exists).
-- [ ] C3-H7 (esp-hal ESP-NOW send-queue saturation and deadlines; the `ESPNOW_SCENARIO=flood` trigger exists).
-- [ ] C3-H8 (esp-hal ESP-NOW shutdown with queued and in-flight requests; the `ESPNOW_SCENARIO=shutdown` and `shutdown-queued` triggers exist).
-- [ ] C3-H9 (esp-hal ESP-NOW TX-power read-back after a scan; a success line is a prerequisite).
+- [x] C3-H7 (esp-hal ESP-NOW send-queue saturation and deadlines); passed on the bench 2026-11-11.
+- [x] C3-H8 (esp-hal ESP-NOW shutdown with queued and in-flight requests); both variants passed on the bench 2026-11-11.
+- [x] C3-H9 (esp-hal ESP-NOW TX-power read-back after a scan); passed on the bench 2026-11-11, three scans with the radio and handle levels unchanged.
 - [ ] C3-H4 (MQTT smoke on `hal_c3_mqtt_lwt`) and C3-H5 (OTA round trip, first bug 004 write path on flash).
-- [ ] C6-H1 (provisioning record across a reboot) and C6-H2 (MQTT scenarios T1 to T6).
+- [x] C6-H1 (provisioning record across a reboot) and C6-H2 (MQTT scenarios T1 to T6); passed on the bench 2026-11-10 and 2026-11-09.
 - [ ] C6-H3 (ESP-NOW coordinator with two C3 peers) and C6-H4 (mixed fleet, IDF peer to hal coordinator, blocked on `PeerSession`).
-- [ ] C6-H5 (hostname broker and runtime subscribe; the code landed 2026-11-05, not run).
-- [ ] C6-I1 (ESP-IDF v5.5.5 coexistence soak, runs only if the bump ships) and C6-I2 (MQTT smoke on `idf_c6_mqtt`).
-- [ ] S3-H1 (Wi-Fi loss, T5a and T5b), S3-H2 (provisioning record across a reboot), S3-H3 (OTA round trip).
-- [ ] S3-I1 (ESP-IDF MQTT soak, blocked on the bug 013 fix, Step 8c).
-- [ ] S3-B1 ESP-IDF (router outage R1 and suspend R3 on `idf_esp32s3_mqtt_lwt`).
-- [ ] S3-B1 esp-hal (router outage R1 and suspend R3 on `hal_esp32s3_mqtt_lwt`).
-- [ ] S3-B2 ESP-IDF (startup message and `wait_suspended`; the code landed 2026-11-05, not run).
-- [ ] S3-B2 esp-hal (startup message, DNS broker name and `wait_suspended`; the code landed 2026-11-05, not run).
+- [x] C6-H5 (hostname broker and runtime subscribe); passed on the bench 2026-11-10 with `MQTT_HOST=bench-broker`.
+- [x] C6-I1 (N/A: the ESP-IDF v5.5.5 bump moved to the next release on 2026-11-10) and C6-I2 (MQTT smoke on `idf_c6_mqtt`); C6-I2 passed on the bench 2026-11-09.
+- [ ] S3-H1 (Wi-Fi loss, T5b; T5a is not run on a mesh, as for C6-H2), S3-H2 (provisioning record across a reboot), S3-H3 (OTA round trip).
+  S3-H1 passed on the bench 2026-11-11 (`mqtt-scenarios --attended` 10/10, two router blocks); S3-H2 and S3-H3 are not run.
+- [ ] S3-I1 (ESP-IDF MQTT soak, blocked on the bug 013 fix, Step 8c); the 2026-11-08 bench soak kept every tick but drifted 2136 B, as before the fix.
+- [x] S3-B1 ESP-IDF (router outage R1 and suspend R3 on `idf_esp32s3_mqtt_lwt`); R3 passed on the bench 2026-11-11 (`just bench s3 suspend` 13/13) and R1 the same night (`mqtt-scenarios --attended` 10/10).
+- [x] S3-B1 esp-hal (router outage R1 and suspend R3 on `hal_esp32s3_mqtt_lwt`); R3 passed on the bench 2026-11-11 (`just bench s3 suspend` 13/13) and R1 the same night (`mqtt-scenarios --attended` 10/10).
+- [x] S3-B2 ESP-IDF (startup message and `wait_suspended`); passed on the bench 2026-11-10/11: `online` retained on the first connect, after the broker restart and after the router pause, `wait_suspended` at once in three cycles.
+- [ ] S3-B2 esp-hal (startup message, DNS broker name and `wait_suspended`); the startup message (first connect, broker restart, router pause) and `wait_suspended` passed on the bench 2026-11-10/11, only the DNS line on the S3 is open (C6-H5 ran it on the C6).
 - [ ] HV-I1 (IDF OTAA join and uplink on the Heltec V3) and HV-H1 (esp-hal SX1262 bring-up) are in the 0.7.0 runbook and not run; bug 007 still needs the critical-section provider variant.
 
 ## Domain flow tables

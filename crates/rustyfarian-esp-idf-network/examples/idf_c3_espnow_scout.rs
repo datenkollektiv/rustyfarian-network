@@ -225,9 +225,19 @@ fn gate(id: &str, ok: bool, detail: &str) {
 }
 
 /// Parks the thread once a one-shot scenario has reported.
+/// Parks the scenario after its gate line.
+///
+/// The gate line is the last console write, and the USB Serial/JTAG console only hands a partial
+/// 64-byte packet to the host on a flush; `fsync` flushes it and waits for the host (bug 019), and
+/// the heartbeat flushes again should that wait have timed out.
 fn park_forever() -> ! {
+    // SAFETY: `fsync` on the console file descriptor has no memory-safety preconditions.
+    unsafe {
+        esp_idf_svc::sys::fsync(1);
+    }
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        log::info!("[app] parked after the scenario");
     }
 }
 
@@ -442,9 +452,14 @@ fn scenario_shutdown(espnow: &EspIdfEspNow, mac: &MacAddress, with_scan: bool) -
         }
     }
     if let Some(scan) = &scan {
-        let aborted = matches!(scan, Err(EspIdfEspNowError::Scan(ScanError::Aborted)));
+        // The worker publishes `Aborted`; a caller that sees the shutdown flag first gets
+        // `Shutdown` (the same pair the juggler host test accepts).
+        let aborted = matches!(
+            scan,
+            Err(EspIdfEspNowError::Scan(ScanError::Aborted)) | Err(EspIdfEspNowError::Shutdown)
+        );
         if !aborted {
-            bad.push(format!("scan did not end Aborted: {scan:?}"));
+            bad.push(format!("scan did not end Aborted or Shutdown: {scan:?}"));
         }
     }
     let pinned = espnow.pinned_channel();

@@ -2,7 +2,7 @@
 id: 018
 title: An ESP-NOW scan at close range reports the coordinator on an adjacent channel
 captured-on: 2026-11-10
-doc-version: 1
+doc-version: 3
 status: open-observation
 kind: observation
 ---
@@ -30,3 +30,5 @@ medium
 
 ## Session Log
 - 2026-11-10 — Observation captured via /bug dialog from the C3-I7 rerun; first check is a rerun with the boards metres apart
+- 2026-11-11 — Related observation: with the C3 scout and the hal C6 coordinator close on the bench the scout found nothing on any channel for about six minutes (the coordinator's `rx` counter stood still, then read 0 after a reset) and found it on channel 11 within seconds of the boards being moved to opposite edges of the table; a replug of both boards happened in the same minute, so distance and replug are not separated
+- 2026-11-11 — The `espnow-cancel` run at 01:45 found the coordinator on channel 10 (C6 on 11) with the boards at opposite edges of the table, so the adjacent-channel find is not only a close-range effect

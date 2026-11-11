@@ -1,0 +1,33 @@
+# esp-hal OTA round trip on the CrowPanel S3 (runbook S3-H3, happy path; the rollback half is `s3/ota-rollback`).
+# Run through `just bench-ota`, which builds the served image, exports the baseline's build-time variables
+# (FIRMWARE_VERSION, OTA_HOST, OTA_PORT, OTA_PATH, OTA_SHA256, OTA_TARGET_VERSION) for the runner's build step,
+# and then runs this check; the setup starts `just ota-serve` on this machine and the teardown stops it:
+#   just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 <this machine's LAN IPv4> --port <s3 port>
+# The board must reach this machine on OTA_PORT (default 8000); on the bench that is a router rule like the
+# broker's (TCP 8000 from the boards' subnet to this machine). The flash erases otadata, so every run starts
+# from slot 0. The served version is not known to the steps, so they match any version string.
+# Uses `setup` and `teardown` (rustyfarian-bench v0.5.0 or later). No person needed.
+examples = ["hal_esp32s3_ota"]
+setup = [["sh", "-c", "mkdir -p tmp; pkill -f scripts/ota-server.py || true; (nohup just ota-serve > tmp/bench-ota-serve.log 2>&1 &); sleep 1; port=$OTA_PORT; [ -n \"$port\" ] || port=8000; curl -sf -o /dev/null http://127.0.0.1:$port/"]]
+teardown = [["sh", "-c", "pkill -f scripts/ota-server.py || true"]]
+
+[[step]]
+say = "Boot 1 marks itself valid, downloads the target image, verifies it and activates the other slot"
+expect = ['\[ota\] running image marked valid', '\[ota\] fetching http://', 'OTA: downloading \d+ bytes', 'OTA: erasing \d+ bytes of the target partition', 'OTA: SHA-256 verified', 'OTA: partition swap complete', '\[ota\] new image activated']
+reject = '\[ota\] update failed|OTA HTTP error|\[ota\] nothing to do|FATAL|PANIC|panicked'
+timeout = 120
+arm = false       # the boot runs during the reset
+
+[[step]]
+say = "Boot 2 runs the new image from slot 1 and marks it valid"
+expect = ['\[ota\] running slot 1 version \d+\.\d+\.\d+ \(target ""\)', '\[ota\] running image marked valid', '\[ota\] nothing to do: OTA_HOST, OTA_PATH and OTA_SHA256 are not configured']
+reject = '\[ota\] fetching|\[ota\] update failed|OTA_DEMO_UNHEALTHY|FATAL|PANIC|panicked'
+timeout = 60
+arm = false
+
+[[step]]
+say = "The new image stays up for 30 s without a reboot"
+expect = '\[ota\] idle: version \d+\.\d+\.\d+ link ups 1 free heap \d+ B'
+reject = 'rst:0x[0-9a-f]+ \(|ESP-ROM:|FATAL|PANIC|panicked'
+timeout = 45
+arm = false
