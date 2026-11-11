@@ -124,8 +124,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ScanMachine::max_polls` covers the reply waits and the candidate phase; host-tested with a peer mock that ACKs on adjacent channels, with mutation checks on the `seq` match, the candidate fallback and the `home_channel` use.
   `ScanMachine::{with_first_seq, seq}` let a driver continue the probe sequence from one scan to the next, which both tiers do, so a reply left over from the previous scan never matches a new probe.
 
+- Wi-Fi regulatory country (ADR 026, [feature doc](docs/features/wifi-country-v1.md)): `juggler::wifi::{Country, CountryError, ChannelSet, Regulatory, CountryPort, apply_country}` with `Country::WORLD` (`01`, channels 1-11, 802.11d on) as the default on both tiers; both tiers re-export `Country`, `CountryError`, `ChannelSet` and `Regulatory`.
+- `wifi::set_country(Country)` and `wifi::regulatory()`, `WiFiConfig::with_country`, `ApConfig::with_country`, `ProvisioningBuilder::with_country(Country)` and `EspIdfEspNow::set_country` / `EspHalEspNow::set_country` (owned radio only) on both tiers.
+- `juggler::espnow::{EspNowConfig, EspNowConfigError}` (the esp-hal `EspNowConfig` moved into `juggler` and is shared by both tiers, with its range constants and a pure `validate` / `validate_owned`); the esp-hal `espnow` module re-exports all of it, so its public paths are unchanged.
+- `EspIdfEspNow::{init_with_radio_config, init_with_radio_sta_config, init_with_radio_scanning_config}` take that `EspNowConfig` (country, TX power, channel) like esp-hal `EspHalEspNow::new_owned`; `init_with_radio` / `init_with_radio_sta` delegate with the default config.
+- esp-hal `EspHalEspNow::new_owned` now refuses a configured channel the configured country does not allow (12 or 13 under `WORLD`) with `InvalidChannel` before any radio work.
+- Both tiers apply the country on every radio start and log `[wifi] country 01, channels 1-11, 802.11d on`; `apply_country` reads before it writes and skips the write while the country matches and the station is not associated, so ESP-IDF flash is written only when the country changes; an owned ESP-NOW radio built with `init_with_radio` and then given another country by `set_country` still writes twice per boot.
+- `juggler::espnow::ScanMachine::with_allowed_channels`, `ScanError::HomeNotAllowed { home }` and `ScanError::NotFound::not_allowed`: the ESP-NOW scan skips channels the country forbids.
+- The `espnow` modules of both tiers re-export `Country`, `ChannelSet`, `CountryError` and `Regulatory`, because an ESP-NOW-only build has no `wifi` module.
+
 ### Changed
 
+- BREAKING: the esp-hal Wi-Fi default country changes from CN (channels 1-13, esp-radio's hard-coded `CountryInfo`) to `Country::WORLD` (`01`, channels 1-11); firmware that relied on channels 12 and 13 must set a country with `with_country` or stay on 1-11.
+- BREAKING: `juggler::wifi::WiFiConfig` and `juggler::wifi::ApConfig` gain the public field `country`, so struct literals must add it.
+- BREAKING: `juggler::provisioning::PortalPlanInput` and `PortalPlan` gain the public field `country`, so struct literals must add it.
+- BREAKING: `juggler::espnow::ScanError::NotFound` gains the field `not_allowed`, `ScanError` gains the variant `HomeNotAllowed`, and `ScanError` and `ScanFault` are `#[non_exhaustive]`, so exhaustive matches need a wildcard arm.
+- BREAKING: `rustyfarian-esp-hal-network` `WifiError` and `EspHalEspNowError` gain `Country(i32)`, so exhaustive matches need an arm.
+- The ESP-NOW scan no longer sends a probe on a channel the country forbids; a configured channel that is forbidden is counted in `not_allowed`, and an explicit `with_channels` list that names one is skipped with one warning per scan.
+- The `espnow` feature of `juggler` now implies `wifi`.
+- `juggler::wifi::validate_ap_config` rejects a SoftAP channel that the configured country forbids, so a provisioning portal on channel 12 or 13 fails under the default `WORLD`.
 - The ESP-IDF tier runs the MQTT connect work on its `mqtt-net` runner thread, one step per loop turn, through the shared `ConnectWorkMachine`; there is no per-connect 12 KiB `mqtt-connect` thread any more.
   `on_connect` runs on that thread under `CallbackScope` with the client lock held; the runner performs no close, shutdown or retry handling until it returns, and a callback that takes longer than 1 s is reported with a `warn!` line.
   The runner releases the client lock and yields after every connect step, so a publisher thread at the runner's priority or above that waits for the lock gets it before the next step and its publish may go out between two steps (before the startup message); readiness (`is_connected`, `wait_connected`, `try_publish`) stays gated on `WorkDone`.
@@ -507,6 +524,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ESP-IDF OTA download: the HTTP receive buffer is 1024 bytes (`buffer_size`), each read is capped at that size, and a read near the deadline makes one wait for the whole remaining budget instead of splitting it.
   Near the deadline a read asks for one byte, so the last part of a download is slower.
 - ESP-IDF LoRa `transmit` and `receive` clear only the IRQ flags they read (`juggler::lora::sx1262::take_irq_status` and `irq_read_mask`), so a TxDone or RxDone that latches between the read and the clear is seen on the next poll; `cancel_rx` still clears every flag.
+- ESP-NOW scan (bug 017): a scan on the ESP-IDF tier no longer fails with `first failure: set channel 12` when the country forbids channels 12 and 13; the forbidden channels are skipped and a scan with no peer ends `peer not found after probing 11 of 13 configured channels (2 not allowed by the country)`.
+  See `docs/bugs/archive/017-espnow-scan-cannot-set-channel-12-2026-11-10.md`.
 
 ## [0.6.0] - 2026-10-09
 

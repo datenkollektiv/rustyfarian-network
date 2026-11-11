@@ -113,12 +113,14 @@ pub use driver::EspHalEspNow;
 #[cfg(feature = "embassy")]
 pub use juggler::espnow::EmbassyClock;
 pub use juggler::espnow::{
-    ClassifySend, Clock, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig,
-    PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession, ScanConfig, ScanError, ScanResult,
-    SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
+    ClassifySend, Clock, EspNowConfig, EspNowConfigError, EspNowDriver, EspNowEvent, EspNowLink,
+    MacAddress, PeerConfig, PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession, ScanConfig,
+    ScanError, ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_TX_POWER_QUARTER_DBM,
+    MAX_CHANNEL, MAX_DATA_LEN, MAX_TX_POWER_QUARTER_DBM, MIN_CHANNEL, MIN_TX_POWER_QUARTER_DBM,
 };
 use juggler::espnow::{Completion, GateRefusal, ProbeReply, Refusal};
 pub use juggler::wifi::TxPowerLevel;
+pub use juggler::wifi::{ChannelSet, Country, CountryError, Regulatory};
 
 #[cfg(all(
     feature = "espnow",
@@ -126,75 +128,6 @@ pub use juggler::wifi::TxPowerLevel;
     not(any(feature = "esp32c3", feature = "esp32c6"))
 ))]
 compile_error!("the `espnow` feature is supported on `esp32c3` and `esp32c6` only");
-
-/// Lowest Wi-Fi channel accepted by [`EspNowConfig::with_channel`] and `set_channel`.
-pub const MIN_CHANNEL: u8 = 1;
-/// Highest Wi-Fi channel accepted by [`EspNowConfig::with_channel`] and `set_channel`.
-pub const MAX_CHANNEL: u8 = 14;
-/// Lowest TX power accepted by the driver, in quarter dBm (2 dBm).
-pub const MIN_TX_POWER_QUARTER_DBM: i8 = 8;
-/// Highest TX power accepted by the driver, in quarter dBm (21 dBm).
-pub const MAX_TX_POWER_QUARTER_DBM: i8 = 84;
-
-// ─── Config ─────────────────────────────────────────────────────────────────
-
-/// TX power [`EspHalEspNow::new_owned`] applies when the config sets none: 13 dBm.
-pub const DEFAULT_TX_POWER_QUARTER_DBM: i8 = 52;
-
-/// Settings applied by both [`EspHalEspNow`] constructors.
-///
-/// The default leaves TX power and channel unset: [`EspHalEspNow::new_owned`] then uses 13 dBm
-/// ([`DEFAULT_TX_POWER_QUARTER_DBM`]) and the radio's channel, [`EspHalEspNow::from_controller`]
-/// keeps the caller's TX power.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EspNowConfig {
-    tx_power_quarter_dbm: Option<i8>,
-    channel: Option<u8>,
-}
-
-impl EspNowConfig {
-    /// Sets the TX power from a named level.
-    pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
-        self.tx_power_quarter_dbm = Some(level.to_quarter_dbm());
-        self
-    }
-
-    /// Sets the TX power in quarter dBm (`[8, 84]`, validated by the constructor); `None` leaves
-    /// it unset.
-    pub fn with_tx_power_quarter_dbm(mut self, quarter_dbm: Option<i8>) -> Self {
-        self.tx_power_quarter_dbm = quarter_dbm;
-        self
-    }
-
-    /// Pins the primary channel after start (`1..=14`).
-    ///
-    /// Meaningful for the owned radio, which has no access point to follow.
-    /// A caller-managed station keeps the channel of its access point: ignored there.
-    pub fn with_channel(mut self, channel: u8) -> Self {
-        self.channel = Some(channel);
-        self
-    }
-
-    /// Configured TX power in quarter dBm, if any.
-    pub fn tx_power_quarter_dbm(&self) -> Option<i8> {
-        self.tx_power_quarter_dbm
-    }
-
-    /// Configured channel, if any.
-    pub fn channel(&self) -> Option<u8> {
-        self.channel
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), EspHalEspNowError> {
-        if let Some(quarter_dbm) = self.tx_power_quarter_dbm {
-            validate_tx_power(quarter_dbm)?;
-        }
-        if let Some(channel) = self.channel {
-            validate_channel(channel)?;
-        }
-        Ok(())
-    }
-}
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
@@ -241,7 +174,8 @@ pub enum EspHalEspNowError {
     InvalidChannel(u8),
     /// TX power outside `[8, 84]` quarter dBm.
     InvalidTxPower(i8),
-    /// The handle was built from a caller-owned controller; change TX power on that controller.
+    /// The handle was built from a caller-owned controller; change TX power and country on that
+    /// controller.
     ControllerNotOwned,
     /// Another [`EspHalEspNow`] is alive (`esp-radio` allows one instance).
     AlreadyInitialised,
@@ -267,6 +201,8 @@ pub enum EspHalEspNowError {
     /// Wi-Fi driver error while starting or tuning the radio.
     #[cfg(all(feature = "espnow", any(feature = "esp32c3", feature = "esp32c6")))]
     Wifi(esp_radio::wifi::WifiError),
+    /// Applying or reading the Wi-Fi country failed with this driver error code.
+    Country(i32),
 }
 
 impl core::fmt::Display for EspHalEspNowError {
@@ -289,6 +225,7 @@ impl core::fmt::Display for EspHalEspNowError {
             Self::Shutdown => write!(f, "the ESP-NOW send queue was shut down"),
             Self::Radio(e) => write!(f, "ESP-NOW driver error: {e:?}"),
             Self::Scan(e) => write!(f, "ESP-NOW scan failed: {e}"),
+            Self::Country(rc) => write!(f, "Wi-Fi country call failed with code {rc:#x}"),
             #[cfg(all(feature = "espnow", any(feature = "esp32c3", feature = "esp32c6")))]
             Self::Wifi(e) => write!(f, "Wi-Fi driver error: {e:?}"),
         }
@@ -311,6 +248,17 @@ impl ClassifySend for EspHalEspNowError {
     }
 }
 
+impl From<EspNowConfigError> for EspHalEspNowError {
+    fn from(e: EspNowConfigError) -> Self {
+        match e {
+            EspNowConfigError::InvalidTxPower(p) => Self::InvalidTxPower(p),
+            EspNowConfigError::InvalidChannel(c) => Self::InvalidChannel(c),
+            // `EspNowConfigError` is non-exhaustive; a future variant is a bad channel or power.
+            _ => Self::Radio(RadioError::InvalidArgument),
+        }
+    }
+}
+
 // ─── Pure helpers (host-tested) ─────────────────────────────────────────────
 
 pub(crate) fn validate_channel(channel: u8) -> Result<(), EspHalEspNowError> {
@@ -321,6 +269,7 @@ pub(crate) fn validate_channel(channel: u8) -> Result<(), EspHalEspNowError> {
     }
 }
 
+#[cfg(all(feature = "espnow", any(feature = "esp32c3", feature = "esp32c6")))]
 pub(crate) fn validate_tx_power(quarter_dbm: i8) -> Result<(), EspHalEspNowError> {
     if (MIN_TX_POWER_QUARTER_DBM..=MAX_TX_POWER_QUARTER_DBM).contains(&quarter_dbm) {
         Ok(())
@@ -533,62 +482,6 @@ mod tests {
     const MAC: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
     #[test]
-    fn default_config_leaves_tx_power_unset_and_is_valid() {
-        let c = EspNowConfig::default();
-        assert_eq!(c.tx_power_quarter_dbm(), None);
-        assert_eq!(DEFAULT_TX_POWER_QUARTER_DBM, 52);
-        assert_eq!(c.channel(), None);
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn config_tx_power_bounds() {
-        let ok_lo = EspNowConfig::default().with_tx_power_quarter_dbm(Some(8));
-        let ok_hi = EspNowConfig::default().with_tx_power_quarter_dbm(Some(84));
-        assert!(ok_lo.validate().is_ok());
-        assert!(ok_hi.validate().is_ok());
-        assert_eq!(
-            EspNowConfig::default()
-                .with_tx_power_quarter_dbm(Some(7))
-                .validate(),
-            Err(EspHalEspNowError::InvalidTxPower(7))
-        );
-        assert_eq!(
-            EspNowConfig::default()
-                .with_tx_power_quarter_dbm(Some(85))
-                .validate(),
-            Err(EspHalEspNowError::InvalidTxPower(85))
-        );
-        assert_eq!(
-            EspNowConfig::default()
-                .with_tx_power_quarter_dbm(Some(-1))
-                .validate(),
-            Err(EspHalEspNowError::InvalidTxPower(-1))
-        );
-    }
-
-    #[test]
-    fn config_levels_map_to_quarter_dbm() {
-        let max = EspNowConfig::default().with_tx_power(TxPowerLevel::Max);
-        assert_eq!(max.tx_power_quarter_dbm(), Some(78));
-        assert!(max.validate().is_ok());
-    }
-
-    #[test]
-    fn config_channel_bounds() {
-        assert!(EspNowConfig::default().with_channel(1).validate().is_ok());
-        assert!(EspNowConfig::default().with_channel(14).validate().is_ok());
-        assert_eq!(
-            EspNowConfig::default().with_channel(0).validate(),
-            Err(EspHalEspNowError::InvalidChannel(0))
-        );
-        assert_eq!(
-            EspNowConfig::default().with_channel(15).validate(),
-            Err(EspHalEspNowError::InvalidChannel(15))
-        );
-    }
-
-    #[test]
     fn frame_length_limit_is_250() {
         assert!(validate_frame_len(&[0u8; 250]).is_ok());
         assert_eq!(
@@ -773,6 +666,7 @@ mod tests {
             EspHalEspNowError::Scan(ScanError::NotFound {
                 probed: 3,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             })
         )

@@ -6,6 +6,7 @@
 //! - [`WiFiConfig`] — connection configuration (SSID, password, connect mode)
 //! - [`ConnectMode`] — blocking vs. non-blocking association strategy
 //! - [`LinkMachine`] — pure reconnect policy shared by both tiers (see [`link`])
+//! - [`Country`] — the regulatory domain both tiers apply (see [`country`])
 //! - [`mock::MockWifiDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -20,6 +21,7 @@ mod link_mock;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
+pub mod country;
 pub mod handover;
 pub mod lines;
 pub mod link;
@@ -27,6 +29,10 @@ pub mod network_link;
 #[cfg(feature = "std")]
 pub mod supervisor;
 
+pub use country::{
+    apply_country, ChannelSet, Country, CountryError, CountryPort, Regulatory,
+    SUPPORTED_COUNTRY_CODES,
+};
 pub use handover::{IdleWait, LinkHandover};
 pub use link::{
     LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
@@ -93,7 +99,9 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
 /// Returns `Ok(())` if `config` is a valid SoftAP configuration.
 ///
 /// Validates the SSID via [`validate_ssid`], the channel against
-/// [`AP_CHANNEL_MIN`]`..=`[`AP_CHANNEL_MAX`], and `max_connections >= 1`.
+/// [`AP_CHANNEL_MIN`]`..=`[`AP_CHANNEL_MAX`] and against the channels of
+/// [`ApConfig::country`] (ESP-IDF silently moves a SoftAP on a channel outside
+/// the country to channel 1), and `max_connections >= 1`.
 /// When a password is present, it must be at least [`AP_PASSWORD_MIN_LEN`]
 /// bytes (the WPA2-Personal minimum) and at most [`PASSWORD_MAX_LEN`] bytes —
 /// the upper bound is delegated to [`validate_password`].
@@ -107,6 +115,9 @@ pub fn validate_ap_config(config: &ApConfig<'_>) -> Result<(), &'static str> {
     }
     if config.channel < AP_CHANNEL_MIN || config.channel > AP_CHANNEL_MAX {
         return Err("AP channel must be in the range 1..=13");
+    }
+    if !config.country.channels().contains(config.channel) {
+        return Err("AP channel is not allowed by the configured country");
     }
     if config.max_connections < 1 {
         return Err("AP max_connections must be at least 1");
@@ -293,7 +304,8 @@ impl TxPowerLevel {
 ///     .connect_nonblocking()                   // optional: return immediately from new()
 ///     .with_power_save(WifiPowerSave::MinModem) // optional: modem sleep for battery savings
 ///     .with_tx_power(TxPowerLevel::Low)        // optional: reduce transmit power
-///     .with_ap_selection(ApSelection::FirstFound); // optional: faster join, first AP found
+///     .with_ap_selection(ApSelection::FirstFound) // optional: faster join, first AP found
+///     .with_country(Country::parse("DE")?);    // optional: channels 1-13 instead of 1-11
 /// ```
 #[derive(Debug, Clone)]
 pub struct WiFiConfig<'a> {
@@ -307,6 +319,8 @@ pub struct WiFiConfig<'a> {
     pub tx_power: TxPowerLevel,
     /// How the station picks an AP when several broadcast the SSID.
     pub ap_selection: ApSelection,
+    /// The country applied to the radio before it starts (default [`Country::WORLD`]).
+    pub country: Country,
 }
 
 impl<'a> WiFiConfig<'a> {
@@ -321,6 +335,7 @@ impl<'a> WiFiConfig<'a> {
             power_save: WifiPowerSave::default(),
             tx_power: TxPowerLevel::default(),
             ap_selection: ApSelection::default(),
+            country: Country::WORLD,
         }
     }
 
@@ -378,6 +393,19 @@ impl<'a> WiFiConfig<'a> {
         self.ap_selection = selection;
         self
     }
+
+    /// Sets the country applied to the radio before it starts.
+    ///
+    /// Defaults to [`Country::WORLD`] (channels 1-11) on both tiers.
+    /// With 802.11d on (the default) the station finds an AP on channel 12 or 13 by its
+    /// passive scan and adopts the AP's country once associated; the configured one decides
+    /// while unassociated (see [`country`]).
+    /// A country that allows 12 and 13 is needed only with `with_ieee80211d(false)`, or for
+    /// a faster active scan of them.
+    pub fn with_country(mut self, country: Country) -> Self {
+        self.country = country;
+        self
+    }
 }
 
 // ─── ApConfig ───────────────────────────────────────────────────────────────
@@ -392,7 +420,8 @@ impl<'a> WiFiConfig<'a> {
 /// let config = ApConfig::wpa2("Rustyfarian-AB12", "provision-me")
 ///     .with_channel(6)                   // optional: override the channel-1 default
 ///     .with_max_connections(2)           // optional: cap associated stations
-///     .with_tx_power(TxPowerLevel::Low); // optional: reduce transmit power
+///     .with_tx_power(TxPowerLevel::Low)  // optional: reduce transmit power
+///     .with_country(Country::WORLD);     // optional: the default, channels 1-11
 /// ```
 pub struct ApConfig<'a> {
     /// Access-point SSID broadcast in beacons.
@@ -405,6 +434,8 @@ pub struct ApConfig<'a> {
     pub max_connections: u8,
     /// Transmit power level applied after the AP starts.
     pub tx_power: TxPowerLevel,
+    /// The country applied before the AP starts; `channel` must be one it allows.
+    pub country: Country,
 }
 
 impl<'a> Clone for ApConfig<'a> {
@@ -415,6 +446,7 @@ impl<'a> Clone for ApConfig<'a> {
             channel: self.channel,
             max_connections: self.max_connections,
             tx_power: self.tx_power,
+            country: self.country,
         }
     }
 }
@@ -427,6 +459,7 @@ impl core::fmt::Debug for ApConfig<'_> {
             .field("channel", &self.channel)
             .field("max_connections", &self.max_connections)
             .field("tx_power", &self.tx_power)
+            .field("country", &self.country)
             .finish()
     }
 }
@@ -450,6 +483,7 @@ impl<'a> ApConfig<'a> {
             channel: AP_CHANNEL_MIN,
             max_connections: AP_MAX_CONNECTIONS_DEFAULT,
             tx_power: TxPowerLevel::default(),
+            country: Country::WORLD,
         }
     }
 
@@ -465,10 +499,12 @@ impl<'a> ApConfig<'a> {
             channel: AP_CHANNEL_MIN,
             max_connections: AP_MAX_CONNECTIONS_DEFAULT,
             tx_power: TxPowerLevel::default(),
+            country: Country::WORLD,
         }
     }
 
-    /// Sets the 2.4 GHz channel (validated to 1..=13 by [`validate_ap_config`]).
+    /// Sets the 2.4 GHz channel (validated to 1..=13, and to the channels of the
+    /// country, by [`validate_ap_config`]).
     pub fn with_channel(mut self, channel: u8) -> Self {
         self.channel = channel;
         self
@@ -483,6 +519,13 @@ impl<'a> ApConfig<'a> {
     /// Sets the transmit power level applied after the AP starts.
     pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
         self.tx_power = level;
+        self
+    }
+
+    /// Sets the country applied before the AP starts (default [`Country::WORLD`],
+    /// channels 1-11); the channel must be one the country allows.
+    pub fn with_country(mut self, country: Country) -> Self {
+        self.country = country;
         self
     }
 }
@@ -1014,8 +1057,54 @@ mod tests {
     fn ap_config_channel_boundaries() {
         assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(0)).is_err());
         assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(1)).is_ok());
-        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(13)).is_ok());
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(11)).is_ok());
         assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(14)).is_err());
+        let de = Country::parse("DE").unwrap();
+        let de_ap = |channel| {
+            ApConfig::open(TEST_SSID)
+                .with_country(de)
+                .with_channel(channel)
+        };
+        assert!(validate_ap_config(&de_ap(13)).is_ok());
+        assert!(validate_ap_config(&de_ap(14)).is_err());
+    }
+
+    #[test]
+    fn ap_config_channel_must_be_allowed_by_the_country() {
+        assert_eq!(
+            validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(12)),
+            Err("AP channel is not allowed by the configured country")
+        );
+        assert!(validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(13)).is_err());
+        let de = Country::parse("DE").unwrap();
+        assert!(
+            validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(12).with_country(de))
+                .is_ok()
+        );
+        let jp = Country::parse("JP").unwrap();
+        assert!(
+            validate_ap_config(&ApConfig::open(TEST_SSID).with_channel(14).with_country(jp))
+                .is_err(),
+            "the portable 1..=13 cap still holds"
+        );
+    }
+
+    #[test]
+    fn country_defaults_to_world_and_is_carried() {
+        assert_eq!(
+            WiFiConfig::new(TEST_SSID, test_psk()).country,
+            Country::WORLD
+        );
+        let de = Country::parse("DE").unwrap();
+        assert_eq!(
+            WiFiConfig::new(TEST_SSID, test_psk())
+                .with_country(de)
+                .country,
+            de
+        );
+        let ap = ApConfig::open(TEST_SSID).with_country(de);
+        assert_eq!(ap.clone().country, de);
+        assert!(alloc::format!("{ap:?}").contains("DE"));
     }
 
     #[test]

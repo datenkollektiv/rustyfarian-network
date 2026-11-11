@@ -5,6 +5,7 @@
 //! - [`EspNowDriver`] — hardware-agnostic ESP-NOW driver interface
 //! - [`EspNowEvent`] — received frame (fixed-size, no heap)
 //! - [`PeerConfig`] — peer registration parameters
+//! - [`EspNowConfig`] — start settings (country, TX power, channel) of an owned radio, taken by both tiers
 //! - [`PeerTracker`] — heartbeat-based peer liveness tracking
 //! - [`PeerLink`] — clock-injected supervisor that decides when to (re)scan for the coordinator
 //! - [`PeerSession`] — the async helper that drives [`PeerLink`] over an [`EspNowLink`] on either
@@ -33,6 +34,7 @@
 
 pub mod callback;
 pub mod command;
+pub mod config;
 #[cfg(any(test, feature = "std"))]
 pub mod deadlines;
 pub mod link;
@@ -51,6 +53,10 @@ pub use callback::InFlightMarker;
 pub use command::{
     parse_frame, parse_system_command, CommandFrame, ProbeFrame, ProbeReply, SystemCommand,
     TAG_IDENTIFY, TAG_PING, TAG_PROBE, TAG_PROBE_REPLY, TAG_SELF_TEST,
+};
+pub use config::{
+    EspNowConfig, EspNowConfigError, DEFAULT_TX_POWER_QUARTER_DBM, MAX_CHANNEL,
+    MAX_TX_POWER_QUARTER_DBM, MIN_CHANNEL, MIN_TX_POWER_QUARTER_DBM,
 };
 #[cfg(any(test, feature = "std"))]
 pub use deadlines::{DeadlineFull, DeadlineId, DeadlineSet, DeadlineStorage};
@@ -86,13 +92,16 @@ pub const MAX_DATA_LEN: usize = 250;
 /// Default capacity for an ESP-NOW receive channel.
 pub const DEFAULT_RX_CHANNEL_CAPACITY: usize = 32;
 
-/// Default channels to scan when probing for a peer.
+/// Default channels to scan when probing for a peer: 1-13.
 ///
-/// Covers channels 1-13 (EU/JP region).  US/CA regulatory domains restrict
-/// 2.4 GHz to channels 1-11; if your peer might land on a channel that is not
-/// allowed in your region the radio will silently fail to send on it.  Use
-/// [`ScanConfig::with_channels`] with a region-appropriate slice when this
-/// matters (e.g. `&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]` for US).
+/// Both tiers skip the channels the radio's Wi-Fi country does not allow, without radio
+/// work (see [`ScanMachine::with_allowed_channels`]).
+/// Under the default [`Country::WORLD`](crate::wifi::Country::WORLD) (channels 1-11) a scan
+/// with this list probes 1-11 and reports 12 and 13 as `not_allowed` in
+/// [`ScanError::NotFound`].
+/// An unassociated scout cannot transmit on a channel its country forbids, so a scout that
+/// looks for a peer whose network runs on 12 or 13 must be set to that network's country
+/// (e.g. `Country::parse("DE")`, channels 1-13).
 pub const DEFAULT_SCAN_CHANNELS: [u8; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// Default per-channel probe timeout when scanning for a peer.
@@ -393,10 +402,13 @@ pub struct ScanConfig<'a> {
 }
 
 impl<'a> ScanConfig<'a> {
-    /// Create a scan config with default channels (1-13) and the default
-    /// timeouts and confirmation settings.
+    /// Create a scan config with default channels ([`DEFAULT_SCAN_CHANNELS`], 1-13)
+    /// and the default timeouts and confirmation settings.
     ///
     /// The scan builds its own probe frames; there is no payload to pass.
+    /// Channels the Wi-Fi country does not allow are skipped (under the default
+    /// [`Country::WORLD`](crate::wifi::Country::WORLD): 12 and 13); set the country of
+    /// the peer's network to reach a peer on 12 or 13.
     pub fn for_peer() -> Self {
         #[allow(deprecated)]
         Self {

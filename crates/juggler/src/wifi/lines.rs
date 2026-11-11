@@ -10,7 +10,7 @@
 use core::fmt::{self, Debug, Display};
 use core::net::Ipv4Addr;
 
-use super::JoinedAp;
+use super::{JoinedAp, Regulatory};
 
 /// The station associated: `[wifi] link up #3` (plus ` (adopted)` for a link the
 /// supervisor found already up when it started, and ` — bssid …, ch N, rssi -NN dBm`
@@ -119,6 +119,19 @@ impl Display for Lifecycle {
             Self::Suspended => "[wifi] suspended",
             Self::ResumeRequested => "[wifi] resume requested",
         })
+    }
+}
+
+/// The radio's country after a tier applied it:
+/// `[wifi] country 01, channels 1-11, 802.11d on`.
+pub struct CountryApplied {
+    /// What the radio reports.
+    pub applied: Regulatory,
+}
+
+impl Display for CountryApplied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[wifi] country {}", self.applied)
     }
 }
 

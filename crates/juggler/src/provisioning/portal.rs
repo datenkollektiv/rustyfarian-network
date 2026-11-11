@@ -16,7 +16,7 @@ use core::fmt::Write as _;
 
 use super::config::MQTT_HOST_MAX_LEN;
 use super::{DeviceName, PortalDefaults, ProvisioningConfig, SchemaProfile, DEVICE_NAME_MAX_LEN};
-use crate::wifi::{validate_ap_config, ApConfig, AP_PASSWORD_MIN_LEN};
+use crate::wifi::{validate_ap_config, ApConfig, Country, AP_PASSWORD_MIN_LEN};
 
 // ── Nonce ─────────────────────────────────────────────────────────────────────
 
@@ -286,6 +286,8 @@ pub struct PortalPlan<'a> {
     pub ap_password: Option<&'a str>,
     /// The 2.4 GHz channel.
     pub channel: u8,
+    /// The Wi-Fi country the SoftAP runs under.
+    pub country: Country,
     /// The device name pre-filled on a fresh device.
     pub device_name: heapless::String<DEVICE_NAME_MAX_LEN>,
     /// `true` when the device name is MAC-suffixed but a default MQTT client
@@ -298,13 +300,14 @@ impl PortalPlan<'_> {
     /// Experimental: API may change before 1.0.
     ///
     /// The SoftAP configuration: WPA2 with the password, or open, on the
-    /// planned channel, with the default connection limit.
+    /// planned channel and country, with the default connection limit.
     pub fn ap_config(&self) -> ApConfig<'_> {
         match self.ap_password {
             Some(pw) => ApConfig::wpa2(self.ssid.as_str(), pw),
             None => ApConfig::open(self.ssid.as_str()),
         }
         .with_channel(self.channel)
+        .with_country(self.country)
     }
 }
 
@@ -319,8 +322,10 @@ pub struct PortalPlanInput<'a> {
     pub ssid_prefix: &'a str,
     /// WPA2 password, `None` for an open AP.
     pub ap_password: Option<&'a str>,
-    /// 2.4 GHz channel.
+    /// 2.4 GHz channel; must be one `country` allows.
     pub channel: u8,
+    /// The Wi-Fi country the SoftAP runs under.
+    pub country: Country,
     /// Device-name policy.
     pub device_name: DeviceName<'a>,
     /// Non-secret form defaults.
@@ -359,6 +364,7 @@ pub fn plan_portal<'a>(
         ssid,
         ap_password: input.ap_password,
         channel: input.channel,
+        country: input.country,
         device_name: input.device_name.resolve(mac),
         client_id_override_warning: matches!(input.device_name, DeviceName::MacSuffixed(_))
             && !input.defaults.mqtt_client.is_empty(),
@@ -678,6 +684,7 @@ mod tests {
             ssid_prefix: "Rusty",
             ap_password: None,
             channel: 6,
+            country: Country::WORLD,
             device_name: DeviceName::Fixed("hive"),
             defaults: PortalDefaults::default(),
             profile: SchemaProfile::WifiMqttDevice,
@@ -756,6 +763,26 @@ mod tests {
             plan_portal(&i, &MAC, |_| true),
             Err(PortalPlanError::InvalidApConfig(_))
         ));
+    }
+
+    #[test]
+    fn channel_checked_against_the_country() {
+        let world = PortalPlanInput {
+            channel: 13,
+            ..input()
+        };
+        assert!(matches!(
+            plan_portal(&world, &MAC, |_| true),
+            Err(PortalPlanError::InvalidApConfig(_))
+        ));
+        let de = Country::parse("DE").unwrap();
+        let i = PortalPlanInput {
+            country: de,
+            ..world
+        };
+        let plan = plan_portal(&i, &MAC, |_| true).expect("13 is allowed in DE");
+        assert_eq!(plan.ap_config().country, de);
+        assert_eq!(plan.ap_config().channel, 13);
     }
 
     #[test]

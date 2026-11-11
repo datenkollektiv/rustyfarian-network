@@ -70,19 +70,32 @@ use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
 };
 pub use juggler::espnow::{
-    ClassifySend, Clock, EmbassyClock, EspNowDriver, EspNowEvent, EspNowLink, MacAddress,
-    PeerConfig, PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession, ScanConfig, ScanError,
-    ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
-    DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT, DEFAULT_RX_CHANNEL_CAPACITY,
-    DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
+    ClassifySend, Clock, EmbassyClock, EspNowConfig, EspNowConfigError, EspNowDriver, EspNowEvent,
+    EspNowLink, MacAddress, PeerConfig, PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession,
+    ScanConfig, ScanError, ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC,
+    DEFAULT_CONFIRMATION_GAP, DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT,
+    DEFAULT_RX_CHANNEL_CAPACITY, DEFAULT_SCAN_CHANNELS, DEFAULT_TX_POWER_QUARTER_DBM, MAX_CHANNEL,
+    MAX_DATA_LEN, MAX_TX_POWER_QUARTER_DBM, MIN_CHANNEL, MIN_TX_POWER_QUARTER_DBM,
 };
 use juggler::espnow::{OversizeLog, SendKind};
 use juggler::wait_list::WaitList;
+pub use juggler::wifi::{ChannelSet, Country, CountryError, Regulatory};
 
 use worker::{block_on, Worker};
 
 /// The channel [`EspIdfEspNow::init_with_radio`] starts its SoftAP on, which is the pin at start.
 const SOFTAP_CHANNEL: u8 = 1;
+
+/// Applies the TX power of `config`, if it sets one; the driver default stays otherwise.
+fn apply_tx_power(config: &EspNowConfig) -> anyhow::Result<()> {
+    if let Some(quarter_dbm) = config.tx_power_quarter_dbm() {
+        // SAFETY: plain FFI call into the Wi-Fi driver, which the caller has started;
+        // `validate_owned` has bounded `quarter_dbm` to the driver's `[8, 84]` range.
+        esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(quarter_dbm) })
+            .with_context(|| format!("failed to set ESP-NOW TX power {quarter_dbm}"))?;
+    }
+    Ok(())
+}
 
 /// How long plain [`EspNowDriver::send`] waits for a queue slot and for its frame to start
 /// before it fails with [`EspIdfEspNowError::Timeout`] (1 s).
@@ -369,20 +382,20 @@ impl EspIdfEspNow {
     /// The Wi-Fi radio must already be started by the caller.
     /// For ESP-NOW-only devices, use [`init_with_radio()`](Self::init_with_radio) instead.
     pub fn init() -> anyhow::Result<Self> {
-        Self::init_inner(
-            DEFAULT_RX_CHANNEL_CAPACITY,
-            None,
-            RadioMode::CallerManagedSta,
-            None,
-        )
+        Self::init_with_capacity(DEFAULT_RX_CHANNEL_CAPACITY)
     }
 
     /// Initialise ESP-NOW with a custom receive-queue capacity.
     ///
     /// The Wi-Fi radio must already be started by the caller.
     /// Frames received while the queue is full are dropped with a warning log.
+    ///
+    /// The caller owns the radio, so its country is the caller's too (see
+    /// `wifi::set_country`); the driver only reads it.
     pub fn init_with_capacity(capacity: usize) -> anyhow::Result<Self> {
-        Self::init_inner(capacity, None, RadioMode::CallerManagedSta, None)
+        // A caller-managed radio cannot scan, so the set only matters for diagnostics.
+        let allowed = crate::regulatory::read().map(|r| r.channels);
+        Self::init_inner(capacity, None, RadioMode::CallerManagedSta, None, allowed)
     }
 
     /// Initialise ESP-NOW and start the Wi-Fi radio internally in
@@ -406,16 +419,59 @@ impl EspIdfEspNow {
     /// [`init_with_radio_sta`](Self::init_with_radio_sta) to keep the prior
     /// behaviour.  Devices that simultaneously run BLE or a user-facing
     /// SoftAP must use [`init_with_radio_sta`](Self::init_with_radio_sta).
+    ///
+    /// # Country
+    ///
+    /// The driver applies [`Country::WORLD`] (channels 1-11) before the radio starts, so the
+    /// country ESP-IDF kept in flash never decides; scans skip the channels the country does
+    /// not allow.
+    /// A scout looking for a peer on a network on channel 12 or 13 starts under that network's
+    /// country through [`init_with_radio_config`](Self::init_with_radio_config).
     pub fn init_with_radio(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
         nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
     ) -> anyhow::Result<Self> {
+        Self::init_with_radio_config(modem, sys_loop, nvs, EspNowConfig::default())
+    }
+
+    /// [`init_with_radio`](Self::init_with_radio) with the start settings of `config`, the same
+    /// [`EspNowConfig`] the esp-hal tier's `EspHalEspNow::new_owned` takes.
+    ///
+    /// Applied in this order:
+    ///
+    /// 1. The country ([`EspNowConfig::with_country`], else [`Country::WORLD`]) once, before the
+    ///    radio starts, so a boot with an unchanged country writes no flash;
+    ///    [`set_country`](Self::set_country) after [`init_with_radio`](Self::init_with_radio)
+    ///    writes it twice per boot (to `01` and back).
+    /// 2. The hidden SoftAP starts on the channel of [`EspNowConfig::with_channel`], else
+    ///    channel 1, which is the pin until a scan finds another.
+    /// 3. The TX power ([`EspNowConfig::with_tx_power`]) after the start.
+    ///    When the config sets none, the ESP-IDF driver default stays: the esp-hal tier applies
+    ///    [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) instead, because its driver starts at 5 dBm.
+    ///
+    /// # Errors
+    ///
+    /// An [`anyhow::Error`] with the context of the failing step: a config outside the driver
+    /// ranges or a channel the country does not allow ([`EspNowConfig::validate_owned`], refused
+    /// before any radio work), or the ESP-IDF error of the Wi-Fi start, the country or the TX
+    /// power.
+    pub fn init_with_radio_config(
+        modem: Modem<'static>,
+        sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
+        nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
+        config: EspNowConfig,
+    ) -> anyhow::Result<Self> {
+        config
+            .validate_owned()
+            .context("invalid ESP-NOW configuration")?;
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)
             .context("failed to create EspWifi for ESP-NOW radio")?;
+        let regulatory = crate::regulatory::apply(config.country().unwrap_or(Country::WORLD))?;
+        let channel = config.channel().unwrap_or(SOFTAP_CHANNEL);
         wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
             ssid_hidden: true,
-            channel: SOFTAP_CHANNEL,
+            channel,
             auth_method: AuthMethod::None,
             ..Default::default()
         }))
@@ -423,13 +479,15 @@ impl EspIdfEspNow {
         wifi.start()
             .context("failed to start Wi-Fi SoftAP for ESP-NOW")?;
         log::info!("Wi-Fi SoftAP started for ESP-NOW (channel-stable, no AP connection)");
+        apply_tx_power(&config)?;
 
-        // The SoftAP started on `SOFTAP_CHANNEL`, so that is the pin until a scan finds another.
+        // The SoftAP started on `channel`, so that is the pin until a scan finds another.
         Self::init_inner(
             DEFAULT_RX_CHANNEL_CAPACITY,
             Some(wifi),
             RadioMode::OwnedSoftAp,
-            Some(SOFTAP_CHANNEL),
+            Some(channel),
+            Some(regulatory.channels),
         )
     }
 
@@ -451,13 +509,42 @@ impl EspIdfEspNow {
     ///
     /// The radio is always put into STA mode, whatever mode the Wi-Fi driver
     /// stored in NVS (after an erased flash that is SoftAP).
+    ///
+    /// The country is [`Country::WORLD`] as for [`init_with_radio`](Self::init_with_radio#country);
+    /// start under another one with [`init_with_radio_sta_config`](Self::init_with_radio_sta_config).
     pub fn init_with_radio_sta(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
         nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
     ) -> anyhow::Result<Self> {
+        Self::init_with_radio_sta_config(modem, sys_loop, nvs, EspNowConfig::default())
+    }
+
+    /// [`init_with_radio_sta`](Self::init_with_radio_sta) with the start settings of `config`
+    /// (see [`init_with_radio_config`](Self::init_with_radio_config)).
+    ///
+    /// Applied in this order: the country (else [`Country::WORLD`]) before the radio starts,
+    /// the TX power after the start (the driver default when unset), then the channel of
+    /// [`EspNowConfig::with_channel`], pinned like the esp-hal `new_owned` does.
+    /// Without a configured channel the unassociated station sets none and there is no pin
+    /// before a scan.
+    ///
+    /// # Errors
+    ///
+    /// As [`init_with_radio_config`](Self::init_with_radio_config); the channel is set with
+    /// `esp_wifi_set_channel`.
+    pub fn init_with_radio_sta_config(
+        modem: Modem<'static>,
+        sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
+        nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
+        config: EspNowConfig,
+    ) -> anyhow::Result<Self> {
+        config
+            .validate_owned()
+            .context("invalid ESP-NOW configuration")?;
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)
             .context("failed to create EspWifi for ESP-NOW radio")?;
+        let regulatory = crate::regulatory::apply(config.country().unwrap_or(Country::WORLD))?;
         // `set_configuration` is the only esp-idf-svc call that sets the Wi-Fi mode; without it the
         // driver keeps the mode stored in NVS, which is SoftAP after an erased flash.
         wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))
@@ -465,14 +552,57 @@ impl EspIdfEspNow {
         wifi.start()
             .context("failed to start Wi-Fi radio for ESP-NOW")?;
         log::info!("Wi-Fi STA started for ESP-NOW (promiscuous-bracket channel re-pin)");
+        apply_tx_power(&config)?;
+        if let Some(channel) = config.channel() {
+            // SAFETY: plain FFI call into the Wi-Fi driver, which `EspWifi::start` has just
+            // started; the station is unassociated and no frame is on the air yet.
+            esp!(unsafe {
+                esp_idf_svc::sys::esp_wifi_set_channel(
+                    channel,
+                    esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE,
+                )
+            })
+            .with_context(|| format!("failed to set channel {channel} for ESP-NOW radio"))?;
+        }
 
-        // No channel is set on the unassociated station, so there is no pin before a scan.
+        // Without a configured channel none is set, so there is no pin before a scan.
         Self::init_inner(
             DEFAULT_RX_CHANNEL_CAPACITY,
             Some(wifi),
             RadioMode::OwnedStaPromisc,
-            None,
+            config.channel(),
+            Some(regulatory.channels),
         )
+    }
+
+    /// Applies `country` to the driver-owned radio and returns what the radio reports; later
+    /// scans probe only the channels it allows.
+    ///
+    /// [`init_with_radio`](Self::init_with_radio) and
+    /// [`init_with_radio_sta`](Self::init_with_radio_sta) start under [`Country::WORLD`]
+    /// (channels 1-11); a scout looking for a peer whose network runs on channel 12 or 13 needs
+    /// that network's country, e.g. `Country::parse("DE")?`, best given to
+    /// [`init_with_radio_config`](Self::init_with_radio_config) at bring-up.
+    /// 802.11d does not help here: only an associated station adopts its AP's country.
+    /// Call it before the first scan: a scan already running keeps its channel set, and the
+    /// radio then refuses a forbidden channel, which the scan reports as a fault.
+    /// ESP-IDF keeps the country in flash; the write is skipped when the radio already reports
+    /// it, but after a constructor that applied another country each boot writes twice.
+    /// Same name and shape as `EspHalEspNow::set_country` (ADR 022).
+    ///
+    /// # Errors
+    ///
+    /// * [`EspIdfEspNowError::RadioNotOwned`] for a driver created via [`init()`](Self::init) /
+    ///   [`init_with_capacity()`](Self::init_with_capacity): the caller owns that radio and sets
+    ///   its country through `wifi::set_country` or `WiFiConfig::with_country`.
+    /// * [`EspIdfEspNowError::Driver`] with the ESP-IDF error of the write or the read-back.
+    pub fn set_country(&self, country: Country) -> Result<Regulatory, EspIdfEspNowError> {
+        if !self.mode.owns_radio() {
+            return Err(EspIdfEspNowError::RadioNotOwned);
+        }
+        let regulatory = crate::regulatory::apply(country).map_err(EspIdfEspNowError::Driver)?;
+        self.worker.set_allowed_channels(regulatory.channels);
+        Ok(regulatory)
     }
 
     /// Returns the Wi-Fi interface that peers must be registered against.
@@ -539,7 +669,8 @@ impl EspIdfEspNow {
     /// # Side effects
     ///
     /// - Scanning hops the radio across [`ScanConfig::channels`] via
-    ///   `esp_wifi_set_channel`.
+    ///   `esp_wifi_set_channel`, skipping the channels the country does not allow
+    ///   ([`set_country`](Self::set_country)); a not-found result counts them as `not_allowed`.
     /// - Any prior peer registration for `mac` is removed before scanning so
     ///   that a stale entry does not abort the probe loop with
     ///   `ESP_ERR_ESPNOW_EXIST`.  The peer is left registered with the
@@ -633,6 +764,10 @@ impl EspIdfEspNow {
     /// (fail-closed, see [`scan_for_peer_blocking`](Self::scan_for_peer_blocking)): a callback
     /// that never fires blocks this constructor, and every later transmission, until the driver
     /// is dropped.
+    ///
+    /// The scan runs under [`Country::WORLD`] (channels 1-11); a peer on channel 12 or 13 needs
+    /// [`init_with_radio_scanning_config`](Self::init_with_radio_scanning_config) with a
+    /// country that allows it.
     pub fn init_with_radio_scanning(
         modem: Modem<'static>,
         sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
@@ -640,7 +775,28 @@ impl EspIdfEspNow {
         peer_mac: &MacAddress,
         scan_config: &ScanConfig<'_>,
     ) -> anyhow::Result<(Self, ScanResult)> {
-        let driver = Self::init_with_radio(modem, sys_loop, nvs)?;
+        Self::init_with_radio_scanning_config(
+            modem,
+            sys_loop,
+            nvs,
+            EspNowConfig::default(),
+            peer_mac,
+            scan_config,
+        )
+    }
+
+    /// [`init_with_radio_scanning`](Self::init_with_radio_scanning) started with
+    /// [`init_with_radio_config`](Self::init_with_radio_config), so the scan runs under the
+    /// country of `config`.
+    pub fn init_with_radio_scanning_config(
+        modem: Modem<'static>,
+        sys_loop: esp_idf_svc::eventloop::EspSystemEventLoop,
+        nvs: Option<esp_idf_svc::nvs::EspDefaultNvsPartition>,
+        config: EspNowConfig,
+        peer_mac: &MacAddress,
+        scan_config: &ScanConfig<'_>,
+    ) -> anyhow::Result<(Self, ScanResult)> {
+        let driver = Self::init_with_radio_config(modem, sys_loop, nvs, config)?;
         let result = driver.scan_for_peer_blocking(peer_mac, scan_config)?;
         Ok((driver, result))
     }
@@ -755,6 +911,7 @@ impl EspIdfEspNow {
         wifi: Option<EspWifi<'static>>,
         mode: RadioMode,
         initial_pin: Option<u8>,
+        allowed: Option<ChannelSet>,
     ) -> anyhow::Result<Self> {
         let esp_now = EspNow::take().context("failed to acquire EspNow singleton")?;
 
@@ -763,6 +920,9 @@ impl EspIdfEspNow {
         // One send callback for the driver's lifetime; the worker is the only sender, so it
         // always belongs to the frame in flight.
         let worker = worker::spawn(mode, initial_pin)?;
+        if let Some(allowed) = allowed {
+            worker.set_allowed_channels(allowed);
+        }
 
         // The scan's reply tap sees every frame first; what it does not take goes to the queue.
         let callback_queue = Arc::clone(&rx);

@@ -1,7 +1,7 @@
 //! ESP-NOW scout — **STA + promiscuous-bracket variant** (ESP32-C3 Super Mini).
 //!
 //! Starts the Wi-Fi radio in unassociated STA mode (`init_with_radio_sta`),
-//! scans channels 1-13 to find the coordinator by MAC-layer ACK, then sends a
+//! scans the channels the country allows (1-11 by default) to find the coordinator, then sends a
 //! message every second.  Before each send, `send_and_wait` re-pins the radio
 //! to the discovered channel using a promiscuous-mode bracket, which suppresses
 //! the ESP-IDF background channel scanner for the duration of the set + send.
@@ -29,6 +29,9 @@
 //!
 //! # Build and Flash
 //!
+//! Set `WIFI_COUNTRY` (e.g. `DE`) when the coordinator's network runs on channel 12 or 13;
+//! unset, the scout probes only the world-safe channels 1-11.
+//!
 //! ```sh
 //! COORDINATOR_MAC="aa:bb:cc:dd:ee:ff" just build-example idf_c3_espnow_scout_promisc
 //! ```
@@ -38,12 +41,24 @@
 //! ```
 
 use anyhow::Context as _;
-use rustyfarian_esp_idf_network::espnow::{EspIdfEspNow, MacAddress, ScanConfig};
+use rustyfarian_esp_idf_network::espnow::{
+    Country, EspIdfEspNow, EspNowConfig, MacAddress, ScanConfig,
+};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+/// Wi-Fi country (`WIFI_COUNTRY`, e.g. `DE`); unset or empty is the world-safe `01` (channels 1-11).
+/// A code the Wi-Fi driver does not support fails the build.
+const COUNTRY: Country = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => country,
+        Err(_) => panic!("WIFI_COUNTRY is not a supported country code"),
+    },
+    _ => Country::WORLD,
+};
 
 const COORDINATOR_MAC_STR: &str = match option_env!("COORDINATOR_MAC") {
     Some(s) => s,
@@ -101,7 +116,12 @@ fn main() -> anyhow::Result<()> {
     let scan_config = ScanConfig::for_peer();
 
     // STA mode: promiscuous bracket re-pins the channel before every send.
-    let espnow = EspIdfEspNow::init_with_radio_sta(peripherals.modem, sys_loop, Some(nvs))?;
+    let espnow = EspIdfEspNow::init_with_radio_sta_config(
+        peripherals.modem,
+        sys_loop,
+        Some(nvs),
+        EspNowConfig::default().with_country(COUNTRY),
+    )?;
 
     // `connected` tracks whether the scout currently believes it knows the
     // coordinator's channel.  Boot in scanning state (false); the main loop

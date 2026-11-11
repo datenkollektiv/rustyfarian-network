@@ -28,6 +28,10 @@
 //! |:------------|:---------------------------------------------------------------------|
 //! | `WIFI_SSID` | Wi-Fi SSID; unset means an empty SSID, which `init_async` rejects    |
 //! | `WIFI_PASS` | Wi-Fi password; unset means an empty password                        |
+//! | `WIFI_COUNTRY` | Wi-Fi country, e.g. `DE`; unset means `01` (channels 1-11, 802.11d on) |
+//!
+//! With 802.11d on, the station finds an access point on channel 12 or 13 by its passive
+//! scan and adopts the access point's country once associated, so the default works there too.
 //!
 //! # Build and flash
 //!
@@ -48,7 +52,7 @@ use esp_println::println;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::espnow::{EspHalEspNow, EspNowConfig};
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, Country, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
 };
 use static_cell::StaticCell;
 
@@ -60,6 +64,16 @@ esp_bootloader_esp_idf::esp_app_desc!();
 static LINK: WifiLink = WifiLink::new();
 
 const CONNECT_BACKOFF_MS: u64 = 5000;
+
+/// Wi-Fi country from `WIFI_COUNTRY` (e.g. `DE`); unset or empty keeps the world-safe default
+/// (`01`, channels 1-11). An unsupported code fails the build.
+const COUNTRY: Option<Country> = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => Some(country),
+        Err(_) => panic!("WIFI_COUNTRY is not a supported Wi-Fi country code"),
+    },
+    _ => None,
+};
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -86,7 +100,11 @@ async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     println!("Initializing Wi-Fi (async, A-MPDU off)...");
-    let config = WiFiConfig::new(SSID, password())
+    let mut wifi_config = WiFiConfig::new(SSID, password());
+    if let Some(country) = COUNTRY {
+        wifi_config = wifi_config.with_country(country);
+    }
+    let config = wifi_config
         .with_peripherals(
             peripherals.TIMG0,
             peripherals.FROM_CPU_INTR0,

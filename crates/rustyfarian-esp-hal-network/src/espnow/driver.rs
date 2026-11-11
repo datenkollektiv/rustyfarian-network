@@ -20,7 +20,7 @@ use juggler::espnow::{
     ScanConfig, ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, ScanTeardown, SendKind,
     SendOutcome, TxCore, TxId, WifiInterface,
 };
-use juggler::wifi::TxPowerLevel;
+use juggler::wifi::{apply_country, ChannelSet, Country, CountryPort, Regulatory, TxPowerLevel};
 
 use super::cell::{Gate, Lease, SharedCopy, Singleton, TakeCell, WaiterList, Wakeups};
 use super::{
@@ -29,6 +29,7 @@ use super::{
     EspHalEspNowError, EspNowConfig, HoldingBuffer, PeerPlan, RadioError, ReplyMailbox,
     DEFAULT_TX_POWER_QUARTER_DBM, MAX_DATA_LEN,
 };
+use crate::wifi::RadioCountry;
 
 /// Frames examined per [`EspNowDriver::try_recv`] call when the head of the queue is oversize.
 const RX_SKIP_LIMIT: usize = 16;
@@ -125,6 +126,9 @@ pub struct EspHalEspNow {
     /// The probe sequence number the last scan ended on; the next scan continues it, so a
     /// reply left over from the previous scan never matches a new probe.
     scan_seq: SharedCopy<u8>,
+    /// The channels a scan may probe: the radio's read-back of its country, taken at
+    /// construction and on every [`EspHalEspNow::set_country`].
+    allowed: SharedCopy<ChannelSet>,
     /// Declared last: released after the `esp-radio` parts have been dropped.
     _instance: Singleton<'static>,
 }
@@ -144,6 +148,7 @@ impl EspHalEspNow {
     /// Only the TX power of `config` is applied, and only when it sets one; by default the
     /// caller's TX power is left alone (see the crate's TX-power policy for associated stations).
     /// The channel follows the access point.
+    /// The controller keeps its country; the channels it reports bound later scans.
     /// Build the controller with A-MPDU off (`HalWifiConfig::with_ampdu(false)`).
     /// Changing the TX power later is the caller's job on its controller.
     ///
@@ -165,10 +170,13 @@ impl EspHalEspNow {
                 .map_err(EspHalEspNowError::Wifi)?;
         }
         let esp_now = controller.esp_now();
+        // The caller's controller keeps its country; only read which channels it allows.
+        let allowed = read_allowed();
         Ok(Self::assemble(
             esp_now,
             None,
             config.tx_power_quarter_dbm(),
+            allowed,
             instance,
         ))
     }
@@ -178,20 +186,29 @@ impl EspHalEspNow {
     ///
     /// Runs `WifiController::new` with A-MPDU RX/TX off; its default station configuration starts
     /// Wi-Fi without connecting; no SSID, no `embassy-net`, no executor needed.
+    /// The radio runs under the country of `config` ([`EspNowConfig::with_country`]), else
+    /// [`Country::WORLD`] (channels 1-11, 802.11d on), applied before the TX power and the
+    /// channel; change it later with [`EspHalEspNow::set_country`].
     /// The TX power of `config` is applied, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) when unset.
+    /// The ESP-IDF `init_with_radio_config` takes the same [`EspNowConfig`] but leaves the driver
+    /// default TX power when none is set.
     /// `esp_rtos::start` must have run and a heap must exist.
     ///
     /// # Errors
     ///
     /// * [`EspHalEspNowError::AlreadyInitialised`] while another handle is alive.
     /// * [`EspHalEspNowError::InvalidTxPower`] / [`EspHalEspNowError::InvalidChannel`] for a bad
-    ///   config.
+    ///   config, including a channel the configured country does not allow (12 or 13 under
+    ///   [`Country::WORLD`]), refused before any radio work
+    ///   ([`EspNowConfig::validate_owned`]).
     /// * [`EspHalEspNowError::Wifi`] if the driver fails to start.
+    /// * [`EspHalEspNowError::Country`] if the driver rejects the country.
+    /// * [`EspHalEspNowError::Radio`] if the radio itself refuses the configured channel.
     pub fn new_owned(
         wifi: esp_hal::peripherals::WIFI<'static>,
         config: EspNowConfig,
     ) -> Result<Self, EspHalEspNowError> {
-        config.validate()?;
+        config.validate_owned()?;
         let instance =
             Singleton::acquire(&INSTANCE).ok_or(EspHalEspNowError::AlreadyInitialised)?;
 
@@ -201,6 +218,12 @@ impl EspHalEspNow {
             .with_ampdu_tx_enable(false);
         let mut controller =
             WifiController::new(wifi, controller_config).map_err(EspHalEspNowError::Wifi)?;
+        // `WifiController::new` applies esp-radio's own country (CN, channels 1-13); replace it
+        // with the configured one (the world-safe default of both tiers when unset) before the
+        // TX power and the channel.
+        let country = config.country().unwrap_or(Country::WORLD);
+        let applied =
+            apply_country(&mut RadioCountry, country).map_err(EspHalEspNowError::Country)?;
         // `WifiController::new` leaves the esp-radio default of 20 (5 dBm); always set ours.
         let tx_power = config
             .tx_power_quarter_dbm()
@@ -210,7 +233,13 @@ impl EspHalEspNow {
             .map_err(EspHalEspNowError::Wifi)?;
 
         let esp_now = controller.esp_now();
-        let handle = Self::assemble(esp_now, Some(controller), Some(tx_power), instance);
+        let handle = Self::assemble(
+            esp_now,
+            Some(controller),
+            Some(tx_power),
+            applied.channels,
+            instance,
+        );
         if let Some(channel) = config.channel() {
             handle.set_channel(channel)?;
             handle.pinned.set(Some(channel));
@@ -222,6 +251,7 @@ impl EspHalEspNow {
         esp_now: EspNow,
         controller: Option<WifiController<'static>>,
         tx_power_quarter_dbm: Option<i8>,
+        allowed: ChannelSet,
         instance: Singleton<'static>,
     ) -> Self {
         let (manager, sender, receiver) = esp_now.split();
@@ -254,6 +284,7 @@ impl EspHalEspNow {
             held: Mutex::new(RefCell::new(HoldingBuffer::new())),
             pinned: SharedCopy::new(None),
             scan_seq: SharedCopy::new(0),
+            allowed: SharedCopy::new(allowed),
             _instance: instance,
         }
     }
@@ -307,6 +338,35 @@ impl EspHalEspNow {
             .map_err(EspHalEspNowError::Wifi)?;
         self.tx_power_quarter_dbm.set(Some(quarter_dbm));
         Ok(())
+    }
+
+    /// Applies the Wi-Fi country to the owned radio and returns what the radio reports.
+    ///
+    /// [`EspHalEspNow::new_owned`] starts the radio under [`EspNowConfig::with_country`], else
+    /// [`Country::WORLD`] (channels 1-11, 802.11d on); a scout that looks for a network on channel 12 or 13 must be set to that
+    /// network's country, since an unassociated station cannot transmit outside its country
+    /// (802.11d only affects an associated station).
+    /// The channels the radio reports become the ones [`EspHalEspNow::scan_for_peer`] probes;
+    /// call this before the first scan, a scan running meanwhile sees a forbidden channel as a
+    /// failed channel change.
+    /// Logs one line, e.g. `[wifi] country DE, channels 1-13, 802.11d on`.
+    /// Same name and shape as `EspIdfEspNow::set_country` (ADR 022).
+    ///
+    /// # Errors
+    ///
+    /// * [`EspHalEspNowError::ControllerNotOwned`] on a [`EspHalEspNow::from_controller`] handle:
+    ///   set the country on that controller (`wifi::set_country`).
+    /// * [`EspHalEspNowError::Busy`] while another call holds the controller.
+    /// * [`EspHalEspNowError::Country`] if the driver rejects the country.
+    pub fn set_country(&self, country: Country) -> Result<Regulatory, EspHalEspNowError> {
+        if !self.owns_controller {
+            return Err(EspHalEspNowError::ControllerNotOwned);
+        }
+        let _controller = self.controller.lease().ok_or(EspHalEspNowError::Busy)?;
+        let applied =
+            apply_country(&mut RadioCountry, country).map_err(EspHalEspNowError::Country)?;
+        self.allowed.set(applied.channels);
+        Ok(applied)
     }
 
     /// The TX power last applied by this handle, in quarter dBm.
@@ -1067,8 +1127,9 @@ impl EspHalEspNow {
             })
         })
         .await?;
-        let mut machine =
-            ScanMachine::new(*mac, *config, self.pinned.get()).with_first_seq(self.scan_seq.get());
+        let mut machine = ScanMachine::new(*mac, *config, self.pinned.get())
+            .with_first_seq(self.scan_seq.get())
+            .with_allowed_channels(self.allowed.get());
         // Holds the exclusion and, on drop, runs the teardown of the machine's last state
         // (immediately, or after the probe on the air when the future was cancelled mid-probe).
         let mut guard = ScanGuard {
@@ -1509,6 +1570,20 @@ fn radio_max_tx_power() -> Option<i8> {
     // It fails with an error code (read as `None`) when Wi-Fi is not started.
     let rc = unsafe { esp_wifi_get_max_tx_power(&mut power) };
     (rc == 0).then_some(power)
+}
+
+/// The channels the radio's country allows; every channel when the read fails, so the scan
+/// keeps its old behaviour and a forbidden channel surfaces as a failed channel change.
+fn read_allowed() -> ChannelSet {
+    match RadioCountry.country() {
+        Ok(regulatory) => regulatory.channels,
+        Err(rc) => {
+            log::warn!(
+                "ESP-NOW: reading the Wi-Fi country failed ({rc:#x}); scans probe every channel"
+            );
+            ChannelSet::ALL
+        }
+    }
 }
 
 /// Reads the primary channel the radio is on, `None` when the driver refuses (not started).

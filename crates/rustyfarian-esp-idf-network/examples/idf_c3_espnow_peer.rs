@@ -27,6 +27,7 @@
 //! | `ESPNOW_PEER_MAC` | Coordinator STA MAC, `aa:bb:cc:dd:ee:ff` (required; printed by it)          |
 //! | `COORDINATOR_MAC` | Accepted as a fallback for `ESPNOW_PEER_MAC` (the scouts' variable name)   |
 //! | `ESPNOW_SCENARIO` | Only `default` exists here; the gate scenarios live in `idf_c3_espnow_scout` |
+//! | `WIFI_COUNTRY`    | Wi-Fi country, e.g. `DE` for a coordinator on channel 12 or 13; unset = `01` (1-11) |
 //!
 //! No credentials are involved.
 //!
@@ -47,7 +48,7 @@
 
 use anyhow::Context as _;
 use rustyfarian_esp_idf_network::espnow::{
-    EmbassyClock, EspIdfEspNow, MacAddress, PeerLinkConfig, PeerSession,
+    Country, EmbassyClock, EspIdfEspNow, EspNowConfig, MacAddress, PeerLinkConfig, PeerSession,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -59,6 +60,16 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 mod espnow_peer_app;
 
 /// `ESPNOW_PEER_MAC` as on the hal peer, `COORDINATOR_MAC` as on the scouts.
+/// Wi-Fi country (`WIFI_COUNTRY`, e.g. `DE`); unset or empty is the world-safe `01` (channels 1-11).
+/// A code the Wi-Fi driver does not support fails the build.
+const COUNTRY: Country = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => country,
+        Err(_) => panic!("WIFI_COUNTRY is not a supported country code"),
+    },
+    _ => Country::WORLD,
+};
+
 const PEER_MAC_STR: Option<&str> = match option_env!("ESPNOW_PEER_MAC") {
     Some(s) => Some(s),
     None => option_env!("COORDINATOR_MAC"),
@@ -154,7 +165,12 @@ fn main() -> anyhow::Result<()> {
     let nvs = EspDefaultNvsPartition::take()?;
 
     // ── ESP-NOW on the owned SoftAP radio ───────────────────────────────
-    let espnow = EspIdfEspNow::init_with_radio(peripherals.modem, sys_loop, Some(nvs))?;
+    let espnow = EspIdfEspNow::init_with_radio_config(
+        peripherals.modem,
+        sys_loop,
+        Some(nvs),
+        EspNowConfig::default().with_country(COUNTRY),
+    )?;
 
     let mac = sta_mac().unwrap_or_default();
     log::info!(

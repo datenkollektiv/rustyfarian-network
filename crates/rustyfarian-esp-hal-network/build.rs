@@ -10,6 +10,8 @@ fn main() {
     // Wi-Fi credentials used by the connectivity examples.
     println!("cargo:rerun-if-env-changed=WIFI_SSID");
     println!("cargo:rerun-if-env-changed=WIFI_PASS");
+    // Wi-Fi country (regulatory domain) read by the ESP-NOW examples.
+    println!("cargo:rerun-if-env-changed=WIFI_COUNTRY");
     // Portal identity overrides used by the provisioning examples.
     println!("cargo:rerun-if-env-changed=PORTAL_SSID_PREFIX");
     println!("cargo:rerun-if-env-changed=PORTAL_SSID_OVERRIDE");

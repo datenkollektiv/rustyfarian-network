@@ -2,8 +2,8 @@
 id: 017
 title: The ESP-IDF scout's full ESP-NOW scan cannot set channel 12
 captured-on: 2026-11-10
-doc-version: 2
-status: open-observation
+doc-version: 3
+status: closed
 kind: observation
 ---
 
@@ -31,3 +31,4 @@ high
 ## Session Log
 - 2026-11-10 — Observation captured via /bug dialog from the first C3-I7 bench run
 - 2026-11-10 — Updated: ESP-IDF answers `ESP_ERR_INVALID_ARG` for channel 12
+- 2026-11-11 — Closed: the country is now applied on both tiers (`juggler::wifi::Country`, default `Country::WORLD` = `01`, channels 1-11) and the ESP-NOW scan skips channels the country forbids, counting them in `NotFound::not_allowed` (ADR 026, [feature doc](../../features/wifi-country-v1.md)); regression test `world_country_with_the_default_list_probes_only_1_to_11` in `crates/juggler/src/espnow/scan.rs` (the default list probes 1 to 11 and ends `NotFound` with two not allowed); the bench rerun of C3-I7 is still owed

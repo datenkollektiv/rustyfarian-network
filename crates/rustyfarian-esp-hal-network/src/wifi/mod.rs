@@ -40,10 +40,10 @@
 #[allow(deprecated)]
 pub use juggler::wifi::{
     credentials_hint, reason_suggests_credentials, validate_password, validate_ssid,
-    wifi_disconnect_reason_name, ApConfig, ApSelection, ConnectMode, DisconnectReason, LinkAction,
-    LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
-    DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
-    RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    wifi_disconnect_reason_name, ApConfig, ApSelection, ChannelSet, ConnectMode, Country,
+    CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState, Regulatory,
+    TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+    POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
 
 /// `embassy-net` `StackResources<N>` size for the SoftAP scaffold.
@@ -167,8 +167,8 @@ mod driver {
         Ssid, WifiController,
     };
     use juggler::wifi::{
-        validate_ap_config, validate_password, validate_ssid, ApConfig, ApSelection, TxPowerLevel,
-        WiFiConfig, WifiPowerSave,
+        validate_ap_config, validate_password, validate_ssid, ApConfig, ApSelection, Country,
+        TxPowerLevel, WiFiConfig, WifiPowerSave,
     };
     use static_cell::StaticCell;
 
@@ -213,6 +213,7 @@ mod driver {
         power_save: WifiPowerSave,
         tx_power: TxPowerLevel,
         ap_selection: ApSelection,
+        country: Country,
         ampdu: bool,
         scheduler: Scheduler,
         wifi: esp_hal::peripherals::WIFI<'static>,
@@ -230,6 +231,7 @@ mod driver {
                 power_save: config.power_save,
                 tx_power: config.tx_power,
                 ap_selection: config.ap_selection,
+                country: config.country,
                 ampdu: true,
                 scheduler,
                 wifi,
@@ -304,6 +306,8 @@ mod driver {
         ConfigureFailed,
         /// An underlying `esp-radio` driver error.
         Driver(esp_radio::wifi::WifiError),
+        /// Applying or reading the Wi-Fi country failed with this driver error code.
+        Country(i32),
     }
 
     impl core::fmt::Display for WifiError {
@@ -311,6 +315,7 @@ mod driver {
             match self {
                 Self::ConfigureFailed => write!(f, "Wi-Fi configuration failed"),
                 Self::Driver(inner) => write!(f, "Wi-Fi driver error: {:?}", inner),
+                Self::Country(rc) => write!(f, "Wi-Fi country call failed with code {rc:#x}"),
             }
         }
     }
@@ -448,6 +453,18 @@ mod driver {
         /// Note that an explicit [`TxPowerLevel::Medium`] is indistinguishable
         /// from the unset default and is therefore *not* applied.
         ///
+        /// # Country
+        ///
+        /// The country of [`WiFiConfig::with_country`][juggler::wifi::WiFiConfig::with_country]
+        /// (default [`Country::WORLD`], channels 1-11, 802.11d on) replaces `esp-radio`'s
+        /// own default (`CN`, channels 1-13) right after the controller is built, before
+        /// the station config, as on the ESP-IDF tier.
+        /// With 802.11d on (the default) the station finds an access point on channel 12 or
+        /// 13 by its passive scan and adopts the access point's country once associated;
+        /// a country that allows those channels is needed only with
+        /// `with_ieee80211d(false)`, or for a faster active scan of them.
+        /// A failed country call returns [`WifiError::Country`].
+        ///
         /// # Scheduler
         ///
         /// `esp-radio` needs the `esp-rtos` scheduler, and the scheduler belongs
@@ -496,6 +513,11 @@ mod driver {
                 .with_ampdu_tx_enable(config.ampdu);
             let mut controller =
                 WifiController::new(config.wifi, controller_config).map_err(WifiError::Driver)?;
+
+            // 2b. Replace esp-radio's own default country (CN, channels 1-13) with the
+            //     configured one before the station config, so the scan and the join see
+            //     the configured channels.  A failed country call is fatal.
+            super::country::set_country(config.country)?;
 
             // 3. Apply station credentials.  `WifiController::new` already applied
             //    an empty StationConfig (which starts the radio driver via
@@ -774,6 +796,14 @@ mod driver {
         /// what triggers `esp_wifi_start()`.  Failure is non-fatal and logged
         /// at `warn`.
         ///
+        /// # Country
+        ///
+        /// The country of [`ApConfig::with_country`][juggler::wifi::ApConfig::with_country]
+        /// (default [`Country::WORLD`], channels 1-11) is applied before the AP config, and
+        /// the channel must be one it allows: a channel outside it is rejected with
+        /// [`WifiError::ConfigureFailed`] (the radio would silently move the AP to channel 1).
+        /// A failed country call returns [`WifiError::Country`].
+        ///
         /// # Static IP
         ///
         /// The AP stack is wired to `192.168.4.1/24` with the AP itself as
@@ -812,6 +842,11 @@ mod driver {
             //    are applied via `set_config` immediately after (step 3).
             let mut controller = WifiController::new(config.wifi, ControllerConfig::default())
                 .map_err(WifiError::Driver)?;
+
+            // 2b. Apply the AP's country before the AP config: the blob moves an AP on a
+            //     channel outside the country to channel 1 (`validate_ap_config` already
+            //     rejected such a channel).  A failed country call is fatal.
+            super::country::set_country(config.ap.country)?;
 
             // 3. Build the esp-radio AP config and apply it.
             let ssid = Ssid::try_from(config.ap.ssid).map_err(WifiError::Driver)?;
@@ -939,6 +974,34 @@ pub use driver::{
     ApConfigExt, AsyncWifiHandle, HalApConfig, HalWifiConfig, SoftApHandle, WiFiConfigExt,
     WiFiManager, WifiError, AP_IP,
 };
+
+#[cfg(all(
+    feature = "embassy",
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
+))]
+mod country;
+
+#[cfg(all(
+    feature = "embassy",
+    feature = "espnow",
+    any(feature = "esp32c6", feature = "esp32c3")
+))]
+pub(crate) use country::RadioCountry;
+#[cfg(all(
+    feature = "embassy",
+    any(
+        feature = "esp32c6",
+        feature = "esp32c3",
+        feature = "esp32s3",
+        feature = "esp32"
+    )
+))]
+pub use country::{regulatory, set_country};
 
 #[cfg(all(
     feature = "embassy",

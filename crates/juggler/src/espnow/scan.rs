@@ -118,7 +118,8 @@
 use core::time::Duration;
 
 use super::command::PROBE_FRAME_LEN;
-use super::{MacAddress, ProbeFrame, ProbeReply, ScanConfig, ScanResult};
+use super::{MacAddress, ProbeFrame, ProbeReply, ScanConfig, ScanResult, DEFAULT_SCAN_CHANNELS};
+use crate::wifi::ChannelSet;
 
 /// Outcome of one probe transmission, reported after [`ScanAction::SendProbe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +240,10 @@ pub enum ScanAction {
 /// A skipped channel does not count as probed, so a scan that fails on every channel reports
 /// `probed: 0` with no other clue.
 /// The machine records only the first such failure; the driver adds the error detail it knows.
+/// A channel the country does not allow is skipped without radio work and is no fault (see
+/// [`ScanMachine::with_allowed_channels`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScanFault {
     /// The radio refused to switch to `channel` ([`ScanInput::Failed`] after
     /// [`ScanAction::SetChannel`]).
@@ -266,15 +270,29 @@ impl core::fmt::Display for ScanFault {
 
 /// Why a scan failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScanError {
     /// The peer did not respond on any probed channel.
+    ///
+    /// `probed <= configured - not_allowed`.
     NotFound {
         /// Channels on which a probe was actually transmitted.
         probed: usize,
         /// Channels in [`ScanConfig::channels`].
         configured: usize,
+        /// Entries of [`ScanConfig::channels`] the Wi-Fi country does not allow; they were
+        /// skipped without radio work (see [`ScanMachine::with_allowed_channels`]).
+        not_allowed: usize,
         /// The first channel switch or probe send that failed, if any.
         first_fault: Option<ScanFault>,
+    },
+    /// The peer replied with a home channel the Wi-Fi country does not allow, so the radio
+    /// cannot follow it; the scan ended not found and the previous pin was restored.
+    ///
+    /// Set the country of the peer's network on this device.
+    HomeNotAllowed {
+        /// The home channel the peer named.
+        home: u8,
     },
     /// The temporary peer (channel 0) could not be registered; nothing was probed.
     RegisterTempPeer,
@@ -296,17 +314,25 @@ impl core::fmt::Display for ScanError {
             Self::NotFound {
                 probed,
                 configured,
+                not_allowed,
                 first_fault,
             } => {
                 write!(
                     f,
                     "peer not found after probing {probed} of {configured} configured channels"
                 )?;
+                if *not_allowed > 0 {
+                    write!(f, " ({not_allowed} not allowed by the country)")?;
+                }
                 match first_fault {
                     Some(fault) => write!(f, " (first failure: {fault})"),
                     None => Ok(()),
                 }
             }
+            Self::HomeNotAllowed { home } => write!(
+                f,
+                "peer replied with home channel {home}, which the country does not allow"
+            ),
             Self::RegisterTempPeer => f.write_str("failed to register temporary peer for scanning"),
             Self::RegisterFoundPeer { channel } => {
                 write!(
@@ -582,6 +608,10 @@ pub struct ScanMachine<'a> {
     seq: u8,
     /// The last encoded probe, for the deprecated [`probe_data`](Self::probe_data).
     last_probe: [u8; PROBE_FRAME_LEN],
+    /// The channels the Wi-Fi country allows; others are skipped.
+    allowed: ChannelSet,
+    /// Entries of the channel list `allowed` excludes.
+    not_allowed: usize,
 }
 
 impl<'a> ScanMachine<'a> {
@@ -610,7 +640,42 @@ impl<'a> ScanMachine<'a> {
                 tx_channel: 0,
             }
             .encode(),
+            allowed: ChannelSet::ALL,
+            not_allowed: 0,
         }
+    }
+
+    /// Restricts the scan to the channels the Wi-Fi country allows (default
+    /// [`ChannelSet::ALL`]).
+    ///
+    /// Both tiers pass the set the radio reported after applying the country.
+    /// A channel of [`ScanConfig::channels`] outside `allowed` is skipped without a
+    /// [`ScanAction::SetChannel`] (never a [`ScanFault`]) and counted in
+    /// [`ScanError::NotFound`]'s `not_allowed`; an explicit list naming one is logged once per
+    /// scan at `warn`.
+    /// When no listed channel is allowed, [`ScanInput::Start`] finishes not found without any
+    /// radio work.
+    /// A reply naming a home channel outside `allowed` ends the scan with
+    /// [`ScanError::HomeNotAllowed`] through the normal not-found teardown.
+    pub fn with_allowed_channels(mut self, allowed: ChannelSet) -> Self {
+        self.allowed = allowed;
+        self.not_allowed = self
+            .config
+            .channels
+            .iter()
+            .filter(|&&channel| !allowed.contains(channel))
+            .count();
+        self
+    }
+
+    /// The channels the scan may probe (see [`with_allowed_channels`](Self::with_allowed_channels)).
+    pub fn allowed_channels(&self) -> ChannelSet {
+        self.allowed
+    }
+
+    /// Entries of [`ScanConfig::channels`] the country does not allow.
+    pub fn not_allowed(&self) -> usize {
+        self.not_allowed
     }
 
     /// Continues the probe sequence of the previous scan: the first probe gets `seq + 1`.
@@ -809,6 +874,18 @@ impl<'a> ScanMachine<'a> {
             (_, ScanInput::Abort) => self.unwind(ScanError::Aborted),
 
             (State::Idle, ScanInput::Start) => {
+                if self.not_allowed > 0 {
+                    self.log_not_allowed();
+                    if self.not_allowed == self.config.channels.len() {
+                        // Nothing to probe: finish without touching the radio.
+                        let error = self.not_found();
+                        return self.enter(
+                            Step::Finishing(Err(error)),
+                            error,
+                            ScanInput::Completed,
+                        );
+                    }
+                }
                 self.state = State::RemovingStale;
                 ScanAction::RemovePeer
             }
@@ -995,6 +1072,30 @@ impl<'a> ScanMachine<'a> {
         }
     }
 
+    /// Logs the channels of the list the country does not allow, once per scan: at `warn` for
+    /// an explicit list, at `debug` for [`DEFAULT_SCAN_CHANNELS`] (expected under the world
+    /// default).
+    fn log_not_allowed(&self) {
+        let skipped = self
+            .config
+            .channels
+            .iter()
+            .filter(|&&channel| !self.allowed.contains(channel))
+            .fold(ChannelSet::EMPTY, |set, &channel| set.with(channel));
+        if self.config.channels == DEFAULT_SCAN_CHANNELS.as_slice() {
+            log::debug!(
+                "ESP-NOW scan: skipping channels {skipped} (country allows {})",
+                self.allowed
+            );
+        } else {
+            log::warn!(
+                "ESP-NOW scan: skipping {} listed channel(s) {skipped} not allowed by the country (allowed {})",
+                self.not_allowed,
+                self.allowed
+            );
+        }
+    }
+
     /// Finish on `channel`: the teardown registers the peer there.
     fn found(&mut self, channel: u8) -> ScanAction {
         self.enter(
@@ -1009,6 +1110,17 @@ impl<'a> ScanMachine<'a> {
     /// A reply named `home` while the radio is on `probed`: finish there, switching first when
     /// the two differ so the radio sits on the found channel at `Done`.
     fn found_at(&mut self, home: u8, probed: u8) -> ScanAction {
+        if !self.allowed.contains(home) {
+            log::warn!(
+                "ESP-NOW scan: peer replied on channel {probed} with home channel {home}, which the country does not allow (allowed {})",
+                self.allowed
+            );
+            return self.enter(
+                Step::Begin { found: None },
+                ScanError::HomeNotAllowed { home },
+                ScanInput::Completed,
+            );
+        }
         if home == probed {
             self.found(home)
         } else {
@@ -1032,6 +1144,7 @@ impl<'a> ScanMachine<'a> {
         ScanError::NotFound {
             probed: self.probed,
             configured: self.config.channels.len(),
+            not_allowed: self.not_allowed,
             first_fault: self.first_fault,
         }
     }
@@ -1047,9 +1160,17 @@ impl<'a> ScanMachine<'a> {
         }
     }
 
-    /// Move to `channels[idx]`, or end the sweep when the list or the burst budget is exhausted:
+    /// Move to the first allowed channel from `channels[idx]` on, or end the sweep when the list or the burst budget is exhausted:
     /// back to the candidate if one was recorded, otherwise not found.
     fn next_channel(&mut self, now: Duration, idx: usize) -> ScanAction {
+        // A channel the country does not allow is skipped without radio work.
+        let mut idx = idx;
+        while let Some(&channel) = self.config.channels.get(idx) {
+            if self.allowed.contains(channel) {
+                break;
+            }
+            idx += 1;
+        }
         let burst_over = now.saturating_sub(self.burst_start) >= self.config.burst_timeout;
         match self.config.channels.get(idx) {
             Some(&channel) if !burst_over => {
@@ -1645,6 +1766,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 10,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::SetChannel { channel: 11 })
             })
         );
@@ -1654,6 +1776,152 @@ mod tests {
             seen[seen.len() - 2..],
             [Seen::RestoreChannel(3), Seen::RegisterFallback(3)]
         );
+    }
+
+    // ── Wi-Fi country (allowed channels) ─────────────────────────────────
+
+    // Hand mutation checks (2026-11-11, `just test-espnow`), each applied, run and reverted:
+    // - skip test: `allowed.contains(channel)` negated in `next_channel` -> many fail, among
+    //   them `an_explicit_list_probes_only_its_allowed_channels`;
+    // - `not_allowed` count: always 0 in `with_allowed_channels` -> 4 fail, among them
+    //   `world_country_with_the_default_list_probes_only_1_to_11`;
+    // - home guard: the `!self.allowed.contains(home)` early return in `found_at` removed ->
+    //   `a_reply_naming_a_forbidden_home_channel_never_switches_to_it`;
+    // - table: `01` moved to the 1-13 row in `Country::channels` -> 9 fail, among them the
+    //   bug 017 regression above.
+
+    fn world() -> ChannelSet {
+        crate::wifi::Country::WORLD.channels()
+    }
+
+    #[test]
+    fn world_country_with_the_default_list_probes_only_1_to_11() {
+        // Bug 017: the default list names 12 and 13, which the world default forbids.
+        let m = machine(ScanConfig::for_peer(), Some(3)).with_allowed_channels(world());
+        assert_eq!(m.not_allowed(), 2);
+        let r = run(m, &Peer::absent(), D::ZERO);
+        assert_eq!(r.channels_set(), (1..=11).collect::<Vec<u8>>());
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 11,
+                configured: 13,
+                not_allowed: 2,
+                first_fault: None
+            })
+        );
+        assert_eq!(r.pinned, Some(3));
+        assert!(r.polls <= r.max_polls);
+    }
+
+    #[test]
+    fn an_explicit_list_probes_only_its_allowed_channels() {
+        let cfg = ScanConfig::for_peer().with_channels(&[12, 13, 6]);
+        let r = run(
+            machine(cfg, None).with_allowed_channels(world()),
+            &Peer::on(6),
+            D::ZERO,
+        );
+        assert_eq!(r.result, Ok(ScanResult { channel: 6 }));
+        assert_eq!(r.channels_set(), [6]);
+        assert_eq!(r.probe_log, [(6, 0)]);
+    }
+
+    #[test]
+    fn an_explicit_list_with_a_forbidden_tail_reports_it_as_not_allowed() {
+        let cfg = ScanConfig::for_peer().with_channels(&[6, 12, 13]);
+        let r = run(
+            machine(cfg, None).with_allowed_channels(world()),
+            &Peer::absent(),
+            D::ZERO,
+        );
+        assert_eq!(r.channels_set(), [6]);
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 1,
+                configured: 3,
+                not_allowed: 2,
+                first_fault: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_list_with_no_allowed_channel_does_no_radio_work() {
+        let cfg = ScanConfig::for_peer().with_channels(&[12, 13]);
+        let r = run(
+            machine(cfg, Some(4)).with_allowed_channels(world()),
+            &Peer::on(12),
+            D::ZERO,
+        );
+        assert!(r.seen().is_empty(), "no radio action: {:?}", r.seen());
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 0,
+                configured: 2,
+                not_allowed: 2,
+                first_fault: None
+            })
+        );
+        assert_eq!(r.pinned, Some(4));
+        assert_eq!(r.polls, 1);
+    }
+
+    #[test]
+    fn a_reply_naming_a_forbidden_home_channel_never_switches_to_it() {
+        // The peer's network runs on 13; a probe on 11 leaks across and is answered.
+        let peer = Peer {
+            acks_also_on: alloc::vec![11],
+            decodes_reply_on: alloc::vec![11],
+            ..Peer::on(13)
+        };
+        let r = run(
+            machine(ScanConfig::for_peer(), Some(3)).with_allowed_channels(world()),
+            &peer,
+            D::ZERO,
+        );
+        assert_eq!(r.result, Err(ScanError::HomeNotAllowed { home: 13 }));
+        assert!(!r.channels_set().contains(&13));
+        assert!(!r.channels_set().contains(&12));
+        assert_eq!(r.pinned, Some(3));
+        let seen = r.seen();
+        assert_eq!(
+            seen[seen.len() - 2..],
+            [Seen::RestoreChannel(3), Seen::RegisterFallback(3)]
+        );
+        assert_eq!(
+            seen.iter().filter(|s| **s == Seen::Restore).count(),
+            1,
+            "the TX power is restored"
+        );
+    }
+
+    #[test]
+    fn the_same_reply_is_followed_when_the_country_allows_the_home_channel() {
+        let peer = Peer {
+            acks_also_on: alloc::vec![11],
+            decodes_reply_on: alloc::vec![11],
+            ..Peer::on(13)
+        };
+        let de = crate::wifi::Country::parse("DE").unwrap().channels();
+        let r = run(
+            machine(ScanConfig::for_peer(), Some(3)).with_allowed_channels(de),
+            &peer,
+            D::ZERO,
+        );
+        assert_eq!(r.result, Ok(ScanResult { channel: 13 }));
+        assert_eq!(r.pinned, Some(13));
+    }
+
+    #[test]
+    fn the_default_allowed_set_changes_nothing() {
+        let m = machine(ScanConfig::for_peer(), None);
+        assert_eq!(m.allowed_channels(), ChannelSet::ALL);
+        assert_eq!(m.not_allowed(), 0);
+        let r = run(m, &Peer::absent(), D::ZERO);
+        assert_eq!(r.channels_set(), (1..=13).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -1778,6 +2046,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 13,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -1846,6 +2115,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 12,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::SetChannel { channel: 9 })
             })
         ));
@@ -1926,6 +2196,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 13,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             }),
             "the candidate probe is not counted as a probed channel"
@@ -1975,6 +2246,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 13,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -1996,6 +2268,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 1,
                 configured: 1,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::ProbeSend { channel: 1 })
             })
         );
@@ -2085,6 +2358,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 3,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -2109,6 +2383,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 0,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -2154,6 +2429,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 3,
                 configured: 3,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -2168,6 +2444,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 0,
                 configured: 0,
+                not_allowed: 0,
                 first_fault: None
             })
         );
@@ -2198,6 +2475,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 11,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::SetChannel { channel: 12 })
             })
         );
@@ -2217,6 +2495,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 1,
                 configured: 2,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::ProbeSend { channel: 1 })
             })
         );
@@ -3197,6 +3476,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 0,
                 configured: 2,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::SetChannel { channel: 1 })
             })
         );
@@ -3216,6 +3496,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 0,
                 configured: 2,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::ProbeSend { channel: 1 })
             })
         );
@@ -3240,6 +3521,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 1,
                 configured: 1,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::ProbeSend { channel: 6 })
             })
         );
@@ -3262,6 +3544,7 @@ mod tests {
             Err(ScanError::NotFound {
                 probed: 0,
                 configured: 3,
+                not_allowed: 0,
                 first_fault: first
             })
         );
@@ -3274,6 +3557,7 @@ mod tests {
             ScanError::NotFound {
                 probed: 3,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: None
             }
             .to_string(),
@@ -3283,6 +3567,7 @@ mod tests {
             ScanError::NotFound {
                 probed: 0,
                 configured: 13,
+                not_allowed: 0,
                 first_fault: Some(ScanFault::ProbeSend { channel: 1 })
             }
             .to_string(),
@@ -3292,10 +3577,26 @@ mod tests {
         assert!(ScanError::NotFound {
             probed: 0,
             configured: 13,
+            not_allowed: 0,
             first_fault: Some(ScanFault::SetChannel { channel: 4 })
         }
         .to_string()
         .ends_with("(first failure: set channel 4)"));
+        assert_eq!(
+            ScanError::NotFound {
+                probed: 11,
+                configured: 13,
+                not_allowed: 2,
+                first_fault: None
+            }
+            .to_string(),
+            "peer not found after probing 11 of 13 configured channels \
+             (2 not allowed by the country)"
+        );
+        assert_eq!(
+            ScanError::HomeNotAllowed { home: 13 }.to_string(),
+            "peer replied with home channel 13, which the country does not allow"
+        );
         assert!(ScanError::RegisterTempPeer
             .to_string()
             .contains("temporary"));

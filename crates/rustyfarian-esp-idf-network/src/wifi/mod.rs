@@ -43,6 +43,17 @@
 //! modes also retry a failed first association within their timeout, and
 //! `is_connected()` is `false` for the whole outage.
 //!
+//! # Country
+//!
+//! [`WiFiManager`] and [`SoftApManager`] apply [`WiFiConfig::country`] /
+//! [`ApConfig::country`] before the radio starts; the default [`Country::WORLD`]
+//! allows channels 1-11.
+//! Set the country of the network (`.with_country(Country::parse("DE")?)`) to join
+//! an AP on channel 12 or 13 without 802.11d, or to run a SoftAP there.
+//! With 802.11d on (the default) the associated station adopts its AP's country and
+//! falls back to the configured one after a disconnect.
+//! ESP-IDF keeps the country in flash; the library re-applies it on every boot.
+//!
 //! # Suspend and deep sleep
 //!
 //! `WiFiManager::suspend()` disconnects and stops the radio inline and pauses
@@ -97,11 +108,11 @@ use rgb::RGB8;
 #[allow(deprecated)]
 pub use juggler::wifi::{
     credentials_hint, reason_suggests_credentials, validate_ap_config, validate_password,
-    validate_ssid, wifi_disconnect_reason_name, ApConfig, ApSelection, ConnectMode,
-    DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState, TxPowerLevel, WiFiConfig,
-    WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN,
-    DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS,
-    RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    validate_ssid, wifi_disconnect_reason_name, ApConfig, ApSelection, ChannelSet, ConnectMode,
+    Country, CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState,
+    Regulatory, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
+    AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
+    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -123,6 +134,7 @@ pub struct IdfWifiConfig<'a> {
     power_save: WifiPowerSave,
     tx_power: TxPowerLevel,
     ap_selection: ApSelection,
+    country: Country,
     modem: Modem<'static>,
     sys_loop: EspSystemEventLoop,
     nvs: Option<EspDefaultNvsPartition>,
@@ -154,6 +166,7 @@ impl<'a> WiFiConfigExt<'a> for WiFiConfig<'a> {
             power_save: self.power_save,
             tx_power: self.tx_power,
             ap_selection: self.ap_selection,
+            country: self.country,
             modem,
             sys_loop,
             nvs,
@@ -237,6 +250,7 @@ impl WiFiManager {
             power_save: config.power_save,
             tx_power: config.tx_power,
             ap_selection: config.ap_selection,
+            country: config.country,
         };
         Self::new_without_led(config.modem, config.sys_loop, config.nvs, wifi_config)
     }
@@ -274,6 +288,10 @@ impl WiFiManager {
         // optional disconnect-event subscription in non-blocking mode.
         let sys_loop_sub = sys_loop.clone();
         let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
+
+        // The driver is initialised but not started: the country decides the channels the
+        // first scan may use.
+        crate::regulatory::apply(config.country)?;
 
         validate_ssid(config.ssid)
             .map_err(|e| anyhow::anyhow!("WiFi SSID invalid (len={}): {}", config.ssid.len(), e))?;
@@ -800,6 +818,36 @@ impl LinkRadio for IdfRadio {
     }
 }
 
+/// Applies `country` to the Wi-Fi driver and returns what the radio reports.
+///
+/// [`WiFiManager`], [`SoftApManager`] and the driver-owned ESP-NOW radios apply their
+/// configured country themselves; call this for a radio the firmware built on its own, or to
+/// change the country later.
+/// The Wi-Fi driver must be initialised (`EspWifi::new`); the radio need not be started.
+/// Logs the shared line, e.g. `[wifi] country DE, channels 1-13, 802.11d on`.
+/// ESP-IDF stores the country in flash; the write is skipped when the radio already reports
+/// the requested code and 802.11d policy.
+/// With 802.11d on, an associated station adopts its AP's country, so the read-back can name
+/// that one instead.
+/// Same name and shape as the esp-hal tier's `wifi::set_country` (ADR 022).
+///
+/// # Errors
+///
+/// The ESP-IDF error of `esp_wifi_set_country_code` or of the read-back, e.g. when the driver
+/// is not initialised.
+pub fn set_country(country: Country) -> anyhow::Result<Regulatory> {
+    crate::regulatory::apply(country)
+}
+
+/// The country the radio reports right now (`esp_wifi_get_country`), `None` when the Wi-Fi
+/// driver is not initialised.
+///
+/// For diagnostics: with 802.11d on, an associated station reports its AP's country.
+/// Same name and shape as the esp-hal tier's `wifi::regulatory` (ADR 022).
+pub fn regulatory() -> Option<Regulatory> {
+    crate::regulatory::read()
+}
+
 /// Reads the SoftAP factory MAC address from efuse.
 ///
 /// This reads the base MAC via `esp_read_mac` with the
@@ -854,7 +902,8 @@ pub struct SoftApManager {
 impl SoftApManager {
     /// Starts a SoftAP from the given [`ApConfig`].
     ///
-    /// Validates the configuration via [`validate_ap_config`], configures the
+    /// Validates the configuration via [`validate_ap_config`] (the channel must be
+    /// one [`ApConfig::country`] allows), applies the country, configures the
     /// access point (WPA2-Personal when a password is present, open otherwise),
     /// starts the radio, then applies the requested transmit power.
     /// As with the STA path, a TX-power failure is logged at `warn` and the AP
@@ -873,6 +922,10 @@ impl SoftApManager {
         log::info!("[wifi] starting softap (ssid len={})", config.ssid.len());
 
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)?;
+
+        // Before the AP starts: ESP-IDF silently moves an AP on a channel outside the
+        // country to channel 1, and `validate_ap_config` checked the channel against it.
+        crate::regulatory::apply(config.country)?;
 
         let ssid = config.ssid.try_into().map_err(|_| {
             anyhow::anyhow!(

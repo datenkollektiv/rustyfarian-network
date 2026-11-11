@@ -66,6 +66,10 @@
 #[cfg(feature = "wifi")]
 pub mod wifi;
 
+/// The Wi-Fi country adapter shared by the Wi-Fi and ESP-NOW drivers.
+#[cfg(any(feature = "wifi", feature = "espnow"))]
+mod regulatory;
+
 /// MQTT builder, handle, and background event loop.
 #[cfg(feature = "mqtt")]
 pub mod mqtt;

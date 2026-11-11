@@ -254,6 +254,11 @@ Since 2026-11-08 both tiers log the joined AP on association (`[wifi] link up #N
 
 ---
 
+**esp-radio 1.0.0-beta.1 hard-codes the Wi-Fi country as CN with channels 1-13 and manual control through `CountryInfo`.**
+Symptom: on esp-hal a scan or a SoftAP on channel 12 or 13 worked while the same firmware on ESP-IDF failed with `ESP_ERR_INVALID_ARG`.
+esp-radio sets the country once when the controller is created, and the library's `esp_wifi_set_country_code` call after `WifiController::new` takes effect, so do not rely on `ControllerConfig::country_info`.
+Re-check this on every esp-radio bump, because the `extern "C"` layout in `rustyfarian-esp-hal-network` is taken from esp-wifi-sys 0.3.0 (ADR 026).
+
 ## Flashing & Serial (espflash 4.x)
 
 **`espflash`'s auto-detect picks Bluetooth ports on Macs with paired headsets, then fails with the generic "Error while connecting to device".**
@@ -645,7 +650,17 @@ The worker publishes `Aborted` for the running scan, but a caller polling its `S
 
 ---
 
+**ESP-IDF stores the Wi-Fi country in flash, and the library re-applies the configured country on every start.**
+The stored country survives a reflash, and the ESP-IDF default is `01` (channels 1-11, 802.11d on).
+A country written directly through `esp_wifi_set_country_code` therefore does not survive the next start, so set it with `Country` or `set_country` instead.
+`apply_country` reads the country first and writes only when the code or the 802.11d policy differs or the station is associated (the radio then reports the AP's country), so a boot with an unchanged country costs no flash write (bug 017, ADR 026).
+An owned ESP-NOW radio from `init_with_radio` that is then given another country by `set_country` still writes twice per boot (to `01` and back); start it with `init_with_radio_config(.., EspNowConfig::default().with_country(country))` instead.
+
 ## SoftAP Provisioning
+
+**A SoftAP channel outside the country silently becomes channel 1 on ESP-IDF.**
+Symptom: a portal configured on channel 12 or 13 under the default `01` comes up on channel 1 with no error.
+`validate_ap_config` rejects such a channel, so the fix is to set the country first with `ProvisioningBuilder::with_country` (or `WiFiConfig::with_country` and `ApConfig::with_country`) before using channel 12 or 13.
 
 **The ESP-IDF AP netif silently retains a non-default subnet across firmware revisions — `softap.ap_ip()` may report `192.168.71.1` (or other) instead of the documented `192.168.4.1`.**
 No code in this workspace sets a custom AP IP, and the `esp-idf-svc` AP wrapper exposes no

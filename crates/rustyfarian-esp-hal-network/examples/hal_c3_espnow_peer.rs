@@ -26,10 +26,16 @@
 //! | Variable          | Meaning                                                            |
 //! |:------------------|:-------------------------------------------------------------------|
 //! | `ESPNOW_PEER_MAC` | Coordinator STA MAC, `aa:bb:cc:dd:ee:ff` (required; printed by it)  |
-//! | `ESPNOW_CHANNEL`  | Optional first guess for the pinned channel (1..=13)               |
+//! | `ESPNOW_CHANNEL`  | Optional first guess for the pinned channel (1..=11, see below)    |
+//! | `WIFI_COUNTRY`    | Optional Wi-Fi country, e.g. `DE`; unset means `01` (channels 1-11) |
 //! | `ESPNOW_SCENARIO` | Optional gate scenario, see below (default `default`, the behaviour above) |
 //!
 //! No credentials are involved.
+//!
+//! The unassociated radio cannot transmit outside its country, so the scan skips channels the
+//! country does not allow: set `WIFI_COUNTRY` to the country of a coordinator on channel 12 or
+//! 13.
+//! The radio starts under the world-safe default, so `ESPNOW_CHANNEL` must be within 1-11.
 //!
 //! # Gate scenarios
 //!
@@ -76,6 +82,7 @@ use rustyfarian_esp_hal_network::espnow::{
     EmbassyClock, EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, MacAddress,
     PeerConfig, PeerLinkConfig, PeerSession, ScanConfig, ScanError, TxPowerLevel,
 };
+use rustyfarian_esp_hal_network::wifi::Country;
 use static_cell::StaticCell;
 
 #[path = "../../../examples-shared/espnow_peer_app.rs"]
@@ -103,6 +110,16 @@ const SCENARIOS: [&str; 6] = [
     "shutdown-queued",
     "txpower",
 ];
+
+/// Wi-Fi country from `WIFI_COUNTRY` (e.g. `DE`); unset or empty keeps the world-safe default
+/// (`01`, channels 1-11). An unsupported code fails the build.
+const COUNTRY: Option<Country> = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => Some(country),
+        Err(_) => panic!("WIFI_COUNTRY is not a supported Wi-Fi country code"),
+    },
+    _ => None,
+};
 
 const PEER_MAC: Option<MacAddress> = match option_env!("ESPNOW_PEER_MAC") {
     Some(s) => parse_mac(s),
@@ -190,6 +207,10 @@ async fn main(spawner: Spawner) {
     let mut config = EspNowConfig::default().with_tx_power(TxPowerLevel::Medium);
     if let Some(channel) = FIRST_CHANNEL {
         config = config.with_channel(channel);
+    }
+    // Applied before the channel and the first scan: the allowed channels bound every scan.
+    if let Some(country) = COUNTRY {
+        config = config.with_country(country);
     }
     let espnow = match EspHalEspNow::new_owned(peripherals.WIFI, config) {
         Ok(e) => e,
@@ -413,7 +434,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
                 let after = radio_state(espnow, coordinator);
                 gate(
                     "C3-H6",
-                    known.is_none() && before == after,
+                    before == after,
                     format_args!(
                         "not-found scan ended ({:?}), state {:?} -> {:?}, coordinator earlier on {:?}",
                         e, before, after, known

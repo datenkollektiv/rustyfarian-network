@@ -35,13 +35,13 @@ timeline
               : ESP-NOW peer link — sans-IO PeerLink core in juggler espnow decides when a peer rescans for its coordinator (boot, 20 consecutive unacknowledged sends, received frame proves the link, rescan backoff), PeerSession helper, shared peer app and peer examples on both tiers implemented 2026-11-11, mixed-fleet bench run pending (C3-H3 and C6-H4 with the C6 as the other tier's coordinator) (feature-doc)
               : Tier parity — consumer code exchangeable, ADR 022 accepted, Steps 0 to 9 done except 8c bug 013, Steps 10 and 11 after 0.7.0 (feature-doc)
               : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally, from the bug 011 review (feature-doc)
+              : Wi-Fi regulatory country — one configurable country on both tiers, applied on every radio start, default 01 world-safe channels 1-11, the ESP-NOW scan skips forbidden channels (bug 017), ADR 026, bench check pending (docs/features/wifi-country-v1.md)
 
     Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 gates HV-I1 and HV-H1, plus bug 007 (LoRa forces a critical-section provider)
               : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub text and the Wi-Fi/MQTT-only vision line
               : juggler scope ADR — document the cross-cutting catch-all rule for the consolidated pure crate
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
-              : ESP-NOW scan country-code awareness — read esp_wifi_get_country() at scan start and probe only its channel range, not the hardcoded 1 to 13
               : LED/timeout dedup — extract the status-LED pulse and timeout-poll loop shared by the ESP-IDF Wi-Fi paths and MqttBuilder.build_and_wait
               : OTA download progress callback — user-facing progress for the OTA session
               : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)

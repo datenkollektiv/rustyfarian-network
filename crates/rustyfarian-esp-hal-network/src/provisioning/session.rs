@@ -63,7 +63,8 @@ pub struct PortalConfig<'a> {
     /// juggler::wifi::AP_PASSWORD_MIN_LEN` causes `start` to return
     /// [`ProvisioningError::PasswordTooShort`].
     pub ap_password: Option<&'a str>,
-    /// 2.4 GHz channel (1–13).
+    /// 2.4 GHz channel (1–13); must be one the country allows (see
+    /// [`ProvisioningBuilder::with_country`], default channels 1-11).
     pub channel: u8,
     /// Device name pre-filled into the portal header and the `dev_name` form
     /// field on a fresh device.
@@ -491,6 +492,7 @@ impl ProvisioningSession {
 pub struct ProvisioningBuilder<'a> {
     config: PortalConfig<'a>,
     on_event: Option<fn(ProvisioningEvent)>,
+    country: juggler::wifi::Country,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
@@ -499,7 +501,19 @@ impl<'a> ProvisioningBuilder<'a> {
         Self {
             config,
             on_event: None,
+            country: juggler::wifi::Country::WORLD,
         }
+    }
+
+    /// Sets the Wi-Fi country the SoftAP runs under (default
+    /// [`Country::WORLD`](juggler::wifi::Country::WORLD), channels 1-11).
+    ///
+    /// The portal channel must be one the country allows; `start()` rejects any other with
+    /// [`ProvisioningError::SoftApInit`] before it brings the SoftAP up.
+    /// Same name and shape as the ESP-IDF tier's builder (ADR 022).
+    pub fn with_country(mut self, country: juggler::wifi::Country) -> Self {
+        self.country = country;
+        self
     }
 
     /// Registers the lifecycle-event callback.
@@ -640,6 +654,7 @@ impl<'a> ProvisioningBuilder<'a> {
                 ssid_prefix: self.config.ssid_prefix,
                 ap_password: self.config.ap_password,
                 channel: self.config.channel,
+                country: self.country,
                 device_name: self.config.device_name,
                 defaults: self.config.defaults,
                 profile: self.config.profile,
@@ -663,6 +678,7 @@ impl<'a> ProvisioningBuilder<'a> {
             let reason = match e {
                 crate::wifi::WifiError::ConfigureFailed => "SoftAP configuration rejected",
                 crate::wifi::WifiError::Driver(_) => "radio driver error",
+                crate::wifi::WifiError::Country(_) => "Wi-Fi country rejected by the radio",
             };
             log::error!("SoftAP init failed: {}", reason);
             ProvisioningError::SoftApInit { reason }

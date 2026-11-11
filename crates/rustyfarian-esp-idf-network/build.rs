@@ -2,6 +2,8 @@ fn main() {
     // Rerun triggers for Wi-Fi credentials used by wifi examples.
     println!("cargo:rerun-if-env-changed=WIFI_SSID");
     println!("cargo:rerun-if-env-changed=WIFI_PASS");
+    // The Wi-Fi country the ESP-NOW examples apply (unset = world-safe "01").
+    println!("cargo:rerun-if-env-changed=WIFI_COUNTRY");
     // Rerun triggers for LoRaWAN credentials used by lora examples.
     println!("cargo:rerun-if-env-changed=LORAWAN_DEV_EUI");
     println!("cargo:rerun-if-env-changed=LORAWAN_APP_EUI");

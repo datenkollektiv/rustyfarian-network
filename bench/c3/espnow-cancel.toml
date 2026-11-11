@@ -16,8 +16,17 @@ examples = ["idf_c3_espnow_scout", "hal_c3_espnow_peer"]
 # ── unattended half: coordinator on ────────────────────────────────────────────
 
 [[step]]
+say = "Boot: the radio applies its country, and a scan finds the coordinator"
+arm = false       # the country line and the first cycle come during the boot
+# The country line is logged once per boot, so it gets its own step: a retry of a later step cannot wait for it.
+# The first scan right after the radio starts may miss the coordinator once (pin kept), so only a FAIL, a forbidden-channel fault or a crash fails here.
+expect = ['\[wifi\] country \S+, channels \d+-\d+, 802\.11d (on|off)', 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel \d+']
+reject = 'first failure: set channel 1[2-4]|ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
 say = "Coordinator on: a cancelled scan keeps the pinned channel and the next scan finds the coordinator"
-arm = false       # the first cycle starts during the boot
+arm = false
 expect = ['ESPNOW-GATE C3-(I7|H6) PASS: scan cancelled after \d+ ms, (pinned channel (?P<pin>\S+) -> (?P=pin)|state (?P<st>RadioState \{[^}]*\}) -> (?P=st))', 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P<ch>\d+) \(earlier']
 reject = 'ESPNOW-GATE \S+ FAIL|not-found scan ended|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 120
@@ -42,7 +51,7 @@ say = "Coordinator off: a cancelled scan keeps the pinned channel and a full sca
 attended = true
 arm = false
 expect = ['ESPNOW-GATE C3-(I7|H6) PASS: scan cancelled after \d+ ms, (pinned channel (?P<pin>\S+) -> (?P=pin)|state (?P<st>RadioState \{[^}]*\}) -> (?P=st))', 'ESPNOW-GATE C3-(I7|H6) PASS: not-found scan ended']
-reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
+reject = 'first failure: set channel 1[2-4]|ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 120
 
 [[step]]
@@ -50,14 +59,16 @@ say = "Keep the coordinator off: two minutes of not-found scans, no hang, no reb
 attended = true
 arm = false
 duration = 120
-reject = 'ESPNOW-GATE \S+ FAIL|scan after cancel found|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+reject = 'first failure: set channel 1[2-4]|ESPNOW-GATE \S+ FAIL|scan after cancel found|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 
 [[step]]
 say = "PLUG the coordinator in again (far edge of the table); the next scan finds it"
 attended = true   # a person powers the coordinator on
 arm = false
-expect = 'ESPNOW-GATE C3-(I7|H6) PASS: scan after cancel found the coordinator on channel (?P<again>\d+)'
-reject = 'ESPNOW-GATE \S+ FAIL|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+expect = 'ESPNOW-GATE C3-(I7|H6) (PASS|FAIL): scan after cancel found the coordinator on channel (?P<again>\d+)'
+# Any find counts here: until it has joined its access point the coordinator answers on passing channels, and the example
+# marks a find on another channel than before as FAIL; the steps after the settle judge the channel.
+reject = 'first failure: set channel 1[2-4]|TX power not restored|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 180
 
 [[step]]

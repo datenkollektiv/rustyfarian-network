@@ -21,7 +21,8 @@ wifi = []
 mqtt = []
 # `sx126x` + `embedded-hal`: the shared SX1262 bring-up (`lora::sx1262`, ADR 023 rung 1).
 lora = ["dep:heapless", "dep:nb", "dep:lorawan-device", "dep:sx126x", "dep:embedded-hal"]
-espnow = []
+# ESP-NOW scans honour the Wi-Fi country (`wifi::ChannelSet`).
+espnow = ["wifi"]
 ota = ["dep:heapless", "dep:sha2"]
 # OTA wire contract (command, manifest, status JSON, reason codes). Needs alloc; the base `ota` feature stays alloc-free.
 ota-wire = ["ota", "dep:serde", "dep:serde_json"]

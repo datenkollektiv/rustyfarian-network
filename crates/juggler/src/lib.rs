@@ -11,7 +11,7 @@
 //! | `mqtt` | `mqtt` (no_std subset) | none |
 //! | `std` | `mqtt` (full, incl. `CallbackScope`, `SubscribeClient`, `Outbox`, `PendingAcks`) | `anyhow` |
 //! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device` |
-//! | `espnow` | `espnow` | none |
+//! | `espnow` | `espnow` | none (implies wifi, for the country channel set) |
 //! | `ota` | `ota` | `heapless`, `sha2` |
 //! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless` (implies wifi+mqtt+lora) |

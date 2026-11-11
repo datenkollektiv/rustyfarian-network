@@ -90,6 +90,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::WifiEvent;
 
 use juggler::provisioning::{format_nonce, plan_portal, PortalPlanInput};
+use juggler::wifi::Country;
 
 use crate::wifi::{softap_mac, SoftApManager};
 
@@ -121,7 +122,8 @@ pub struct PortalConfig<'a> {
     pub ssid_override: Option<&'a str>,
     /// Optional WPA2 password for the AP. `None` runs an open AP.
     pub ap_password: Option<&'a str>,
-    /// 2.4 GHz channel (1–13).
+    /// 2.4 GHz channel (1–13); must be one the country allows (see
+    /// [`ProvisioningBuilder::with_country`], default channels 1-11).
     pub channel: u8,
     /// Device name used to pre-fill the portal's `dev_name` field and surfaced as
     /// `device_name` on `/status`.
@@ -198,6 +200,7 @@ pub struct ProvisioningBuilder<'a> {
     config: PortalConfig<'a>,
     status_entries: Vec<(String, String)>,
     on_event: Option<Arc<dyn Fn(ProvisioningEvent) + Send + Sync + 'static>>,
+    country: Country,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
@@ -209,7 +212,21 @@ impl<'a> ProvisioningBuilder<'a> {
             config,
             status_entries: Vec::new(),
             on_event: None,
+            country: Country::WORLD,
         }
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Sets the Wi-Fi country the portal's SoftAP runs under (default [`Country::WORLD`],
+    /// channels 1-11).
+    ///
+    /// [`PortalConfig::channel`] must be one the country allows, or [`start`](Self::start)
+    /// fails; set e.g. `Country::parse("DE")?` for a portal on channel 12 or 13.
+    /// Same name and shape as the esp-hal tier's `ProvisioningBuilder::with_country` (ADR 022).
+    pub fn with_country(mut self, country: Country) -> Self {
+        self.country = country;
+        self
     }
 
     /// Experimental: API may change before 1.0.
@@ -265,6 +282,7 @@ impl<'a> ProvisioningBuilder<'a> {
                 ssid_prefix: self.config.ssid_prefix,
                 ap_password: self.config.ap_password,
                 channel: self.config.channel,
+                country: self.country,
                 device_name: self.config.device_name,
                 defaults: self.config.defaults,
                 profile: self.config.profile,

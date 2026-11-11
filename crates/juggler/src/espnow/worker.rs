@@ -117,7 +117,7 @@ use core::time::Duration;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
 use std::thread;
@@ -130,6 +130,7 @@ use super::{
     TxCore, TxId, WifiInterface, MAX_DATA_LEN,
 };
 use crate::wait_list::WaitList;
+use crate::wifi::ChannelSet;
 
 /// Request slots of the send queue.
 ///
@@ -376,6 +377,8 @@ struct Shared<E> {
     /// The probe sequence number the last scan ended on; the next scan continues it, so a
     /// reply left over from the previous scan never matches a new probe.
     scan_seq: AtomicU8,
+    /// The channels the Wi-Fi country allows ([`ChannelSet::bits`]); scans skip the others.
+    allowed: AtomicU16,
 }
 
 /// The error of a refused submission.
@@ -514,6 +517,7 @@ impl<E> Shared<E> {
             config,
             pinned: AtomicU8::new(config.initial_pin.unwrap_or(u8::MAX)),
             scan_seq: AtomicU8::new(0),
+            allowed: AtomicU16::new(ChannelSet::ALL.bits()),
         }
     }
 
@@ -524,6 +528,10 @@ impl<E> Shared<E> {
     /// Time on the [`TxCore`] clock.
     fn now(&self) -> Duration {
         self.epoch.elapsed()
+    }
+
+    fn allowed(&self) -> ChannelSet {
+        ChannelSet::from_bits(self.allowed.load(Ordering::Relaxed))
     }
 
     fn pinned_channel(&self) -> Option<u8> {
@@ -964,7 +972,8 @@ impl<E: Debug> Shared<E> {
             return;
         }
         let mut machine = ScanMachine::new(job.mac, job.config(), self.pinned_channel())
-            .with_first_seq(self.scan_seq.load(Ordering::Relaxed));
+            .with_first_seq(self.scan_seq.load(Ordering::Relaxed))
+            .with_allowed_channels(self.allowed());
         let result = self.drive_scan(radio, epoch, &mut machine);
         // The pin follows the machine whatever became of the caller: on a success the peer is
         // registered on the new channel, on any failure the machine restored the old one.
@@ -1377,6 +1386,21 @@ impl<R: EspNowRadio> EspNowWorker<R> {
     /// The channel the driver keeps pinned, if any.
     pub fn pinned_channel(&self) -> Option<u8> {
         self.shared.pinned_channel()
+    }
+
+    /// Sets the channels the Wi-Fi country allows; every later scan skips the others (see
+    /// [`ScanMachine::with_allowed_channels`]).
+    ///
+    /// The tier passes the set the radio reported after applying the country, at construction
+    /// and on every country change.
+    /// Defaults to [`ChannelSet::ALL`]; a scan already running keeps the set it started with.
+    pub fn set_allowed_channels(&self, allowed: ChannelSet) {
+        self.shared.allowed.store(allowed.bits(), Ordering::Relaxed);
+    }
+
+    /// The channels scans may probe (see [`set_allowed_channels`](Self::set_allowed_channels)).
+    pub fn allowed_channels(&self) -> ChannelSet {
+        self.shared.allowed()
     }
 
     /// Queues one frame for the worker and waits for its result.
@@ -2296,6 +2320,38 @@ mod tests {
                 Call::SetChannel(1),
                 Call::AddPeer(1),
             ]
+        );
+    }
+
+    #[test]
+    fn the_allowed_channel_set_keeps_the_radio_off_forbidden_channels() {
+        let fixture = Fixture::new(SOFTAP);
+        fixture.edit(|state| state.auto = Auto::PeerOn(99));
+        assert_eq!(fixture.worker.allowed_channels(), ChannelSet::ALL);
+        let world = crate::wifi::Country::WORLD.channels();
+        fixture.worker.set_allowed_channels(world);
+        assert_eq!(fixture.worker.allowed_channels(), world);
+        let config = scan_config(&[11, 12, 13]);
+        let error = fixture.scan(&config).result().unwrap_err();
+        assert!(matches!(
+            error,
+            WorkerError::Scan {
+                kind: ScanError::NotFound {
+                    probed: 1,
+                    configured: 3,
+                    not_allowed: 2,
+                    first_fault: None
+                },
+                cause: None
+            }
+        ));
+        let calls = fixture.calls();
+        assert!(calls.contains(&Call::SetChannel(11)));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::SetChannel(12) | Call::SetChannel(13))),
+            "{calls:?}"
         );
     }
 

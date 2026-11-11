@@ -32,6 +32,8 @@
 //! # Build and Flash
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set at build time (or via `.envrc`).
+//! `WIFI_COUNTRY` (e.g. `DE`) is optional; unset is the world-safe `01` (channels 1-11), and with
+//! 802.11d the associated station adopts its AP's country anyway.
 //!
 //! ```sh
 //! WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example idf_c3_espnow_coordinator
@@ -42,7 +44,7 @@
 //! ```
 
 use rustyfarian_esp_idf_network::espnow::EspIdfEspNow;
-use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
+use rustyfarian_esp_idf_network::wifi::{Country, WiFiConfig, WiFiConfigExt, WiFiManager};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
@@ -52,6 +54,16 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 #[path = "../../../examples-shared/espnow_echo_app.rs"]
 mod espnow_echo_app;
+
+/// Wi-Fi country (`WIFI_COUNTRY`, e.g. `DE`); unset or empty is the world-safe `01` (channels 1-11).
+/// A code the Wi-Fi driver does not support fails the build.
+const COUNTRY: Country = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => country,
+        Err(_) => panic!("WIFI_COUNTRY is not a supported country code"),
+    },
+    _ => Country::WORLD,
+};
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -82,8 +94,9 @@ fn main() -> anyhow::Result<()> {
     led.set_low()?; // LED on — booting / connecting
 
     // ── Wi-Fi ───────────────────────────────────────────────────────────
-    let config =
-        WiFiConfig::new(SSID, password()).with_peripherals(peripherals.modem, sys_loop, Some(nvs));
+    let config = WiFiConfig::new(SSID, password())
+        .with_country(COUNTRY)
+        .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
     let wifi = WiFiManager::init(config)?;
 
     let ip = wifi.wait_connected(30_000)?;

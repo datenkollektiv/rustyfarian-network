@@ -1,7 +1,7 @@
 //! ESP-NOW scout — **SoftAP channel-lock variant** (ESP32-C3 Super Mini).
 //!
-//! Starts the Wi-Fi radio in SoftAP mode (`init_with_radio`), scans channels
-//! 1-13 to find the coordinator (the `0xF3` probe is answered with a `0xF4`
+//! Starts the Wi-Fi radio in SoftAP mode (`init_with_radio`), scans the channels
+//! the country allows (1-11 by default) to find the coordinator (the `0xF3` probe is answered with a `0xF4`
 //! reply naming its channel, the MAC-layer ACK is the fallback, ADR 025), then
 //! sends a message every second.  SoftAP beacon scheduling prevents the Wi-Fi driver from
 //! autonomously hopping channels, so every send lands on the coordinator's
@@ -21,6 +21,8 @@
 //! Set `COORDINATOR_MAC` at build time to the coordinator's STA MAC address.
 //! The coordinator prints its MAC on boot — look for the
 //! "Coordinator STA MAC: ..." log line.
+//! Set `WIFI_COUNTRY` (e.g. `DE`) when the coordinator's network runs on channel 12 or 13;
+//! unset, the scout probes only the world-safe channels 1-11.
 //!
 //! # Gate scenarios
 //!
@@ -61,7 +63,7 @@ use embassy_futures::join::{join3, join_array};
 use embassy_futures::yield_now;
 use embassy_time::{with_timeout, Duration as EmbassyDuration, Timer};
 use rustyfarian_esp_idf_network::espnow::{
-    EspIdfEspNow, EspIdfEspNowError, MacAddress, ScanConfig, ScanError,
+    Country, EspIdfEspNow, EspIdfEspNowError, EspNowConfig, MacAddress, ScanConfig, ScanError,
 };
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -69,6 +71,16 @@ use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+/// Wi-Fi country (`WIFI_COUNTRY`, e.g. `DE`); unset or empty is the world-safe `01` (channels 1-11).
+/// A code the Wi-Fi driver does not support fails the build.
+const COUNTRY: Country = match option_env!("WIFI_COUNTRY") {
+    Some(code) if !code.is_empty() => match Country::parse(code) {
+        Ok(country) => country,
+        Err(_) => panic!("WIFI_COUNTRY is not a supported country code"),
+    },
+    _ => Country::WORLD,
+};
 
 const COORDINATOR_MAC_STR: &str = match option_env!("COORDINATOR_MAC") {
     Some(s) => s,
@@ -149,7 +161,12 @@ fn main() -> anyhow::Result<()> {
     // ── ESP-NOW with channel scanning (retry until coordinator is found) ─
     let scan_config = ScanConfig::for_peer();
 
-    let espnow = EspIdfEspNow::init_with_radio(peripherals.modem, sys_loop, Some(nvs))?;
+    let espnow = EspIdfEspNow::init_with_radio_config(
+        peripherals.modem,
+        sys_loop,
+        Some(nvs),
+        EspNowConfig::default().with_country(COUNTRY),
+    )?;
 
     anyhow::ensure!(
         SCENARIOS.contains(&SCENARIO),
@@ -307,7 +324,7 @@ fn scenario_cancel(espnow: &EspIdfEspNow, mac: &MacAddress, config: &ScanConfig<
                 let pinned_after = espnow.pinned_channel();
                 gate(
                     "C3-I7",
-                    known.is_none() && pinned_before == pinned_after,
+                    pinned_before == pinned_after,
                     &format!(
                         "not-found scan ended ({e}), pinned channel {pinned_before:?} -> {pinned_after:?}, coordinator earlier on {known:?}"
                     ),
