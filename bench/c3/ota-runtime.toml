@@ -1,0 +1,186 @@
+# ESP-IDF OTA consumer runtime on the C3 Super Mini (runbook C3-I5, the 0.7.0 subset of
+# `docs/runbooks/ota-hardware-test.md`: P2, P7, P13, P14 and P17), chained on one board in one run.
+# Prerequisites, all in the shell that starts the run (the shell beats the dotenv file):
+#   export MQTT_HOST=<this machine's LAN IPv4> MQTT_PORT=1883 OTA_HOST=<same IPv4> OTA_PORT=8000
+#   export FIRMWARE_VERSION=1.0.0 ESPFLASH_PORT=<c3 port>
+#   just mosquitto up
+#   just ota-image 1.1.0; just ota-image 1.2.0; just ota-image-unhealthy 1.5.0 60
+#   just ota-image-unhealthy 1.6.0; just ota-image 1.9.0; just ota-image 1.10.0
+#   just bench c3 ota-runtime --port <c3 port>
+# The setup erases the whole flash (the runtime keeps attempt and rollback records in NVS), starts the
+# image server and a status subscriber that writes to tmp/bench-ota-status.log; every row writes a marker
+# line there first, and its probe judges only the statuses after that marker. P17 stops the broker for
+# about 15 s. No person needed: the runner flashes and resets over USB.
+examples = ["idf_c3_ota_runtime"]
+setup = [
+  ["sh", "-c", "scripts/espflash.sh erase-flash"],
+  ["sh", "-c", "mkdir -p tmp; pkill -f scripts/ota-server.py || true; (nohup just ota-serve > tmp/bench-ota-serve.log 2>&1 &); sleep 1; curl -sf -o /dev/null http://127.0.0.1:$OTA_PORT/"],
+  ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; : > tmp/bench-ota-status.log; (nohup just ota-sub >> tmp/bench-ota-status.log 2>&1 &); sleep 1"],
+]
+teardown = [["sh", "-c", "pkill -f scripts/ota-server.py || true; pkill -f 'mosquitto_sub.*/ota/status' || true"]]
+
+# ── baseline ───────────────────────────────────────────────────────────────────
+
+[[step]]
+say = "Baseline 1.0.0 boots and connects to the broker"
+arm = false       # printed during the reset
+expect = ['OTA example 1\.0\.0 starting', '\[mqtt\] connected \(session present']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+# ── P2: first update ───────────────────────────────────────────────────────────
+
+[[step]]
+say = "P2: offer 1.1.0; the device downloads it, reboots into it and marks it valid"
+run = ["sh", "-c", "echo MARK-P2 >> tmp/bench-ota-status.log; just ota-cmd 1.1.0"]
+arm = false
+expect = ['\[ota\] attempt \d+ begun', 'OTA example 1\.1\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
+reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 180
+
+[[step]]
+say = "P2: the broker saw downloading, swap_pending and applied 1.1.0"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P2"]
+arm = false
+expect = ['"status":"downloading"', '"status":"swap_pending"', '"status":"applied","version":"1\.1\.0"']
+reject = '"status":"failed"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── P7: operator rollback (from 1.2.0 back to 1.1.0) ──────────────────────────
+
+[[step]]
+say = "P7 setup: offer 1.2.0 and let it become valid"
+run = ["sh", "-c", "echo MARK-P7SETUP >> tmp/bench-ota-status.log; just ota-cmd 1.2.0"]
+arm = false
+expect = ['OTA example 1\.2\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
+reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 180
+
+[[step]]
+say = "P7 setup: the broker saw applied 1.2.0"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P7SETUP"]
+arm = false
+expect = '"status":"applied","version":"1\.2\.0"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "P7: roll back from 1.2.0; the device reboots at once into 1.1.0"
+run = ["sh", "-c", "echo MARK-P7 >> tmp/bench-ota-status.log; just ota-rollback 1.2.0"]
+arm = false
+expect = ['\[ota\] operator rollback armed; rolling back', 'OTA example 1\.1\.0 starting']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+[[step]]
+say = "P7: the broker saw rolled_back with reason operator"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P7"]
+arm = false
+expect = '"status":"rolled_back","reason":"operator"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── P13: unhealthy image, 60 s deadline ────────────────────────────────────────
+
+[[step]]
+say = "P13: offer the unhealthy 1.5.0 (60 s deadline); it never turns healthy and rolls back to 1.1.0"
+run = ["sh", "-c", "echo MARK-P13 >> tmp/bench-ota-status.log; just ota-cmd 1.5.0"]
+arm = false
+expect = ['OTA example 1\.5\.0 starting', 'OTA_DEMO_UNHEALTHY=1', '\[ota\] health deadline reached with the slot still pending; rolling back', 'OTA example 1\.1\.0 starting']
+reject = '\[ota\] download failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 240
+
+[[step]]
+say = "P13: the broker saw downloading, swap_pending and rolled_back with reason health_deadline, no applied"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P13"]
+arm = false
+expect = ['"status":"downloading"', '"status":"swap_pending"', '"status":"rolled_back","reason":"health_deadline"']
+reject = '"status":"applied"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "P13: a re-offer of 1.5.0 is refused as previously rolled back"
+run = ["sh", "-c", "echo MARK-P13RE >> tmp/bench-ota-status.log; just ota-cmd 1.5.0"]
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P13RE"]
+arm = false
+expect = '"status":"failed","reason":"previously_rolled_back"'
+reject = '"status":"downloading"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 30
+
+# ── P14: unhealthy image, default 120 s deadline ───────────────────────────────
+
+[[step]]
+say = "P14: offer the unhealthy 1.6.0 (default 120 s deadline); it rolls back to 1.1.0"
+run = ["sh", "-c", "echo MARK-P14 >> tmp/bench-ota-status.log; just ota-cmd 1.6.0"]
+arm = false
+expect = ['OTA example 1\.6\.0 starting', 'OTA_DEMO_UNHEALTHY=1', '\[ota\] health deadline reached with the slot still pending; rolling back', 'OTA example 1\.1\.0 starting']
+reject = '\[ota\] download failed|failure deadline overridden|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 300
+
+[[step]]
+say = "P14: the broker saw rolled_back with reason health_deadline, no applied"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P14"]
+arm = false
+expect = ['"status":"downloading"', '"status":"swap_pending"', '"status":"rolled_back","reason":"health_deadline"']
+reject = '"status":"applied"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── P17: rollback report across a broker outage ────────────────────────────────
+
+[[step]]
+say = "P17 setup: offer 1.9.0 and let it become valid"
+run = ["sh", "-c", "echo MARK-P17SETUP >> tmp/bench-ota-status.log; just ota-cmd 1.9.0"]
+arm = false
+expect = ['OTA example 1\.9\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
+reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 180
+
+[[step]]
+say = "P17 setup: the broker saw applied 1.9.0"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P17SETUP"]
+arm = false
+expect = '"status":"applied","version":"1\.9\.0"'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "P17: roll back from 1.9.0 and stop the broker at once; the report stays pending"
+run = ["sh", "-c", "echo MARK-P17 >> tmp/bench-ota-status.log; just ota-rollback 1.9.0 && just mosquitto down"]
+arm = false
+expect = ['\[ota\] operator rollback armed; rolling back', 'OTA example 1\.1\.0 starting', '\[ota\] boot reconciliation: ReportedRollback, slot released: true, report pending: true']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+[[step]]
+say = "P17: the broker stays down for 15 s (at least one report retry), no reboot"
+duration = 15
+arm = false
+reject = '\[mqtt\] connected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "P17: start the broker again (the status subscriber restarts with it); the device reconnects"
+run = ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; just mosquitto up; (nohup just ota-sub >> tmp/bench-ota-status.log 2>&1 &); sleep 1"]
+arm = false
+expect = '\[mqtt\] connected \(session present'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 90
+
+[[step]]
+say = "P17: offer 1.10.0 right after the reconnect; it is applied once the report is delivered"
+run = ["sh", "-c", "just ota-cmd 1.10.0"]
+arm = false
+expect = ['OTA example 1\.10\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
+reject = '\[ota\] download failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 240
+
+[[step]]
+say = "P17: the broker saw the delayed rolled_back operator report, then the update to 1.10.0"
+probe = ["scripts/bench-ota-status-since.sh", "MARK-P17"]
+arm = false
+expect = ['"status":"rolled_back","reason":"operator"', '"status":"downloading"', '"status":"swap_pending"', '"status":"applied","version":"1\.10\.0"']
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60

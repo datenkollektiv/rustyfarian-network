@@ -1,0 +1,47 @@
+# esp-hal OTA rollback on the C3 Super Mini (runbook C3-H5, unhealthy image, rollback boot and reset check).
+# Run through `just bench-ota`; a check whose name contains `rollback` gets the served image built with
+# OTA_DEMO_UNHEALTHY=1 (`just ota-image-unhealthy`), and the baseline is built as usual:
+#   just bench-ota c3 ota-rollback hal_c3_ota 1.0.0 2.0.0 <this machine's LAN IPv4> --port <c3 port>
+# After this check, run `c3/ota` with a higher target (3.0.0) for the healthy update after the rollback.
+# Same network and server notes as `c3/ota`. Uses `setup`, `teardown` and `reset` (rustyfarian-bench v0.5.0
+# or later). No person needed: the runner resets the board over USB where the runbook says "press reset".
+examples = ["hal_c3_ota"]
+setup = [["sh", "-c", "mkdir -p tmp; pkill -f scripts/ota-server.py || true; (nohup just ota-serve > tmp/bench-ota-serve.log 2>&1 &); sleep 1; port=$OTA_PORT; [ -n \"$port\" ] || port=8000; curl -sf -o /dev/null http://127.0.0.1:$port/"]]
+teardown = [["sh", "-c", "pkill -f scripts/ota-server.py || true"]]
+
+[[step]]
+say = "Boot 1 marks itself valid, downloads the unhealthy image, verifies it and activates the other slot"
+expect = ['\[ota\] running image marked valid', '\[ota\] fetching http://', 'OTA: downloading \d+ bytes', 'OTA: SHA-256 verified', 'OTA: partition swap complete', '\[ota\] new image activated']
+reject = '\[ota\] update failed|OTA HTTP error|\[ota\] nothing to do|FATAL|PANIC|panicked'
+timeout = 120
+arm = false       # the boot runs during the reset
+
+[[step]]
+say = "Boot 2 runs the unhealthy image from slot 1 and announces that it never marks itself valid"
+expect = ['\[ota\] running slot 1 version \d+\.\d+\.\d+ \(target ""\)', 'OTA_DEMO_UNHEALTHY=1: this image never marks itself valid']
+reject = '\[ota\] running image marked valid|\[ota\] fetching|FATAL|PANIC|panicked'
+timeout = 60
+arm = false
+
+[[step]]
+say = "The unhealthy image idles for 30 s without marking itself valid and without a reboot"
+expect = '\[ota\] idle: version \d+\.\d+\.\d+ link ups 1 free heap \d+ B'
+reject = '\[ota\] running image marked valid|rst:0x[0-9a-f]+ \(|ESP-ROM:|FATAL|PANIC|panicked'
+timeout = 45
+arm = false
+
+[[step]]
+say = "Rollback boot: a reset makes the bootloader fall back to slot 0, which does not retry the target"
+reset = true      # the runbook's reset-button press, done over USB
+expect = ['\[ota\] running slot 0 version \d+\.\d+\.\d+ \(target "\d+\.\d+\.\d+"\)', '\[ota\] running image marked valid', '\[ota\] previous update was rolled back; not retrying', '\[ota\] nothing to do: the previous update was rolled back']
+reject = '\[ota\] fetching|\[ota\] running slot 1|OTA_DEMO_UNHEALTHY|FATAL|PANIC|panicked'
+timeout = 60
+arm = false
+
+[[step]]
+say = "Reset check: another reset boots slot 0 again and still skips the rolled-back target"
+reset = true
+expect = ['\[ota\] running slot 0 version \d+\.\d+\.\d+ \(target "\d+\.\d+\.\d+"\)', '\[ota\] running image marked valid', '\[ota\] previous update was rolled back; not retrying', '\[ota\] nothing to do: the previous update was rolled back']
+reject = '\[ota\] fetching|\[ota\] running slot 1|OTA_DEMO_UNHEALTHY|FATAL|PANIC|panicked'
+timeout = 60
+arm = false
