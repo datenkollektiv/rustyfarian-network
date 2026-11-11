@@ -44,6 +44,7 @@ pub use juggler::wifi::{
     CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState, Regulatory,
     TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
     POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    STATION_TX_POWER_DEFAULT,
 };
 
 /// `embassy-net` `StackResources<N>` size for the SoftAP scaffold.
@@ -544,40 +545,22 @@ mod driver {
                 .set_config(&Config::Station(station))
                 .map_err(WifiError::Driver)?;
 
-            // 4. TX power: apply ONLY an explicitly requested level.
+            // 4. TX power: always the shared station level (`STATION_TX_POWER_DEFAULT`,
+            // 8.5 dBm, unless configured), exactly as the ESP-IDF tier sets it.
             //
-            // ESP32-C3/C6 Super Mini and similar PCB-antenna boards reflect RF energy
-            // back into the chip at high power, corrupting WPA2 auth frames and causing
-            // every AP to deauth with reason 2 (AuthenticationExpired).  ESP-IDF limits
-            // TX power internally for regulatory compliance; the bare-metal blob does
-            // not.  Against esp-radio 0.18, whose default was ~20 dBm, this crate forced
-            // 8.5 dBm to stay under that threshold.
+            // ESP32-C3/C6 Super Mini and similar PCB-antenna boards reflect RF energy back
+            // into the chip at high power, corrupting WPA2 auth frames (every AP deauths
+            // with reason 2, AuthenticationExpired); 8.5 dBm stays under that threshold.
+            // esp-radio 1.0.0-beta.1 starts at 5 dBm inside `WifiController::new`; the
+            // shared level replaces it so both tiers radiate the same power.
             //
-            // esp-radio 1.0.0-beta.1 applies a 5 dBm default of its own inside
-            // `WifiController::new` (`esp_wifi_set_max_tx_power(20)`), which is LOWER
-            // than 8.5 dBm — forcing 8.5 would only raise it.  So when the caller left
-            // tx_power at the juggler default we now set nothing and inherit the driver
-            // default, which is the conservative choice while the pathology is
-            // unre-validated under beta.1's ESP-IDF 6.1 blob (maintainer's call,
-            // 2026-09-26).
-            //
-            // WARNING: this couples our effective default to esp-radio's. Any esp-radio
-            // bump MUST re-check that default — anything above ~8.5 dBm silently
-            // reintroduces the pathology on PCB-antenna boards.
-            //
-            // An explicit level is still applied verbatim. The call is only valid after
-            // esp_wifi_start() (before it returns ESP_ERR_WIFI_NOT_STARTED, 0x3002);
-            // since esp-radio 1.0.0-beta.1 the initial station config inside
-            // `WifiController::new` (step 2) is what starts the radio — `set_config`
-            // only restarts it on a mode change — so both steps 2 and 3 precede it.
-            //
-            // The symbol is already in the linked binary via esp-radio's dependency on
-            // esp-wifi-sys; no extra crate dependency is needed.
+            // The call is only valid after esp_wifi_start() (before it returns
+            // ESP_ERR_WIFI_NOT_STARTED, 0x3002); since esp-radio 1.0.0-beta.1 the initial
+            // station config inside `WifiController::new` (step 2) starts the radio, so
+            // both steps 2 and 3 precede it.
             //
             // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
-            if config.tx_power != TxPowerLevel::default() {
-                set_tx_power_or_log(config.tx_power.to_quarter_dbm());
-            }
+            set_tx_power_or_log(config.tx_power.to_quarter_dbm());
 
             // 5. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);

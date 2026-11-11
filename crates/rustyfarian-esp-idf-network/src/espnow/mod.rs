@@ -86,14 +86,17 @@ use worker::{block_on, Worker};
 /// The channel [`EspIdfEspNow::init_with_radio`] starts its SoftAP on, which is the pin at start.
 const SOFTAP_CHANNEL: u8 = 1;
 
-/// Applies the TX power of `config`, if it sets one; the driver default stays otherwise.
+/// Applies the TX power of `config`, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) when it sets none.
+///
+/// The ESP-IDF driver starts at 20 dBm, which corrupts the frames and the ACKs of an ESP32-C3
+/// Super Mini (bug 022); the esp-hal tier applies the same default.
 fn apply_tx_power(config: &EspNowConfig) -> anyhow::Result<()> {
-    if let Some(quarter_dbm) = config.tx_power_quarter_dbm() {
-        // SAFETY: plain FFI call into the Wi-Fi driver, which the caller has started;
-        // `validate_owned` has bounded `quarter_dbm` to the driver's `[8, 84]` range.
-        esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(quarter_dbm) })
-            .with_context(|| format!("failed to set ESP-NOW TX power {quarter_dbm}"))?;
-    }
+    let quarter_dbm = config.owned_tx_power_quarter_dbm();
+    // SAFETY: plain FFI call into the Wi-Fi driver, which the caller has started;
+    // `validate_owned` has bounded a configured `quarter_dbm` to the driver's `[8, 84]` range,
+    // and the default is inside it.
+    esp!(unsafe { esp_idf_svc::sys::esp_wifi_set_max_tx_power(quarter_dbm) })
+        .with_context(|| format!("failed to set ESP-NOW TX power {quarter_dbm}"))?;
     Ok(())
 }
 
@@ -447,8 +450,8 @@ impl EspIdfEspNow {
     /// 2. The hidden SoftAP starts on the channel of [`EspNowConfig::with_channel`], else
     ///    channel 1, which is the pin until a scan finds another.
     /// 3. The TX power ([`EspNowConfig::with_tx_power`]) after the start.
-    ///    When the config sets none, the ESP-IDF driver default stays: the esp-hal tier applies
-    ///    [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) instead, because its driver starts at 5 dBm.
+    ///    When the config sets none, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm), as on the esp-hal
+    ///    tier: the driver's own 20 dBm corrupts the frames of an ESP32-C3 Super Mini (bug 022).
     ///
     /// # Errors
     ///
@@ -467,7 +470,7 @@ impl EspIdfEspNow {
             .context("invalid ESP-NOW configuration")?;
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)
             .context("failed to create EspWifi for ESP-NOW radio")?;
-        let regulatory = crate::regulatory::apply(config.country().unwrap_or(Country::WORLD))?;
+        let regulatory = crate::regulatory::apply(config.owned_country())?;
         let channel = config.channel().unwrap_or(SOFTAP_CHANNEL);
         wifi.set_configuration(&Configuration::AccessPoint(AccessPointConfiguration {
             ssid_hidden: true,
@@ -524,7 +527,7 @@ impl EspIdfEspNow {
     /// (see [`init_with_radio_config`](Self::init_with_radio_config)).
     ///
     /// Applied in this order: the country (else [`Country::WORLD`]) before the radio starts,
-    /// the TX power after the start (the driver default when unset), then the channel of
+    /// the TX power after the start ([`DEFAULT_TX_POWER_QUARTER_DBM`] when unset), then the channel of
     /// [`EspNowConfig::with_channel`], pinned like the esp-hal `new_owned` does.
     /// Without a configured channel the unassociated station sets none and there is no pin
     /// before a scan.
@@ -544,7 +547,7 @@ impl EspIdfEspNow {
             .context("invalid ESP-NOW configuration")?;
         let mut wifi = EspWifi::new(modem, sys_loop, nvs)
             .context("failed to create EspWifi for ESP-NOW radio")?;
-        let regulatory = crate::regulatory::apply(config.country().unwrap_or(Country::WORLD))?;
+        let regulatory = crate::regulatory::apply(config.owned_country())?;
         // `set_configuration` is the only esp-idf-svc call that sets the Wi-Fi mode; without it the
         // driver keeps the mode stored in NVS, which is SoftAP after an erased flash.
         wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))

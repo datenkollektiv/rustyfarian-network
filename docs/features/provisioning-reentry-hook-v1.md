@@ -50,3 +50,4 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
 - 2026-10-27 — Updated: core, example and docs implemented via workflow; hardware gate open.
 - 2026-10-27 — Updated: review findings fixed, host tests and `just verify` green; only the hardware gate remains.
 - 2026-10-28 — Updated: spookhouse reply closes three open questions, stored-flag hook pattern recorded; hardware gate still open.
+- 2026-11-11 — Updated: spookhouse bench report (C3 DevKitM, 7/7 cases, `None` and `FactoryReset` from a stored flag) recorded as second-consumer evidence on runbook gate C3-I4; report archived.

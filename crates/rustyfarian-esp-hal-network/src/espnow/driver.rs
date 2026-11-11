@@ -27,7 +27,7 @@ use super::{
     completion_result, existing_peer_is_idempotent, expired, gate_refusal_error, plan_peer,
     refusal_error, runner_wait_deadline, validate_channel, validate_frame_len, validate_tx_power,
     EspHalEspNowError, EspNowConfig, HoldingBuffer, PeerPlan, RadioError, ReplyMailbox,
-    DEFAULT_TX_POWER_QUARTER_DBM, MAX_DATA_LEN,
+    MAX_DATA_LEN,
 };
 use crate::wifi::RadioCountry;
 
@@ -189,7 +189,7 @@ impl EspHalEspNow {
     /// The radio runs under the country of `config` ([`EspNowConfig::with_country`]), else
     /// [`Country::WORLD`] (channels 1-11, 802.11d on), applied before the TX power and the
     /// channel; change it later with [`EspHalEspNow::set_country`].
-    /// The TX power of `config` is applied, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) when unset.
+    /// The TX power of `config` is applied, [`DEFAULT_TX_POWER_QUARTER_DBM`](crate::espnow::DEFAULT_TX_POWER_QUARTER_DBM) (13 dBm) when unset.
     /// The ESP-IDF `init_with_radio_config` takes the same [`EspNowConfig`] but leaves the driver
     /// default TX power when none is set.
     /// `esp_rtos::start` must have run and a heap must exist.
@@ -221,13 +221,11 @@ impl EspHalEspNow {
         // `WifiController::new` applies esp-radio's own country (CN, channels 1-13); replace it
         // with the configured one (the world-safe default of both tiers when unset) before the
         // TX power and the channel.
-        let country = config.country().unwrap_or(Country::WORLD);
+        let country = config.owned_country();
         let applied =
             apply_country(&mut RadioCountry, country).map_err(EspHalEspNowError::Country)?;
         // `WifiController::new` leaves the esp-radio default of 20 (5 dBm); always set ours.
-        let tx_power = config
-            .tx_power_quarter_dbm()
-            .unwrap_or(DEFAULT_TX_POWER_QUARTER_DBM);
+        let tx_power = config.owned_tx_power_quarter_dbm();
         controller
             .set_max_tx_power(tx_power)
             .map_err(EspHalEspNowError::Wifi)?;

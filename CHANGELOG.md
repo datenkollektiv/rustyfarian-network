@@ -135,6 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (behaviour):** the Wi-Fi station TX power defaults to `juggler::wifi::STATION_TX_POWER_DEFAULT` (`TxPowerLevel::Low`, 8.5 dBm) on both tiers, applied verbatim through `WiFiConfig::station_tx_power_quarter_dbm()`: ESP-IDF stations drop from 13 dBm, esp-hal stations rise from esp-radio's 5 dBm; pass `with_tx_power(TxPowerLevel::Medium)` for the old ESP-IDF range.
 - BREAKING: the esp-hal Wi-Fi default country changes from CN (channels 1-13, esp-radio's hard-coded `CountryInfo`) to `Country::WORLD` (`01`, channels 1-11); firmware that relied on channels 12 and 13 must set a country with `with_country` or stay on 1-11.
 - BREAKING: `juggler::wifi::WiFiConfig` and `juggler::wifi::ApConfig` gain the public field `country`, so struct literals must add it.
 - BREAKING: `juggler::provisioning::PortalPlanInput` and `PortalPlan` gain the public field `country`, so struct literals must add it.
@@ -446,6 +447,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- ESP-IDF ESP-NOW owned radios (`init_with_radio*`) apply 13 dBm (`DEFAULT_TX_POWER_QUARTER_DBM`) when the config sets no TX power, as esp-hal does, instead of the driver's 20 dBm, at which an ESP32-C3 Super Mini corrupted its own frames and MAC ACKs (bug 022); both tiers take the default from the shared `EspNowConfig::owned_tx_power_quarter_dbm()` and `owned_country()`.
 - ESP-IDF MQTT: a kept session (`clean_session = false`) whose connect plan is empty — no subscription owed, no startup message, no `on_connect` — now goes live for runtime subscriptions; before, a `MqttHandle::subscribe` made after such a reconnect was stored and never sent (found while the connect work moved to the runner, bug 013).
 - `juggler::mqtt::PendingAcks` no longer grows with fire-and-forget QoS 1 publishes: the early-outcome buffer is capped at `EARLY_ACK_CAPACITY` (8) entries, oldest first.
   Before, every `Published` event of a `try_publish` stayed in it until the next disconnect, about 2 KB of heap per 10 min of 5 s ticks on the ESP-IDF tier; see `docs/bugs/archive/021-mqtt-early-ack-buffer-grows-per-publish-2026-11-11.md`.

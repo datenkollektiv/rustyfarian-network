@@ -23,6 +23,8 @@
 //! "Coordinator STA MAC: ..." log line.
 //! Set `WIFI_COUNTRY` (e.g. `DE`) when the coordinator's network runs on channel 12 or 13;
 //! unset, the scout probes only the world-safe channels 1-11.
+//! Set `ESPNOW_TX_POWER` (quarter dBm, `8..=84`, e.g. `80` for 20 dBm) to override the radio's TX
+//! power; unset, the shared owned-radio default of 13 dBm applies (bisecting radio faults, bug 022).
 //!
 //! # Gate scenarios
 //!
@@ -81,6 +83,29 @@ const COUNTRY: Country = match option_env!("WIFI_COUNTRY") {
     },
     _ => Country::WORLD,
 };
+
+/// TX power override (`ESPNOW_TX_POWER`, quarter dBm); unset or empty keeps the 13 dBm default.
+const TX_POWER_QUARTER_DBM: Option<i8> = match option_env!("ESPNOW_TX_POWER") {
+    Some(v) if !v.is_empty() => Some(parse_quarter_dbm(v)),
+    _ => None,
+};
+
+/// Decimal quarter dBm from the build environment; the constructor validates the range.
+const fn parse_quarter_dbm(v: &str) -> i8 {
+    let b = v.as_bytes();
+    let mut i = 0;
+    let mut n: i32 = 0;
+    while i < b.len() {
+        assert!(
+            b[i].is_ascii_digit(),
+            "ESPNOW_TX_POWER must be decimal quarter dBm"
+        );
+        n = n * 10 + (b[i] - b'0') as i32;
+        assert!(n <= 127, "ESPNOW_TX_POWER is out of range");
+        i += 1;
+    }
+    n as i8
+}
 
 const COORDINATOR_MAC_STR: &str = match option_env!("COORDINATOR_MAC") {
     Some(s) => s,
@@ -165,8 +190,11 @@ fn main() -> anyhow::Result<()> {
         peripherals.modem,
         sys_loop,
         Some(nvs),
-        EspNowConfig::default().with_country(COUNTRY),
+        EspNowConfig::default()
+            .with_country(COUNTRY)
+            .with_tx_power_quarter_dbm(TX_POWER_QUARTER_DBM),
     )?;
+    log::info!("radio TX power {:?} quarter dBm", radio_tx_power());
 
     anyhow::ensure!(
         SCENARIOS.contains(&SCENARIO),

@@ -294,6 +294,15 @@ impl TxPowerLevel {
 
 // ─── WiFiConfig ─────────────────────────────────────────────────────────────
 
+/// Station TX power both tiers apply when the firmware sets none: [`TxPowerLevel::Low`] (~8.5 dBm).
+///
+/// PCB-antenna boards such as the ESP32-C3 Super Mini corrupt their own frames at high power
+/// (WPA2 auth deauths with reason 2 on the bare-metal blob, bug 022 for ESP-NOW); 8.5 dBm is the
+/// level validated on both tiers.
+/// Both tiers apply [`WiFiConfig::station_tx_power_quarter_dbm`] verbatim, so this is the only
+/// place the default lives.
+pub const STATION_TX_POWER_DEFAULT: TxPowerLevel = TxPowerLevel::Low;
+
 /// Wi-Fi connection configuration.
 ///
 /// Construct via `WiFiConfig::new`, then chain builder methods as needed:
@@ -333,7 +342,7 @@ impl<'a> WiFiConfig<'a> {
             password,
             connect_mode: ConnectMode::default(),
             power_save: WifiPowerSave::default(),
-            tx_power: TxPowerLevel::default(),
+            tx_power: STATION_TX_POWER_DEFAULT,
             ap_selection: ApSelection::default(),
             country: Country::WORLD,
         }
@@ -377,13 +386,19 @@ impl<'a> WiFiConfig<'a> {
 
     /// Sets the Wi-Fi transmit power level applied after `wifi.start()`.
     ///
-    /// Defaults to [`TxPowerLevel::Medium`] (~13 dBm).
+    /// Defaults to [`STATION_TX_POWER_DEFAULT`] ([`TxPowerLevel::Low`], ~8.5 dBm) on both tiers.
     ///
     /// Lower levels reduce power draw and heat; higher levels increase range.
     /// The exact dBm mapping depends on the chip — see [`TxPowerLevel`].
     pub fn with_tx_power(mut self, level: TxPowerLevel) -> Self {
         self.tx_power = level;
         self
+    }
+
+    /// TX power the station applies, in quarter dBm: the configured level, else
+    /// [`STATION_TX_POWER_DEFAULT`]; both tiers set exactly this after `wifi.start()`.
+    pub fn station_tx_power_quarter_dbm(&self) -> i8 {
+        self.tx_power.to_quarter_dbm()
     }
 
     /// Sets how the station picks an AP when several broadcast the SSID.
@@ -917,9 +932,17 @@ mod tests {
     }
 
     #[test]
-    fn wifi_config_default_tx_power_is_medium() {
+    fn wifi_config_default_tx_power_is_low() {
         let config = test_config();
-        assert_eq!(config.tx_power, TxPowerLevel::Medium);
+        assert_eq!(config.tx_power, TxPowerLevel::Low);
+        assert_eq!(STATION_TX_POWER_DEFAULT, TxPowerLevel::Low);
+        assert_eq!(config.station_tx_power_quarter_dbm(), 34);
+    }
+
+    #[test]
+    fn station_tx_power_follows_an_explicit_level() {
+        let config = test_config().with_tx_power(TxPowerLevel::Medium);
+        assert_eq!(config.station_tx_power_quarter_dbm(), 52);
     }
 
     #[test]

@@ -112,7 +112,7 @@ pub use juggler::wifi::{
     Country, CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState,
     Regulatory, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
     AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
-    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN, STATION_TX_POWER_DEFAULT,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience

@@ -225,6 +225,7 @@ The pin moved from the `configure_tx` parameter to a chained `.with_pin(...)` ca
 The reference migration is in the `rustyfarian-ws2812` repo's CHANGELOG entry for the April 2026 wave (file: `crates/rustyfarian-esp-hal-ws2812/examples/hal_c6_*.rs`).
 
 **TX-power coupling on ESP32-C3/C6 Super Mini (PCB antenna reflects full TX, corrupting WPA2 auth frames).**
+November 2026: the station default is shared again, `juggler::wifi::STATION_TX_POWER_DEFAULT` = `TxPowerLevel::Low` (8.5 dBm) on both tiers, applied verbatim; the esp-radio coupling below no longer decides the station level.
 April 2026 (esp-radio 0.18): bare-metal blob transmits ~20 dBm; ESP-IDF clamps to 8.5 dBm. Workaround: call `esp_wifi_set_max_tx_power(34)` (8.5 dBm) after `set_config()`.
 September 2026 (esp-radio 1.0.0-beta.1): driver applies 5 dBm default inside `WifiController::new`; crate no longer forces TX power on unset default, instead inherits driver's own. At 5 dBm, C3 Super Mini joins cleanly (validated hardware 2026-09-26); couples effective default to `esp-radio`'s own — re-validate on every version bump. Pass `TxPowerLevel::Low` explicitly via `WiFiConfig::with_tx_power` to restore 8.5 dBm.
 
@@ -600,6 +601,12 @@ The detailed analysis, decision, and consequence trail for the channel-stability
 lives in [ADR 012](adr/012-espnow-unassociated-sta-channel-stability.md).
 The entries below are pitfall reminders only — when behaviour drifts, update the ADR and
 the rustdoc on `EspIdfEspNow`, not this section.
+
+**An ESP32-C3 Super Mini at 20 dBm breaks ESP-NOW in both directions (bug 022).**
+2026-11-11: the ESP-IDF scout found no coordinator for minutes, or the coordinator's replies were about 90 % `NoAck` although it received every frame; it came and went with board and cable position.
+A MAC-layer ACK is a transmission of the receiver, so a TX-power fault on the C3 looks like the *peer's* sends failing.
+An alternating series on one bench (scout at 80 vs 52 quarter dBm, fresh boot each run) gave 1 of 3 vs 3 of 3 clean runs, 1 of 5 vs 9 of 10 over the night; A-MPDU, a reply delay, a coordinator reset and coordinator uptime changed nothing.
+Fix: both tiers' owned radios default to 13 dBm through the shared `EspNowConfig::owned_tx_power_quarter_dbm()`; bisect radio faults with the scout's `ESPNOW_TX_POWER` and one variable per run.
 
 **Unassociated STA radio drifts off `esp_wifi_set_channel` within ms.**
 Symptom: coordinator (AP-locked) receives every scan probe but zero data frames; scout's

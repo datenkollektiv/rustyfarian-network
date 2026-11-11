@@ -61,10 +61,12 @@ duration = 20
 reject = 'Re-scan: coordinator now on channel|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 
 [[step]]
-say = "PLUG the coordinator in again (far edge of the table); a rescan finds it"
+say = "PLUG the coordinator in again (far edge of the table); the scout reaches it again"
 attended = true   # a person powers the coordinator on
 arm = false
-expect = 'Re-scan: coordinator now on channel (?P<again>\d+)'
+# Either line proves the refind: a rescan after a failed send, or (coordinator back on the pinned channel) a plain send
+# that is ACKed again without any rescan.
+expect = '(Re-scan: coordinator now on channel \d+|TX #\d+: "hello #\d+" — ACK)'
 reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 180
 

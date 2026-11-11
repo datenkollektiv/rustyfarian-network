@@ -19,9 +19,10 @@ pub const MAX_CHANNEL: u8 = 14;
 pub const MIN_TX_POWER_QUARTER_DBM: i8 = 8;
 /// Highest TX power accepted by the driver, in quarter dBm (21 dBm).
 pub const MAX_TX_POWER_QUARTER_DBM: i8 = 84;
-/// TX power the esp-hal `new_owned` applies when the config sets none: 13 dBm.
+/// TX power both tiers' owned-radio constructors apply when the config sets none: 13 dBm.
 ///
-/// The ESP-IDF constructors leave the driver default instead when the config sets none.
+/// The drivers' own defaults differ (ESP-IDF 20 dBm, esp-radio 5 dBm), and 20 dBm corrupts the
+/// frames and ACKs of an ESP32-C3 Super Mini (bug 022).
 pub const DEFAULT_TX_POWER_QUARTER_DBM: i8 = 52;
 
 /// Why an [`EspNowConfig`] was refused.
@@ -110,6 +111,21 @@ impl EspNowConfig {
         self.tx_power_quarter_dbm
     }
 
+    /// TX power an owned radio applies: the configured one, else [`DEFAULT_TX_POWER_QUARTER_DBM`].
+    ///
+    /// Both tiers' owned-radio constructors call this, so the default lives in one place.
+    pub fn owned_tx_power_quarter_dbm(&self) -> i8 {
+        self.tx_power_quarter_dbm
+            .unwrap_or(DEFAULT_TX_POWER_QUARTER_DBM)
+    }
+
+    /// Country an owned radio applies: the configured one, else [`Country::WORLD`].
+    ///
+    /// Both tiers' owned-radio constructors call this, so the default lives in one place.
+    pub fn owned_country(&self) -> Country {
+        self.country.unwrap_or(Country::WORLD)
+    }
+
     /// Configured channel, if any.
     pub fn channel(&self) -> Option<u8> {
         self.channel
@@ -164,6 +180,27 @@ impl EspNowConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_defaults_are_13_dbm_and_world() {
+        let config = super::EspNowConfig::default();
+        assert_eq!(
+            config.owned_tx_power_quarter_dbm(),
+            super::DEFAULT_TX_POWER_QUARTER_DBM
+        );
+        assert_eq!(super::DEFAULT_TX_POWER_QUARTER_DBM, 52);
+        assert_eq!(config.owned_country(), crate::wifi::Country::WORLD);
+    }
+
+    #[test]
+    fn owned_values_follow_the_config() {
+        let de = crate::wifi::Country::parse("DE").unwrap();
+        let config = super::EspNowConfig::default()
+            .with_tx_power_quarter_dbm(Some(34))
+            .with_country(de);
+        assert_eq!(config.owned_tx_power_quarter_dbm(), 34);
+        assert_eq!(config.owned_country(), de);
+    }
+
     use super::*;
 
     #[test]
