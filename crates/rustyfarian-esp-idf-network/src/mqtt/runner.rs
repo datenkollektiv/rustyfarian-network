@@ -1,5 +1,5 @@
-//! The ESP-IDF session runner: network gate, retry pacing and every esp-mqtt
-//! call in one place (ADR 022 decisions 2 and 10, bug 010).
+//! The ESP-IDF session runner: network gate, retry pacing, the connect work and
+//! every esp-mqtt call in one place (ADR 022 decisions 2 and 10, bug 010).
 //!
 //! esp-mqtt cannot be told to wait: `EspMqttClient::new` starts the client task,
 //! which attempts a connection immediately and reports `Host is unreachable`
@@ -14,7 +14,7 @@
 //! | `Connect` (later) | `esp_mqtt_client_reconnect` (sets a bit) |
 //! | `Close` | `esp_mqtt_client_disconnect` (sets a bit) |
 //! | `Wait { ms }` | a deadline in this thread |
-//! | `ConnectWork` | the per-connect helper thread |
+//! | `ConnectWork` | this thread, one step per turn ([`ConnectWorkMachine`]) |
 //! | `Ready` | none; [`Session::poll`] already woke `wait_connected` |
 //! | `Ignored` | none; logged, and an error after a long run of them |
 //!
@@ -25,14 +25,28 @@
 //!
 //! # Threading (ADR 017)
 //!
-//! This is the only thread that calls `esp_mqtt_client_*`. It never takes the
-//! client mutex — the `reconnect`, `disconnect` and `stop` calls take the raw
-//! handle and, except for `stop`, only set an event bit, so the runner cannot
-//! wait on esp-mqtt's `api_lock` while the mqtt task is parked in an event
-//! dispatch. The event-loop thread only reports inputs, and the connect helper
-//! only runs the connect work; both hand their results to this thread.
+//! This is the only thread that calls `esp_mqtt_client_*`. The `reconnect`,
+//! `disconnect` and `stop` calls take the raw handle and, except for `stop`,
+//! only set an event bit. The connect work — SUBSCRIBE for every builder
+//! topic, the startup publish, the user's `on_connect`, then the runtime
+//! catch-up — runs here too, as one [`ConnectWorkMachine`] action per turn:
+//! each action is one `with_client_mut` hold around one esp-mqtt call, and
+//! between two actions the runner drains up to [`DRAIN_PER_STEP`] inputs, so
+//! `NetworkDown`, `Disconnected`, `Shutdown`, a retry and the dropped-handle
+//! check are at most one step late. The runner takes the client lock only for
+//! one bounded connect step at a time, releases it and yields after every
+//! step, so a publisher thread at the runner's priority or above that waits
+//! for the lock (`publish_with`, `publish_acked`, the outbox drain; any
+//! `std::thread`-spawned publisher) gets it before the next step, while
+//! readiness (`try_publish`, `is_connected`, `wait_connected`) stays gated on
+//! `WorkDone`. It never holds the lock while a callback could be
+//! parking the mqtt task: the event-loop thread never takes it (ADR 017), and
+//! esp-mqtt's recursive `api_lock`, which `subscribe`, `enqueue` and `stop`
+//! take, is released once that thread calls `next()` again — it never waits
+//! on this one, so a step cannot deadlock. The event-loop thread only reports
+//! inputs; it never acts on the session.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -42,22 +56,28 @@ use esp_idf_svc::mqtt::client::{
     EspMqttClient, EspMqttConnection, LwtConfiguration, MqttClientConfiguration,
 };
 use juggler::mqtt::lines::{Connecting, Reconnecting, WaitingForNetwork};
-use juggler::mqtt::{ConnectWorkPlan, NetworkGate, SessionAction, SessionInput, SessionToken};
+use juggler::mqtt::{
+    ConnectWorkMachine, ConnectWorkPlan, NetworkGate, SessionAction, SessionInput, SessionToken,
+    WorkAction, WorkInput,
+};
 
+use super::connect_port::IdfConnectPort;
 use super::session::Session;
-use super::{to_esp_qos, LwtParts, SubscribableClient, CONNECT_THREAD_STACK_SIZE};
-
-/// Stack of the runner thread: it only logs, reads a channel and calls the
-/// handful of esp-mqtt entry points above (no recursion, no payloads).
-pub(super) const RUNNER_STACK_SIZE: usize = 4096;
+use super::task_name::spawn_named;
+use super::{to_esp_qos, LwtParts, SubscribableClient, RUNNER_STACK_SIZE};
 
 /// Ignored inputs in a row after which the runner reports that it and the
 /// machine have fallen out of step (ADR 023 decisions 5 and 6).
 const IGNORED_IN_A_ROW_LIMIT: u32 = 16;
 
+/// Most inputs the runner takes between two connect steps, so a flood of
+/// inputs cannot starve the work and a pending input is seen within one step.
+const DRAIN_PER_STEP: usize = 16;
+
 /// One message to the runner.
 pub(super) enum Msg {
-    /// A session input from the event loop or the connect helper.
+    /// A session input from the event loop, or one this thread reported
+    /// itself through [`Session::send`].
     Input(SessionInput),
     /// The station became ready (`true`) or stopped being ready (`false`).
     Ready(bool),
@@ -119,6 +139,12 @@ impl ClientConfig {
     }
 }
 
+/// Connect work in progress: the machine plus the input to feed it next.
+pub(super) struct PendingWork {
+    machine: ConnectWorkMachine,
+    next: WorkInput,
+}
+
 /// Drives the session machine on its own thread; see the module docs.
 pub(super) struct Runner {
     pub(super) session: Arc<Session>,
@@ -140,17 +166,24 @@ pub(super) struct Runner {
     /// Inputs the machine ignored in a row; see [`IGNORED_IN_A_ROW_LIMIT`].
     pub(super) ignored_in_a_row: u32,
     pub(super) subs: Arc<super::Subscriptions>,
+    /// The message published on every (re)connect, borrowed per step.
     pub(super) startup: Option<super::StartupMessage>,
-    pub(super) on_connect: Option<Arc<std::sync::Mutex<super::OnConnectCallback>>>,
+    /// The user's connect callback; this thread is its only caller.
+    pub(super) on_connect: Option<super::OnConnectCallback>,
+    /// Connect work in progress: the machine plus the input to feed it next.
+    pub(super) work: Option<PendingWork>,
+    /// Turns readiness observations into `NetworkUp` / `NetworkDown`.
+    pub(super) gate: NetworkGate,
+    /// When the next connect attempt is due, after a `Wait`.
+    pub(super) retry_at: Option<Instant>,
+    /// `true` once the input channel closed; the runner then shuts down.
+    pub(super) inputs_closed: bool,
 }
 
 impl Runner {
-    /// Spawns the runner on its own thread.
+    /// Spawns the runner on its own thread, named `mqtt-net` for FreeRTOS.
     pub(crate) fn spawn(runner: Runner) -> anyhow::Result<()> {
-        std::thread::Builder::new()
-            .name("mqtt-net".into())
-            .stack_size(RUNNER_STACK_SIZE)
-            .spawn(move || runner.run())
+        spawn_named(c"mqtt-net", RUNNER_STACK_SIZE, move || runner.run())
             .context("failed to spawn the MQTT runner thread")?;
         Ok(())
     }
@@ -159,17 +192,14 @@ impl Runner {
         // Seeds the gate with the readiness the link had at build time; the
         // sink registered by `build` was in place first, so an event that landed
         // in between is already queued and is applied after the seed.
-        let mut gate = NetworkGate::new();
-        let mut retry_at: Option<Instant> = None;
-
-        if let Some(input) = gate.feed(self.seed_ready) {
-            self.act(input, &mut retry_at);
+        if let Some(input) = self.gate.feed(self.seed_ready) {
+            self.act(input);
         }
 
         loop {
-            if retry_due(retry_at) {
-                retry_at = None;
-                self.act(SessionInput::RetryElapsed, &mut retry_at);
+            if retry_due(self.retry_at) {
+                self.retry_at = None;
+                self.act(SessionInput::RetryElapsed);
             }
             if self.alive.upgrade().is_none() {
                 log::info!("[mqtt] all handles dropped, stopping the session");
@@ -177,16 +207,21 @@ impl Runner {
                 return;
             }
 
-            match self.inputs.recv_timeout(wait_for(retry_at)) {
-                Ok(Msg::Input(input)) => self.act(input, &mut retry_at),
-                Ok(Msg::Ready(ready)) => {
-                    if let Some(input) = gate.feed(ready) {
-                        if input == SessionInput::NetworkDown {
-                            log::info!("{}", WaitingForNetwork);
-                        }
-                        self.act(input, &mut retry_at);
-                    }
+            // While connect work is pending the runner never blocks: it takes
+            // the inputs already queued, then performs one step.
+            if self.work.is_some() {
+                self.drain_inputs();
+                if self.inputs_closed {
+                    log::info!("[mqtt] runner inputs closed, stopping the session");
+                    self.shutdown();
+                    return;
                 }
+                self.work_turn();
+                continue;
+            }
+
+            match self.inputs.recv_timeout(wait_for(self.retry_at)) {
+                Ok(msg) => self.handle_msg(msg),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     log::info!("[mqtt] runner inputs closed, stopping the session");
@@ -197,8 +232,38 @@ impl Runner {
         }
     }
 
+    /// Takes up to [`DRAIN_PER_STEP`] queued inputs without waiting.
+    fn drain_inputs(&mut self) {
+        for _ in 0..DRAIN_PER_STEP {
+            match self.inputs.try_recv() {
+                Ok(msg) => self.handle_msg(msg),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.inputs_closed = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Feeds one message to the gate or the machine; shared by the blocking
+    /// wait and the drain between connect steps.
+    fn handle_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::Input(input) => self.act(input),
+            Msg::Ready(ready) => {
+                if let Some(input) = self.gate.feed(ready) {
+                    if input == SessionInput::NetworkDown {
+                        log::info!("{}", WaitingForNetwork);
+                    }
+                    self.act(input);
+                }
+            }
+        }
+    }
+
     /// Feeds one input to the machine and performs its action.
-    fn act(&mut self, input: SessionInput, retry_at: &mut Option<Instant>) {
+    fn act(&mut self, input: SessionInput) {
         if matches!(
             input,
             SessionInput::Disconnected | SessionInput::NetworkDown
@@ -230,7 +295,7 @@ impl Runner {
             SessionAction::Close => self.close(),
             SessionAction::Wait { ms } => {
                 log::warn!("{}", Reconnecting { ms });
-                *retry_at = Some(Instant::now() + Duration::from_millis(ms));
+                self.retry_at = Some(Instant::now() + Duration::from_millis(ms));
             }
         }
     }
@@ -269,8 +334,19 @@ impl Runner {
         }
     }
 
-    /// Runs one session's connect work on the helper thread (ADR 017).
+    /// Installs one session's connect work; the turns that follow perform it
+    /// one action at a time (see [`Runner::work_turn`]).
+    ///
+    /// An empty plan is installed too: the machine's closing step still runs
+    /// the runtime catch-up and marks the tracker live, so a kept session with
+    /// nothing else to send sends its stored runtime requests.
     fn connect_work(&mut self, token: SessionToken, subscribe: bool, session_present: bool) {
+        if let Some(old) = self.work.take() {
+            log::debug!(
+                "[mqtt] connect work for an older session abandoned ({:?})",
+                old.machine.token()
+            );
+        }
         self.subs.begin_connect(subscribe);
         let plan = ConnectWorkPlan::new(
             subscribe,
@@ -278,49 +354,87 @@ impl Runner {
             self.startup.is_some(),
             self.on_connect.is_some(),
         );
-        if plan.is_empty() {
-            self.session.send(SessionInput::WorkDone(token));
+        self.work = Some(PendingWork {
+            machine: ConnectWorkMachine::new(token, plan, session_present),
+            next: WorkInput::Start,
+        });
+    }
+
+    /// Performs exactly one action of the pending connect work.
+    ///
+    /// The session is probed before every action: `go_offline`, this probe and
+    /// the closing step all run on this thread, so the closing step can never
+    /// follow a `go_offline` for the same session.
+    fn work_turn(&mut self) {
+        let Some(mut work) = self.work.take() else {
             return;
-        }
-
-        let session = Arc::clone(&self.session);
-        let outbox = Arc::clone(self.session.outbox());
-        let subs = Arc::clone(&self.subs);
-        let startup = self.startup.clone();
-        let on_connect = self.on_connect.clone();
-
-        // The helper does the connect work under one hold of the outbox's
-        // client lock, off this thread and off the event-loop thread: esp-mqtt
-        // holds its recursive `api_lock` for the whole connect handshake, and
-        // esp-idf-svc parks the mqtt task until the event loop calls `next()`
-        // again, so neither thread may take the client lock (ADR 017).
-        let spawned = std::thread::Builder::new()
-            .name("mqtt-connect".into())
-            .stack_size(CONNECT_THREAD_STACK_SIZE)
-            .spawn(move || {
-                let attached = outbox.with_client_mut(|client| {
-                    super::connect_work(
-                        client,
-                        &super::ConnectWork {
-                            session: &session,
-                            token,
-                            plan,
-                            subs: &subs,
-                            startup: startup.as_ref(),
-                            on_connect: on_connect.as_deref(),
-                            session_present,
-                        },
+        };
+        let token = work.machine.token();
+        let input = if self.session.is_current(token) {
+            work.next
+        } else {
+            WorkInput::SessionEnded
+        };
+        match work.machine.poll(input) {
+            action @ (WorkAction::Step(_) | WorkAction::Finish) => {
+                work.next = self.perform(action, work.machine.session_present());
+                self.work = Some(work);
+                // The client lock is released now, but the next turn re-takes
+                // it at once: `run` never blocks while work is pending, and a
+                // FreeRTOS mutex give only makes an equal-priority waiter
+                // ready, it does not preempt the giver (a higher-priority
+                // waiter already ran). One yield per step hands the CPU to a
+                // same-priority publisher that waits for the lock
+                // (`publish_with`, `publish_acked`, the outbox drain), so it
+                // takes the lock before the next step.
+                std::thread::yield_now();
+            }
+            WorkAction::Report(report) => {
+                if matches!(report, SessionInput::WorkDone(_)) {
+                    log::debug!(
+                        "[mqtt] mqtt-net stack: {} B unused",
+                        super::stack_unused_here()
                     );
-                });
-                if attached.is_none() {
-                    log::error!("[mqtt] connect helper: no client attached to the session");
-                    session.send(SessionInput::WorkFailed(token));
                 }
-            })
-            .is_ok();
-        if !spawned {
-            log::error!("[mqtt] could not spawn the connect helper thread");
-            self.session.send(SessionInput::WorkFailed(token));
+                // `WorkDone` -> `Ready`: `Session::poll` wakes `wait_connected`
+                // here, no channel round trip; `WorkFailed` -> `Close`.
+                self.act(report);
+            }
+            WorkAction::Abandon => {
+                log::debug!("[mqtt] connect work abandoned: the session ended");
+            }
+            WorkAction::Ignored => {
+                log::error!("[mqtt] connect work out of step; dropping it");
+            }
+        }
+    }
+
+    /// Performs one `Step` or `Finish` through the client: one hold of the
+    /// outbox's client lock around one esp-mqtt call.
+    fn perform(&self, action: WorkAction, session_present: bool) -> WorkInput {
+        let subs = &*self.subs;
+        let startup = self.startup.as_ref();
+        let on_connect = self.on_connect.as_ref();
+        let performed = self.session.outbox().with_client_mut(|client| {
+            juggler::mqtt::perform(
+                &mut IdfConnectPort {
+                    client,
+                    subs,
+                    startup,
+                    on_connect,
+                },
+                action,
+                session_present,
+            )
+        });
+        match performed {
+            Some(Some(input)) => input,
+            // Unreachable for `Step` and `Finish`, which always ask for a call.
+            Some(None) => WorkInput::StepFailed,
+            None => {
+                log::error!("[mqtt] connect work: no client attached to the session");
+                WorkInput::StepFailed
+            }
         }
     }
 
@@ -354,10 +468,15 @@ impl Runner {
 
     /// Ends the session through the machine, then stops the client; dropping
     /// it makes the event-loop thread's `next()` return, so that thread exits too.
+    ///
+    /// Never runs under the client lock.
     fn shutdown(&mut self) {
+        // Nothing may touch the client after `stop`, so pending work goes first.
+        self.work = None;
         // The machine answers `Close` for a busy session, which `act` performs;
-        // nothing reads the `Disconnected` that follows, and no retry is armed.
-        self.act(SessionInput::Shutdown, &mut None);
+        // nothing reads the `Disconnected` that follows, and a retry deadline
+        // is never waited for again.
+        self.act(SessionInput::Shutdown);
         if let Some(handle) = self.handle.take() {
             // Wake the task out of its reconnect wait first: otherwise `stop`
             // waits out the whole pause (`reconnect_timeout_ms / 2`, 5 s).

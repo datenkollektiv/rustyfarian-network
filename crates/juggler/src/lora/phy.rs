@@ -11,7 +11,7 @@
 //! rejected with [`RadioErrorKind::tx_in_progress`] instead of a `Txing` response.
 //!
 //! A `Phy` event that arrives while no TX or RX is in progress is out of phase.
-//! Internally it is a [`PhyOutcome::Ignored`], distinct from a closed RX window;
+//! Internally it is a `PhyOutcome::Ignored`, distinct from a closed RX window;
 //! both become `Response::Idle` only at the `lorawan-device` boundary, and
 //! [`LorawanPhy::ignored_events`] counts the ignored ones.
 

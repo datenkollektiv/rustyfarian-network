@@ -48,7 +48,7 @@ pub fn derive_softap_ssid(prefix: &str, mac: &[u8; 6]) -> heapless::String<32> {
 ///
 /// - `Some(s)` — the override path:
 ///   1. If `s.trim().is_empty()` returns `Err("SSID is whitespace-only")`.
-///   2. Calls [`validate_ssid`](crate::wifi::validate_ssid) which rejects empty
+///   2. Calls [`validate_ssid`] which rejects empty
 ///      strings and SSIDs longer than 32 UTF-8 bytes; propagates its `&'static str`
 ///      error unchanged.
 ///   3. Constructs a [`heapless::String<32>`] from `s` (guaranteed to fit after

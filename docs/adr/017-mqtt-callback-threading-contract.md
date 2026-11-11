@@ -5,6 +5,7 @@
 Accepted — 2026-09-28.
 Implemented on `main` (commit 511b37f..2f2597a); ships in v0.5.1.
 Amended 2026-11-02: §2's plumbing (helper thread, work order, stale-session guard) is superseded by ADR 022 Steps 6, 8b-1 and 8b-2; the contract itself is unchanged.
+Amended 2026-11-11 (ADR 022 Step 8c, bug 013): §2 has no helper thread any more; the `mqtt-net` runner performs the connect work one step per turn; contract §1 and §3 are unchanged.
 
 ## Context
 
@@ -26,7 +27,7 @@ If the caller is on the event-loop thread inside a callback, it returns `Publish
 Detection uses a thread-local depth counter `juggler::mqtt::CallbackScope`, entered for the whole event-loop thread and around each `on_connect` invocation, not a `ThreadId` comparison.
 Host tests confirm the mechanism (see project lore reference).
 
-### 2. Off-thread helper: per-connection thread for startup and subscribe work
+### 2. Connect work placement (originally an off-thread helper; superseded, see the 2026-11-11 amendment below)
 
 On every `Connected` event, one short-lived helper thread (`juggler::mqtt::spawn_connect_thread`) runs, holding the client mutex once, in order:
 1. The `with_startup_message()` publish (if configured).
@@ -42,6 +43,15 @@ Amended 2026-11-02 (ADR 022 Steps 6, 8b-1 and 8b-2): the helper is now the tier'
 The stale-session guard is now `juggler::mqtt::SessionToken`: `is_connected()` turns true only when the shared `SessionMachine` sees `WorkDone` for the current token, and a stale worker's report is ignored.
 `juggler::mqtt::spawn_connect_thread`, `juggler::mqtt::spawn_subscriber_thread` and `juggler::mqtt::ConnectionEpoch` are deprecated, used by no tier, and stay until 1.0.
 
+Amended 2026-11-11 (ADR 022 Step 8c, bug 013): the ESP-IDF tier runs no connect helper thread at all.
+The connect work runs on the `mqtt-net` runner thread itself, one step per loop turn, and each step takes the client lock only for its own esp-mqtt call: one SUBSCRIBE, the startup `enqueue`, the `on_connect` call, or the closing runtime catch-up.
+The step order, stop at the first failed SUBSCRIBE, startup publish or runtime catch-up (a failing `on_connect` is logged, never fatal), the closing catch-up before `WorkDone`, and the terminal report are the shared `juggler::mqtt::ConnectWorkMachine` (ADR 023 rung 3), performed through the narrow `juggler::mqtt::ConnectPort` by `juggler::mqtt::perform`.
+Before every step the runner asks `SessionMachine::is_current` for the work's `SessionToken`, and it abandons the work of a session that ended without reporting it.
+`on_connect` still runs under `CallbackScope` with `&mut EspMqttClient`, and the event-loop thread still never takes the client lock.
+A publisher thread that waits for the client lock gets it before the next step when it runs at the runner's priority (the runner yields after every step) or above (it preempts on the mutex give); a lower-priority publisher has no such guarantee.
+The `mqtt-connect` thread named in the 2026-11-02 amendment is gone, and so is the one-helper-thread wording in the Consequences and Alternatives sections below, which this amendment supersedes.
+Contract §1 and §3 are unchanged.
+
 ### 3. User contract for safe callback design
 
 - **From `on_connect`:** use the `&mut EspMqttClient` parameter; never call `MqttHandle` methods.
@@ -56,18 +66,19 @@ The stale-session guard is now `juggler::mqtt::SessionToken`: `is_connected()` t
 - Deadlock is impossible via `MqttHandle`: callbacks that violate the contract fail fast instead of hanging forever (the deprecated legacy `MqttManager` is excluded — see Negative).
 - Backward-compatible: no signature changes, no new enum variants; `on_connect` signature unchanged.
 - Ordering preserved: startup message precedes any `on_connect` publish.
-- The `on_connect` helper thread approach is minimal and isolates unsafe-to-call code to a single point.
+- Running the connect work on one library thread (the `mqtt-net` runner since 2026-11-11) isolates unsafe-to-call code to a single point.
 
 ### Negative
 
 - Behavior change: a callback call that used to hang now fails with an error — acceptable in a patch release for safety.
-- Stack cost: one helper thread (~12 KiB per reconnect).
-- Known limit: if the helper thread cannot be spawned, `is_connected()` stays false and retries on the next reconnect.
+- Step 8c (2026-11-11) adds three `unsafe` blocks, all FFI: the `esp_pthread_get_cfg` and `esp_pthread_set_cfg` calls that name a library thread, the restore of the caller's pthread configuration, and the `uxTaskGetStackHighWaterMark` self-measurement.
 - Known limit: `is_connected()` confirms before subscriptions are sent (ROADMAP row notes this).
 - A running `on_connect` cannot be cancelled by a disconnect.
 - The deprecated legacy `MqttManager` has no guard (out of scope).
 - Guard cost: every `MqttHandle` publish/subscribe call first reads the thread-local `CallbackScope` depth counter (`juggler::mqtt::in_callback`) — one thread-local `Cell<u32>` read, no lock, no allocation; negligible next to the `enqueue` it precedes.
-- A blocked `on_connect` holds the helper thread's client mutex until it returns, keeping `is_connected()` false and blocking `publish*`/`subscribe` from other threads; `try_publish*` returns `WouldBlock` — why `on_connect` must be short-lived.
+- A blocked `on_connect` holds the client lock AND defers the runner's Close, Shutdown and retry handling until it returns; a warning is logged past 1 s, and `is_connected()` stays false meanwhile, which is why `on_connect` must be short-lived.
+- The connect plan no longer runs under one continuous client-lock hold, so an app publish may enqueue between two steps, before the startup message; readiness (`try_publish*`, `is_connected()`, `wait_connected`) is still gated on `WorkDone`.
+- A SUBSCRIBE step performs `esp_mqtt_write` on the runner thread, so under `mqtts://` the TLS write frames run there, and the runner stack is sized for them.
 - A panic in `on_connect` aborts and resets the device on ESP-IDF targets (std with `panic_abort`); unwinding builds poison the client mutex, causing all later `MqttHandle` calls to fail until reboot.
 
 ## Rationale
@@ -79,10 +90,18 @@ A working variant requires a separate pump thread plus a dispatcher thread with 
 It also migrates `on_message` to another thread.
 Kept as a possible opt-in design for a future breaking release, not adopted now.
 
+### On the runner performing the connect work (2026-11-11)
+
+The `mqtt-net` runner performs the connect work itself, because a step cannot deadlock on `api_lock`.
+The lock is released when the event-loop thread calls `EspMqttConnection::next()` again, and that thread never waits on the runner: it only makes unbounded `Session::send` calls, pushes into the inbound queue and calls `PendingAcks`.
+`publish_acked` registers its waiter only after it has released the outbox lock, so no lock cycle exists.
+The earlier premise that the runner already blocked on `api_lock` in `connect()` and `close()` was wrong: `esp_mqtt_client_reconnect` and `esp_mqtt_client_disconnect` take no `api_lock` and only set event bits.
+The calls that do take `api_lock` are `subscribe`, `enqueue` and `stop`, and the connect steps make the first two, one per step, apart from the user's `on_connect`, which makes whatever calls it chooses through the `&mut EspMqttClient` parameter.
+
 ## Alternatives Considered
 
-- Change `on_connect` to `Fn(bool)` (no client access) — no longer needed since `on_connect` now runs on the helper thread; possible v0.6 cleanup only.
-- Guard only, without the helper thread — insufficient: the startup message and `on_connect` client access would still deadlock in the `Connected` path.
+- Change `on_connect` to `Fn(bool)` (no client access) — no longer needed since `on_connect` now runs on the helper thread; possible v0.6 cleanup only (the helper is gone since 2026-11-11; the argument holds for the runner).
+- Guard only, without the helper thread — insufficient: the startup message and `on_connect` client access would still deadlock in the `Connected` path (the helper is gone since 2026-11-11; the argument holds for the runner).
 
 <details>
 <summary>Source evidence: ESP-IDF esp-mqtt and esp-idf-svc threading model</summary>

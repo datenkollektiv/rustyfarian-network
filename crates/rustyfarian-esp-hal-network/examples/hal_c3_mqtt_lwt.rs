@@ -183,6 +183,8 @@ async fn main(spawner: Spawner) {
         tick_topic,
         suspend_demo: env::mqtt_suspend_demo(),
         free_heap,
+        min_free_heap: None,
+        stack_report: None,
     };
     lwt_app::run(&LINK, &mqtt, &cfg).await;
 }

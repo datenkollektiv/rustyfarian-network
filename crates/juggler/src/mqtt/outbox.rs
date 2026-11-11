@@ -220,8 +220,9 @@ impl<C> Outbox<C> {
     /// Runs `f` on the attached client without waiting for the outbox lock.
     ///
     /// A contended lock reports [`TryClient::Busy`] instead of blocking, so a
-    /// caller on the event-loop or connect-helper thread can fail fast; the
-    /// tier maps that to its non-blocking "would block" error.
+    /// caller that must not wait (the tier's `try_publish`) fails fast while
+    /// the runner holds the client for a connect step; the tier maps that to
+    /// its non-blocking "would block" error.
     pub fn try_with_client_mut<R>(&self, f: impl FnOnce(&mut C) -> R) -> TryClient<R> {
         let mut inner = match self.inner.try_lock() {
             Ok(inner) => inner,

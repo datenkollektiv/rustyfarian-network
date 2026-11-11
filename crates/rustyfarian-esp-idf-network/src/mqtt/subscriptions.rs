@@ -128,7 +128,7 @@ impl Subscriptions {
     /// time and each sends what the tracker holds at that moment: a caller whose
     /// request a newer one superseded finds nothing owed, and the newest QoS
     /// always goes out last.
-    /// Lock order is client lock, then this store's lock, like the connect helper.
+    /// Lock order is client lock, then this store's lock, like the runner's connect steps.
     /// Returns `false` when `send` failed; the entry stays owed.
     pub(super) fn send_owed_topic(&self, topic: &str, send: impl FnOnce(QoS) -> bool) -> bool {
         let mut inner = self.lock();
@@ -140,7 +140,7 @@ impl Subscriptions {
 
     /// Sends every runtime entry the session still lacks, then goes live.
     ///
-    /// Runs on the connect helper after its plan, under the client lock.
+    /// Runs on the runner thread, under the client lock, as the last connect step.
     /// Requests admitted before this call are sent here; later ones see `live`
     /// and go out themselves.
     /// Returns `false` (not live) when a send fails; that entry stays pending.

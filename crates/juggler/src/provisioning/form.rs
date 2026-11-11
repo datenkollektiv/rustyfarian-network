@@ -63,7 +63,7 @@ const MAX_CANONICAL_FIELDS: usize = 8;
 /// treated as one: the [`Debug`](core::fmt::Debug) impl shows the key but
 /// redacts the value as `"<redacted>"`, and every `ExtraField` — including a
 /// clone taken out of a
-/// [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig) — scrubs
+/// [`ProvisioningConfig`] — scrubs
 /// its value on drop. Because of that `Drop` impl, the fields can be borrowed
 /// or cloned but not moved out of the struct.
 #[derive(Clone, PartialEq, Eq)]

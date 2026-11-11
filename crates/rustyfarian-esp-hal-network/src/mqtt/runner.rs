@@ -21,8 +21,9 @@ use embassy_sync::signal::Signal;
 use embassy_time::{with_deadline, with_timeout, Duration, Instant, Timer};
 use juggler::mqtt::lines::{Connected, Connecting, Disconnected, Reconnecting, WaitingForNetwork};
 use juggler::mqtt::{
-    AckStatus, BrokerHost, ConnectStep, ConnectWorkPlan, MqttClient, NetworkGate, SessionAction,
-    SessionInput, SessionMachine, SubscribeWindow, SUBSCRIBE_WINDOW,
+    AckStatus, BrokerHost, ConnectStep, ConnectWorkMachine, ConnectWorkPlan, MqttClient,
+    NetworkGate, SessionAction, SessionInput, SessionMachine, SubscribeWindow, WorkAction,
+    WorkInput, SUBSCRIBE_WINDOW,
 };
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use minimq::{
@@ -779,81 +780,71 @@ async fn serve(
             subs.begin_connect(subscribe);
             subs.len()
         });
-    let plan = ConnectWorkPlan::new(subscribe, total, startup.is_some(), false);
+    // The shared machine holds the step order and the stop-at-first-failure rule
+    // (ADR 023 rung 3); this loop performs one action per loop turn (the startup
+    // step drains the SUBACK window before it publishes). It never feeds
+    // `SessionEnded`: on this tier a session that ends mid-work is the `select` in
+    // `run` dropping this future, so no action runs after the end.
+    let mut work = ConnectWorkMachine::new(
+        token,
+        ConnectWorkPlan::new(subscribe, total, startup.is_some(), false),
+        event != ConnectEvent::Connected,
+    );
     let mut window = SubWindow::new();
-    for step in plan {
-        let failed = match step {
-            ConnectStep::Subscribe(index) if index < fixed => {
-                let (topic, qos) = subscriptions[index];
-                subscribe_paced(
+    let mut input = WorkInput::Start;
+    let mut failure: Option<&'static str> = None;
+    loop {
+        input = match work.poll(input) {
+            WorkAction::Step(ConnectStep::Subscribe(index)) => outcome(
+                subscribe_entry(
                     &mut conn,
                     shared,
                     &mut window,
-                    fixed,
+                    subscriptions,
                     index,
-                    topic,
-                    qos,
                     deadline,
                 )
-                .await
-                .err()
-            }
-            ConnectStep::Subscribe(index) => {
-                let entry = shared
-                    .runtime_subscriptions
-                    .lock(|s| s.borrow().get(index - fixed));
-                match entry {
-                    Some((topic, qos)) => subscribe_paced(
-                        &mut conn,
-                        shared,
-                        &mut window,
-                        fixed,
-                        index,
-                        topic.as_str(),
-                        qos,
-                        deadline,
-                    )
-                    .await
-                    .err(),
-                    None => None,
-                }
-            }
-            ConnectStep::PublishStartup => match startup {
+                .await,
+                &mut failure,
+            ),
+            WorkAction::Step(ConnectStep::PublishStartup) => match startup {
                 Some(msg) => {
-                    match drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline).await
-                    {
-                        Err(reason) => Some(reason),
-                        Ok(()) => {
-                            let request = PublishRequest {
-                                topic: heapless::String::try_from(msg.topic).unwrap_or_default(),
-                                payload: heapless::Vec::from_slice(msg.payload).unwrap_or_default(),
-                                qos: msg.qos,
-                                retain: msg.retain,
-                            };
-                            publish_queued(&mut conn, shared, &request, deadline)
-                                .await
-                                .err()
-                        }
-                    }
+                    let sent =
+                        match drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline)
+                            .await
+                        {
+                            Err(reason) => Err(reason),
+                            Ok(()) => {
+                                let request = PublishRequest {
+                                    topic: heapless::String::try_from(msg.topic)
+                                        .unwrap_or_default(),
+                                    payload: heapless::Vec::from_slice(msg.payload)
+                                        .unwrap_or_default(),
+                                    qos: msg.qos,
+                                    retain: msg.retain,
+                                };
+                                publish_queued(&mut conn, shared, &request, deadline).await
+                            }
+                        };
+                    outcome(sent, &mut failure)
                 }
-                None => None,
+                None => WorkInput::StepDone,
             },
-            ConnectStep::RunOnConnect => None,
+            // Unreachable: the plan is built with `on_connect = false` on this tier.
+            WorkAction::Step(ConnectStep::RunOnConnect) => WorkInput::StepDone,
+            // Ready only once the broker has answered every SUBSCRIBE.
+            WorkAction::Finish => outcome(
+                drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline).await,
+                &mut failure,
+            ),
+            WorkAction::Report(report) => {
+                if shared.poll(report) != SessionAction::Ready {
+                    return failure.unwrap_or("session ended during connect work");
+                }
+                break;
+            }
+            WorkAction::Abandon | WorkAction::Ignored => return "connect work out of step",
         };
-        if let Some(reason) = failed {
-            shared.poll(SessionInput::WorkFailed(token));
-            return reason;
-        }
-    }
-    // Ready only once the broker has answered every SUBSCRIBE.
-    if let Err(reason) = drain_subscriptions(&mut conn, shared, &mut window, fixed, deadline).await
-    {
-        shared.poll(SessionInput::WorkFailed(token));
-        return reason;
-    }
-
-    if shared.poll(SessionInput::WorkDone(token)) != SessionAction::Ready {
-        return "session ended during connect work";
     }
     log::info!(
         "{}",
@@ -923,6 +914,54 @@ fn forward_inbound(shared: &Shared, inbound: &InboundPublish<'_>) {
             bump(&shared.dropped_inbound);
             log::warn!("[mqtt] dropped oversized inbound on {}", inbound.topic());
         }
+    }
+}
+
+/// Maps the result of one connect step to the machine's input; a failure reason is
+/// kept so `serve` returns it once the machine reports.
+fn outcome(result: Result<(), &'static str>, failure: &mut Option<&'static str>) -> WorkInput {
+    match result {
+        Ok(()) => WorkInput::StepDone,
+        Err(reason) => {
+            *failure = Some(reason);
+            WorkInput::StepFailed
+        }
+    }
+}
+
+/// Sends the SUBSCRIBE of plan entry `index`: a builder topic below the builder count,
+/// otherwise the runtime entry at `index - fixed`; a runtime entry that is gone is done.
+async fn subscribe_entry(
+    conn: &mut Conn<'_>,
+    shared: &Shared,
+    window: &mut SubWindow,
+    subscriptions: &[(&'static str, QoS)],
+    index: usize,
+    deadline: Instant,
+) -> Result<(), &'static str> {
+    let fixed = subscriptions.len();
+    if index < fixed {
+        let (topic, qos) = subscriptions[index];
+        return subscribe_paced(conn, shared, window, fixed, index, topic, qos, deadline).await;
+    }
+    let entry = shared
+        .runtime_subscriptions
+        .lock(|s| s.borrow().get(index - fixed));
+    match entry {
+        Some((topic, qos)) => {
+            subscribe_paced(
+                conn,
+                shared,
+                window,
+                fixed,
+                index,
+                topic.as_str(),
+                qos,
+                deadline,
+            )
+            .await
+        }
+        None => Ok(()),
     }
 }
 

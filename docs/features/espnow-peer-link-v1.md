@@ -47,9 +47,9 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 ## State
 - [x] Design approved
 - [x] `PeerLink` core with host tests and mutation checks
-- [ ] Generic helper over the espnow-tier-parity-v1 trait
-- [ ] Peer examples on both tiers use the helper
-- [ ] Documentation updated
+- [x] Generic helper over the espnow-tier-parity-v1 trait
+- [x] Peer examples on both tiers use the helper
+- [x] Documentation updated
 
 Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
@@ -66,3 +66,5 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
 - 2026-11-03 — Design review folded in: outcome classes, timer contract, ordering and stale results, coordinator-only `PeerHeard`
 - 2026-11-03 — `PeerLink` core implemented in juggler, `SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`
 - 2026-11-03 — Helper shape settled (`PeerSession`), delivered by espnow-tier-parity-v1 Steps 6–7
+- 2026-11-11 — `PeerSession` landed in `juggler::espnow::session` (Step 6) and both peers run the shared `examples-shared/espnow_peer_app.rs` on it (Step 7: new `idf_c3_espnow_peer`, rewritten `hal_c3_espnow_peer`); READMEs and CHANGELOG updated; the bench check `bench/c3/espnow-peer-session.toml` judges C3-H3 and C6-H4 and awaits the run
+- 2026-11-11 — Review pass applied: a `run` dropped mid-scan hands the scan back (rule 3, host test), the failed-scan log follows the core's decision (retry delay or rule-5 relink), `EmbassyClock` clamps its deadline, the IDF tier re-exports `EspNowLink` and `ClassifySend`, the shared app logs local send errors at `debug` (an esp-hal `Timeout` no longer fails the soak), bench step 12 rejects crashes only, `just test-espnow` covers `espnow::session`

@@ -49,8 +49,10 @@ const READY_POLL_MS: u64 = 10;
 /// Slice of the blocking wait for the first IP; the loop waits as long as it takes,
 /// and `get_ip` warns once per elapsed slice.
 const WIFI_IP_WAIT_SLICE_MS: u64 = 30_000;
-/// Worker tasks of this variant, named through `spike::name_next_threads`.
-const WORKER_TASKS: [&std::ffi::CStr; 3] = [c"wifi-link", c"mqtt-events", c"mqtt_task"];
+/// Worker tasks of this variant: `wifi-link` named through `spike::name_next_threads`,
+/// `mqtt-events` and `mqtt-net` by the library.
+const WORKER_TASKS: [&std::ffi::CStr; 4] =
+    [c"wifi-link", c"mqtt-events", c"mqtt-net", c"mqtt_task"];
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();

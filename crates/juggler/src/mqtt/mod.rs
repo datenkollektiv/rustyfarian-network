@@ -3,6 +3,7 @@
 #[cfg(feature = "std")]
 pub mod chunks;
 mod client;
+mod connect_work;
 mod gate;
 mod host;
 pub mod lines;
@@ -14,6 +15,7 @@ pub mod session;
 mod subscriptions;
 
 pub use client::{MqttClient, MqttMessage};
+pub use connect_work::{perform, ConnectPort, ConnectWorkMachine, WorkAction, WorkInput};
 pub use gate::NetworkGate;
 pub use host::{classify_broker_host, BrokerHost, MAX_HOSTNAME_LEN};
 #[cfg(feature = "std")]
@@ -736,12 +738,17 @@ pub trait SubscribeClient {
 /// skipped) should react to `false` by confirming/cleaning up whatever
 /// bookkeeping was expecting the thread to run.
 ///
+/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
+/// helper thread exists any more.
+///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
 #[deprecated(
     note = "no tier spawns a connect helper through this since tier-parity Step 8b-2: \
             the ESP-IDF session runs its connect work on its own worker and reports \
-            to `SessionMachine`; slated for removal in 1.0 (ADR 022)"
+            to `SessionMachine` (since Step 8c the ESP-IDF tier runs that work on its \
+            mqtt-net runner thread); slated for removal in 1.0 (ADR 022)"
 )]
 pub fn spawn_connect_thread<C, F>(
     client: std::sync::Arc<std::sync::Mutex<C>>,
@@ -804,6 +811,10 @@ where
 /// failure (logged internally as a warning) is not actionable here — the next
 /// reconnect will simply retry.
 ///
+/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
+/// subscriber thread exists any more.
+///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
 #[deprecated(
@@ -860,10 +871,21 @@ struct PendingInner {
     /// Publishers currently blocked waiting for their PUBACK.
     waiters: std::collections::HashMap<MessageId, AckSlot>,
     /// Outcomes that arrived before their waiter registered (see
-    /// [`PendingAcks::resolve`]). Drained by [`PendingAcks::register`]; bounded
-    /// by the number of un-awaited in-flight ids.
-    early: std::collections::HashMap<MessageId, AckOutcome>,
+    /// [`PendingAcks::resolve`]), oldest first. Drained by
+    /// [`PendingAcks::register`] and capped at [`EARLY_ACK_CAPACITY`] entries:
+    /// a fire-and-forget publish registers no waiter, so without the cap every
+    /// `Published` event of a QoS 1 `try_publish` stayed here until the next
+    /// disconnect (bug 021, one entry per tick on the S3 soak).
+    early: std::collections::VecDeque<(MessageId, AckOutcome)>,
 }
+
+/// Most early outcomes [`PendingAcks`] keeps while no waiter has registered.
+///
+/// The buffer only has to cover the gap between an enqueue returning its id and
+/// the publisher's `register`, the next instruction, so a handful is plenty;
+/// older entries belong to publishes nobody waits for and are dropped.
+#[cfg(feature = "std")]
+pub const EARLY_ACK_CAPACITY: usize = 8;
 
 /// Registry correlating in-flight QoS 1 publishes to their PUBACK.
 ///
@@ -899,7 +921,13 @@ impl PendingAcks {
     /// is pre-resolved and [`wait`](AckWaiter::wait) returns immediately.
     pub fn register(&self, id: MessageId) -> AckWaiter {
         let mut inner = self.lock();
-        let slot: AckSlot = if let Some(outcome) = inner.early.remove(&id) {
+        let early = inner
+            .early
+            .iter()
+            .position(|(early_id, _)| *early_id == id)
+            .and_then(|at| inner.early.remove(at))
+            .map(|(_, outcome)| outcome);
+        let slot: AckSlot = if let Some(outcome) = early {
             std::sync::Arc::new((
                 std::sync::Mutex::new(Some(outcome)),
                 std::sync::Condvar::new(),
@@ -926,13 +954,18 @@ impl PendingAcks {
     /// `register` — a window that cannot occur in practice, since a PUBACK is a
     /// network round-trip away while the `register` is the next instruction, but
     /// the buffer makes the ordering correct by construction and testable.
+    /// The buffer holds at most [`EARLY_ACK_CAPACITY`] outcomes; the oldest is
+    /// dropped first, which is the ack of a publish nobody waits for.
     pub fn resolve(&self, id: MessageId, outcome: AckOutcome) {
         let mut inner = self.lock();
         if let Some(slot) = inner.waiters.remove(&id) {
             drop(inner);
             Self::fill(&slot, outcome);
         } else {
-            inner.early.insert(id, outcome);
+            if inner.early.len() >= EARLY_ACK_CAPACITY {
+                inner.early.pop_front();
+            }
+            inner.early.push_back((id, outcome));
         }
     }
 
@@ -954,7 +987,7 @@ impl PendingAcks {
     fn cancel(&self, id: MessageId) {
         let mut inner = self.lock();
         inner.waiters.remove(&id);
-        inner.early.remove(&id);
+        inner.early.retain(|(early_id, _)| *early_id != id);
     }
 
     /// Stores `outcome` in a slot and wakes the parked publisher.
@@ -972,6 +1005,12 @@ impl PendingAcks {
     #[cfg(test)]
     fn waiter_count(&self) -> usize {
         self.lock().waiters.len()
+    }
+
+    /// Number of buffered early outcomes (introspection for tests).
+    #[cfg(test)]
+    fn early_count(&self) -> usize {
+        self.lock().early.len()
     }
 }
 
@@ -1064,6 +1103,10 @@ pub struct EpochToken(u32);
 /// The epoch protects only this flag.  It does not cancel a helper whose work
 /// is already in flight — see the "Stale-thread safety" section of
 /// [`spawn_connect_thread`] for what a stale helper can and cannot do.
+///
+/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
+/// helper thread exists any more and no stale helper can race this epoch.
 ///
 /// The `u32` packs `generation << 1 | connected_bit` so both fields move
 /// together in one atomic operation.
@@ -2307,6 +2350,29 @@ mod tests {
             w2.wait(Duration::from_millis(50)),
             Some(AckOutcome::Disconnected)
         );
+        assert_eq!(acks.waiter_count(), 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ack_early_buffer_is_bounded_without_waiters() {
+        use super::{AckOutcome, PendingAcks, EARLY_ACK_CAPACITY};
+        let acks = PendingAcks::new();
+        // Fire-and-forget QoS 1 publishes resolve without ever registering a
+        // waiter (bug 021): the buffer must not grow with them.
+        for id in 0..1000u32 {
+            acks.resolve(id, AckOutcome::Acked);
+        }
+        assert_eq!(acks.early_count(), EARLY_ACK_CAPACITY);
+        // The newest outcome is still delivered to a late register ...
+        let waiter = acks.register(999);
+        assert_eq!(
+            waiter.wait(Duration::from_millis(50)),
+            Some(AckOutcome::Acked)
+        );
+        // ... and an evicted one is gone, so its register parks until timeout.
+        let waiter = acks.register(0);
+        assert_eq!(waiter.wait(Duration::from_millis(30)), None);
         assert_eq!(acks.waiter_count(), 0);
     }
 

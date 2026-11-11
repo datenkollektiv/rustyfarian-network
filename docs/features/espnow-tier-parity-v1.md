@@ -72,3 +72,4 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - 2026-11-03 — Inventory and step plan written; B1–B6, names, juggler deps approved; two released ESP-IDF bugs found (stale ACK, oversize receive)
 - 2026-11-03 — Review contracts settled: atomic scan admission, preemption, shutdown, scan cancellation, broadcast refusal, unordered receive
 - 2026-11-11 — Plan Step 5 done inside the probe-reply feature: shared `examples-shared/espnow_echo_app.rs` on both coordinators, the IDF one on `block_on`
+- 2026-11-11 — Plan Steps 6 and 7 done: `PeerSession` (`Clock`, `EmbassyClock`) in juggler with host tests, the shared `examples-shared/espnow_peer_app.rs` in the new `idf_c3_espnow_peer` and the rewritten `hal_c3_espnow_peer`, both tiers re-export the names; bench check `bench/c3/espnow-peer-session.toml` for C3-H3 and C6-H4 awaits the run

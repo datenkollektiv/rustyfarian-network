@@ -11,20 +11,28 @@
 //!   shared app drains.
 //! * Everything else — the 5 s tick on `<prefix>/tick`, link and MQTT state logs, the free
 //!   heap, and the suspend demo — is the shared app, and its lines start with `[app]`.
+//! * Measurement lines (Step 8c, bug 013): after each `[app] connect #N free heap` line the
+//!   shared app adds `[app] connect #N min free heap: Y B` and one `[app] stack unused <name>: N B`
+//!   per task (`main`, `mqtt-events`, `mqtt-net`, `mqtt_task`), and after the minute heap line
+//!   `[app] heap min free: Y B`. The library names its own tasks (`mqtt-events`, `mqtt-net`).
+//! * `MQTT_ON_CONNECT_DEMO=1` registers an `on_connect` that enqueues one
+//!   retained `on_connect` on `<prefix>/boot` and logs `[app] on_connect ran`, so the
+//!   `on_connect` step can be measured; unset, no `on_connect` is registered.
 //!
 //! Build-time environment (all `option_env!`, see `.env.example`):
 //!
-//! | Variable            | Default                | Meaning                               |
-//! |:--------------------|:-----------------------|:--------------------------------------|
-//! | `WIFI_SSID`         | (required)             | Wi-Fi SSID                            |
-//! | `WIFI_PASS`         | (required)             | Wi-Fi password                        |
-//! | `MQTT_HOST`         | (required)             | Broker IP or hostname                 |
-//! | `MQTT_PORT`         | `1883`                 | Broker port                           |
-//! | `MQTT_CLIENT_ID`    | `idf-s3-mqtt`          | Client id (≤ 23 bytes)                |
-//! | `MQTT_USER`         | unset                  | Optional username                     |
-//! | `MQTT_PASS`         | unset                  | Optional password                     |
-//! | `MQTT_TOPIC_PREFIX` | `rustyfarian/idf-mqtt` | Topic prefix for status/cmd/tick      |
-//! | `MQTT_SUSPEND_DEMO` | unset                  | `1`: suspend 20 s every 60 s          |
+//! | Variable               | Default                | Meaning                             |
+//! |:-----------------------|:-----------------------|:------------------------------------|
+//! | `WIFI_SSID`            | (required)             | Wi-Fi SSID                          |
+//! | `WIFI_PASS`            | (required)             | Wi-Fi password                      |
+//! | `MQTT_HOST`            | (required)             | Broker IP or hostname               |
+//! | `MQTT_PORT`            | `1883`                 | Broker port                         |
+//! | `MQTT_CLIENT_ID`       | `idf-s3-mqtt`          | Client id (≤ 23 bytes)              |
+//! | `MQTT_USER`            | unset                  | Optional username                   |
+//! | `MQTT_PASS`            | unset                  | Optional password                   |
+//! | `MQTT_TOPIC_PREFIX`    | `rustyfarian/idf-mqtt` | Topic prefix for status/cmd/tick    |
+//! | `MQTT_SUSPEND_DEMO`    | unset                  | `1`: suspend 20 s every 60 s        |
+//! | `MQTT_ON_CONNECT_DEMO` | unset                  | `1`: measurement `on_connect`       |
 //!
 //! # Build and flash
 //!
@@ -35,13 +43,16 @@
 
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use rustyfarian_esp_idf_network::mqtt::{LwtConfig, MqttBuilder, QoS};
+use rustyfarian_esp_idf_network::mqtt::{to_esp_qos, LwtConfig, MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 
 #[path = "common/env.rs"]
 mod env;
 #[path = "../../../examples-shared/lwt_app.rs"]
 mod lwt_app;
+#[allow(dead_code)] // only the stack helper is used here
+#[path = "common/spike.rs"]
+mod spike;
 
 const KEEP_ALIVE_SECS: u64 = 30;
 const WIFI_FIRST_CONNECT_WAIT_MS: u64 = 30_000;
@@ -49,6 +60,28 @@ const WIFI_FIRST_CONNECT_WAIT_MS: u64 = 30_000;
 fn free_heap() -> usize {
     // SAFETY: plain FFI query with no arguments or side effects.
     unsafe { esp_idf_svc::sys::esp_get_free_heap_size() as usize }
+}
+
+fn min_free_heap() -> usize {
+    // SAFETY: plain FFI query with no arguments or side effects.
+    unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() as usize }
+}
+
+/// Logs the unused stack of the main task, the library's tasks and esp-mqtt's task.
+fn stack_report() {
+    for name in [c"main", c"mqtt-events", c"mqtt-net", c"mqtt_task"] {
+        match spike::stack_high_water(name) {
+            Some(unused) => log::info!(
+                "[app] stack unused {}: {} B",
+                name.to_string_lossy(),
+                unused
+            ),
+            None => log::info!(
+                "[app] stack unused {}: no such task",
+                name.to_string_lossy()
+            ),
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,10 +130,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     let status_topic_static: &'static str = format!("{prefix}/status").leak();
-    let mqtt = MqttBuilder::new(mqtt_config)
+    let mut builder = MqttBuilder::new(mqtt_config)
         .subscribe(&cmd_topic, QoS::AtLeastOnce)
-        .with_startup_message(status_topic_static, b"online", QoS::AtLeastOnce, true)
-        .build(&wifi)?;
+        .with_startup_message(status_topic_static, b"online", QoS::AtLeastOnce, true);
+    if env::mqtt_on_connect_demo() {
+        let boot_topic = format!("{prefix}/boot");
+        builder = builder.on_connect(move |client, session_present| {
+            client.enqueue(
+                &boot_topic,
+                to_esp_qos(QoS::AtLeastOnce),
+                true,
+                b"on_connect",
+            )?;
+            log::info!(
+                "[app] on_connect ran (session present: {})",
+                session_present
+            );
+            Ok(())
+        });
+    }
+    let mqtt = builder.build(&wifi)?;
 
     log::info!(
         "[app] topics: status={} cmd={} tick={}",
@@ -113,6 +162,8 @@ fn main() -> anyhow::Result<()> {
         tick_topic: &tick_topic,
         suspend_demo: env::mqtt_suspend_demo(),
         free_heap,
+        min_free_heap: Some(min_free_heap),
+        stack_report: Some(stack_report),
     };
     esp_idf_svc::hal::task::block_on(lwt_app::run(&wifi, &mqtt, &cfg));
     Ok(())

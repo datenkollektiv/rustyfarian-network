@@ -37,6 +37,11 @@ pub struct LwtAppConfig<'a> {
     pub suspend_demo: bool,
     /// Tier heap reporter; the value is logged and sent in the tick payload.
     pub free_heap: fn() -> usize,
+    /// Tier minimum-free-heap reporter; `Some` adds the `[app] connect #N min free heap`
+    /// and `[app] heap min free` lines, `None` leaves the output as before.
+    pub min_free_heap: Option<fn() -> usize>,
+    /// Tier stack reporter, called after each connect line; `None` leaves the output as before.
+    pub stack_report: Option<fn()>,
 }
 
 /// Runs the LWT application until the process ends.
@@ -123,6 +128,16 @@ async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtApp
                 mqtt.connect_count(),
                 (cfg.free_heap)()
             );
+            if let Some(min_free_heap) = cfg.min_free_heap {
+                log::info!(
+                    "[app] connect #{} min free heap: {} B",
+                    mqtt.connect_count(),
+                    min_free_heap()
+                );
+            }
+            if let Some(stack_report) = cfg.stack_report {
+                stack_report();
+            }
         }
         was_connected = mqtt.is_connected();
 
@@ -151,6 +166,9 @@ async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtApp
                 (cfg.free_heap)(),
                 mqtt.connect_count()
             );
+            if let Some(min_free_heap) = cfg.min_free_heap {
+                log::info!("[app] heap min free: {} B", min_free_heap());
+            }
         }
     }
 }

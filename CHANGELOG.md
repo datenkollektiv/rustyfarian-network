@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Clone` on `juggler::wifi::LinkMachine`, `juggler::wifi::LinkHandover` and `juggler::backoff::ExponentialBackoff`.
 - `juggler::mqtt::{ConnectWorkPlan, ConnectStep}`: the ordered connect work (subscriptions, startup message and `on_connect`) that both tiers run.
   `ChunkAssembler::dropped_by_last_feed()` reports how many messages the last feed dropped.
+- `juggler::mqtt::{ConnectWorkMachine, WorkInput, WorkAction, ConnectPort, perform}` (`no_std`, host-tested): one session's connect work as a finite action machine (ADR 023 rung 3) that both tiers drive, plus the one-call-per-method port and the mapping the ESP-IDF tier runs it through.
+  The machine emits the plan steps in order, stops at the first failed SUBSCRIBE or startup publish, always emits `Finish` before it reports `WorkDone`, and answers `Abandon` for a session that ended.
 - `juggler::ota::runtime` pure decisions that the IDF health and reporter loops call directly: `poll_decision`, `after_unhealthy`, `deadline_plan`, `SlotReads`, `SlotRetry`, `PollStep`, `DeadlinePlan`, `ReportPace`, `after_publish`, `CompletionBackoff` and `completion_step`.
   The released `HealthMachine` and `ReporterMachine` stay as deprecated wrappers over the same functions (see Deprecated).
 - `juggler::espnow::TxCore::admit_direct`, `ScanTeardown`, `CancelOutcome`, `ScanMachine::{max_polls, abort_teardown, poll_bounded}`, and the `ScanGate` cancel path (`cancel_running`, `on_probe_complete`, `has_deferred`).
@@ -124,6 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The ESP-IDF tier runs the MQTT connect work on its `mqtt-net` runner thread, one step per loop turn, through the shared `ConnectWorkMachine`; there is no per-connect 12 KiB `mqtt-connect` thread any more.
+  `on_connect` runs on that thread under `CallbackScope` with the client lock held; the runner performs no close, shutdown or retry handling until it returns, and a callback that takes longer than 1 s is reported with a `warn!` line.
+  The runner releases the client lock and yields after every connect step, so a publisher thread at the runner's priority or above that waits for the lock gets it before the next step and its publish may go out between two steps (before the startup message); readiness (`is_connected`, `wait_connected`, `try_publish`) stays gated on `WorkDone`.
+- `rustyfarian-esp-idf-network` MQTT stack sizes: the `MqttBuilder` event loop goes from 12 KiB to 8 KiB and the runner from 4 KiB to 8 KiB, provisional until the CrowPanel S3 measurement, each guarded by a static assertion against the measured use plus 2 KiB headroom.
+  The runner thread now performs the SUBSCRIBE writes (TLS frames under `mqtts://`) and `on_connect`, which is what sizes it.
+- `rustyfarian-esp-idf-network` names its MQTT library tasks `mqtt-events` and `mqtt-net` in FreeRTOS, so `xTaskGetHandle` (the example's `stack_report`) and the S3 measurement run read their stack high-water marks by name; both threads log their own high-water mark at `debug`.
+- The esp-hal MQTT runner drives the same `ConnectWorkMachine` in `serve`; its behaviour and log lines are unchanged.
+- `examples-shared/lwt_app.rs` prints additional measurement lines: `[app] connect #N min free heap: Y B` after each connect line, `[app] heap min free: Y B` after the minute line and, on ESP-IDF, one `[app] stack unused <name>: N B` per task; `idf_esp32s3_mqtt_lwt` registers a measurement `on_connect` when `MQTT_ON_CONNECT_DEMO=1` is set at build time.
+- `hal_c3_espnow_peer`: the default scenario runs the shared peer app on a `PeerSession` instead of its own send loop, `scan_until_found` and rescan counter, so the two C3 peers differ only in setup; the gate scenarios (`cancel`, `flood`, `shutdown`, `shutdown-queued`, `txpower`) and their `ESPNOW-GATE` lines are unchanged, and the example is excluded from the published package because it includes a file outside the crate.
+  In the default scenario a `Timeout` (a frame that never started within the 50 ms bound) is now a local failure: it counts as failed and in `local_failures`, no longer toward the rescan threshold, and the per-send `[espnow] send error:` line moved to `debug`, so the `espnow-soak` and `espnow-peer-session` checks are not failed by one queueing overrun.
 - Both tiers now print the same Wi-Fi and MQTT lifecycle log lines, and every example uses the `[app]` prefix (was `[example]`) and logs `[app] start <example> (esp-hal|esp-idf)` as its first line, the only place the tier appears.
   Wi-Fi: `[wifi] link up #N`, `[wifi] network ready — ip A.B.C.D`, `[wifi] disconnected — <reason>`, `[wifi] reconnecting in N ms (attempt K)`, `[wifi] suspend requested`, `[wifi] suspended`, `[wifi] resume requested`; the ESP-IDF tier's other lines (`WiFi started`, `WiFi connect requested`, ...) and a few esp-hal ones take the lowercase `[wifi]` prefix.
   MQTT: `[mqtt] waiting for network`, `[mqtt] connecting to H:P`, `[mqtt] connected (session present: yes|no, N subscriptions)`, `[mqtt] disconnected — <cause>`, `[mqtt] reconnecting in N ms`.
@@ -293,7 +305,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HAL tier: portal extras are now persisted through a repeatable `TAG_EXTRA` (`0x0A`) record tag, and `MAX_RECORD_LEN` grows from 512 to 1280 B (ADR 015 amendment 2026-10-27).
   `juggler::provisioning::LoraFields::from_storage_parts`, and public `EUI_HEX_LEN` and `APP_KEY_HEX_LEN`.
   `juggler::provisioning::{ProvisioningKv, KvProvisioningStore}` (feature `std`): the provisioning NVS key layout over a key-value trait, with host tests that load a 0.6.x-shaped record; the IDF tier's `ProvisioningStore` now delegates to it over NVS, with no public API change.
-  Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot on ESP32-C3 and ESP32-C6) is still open.
+  Runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`; the hardware gate (a HAL record with extras across a reboot) passed on the ESP32-C3 (2026-11-09), the ESP32-C6 (2026-11-10) and the ESP32-S3 (2026-11-11).
   Requested by the spookhouse review-queue item `rustyfarian-network-boot-device-name-v1`; see `docs/features/provisioning-boot-identity-v1.md`.
 - Provisioning re-entry hook: `juggler::provisioning::ReentryRequest { None, Portal, FactoryReset }` (`#[non_exhaustive]`).
   `juggler::provisioning::{gate_reentry, ReentryGate}`: the host-tested ordering primitive that asks the hook once and opens the store only on `None`.
@@ -403,7 +415,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::lora::{LorawanDevice, LorawanResponse}`: deprecated and kept; use `LorawanTimeline`.
 - `rustyfarian-esp-idf-network` `EspIdfLoraRadio::irq_pending()` and `cancel_rx()` inherent forwarders: deprecated since 0.7.0; call the `LoraRadio` trait methods.
 - `juggler::ota::runtime::begin_failure`: deprecated; use `begin_failure_outcome`.
-- `juggler::mqtt::{ConnectionEpoch, spawn_connect_thread, spawn_subscriber_thread}`: no tier uses them since tier-parity Steps 8b-1 and 8b-2 — `SessionMachine`'s `SessionToken` guards stale sessions and the ESP-IDF tier runs its connect work on its own worker — and they are slated for removal in 1.0; the regression tests and the public-path test still cover them until then.
+- `juggler::mqtt::{ConnectionEpoch, spawn_connect_thread, spawn_subscriber_thread}`: no tier uses them since tier-parity Steps 8b-1 and 8b-2 — `SessionMachine`'s `SessionToken` guards stale sessions and the ESP-IDF tier runs its connect work on its `mqtt-net` runner thread — and they are slated for removal in 1.0; the regression tests and the public-path test still cover them until then.
 - `rustyfarian-esp-idf-network` `WiFiManager::link_state()`: use `state()`, the name both tiers share.
 - `juggler::wifi::WifiDriver`: no tier implements it; ADR 022's shared link traits replace it. Its docs no longer claim the ESP-IDF `WiFiManager` as an implementor, and `MqttConnectionState`'s docs now hold for both tiers.
 - `juggler::ota::runtime::{HealthMachine, HealthAction, HealthEvent, ReporterMachine, ViewStep, CompletionRetry}`: deprecated since 0.7.0 and kept for one release.
@@ -411,8 +423,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::espnow::ScanConfig::new(probe_data)`, the `ScanConfig::probe_data` field and `ScanMachine::probe_data()`: the scan sends the `0xF3` probe frame itself, so the payload is ignored; use `ScanConfig::for_peer()` and `ScanMachine::probe_frame(channel)`.
   `probe_data()` returns the last encoded probe frame for one release; the slice now borrows the machine, so a driver that held the old `&'a [u8]` across `poll` must read it after each `SendProbe` instead.
 
+### Removed
+
+- The documented "helper-spawn failure" mode of `rustyfarian-esp-idf-network` `MqttHandle::is_connected()` and `MqttBuilder::build_and_wait()`: the connect work runs on the runner thread, so there is no thread to fail to spawn and no `[mqtt] could not spawn the connect helper thread` error.
+
 ### Fixed
 
+- ESP-IDF MQTT: a kept session (`clean_session = false`) whose connect plan is empty — no subscription owed, no startup message, no `on_connect` — now goes live for runtime subscriptions; before, a `MqttHandle::subscribe` made after such a reconnect was stored and never sent (found while the connect work moved to the runner, bug 013).
+- `juggler::mqtt::PendingAcks` no longer grows with fire-and-forget QoS 1 publishes: the early-outcome buffer is capped at `EARLY_ACK_CAPACITY` (8) entries, oldest first.
+  Before, every `Published` event of a `try_publish` stayed in it until the next disconnect, about 2 KB of heap per 10 min of 5 s ticks on the ESP-IDF tier; see `docs/bugs/archive/021-mqtt-early-ack-buffer-grows-per-publish-2026-11-11.md`.
 - esp-hal OTA: `EspHalOtaManager::fetch_and_apply` now opens the TCP connection to the image server itself; before, it wrote the `GET` onto the caller's unconnected socket and every fetch failed at once as `ServerUnreachable` with nothing in the server log.
   The host must be an IPv4 literal (no DNS on this tier); a failed connect logs the embassy-net error, a connect timeout is `DownloadTimeout`, and the connect time comes off the header-phase budget.
   The status-line parser also accepts `HTTP/1.0`, which `just ota-serve` (Python's `http.server`) answers with; it rejected it as `BadStatusLine` before; see `docs/bugs/archive/020-hal-ota-never-connects-the-socket-2026-11-11.md`.

@@ -1,6 +1,5 @@
-//! Session state shared by the runner thread, the event-loop thread, the connect
-//! helper and every [`MqttHandle`](super::MqttHandle) clone (ADR 022,
-//! tier-parity Step 8b).
+//! Session state shared by the runner thread, the event-loop thread and every
+//! [`MqttHandle`](super::MqttHandle) clone (ADR 022, tier-parity Step 8b).
 //!
 //! The shared [`SessionMachine`] is the single source of state, readiness, the
 //! publish gate and the connect count. Its mutex is never held across a client
@@ -69,7 +68,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Everything the runner, the event loop, the connect helper and the handles share.
+/// Everything the runner, the event loop and the handles share.
 pub(crate) struct Session {
     machine: Mutex<SessionMachine>,
     ready: WaitList,
@@ -80,8 +79,8 @@ pub(crate) struct Session {
     /// publishes that arrived before it. The outbox owns its own lock, so no
     /// outer mutex is needed to reach the client.
     outbox: Arc<Outbox<SubscribableClient>>,
-    /// Session inputs for the runner thread; the event loop and the connect
-    /// helper only report, they never act (ADR 017).
+    /// Session inputs for the runner thread; the event loop only reports, it
+    /// never acts (ADR 017).
     inputs: Sender<Msg>,
 }
 
@@ -116,7 +115,7 @@ impl Session {
         action
     }
 
-    /// The shared outbox, for the connect helper and the runner.
+    /// The shared outbox, for the runner's connect steps.
     pub(crate) fn outbox(&self) -> &Arc<Outbox<SubscribableClient>> {
         &self.outbox
     }

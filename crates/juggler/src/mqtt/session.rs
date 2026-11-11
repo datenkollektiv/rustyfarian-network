@@ -29,7 +29,9 @@
 //!   at most one retry timer.
 //! - After [`SessionAction::ConnectWork`] it runs the steps of a
 //!   [`ConnectWorkPlan`] in order and feeds [`SessionInput::WorkDone`] or, at
-//!   the first failed step, [`SessionInput::WorkFailed`].
+//!   the first failed step, [`SessionInput::WorkFailed`]; it does so by driving
+//!   a [`ConnectWorkMachine`](super::ConnectWorkMachine) built from that plan,
+//!   one action per turn, and feeding the input the machine reports.
 //! - After [`SessionAction::Ready`] it wakes the publishers waiting for the session.
 //! - A driver that retries on its own may report [`SessionInput::AttemptStarted`].
 //!
@@ -862,12 +864,38 @@ mod tests {
 
     /// The documented answer of a well-behaved tier to `action`, or `None`
     /// when the action asks for nothing and the loop waits for the outside.
+    ///
+    /// `ConnectWork` is answered the way a tier answers it: a
+    /// `ConnectWorkMachine` over the plan, run to its report through a port
+    /// whose every call succeeds.
     fn answer(action: SessionAction) -> Option<SessionInput> {
+        use crate::mqtt::connect_work::scripted::ScriptedPort;
+        use crate::mqtt::{perform, ConnectWorkMachine, WorkAction, WorkInput};
+
         match action {
             A::Connect => Some(I::Connected {
                 session_present: false,
             }),
-            A::ConnectWork { token, .. } => Some(I::WorkDone(token)),
+            A::ConnectWork {
+                token,
+                subscribe,
+                session_present,
+            } => {
+                let plan = ConnectWorkPlan::new(subscribe, 2, true, true);
+                let mut work = ConnectWorkMachine::new(token, plan, session_present);
+                let mut port = ScriptedPort::accepting();
+                let mut input = WorkInput::Start;
+                loop {
+                    let action = work.poll(input);
+                    match perform(&mut port, action, session_present) {
+                        Some(next) => input = next,
+                        None => match action {
+                            WorkAction::Report(report) => return Some(report),
+                            other => panic!("connect work ended in {:?}", other),
+                        },
+                    }
+                }
+            }
             A::Close => Some(I::Disconnected),
             A::Wait { .. } => Some(I::RetryElapsed),
             A::None | A::Ready | A::Ignored => None,

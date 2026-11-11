@@ -461,6 +461,25 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_session_with_nothing_to_send_is_live_after_catch_up() {
+        // The empty connect plan of a kept session: no builder subscriptions
+        // to redo, no startup, no callback. The closing step still has to run,
+        // or every later runtime request is stored instead of sent.
+        let mut t = T::new();
+        t.begin_connect(false);
+        assert_eq!(t.next_pending(), None);
+        assert!(!t.is_live());
+        let mut sends = 0;
+        assert!(t.catch_up_and_go_live(|_, _| {
+            sends += 1;
+            true
+        }));
+        assert_eq!(sends, 0, "nothing was owed");
+        assert!(t.is_live());
+        assert_eq!(add(&mut t, Q1), TrackedRequest::SendNow);
+    }
+
+    #[test]
     fn a_kept_session_sends_only_what_is_still_owed() {
         let mut t = T::new();
         add(&mut t, Q1);

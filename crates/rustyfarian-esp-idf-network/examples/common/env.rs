@@ -116,3 +116,9 @@ pub fn mqtt_pass() -> Option<&'static str> {
 pub fn mqtt_suspend_demo() -> bool {
     option_env!("MQTT_SUSPEND_DEMO") == Some("1")
 }
+
+/// `MQTT_ON_CONNECT_DEMO=1` makes `idf_esp32s3_mqtt_lwt` register its measurement `on_connect`.
+#[allow(dead_code)]
+pub fn mqtt_on_connect_demo() -> bool {
+    option_env!("MQTT_ON_CONNECT_DEMO") == Some("1")
+}

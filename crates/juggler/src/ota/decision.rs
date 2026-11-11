@@ -73,7 +73,7 @@ pub fn decide_update(running: Version, offered: Version) -> UpdateDecision {
 ///
 /// - An attempt record exists (see [`AttemptRecord`](super::AttemptRecord)).
 ///   Overwriting it with a new attempt destroys unresolved evidence of what
-///   happened to the previous one (see the [`reconcile`](super::reconcile)
+///   happened to the previous one (see the [`reconcile`](mod@super::reconcile)
 ///   module docs).
 /// - A report is undelivered.
 ///   v1 keeps a single report record, so a second report must not overwrite
@@ -190,7 +190,7 @@ pub enum OfferDecision {
 ///
 /// Build `admission` with [`Admission::from_records`]: it is blocked while an
 /// attempt record exists (overwriting it destroys unresolved evidence, see the
-/// [`reconcile`](super::reconcile) module docs) or a report is undelivered
+/// [`reconcile`](mod@super::reconcile) module docs) or a report is undelivered
 /// (v1 keeps a single report record).
 ///
 /// On [`OfferDecision::Blocked`] the offer is not dropped by the core, and

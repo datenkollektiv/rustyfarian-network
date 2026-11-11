@@ -90,7 +90,7 @@ fn min_free_heap() -> u32 {
 const MAX_TASK_NAME_LEN: usize = 15;
 
 /// Unused stack of the named task in bytes, or `None` if no task has that name.
-fn stack_high_water(name: &CStr) -> Option<u32> {
+pub fn stack_high_water(name: &CStr) -> Option<u32> {
     if name.to_bytes().len() > MAX_TASK_NAME_LEN {
         return None;
     }

@@ -84,7 +84,7 @@ pub const APP_KEY_HEX_LEN: usize = 32;
 /// # Secret lifetime
 ///
 /// When a `ProvisioningConfig`, [`LoraFields`], [`MqttFields`], or
-/// [`ExtraField`](crate::provisioning::ExtraField) value (including a clone)
+/// [`ExtraField`] value (including a clone)
 /// is dropped, the Wi-Fi password, the MQTT password, the AppKey, and every
 /// extra field's value in *that value's own storage* are overwritten (zeroed,
 /// via [`zeroize`]) before the memory is released.

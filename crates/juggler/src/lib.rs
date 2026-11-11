@@ -9,13 +9,14 @@
 //! | (always) | `backoff`, `status_colors` | none |
 //! | `wifi` | `wifi` | none |
 //! | `mqtt` | `mqtt` (no_std subset) | none |
-//! | `std` | `mqtt` (full, incl. thread helpers) | `anyhow` |
+//! | `std` | `mqtt` (full, incl. `CallbackScope`, `SubscribeClient`, `Outbox`, `PendingAcks`) | `anyhow` |
 //! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device` |
 //! | `espnow` | `espnow` | none |
 //! | `ota` | `ota` | `heapless`, `sha2` |
 //! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless` (implies wifi+mqtt+lora) |
 //! | `flash-store` | `provisioning::flash_store` | `embedded-storage` (implies `provisioning`) |
+//! | `embassy` | `espnow::EmbassyClock` | `embassy-time` (no time driver, ADR 021) |
 //! | `mock` | `wifi::mock`, `lora::mock`, `espnow::mock` | (implies wifi+lora+espnow) |
 //!
 //! ## Cargo features
@@ -53,13 +54,16 @@
 //!
 //! ### Utility features
 //!
-//! - **`std`** — Enables full MQTT helpers that require the standard library:
-//!   [`mqtt::spawn_subscriber_thread`], [`mqtt::SubscribeClient`] trait,
-//!   [`mqtt::QoS`] enum, and [`mqtt::format_broker_url`]. These functions need
-//!   `std::thread`, `std::sync`, and the `anyhow` crate. **Implies `mqtt` feature.**
+//! - **`std`** — Enables the MQTT support that requires the standard library:
+//!   [`mqtt::CallbackScope`] (the callback-context guard), the
+//!   [`mqtt::SubscribeClient`] trait, [`mqtt::Outbox`] and [`mqtt::PendingAcks`]
+//!   (the shared publish path with its PUBACK waiters), plus
+//!   [`mqtt::format_broker_url`]. These need `std::sync`, `std::thread`, and the
+//!   `anyhow` crate. The thread helpers `spawn_connect_thread` and
+//!   `spawn_subscriber_thread` are also behind it, but both are deprecated and
+//!   unused by either tier. **Implies `mqtt` feature.**
 //!   Everything else in `juggler` is `no_std`; this flag does not affect other
-//!   domains. Use this only if you need the thread-based subscriber helpers;
-//!   pure MQTT validation and state machines compile under `mqtt` alone.
+//!   domains. Pure MQTT validation and state machines compile under `mqtt` alone.
 //!
 //! - **`mock`** — Exposes test-double implementations for unit testing:
 //!   [`wifi::mock::MockWifiDriver`], [`lora::mock::MockLoraRadio`], and

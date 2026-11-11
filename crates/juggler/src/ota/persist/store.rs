@@ -827,7 +827,7 @@ impl<K: OtaKv> OtaStore<K> {
 
     /// After a failed `fetch_and_apply`: clears the attempt only when the decision core says [`ReconcileAction::ClearAttempt`].
     ///
-    /// Builds the same `BootFacts` as boot reconciliation (`hw`, `running_version`, and the report fact from the store), runs [`reconcile`], and performs only the clear.
+    /// Builds the same `BootFacts` as boot reconciliation (`hw`, `running_version`, and the report fact from the store), runs [`reconcile()`], and performs only the clear.
     /// A boot-time action (health check, refusal, rollback report, defer) is left to the next boot and returned as [`FailedDownload::Kept`].
     /// A rollback request is not settled here; that is the boot's job.
     ///
