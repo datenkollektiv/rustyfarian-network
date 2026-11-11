@@ -1,0 +1,121 @@
+# ESP-NOW peer session across a coordinator power cycle (runbook gates C3-H3 and C6-H4).
+# Both peers run the shared peer app on `PeerSession` (parity plan Step 7) and print the same lines, so one set of
+# steps judges the hal peer `hal_c3_espnow_peer` and the ESP-IDF peer `idf_c3_espnow_peer` in turn.
+# The runbook pairs the C3 with the C6 in both directions, so run the check twice, with a different coordinator on
+# the C6 each time (`ESPFLASH_PORT=<c6 port> just run <coordinator>` before the run, note the printed STA MAC):
+#   idf_c6_espnow_coordinator      the hal peer half of the run counts for C3-H3 (hal peer, IDF coordinator)
+#   hal_c6_espnow_sta_coordinator  the IDF peer half of the run counts for C6-H4 (IDF peer, hal coordinator)
+# The other half of each run is a free extra; the coordinator follows its access point's channel.
+# The MAC is read at build time (both peers take `ESPNOW_PEER_MAC`); leave ESPNOW_SCENARIO unset (or `default`):
+#   ESPNOW_PEER_MAC=<coordinator STA MAC> just bench c3 espnow-peer-session --port <c3 port>
+# The peer sends an 8-byte frame every 100 ms and prints its counters every 10 s:
+#   [espnow] sent=N acked=N failed=N fail_rate=D.DD% echoes=N channel=Some(N) oversize_dropped=N rescans=N local_failures=N
+# The session logs `[espnow] coordinator found on channel N` after a scan and `[espnow] N sends unacknowledged -
+# rescanning` when 20 sends in a row get no ACK; `rescans` counts every scan issued while the link is lost.
+# A relink can be silent: after a failed rescan the radio stays on the last channel, and the first ACK there makes the
+# link whole again with no line printed (the gate accepts a relink "without a rescan or after one"), so the recovery
+# is judged from the counters: `acked` rises again on the pinned channel; a late rescan or failed scan in the window
+# after the settle is allowed, only a crash is not. No router or hotspot channel is changed in 0.7.0.
+# Two halves: `--unattended` boots, finds the coordinator and watches 60 s of sends with the cumulative failure rate
+# below 5 % and no rescan; `--attended` asks a person to unplug the coordinator, judges the threshold rescan and the
+# rising rescans counter, keeps it off for 20 s, asks to plug it in again, waits a 15 s settle (the coordinator ACKs
+# probes on passing channels while it still scans for its access point, see the C3-I7 record) and judges 30 s of
+# acknowledged sends on the pinned channel.
+examples = ["hal_c3_espnow_peer", "idf_c3_espnow_peer"]
+
+# ── unattended half: coordinator on ────────────────────────────────────────────
+
+[[step]]
+say = "The peer boots on the owned radio in the default scenario"
+arm = false       # printed during the reset
+expect = ['ESP-NOW up on owned radio, tx power Some\(\d+\) quarter-dBm, own STA MAC', 'ESPNOW_SCENARIO=default']
+reject = 'FATAL|set ESPNOW_PEER_MAC|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "The first scan finds the coordinator (power it on if it is off)"
+arm = false
+expect = '\[espnow\] coordinator found on channel (?P<ch>\d+)'
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 180
+
+[[step]]
+say = "The first counters line arrives on the pinned channel"
+arm = false
+expect = '\[espnow\] sent=\d+ acked=\d+ failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\((?P=ch)\)'
+reject = '\[espnow\] send error:|\[espnow\] \d+ sends unacknowledged - rescanning|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+[[step]]
+say = "Steady: 60 s of sends at 100 ms, cumulative failure rate below 5 %, no rescan, no send error, no reboot"
+arm = false
+duration = 60
+reject = 'fail_rate=(?!0\.|[1-4]\.)\d+\.\d\d%|\[espnow\] \d+ sends unacknowledged - rescanning|\[espnow\] send error:|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Steady counters: still on the pinned channel, failure rate below 5 %, rescans=0"
+arm = false
+expect = '\[espnow\] sent=\d+ acked=\d+ failed=\d+ fail_rate=[0-4]\.\d\d% echoes=\d+ channel=Some\((?P=ch)\) oversize_dropped=\d+ rescans=0 '
+reject = '\[espnow\] send error:|\[espnow\] \d+ sends unacknowledged - rescanning|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+# ── attended half: coordinator off, then on again ──────────────────────────────
+
+[[step]]
+say = "Wait for the found line after the reset, then UNPLUG the coordinator (plug it in only when a later step says so)"
+confirm = "Is the coordinator unplugged?"
+attended = true   # a person acts; the sends repeat every 100 ms, so lines printed while you answer are not needed
+
+[[step]]
+say = "Coordinator off: 20 unacknowledged sends trigger a rescan and the rescans counter rises"
+attended = true
+arm = false
+expect = ['\[espnow\] \d+ sends unacknowledged - rescanning', '\[espnow\] sent=\d+ acked=\d+ failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\(\d+\) oversize_dropped=\d+ rescans=[1-9]\d* ']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 90
+
+[[step]]
+say = "Keep the coordinator off for 20 s: failed sends and failed scans only, no find, no hang, no reboot"
+attended = true
+arm = false
+duration = 20
+reject = '\[espnow\] coordinator found on channel|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "PLUG the coordinator in again (far edge of the table)"
+confirm = "Is the coordinator plugged in again?"
+attended = true   # a person powers the coordinator on; the relink may print no line, so the counters judge it below
+
+[[step]]
+say = "Let the coordinator settle for 15 s: while it still scans for its access point it ACKs probes on passing channels"
+attended = true
+arm = false
+duration = 15
+# Only a crash counts here: a find on a passing channel, failed sends and rescans are expected until the station is associated.
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Settled: a counters line to compare against (acked and the pinned channel)"
+attended = true
+arm = false
+expect = '\[espnow\] sent=\d+ acked=(?P<acked>\d+) failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\((?P<again>\d+)\)'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+[[step]]
+say = "Steady after the power cycle: 30 s with no reboot (one late rescan may still relink; the counters below judge it)"
+attended = true
+arm = false
+duration = 30
+# Only a crash counts here: the gate accepts a relink "without a rescan or after one", so a late threshold rescan or a
+# failed retry scan in this window is allowed and the next step judges the relink from `acked` and the channel.
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Relinked: the acked counter has risen and the channel is still the pinned one"
+attended = true
+arm = false
+# `acked` differs from the settled line (an ACK while lost relinks on the last channel); a flat count means no ACK in 30 s.
+expect = '\[espnow\] sent=\d+ acked=(?!(?P=acked) )\d+ failed=\d+ fail_rate=\d+\.\d\d% echoes=\d+ channel=Some\((?P=again)\)'
+reject = '\[espnow\] \d+ sends unacknowledged - rescanning|\[espnow\] scan failed:|\[espnow\] send error:|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30

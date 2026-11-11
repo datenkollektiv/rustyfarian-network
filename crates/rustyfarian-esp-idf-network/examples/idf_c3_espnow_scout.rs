@@ -1,8 +1,9 @@
 //! ESP-NOW scout — **SoftAP channel-lock variant** (ESP32-C3 Super Mini).
 //!
 //! Starts the Wi-Fi radio in SoftAP mode (`init_with_radio`), scans channels
-//! 1-13 to find the coordinator by MAC-layer ACK, then sends a message every
-//! second.  SoftAP beacon scheduling prevents the Wi-Fi driver from
+//! 1-13 to find the coordinator (the `0xF3` probe is answered with a `0xF4`
+//! reply naming its channel, the MAC-layer ACK is the fallback, ADR 025), then
+//! sends a message every second.  SoftAP beacon scheduling prevents the Wi-Fi driver from
 //! autonomously hopping channels, so every send lands on the coordinator's
 //! channel without any per-send re-pinning.  This is the race-free, recommended
 //! approach for most deployments.
@@ -146,7 +147,7 @@ fn main() -> anyhow::Result<()> {
     led.set_high()?; // LED off (active low)
 
     // ── ESP-NOW with channel scanning (retry until coordinator is found) ─
-    let scan_config = ScanConfig::new(b"scout-probe");
+    let scan_config = ScanConfig::for_peer();
 
     let espnow = EspIdfEspNow::init_with_radio(peripherals.modem, sys_loop, Some(nvs))?;
 
@@ -404,7 +405,7 @@ fn scenario_shutdown(espnow: &EspIdfEspNow, mac: &MacAddress, with_scan: bool) -
     };
     // No peer owns this address, so every probe fails and the scan keeps going.
     let silent: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-    let scan_config = ScanConfig::new(b"scout-probe").with_channels(&CHANNELS);
+    let scan_config = ScanConfig::for_peer().with_channels(&CHANNELS);
 
     let pinned_before = espnow.pinned_channel();
     let outcome = block_on(with_timeout(EmbassyDuration::from_secs(10), async {

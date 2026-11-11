@@ -1,6 +1,6 @@
 //! The MQTT log lines both tiers print, one text per event.
 //!
-//! Each type renders a whole line, prefix included, through [`Display`](core::fmt::Display).
+//! Each type renders a whole line, prefix included, through [`Display`].
 //! The tier name is not part of any line; examples print it once in their boot line.
 //! The host tests at the bottom pin every text.
 

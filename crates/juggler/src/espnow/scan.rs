@@ -14,8 +14,9 @@
 //! 1. Call [`ScanMachine::poll`] with [`ScanInput::Start`].
 //! 2. Perform the returned action.
 //! 3. Report the outcome with [`ScanInput::Completed`] (the operation succeeded, or the
-//!    requested wait has elapsed), [`ScanInput::Failed`] (the operation failed) or, after
-//!    [`ScanAction::SendProbe`], [`ScanInput::Sent`].
+//!    requested wait has elapsed), [`ScanInput::Failed`] (the operation failed), after
+//!    [`ScanAction::SendProbe`], [`ScanInput::Sent`], or, after [`ScanAction::AwaitReply`],
+//!    [`ScanInput::Reply`] for a probe reply the peer sent.
 //!    To give up while the scan is running, feed [`ScanInput::Abort`] instead; when the driver
 //!    is being deinitialised, feed [`ScanInput::Shutdown`].
 //! 4. Repeat until [`ScanAction::Done`].
@@ -30,11 +31,27 @@
 //!
 //! ```text
 //! RemovePeer -> RegisterPeer{0} -> BoostTxPower
-//!   per channel: SetChannel -> SendProbe -> [WaitUntil -> SendProbe]*  (confirmations)
+//!   per channel: SetChannel -> SendProbe -> [AwaitReply]              (ACKed: wait for the reply)
+//!     reply names the home channel: [SetChannel{home}]               -> found
+//!     no reply: the first such channel becomes the candidate, next channel
+//!   candidate (list or burst over, nothing found):
+//!     SetChannel -> SendProbe -> AwaitReply
+//!       -> [WaitUntil -> SendProbe -> AwaitReply]*                    (confirmations)
 //!   RestoreTxPower -> RemovePeer
 //!     found:     RegisterPeer{channel}                                -> Done(Ok)
 //!     not found: [RestoreChannel{pin} -> RegisterFallbackPeer{pin}]   -> Done(Err)
 //! ```
+//!
+//! A probe is the three-byte [`ProbeFrame`] (`0xF3`, ADR 025) with a per-scan sequence number;
+//! [`ScanMachine::probe_frame`] builds it for the channel named by `SendProbe`.
+//! A peer running the echo app answers with a [`ProbeReply`] that states its home channel, and
+//! that reply wins: the scan ends on the stated channel without another probe (bug 018: an
+//! adjacent channel decodes and ACKs the probe, so the ACK alone cannot name the channel).
+//! An ACK without a reply within [`ScanConfig::reply_timeout`] keeps the old meaning as a
+//! fallback for peers that do not reply: the first such channel is the candidate, the sweep
+//! goes on (a later reply still wins), and once the channel list or the burst budget is spent
+//! the scan returns to the candidate and settles it with the confirmation rule of
+//! [`ScanConfig::probe_confirmations`] and [`ScanConfig::confirmation_gap`].
 //!
 //! A failed registration (temporary peer after `RemovePeer`, discovered peer after the
 //! teardown) takes the same best-effort `[RestoreChannel -> RegisterFallbackPeer]` path
@@ -55,6 +72,19 @@
 //!   must not change under a frame on the air, ADR 020 fail-closed) and reported as
 //!   [`SendOutcome::Acked`] or [`SendOutcome::NoAck`] by its real MAC-layer result.
 //!   Both tiers follow this rule.
+//!   The payload is [`ScanMachine::probe_frame`]`(channel)` for the channel the action names.
+//! - [`ScanAction::AwaitReply`] asks the driver to wait for a `0xF4` [`ProbeReply`] from the
+//!   peer until the monotonic clock reaches `until`.
+//!   Feed [`ScanInput::Reply`] for each reply received from the peer's MAC in the meantime:
+//!   one that matches the outstanding probe (`seq` and `tx_channel`) ends the scan, one that does
+//!   not answers `AwaitReply` again with the same `until` (and does not count toward the poll
+//!   budget), so the wait goes on.
+//!   Feed [`ScanInput::Completed`] once the deadline has passed.
+//!   A reply that arrives while no `AwaitReply` is pending stands for nothing the machine can
+//!   use: drop it in the driver, as feeding it is an out-of-phase input.
+//! - At `Done(Ok)` the radio sits on the found channel, as before: when a reply names a channel
+//!   other than the probed one, the machine issues `SetChannel` for it before the teardown, and a
+//!   refused switch ends the scan not found with [`ScanFault::SetChannel`].
 //! - [`ScanAction::RemovePeer`] is best effort: both `Completed` and `Failed` continue.
 //! - [`ScanAction::BoostTxPower`] and [`ScanAction::RestoreTxPower`] are advisory; a driver
 //!   that cannot change TX power reports `Completed` and the scan proceeds.
@@ -87,7 +117,8 @@
 
 use core::time::Duration;
 
-use super::{MacAddress, ScanConfig, ScanResult};
+use super::command::PROBE_FRAME_LEN;
+use super::{MacAddress, ProbeFrame, ProbeReply, ScanConfig, ScanResult};
 
 /// Outcome of one probe transmission, reported after [`ScanAction::SendProbe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +148,11 @@ pub enum ScanInput {
     Abort,
     /// Result of the previous [`ScanAction::SendProbe`].
     Sent(SendOutcome),
+    /// A probe reply from the peer, received during [`ScanAction::AwaitReply`].
+    ///
+    /// One that matches the outstanding probe ends the scan on the reply's home channel; any
+    /// other is ignored and the wait continues.
+    Reply(ProbeReply),
     /// The driver is being deinitialised: finish at once with [`ScanError::Aborted`] and emit
     /// no teardown, since the radio is going away and a probe may still be on the air.
     Shutdown,
@@ -184,6 +220,13 @@ pub enum ScanAction {
     },
     /// Sleep until the monotonic clock reaches this instant, then report `Completed`.
     WaitUntil(Duration),
+    /// Wait for a probe reply from the peer (see the
+    /// [module docs](self#contract-for-the-io-side)): report each reply with
+    /// [`ScanInput::Reply`], and `Completed` once the clock reaches `until`.
+    AwaitReply {
+        /// Deadline of the wait; [`ScanConfig::reply_timeout`] after the ACK.
+        until: Duration,
+    },
     /// The scan has finished.  Further polls answer [`ScanAction::Ignored`].
     Done(Result<ScanResult, ScanError>),
     /// The input arrived after [`ScanAction::Done`] and changed nothing (ADR 023 decision 5).
@@ -480,6 +523,19 @@ enum State {
     Probing {
         idx: usize,
     },
+    /// `AwaitReply` issued after an ACK on `channels[idx]` for `probe`; `done` confirmations
+    /// have ACKed so far (always `0` during the sweep).
+    AwaitingReply {
+        idx: usize,
+        done: u8,
+        probe: ProbeFrame,
+        until: Duration,
+    },
+    /// `SetChannel { channel: home }` issued because a reply named a channel other than the
+    /// probed one.
+    SwitchingToHome {
+        home: u8,
+    },
     /// Confirmation gap `WaitUntil` issued; `done` confirmations have ACKed so far.
     Gap {
         idx: usize,
@@ -492,6 +548,16 @@ enum State {
     },
     /// The teardown runs, or has finished.
     Teardown(ScanTeardown),
+}
+
+/// Which part of the burst the machine is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Walking the channel list; an ACK without a reply only records a candidate.
+    Sweep,
+    /// Back on the candidate after the list or the burst budget ended; the confirmation rule
+    /// settles it, and leaving the channel ends the scan.
+    Candidate,
 }
 
 /// Pure ESP-NOW peer-scan state machine.  See the [module docs](self).
@@ -509,6 +575,13 @@ pub struct ScanMachine<'a> {
     boosted: bool,
     /// Calls of [`poll_bounded`](Self::poll_bounded) so far.
     polls: usize,
+    phase: Phase,
+    /// Index of the first channel that ACKed without a reply.
+    candidate: Option<usize>,
+    /// Sequence number of the last probe issued (`0` before the first).
+    seq: u8,
+    /// The last encoded probe, for the deprecated [`probe_data`](Self::probe_data).
+    last_probe: [u8; PROBE_FRAME_LEN],
 }
 
 impl<'a> ScanMachine<'a> {
@@ -529,7 +602,36 @@ impl<'a> ScanMachine<'a> {
             burst_expired: false,
             boosted: false,
             polls: 0,
+            phase: Phase::Sweep,
+            candidate: None,
+            seq: 0,
+            last_probe: ProbeFrame {
+                seq: 0,
+                tx_channel: 0,
+            }
+            .encode(),
         }
+    }
+
+    /// Continues the probe sequence of the previous scan: the first probe gets `seq + 1`.
+    ///
+    /// A fresh machine starts at `0`, so every scan would issue `(seq 1, channels[0])` first,
+    /// and a reply to the previous scan's first probe that sat unread in the radio's queue
+    /// would match it.
+    /// Pass the [`seq`](Self::seq) of the previous scan, as both tiers do, and the pair never
+    /// repeats until the counter wraps.
+    pub fn with_first_seq(mut self, seq: u8) -> Self {
+        self.seq = seq;
+        self.last_probe = ProbeFrame { seq, tx_channel: 0 }.encode();
+        self
+    }
+
+    /// Sequence number of the last probe issued (the start value before the first).
+    ///
+    /// Persist this after [`ScanAction::Done`] and pass it to the next machine through
+    /// [`with_first_seq`](Self::with_first_seq).
+    pub fn seq(&self) -> u8 {
+        self.seq
     }
 
     /// MAC address of the peer being scanned for.
@@ -567,19 +669,24 @@ impl<'a> ScanMachine<'a> {
     /// The most polls a scan driven with valid inputs needs, the one that returns
     /// [`ScanAction::Done`] included.
     ///
-    /// Three setup steps, `2 + 2 * probe_confirmations` per configured channel (channel switch,
-    /// probe, and a gap plus a probe per confirmation), and at most
-    /// [`ScanTeardown::MAX_POLLS`] for the teardown.
+    /// Three setup steps, three per configured channel (channel switch, probe, reply wait),
+    /// `3 + 3 * probe_confirmations` for the candidate phase (channel switch, probe and reply
+    /// wait, then a gap, a probe and a reply wait per confirmation), one channel switch to a
+    /// home channel a reply named, and at most [`ScanTeardown::MAX_POLLS`] for the teardown.
+    /// An ignored reply (stale `seq` or other `tx_channel`) is answered with the same
+    /// `AwaitReply` and not counted by [`poll_bounded`](Self::poll_bounded).
     /// A driver loop that reaches this count without `Done` feeds [`ScanInput::Abort`] once;
     /// the teardown then needs at most `ScanTeardown::MAX_POLLS` more.
     pub fn max_polls(&self) -> usize {
         const SETUP_POLLS: usize = 3;
-        let per_channel = 2 + 2 * usize::from(self.config.probe_confirmations);
+        const PER_CHANNEL: usize = 3;
+        const HOME_SWITCH: usize = 1;
+        let candidate = 3 + 3 * usize::from(self.config.probe_confirmations);
         self.config
             .channels
             .len()
-            .saturating_mul(per_channel)
-            .saturating_add(SETUP_POLLS + ScanTeardown::MAX_POLLS)
+            .saturating_mul(PER_CHANNEL)
+            .saturating_add(SETUP_POLLS + candidate + HOME_SWITCH + ScanTeardown::MAX_POLLS)
     }
 
     /// The teardown the machine would run if it were fed [`ScanInput::Abort`] now.
@@ -602,6 +709,8 @@ impl<'a> ScanMachine<'a> {
             | State::Boosting
             | State::SettingChannel { .. }
             | State::Probing { .. }
+            | State::AwaitingReply { .. }
+            | State::SwitchingToHome { .. }
             | State::Gap { .. }
             | State::Confirming { .. } => {
                 self.teardown(Step::Begin { found: None }, ScanError::Aborted)
@@ -622,14 +731,39 @@ impl<'a> ScanMachine<'a> {
         }
     }
 
-    /// The probe payload to transmit on [`ScanAction::SendProbe`].
-    pub fn probe_data(&self) -> &'a [u8] {
-        self.config.probe_data
+    /// The probe payload to transmit on [`ScanAction::SendProbe`]`{ channel, .. }`: the
+    /// [`ProbeFrame`] with the scan's current sequence number and `channel` as `tx_channel`.
+    ///
+    /// The sequence number advances with every `SendProbe` the machine issues, so a reply is
+    /// matched to the probe it answers.
+    pub fn probe_frame(&self, channel: u8) -> [u8; PROBE_FRAME_LEN] {
+        ProbeFrame {
+            seq: self.seq,
+            tx_channel: channel,
+        }
+        .encode()
+    }
+
+    /// The last probe frame the machine issued (the start-sequence frame for channel 0 before
+    /// the first probe).
+    ///
+    /// Kept for one release for drivers written against the payload of
+    /// [`ScanConfig::probe_data`]; the scan now sends the `0xF3` frame.
+    /// Unlike that payload, the slice borrows the machine, so read it after each `SendProbe`
+    /// instead of holding it across `poll`.
+    #[deprecated(
+        since = "0.7.0",
+        note = "the scan sends the 0xF3 probe frame; use `probe_frame(channel)` for the channel `SendProbe` names"
+    )]
+    pub fn probe_data(&self) -> &[u8] {
+        &self.last_probe
     }
 
     /// [`poll`](Self::poll) under the poll budget of ADR 023 decision 6.
     ///
-    /// Counts its own calls.
+    /// Counts its own calls, except one whose [`ScanInput::Reply`] was ignored (the answer is
+    /// the pending [`ScanAction::AwaitReply`] again), since it advanced nothing and the wait it
+    /// belongs to is bounded by its deadline.
     /// The call that reaches [`max_polls`](Self::max_polls) substitutes [`ScanInput::or_abort`]`(true)` for `input`, so a scan that never finishes unwinds through its teardown.
     /// Once the teardown budget of [`ScanTeardown::MAX_POLLS`] polls is spent as well, the machine is broken.
     /// Use it instead of `poll` in a driver loop, and do not mix the two.
@@ -652,8 +786,13 @@ impl<'a> ScanMachine<'a> {
         } else {
             input
         };
-        self.polls += 1;
-        Ok(self.poll(now, input))
+        let action = self.poll(now, input);
+        let ignored_reply =
+            matches!(input, ScanInput::Reply(_)) && matches!(action, ScanAction::AwaitReply { .. });
+        if !ignored_reply {
+            self.polls += 1;
+        }
+        Ok(action)
     }
 
     /// Advance the machine.  See the [module docs](self) for the protocol.
@@ -707,7 +846,7 @@ impl<'a> ScanMachine<'a> {
                 self.record_fault(ScanFault::SetChannel {
                     channel: self.config.channels[idx],
                 });
-                self.next_channel(now, idx + 1)
+                self.leave_channel(now, idx)
             }
 
             (State::Probing { idx }, ScanInput::Sent(outcome)) => match outcome {
@@ -715,31 +854,64 @@ impl<'a> ScanMachine<'a> {
                     self.record_fault(ScanFault::ProbeSend {
                         channel: self.config.channels[idx],
                     });
-                    self.next_channel(now, idx + 1)
+                    self.leave_channel(now, idx)
                 }
                 SendOutcome::NoAck => {
-                    self.probed += 1;
-                    self.next_channel(now, idx + 1)
+                    self.count_probed();
+                    self.leave_channel(now, idx)
                 }
                 SendOutcome::Acked => {
-                    self.probed += 1;
-                    self.after_ack(now, idx, 0)
+                    self.count_probed();
+                    self.await_reply(now, idx, 0)
                 }
             },
+
+            // The reply wins: the peer states its home channel, so no probe on it proves more.
+            (State::AwaitingReply { probe, until, .. }, ScanInput::Reply(reply)) => {
+                if reply.seq == probe.seq
+                    && reply.tx_channel == probe.tx_channel
+                    && (1..=14).contains(&reply.home_channel)
+                {
+                    self.found_at(reply.home_channel, probe.tx_channel)
+                } else {
+                    log::debug!(
+                        "ESP-NOW scan: ignoring probe reply {reply:?} (outstanding probe {probe:?})"
+                    );
+                    ScanAction::AwaitReply { until }
+                }
+            }
+            // No reply: an ACK alone only nominates the channel (bug 018) until the sweep is
+            // over; back on the candidate, the confirmation rule settles it.
+            (State::AwaitingReply { idx, done, .. }, ScanInput::Completed) => match self.phase {
+                Phase::Sweep => {
+                    if self.candidate.is_none() {
+                        self.candidate = Some(idx);
+                    }
+                    self.next_channel(now, idx + 1)
+                }
+                Phase::Candidate => self.after_ack(now, idx, done),
+            },
+
+            (State::SwitchingToHome { home }, ScanInput::Completed) => self.found(home),
+            // The stated home channel is not usable here: the peer stays unreachable.
+            (State::SwitchingToHome { home }, ScanInput::Failed) => {
+                self.record_fault(ScanFault::SetChannel { channel: home });
+                self.finish_not_found()
+            }
 
             (State::Gap { idx, done }, ScanInput::Completed) => {
                 self.state = State::Confirming { idx, done };
                 self.send_probe(idx, done + 1)
             }
             (State::Confirming { idx, done }, ScanInput::Sent(outcome)) => match outcome {
-                SendOutcome::Acked => self.after_ack(now, idx, done + 1),
+                SendOutcome::Acked => self.await_reply(now, idx, done + 1),
                 // Unconfirmed: the peer was only passing through (roaming).
-                SendOutcome::NoAck => self.next_channel(now, idx + 1),
+                SendOutcome::NoAck => self.leave_channel(now, idx),
                 SendOutcome::Local => {
                     self.record_fault(ScanFault::ProbeSend {
                         channel: self.config.channels[idx],
                     });
-                    self.next_channel(now, idx + 1)
+                    self.leave_channel(now, idx)
                 }
             },
 
@@ -780,12 +952,79 @@ impl<'a> ScanMachine<'a> {
         self.first_fault.get_or_insert(fault);
     }
 
-    fn send_probe(&self, idx: usize, confirmation: u8) -> ScanAction {
+    /// Issue the next probe on `channels[idx]`, advancing the sequence number.
+    fn send_probe(&mut self, idx: usize, confirmation: u8) -> ScanAction {
+        let channel = self.config.channels[idx];
+        self.seq = self.seq.wrapping_add(1);
+        self.last_probe = self.probe_frame(channel);
         ScanAction::SendProbe {
-            channel: self.config.channels[idx],
+            channel,
             confirmation,
             timeout: self.config.probe_timeout,
         }
+    }
+
+    /// Wait for the reply to the probe just ACKed on `channels[idx]`.
+    fn await_reply(&mut self, now: Duration, idx: usize, done: u8) -> ScanAction {
+        let until = now.saturating_add(self.config.reply_timeout);
+        self.state = State::AwaitingReply {
+            idx,
+            done,
+            probe: ProbeFrame {
+                seq: self.seq,
+                tx_channel: self.config.channels[idx],
+            },
+            until,
+        };
+        ScanAction::AwaitReply { until }
+    }
+
+    /// A probe went out on a new channel; confirmation and candidate probes are not counted.
+    fn count_probed(&mut self) {
+        if self.phase == Phase::Sweep {
+            self.probed += 1;
+        }
+    }
+
+    /// The scan is done with `channels[idx]` without a result: the next channel during the
+    /// sweep, the end of the scan once back on the candidate.
+    fn leave_channel(&mut self, now: Duration, idx: usize) -> ScanAction {
+        match self.phase {
+            Phase::Sweep => self.next_channel(now, idx + 1),
+            Phase::Candidate => self.finish_not_found(),
+        }
+    }
+
+    /// Finish on `channel`: the teardown registers the peer there.
+    fn found(&mut self, channel: u8) -> ScanAction {
+        self.enter(
+            Step::Begin {
+                found: Some(channel),
+            },
+            self.not_found(),
+            ScanInput::Completed,
+        )
+    }
+
+    /// A reply named `home` while the radio is on `probed`: finish there, switching first when
+    /// the two differ so the radio sits on the found channel at `Done`.
+    fn found_at(&mut self, home: u8, probed: u8) -> ScanAction {
+        if home == probed {
+            self.found(home)
+        } else {
+            log::debug!("ESP-NOW scan: peer replied on channel {probed}, home channel {home}");
+            self.state = State::SwitchingToHome { home };
+            ScanAction::SetChannel { channel: home }
+        }
+    }
+
+    /// Finish with [`ScanError::NotFound`].
+    fn finish_not_found(&mut self) -> ScanAction {
+        self.enter(
+            Step::Begin { found: None },
+            self.not_found(),
+            ScanInput::Completed,
+        )
     }
 
     /// The error a scan that found nothing finishes with.
@@ -797,22 +1036,19 @@ impl<'a> ScanMachine<'a> {
         }
     }
 
-    /// An ACK arrived on `channels[idx]` with `done` confirmations already collected.
+    /// The reply wait after an ACK on the candidate `channels[idx]` ended with `done`
+    /// confirmations collected: the confirmation rule decides.
     fn after_ack(&mut self, now: Duration, idx: usize, done: u8) -> ScanAction {
         if done >= self.config.probe_confirmations {
-            let found = Some(self.config.channels[idx]);
-            self.enter(
-                Step::Begin { found },
-                self.not_found(),
-                ScanInput::Completed,
-            )
+            self.found(self.config.channels[idx])
         } else {
             self.state = State::Gap { idx, done };
             ScanAction::WaitUntil(now.saturating_add(self.config.confirmation_gap))
         }
     }
 
-    /// Move to `channels[idx]`, or end the burst when the list or the burst budget is exhausted.
+    /// Move to `channels[idx]`, or end the sweep when the list or the burst budget is exhausted:
+    /// back to the candidate if one was recorded, otherwise not found.
     fn next_channel(&mut self, now: Duration, idx: usize) -> ScanAction {
         let burst_over = now.saturating_sub(self.burst_start) >= self.config.burst_timeout;
         match self.config.channels.get(idx) {
@@ -829,11 +1065,18 @@ impl<'a> ScanMachine<'a> {
                         self.probed
                     );
                 }
-                self.enter(
-                    Step::Begin { found: None },
-                    self.not_found(),
-                    ScanInput::Completed,
-                )
+                match self.candidate {
+                    Some(candidate) => {
+                        let channel = self.config.channels[candidate];
+                        log::debug!(
+                            "ESP-NOW scan: no reply on any channel; confirming the ACK on channel {channel}"
+                        );
+                        self.phase = Phase::Candidate;
+                        self.state = State::SettingChannel { idx: candidate };
+                        ScanAction::SetChannel { channel }
+                    }
+                    None => self.finish_not_found(),
+                }
             }
         }
     }
@@ -884,6 +1127,13 @@ mod tests {
     struct Peer {
         /// The channel the peer sits on; probes on other channels are not ACKed.
         home: Option<u8>,
+        /// Adjacent channels on which the peer's radio still decodes and ACKs a probe (bug 018).
+        acks_also_on: Vec<u8>,
+        /// The peer runs the echo app and answers a decoded probe with a `ProbeReply`.
+        replies: bool,
+        /// Channels in `acks_also_on` on which the scanning radio also decodes the reply;
+        /// on `home` it always does.
+        decodes_reply_on: Vec<u8>,
         /// Channels the radio refuses to switch to.
         refuse: Vec<u8>,
         /// Number of ACKs the peer gives before going silent (roam simulation).
@@ -897,14 +1147,25 @@ mod tests {
     }
 
     impl Peer {
+        /// A peer on `channel` that answers probes with a reply (the echo app).
         fn on(channel: u8) -> Self {
             Self {
                 home: Some(channel),
+                acks_also_on: Vec::new(),
+                replies: true,
+                decodes_reply_on: Vec::new(),
                 refuse: Vec::new(),
                 acks_before_silence: None,
                 roams_to: None,
                 fail_register: None,
                 fail_send: None,
+            }
+        }
+        /// A peer on `channel` that only ACKs at the MAC layer (no echo app).
+        fn legacy(channel: u8) -> Self {
+            Self {
+                replies: false,
+                ..Self::on(channel)
             }
         }
         fn absent() -> Self {
@@ -927,12 +1188,15 @@ mod tests {
         RegisterFallback(u8),
         Probe(D),
         Wait(D),
+        AwaitReply(D),
     }
 
     struct Run {
         actions: Vec<(D, Seen)>,
         /// `(channel, confirmation)` of every `SendProbe`.
         probe_log: Vec<(u8, u8)>,
+        /// The decoded probe frame of every `SendProbe`.
+        frames: Vec<ProbeFrame>,
         result: Result<ScanResult, ScanError>,
         pinned: Option<u8>,
         end: D,
@@ -965,7 +1229,7 @@ mod tests {
 
     /// Drive a machine against a simulated peer on a virtual clock.
     /// Each radio operation costs `op_cost`; a NoAck costs the full probe timeout,
-    /// an ACK arrives after 5 ms.
+    /// an ACK arrives after 5 ms and a reply 2 ms after the ACK.
     fn run(mut m: ScanMachine<'_>, peer: &Peer, op_cost: D) -> Run {
         let probe_timeout = m.config.probe_timeout;
         let mut home = peer.home;
@@ -976,6 +1240,7 @@ mod tests {
         let mut acks = 0usize;
         let mut actions = Vec::new();
         let mut probe_log = Vec::new();
+        let mut frames: Vec<ProbeFrame> = Vec::new();
         let mut input = ScanInput::Start;
         let max_polls = m.max_polls();
         for polls in 1..10_000 {
@@ -985,6 +1250,7 @@ mod tests {
                     return Run {
                         actions,
                         probe_log,
+                        frames,
                         result,
                         pinned: m.pinned_channel(),
                         end: now,
@@ -1054,6 +1320,9 @@ mod tests {
                     assert_eq!(timeout, probe_timeout);
                     assert_eq!(channel, radio_channel, "probe carries the channel");
                     probe_log.push((channel, confirmation));
+                    let frame = ProbeFrame::parse(&m.probe_frame(channel)).expect("a 0xF3 probe");
+                    assert_eq!(frame.tx_channel, channel);
+                    frames.push(frame);
                     actions.push((now, Seen::Probe(timeout)));
                     let n = probes;
                     probes += 1;
@@ -1063,7 +1332,9 @@ mod tests {
                         continue;
                     }
                     let silent = peer.acks_before_silence.is_some_and(|k| acks >= k);
-                    if home == Some(radio_channel) && !silent {
+                    let decoded =
+                        home == Some(radio_channel) || peer.acks_also_on.contains(&radio_channel);
+                    if decoded && !silent {
                         acks += 1;
                         if peer.roams_to.is_some() {
                             home = peer.roams_to;
@@ -1081,6 +1352,22 @@ mod tests {
                     now = t;
                     input = ScanInput::Completed;
                 }
+                ScanAction::AwaitReply { until } => {
+                    actions.push((now, Seen::AwaitReply(until)));
+                    assert!(until >= now);
+                    let heard = home == Some(radio_channel)
+                        || peer.decodes_reply_on.contains(&radio_channel);
+                    match (peer.replies && heard, home, frames.last()) {
+                        (true, Some(home), Some(probe)) => {
+                            now += D::from_millis(2);
+                            input = ScanInput::Reply(ProbeReply::answering(probe, home));
+                        }
+                        _ => {
+                            now = until;
+                            input = ScanInput::Completed;
+                        }
+                    }
+                }
                 ScanAction::Ignored => panic!("input ignored before Done"),
             }
         }
@@ -1095,11 +1382,8 @@ mod tests {
 
     #[test]
     fn found_on_channel_1_default_settings() {
-        let r = run(
-            machine(ScanConfig::new(b"probe"), None),
-            &Peer::on(1),
-            D::ZERO,
-        );
+        // Adjusted for the probe reply: the reply ends the scan, no confirmation probe.
+        let r = run(machine(ScanConfig::for_peer(), None), &Peer::on(1), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 1 }));
         assert_eq!(r.pinned, Some(1));
         assert_eq!(
@@ -1110,8 +1394,7 @@ mod tests {
                 Seen::Boost,
                 Seen::SetChannel(1),
                 Seen::Probe(super::super::DEFAULT_PROBE_TIMEOUT),
-                Seen::Wait(D::from_secs(1000) + D::from_millis(5) + D::from_millis(150)),
-                Seen::Probe(super::super::DEFAULT_PROBE_TIMEOUT),
+                Seen::AwaitReply(D::from_secs(1000) + D::from_millis(5) + D::from_millis(50)),
                 Seen::Restore,
                 Seen::Remove,
                 Seen::Register(1),
@@ -1121,25 +1404,363 @@ mod tests {
 
     #[test]
     fn found_on_channel_6() {
-        let r = run(machine(ScanConfig::new(b"p"), None), &Peer::on(6), D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &Peer::on(6), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 6 }));
         assert_eq!(r.channels_set(), [1, 2, 3, 4, 5, 6]);
         assert_eq!(r.pinned, Some(6));
-        // 5 misses + 2 hits.
-        assert_eq!(r.probes(), 7);
+        // 5 misses + 1 hit; the reply replaces the confirmation probe.
+        assert_eq!(r.probes(), 6);
         assert_eq!(r.seen().last(), Some(&Seen::Register(6)));
+    }
+
+    // ── probe reply (bug 018) ─────────────────────────────────────────────
+
+    // Hand mutation checks (2026-11-11, `just test-espnow`), each applied, run and reverted:
+    // - seq match: `reply.seq == probe.seq` dropped from the reply arm -> 454/2:
+    //   `stale_or_foreign_replies_are_ignored_and_the_wait_continues` and
+    //   `ignored_replies_do_not_consume_the_poll_budget` (a seq+1 reply finishes the scan).
+    // - candidate fallback: `self.candidate = Some(idx)` removed -> 443/13, among them
+    //   `legacy_ack_only_peer_is_found_through_the_candidate_and_confirmation_path` and
+    //   `burst_budget_ending_with_a_candidate_still_runs_the_candidate_phase` (`NotFound`).
+    // - home_channel use: `found_at(probe.tx_channel, ..)` in place of `reply.home_channel` ->
+    //   454/2: `adjacent_ack_whose_reply_names_the_home_channel_finds_it_at_once` (pins 10) and
+    //   `reply_home_channel_that_the_radio_refuses_ends_the_scan_not_found`.
+
+    #[test]
+    fn adjacent_ack_without_a_decodable_reply_is_outrun_by_the_reply_on_the_home_channel() {
+        // Channel 10 decodes and ACKs the probe, but the reply is only heard on 11.
+        let peer = Peer {
+            acks_also_on: alloc::vec![10],
+            ..Peer::on(11)
+        };
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
+        assert_eq!(r.result, Ok(ScanResult { channel: 11 }));
+        assert_eq!(r.pinned, Some(11));
+        assert_eq!(
+            r.channels_set(),
+            (1..=11).collect::<Vec<u8>>(),
+            "the candidate on 10 is never revisited"
+        );
+        assert_eq!(r.probe_log[r.probe_log.len() - 2..], [(10, 0), (11, 0)]);
+        assert_eq!(
+            r.actions
+                .iter()
+                .filter(|(_, s)| matches!(s, Seen::AwaitReply(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn adjacent_ack_whose_reply_names_the_home_channel_finds_it_at_once() {
+        let peer = Peer {
+            acks_also_on: alloc::vec![10],
+            decodes_reply_on: alloc::vec![10],
+            ..Peer::on(11)
+        };
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
+        assert_eq!(r.result, Ok(ScanResult { channel: 11 }));
+        assert_eq!(r.pinned, Some(11));
+        assert_eq!(r.probes(), 10, "no probe on 11: the reply named it");
+        let seen = r.seen();
+        assert_eq!(
+            seen[seen.len() - 4..],
+            [
+                Seen::SetChannel(11),
+                Seen::Restore,
+                Seen::Remove,
+                Seen::Register(11)
+            ],
+            "the radio is moved to the stated home channel before the teardown"
+        );
+    }
+
+    #[test]
+    fn legacy_ack_only_peer_is_found_through_the_candidate_and_confirmation_path() {
+        let r = run(
+            machine(ScanConfig::for_peer(), None),
+            &Peer::legacy(6),
+            D::ZERO,
+        );
+        assert_eq!(r.result, Ok(ScanResult { channel: 6 }));
+        assert_eq!(r.pinned, Some(6));
+        // The whole list first, then back to the candidate.
+        assert_eq!(r.channels_set(), (1..=13).chain([6]).collect::<Vec<u8>>());
+        assert_eq!(r.probe_log[r.probe_log.len() - 2..], [(6, 0), (6, 1)]);
+        assert_eq!(
+            r.probes(),
+            15,
+            "13 sweep probes, one candidate probe, one confirmation"
+        );
+        assert_eq!(
+            r.seen()
+                .iter()
+                .filter(|s| matches!(s, Seen::Wait(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_reply_during_the_candidate_phase_also_wins() {
+        let cfg = ScanConfig::for_peer().with_channels(&[6]);
+        let mut m = machine(cfg, None);
+        let t = D::from_secs(5);
+        m.poll(t, ScanInput::Start);
+        m.poll(t, ScanInput::Completed);
+        m.poll(t, ScanInput::Completed);
+        assert_eq!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::SetChannel { channel: 6 }
+        );
+        assert!(matches!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::SendProbe { .. }
+        ));
+        assert!(matches!(
+            m.poll(t, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::AwaitReply { .. }
+        ));
+        // No reply in the sweep: the list is over, back to the candidate.
+        assert_eq!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::SetChannel { channel: 6 }
+        );
+        assert!(matches!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::SendProbe {
+                channel: 6,
+                confirmation: 0,
+                ..
+            }
+        ));
+        let probe = ProbeFrame::parse(&m.probe_frame(6)).unwrap();
+        assert!(matches!(
+            m.poll(t, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::AwaitReply { .. }
+        ));
+        // The reply arrives this time: found without the confirmation probe.
+        assert_eq!(
+            m.poll(t, ScanInput::Reply(ProbeReply::answering(&probe, 6))),
+            ScanAction::RestoreTxPower
+        );
+        assert_eq!(m.poll(t, ScanInput::Completed), ScanAction::RemovePeer);
+        assert_eq!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::RegisterPeer { channel: 6 }
+        );
+        assert_eq!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::Done(Ok(ScanResult { channel: 6 }))
+        );
+    }
+
+    #[test]
+    fn stale_or_foreign_replies_are_ignored_and_the_wait_continues() {
+        let cfg = ScanConfig::for_peer().with_channels(&[6]);
+        let mut m = machine(cfg, None);
+        let t = D::from_secs(5);
+        m.poll(t, ScanInput::Start);
+        m.poll(t, ScanInput::Completed);
+        m.poll(t, ScanInput::Completed);
+        m.poll(t, ScanInput::Completed);
+        assert!(matches!(
+            m.poll(t, ScanInput::Completed),
+            ScanAction::SendProbe { channel: 6, .. }
+        ));
+        let probe = ProbeFrame::parse(&m.probe_frame(6)).unwrap();
+        let until = t + D::from_millis(50);
+        assert_eq!(
+            m.poll(t, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::AwaitReply { until }
+        );
+        let stale = ProbeReply {
+            seq: probe.seq.wrapping_add(1),
+            ..ProbeReply::answering(&probe, 11)
+        };
+        let foreign = ProbeReply {
+            tx_channel: 7,
+            ..ProbeReply::answering(&probe, 11)
+        };
+        let out_of_range = ProbeReply::answering(&probe, 0);
+        for reply in [stale, foreign, out_of_range] {
+            assert_eq!(
+                m.poll(t + D::from_millis(10), ScanInput::Reply(reply)),
+                ScanAction::AwaitReply { until },
+                "{reply:?} must not end the wait"
+            );
+        }
+        // The deadline passes: the channel is the candidate and the list is over.
+        assert_eq!(
+            m.poll(until, ScanInput::Completed),
+            ScanAction::SetChannel { channel: 6 }
+        );
+        assert_eq!(m.pinned_channel(), None);
+    }
+
+    #[test]
+    fn ignored_replies_do_not_consume_the_poll_budget() {
+        let cfg = ScanConfig::for_peer().with_channels(&[6]);
+        let mut m = machine(cfg, None);
+        let t = D::ZERO;
+        let mut action = m.poll_bounded(t, ScanInput::Start).unwrap();
+        while !matches!(action, ScanAction::SendProbe { .. }) {
+            action = m.poll_bounded(t, ScanInput::Completed).unwrap();
+        }
+        let probe = ProbeFrame::parse(&m.probe_frame(6)).unwrap();
+        m.poll_bounded(t, ScanInput::Sent(SendOutcome::Acked))
+            .unwrap();
+        let polls = m.polls;
+        let stale = ProbeReply {
+            seq: probe.seq.wrapping_add(1),
+            ..ProbeReply::answering(&probe, 6)
+        };
+        for _ in 0..(m.max_polls() * 2) {
+            assert!(matches!(
+                m.poll_bounded(t, ScanInput::Reply(stale)).unwrap(),
+                ScanAction::AwaitReply { .. }
+            ));
+        }
+        assert_eq!(m.polls, polls, "ignored replies are not counted");
+        // A matching reply is counted and finishes the scan.
+        assert_eq!(
+            m.poll_bounded(t, ScanInput::Reply(ProbeReply::answering(&probe, 6)))
+                .unwrap(),
+            ScanAction::RestoreTxPower
+        );
+        assert_eq!(m.polls, polls + 1);
+    }
+
+    #[test]
+    fn reply_home_channel_that_the_radio_refuses_ends_the_scan_not_found() {
+        let peer = Peer {
+            acks_also_on: alloc::vec![10],
+            decodes_reply_on: alloc::vec![10],
+            refuse: alloc::vec![11],
+            ..Peer::on(11)
+        };
+        let r = run(machine(ScanConfig::for_peer(), Some(3)), &peer, D::ZERO);
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 10,
+                configured: 13,
+                first_fault: Some(ScanFault::SetChannel { channel: 11 })
+            })
+        );
+        assert_eq!(r.pinned, Some(3));
+        let seen = r.seen();
+        assert_eq!(
+            seen[seen.len() - 2..],
+            [Seen::RestoreChannel(3), Seen::RegisterFallback(3)]
+        );
+    }
+
+    #[test]
+    fn burst_budget_ending_with_a_candidate_still_runs_the_candidate_phase() {
+        let cfg = ScanConfig::for_peer().with_burst_timeout(D::from_millis(1));
+        let r = run(machine(cfg, None), &Peer::legacy(1), D::ZERO);
+        assert_eq!(r.result, Ok(ScanResult { channel: 1 }));
+        assert_eq!(r.channels_set(), [1, 1], "the sweep ends after one channel");
+        assert_eq!(r.probe_log, [(1, 0), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn probe_frames_carry_an_increasing_sequence_and_the_probed_channel() {
+        let r = run(
+            machine(ScanConfig::for_peer(), None),
+            &Peer::legacy(6),
+            D::ZERO,
+        );
+        let seqs: Vec<u8> = r.frames.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs, (1..=15).collect::<Vec<u8>>());
+        let channels: Vec<u8> = r.frames.iter().map(|f| f.tx_channel).collect();
+        assert_eq!(channels, (1..=13).chain([6, 6]).collect::<Vec<u8>>());
+        assert!(r
+            .frames
+            .iter()
+            .all(|f| f.encode()[0] == super::super::TAG_PROBE));
+    }
+
+    #[test]
+    fn a_scan_seeded_with_the_previous_sequence_continues_it() {
+        let first = run(
+            machine(ScanConfig::for_peer().with_channels(&[6]), None),
+            &Peer::legacy(6),
+            D::ZERO,
+        );
+        let last_seq = first.frames.last().map(|f| f.seq);
+        assert_eq!(
+            last_seq,
+            Some(3),
+            "sweep probe, candidate probe, one confirmation"
+        );
+        let second = run(
+            machine(ScanConfig::for_peer().with_channels(&[6]), None).with_first_seq(3),
+            &Peer::legacy(6),
+            D::ZERO,
+        );
+        let seqs: Vec<u8> = second.frames.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs, [4, 5, 6]);
+        // Mutation check: a stale reply to the previous scan's first probe no longer matches.
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[6]), None).with_first_seq(3);
+        assert_eq!(m.seq(), 3);
+        m.poll(D::ZERO, ScanInput::Start);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        let ScanAction::AwaitReply { until } = m.poll(D::ZERO, ScanInput::Sent(SendOutcome::Acked))
+        else {
+            panic!("expected the reply wait");
+        };
+        assert_eq!(m.seq(), 4);
+        let stale = ProbeReply {
+            seq: 1,
+            tx_channel: 6,
+            home_channel: 11,
+        };
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Reply(stale)),
+            ScanAction::AwaitReply { until }
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn probe_data_returns_the_last_encoded_frame() {
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[6]), None);
+        assert_eq!(m.probe_data(), &[super::super::TAG_PROBE, 0, 0]);
+        m.poll(D::ZERO, ScanInput::Start);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        m.poll(D::ZERO, ScanInput::Completed);
+        assert!(matches!(
+            m.poll(D::ZERO, ScanInput::Completed),
+            ScanAction::SendProbe { .. }
+        ));
+        assert_eq!(m.probe_data(), &m.probe_frame(6));
+        assert_eq!(m.probe_data(), &[super::super::TAG_PROBE, 1, 6]);
     }
 
     #[test]
     fn found_on_channel_11() {
-        let r = run(machine(ScanConfig::new(b"p"), None), &Peer::on(11), D::ZERO);
+        let r = run(
+            machine(ScanConfig::for_peer(), None),
+            &Peer::on(11),
+            D::ZERO,
+        );
         assert_eq!(r.result, Ok(ScanResult { channel: 11 }));
         assert_eq!(r.channels_set(), (1..=11).collect::<Vec<u8>>());
     }
 
     #[test]
     fn found_on_last_default_channel_13() {
-        let r = run(machine(ScanConfig::new(b"p"), None), &Peer::on(13), D::ZERO);
+        let r = run(
+            machine(ScanConfig::for_peer(), None),
+            &Peer::on(13),
+            D::ZERO,
+        );
         assert_eq!(r.result, Ok(ScanResult { channel: 13 }));
     }
 
@@ -1148,7 +1769,7 @@ mod tests {
     #[test]
     fn not_found_without_previous_pin_leaves_peer_removed() {
         let r = run(
-            machine(ScanConfig::new(b"p"), None),
+            machine(ScanConfig::for_peer(), None),
             &Peer::absent(),
             D::ZERO,
         );
@@ -1177,7 +1798,7 @@ mod tests {
     #[test]
     fn not_found_with_previous_pin_restores_channel_then_fallback_peer() {
         let r = run(
-            machine(ScanConfig::new(b"p"), Some(9)),
+            machine(ScanConfig::for_peer(), Some(9)),
             &Peer::absent(),
             D::ZERO,
         );
@@ -1197,9 +1818,9 @@ mod tests {
 
     #[test]
     fn failed_rescan_after_success_restores_the_discovered_channel() {
-        let first = run(machine(ScanConfig::new(b"p"), None), &Peer::on(6), D::ZERO);
+        let first = run(machine(ScanConfig::for_peer(), None), &Peer::on(6), D::ZERO);
         let second = run(
-            machine(ScanConfig::new(b"p"), first.pinned),
+            machine(ScanConfig::for_peer(), first.pinned),
             &Peer::absent(),
             D::ZERO,
         );
@@ -1219,7 +1840,7 @@ mod tests {
             refuse: alloc::vec![9],
             ..Peer::absent()
         };
-        let r = run(machine(ScanConfig::new(b"p"), Some(9)), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), Some(9)), &peer, D::ZERO);
         assert!(matches!(
             r.result,
             Err(ScanError::NotFound {
@@ -1239,27 +1860,34 @@ mod tests {
     // ── confirmation ──────────────────────────────────────────────────────
 
     #[test]
-    fn zero_confirmations_first_ack_wins() {
-        let cfg = ScanConfig::new(b"p").with_probe_confirmations(0);
-        let r = run(machine(cfg, None), &Peer::on(3), D::ZERO);
+    fn zero_confirmations_settle_the_legacy_candidate_without_a_confirmation_probe() {
+        // Adjusted for the probe reply: an ACK-only hit is settled after the sweep (bug 018).
+        let cfg = ScanConfig::for_peer().with_probe_confirmations(0);
+        let r = run(machine(cfg, None), &Peer::legacy(3), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 3 }));
         assert_eq!(
             r.probes(),
-            3,
-            "two misses and one hit, no confirmation probe"
+            14,
+            "13 sweep probes and one candidate probe, no confirmation probe"
         );
+        assert_eq!(r.channels_set(), (1..=13).chain([3]).collect::<Vec<u8>>());
         assert!(!r.seen().iter().any(|s| matches!(s, Seen::Wait(_))));
     }
 
     #[test]
     fn confirmation_requires_every_extra_probe_and_waits_the_gap_each_time() {
+        // Adjusted for the probe reply: confirmations run in the candidate phase of a legacy peer.
         let gap = D::from_millis(200);
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_probe_confirmations(3)
             .with_confirmation_gap(gap);
-        let r = run(machine(cfg, None), &Peer::on(1), D::ZERO);
+        let r = run(machine(cfg, None), &Peer::legacy(1), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 1 }));
-        assert_eq!(r.probes(), 4, "first probe plus three confirmations");
+        assert_eq!(
+            r.probes(),
+            17,
+            "13 sweep probes, the candidate probe and three confirmations"
+        );
         let waits: Vec<_> = r
             .actions
             .iter()
@@ -1269,25 +1897,30 @@ mod tests {
             })
             .collect();
         assert_eq!(waits, [gap, gap, gap]);
-        // Gaps separate the probes: each probe starts one gap after the previous ACK.
+        // Gaps separate the candidate probes: each starts one reply wait plus one gap after
+        // the previous ACK.
         let probe_times: Vec<D> = r
             .actions
             .iter()
             .filter(|(_, s)| matches!(s, Seen::Probe(_)))
             .map(|(t, _)| *t)
             .collect();
-        for w in probe_times.windows(2) {
-            assert_eq!(w[1] - w[0], D::from_millis(5) + gap);
+        for w in probe_times[probe_times.len() - 4..].windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                D::from_millis(5) + super::super::DEFAULT_REPLY_TIMEOUT + gap
+            );
         }
     }
 
     #[test]
     fn roaming_peer_that_acks_once_is_rejected_and_scan_moves_on() {
+        // Adjusted for the probe reply: the single ACK is re-probed as the candidate.
         let peer = Peer {
             acks_before_silence: Some(1),
-            ..Peer::on(6)
+            ..Peer::legacy(6)
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
         assert_eq!(
             r.result,
             Err(ScanError::NotFound {
@@ -1295,48 +1928,85 @@ mod tests {
                 configured: 13,
                 first_fault: None
             }),
-            "the confirmation probe is not counted as a probed channel"
+            "the candidate probe is not counted as a probed channel"
         );
-        assert_eq!(r.channels_set(), (1..=13).collect::<Vec<u8>>());
+        assert_eq!(r.channels_set(), (1..=13).chain([6]).collect::<Vec<u8>>());
         assert_eq!(r.pinned, None);
     }
 
     #[test]
     fn probe_actions_carry_channel_and_confirmation_index() {
-        let cfg = ScanConfig::new(b"p").with_probe_confirmations(2);
-        let r = run(machine(cfg, None), &Peer::on(2), D::ZERO);
-        assert_eq!(r.probe_log, [(1, 0), (2, 0), (2, 1), (2, 2)]);
+        // Adjusted for the probe reply: the confirmations follow the sweep.
+        let cfg = ScanConfig::for_peer().with_probe_confirmations(2);
+        let r = run(machine(cfg, None), &Peer::legacy(2), D::ZERO);
+        let expected: Vec<(u8, u8)> = (1..=13)
+            .map(|c| (c, 0))
+            .chain([(2, 0), (2, 1), (2, 2)])
+            .collect();
+        assert_eq!(r.probe_log, expected);
     }
 
     #[test]
     fn peer_unconfirmed_on_one_channel_is_found_on_a_later_one() {
+        // Adjusted for the probe reply: the transit ACK on 3 becomes the candidate and the
+        // reply on 8 wins before it is settled.
         let peer = Peer {
             roams_to: Some(8),
             ..Peer::on(3)
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 8 }));
         assert_eq!(r.channels_set(), (1..=8).collect::<Vec<u8>>());
         assert_eq!(r.pinned, Some(8));
-        // Channel 3: ACK, then the unconfirmed confirmation; channel 8: both ACK.
-        assert!(r.probe_log.contains(&(3, 1)));
-        assert_eq!(r.probe_log[r.probe_log.len() - 2..], [(8, 0), (8, 1)]);
+        assert_eq!(r.probe_log[r.probe_log.len() - 2..], [(7, 0), (8, 0)]);
         assert_eq!(r.seen().last(), Some(&Seen::Register(8)));
     }
 
     #[test]
-    fn confirmation_send_error_rejects_the_channel() {
+    fn legacy_peer_that_roamed_after_its_first_ack_is_not_found_this_scan() {
+        // The first ACK-only hit is the only candidate; the later home is left to a rescan.
         let peer = Peer {
-            fail_send: Some(1),
-            ..Peer::on(1)
+            roams_to: Some(8),
+            ..Peer::legacy(3)
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
-        assert!(matches!(r.result, Err(ScanError::NotFound { .. })));
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 13,
+                configured: 13,
+                first_fault: None
+            })
+        );
+        assert_eq!(r.channels_set(), (1..=13).chain([3]).collect::<Vec<u8>>());
+        assert_eq!(r.pinned, None);
     }
 
     #[test]
-    fn confirmation_gap_is_added_to_the_ack_time_not_the_epoch() {
-        let cfg = ScanConfig::new(b"p").with_confirmation_gap(D::from_millis(150));
+    fn confirmation_send_error_rejects_the_channel() {
+        // Adjusted for the probe reply: probe 0 is the sweep, 1 the candidate, 2 its confirmation.
+        let peer = Peer {
+            fail_send: Some(2),
+            ..Peer::legacy(1)
+        };
+        let cfg = ScanConfig::for_peer().with_channels(&[1]);
+        let r = run(machine(cfg, None), &peer, D::ZERO);
+        assert_eq!(
+            r.result,
+            Err(ScanError::NotFound {
+                probed: 1,
+                configured: 1,
+                first_fault: Some(ScanFault::ProbeSend { channel: 1 })
+            })
+        );
+    }
+
+    #[test]
+    fn reply_wait_and_confirmation_gap_are_added_to_the_event_time_not_the_epoch() {
+        // Adjusted for the probe reply: the gap follows the reply wait of a candidate ACK.
+        let cfg = ScanConfig::for_peer()
+            .with_channels(&[1])
+            .with_confirmation_gap(D::from_millis(150));
         let mut m = machine(cfg, None);
         let t0 = D::from_secs(42);
         assert_eq!(m.poll(t0, ScanInput::Start), ScanAction::RemovePeer);
@@ -1356,13 +2026,37 @@ mod tests {
         let ack_at = t0 + D::from_millis(7);
         assert_eq!(
             m.poll(ack_at, ScanInput::Sent(SendOutcome::Acked)),
-            ScanAction::WaitUntil(ack_at + D::from_millis(150))
+            ScanAction::AwaitReply {
+                until: ack_at + D::from_millis(50)
+            }
+        );
+        let timed_out = ack_at + D::from_millis(61);
+        assert_eq!(
+            m.poll(timed_out, ScanInput::Completed),
+            ScanAction::SetChannel { channel: 1 },
+            "list over: back to the candidate"
+        );
+        assert!(matches!(
+            m.poll(timed_out, ScanInput::Completed),
+            ScanAction::SendProbe { .. }
+        ));
+        let ack2_at = timed_out + D::from_millis(9);
+        assert_eq!(
+            m.poll(ack2_at, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::AwaitReply {
+                until: ack2_at + D::from_millis(50)
+            }
+        );
+        let timed_out2 = ack2_at + D::from_millis(50);
+        assert_eq!(
+            m.poll(timed_out2, ScanInput::Completed),
+            ScanAction::WaitUntil(timed_out2 + D::from_millis(150))
         );
     }
 
     #[test]
     fn huge_clock_values_saturate_instead_of_overflowing() {
-        let cfg = ScanConfig::new(b"p");
+        let cfg = ScanConfig::for_peer();
         let mut m = machine(cfg, None);
         let now = D::MAX;
         m.poll(now, ScanInput::Start);
@@ -1372,7 +2066,7 @@ mod tests {
         m.poll(now, ScanInput::Completed);
         assert_eq!(
             m.poll(now, ScanInput::Sent(SendOutcome::Acked)),
-            ScanAction::WaitUntil(D::MAX)
+            ScanAction::AwaitReply { until: D::MAX }
         );
     }
 
@@ -1380,7 +2074,7 @@ mod tests {
 
     #[test]
     fn burst_timeout_stops_before_the_next_channel() {
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_probe_timeout(D::from_millis(100))
             .with_burst_timeout(D::from_millis(250));
         let r = run(machine(cfg, None), &Peer::absent(), D::ZERO);
@@ -1399,7 +2093,7 @@ mod tests {
 
     #[test]
     fn burst_timeout_boundary_is_inclusive() {
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_probe_timeout(D::from_millis(100))
             .with_burst_timeout(D::from_millis(200));
         let r = run(machine(cfg, None), &Peer::absent(), D::ZERO);
@@ -1408,7 +2102,7 @@ mod tests {
 
     #[test]
     fn zero_burst_timeout_probes_nothing() {
-        let cfg = ScanConfig::new(b"p").with_burst_timeout(D::ZERO);
+        let cfg = ScanConfig::for_peer().with_burst_timeout(D::ZERO);
         let r = run(machine(cfg, None), &Peer::on(1), D::ZERO);
         assert_eq!(
             r.result,
@@ -1424,7 +2118,7 @@ mod tests {
 
     #[test]
     fn burst_budget_does_not_interrupt_confirmation_of_a_channel() {
-        let cfg = ScanConfig::new(b"p").with_burst_timeout(D::from_millis(1));
+        let cfg = ScanConfig::for_peer().with_burst_timeout(D::from_millis(1));
         let r = run(machine(cfg, None), &Peer::on(1), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 1 }));
     }
@@ -1432,7 +2126,7 @@ mod tests {
     #[test]
     fn burst_clock_starts_after_registration_and_boost() {
         // Slow driver operations before the loop must not eat into the burst budget.
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_probe_timeout(D::from_millis(100))
             .with_burst_timeout(D::from_millis(150));
         let r = run(machine(cfg, None), &Peer::absent(), D::from_millis(40));
@@ -1444,7 +2138,7 @@ mod tests {
     #[test]
     fn custom_channel_list_is_probed_in_order() {
         let list = [11, 1, 6];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let r = run(machine(cfg, None), &Peer::on(6), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 6 }));
         assert_eq!(r.channels_set(), [11, 1, 6]);
@@ -1453,7 +2147,7 @@ mod tests {
     #[test]
     fn peer_outside_custom_list_is_not_found() {
         let list = [1, 6, 11];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let r = run(machine(cfg, None), &Peer::on(5), D::ZERO);
         assert_eq!(
             r.result,
@@ -1467,7 +2161,7 @@ mod tests {
 
     #[test]
     fn empty_channel_list_is_not_found_without_probing() {
-        let cfg = ScanConfig::new(b"p").with_channels(&[]);
+        let cfg = ScanConfig::for_peer().with_channels(&[]);
         let r = run(machine(cfg, None), &Peer::on(1), D::ZERO);
         assert_eq!(
             r.result,
@@ -1488,16 +2182,17 @@ mod tests {
             refuse: alloc::vec![1, 2],
             ..Peer::on(3)
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 3 }));
         assert_eq!(r.channels_set(), [1, 2, 3]);
-        assert_eq!(r.probes(), 2, "no probe on the refused channels");
+        // Adjusted for the probe reply: one probe, the reply replaces the confirmation.
+        assert_eq!(r.probes(), 1, "no probe on the refused channels");
 
         let peer = Peer {
             refuse: alloc::vec![12, 13],
             ..Peer::absent()
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
         assert_eq!(
             r.result,
             Err(ScanError::NotFound {
@@ -1515,7 +2210,7 @@ mod tests {
             fail_send: Some(0),
             ..Peer::absent()
         };
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let r = run(machine(cfg, None), &peer, D::ZERO);
         assert_eq!(
             r.result,
@@ -1536,7 +2231,7 @@ mod tests {
             fail_register: Some(0),
             ..Peer::on(1)
         };
-        let r = run(machine(ScanConfig::new(b"p"), Some(4)), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), Some(4)), &peer, D::ZERO);
         assert_eq!(r.result, Err(ScanError::RegisterTempPeer));
         assert_eq!(
             r.seen(),
@@ -1556,7 +2251,7 @@ mod tests {
             fail_register: Some(0),
             ..Peer::on(1)
         };
-        let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
         assert_eq!(r.result, Err(ScanError::RegisterTempPeer));
         assert_eq!(r.seen(), [Seen::Remove, Seen::Register(0)]);
         assert_eq!(r.pinned, None);
@@ -1569,7 +2264,7 @@ mod tests {
             refuse: alloc::vec![4],
             ..Peer::on(1)
         };
-        let r = run(machine(ScanConfig::new(b"p"), Some(4)), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), Some(4)), &peer, D::ZERO);
         assert_eq!(r.result, Err(ScanError::RegisterTempPeer));
         assert_eq!(
             r.seen(),
@@ -1588,7 +2283,7 @@ mod tests {
             fail_register: Some(1),
             ..Peer::on(6)
         };
-        let r = run(machine(ScanConfig::new(b"p"), Some(2)), &peer, D::ZERO);
+        let r = run(machine(ScanConfig::for_peer(), Some(2)), &peer, D::ZERO);
         assert_eq!(r.result, Err(ScanError::RegisterFoundPeer { channel: 6 }));
         let seen = r.seen();
         assert_eq!(
@@ -1607,7 +2302,7 @@ mod tests {
     #[test]
     fn stale_peer_removal_result_is_irrelevant() {
         for input in [ScanInput::Completed, ScanInput::Failed] {
-            let mut m = machine(ScanConfig::new(b"p"), None);
+            let mut m = machine(ScanConfig::for_peer(), None);
             assert_eq!(m.poll(D::ZERO, ScanInput::Start), ScanAction::RemovePeer);
             assert_eq!(
                 m.poll(D::ZERO, input),
@@ -1621,7 +2316,7 @@ mod tests {
     #[test]
     fn tx_power_is_boosted_for_the_burst_and_restored_on_every_outcome() {
         for peer in [Peer::on(2), Peer::absent()] {
-            let r = run(machine(ScanConfig::new(b"p"), None), &peer, D::ZERO);
+            let r = run(machine(ScanConfig::for_peer(), None), &peer, D::ZERO);
             let seen = r.seen();
             let boost = seen.iter().position(|s| *s == Seen::Boost).unwrap();
             let restore = seen.iter().position(|s| *s == Seen::Restore).unwrap();
@@ -1643,7 +2338,7 @@ mod tests {
 
     #[test]
     fn tx_power_failures_are_ignored() {
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[1]), None);
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[1]), None);
         m.poll(D::ZERO, ScanInput::Start);
         m.poll(D::ZERO, ScanInput::Completed);
         assert_eq!(
@@ -1685,7 +2380,7 @@ mod tests {
 
     #[test]
     fn burst_expired_is_set_only_when_channels_were_left_unprobed() {
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_probe_timeout(D::from_millis(100))
             .with_burst_timeout(D::from_millis(250));
         let mut m = machine(cfg, None);
@@ -1695,7 +2390,7 @@ mod tests {
         assert!(m.burst_expired());
         assert_eq!(m.probed(), 3);
 
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[1]), None);
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[1]), None);
         drive_to_done(&mut m, D::ZERO);
         assert!(!m.burst_expired(), "list exhausted, not the budget");
     }
@@ -1720,7 +2415,7 @@ mod tests {
 
     #[test]
     fn abort_during_boost_unwinds_through_teardown_and_fallback() {
-        let mut m = machine(ScanConfig::new(b"p"), Some(9));
+        let mut m = machine(ScanConfig::for_peer(), Some(9));
         assert_eq!(m.poll(D::ZERO, ScanInput::Start), ScanAction::RemovePeer);
         m.poll(D::ZERO, ScanInput::Completed);
         assert_eq!(
@@ -1752,7 +2447,7 @@ mod tests {
 
     #[test]
     fn abort_without_pin_ends_after_peer_removal() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         m.poll(D::ZERO, ScanInput::Start);
         m.poll(D::ZERO, ScanInput::Completed);
         m.poll(D::ZERO, ScanInput::Completed);
@@ -1789,7 +2484,7 @@ mod tests {
 
     #[test]
     fn abort_during_the_register_temp_peer_fallback_still_registers_the_fallback_peer() {
-        let mut m = machine(ScanConfig::new(b"p"), Some(9));
+        let mut m = machine(ScanConfig::for_peer(), Some(9));
         m.poll(D::ZERO, ScanInput::Start);
         m.poll(D::ZERO, ScanInput::Completed);
         assert_eq!(
@@ -1809,7 +2504,7 @@ mod tests {
     #[test]
     fn abort_in_every_teardown_state_continues_the_teardown() {
         // Pinned, aborted while boosting: every later step is fed `Abort`.
-        let seen = actions_after_abort(machine(ScanConfig::new(b"p"), Some(9)), 2);
+        let seen = actions_after_abort(machine(ScanConfig::for_peer(), Some(9)), 2);
         assert_eq!(
             seen,
             [
@@ -1822,7 +2517,7 @@ mod tests {
             ]
         );
         // Unpinned: no channel to restore.
-        let seen = actions_after_abort(machine(ScanConfig::new(b"p"), None), 2);
+        let seen = actions_after_abort(machine(ScanConfig::for_peer(), None), 2);
         assert_eq!(
             seen,
             [
@@ -1842,7 +2537,7 @@ mod tests {
                 action = m.poll_bounded(D::ZERO, ScanInput::Completed).unwrap();
             }
         };
-        let mut before = machine(ScanConfig::new(b"p"), None);
+        let mut before = machine(ScanConfig::for_peer(), None);
         drive_to_probe(&mut before);
         before.polls = before.max_polls() - 1;
         assert_eq!(
@@ -1850,7 +2545,7 @@ mod tests {
             Ok(ScanAction::SetChannel { channel: 2 })
         );
 
-        let mut at = machine(ScanConfig::new(b"p"), None);
+        let mut at = machine(ScanConfig::for_peer(), None);
         drive_to_probe(&mut at);
         at.polls = at.max_polls();
         assert_eq!(
@@ -1861,7 +2556,7 @@ mod tests {
 
     #[test]
     fn poll_bounded_gives_up_after_the_teardown_budget() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         let allowed = m.max_polls() + ScanTeardown::MAX_POLLS;
         let mut ok = 0;
         let mut result = Ok(ScanAction::Ignored);
@@ -1878,7 +2573,7 @@ mod tests {
 
     #[test]
     fn poll_bounded_leaves_a_valid_scan_alone() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         let mut input = ScanInput::Start;
         let mut polls = 0;
         loop {
@@ -1897,7 +2592,7 @@ mod tests {
 
     #[test]
     fn abort_after_the_peer_was_found_keeps_the_new_pin() {
-        let mut config = ScanConfig::new(b"p");
+        let mut config = ScanConfig::for_peer();
         config.probe_confirmations = 0;
         let mut m = machine(config, Some(9));
         m.poll(D::ZERO, ScanInput::Start);
@@ -1908,8 +2603,14 @@ mod tests {
             ScanAction::SetChannel { channel: 1 }
         );
         m.poll(D::ZERO, ScanInput::Completed);
-        assert_eq!(
+        // Adjusted for the probe reply: the ACK alone no longer finishes, the reply does.
+        let probe = ProbeFrame::parse(&m.probe_frame(1)).unwrap();
+        assert!(matches!(
             m.poll(D::ZERO, ScanInput::Sent(SendOutcome::Acked)),
+            ScanAction::AwaitReply { .. }
+        ));
+        assert_eq!(
+            m.poll(D::ZERO, ScanInput::Reply(ProbeReply::answering(&probe, 1))),
             ScanAction::RestoreTxPower
         );
         assert_eq!(m.poll(D::ZERO, ScanInput::Abort), ScanAction::RemovePeer);
@@ -1938,7 +2639,7 @@ mod tests {
 
     #[test]
     fn abort_before_start_finishes_immediately() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         assert_eq!(
             m.poll(D::ZERO, ScanInput::Abort),
             ScanAction::Done(Err(ScanError::Aborted))
@@ -1947,7 +2648,7 @@ mod tests {
 
     #[test]
     fn unexpected_input_mid_scan_unwinds_through_teardown() {
-        let mut m = machine(ScanConfig::new(b"p"), Some(4));
+        let mut m = machine(ScanConfig::for_peer(), Some(4));
         m.poll(D::ZERO, ScanInput::Start);
         // RemovePeer was issued; a send outcome makes no sense.
         assert_eq!(
@@ -1971,7 +2672,7 @@ mod tests {
 
     #[test]
     fn unexpected_input_inside_teardown_finishes_immediately() {
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[]), None);
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[]), None);
         m.poll(D::ZERO, ScanInput::Start);
         m.poll(D::ZERO, ScanInput::Completed);
         m.poll(D::ZERO, ScanInput::Completed);
@@ -2052,7 +2753,7 @@ mod tests {
             for home in [None, Some(6)] {
                 for at in 0..20 {
                     for disturbance in disturbances {
-                        let cfg = ScanConfig::new(b"p").with_channels(&list);
+                        let cfg = ScanConfig::for_peer().with_channels(&list);
                         let seen = disturbed(cfg, pin, home, at, disturbance);
                         let case = (pin, home, at, disturbance);
                         assert!(matches!(seen.last(), Some(ScanAction::Done(_))), "{case:?}");
@@ -2086,7 +2787,7 @@ mod tests {
         let list = [1, 6];
         for pin in [None, Some(9)] {
             for home in [None, Some(6)] {
-                let cfg = ScanConfig::new(b"p").with_channels(&list);
+                let cfg = ScanConfig::for_peer().with_channels(&list);
                 let undisturbed = disturbed(cfg, pin, home, usize::MAX, ScanInput::Start);
                 for at in 0..undisturbed.len() {
                     let seen = disturbed(cfg, pin, home, at, ScanInput::Shutdown);
@@ -2106,7 +2807,7 @@ mod tests {
 
     #[test]
     fn shutdown_after_done_is_ignored() {
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[1]), None);
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[1]), None);
         let result = drive_with(&mut m, |a| {
             matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::NoAck))
         });
@@ -2118,7 +2819,7 @@ mod tests {
 
     #[test]
     fn shutdown_before_start_finishes_and_keeps_the_pin() {
-        let mut m = machine(ScanConfig::new(b"p"), Some(4));
+        let mut m = machine(ScanConfig::for_peer(), Some(4));
         assert_eq!(
             m.poll(D::ZERO, ScanInput::Shutdown),
             ScanAction::Done(Err(ScanError::Aborted))
@@ -2131,11 +2832,11 @@ mod tests {
     fn every_scripted_scan_finishes_within_max_polls() {
         let list = [11, 1, 6];
         let configs = [
-            ScanConfig::new(b"p"),
-            ScanConfig::new(b"p").with_channels(&list),
-            ScanConfig::new(b"p").with_probe_confirmations(0),
-            ScanConfig::new(b"p").with_probe_confirmations(3),
-            ScanConfig::new(b"p")
+            ScanConfig::for_peer(),
+            ScanConfig::for_peer().with_channels(&list),
+            ScanConfig::for_peer().with_probe_confirmations(0),
+            ScanConfig::for_peer().with_probe_confirmations(3),
+            ScanConfig::for_peer()
                 .with_channels(&list)
                 .with_probe_confirmations(2),
         ];
@@ -2145,10 +2846,17 @@ mod tests {
                 Peer::on(1),
                 Peer::on(6),
                 Peer::on(13),
+                Peer::legacy(1),
+                Peer::legacy(6),
+                Peer::legacy(13),
                 // The found peer's registration fails: the longest teardown.
                 Peer {
                     fail_register: Some(1),
                     ..Peer::on(13)
+                },
+                Peer {
+                    fail_register: Some(1),
+                    ..Peer::legacy(13)
                 },
                 Peer {
                     fail_register: Some(1),
@@ -2161,6 +2869,35 @@ mod tests {
                 Peer {
                     roams_to: Some(6),
                     ..Peer::on(1)
+                },
+                Peer {
+                    roams_to: Some(6),
+                    ..Peer::legacy(1)
+                },
+                // Adjacent-channel ACKs (bug 018), with and without a decodable reply.
+                Peer {
+                    acks_also_on: alloc::vec![10, 12],
+                    ..Peer::on(11)
+                },
+                Peer {
+                    acks_also_on: alloc::vec![10, 12],
+                    decodes_reply_on: alloc::vec![10],
+                    ..Peer::on(11)
+                },
+                Peer {
+                    acks_also_on: alloc::vec![10, 12],
+                    decodes_reply_on: alloc::vec![10],
+                    fail_register: Some(1),
+                    ..Peer::on(11)
+                },
+                Peer {
+                    acks_also_on: alloc::vec![10, 12],
+                    ..Peer::legacy(11)
+                },
+                Peer {
+                    acks_also_on: alloc::vec![12, 13],
+                    decodes_reply_on: alloc::vec![13],
+                    ..Peer::on(11)
                 },
             ]
         };
@@ -2201,7 +2938,7 @@ mod tests {
         for pin in [None, Some(9)] {
             for home in [None, Some(6)] {
                 for steps in 0..20 {
-                    let cfg = ScanConfig::new(b"p").with_channels(&list);
+                    let cfg = ScanConfig::for_peer().with_channels(&list);
                     let mut m = machine(cfg, pin);
                     let mut channel = 0;
                     let mut input = ScanInput::Start;
@@ -2248,7 +2985,7 @@ mod tests {
 
     #[test]
     fn abort_teardown_before_start_is_empty() {
-        let m = machine(ScanConfig::new(b"p"), Some(9));
+        let m = machine(ScanConfig::for_peer(), Some(9));
         let t = m.abort_teardown();
         assert!(!t.is_done());
         assert_eq!(t.mac(), &MAC);
@@ -2261,7 +2998,7 @@ mod tests {
 
     #[test]
     fn abort_teardown_between_stale_remove_and_temp_register_re_registers_the_pin() {
-        let mut m = machine(ScanConfig::new(b"p"), Some(9));
+        let mut m = machine(ScanConfig::for_peer(), Some(9));
         assert_eq!(m.poll(D::ZERO, ScanInput::Start), ScanAction::RemovePeer);
         // The caller's registration on channel 9 is gone; the teardown must put it back.
         assert_eq!(
@@ -2289,7 +3026,7 @@ mod tests {
 
     #[test]
     fn a_teardown_copy_runs_independently_of_the_machine() {
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[1]), None);
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[1]), None);
         m.poll(D::ZERO, ScanInput::Start);
         m.poll(D::ZERO, ScanInput::Completed);
         m.poll(D::ZERO, ScanInput::Completed);
@@ -2311,7 +3048,7 @@ mod tests {
 
     #[test]
     fn input_before_start_is_rejected() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         assert_eq!(
             m.poll(D::ZERO, ScanInput::Completed),
             ScanAction::Done(Err(ScanError::UnexpectedInput))
@@ -2321,7 +3058,7 @@ mod tests {
     #[test]
     fn done_is_sticky() {
         let list = [1];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let mut m = machine(cfg, None);
         let r = run(m.clone(), &Peer::absent(), D::ZERO);
         let done = ScanAction::Done(r.result);
@@ -2343,6 +3080,11 @@ mod tests {
             ScanInput::Completed,
             ScanInput::Failed,
             ScanInput::Sent(SendOutcome::Acked),
+            ScanInput::Reply(ProbeReply {
+                seq: 1,
+                tx_channel: 1,
+                home_channel: 1,
+            }),
             ScanInput::Abort,
             ScanInput::Shutdown,
         ] {
@@ -2354,7 +3096,7 @@ mod tests {
 
     #[test]
     fn a_finished_teardown_ignores_every_input() {
-        let mut m = machine(ScanConfig::new(b"p").with_channels(&[1]), Some(3));
+        let mut m = machine(ScanConfig::for_peer().with_channels(&[1]), Some(3));
         m.poll(D::ZERO, ScanInput::Start);
         let mut t = m.abort_teardown();
         let actions = drive_teardown(t);
@@ -2383,9 +3125,16 @@ mod tests {
 
     #[test]
     fn accessors_expose_peer_probe_and_pin() {
-        let m = machine(ScanConfig::new(b"probe-frame"), Some(7));
+        let m = machine(ScanConfig::for_peer(), Some(7));
         assert_eq!(m.mac(), &MAC);
-        assert_eq!(m.probe_data(), b"probe-frame");
+        assert_eq!(
+            m.probe_frame(6),
+            ProbeFrame {
+                seq: 0,
+                tx_channel: 6
+            }
+            .encode()
+        );
         assert_eq!(m.pinned_channel(), Some(7));
     }
 
@@ -2419,7 +3168,7 @@ mod tests {
 
     #[test]
     fn first_fault_is_none_when_every_channel_just_did_not_ack() {
-        let mut m = machine(ScanConfig::new(b"p"), None);
+        let mut m = machine(ScanConfig::for_peer(), None);
         let r = drive_with(&mut m, |a| {
             matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::NoAck))
         });
@@ -2437,7 +3186,7 @@ mod tests {
     #[test]
     fn first_fault_records_a_failed_set_channel() {
         let list = [1, 6];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let mut m = machine(cfg, None);
         let r = drive_with(&mut m, |a| match a {
             ScanAction::SetChannel { .. } => Some(ScanInput::Failed),
@@ -2457,7 +3206,7 @@ mod tests {
     #[test]
     fn first_fault_records_a_probe_send_error() {
         let list = [1, 6];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let mut m = machine(cfg, None);
         let r = drive_with(&mut m, |a| {
             matches!(a, ScanAction::SendProbe { .. }).then_some(ScanInput::Sent(SendOutcome::Local))
@@ -2475,7 +3224,7 @@ mod tests {
     #[test]
     fn first_fault_records_a_confirmation_probe_error() {
         let list = [6];
-        let cfg = ScanConfig::new(b"p")
+        let cfg = ScanConfig::for_peer()
             .with_channels(&list)
             .with_probe_confirmations(1);
         let mut m = machine(cfg, None);
@@ -2499,7 +3248,7 @@ mod tests {
     #[test]
     fn only_the_first_fault_is_kept() {
         let list = [1, 6, 11];
-        let cfg = ScanConfig::new(b"p").with_channels(&list);
+        let cfg = ScanConfig::for_peer().with_channels(&list);
         let mut m = machine(cfg, None);
         let r = drive_with(&mut m, |a| match a {
             ScanAction::SetChannel { channel: 1 } => Some(ScanInput::Failed),

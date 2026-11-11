@@ -36,6 +36,14 @@
 //!   frame in flight (matched by destination MAC) and notifies the `Condvar`; it does not log,
 //!   wait, call the radio or wake wakers.
 //!   A callback that arrives while no frame is in flight is ignored.
+//! - The receive callback is an event too: the tier offers every frame to
+//!   [`SendEvents::probe_reply`] first, the reply tap of a running scan.
+//!   It keeps a `0xF4` [`ProbeReply`] from the scan's peer in the one-slot `ReplyMailbox`
+//!   under the same mutex and notifies the `Condvar`; every other frame, and every reply while
+//!   no probe to that peer is outstanding, is left to the tier's receive queue.
+//!   The mailbox is armed when a probe is handed to the radio, not first at
+//!   [`ScanAction::AwaitReply`]: the ACK callback and the reply both arrive from the Wi-Fi
+//!   task, so a reply may beat the worker to the wait step.
 //! - Nothing that can free memory or build an error runs under the lock: scan jobs and results
 //!   the gate discards are handed back and dropped after unlocking, and a full [`DeadlineSet`]
 //!   grows from storage allocated outside the lock.
@@ -88,7 +96,7 @@
 //!
 //! A scan started right after the cancel does not fail: [`ScanGate::admit`] answers
 //! [`GateRefusal::Unwinding`] while the cancelled scan holds the slot, and
-//! [`Worker::scan_for_peer`] waits on the [`WaitList`] until the worker has ended the cancelled
+//! [`EspNowWorker::scan_for_peer`] waits on the [`WaitList`] until the worker has ended the cancelled
 //! scan (probe waited out, restore done, [`ScanGate::finish`] or [`ScanGate::release`], which
 //! wakes the list) and then admits again.
 //!
@@ -117,9 +125,9 @@ use std::time::Instant;
 
 use super::{
     Cancelled, Completed, Completion, DeadlineId, DeadlineSet, DeadlineStorage, GateRefusal,
-    InFlightMarker, JobEpoch, MacAddress, Next, PeerConfig, Refusal, ScanAction, ScanConfig,
-    ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome, TxCore, TxId,
-    WifiInterface, MAX_DATA_LEN,
+    InFlightMarker, JobEpoch, MacAddress, Next, PeerConfig, ProbeReply, Refusal, ScanAction,
+    ScanConfig, ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, SendKind, SendOutcome,
+    TxCore, TxId, WifiInterface, MAX_DATA_LEN,
 };
 use crate::wait_list::WaitList;
 
@@ -250,31 +258,33 @@ pub enum WorkerError<E> {
 struct ScanJob {
     mac: MacAddress,
     channels: Vec<u8>,
-    probe_data: Vec<u8>,
     probe_timeout: Duration,
     burst_timeout: Duration,
     probe_confirmations: u8,
     confirmation_gap: Duration,
+    reply_timeout: Duration,
 }
 
 impl ScanJob {
     fn new(mac: MacAddress, config: &ScanConfig<'_>) -> Self {
+        // `..` skips the deprecated `probe_data`: the machine builds its own probe frames.
         let ScanConfig {
             channels,
-            probe_data,
             probe_timeout,
             burst_timeout,
             probe_confirmations,
             confirmation_gap,
+            reply_timeout,
+            ..
         } = *config;
         Self {
             mac,
             channels: channels.to_vec(),
-            probe_data: probe_data.to_vec(),
             probe_timeout,
             burst_timeout,
             probe_confirmations,
             confirmation_gap,
+            reply_timeout,
         }
     }
 
@@ -282,11 +292,12 @@ impl ScanJob {
     fn config(&self) -> ScanConfig<'_> {
         ScanConfig {
             channels: &self.channels,
-            probe_data: &self.probe_data,
             probe_timeout: self.probe_timeout,
             burst_timeout: self.burst_timeout,
             probe_confirmations: self.probe_confirmations,
             confirmation_gap: self.confirmation_gap,
+            reply_timeout: self.reply_timeout,
+            ..ScanConfig::for_peer()
         }
     }
 }
@@ -306,6 +317,20 @@ impl<E> ScanFailure<E> {
     }
 }
 
+/// The one-slot mailbox of the reply tap: the probe reply the running scan waits for.
+///
+/// Armed by the worker from the moment a probe to `awaiting` is handed to the radio until the
+/// scan moves past the reply wait, and read at [`ScanAction::AwaitReply`].
+/// The receive callback fills it ([`SendEvents::probe_reply`]); a newer reply replaces an unread
+/// one, since the machine matches the reply to the outstanding probe anyway.
+#[derive(Default)]
+struct ReplyMailbox {
+    /// The peer whose `0xF4` replies the tap takes; `None` while no probe is outstanding.
+    awaiting: Option<MacAddress>,
+    /// The latest reply from `awaiting` since the slot was last read.
+    reply: Option<ProbeReply>,
+}
+
 /// Everything behind the one lock.
 struct TxState<E> {
     core: TxCore<TxOutcome<E>, TX_SLOTS>,
@@ -316,6 +341,8 @@ struct TxState<E> {
     /// The single scan job: admission, hand-off, result, cancellation and the scan exclusion of
     /// `core`, kept in step by the gate.
     scan: ScanGate<ScanJob, Result<ScanResult, ScanFailure<E>>>,
+    /// The probe reply the running scan waits for, fed by the receive callback.
+    reply: ReplyMailbox,
 }
 
 /// One frame handed out by [`TxCore::next`], copied so the lock can be released to transmit.
@@ -346,6 +373,9 @@ struct Shared<E> {
     config: WorkerConfig,
     /// The channel the driver keeps pinned; [`u8::MAX`] means none.
     pinned: AtomicU8,
+    /// The probe sequence number the last scan ended on; the next scan continues it, so a
+    /// reply left over from the previous scan never matches a new probe.
+    scan_seq: AtomicU8,
 }
 
 /// The error of a refused submission.
@@ -476,12 +506,14 @@ impl<E> Shared<E> {
                 inflight: InFlightMarker::new(),
                 deadlines: DeadlineSet::with_capacity(DEADLINE_CAPACITY),
                 scan: ScanGate::new(),
+                reply: ReplyMailbox::default(),
             }),
             wake: Condvar::new(),
             waiters: WaitList::new(),
             epoch: Instant::now(),
             config,
             pinned: AtomicU8::new(config.initial_pin.unwrap_or(u8::MAX)),
+            scan_seq: AtomicU8::new(0),
         }
     }
 
@@ -506,6 +538,43 @@ impl<E> Shared<E> {
         if recorded {
             self.wake.notify_all();
         }
+    }
+
+    /// The reply tap: keeps a `0xF4` reply from `mac` while a probe to that peer is
+    /// outstanding, and reports whether the frame was taken.
+    fn on_probe_reply(&self, mac: &[u8], data: &[u8]) -> bool {
+        let Some(reply) = ProbeReply::parse(data) else {
+            return false;
+        };
+        let taken = {
+            let mut state = self.lock();
+            match state.reply.awaiting {
+                Some(awaiting) if awaiting[..] == *mac => {
+                    state.reply.reply = Some(reply);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if taken {
+            self.wake.notify_all();
+        }
+        taken
+    }
+
+    /// Arms the reply tap for the probe to `mac` that is about to go out; a reply still in the
+    /// slot answered an earlier probe and is dropped.
+    fn arm_reply(&self, mac: MacAddress) {
+        let mut state = self.lock();
+        state.reply.awaiting = Some(mac);
+        state.reply.reply = None;
+    }
+
+    /// Disarms the reply tap: replies reach the application again.
+    fn disarm_reply(&self) {
+        let mut state = self.lock();
+        state.reply.awaiting = None;
+        state.reply.reply = None;
     }
 
     /// Ends every request, tells the worker to stop and wakes every caller; idempotent.
@@ -863,6 +932,30 @@ impl<E: Debug> Shared<E> {
         }
     }
 
+    /// Waits for a probe reply in the armed mailbox until `until` on the scan's clock.
+    ///
+    /// [`ScanInput::Reply`] for a reply, [`ScanInput::Completed`] once the deadline has passed;
+    /// cancellation and shutdown end the wait early with `Completed` too (the caller substitutes
+    /// `Abort` or `Shutdown` at the next step).
+    /// A reply that arrived between the probe and this call is already in the slot.
+    /// The deadline is checked before the slot, so a peer that streams replies the machine
+    /// ignores cannot hold the scan in its wait past `until`.
+    fn await_reply(&self, epoch: JobEpoch, until: Duration) -> ScanInput {
+        let mut state = self.lock();
+        loop {
+            if state.core.is_shut_down()
+                || state.scan.cancel_requested(epoch)
+                || self.now() >= until
+            {
+                return ScanInput::Completed;
+            }
+            if let Some(reply) = state.reply.reply.take() {
+                return ScanInput::Reply(reply);
+            }
+            state = self.park(state, Some(until));
+        }
+    }
+
     /// Runs one scan job and ends the exclusion once everything is restored.
     fn run_scan<R: EspNowRadio<Error = E>>(&self, radio: &mut R, epoch: JobEpoch, job: &ScanJob) {
         if self.abort_requested(epoch) {
@@ -870,13 +963,15 @@ impl<E: Debug> Shared<E> {
             self.finish_scan_job(epoch, None);
             return;
         }
-        let mut machine = ScanMachine::new(job.mac, job.config(), self.pinned_channel());
+        let mut machine = ScanMachine::new(job.mac, job.config(), self.pinned_channel())
+            .with_first_seq(self.scan_seq.load(Ordering::Relaxed));
         let result = self.drive_scan(radio, epoch, &mut machine);
         // The pin follows the machine whatever became of the caller: on a success the peer is
         // registered on the new channel, on any failure the machine restored the old one.
         if let Some(channel) = machine.pinned_channel() {
             self.pinned.store(channel, Ordering::Relaxed);
         }
+        self.scan_seq.store(machine.seq(), Ordering::Relaxed);
         match &result {
             Ok(found) => log::info!("Peer {:02X?} found on channel {}", job.mac, found.channel),
             Err(failure) if matches!(failure.kind, ScanError::NotFound { .. }) => {
@@ -982,7 +1077,6 @@ impl<E: Debug> Shared<E> {
         machine: &mut ScanMachine<'_>,
     ) -> Result<ScanResult, ScanFailure<E>> {
         let mac = *machine.mac();
-        let probe_data = machine.probe_data();
         let temp_peer = PeerConfig {
             mac,
             channel: 0,
@@ -993,6 +1087,11 @@ impl<E: Debug> Shared<E> {
         // `Some` once the level before the burst was read: `RestoreTxPower` puts it back.
         let mut saved_tx_power: Option<i8> = None;
         let mut last_register_error: Option<E> = None;
+        // Whatever ends the scan, the reply tap must not outlive it.
+        let _disarm = DisarmOnExit(self);
+        // True while the reply tap is armed: from a probe's send until the scan moves past its
+        // reply wait (see [`ReplyMailbox`]).
+        let mut armed = false;
 
         let mut input = ScanInput::Start;
         loop {
@@ -1006,6 +1105,15 @@ impl<E: Debug> Shared<E> {
                 Ok(action) => action,
                 Err(kind) => return Err(ScanFailure { kind, cause: None }),
             };
+            if armed
+                && !matches!(
+                    action,
+                    ScanAction::SendProbe { .. } | ScanAction::AwaitReply { .. }
+                )
+            {
+                self.disarm_reply();
+                armed = false;
+            }
             input = match action {
                 ScanAction::RemovePeer => {
                     // Best effort: removes a stale registration, or the scan peer.
@@ -1099,31 +1207,42 @@ impl<E: Debug> Shared<E> {
                     channel,
                     confirmation,
                     timeout,
-                } => match self.transmit_probe(radio, &mac, probe_data, timeout) {
-                    Ok(SendOutcome::Acked) => ScanInput::Sent(SendOutcome::Acked),
-                    Ok(outcome) => {
-                        if confirmation == 0 {
-                            log::debug!("No ACK on channel {}", channel);
-                        } else {
-                            log::debug!(
-                                "Channel {} unconfirmed: probe {} not ACKed \
-                                 (likely roaming peer)",
-                                channel,
-                                confirmation
-                            );
+                } => {
+                    // Armed before the probe leaves: a reply may arrive before the worker has
+                    // been told about the ACK.
+                    self.arm_reply(mac);
+                    armed = true;
+                    match self.transmit_probe(radio, &mac, &machine.probe_frame(channel), timeout) {
+                        Ok(SendOutcome::Acked) => ScanInput::Sent(SendOutcome::Acked),
+                        Ok(outcome) => {
+                            if confirmation == 0 {
+                                log::debug!("No ACK on channel {}", channel);
+                            } else {
+                                log::debug!(
+                                    "Channel {} unconfirmed: probe {} not ACKed \
+                                     (likely roaming peer)",
+                                    channel,
+                                    confirmation
+                                );
+                            }
+                            ScanInput::Sent(outcome)
                         }
-                        ScanInput::Sent(outcome)
+                        Err(e) => {
+                            machine.log_fault(format_args!(
+                                "probe on channel {channel} failed: {e:?}"
+                            ));
+                            ScanInput::Sent(SendOutcome::Local)
+                        }
                     }
-                    Err(e) => {
-                        machine.log_fault(format_args!("probe on channel {channel} failed: {e:?}"));
-                        ScanInput::Sent(SendOutcome::Local)
-                    }
-                },
+                }
                 ScanAction::WaitUntil(deadline) => {
                     // Interruptible: cancellation or shutdown ends the gap at once.
                     self.sleep_until(epoch, deadline);
                     ScanInput::Completed
                 }
+                // Interruptible like the gap; a reply in the mailbox ends it at once and the
+                // machine decides whether it answers the outstanding probe.
+                ScanAction::AwaitReply { until } => self.await_reply(epoch, until),
                 ScanAction::RestoreTxPower => {
                     match saved_tx_power.take() {
                         Some(previous) => {
@@ -1161,6 +1280,15 @@ impl<E: Debug> Shared<E> {
     }
 }
 
+/// Disarms the reply tap when a scan drive ends, on any path.
+struct DisarmOnExit<'a, E>(&'a Shared<E>);
+
+impl<E> Drop for DisarmOnExit<'_, E> {
+    fn drop(&mut self) {
+        self.0.disarm_reply();
+    }
+}
+
 /// Stops the worker's callers when the thread ends, so a waiting caller fails with `Shutdown`
 /// instead of hanging.
 ///
@@ -1173,7 +1301,7 @@ impl<E> Drop for ExitGuard<E> {
     }
 }
 
-/// Cloneable handle for the tier's send callback.
+/// Cloneable handle for the tier's send and receive callbacks.
 ///
 /// The handle owns a share of the worker's state, so a callback registered with it can never
 /// outlive that state.
@@ -1192,6 +1320,21 @@ impl<E> SendEvents<E> {
     /// A result that matches no frame in flight is ignored.
     pub fn send_done(&self, mac: &[u8], acked: bool) {
         self.0.on_send_done(mac, acked);
+    }
+
+    /// The reply tap of a running scan: offers a received frame from `mac` to the scan.
+    ///
+    /// Returns `true` when the frame was taken: it is a `0xF4` [`ProbeReply`] and a scan probe
+    /// to `mac` is outstanding (from its send until the scan moves past the reply wait), so the
+    /// tier must not queue it for the application.
+    /// Every other frame returns `false` untouched: a reply from another peer, a reply while no
+    /// probe to `mac` is outstanding, or any payload that is not a reply.
+    ///
+    /// Runs in the Wi-Fi task, like [`send_done`](Self::send_done): it only parses, locks,
+    /// stores and notifies.
+    /// Call it before queueing the frame; the reply never reaches `receive`.
+    pub fn probe_reply(&self, mac: &[u8], data: &[u8]) -> bool {
+        self.0.on_probe_reply(mac, data)
     }
 }
 
@@ -1307,6 +1450,7 @@ impl<R: EspNowRadio> Drop for EspNowWorker<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::espnow::command::{ProbeFrame, PROBE_FRAME_LEN};
     use core::pin::Pin;
     use core::task::Context;
     use std::task::Wake;
@@ -1352,6 +1496,10 @@ mod tests {
         Ack,
         /// Frames are acknowledged only while the radio is on this channel.
         PeerOn(u8),
+        /// Like `PeerOn(channel)`, and every acknowledged probe is answered at once with a
+        /// reply naming `home`, as the echo app does (a peer whose radio sits on `home` and
+        /// decodes the adjacent `channel` when the two differ).
+        ReplyOn { channel: u8, home: u8 },
     }
 
     struct MockState {
@@ -1364,6 +1512,8 @@ mod tests {
         fail_send: bool,
         auto: Auto,
         events: Option<SendEvents<MockError>>,
+        /// The payload of the latest send, so a test can answer a probe.
+        last_payload: Vec<u8>,
     }
 
     struct MockShared {
@@ -1393,7 +1543,7 @@ mod tests {
             data: &[u8],
             repin: Option<u8>,
         ) -> Result<(), MockError> {
-            let (events, ack) = {
+            let (events, ack, home) = {
                 let mut state = self.0.lock();
                 state.calls.push(Call::Send {
                     mac: *mac,
@@ -1404,15 +1554,29 @@ mod tests {
                 if state.fail_send {
                     return Err(MockError("send"));
                 }
-                let ack = match state.auto {
-                    Auto::Off => None,
-                    Auto::Ack => Some(true),
-                    Auto::PeerOn(channel) => Some(state.channel == channel),
+                state.last_payload = data.to_vec();
+                let (ack, home) = match state.auto {
+                    Auto::Off => (None, None),
+                    Auto::Ack => (Some(true), None),
+                    Auto::PeerOn(channel) => (Some(state.channel == channel), None),
+                    Auto::ReplyOn { channel, home } => {
+                        let acked = state.channel == channel;
+                        (Some(acked), acked.then_some(home))
+                    }
                 };
-                (state.events.clone(), ack)
+                (state.events.clone(), ack, home)
             };
-            if let (Some(events), Some(ack)) = (events, ack) {
+            let Some(events) = events else {
+                return Ok(());
+            };
+            if let Some(ack) = ack {
                 events.send_done(mac, ack);
+            }
+            // The reply follows the ACK from the same (Wi-Fi) task, before the worker runs.
+            if let Some(reply) = home
+                .and_then(|home| ProbeFrame::parse(data).map(|p| ProbeReply::answering(&p, home)))
+            {
+                events.probe_reply(mac, &reply.encode());
             }
             Ok(())
         }
@@ -1550,6 +1714,7 @@ mod tests {
                     fail_send: false,
                     auto: Auto::Off,
                     events: None,
+                    last_payload: Vec::new(),
                 }),
                 changed: Condvar::new(),
             });
@@ -1637,15 +1802,16 @@ mod tests {
     }
 
     fn scan_config(channels: &'static [u8]) -> ScanConfig<'static> {
-        ScanConfig::new(&[0xAA])
+        ScanConfig::for_peer()
             .with_channels(channels)
             .with_probe_confirmations(0)
     }
 
+    /// A probe send: the three-byte `0xF3` frame the machine builds.
     fn probe(repin: Option<u8>) -> Call {
         Call::Send {
             mac: MAC,
-            len: 1,
+            len: PROBE_FRAME_LEN,
             repin,
         }
     }
@@ -1923,11 +2089,13 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // Without a reply tap the ACK nominates channel 1 and the candidate probe settles it.
         assert_eq!(
             repins,
             [
                 (PAYLOAD.len(), Some(7)),
-                (1, None),
+                (super::super::command::PROBE_FRAME_LEN, None),
+                (super::super::command::PROBE_FRAME_LEN, None),
                 (PAYLOAD.len(), Some(1))
             ]
         );
@@ -1954,12 +2122,154 @@ mod tests {
                 probe(None),
                 Call::SetChannel(6),
                 probe(None),
+                // Without a reply tap the ACK on 6 is a candidate: the sweep finishes first.
+                Call::SetChannel(11),
+                probe(None),
+                Call::SetChannel(6),
+                probe(None),
                 Call::SetTxPower(52),
                 Call::TxPower,
                 Call::RemovePeer,
                 Call::AddPeer(6),
             ]
         );
+    }
+
+    // Hand mutation check 2026-11-11 (task 3 of the probe-reply feature): with the MAC guard
+    // of `Shared::on_probe_reply` dropped, `the_reply_tap_takes_only_replies_to_the_
+    // outstanding_probe_of_the_scanned_peer` failed (30/1); with the tap armed only at
+    // `AwaitReply` instead of at `SendProbe`, that test and
+    // `a_probe_reply_ends_the_scan_on_the_peers_home_channel` failed (29/2), because the
+    // reply that follows the ACK from the same task was handed to the application.
+    #[test]
+    fn a_probe_reply_ends_the_scan_on_the_peers_home_channel() {
+        // Bug 018: the peer sits on 11, decodes and ACKs the probe sent on 10/6; its reply
+        // names 11, so the scan ends there without probing on, and without the candidate return.
+        let fixture = Fixture::new(SOFTAP);
+        fixture.edit(|state| {
+            state.auto = Auto::ReplyOn {
+                channel: 6,
+                home: 11,
+            }
+        });
+        let config = scan_config(&[1, 6, 11]);
+        let result = fixture.scan(&config).result();
+        assert_eq!(result.unwrap().channel, 11);
+        assert_eq!(fixture.worker.pinned_channel(), Some(11));
+        assert_eq!(
+            fixture.calls(),
+            [
+                Call::RemovePeer,
+                Call::AddPeer(0),
+                Call::TxPower,
+                Call::SetTxPower(78),
+                Call::SetChannel(1),
+                probe(None),
+                Call::SetChannel(6),
+                probe(None),
+                // The reply named 11: the radio moves there and the teardown follows at once.
+                Call::SetChannel(11),
+                Call::SetTxPower(52),
+                Call::TxPower,
+                Call::RemovePeer,
+                Call::AddPeer(11),
+            ]
+        );
+        // The scan is over: a late reply is the application's.
+        let late = ProbeReply {
+            seq: 9,
+            tx_channel: 6,
+            home_channel: 11,
+        };
+        assert!(!fixture.worker.events().probe_reply(&MAC, &late.encode()));
+    }
+
+    #[test]
+    fn the_reply_tap_takes_only_replies_to_the_outstanding_probe_of_the_scanned_peer() {
+        let fixture = Fixture::new(SOFTAP);
+        let events = fixture.worker.events();
+        let config = scan_config(&[6]).with_reply_timeout(Duration::from_secs(30));
+        let idle = ProbeReply {
+            seq: 0,
+            tx_channel: 6,
+            home_channel: 6,
+        };
+        assert!(
+            !events.probe_reply(&MAC, &idle.encode()),
+            "no scan runs: the reply is the application's"
+        );
+
+        let mut scan = fixture.scan(&config);
+        scan.poll_once();
+        fixture.wait_for_sends(1);
+        // The probe is on the air and its ACK not yet reported: the tap is already armed.
+        let probe = ProbeFrame::parse(&fixture.mock.lock().last_payload).unwrap();
+        let reply = ProbeReply::answering(&probe, 6).encode();
+        assert!(
+            !events.probe_reply(&OTHER, &reply),
+            "a reply from another peer is not taken"
+        );
+        assert!(
+            !events.probe_reply(&MAC, &probe.encode()),
+            "a probe (0xF3) from the peer is not a reply"
+        );
+        assert!(
+            !events.probe_reply(&MAC, b"hello"),
+            "an application frame from the peer is not taken"
+        );
+        let stale = ProbeReply {
+            seq: probe.seq.wrapping_add(1),
+            ..ProbeReply::answering(&probe, 6)
+        };
+        assert!(
+            events.probe_reply(&MAC, &stale.encode()),
+            "a reply from the peer is taken while its probe is outstanding"
+        );
+        fixture.callback(&MAC, true);
+        assert!(
+            scan.stays_pending(),
+            "the stale reply answers another probe: the wait goes on"
+        );
+        assert!(
+            events.probe_reply(&MAC, &reply),
+            "the tap stays armed through an ignored reply"
+        );
+        assert_eq!(scan.result().unwrap().channel, 6);
+        assert_eq!(fixture.sends(), 1, "a reply needs no confirmation probe");
+        assert!(
+            !events.probe_reply(&MAC, &reply),
+            "after the scan the tap is disarmed"
+        );
+    }
+
+    #[test]
+    fn a_reply_timeout_completes_the_wait_and_the_ack_only_peer_is_found_after_the_sweep() {
+        let fixture = Fixture::new(SOFTAP);
+        fixture.edit(|state| state.auto = Auto::PeerOn(6));
+        let reply_timeout = Duration::from_millis(200);
+        let config = scan_config(&[6, 11]).with_reply_timeout(reply_timeout);
+        let started = Instant::now();
+        let result = fixture.scan(&config).result();
+        let elapsed = started.elapsed();
+        assert_eq!(result.unwrap().channel, 6);
+        assert!(
+            elapsed >= 2 * reply_timeout,
+            "each of the two ACKed probes (sweep and candidate) waits out the reply timeout \
+             before `Completed` is fed: {elapsed:?}"
+        );
+        assert_eq!(
+            fixture.calls()[4..10],
+            [
+                Call::SetChannel(6),
+                probe(None),
+                // Timed out without a reply: 6 is the candidate and the sweep goes on.
+                Call::SetChannel(11),
+                probe(None),
+                Call::SetChannel(6),
+                probe(None),
+            ]
+        );
+        assert_eq!(fixture.sends(), 3);
     }
 
     #[test]
@@ -2247,7 +2557,8 @@ mod tests {
             .with_confirmation_gap(Duration::from_secs(30));
         let mut scan = fixture.scan(&config);
         scan.poll_once();
-        fixture.wait_for_sends(1);
+        // The sweep probe and, after its reply wait, the candidate probe; the gap follows.
+        fixture.wait_for_sends(2);
         thread::sleep(SETTLE);
         let started = Instant::now();
         drop(scan);
@@ -2258,8 +2569,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(
             fixture.sends(),
-            2,
-            "the second probe never went out, only the frame"
+            3,
+            "the confirmation probe never went out, only the frame"
         );
         assert!(fixture.calls().contains(&Call::SetTxPower(52)));
     }

@@ -2,8 +2,8 @@
 id: 016
 title: An ESP-NOW scan started right after a cancelled scan is refused as Busy
 captured-on: 2026-11-10
-doc-version: 3
-status: open-defect
+doc-version: 4
+status: closed
 kind: defect
 ---
 
@@ -71,3 +71,4 @@ Claude session on `prepare-release-bench`
 - 2026-11-10 — Observation captured via /bug dialog from the first C3-I7 bench run; blocks C3-I7
 - 2026-11-10 — Promoted to defect with the approved decision: wait for an unwinding cancelled scan instead of `Busy`
 - 2026-11-10 — Fixed on both tiers (`GateRefusal::Unwinding`, wait and re-admit; host tests plus two mutation checks); the C3-I7 rerun showed no `radio is busy` across all cancel cycles; close after the gate passes
+- 2026-11-11 — Closed on bench evidence only: `just bench c3 espnow-cancel` on 2026-11-10 after the fix and five cancel runs on 2026-11-11 (scout and hal peer, unattended and attended halves) logged no `radio is busy`, every cancelled scan was followed by an admitted rescan; gate C3-I7 passed on 2026-11-11

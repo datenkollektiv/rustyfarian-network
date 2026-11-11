@@ -12,9 +12,10 @@ description = "Bare-metal (esp-hal) async drivers for Wi-Fi, LoRa, OTA, and prov
 keywords    = ["esp32", "esp-hal", "embedded", "no-std", "async"]
 categories  = ["embedded", "hardware-support", "no-std"]
 readme = "README.md"
-# The LWT example shares its application body with the ESP-IDF twin
-# (`examples-shared/lwt_app.rs`), which lives outside this package; it is bench-only.
-exclude = ["examples/hal_esp32s3_mqtt_lwt.rs", "examples/hal_esp32_mqtt_lwt.rs", "examples/hal_c3_mqtt_lwt.rs"]
+# The LWT and ESP-NOW coordinator examples share their application bodies with the ESP-IDF
+# twins (`examples-shared/lwt_app.rs`, `examples-shared/espnow_echo_app.rs`), which live
+# outside this package; they are bench-only.
+exclude = ["examples/hal_esp32s3_mqtt_lwt.rs", "examples/hal_esp32_mqtt_lwt.rs", "examples/hal_c3_mqtt_lwt.rs", "examples/hal_c6_espnow_sta_coordinator.rs"]
 
 [package.metadata.docs.rs]
 default-target = "riscv32imc-unknown-none-elf"

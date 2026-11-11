@@ -1,17 +1,28 @@
 //! ESP-NOW coordinator example for ESP32-C3 Super Mini.
 //!
-//! Connects to a Wi-Fi AP (adopting the AP's channel), then initialises
-//! ESP-NOW and listens for incoming frames.  Every received frame is logged
-//! with the sender MAC and payload.
+//! Connects to a Wi-Fi AP (adopting the AP's channel), initialises ESP-NOW and
+//! runs the shared coordinator application through `block_on`.
+//! Twin of `hal_c6_espnow_sta_coordinator`: both run the same application body,
+//! `examples-shared/espnow_echo_app.rs`, so the two tiers answer peers alike.
+//! This file is setup only: Wi-Fi, the LED, ESP-NOW and one `block_on`.
+//!
+//! The shared app registers unknown senders as peers (channel 0 = current
+//! channel), answers a scan probe (`0xF3`) with a `0xF4` reply that names the
+//! current channel (ADR 025), echoes every other payload back to its sender and
+//! logs the counters and the channel every 10 s (`[app] rx=… reply_acked=…
+//! reply_failed=… oversize_dropped=… channel=… heap_free=…`).
 //!
 //! The onboard LED (GPIO 8, active low) shows status:
 //! - **on** — connecting to WiFi / booting
 //! - **off briefly** — WiFi connected, initialising ESP-NOW
-//! - **on** — ESP-NOW ready, waiting for frames
-//! - **flicker** — frame received
+//! - **on** — ESP-NOW ready, answering frames
+//!
+//! The per-frame flicker of earlier releases is gone: the shared app owns the
+//! receive loop, and the counters line reports the traffic instead.
 //!
 //! The coordinator's Wi-Fi channel is dictated by the AP.  The scout device
-//! discovers this channel automatically via [`scan_for_peer`].
+//! discovers this channel automatically via [`scan_for_peer`]: the coordinator
+//! states it in the probe reply, and the MAC-layer ACK stays the fallback.
 //!
 //! # Components
 //!
@@ -30,13 +41,17 @@
 //! just flash idf_c3_espnow_coordinator
 //! ```
 
-use rustyfarian_esp_idf_network::espnow::{EspIdfEspNow, EspNowDriver};
+use rustyfarian_esp_idf_network::espnow::EspIdfEspNow;
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiConfigExt, WiFiManager};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::task::block_on;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+
+#[path = "../../../examples-shared/espnow_echo_app.rs"]
+mod espnow_echo_app;
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -46,6 +61,11 @@ const SSID: &str = match option_env!("WIFI_SSID") {
 // keeping CodeQL's hard-coded-credential query source-free.
 fn password() -> &'static str {
     option_env!("WIFI_PASS").unwrap_or_default()
+}
+
+fn free_heap() -> usize {
+    // SAFETY: plain FFI query with no arguments or side effects.
+    unsafe { esp_idf_svc::sys::esp_get_free_heap_size() as usize }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -73,20 +93,9 @@ fn main() -> anyhow::Result<()> {
     led.set_high()?;
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let mut channel: u8 = 0;
-    let mut second: esp_idf_svc::sys::wifi_second_chan_t = 0;
-    // SAFETY: Wi-Fi has been started by WiFiManager::init above; both out
-    // pointers are valid for the duration of the call.
-    let ret = unsafe { esp_idf_svc::sys::esp_wifi_get_channel(&mut channel, &mut second) };
-    if ret == esp_idf_svc::sys::ESP_OK {
-        log::info!("Operating on Wi-Fi channel {}", channel);
-    } else {
-        log::warn!("esp_wifi_get_channel failed: error code {}", ret);
-    }
-
     let mut mac = [0u8; 6];
-    // SAFETY: same as above; `mac` is a 6-byte buffer and the STA interface
-    // is up after a successful WiFiManager::init.
+    // SAFETY: Wi-Fi has been started by WiFiManager::init above; `mac` is a
+    // 6-byte buffer and the STA interface is up.
     let ret = unsafe {
         esp_idf_svc::sys::esp_wifi_get_mac(
             esp_idf_svc::sys::wifi_interface_t_WIFI_IF_STA,
@@ -109,27 +118,18 @@ fn main() -> anyhow::Result<()> {
 
     // ── ESP-NOW ─────────────────────────────────────────────────────────
     let espnow = EspIdfEspNow::init()?;
-    log::info!("ESP-NOW initialised — waiting for frames ...");
+    match espnow.current_channel() {
+        Some(channel) => log::info!("Operating on Wi-Fi channel {}", channel),
+        None => log::warn!("the radio did not report its channel"),
+    }
+    log::info!("ESP-NOW initialised — answering frames ...");
 
     led.set_low()?; // LED on — ready
 
-    loop {
-        if let Some(event) = espnow.try_recv() {
-            log::info!(
-                "RX from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}: {:?}",
-                event.mac[0],
-                event.mac[1],
-                event.mac[2],
-                event.mac[3],
-                event.mac[4],
-                event.mac[5],
-                core::str::from_utf8(event.payload()).unwrap_or("<binary>"),
-            );
-            // Flicker on receive
-            led.set_high()?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            led.set_low()?;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let cfg = espnow_echo_app::EchoAppConfig {
+        oversize_dropped: &|| espnow.oversize_dropped(),
+        free_heap,
+    };
+    block_on(espnow_echo_app::run(&espnow, &cfg));
+    Ok(())
 }

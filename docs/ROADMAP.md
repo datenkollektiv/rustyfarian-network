@@ -2,19 +2,13 @@
 
 *Last updated: November 2026*
 
-## Context & recent milestones
+## Context
 
-Both tiers moved to the September 2026 stack on 2026-09-25.
-The bare-metal tier pins `esp-hal 1.2.2` and `esp-radio 1.0.0-beta.1` (pre-release; re-pin to `1.0.0` stable when available).
-The IDF tier pins `esp-idf-svc 0.53` and `esp-idf-hal 0.47`.
-Hardware validated 2026-09-26: bare-metal C3 STA join, C6 SoftAP provisioning, S3 SX1262 bring-up; provisioning reboot-to-STA not exercised; IDF C3 validated.
-Bare-metal Wi-Fi is async-only following `esp-radio 0.18`'s removal of direct `smoltcp` integration.
-The TTN OTAA join and first uplink were validated 2026-06-17.
-OTA consumer runtime was hardware-validated end to end on 2026-10-08 (library runbook 21/21 on ESP32-C3) and adoption tests passed on 2026-10-09 (rgb-clock); MQTT auto-reconnect is fixed for 0.6.0 (bug 005, broken since 0.4.0).
-esp-hal provisioning now owns the SoftAP bring-up, so `ssid_override` and the `{prefix}-{MAC}` default apply on both tiers; validated on an ESP32-C3 Mini-1 on 2026-10-30, which also surfaced and fixed bug 006 (the esp-hal store never read a record back on hardware).
-Bare-metal ESP-NOW (`espnow` feature, ADR 020) is implemented for ESP32-C3 and ESP32-C6 with the two examples `hal_c6_espnow_sta_coordinator` and `hal_c3_espnow_peer`; it is hardware-pending until gates G-E1 and G-E2 pass.
-Tier parity (ADR 022) is the primary API goal: since 2026-11-01 both tiers implement the shared `NetworkLink` and `MqttClient` traits on sans-IO link and session machines in `juggler`, and Step 9 proves one application on both tiers.
-See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHANGELOG.md` for API changes.
+Both tiers run the September 2026 stack.
+The bare-metal tier pins `esp-hal 1.2.2` and `esp-radio 1.0.0-beta.1`, a pre-release to re-pin to `1.0.0` when it ships.
+The ESP-IDF tier pins `esp-idf-svc 0.53` and `esp-idf-hal 0.47`.
+Tier parity (ADR 022) is the primary API goal, with both tiers on shared `juggler` cores.
+For history, see `CHANGELOG.md` and `docs/features/archive/`.
 
 ## Forward plan
 
@@ -36,31 +30,25 @@ See `docs/features/archive/esp-hal-stack-upgrade-september-2026-v1.md` and `CHAN
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Bare-metal ESP-NOW hardware gates — implemented, hardware pending — G-E1 unassociated STA channel drift, G-E2 C6 coex-off recv loss, plus mixed IDF/hal fleet and IDF scan re-checks (feature-doc)
-              : ESP-NOW tier parity (ADR 022 Phase 6) — shared async trait in juggler espnow, driver keeps the pinned channel so scan_for_peer has one shape, ESP-IDF blocking scan renamed scan_for_peer_blocking, ESP-IDF async on one espnow-tx worker thread, async send reports the MAC ACK, prerequisite for the peer link helper (feature-doc)
-              : ESP-NOW peer link — sans-IO PeerLink core in juggler espnow decides when a peer rescans for its coordinator (boot, 20 consecutive unacknowledged sends, received frame proves the link, rescan backoff), one generic async helper over the parity trait, the core can land first (feature-doc)
-              : Provisioning boot identity on one juggler type — desk work landed 2026-10-27 (both tiers hand out ProvisioningConfig, WifiMqttBoot exposes device_name, ota_url and config, secret-free Debug, esp-hal extras persisted via a new TLV tag, StoredConfig deprecated) — only the hardware gate stays open, an esp-hal extras record must survive a reboot on a C3 or C6 board, runbook is the esp-hal extras runbook under docs runbooks (feature-doc)
-              : Provisioning re-entry hook — optional pre-load hook answers None, Portal or FactoryReset once per boot, the library reports it as a WifiMqttLoadOutcome and never erases, the consumer owns GPIO, hold time and erase, IDF tier first, part 6 of the Wi-Fi portal fallback (feature-doc)
-              : Wi-Fi reconnect and radio suspend/resume on both tiers (PR 1 and PR 2 of request U2f from rustyfarian-knob, implemented) — one pure LinkMachine in juggler owns connect, reconnect with a 1 s to 30 s back-off and suspend, the IDF WiFiManager runs it on a worker thread in every connect mode, IDF suspend and resume stop and start the radio for deep sleep, the esp-hal WifiLink replaces the per-example loops, IDF try_publish refuses while disconnected, R3 suspend/resume passed on the CrowPanel S3 for both tiers and R1 router pause passed for ESP-IDF on 2026-11-02 and for esp-hal on the CrowPanel S3 on 2026-11-03 (feature-doc)
-              : Tier parity — consumer code exchangeable between the ESP-IDF and esp-hal tiers, async API on both tiers, behaviour in host-tested juggler cores behind narrow per-tier ports, Wi-Fi and MQTT first (request U2g from rustyfarian-knob), ADR 022 Accepted 2026-11-03, 12-step plan in the tier-parity-v1 plan doc, Steps 0 to 9 done except Step 8c, Step 9 proved one application on both tiers on the CrowPanel S3 on 2026-11-03, bench runs closed bugs 001, 009, 010, 011 and 014, next is Step 8c bug 013 IDF thread memory, then release 0.7.0, then Steps 10 and 11 Wi-Fi names and MQTT shape (feature-doc) (in progress)
-              : Tier capability closure — close the remaining API-capability gaps after ADR 022 Step 9, IDF with_startup_message, async wait_suspended on NetworkLink, hal runtime subscribe, hal DNS, plus upstream asks for esp-radio WifiController stop and start, and for esp-idf-svc inbound retain and QoS (feature-doc)
-              : Shared disconnect-reason vocabulary — one juggler wifi DisconnectReason enum with name and code that both tiers and consumer code match on, esp-hal maps esp-radio reasons through a local table, follow-up from the bug 011 review (feature-doc)
+    Ready     : Bare-metal ESP-NOW hardware gates — G-E1 is the C3-H2 soak, mixed-fleet checks C3-H3 and C6-H4 pending, two-peer coex and channel sweeps downstream (feature-doc)
+              : ESP-NOW tier parity (ADR 022 Phase 6) — Steps 6 and 7 landed 2026-11-11 (PeerSession, peer app, peer examples), mixed-fleet C3-H3 and C6-H4 pending (feature-doc)
+              : ESP-NOW peer link — sans-IO PeerLink core in juggler espnow decides when a peer rescans for its coordinator (boot, 20 consecutive unacknowledged sends, received frame proves the link, rescan backoff), PeerSession helper, shared peer app and peer examples on both tiers implemented 2026-11-11, mixed-fleet bench run pending (C3-H3 and C6-H4 with the C6 as the other tier's coordinator) (feature-doc)
+              : Tier parity — consumer code exchangeable, ADR 022 accepted, Steps 0 to 9 done except 8c bug 013, Steps 10 and 11 after 0.7.0 (feature-doc)
+              : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally, from the bug 011 review (feature-doc)
 
-    Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 gates HV-I1 (ESP-IDF OTAA join and uplink on TTN EU868) and HV-H1 (esp-hal SX1262 bring-up), plus bug 007 (LoRa forces a critical-section provider) with its provider variant
+    Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 gates HV-I1 and HV-H1, plus bug 007 (LoRa forces a critical-section provider)
               : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
-              : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub description of rustyfarian-esp-hal-network and the Wi-Fi/MQTT-only vision line
+              : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub text and the Wi-Fi/MQTT-only vision line
               : juggler scope ADR — document the cross-cutting catch-all rule for the consolidated pure crate
               : .cargo/config.toml setup detection — detect missing config in justfile, clearer first-build errors
-              : ESP-NOW scan country-code awareness — query esp_wifi_get_country() at scan start and restrict probed channels to schan..schan+nchan-1 instead of hardcoded 1-13, eliminates ESP_ERR_WIFI_NOT_ALLOWED_CHANNEL warnings on US/FCC and other restricted-band regions
-              : MQTT subscribe-during-shutdown race fix — check whether it still applies after tier parity Step 8b-2 replaced the connect helper — detached subscriber thread spawned on Connected can block forever in esp_mqtt_client_subscribe if last MqttHandle is dropped before SUBACK, track in-flight subscriptions via a shared atomic counter, gate event-loop exit on count==0 so the loop keeps pumping events until SubscribeAck arrives, also close the window where is_connected() reads true before the subscriber thread has sent SUBSCRIBE
-              : LED/timeout dedup — extract the shared status-LED pulse + timeout-poll loop duplicated between rustyfarian-esp-idf-network (blocking vs LED paths) and MqttBuilder.build_and_wait into one helper
-              : LoRa RF-config mapping guard — make map_rf_config/cr_to_sx126x non-exhaustive-safe so new upstream lora-modulation variants return InvalidRfConfig instead of failing to compile or panicking
-              : LoRaWAN OTAA join timing regression tests — extract event-loop + absolute timeout handling from idf_esp32s3_join into host-testable helper, add mock-radio tests covering TimeoutRequest absolute timestamp (not relative elapsed) and RX1 window cap at inter-window gap
-              : OTA runtime Watchtower v2 second-device validation — adopt the runtime on second consumer (Watchtower C3-DevKitM-1), validate against reference runbook
+              : ESP-NOW scan country-code awareness — read esp_wifi_get_country() at scan start and probe only its channel range, not the hardcoded 1 to 13
+              : LED/timeout dedup — extract the status-LED pulse and timeout-poll loop shared by the ESP-IDF Wi-Fi paths and MqttBuilder.build_and_wait
+              : OTA download progress callback — user-facing progress for the OTA session
+              : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)
 
-    Mid term  : Phase 5 — TTN v3 EU868 OTAA join + first uplink validated 2026-06-17, remaining first downlink (FPort 10) + session persistence
-              : OTA security model doc — threat model, signed-manifest question (rollback policy covered by the OTA decision core)
-              : Contract tests beyond Wi-Fi and MQTT — replicate the ADR 022 conformance suites (tier-parity Step 4) to LoRa and ESP-NOW
+    Mid term  : LoRa TTN OTAA validation — join and first uplink done 2026-06-17, first downlink (FPort 10) and session persistence remain (runbook)
+              : OTA security model doc — threat model and signed-manifest question, rollback policy already covered
+              : Contract tests beyond Wi-Fi and MQTT — ADR 022 conformance suites for LoRa and ESP-NOW
               : LoRa post-adoption backlog — PartialEq, heapless Deque FIFO, CRC-32, hardware driver, state machine
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
@@ -68,111 +56,30 @@ timeline
 
 ---
 
-## June 2026 code deep-dive findings
+## Code deep-dive findings (June 2026, re-checked 2026-11-11)
 
-Full review of all 13 crates (~13k lines), the build scripts, and CI.
-Overall verdict: the pure-first architecture is consistently executed (thin HAL wrappers, ~208 host tests in the pure layer, minimal and justified unsafe).
-The items below are the deltas worth fixing.
-Items promoted to the timeline are marked; the rest are small enough to batch into a hygiene session.
+The June review covered all crates before the juggler consolidation.
+The rows were re-checked against the code on 2026-11-11 with the resolved ones removed.
 
-|  # | Area                | Finding                                                                                                                                                                                                                                                                                  | Tracked                                                                       |
-|---:|:--------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------------------------------------|
-|  1 | README              | `rustyfarian-esp-hal-wifi` still described as "stub; full implementation in progress" — it is a working async STA driver, hardware-validated on C3/C6; vision line still says "Wi-Fi and MQTT" though the workspace spans five protocols                                                 | Near term (folded into 2D crate-status table)                                 |
-|  3 | esp-idf wifi + mqtt | Status-LED pulse cadence and timeout-poll loop duplicated in three places (`WiFiManager` blocking path, LED path, `MqttBuilder::build_and_wait`)                                                                                                                                         | Near term (LED/timeout dedup)                                                 |
-|  4 | esp-idf-lora        | RF-config mapping (`map_rf_config`, SF/BW/CR converters) has no guard for new upstream `lora-modulation` enum variants                                                                                                                                                                   | Near term (mapping guard)                                                     |
-|  5 | esp-idf-mqtt        | Currently open: `is_connected()` flips true before the detached subscriber thread has sent SUBSCRIBE — brief window where publishes race ahead of subscriptions (distinct from the resolved SUBACK-deadlock)                                                                             | Near term (folded into subscribe-race fix)                                    |
-|  6 | esp-idf-espnow      | `pinned_channel` (`AtomicU8`, sentinel `u8::MAX`) is only updated on successful scans and is never explicitly invalidated on failed scans; failed-scan recovery reuses the last known channel, which is intentional but could become stale if peer/channel reality changes underneath it | Hygiene batch (review whether to keep as-is or add an explicit staleness TTL) |
-|  7 | espnow-pure         | `EspNowEvent::new()` panics on oversized payload in debug but silently truncates in release — mode-dependent behaviour                                                                                                                                                                   | Hygiene batch                                                                 |
-|  8 | esp-idf-ota         | Cooperative total download deadline now exists (`OtaSession::with_deadline`), complementing the per-read timeout; no user-facing progress callback                                                                                                                                       | Partially resolved (deadline ships in 0.6.0); progress callback deferred      |
-|  9 | lora-pure           | `LorawanDevice::process()` returns `NoUpdate` — `PhyRxTx` bridge unwired pending TTN hardware validation (known, documented HIGH RISK)                                                                                                                                                   | Mid term (Phase 5, already tracked)                                           |
-| 10 | Pure layer          | Minor style drift: error types vary between `&'static str`, concrete enums, and generic `LorawanError<E>`; acceptable, candidate for the pure-scope ADR to codify                                                                                                                        | Near term (folded into pure-scope ADR)                                        |
+|  # | Area                | Finding                                                                                     | Tracked                                                    |
+|---:|:--------------------|:--------------------------------------------------------------------------------------------|:-----------------------------------------------------------|
+|  1 | README              | The README vision line still says only Wi-Fi and MQTT; the stub wording is gone.            | Near term (folded into 2D crate-status table)              |
+|  3 | esp-idf wifi + mqtt | The status-LED pulse and timeout-poll loop exist three times: the WiFiManager LED path, its poll loop and `MqttBuilder::build_and_wait`. | Near term (LED/timeout dedup) |
+|  7 | espnow-pure         | Both drivers build events with `EspNowEvent::try_new`, which never truncates; the public `EspNowEvent::new` still panics in debug and truncates in release, so deprecate it. | Hygiene batch |
+|  9 | lora-pure           | juggler's `LorawanDevice::process()` still returns `NoUpdate` (the `PhyRxTx` bridge is unwired); the hardware-proven join path is `LorawanTimeline` plus `lorawan-device` in the ESP-IDF join example, so the wrapper is either wired or retired. | Mid term (LoRa, with the deferred hardware validation) |
+| 10 | Pure layer          | Five juggler modules still return `&'static str` errors (wifi, provisioning boot and ssid, mqtt host and subscriptions) beside concrete enums and `LorawanError<E>`. | Near term (folded into pure-scope ADR)                     |
 
 Positive findings worth keeping in mind (no action):
 
 - `rustyfarian-esp-hal-network` OTA module's hand-rolled HTTP/1.1 parser is the security high-water mark (33 tests covering RFC 7230 smuggling vectors).
 - MQTT's SUBACK-deadlock avoidance (resolved via `MqttBuilder::subscribe`) and its `Weak`-based event-loop shutdown are solid.
-- ESP-NOW's failed-scan recovery restores both peer registration and the last-known-good channel (see #6 for the staleness trade-off).
+- ESP-NOW's failed-scan recovery keeps the last known channel by design; since ADR 025 a stale pin is corrected by the coordinator's probe reply on the next scan, and PeerLink rescans after 20 unacknowledged sends.
 
 ---
 
 ## Midterm detail
 
-### Phase 5 — TTN v3 EU868 OTAA validation
-
-<details>
-<summary><strong>Validation checklist</strong></summary>
-
-The goal is end-to-end OTAA join + first uplink + first downlink with the least moving parts.
-All steps use TTN v3 EU868.
-
-**Step 0 — Credentials**
-
-- Create a TTN application and register an end device (LoRaWAN MAC V1.0.3, RP001-1.0.3, OTAA).
-- Record DevEUI (8 bytes), JoinEUI/AppEUI (8 bytes), AppKey (16 bytes).
-- Decide byte order: TTN displays EUIs as big-endian strings; many stacks expect LSB-first in memory.
-  Log DevEUI/JoinEUI as bytes and compare against `lorawan-device` documentation before flashing.
-  See `docs/project-lore.md` — "EUI byte order" for the full pitfall description.
-
-**Step 1 — Gateway & RF sanity**
-
-- Confirm a TTN-connected EU868 gateway is online (TTN Console → Gateways → "connected recently").
-  For the current Pi 4 + RAK5146 SPI EU868/GPS gateway setup, see the [operational runbook](https://devops.datenkollektiv.de/pages/lorawan-gateway-rak5146-trixie.html).
-  A shorter [Trixie gateway write-up](https://devops.datenkollektiv.de/lorawan-gateway-rak5146-trixie.html) is also available.
-- Place the device within metres for initial tests; use a correct EU868 antenna.
-
-**Step 2 — SX1262 bring-up (before LoRaWAN)**
-
-- Verify SPI mode 0, 8 MHz; confirm NSS/CS, BUSY, RESET, DIO1 pins.
-- Issue a status/sanity command after reset and log the response.
-- Confirm BUSY line goes high during operations and returns low; if BUSY is never handled,
-  every SPI command stalls — see `docs/project-lore.md` — "BUSY pin".
-
-**Step 3 — TTN Live Data setup**
-
-- Open TTN Console → Application → End Device → Live Data (leave open during testing).
-- Enable join-accept and uplink viewing; confirm gateway metadata (RSSI/SNR) is visible.
-
-**Step 4 — OTAA join**
-
-- Firmware must log "joining..." and then either "joined" or the failure reason.
-- In Live Data, expect: join-request uplink(s) → join-accept downlink.
-- If a join-request is visible but no join-accept: wrong AppKey or EUI byte order mismatch.
-- If join-accept is visible in TTN but a device never joins: RX timing or DIO1 IRQ issue
-  (see `docs/project-lore.md` — "DIO1 interrupt" and "RX window").
-- Tune `RX_WINDOW_OFFSET_MS` if windows are missed; start at -200 ms and adjust upward.
-
-**Step 5 — First uplink**
-
-- After joining, send a small payload (1-8 bytes) on FPort 1.
-- TTN Live Data should show the uplink with decoded payload bytes and RSSI/SNR.
-- Do not send it before join completes; `LorawanDevice::send()` guards this but the guard
-  will need to hold once the real state machine is wired.
-
-**Step 6 — First downlink (port 10 OTA commands)**
-
-- In TTN Console, schedule a downlink: FPort 10, payload `01` (CheckUpdate).
-- Trigger an uplink first — downlinks only arrive in RX windows after an uplink.
-- Confirm `parse_ota_command()` receives the payload.
-- Test additional commands: `05` (ReportVersion), `02 01 02 03` (UpdateAvailable 1.2.3).
-
-**Step 7 — Deep sleep / session persistence (Phase 7 readiness)**
-
-- After join, persist `LorawanSessionData` (CRC-32 check: implement before relying on restore).
-- Sleep and wake; confirm TTN accepts subsequent uplinks with incremented `FCntUp`.
-- If `FCntUp` is reset or reused, TTN silently rejects the frames — see `docs/project-lore.md` — "Frame counter reuse".
-
-**Common pitfalls quick reference**
-
-| Symptom                                    | Likely cause                                           |
-|:-------------------------------------------|:-------------------------------------------------------|
-| Join-request visible, no join-accept       | Wrong AppKey or EUI byte order mismatch                |
-| Join-accept in TTN, device stays `Joining` | RX window timing off, or DIO1 IRQ not delivered        |
-| All SPI commands stall / timeout           | BUSY pin not polled before each command                |
-| Downlinks queued but never received        | No uplink to open the RX window; or wrong FPort        |
-| Post-sleep uplinks rejected by TTN         | `FCntUp` reset to 0 (session key/counter not restored) |
-| Never joins but gateway is nearby          | Wrong frequency plan (US915 vs EU868) or no antenna    |
-
-</details>
+Phase 5 TTN v3 EU868 OTAA validation checklist: [runbooks/ttn-otaa-validation.md](runbooks/ttn-otaa-validation.md).
 
 ### Research
 

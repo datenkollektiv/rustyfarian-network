@@ -1,18 +1,25 @@
 //! Bare-metal ESP-NOW peer for ESP32-C3: owned radio, no Wi-Fi association, no SSID.
 //!
-//! Mirrors the "matrix"/"nunchuk" role of a multi-board prop:
+//! Mirrors the "matrix"/"nunchuk" role of a multi-board prop.
+//! Twin of `idf_c3_espnow_peer`: both run the same application body,
+//! `examples-shared/espnow_peer_app.rs`, on a [`PeerSession`] (ESP-NOW parity Step 7).
+//! This file is setup, plus the gate scenarios below.
 //!
 //! * [`EspHalEspNow::new_owned`] starts an unassociated station (the chip keeps its STA MAC),
 //!   with the TX power capped at 13 dBm (52 quarter-dBm) to avoid saturating a nearby receiver.
-//! * [`EspHalEspNow::scan_for_peer`] finds the channel on which the coordinator
-//!   (`hal_c6_espnow_sta_coordinator`) answers with a MAC-layer ACK. The pinned channel of the last
-//!   successful scan is kept across rescans and restored if a scan fails.
-//! * Every 100 ms an 8-byte frame (big-endian sequence counter) is sent and its ACK counted.
-//!   Echoed frames are counted, not logged, so the output does not distort the measurement.
+//! * The session scans for the coordinator (`hal_c6_espnow_sta_coordinator`) through
+//!   [`EspHalEspNow::scan_for_peer`]: the scan sends the `0xF3` probe, the coordinator answers
+//!   with a `0xF4` reply naming its channel, and a MAC-layer ACK alone is the fallback (ADR 025).
+//!   The pinned channel of the last successful scan is kept across rescans and restored if a
+//!   scan fails.
+//! * The shared app sends an 8-byte frame (big-endian sequence counter) every 100 ms and counts
+//!   its ACK; echoed frames are counted, not logged, so the output does not distort the
+//!   measurement.
 //!   Every 10 s the counters are logged with the failure rate; this is the traffic pattern of
 //!   hardware gate G-E1 (30 minutes at 100 ms, failures below 1 %).
-//! * After `RESCAN_AFTER_FAILURES` consecutive unacknowledged sends the peer rescans, which
-//!   recovers from a channel change of the coordinator's access point.
+//! * After 20 consecutive unacknowledged sends the session rescans, which recovers from a
+//!   channel change of the coordinator's access point; a failed scan is retried with a doubling
+//!   backoff (`PeerLinkConfig`).
 //!
 //! Build-time environment (`option_env!`):
 //!
@@ -29,6 +36,7 @@
 //! `ESPNOW_SCENARIO` selects a hardware gate scenario of
 //! `docs/runbooks/release-0.7.0-hardware-test.md`.
 //! Each scenario logs lines that start with `ESPNOW-GATE <gate> PASS` or `ESPNOW-GATE <gate> FAIL`.
+//! The scenarios drive the driver directly, without the session.
 //!
 //! | `ESPNOW_SCENARIO` | Gate   | What it does                                                                  |
 //! |:------------------|:-------|:------------------------------------------------------------------------------|
@@ -56,32 +64,27 @@ extern crate alloc;
 
 use alloc::string::String;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::join::{join3, join_array};
-use embassy_time::{with_timeout, Duration, Instant, Ticker, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 use rustyfarian_esp_hal_network::espnow::{
-    EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, MacAddress, PeerConfig,
-    ScanConfig, ScanError, TxPowerLevel,
+    EmbassyClock, EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, MacAddress,
+    PeerConfig, PeerLinkConfig, PeerSession, ScanConfig, ScanError, TxPowerLevel,
 };
 use static_cell::StaticCell;
 
+#[path = "../../../examples-shared/espnow_peer_app.rs"]
+mod espnow_peer_app;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const SEND_PERIOD_MS: u64 = 100;
-const ACK_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
-const STATS_SECS: u64 = 10;
-const RESCAN_AFTER_FAILURES: u32 = 20;
+/// Retry delay of the gate scenarios' first scan (the default scenario backs off in the session).
 const RESCAN_BACKOFF_MS: u64 = 2000;
-/// Probe payload sent during the scan; any short frame the coordinator accepts will do.
-const PROBE: &[u8] = b"scan";
-
-/// Echoed frames received; written by `rx_task` only (ESP32-C3 has no atomic read-modify-write).
-static RX_ECHOES: AtomicU32 = AtomicU32::new(0);
 
 /// Set by `sender_task` once `run_sender` has returned (gate C3-H8).
 static SENDER_RETURNED: AtomicBool = AtomicBool::new(false);
@@ -206,7 +209,6 @@ async fn main(spawner: Spawner) {
     );
 
     spawner.spawn(sender_task(espnow).unwrap());
-    spawner.spawn(rx_task(espnow).unwrap());
 
     if !SCENARIOS.contains(&SCENARIO) {
         println!(
@@ -216,6 +218,22 @@ async fn main(spawner: Spawner) {
         halt().await
     }
     println!("ESPNOW_SCENARIO={}", SCENARIO);
+
+    if SCENARIO == "default" {
+        // The session's scans register the coordinator as a peer; the shared app receives
+        // through the session, so no separate drain task runs here.
+        let session =
+            PeerSession::new(espnow, coordinator, PeerLinkConfig::default(), EmbassyClock);
+        let cfg = espnow_peer_app::PeerAppConfig {
+            pinned_channel: &|| espnow.pinned_channel(),
+            oversize_dropped: &|| espnow.oversize_dropped(),
+        };
+        espnow_peer_app::run(&session, &cfg).await;
+        halt().await
+    }
+
+    // The gate scenarios drive the driver directly; a drain task keeps the receive queue empty.
+    spawner.spawn(rx_task(espnow).unwrap());
     if SCENARIO == "cancel" {
         scenario_cancel(espnow, &coordinator).await
     }
@@ -227,69 +245,38 @@ async fn main(spawner: Spawner) {
         "shutdown" => scenario_shutdown(espnow, &coordinator, true).await,
         "shutdown-queued" => scenario_shutdown(espnow, &coordinator, false).await,
         "txpower" => scenario_txpower(espnow, &coordinator).await,
-        _ => {}
-    }
-
-    let mut ticker = Ticker::every(Duration::from_millis(SEND_PERIOD_MS));
-    let mut seq: u32 = 0;
-    let (mut sent, mut acked) = (0u32, 0u32);
-    let mut consecutive_failures: u32 = 0;
-    let mut last_stats = Instant::now();
-    loop {
-        ticker.next().await;
-        seq = seq.wrapping_add(1);
-        let mut frame = [0u8; 8];
-        frame[..4].copy_from_slice(&seq.to_be_bytes());
-        frame[4..].copy_from_slice(&(Instant::now().as_millis() as u32).to_be_bytes());
-
-        sent += 1;
-        match espnow.send_acked(&coordinator, &frame, ACK_TIMEOUT).await {
-            Ok(()) => {
-                acked += 1;
-                consecutive_failures = 0;
-            }
-            Err(EspHalEspNowError::SendFailed | EspHalEspNowError::Timeout) => {
-                consecutive_failures += 1;
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                println!("[espnow] send error: {}", e);
-            }
-        }
-
-        if last_stats.elapsed() >= Duration::from_secs(STATS_SECS) {
-            last_stats = Instant::now();
-            let failed = sent - acked;
-            // Failure rate in hundredths of a percent, integer only.
-            let per_10k = (failed as u64 * 10_000) / sent.max(1) as u64;
-            println!(
-                "[espnow] sent={} acked={} failed={} fail_rate={}.{:02}% echoes={} channel={:?} oversize_dropped={}",
-                sent,
-                acked,
-                failed,
-                per_10k / 100,
-                per_10k % 100,
-                RX_ECHOES.load(Ordering::Relaxed),
-                espnow.pinned_channel(),
-                espnow.oversize_dropped()
-            );
-        }
-
-        if consecutive_failures >= RESCAN_AFTER_FAILURES {
-            println!(
-                "[espnow] {} sends unacknowledged - rescanning",
-                consecutive_failures
-            );
-            scan_until_found(espnow, &coordinator).await;
-            consecutive_failures = 0;
-            ticker.reset();
-        }
+        _ => halt().await,
     }
 }
 
-/// Scans until the coordinator answers; the driver keeps the last good channel across attempts.
+/// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
+#[embassy_executor::task]
+async fn sender_task(espnow: &'static EspHalEspNow) {
+    espnow.run_sender().await;
+    SENDER_RETURNED.store(true, Ordering::Relaxed);
+}
+
+/// Drains the frames the coordinator echoes back during a gate scenario, so the 10-frame RX
+/// queue does not overflow; the default scenario receives through the session instead.
+/// Probe replies never arrive here: the scan takes them before `receive` sees them.
+#[embassy_executor::task]
+async fn rx_task(espnow: &'static EspHalEspNow) {
+    loop {
+        let _ = espnow.receive().await;
+    }
+}
+
+/// Parks the task after a fatal error (the message is already logged).
+async fn halt() -> ! {
+    loop {
+        Timer::after(Duration::from_secs(3600)).await;
+    }
+}
+
+/// Scans until the coordinator answers, for the gate scenarios that need it found first; the
+/// driver keeps the last good channel across attempts.
 async fn scan_until_found(espnow: &EspHalEspNow, coordinator: &MacAddress) {
-    let scan = ScanConfig::new(PROBE);
+    let scan = ScanConfig::for_peer();
     loop {
         match espnow.scan_for_peer(coordinator, &scan).await {
             Ok(result) => {
@@ -307,31 +294,6 @@ async fn scan_until_found(espnow: &EspHalEspNow, coordinator: &MacAddress) {
                 Timer::after(Duration::from_millis(RESCAN_BACKOFF_MS)).await;
             }
         }
-    }
-}
-
-/// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
-#[embassy_executor::task]
-async fn sender_task(espnow: &'static EspHalEspNow) {
-    espnow.run_sender().await;
-    SENDER_RETURNED.store(true, Ordering::Relaxed);
-}
-
-/// Counts frames the coordinator echoes back (reported in the periodic stats, never logged per
-/// frame); draining keeps the 10-frame RX queue from overflowing.
-#[embassy_executor::task]
-async fn rx_task(espnow: &'static EspHalEspNow) {
-    loop {
-        let _ = espnow.receive().await;
-        let n = RX_ECHOES.load(Ordering::Relaxed);
-        RX_ECHOES.store(n.wrapping_add(1), Ordering::Relaxed);
-    }
-}
-
-/// Parks the task after a fatal error (the message is already logged).
-async fn halt() -> ! {
-    loop {
-        Timer::after(Duration::from_secs(3600)).await;
     }
 }
 
@@ -400,7 +362,7 @@ fn radio_state(espnow: &EspHalEspNow, coordinator: &MacAddress) -> RadioState {
 /// must find the coordinator on the channel it was found on before.
 async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
     const DELAYS_MS: [u64; 6] = [3, 10, 25, 60, 120, 250];
-    let scan = ScanConfig::new(PROBE);
+    let scan = ScanConfig::for_peer();
     let mut known: Option<u8> = None;
     let mut cycle = 0usize;
     loop {
@@ -573,7 +535,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
     };
     // No peer owns this address, so every probe fails and the scan keeps going.
     let silent: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-    let scan_config = ScanConfig::new(PROBE).with_channels(&CHANNELS);
+    let scan_config = ScanConfig::for_peer().with_channels(&CHANNELS);
 
     let outcome = with_timeout(Duration::from_secs(10), async {
         let sends = join_array::<_, SENDS>(core::array::from_fn(|i| {
@@ -642,7 +604,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
         );
     }
     let later_scan = espnow
-        .scan_for_peer(coordinator, &ScanConfig::new(PROBE))
+        .scan_for_peer(coordinator, &ScanConfig::for_peer())
         .await;
     let after = radio_state(espnow, coordinator);
     if later_scan.is_ok() || before != after {
@@ -682,7 +644,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
 
 /// C3-H9: the radio TX power must be the same before and after each scan.
 async fn scenario_txpower(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
-    let scan = ScanConfig::new(PROBE);
+    let scan = ScanConfig::for_peer();
     let mut scans = 0u32;
     loop {
         scans += 1;

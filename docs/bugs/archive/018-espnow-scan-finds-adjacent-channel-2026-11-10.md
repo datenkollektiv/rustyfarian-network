@@ -2,8 +2,8 @@
 id: 018
 title: An ESP-NOW scan at close range reports the coordinator on an adjacent channel
 captured-on: 2026-11-10
-doc-version: 3
-status: open-observation
+doc-version: 4
+status: closed
 kind: observation
 ---
 
@@ -32,3 +32,5 @@ medium
 - 2026-11-10 — Observation captured via /bug dialog from the C3-I7 rerun; first check is a rerun with the boards metres apart
 - 2026-11-11 — Related observation: with the C3 scout and the hal C6 coordinator close on the bench the scout found nothing on any channel for about six minutes (the coordinator's `rx` counter stood still, then read 0 after a reset) and found it on channel 11 within seconds of the boards being moved to opposite edges of the table; a replug of both boards happened in the same minute, so distance and replug are not separated
 - 2026-11-11 — The `espnow-cancel` run at 01:45 found the coordinator on channel 10 (C6 on 11) with the boards at opposite edges of the table, so the adjacent-channel find is not only a close-range effect
+- 2026-11-11 — Fix landed (ADR 025, feature [espnow-probe-reply-channel-v1](../features/espnow-probe-reply-channel-v1.md)): the scan sends a `0xF3` probe and trusts the coordinator's `0xF4` reply carrying its channel over the MAC-layer ACK, which stays the fallback; the shared echo app answers on both coordinators; closes after the bench rerun of C3-I7 and C3-H6 with the found channel equal to the coordinator's
+- 2026-11-11 — Closed: with the probe reply (ADR 025) both tiers found the coordinator on channel 11 in every scan after a cancel (`just bench c3 espnow-cancel --unattended` 2/2 twice per tier), and the txpower, flood and shutdown reruns showed no adjacent-channel find; the only wandering finds left are the boot-time roaming case while a freshly powered coordinator still scans for its access point, recorded in ADR 025

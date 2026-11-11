@@ -7,6 +7,8 @@
 //! - [`PeerConfig`] — peer registration parameters
 //! - [`PeerTracker`] — heartbeat-based peer liveness tracking
 //! - [`PeerLink`] — clock-injected supervisor that decides when to (re)scan for the coordinator
+//! - [`PeerSession`] — the async helper that drives [`PeerLink`] over an [`EspNowLink`] on either
+//!   tier, with its [`Clock`] port (`EmbassyClock` behind the `embassy` feature)
 //! - [`EspNowLink`] — async acked send, receive and scan surface both tiers implement
 //! - [`ClassifySend`] — maps a tier send error onto [`SendOutcome`]
 //! - [`OversizeLog`] — counter and rate-limited log decision for dropped oversize frames
@@ -24,9 +26,10 @@
 //!
 //! # Feature flags
 //!
-//! | Feature | What it enables                                              |
-//! |:--------|:-------------------------------------------------------------|
-//! | `mock`  | `MockEspNowDriver` for downstream host-side tests            |
+//! | Feature   | What it enables                                              |
+//! |:----------|:-------------------------------------------------------------|
+//! | `mock`    | `MockEspNowDriver` for downstream host-side tests            |
+//! | `embassy` | `EmbassyClock`, the `embassy-time` clock for `PeerSession`   |
 
 pub mod callback;
 pub mod command;
@@ -38,6 +41,7 @@ pub mod link_trait;
 pub mod mock;
 pub mod scan;
 pub mod scan_job;
+pub mod session;
 pub mod tracker;
 pub mod tx;
 #[cfg(feature = "std")]
@@ -59,6 +63,9 @@ pub use scan::{
     ScanAction, ScanError, ScanFault, ScanInput, ScanMachine, ScanTeardown, SendOutcome,
 };
 pub use scan_job::{CancelOutcome, Cancelled, GateRefusal, JobEpoch, ScanGate, ScanJobSlot};
+#[cfg(feature = "embassy")]
+pub use session::EmbassyClock;
+pub use session::{Clock, PeerSendError, PeerSession};
 pub use tracker::PeerTracker;
 #[allow(deprecated)]
 pub use tx::DeferredRestore;
@@ -133,6 +140,15 @@ pub const DEFAULT_PROBE_CONFIRMATIONS: u8 = 1;
 /// the risk of false-positive channel detection during roams.
 /// Override with [`ScanConfig::with_confirmation_gap`].
 pub const DEFAULT_CONFIRMATION_GAP: core::time::Duration = core::time::Duration::from_millis(150);
+
+/// Default wait for the peer's [`ProbeReply`] after a probe was ACKed.
+///
+/// A coordinator running the shared echo app answers a probe within a few
+/// milliseconds; the wait only has to outlast that.
+/// It starts at the ACK, so it adds to [`DEFAULT_PROBE_TIMEOUT`] on each
+/// channel that ACKs and nothing on the others.
+/// Override with [`ScanConfig::with_reply_timeout`].
+pub const DEFAULT_REPLY_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -320,14 +336,23 @@ impl PeerConfig {
 
 /// Configuration for ESP-NOW channel scanning.
 ///
-/// Controls which channels to probe, what payload to send as the probe
-/// frame, and how long to wait for the MAC-layer ACK on each channel.
-/// The peer ACKs at the MAC layer regardless of payload content.
+/// Controls which channels to probe, how long to wait for the MAC-layer ACK
+/// on each channel, and how long to wait for the peer's [`ProbeReply`] after
+/// an ACK.
+/// The scan sends the [`ProbeFrame`] (`0xF3`) as its probe; the peer ACKs at
+/// the MAC layer regardless of payload content, and a peer running the echo
+/// app answers with its home channel (ADR 025).
 #[derive(Debug, Clone, Copy)]
 pub struct ScanConfig<'a> {
     /// Channels to scan, in order (default: [`DEFAULT_SCAN_CHANNELS`]).
     pub channels: &'a [u8],
-    /// Payload sent as the probe frame.
+    /// Ignored: the scan sends the [`ProbeFrame`] it builds itself.
+    ///
+    /// Kept for one release; build the config with [`ScanConfig::for_peer`].
+    #[deprecated(
+        since = "0.7.0",
+        note = "the scan sends the 0xF3 probe frame itself; build the config with `ScanConfig::for_peer()`"
+    )]
     pub probe_data: &'a [u8],
     /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
     ///
@@ -357,19 +382,48 @@ pub struct ScanConfig<'a> {
     /// roughly 100 ms across common ESP-IDF / vendor stacks) for the
     /// confirmation to reliably reject a roaming peer's transient ACK.
     pub confirmation_gap: core::time::Duration,
+    /// Wait for the peer's [`ProbeReply`] after a probe was ACKed
+    /// (default: [`DEFAULT_REPLY_TIMEOUT`] = 50 ms).
+    ///
+    /// A reply that names the peer's home channel ends the scan on that
+    /// channel; an ACK without a reply within this wait makes the channel a
+    /// candidate that is settled after the channel list with the confirmation
+    /// rule above.
+    pub reply_timeout: core::time::Duration,
 }
 
 impl<'a> ScanConfig<'a> {
-    /// Create a scan config with default channels (1-13), the given probe
-    /// payload, and the default timeouts and confirmation settings.
-    pub fn new(probe_data: &'a [u8]) -> Self {
+    /// Create a scan config with default channels (1-13) and the default
+    /// timeouts and confirmation settings.
+    ///
+    /// The scan builds its own probe frames; there is no payload to pass.
+    pub fn for_peer() -> Self {
+        #[allow(deprecated)]
         Self {
             channels: &DEFAULT_SCAN_CHANNELS,
-            probe_data,
+            probe_data: &[],
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             burst_timeout: DEFAULT_BURST_TIMEOUT,
             probe_confirmations: DEFAULT_PROBE_CONFIRMATIONS,
             confirmation_gap: DEFAULT_CONFIRMATION_GAP,
+            reply_timeout: DEFAULT_REPLY_TIMEOUT,
+        }
+    }
+
+    /// Create a scan config with default channels (1-13), the given probe
+    /// payload, and the default timeouts and confirmation settings.
+    ///
+    /// `probe_data` is ignored: the scan sends the [`ProbeFrame`] it builds
+    /// itself.
+    #[deprecated(
+        since = "0.7.0",
+        note = "the scan sends the 0xF3 probe frame itself; use `ScanConfig::for_peer()`"
+    )]
+    pub fn new(probe_data: &'a [u8]) -> Self {
+        #[allow(deprecated)]
+        Self {
+            probe_data,
+            ..Self::for_peer()
         }
     }
 
@@ -412,6 +466,17 @@ impl<'a> ScanConfig<'a> {
     /// and reduces it to a doubled-up first-ACK-wins scan.
     pub fn with_confirmation_gap(mut self, gap: core::time::Duration) -> Self {
         self.confirmation_gap = gap;
+        self
+    }
+
+    /// Override the wait for the peer's [`ProbeReply`] after an ACK.
+    ///
+    /// The wait starts at the ACK.
+    /// Too short a value turns a replying peer into an ACK-only candidate,
+    /// which is settled with the confirmation rule after the channel list, so
+    /// an adjacent channel may win as before the reply existed.
+    pub fn with_reply_timeout(mut self, timeout: core::time::Duration) -> Self {
+        self.reply_timeout = timeout;
         self
     }
 }
@@ -619,38 +684,54 @@ mod tests {
 
     #[test]
     fn scan_config_default_channels() {
-        let config = ScanConfig::new(b"probe");
+        let config = ScanConfig::for_peer();
         assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
-        assert_eq!(config.probe_data, b"probe");
         assert_eq!(config.probe_timeout, DEFAULT_PROBE_TIMEOUT);
         assert_eq!(config.burst_timeout, DEFAULT_BURST_TIMEOUT);
         assert_eq!(config.probe_confirmations, DEFAULT_PROBE_CONFIRMATIONS);
         assert_eq!(config.confirmation_gap, DEFAULT_CONFIRMATION_GAP);
+        assert_eq!(config.reply_timeout, DEFAULT_REPLY_TIMEOUT);
+    }
+
+    #[test]
+    fn scan_config_custom_reply_timeout() {
+        let timeout = core::time::Duration::from_millis(20);
+        let config = ScanConfig::for_peer().with_reply_timeout(timeout);
+        assert_eq!(config.reply_timeout, timeout);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_scan_config_new_still_builds_the_default_config() {
+        let config = ScanConfig::new(b"probe");
+        assert_eq!(config.probe_data, b"probe");
+        assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
+        assert_eq!(config.reply_timeout, DEFAULT_REPLY_TIMEOUT);
     }
 
     #[test]
     fn scan_config_custom_channels() {
         let channels = [1, 6, 11];
-        let config = ScanConfig::new(b"ping").with_channels(&channels);
+        let config = ScanConfig::for_peer().with_channels(&channels);
         assert_eq!(config.channels, &[1, 6, 11]);
     }
 
     #[test]
     fn scan_config_custom_probe_confirmations() {
-        let config = ScanConfig::new(b"ping").with_probe_confirmations(3);
+        let config = ScanConfig::for_peer().with_probe_confirmations(3);
         assert_eq!(config.probe_confirmations, 3);
     }
 
     #[test]
     fn scan_config_zero_probe_confirmations_disables_confirmation() {
-        let config = ScanConfig::new(b"ping").with_probe_confirmations(0);
+        let config = ScanConfig::for_peer().with_probe_confirmations(0);
         assert_eq!(config.probe_confirmations, 0);
     }
 
     #[test]
     fn scan_config_custom_confirmation_gap() {
         let gap = core::time::Duration::from_millis(200);
-        let config = ScanConfig::new(b"ping").with_confirmation_gap(gap);
+        let config = ScanConfig::for_peer().with_confirmation_gap(gap);
         assert_eq!(config.confirmation_gap, gap);
     }
 
@@ -669,14 +750,14 @@ mod tests {
     #[test]
     fn scan_config_custom_probe_timeout() {
         let timeout = core::time::Duration::from_millis(250);
-        let config = ScanConfig::new(b"ping").with_probe_timeout(timeout);
+        let config = ScanConfig::for_peer().with_probe_timeout(timeout);
         assert_eq!(config.probe_timeout, timeout);
     }
 
     #[test]
     fn scan_config_custom_burst_timeout() {
         let timeout = core::time::Duration::from_secs(5);
-        let config = ScanConfig::new(b"ping").with_burst_timeout(timeout);
+        let config = ScanConfig::for_peer().with_burst_timeout(timeout);
         assert_eq!(config.burst_timeout, timeout);
     }
 

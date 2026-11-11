@@ -213,6 +213,9 @@ struct LinkState {
     last_timeout: Option<Duration>,
     pinned: Option<u8>,
     shut_down: bool,
+    hold_sends: bool,
+    hold_scans: bool,
+    scans_requested: usize,
 }
 
 /// Mock implementation of [`EspNowLink`] (and [`EspNowDriver`]) for host-side tests.
@@ -227,6 +230,12 @@ struct LinkState {
 /// A successful scan pins its channel; a failed one keeps the previous pin.
 /// [`receive`](EspNowLink::receive) pends while the queue is empty, so tests only await it
 /// after queueing a frame.
+/// While [`set_hold_sends`](Self::set_hold_sends) is on, a `send_acked` takes its scripted
+/// result at the call but pends until the hold is lifted, so a test can interleave other
+/// work with a frame in flight.
+/// While [`set_hold_scans`](Self::set_hold_scans) is on, a `scan_for_peer` is counted at the
+/// call but pends until the hold is lifted and takes its scripted result only then, so a
+/// scan dropped while held consumes nothing.
 pub struct MockEspNowLink {
     driver: MockEspNowDriver,
     state: RefCell<LinkState>,
@@ -243,8 +252,33 @@ impl MockEspNowLink {
                 last_timeout: None,
                 pinned: None,
                 shut_down: false,
+                hold_sends: false,
+                hold_scans: false,
+                scans_requested: 0,
             }),
         }
+    }
+
+    /// Holds every [`scan_for_peer`](EspNowLink::scan_for_peer) pending until the hold is
+    /// lifted.
+    ///
+    /// The call is counted at once; the scripted result is taken on the first poll after
+    /// `set_hold_scans(false)`.
+    pub fn set_hold_scans(&self, hold: bool) {
+        self.state.borrow_mut().hold_scans = hold;
+    }
+
+    /// Holds every [`send_acked`](EspNowLink::send_acked) pending until the hold is lifted.
+    ///
+    /// The scripted result is taken when the call starts; the frame is recorded as sent and
+    /// the result returned on the first poll after `set_hold_sends(false)`.
+    pub fn set_hold_sends(&self, hold: bool) {
+        self.state.borrow_mut().hold_sends = hold;
+    }
+
+    /// Number of [`scan_for_peer`](EspNowLink::scan_for_peer) calls so far.
+    pub fn scans_requested(&self) -> usize {
+        self.state.borrow().scans_requested
     }
 
     /// Queues the result of a future [`send_acked`](EspNowLink::send_acked) call.
@@ -332,6 +366,15 @@ impl EspNowLink for MockEspNowLink {
             state.last_timeout = Some(timeout);
             state.send_script.pop_front().unwrap_or(Ok(()))
         };
+        core::future::poll_fn(|cx| {
+            if self.state.borrow().hold_sends {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(())
+            }
+        })
+        .await;
         if !matches!(scripted, Err(MockLinkError::Local)) {
             self.driver
                 .send(mac, data)
@@ -356,6 +399,16 @@ impl EspNowLink for MockEspNowLink {
         _mac: &MacAddress,
         _config: &ScanConfig<'_>,
     ) -> Result<ScanResult, Self::Error> {
+        self.state.borrow_mut().scans_requested += 1;
+        core::future::poll_fn(|cx| {
+            if self.state.borrow().hold_scans {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(())
+            }
+        })
+        .await;
         let mut state = self.state.borrow_mut();
         let result = state
             .scan_script
@@ -368,6 +421,12 @@ impl EspNowLink for MockEspNowLink {
     }
 
     fn pinned_channel(&self) -> Option<u8> {
+        self.state.borrow().pinned
+    }
+
+    /// The mock has no radio: its live channel is its pin (see
+    /// [`set_pinned_channel`](Self::set_pinned_channel)).
+    fn current_channel(&self) -> Option<u8> {
         self.state.borrow().pinned
     }
 

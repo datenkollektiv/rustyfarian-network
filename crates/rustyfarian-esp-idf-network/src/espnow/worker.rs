@@ -232,6 +232,23 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 // ESP-IDF facts
 // ---------------------------------------------------------------------------------------------
 
+/// The primary channel the Wi-Fi radio is on (`esp_wifi_get_channel`), `None` when the driver
+/// refuses the query (radio not initialised or not started).
+///
+/// Any thread may call it; the function only reads the driver's state.
+pub(super) fn current_channel() -> Option<u8> {
+    let mut primary: u8 = 0;
+    let mut second = esp_idf_svc::sys::wifi_second_chan_t_WIFI_SECOND_CHAN_NONE;
+    // SAFETY: plain FFI call into the ESP-IDF Wi-Fi subsystem with pointers to two live locals
+    // it writes; it reads driver state only and fails cleanly before the driver is initialised.
+    let ret = unsafe { esp_idf_svc::sys::esp_wifi_get_channel(&mut primary, &mut second) };
+    if ret != esp_idf_svc::sys::ESP_OK {
+        log::debug!("esp_wifi_get_channel failed: {ret:#x}");
+        return None;
+    }
+    Some(primary)
+}
+
 /// Hands one frame to the radio and returns the `esp_err_t`.
 ///
 /// With `repin`, the radio is first re-pinned to that channel inside a promiscuous bracket

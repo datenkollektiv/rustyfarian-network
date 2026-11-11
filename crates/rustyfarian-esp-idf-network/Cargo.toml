@@ -9,9 +9,10 @@ description = "ESP-IDF (std) drivers for Wi-Fi, MQTT, LoRa, ESP-NOW, OTA, and pr
 keywords = ["esp32", "esp-idf", "wifi", "mqtt", "lora"]
 categories = ["embedded", "hardware-support"]
 readme = "README.md"
-# The LWT example shares its application body with the esp-hal twin
-# (`examples-shared/lwt_app.rs`), which lives outside this package; it is bench-only.
-exclude = ["examples/idf_esp32s3_mqtt_lwt.rs"]
+# The LWT and ESP-NOW coordinator examples share their application bodies with the esp-hal
+# twins (`examples-shared/lwt_app.rs`, `examples-shared/espnow_echo_app.rs`), which live
+# outside this package; they are bench-only.
+exclude = ["examples/idf_esp32s3_mqtt_lwt.rs", "examples/idf_c3_espnow_coordinator.rs"]
 
 [package.metadata.docs.rs]
 default-target = "riscv32imc-esp-espidf"
@@ -90,6 +91,8 @@ lora = [
 
 # espnow: ESP-NOW peer-to-peer driver.
 espnow = ["juggler/wifi", "juggler/espnow", "juggler/std"]
+# `juggler/embassy` brings `espnow::EmbassyClock` for `PeerSession` (no time driver is selected).
+espnow = ["juggler/wifi", "juggler/espnow", "juggler/std", "juggler/embassy"]
 
 # ota: Streaming download + SHA-256 verify + partition swap.
 ota = ["juggler/ota", "juggler/ota-wire", "dep:embedded-svc"]

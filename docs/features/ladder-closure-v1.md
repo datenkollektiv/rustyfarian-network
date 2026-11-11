@@ -162,7 +162,7 @@ An item is ticked once every gate it names has a pass (or an N/A waiver) in `doc
 - [x] ES-I1 (ESP32 classic, ESP-IDF, MQTT smoke with AP off and on); passed on the bench 2026-11-08 with a router block as the outage.
 - [x] ES-H1 and ES-H2 (ESP32 classic, esp-hal, Wi-Fi and MQTT smoke); passed on the bench 2026-11-08 with a router block as the outage.
 - [ ] C3-I1 (ESP-NOW coordinator power cycle) and C3-I2 (ESP-NOW scan on channels 1, 6 and 11).
-- [ ] C3-I7 (IDF ESP-NOW scan cancel and not-found restore; the `ESPNOW_SCENARIO=cancel` trigger exists).
+- [x] C3-I7 (IDF ESP-NOW scan cancel and not-found restore); passed on the bench 2026-11-11 with the probe reply (ADR 025), bug 018 closed.
 - [x] C3-I8 (IDF ESP-NOW send-queue saturation and queued versus in-flight deadlines); passed on the bench 2026-11-10.
 - [x] C3-I9 (IDF ESP-NOW shutdown with queued and in-flight requests); both variants passed on the bench 2026-11-10.
 - [x] C3-I10 (IDF ESP-NOW TX-power read-back after a scan); passed on the bench 2026-11-10.
@@ -171,7 +171,7 @@ An item is ticked once every gate it names has a pass (or an N/A waiver) in `doc
   The flattened health and reporter loops need the rows P2, P7, P13, P14 and P17 rerun.
 - [x] C3-H1 (provisioning record with extras across a reboot); passed 2026-11-09 on `c4d3879`, the stalled-client step is still not runnable.
 - [ ] C3-H2 (owned-radio ESP-NOW peer, 30 minutes, and channel scan) and C3-H3 (mixed fleet, peer link, blocked on `PeerSession`).
-- [ ] C3-H6 (esp-hal ESP-NOW scan cancel and not-found restore; the `ESPNOW_SCENARIO=cancel` trigger exists).
+- [ ] C3-H6 (esp-hal ESP-NOW scan cancel and not-found restore); the same-channel half passed on the bench 2026-11-11, the coordinator-off half is still owed.
 - [x] C3-H7 (esp-hal ESP-NOW send-queue saturation and deadlines); passed on the bench 2026-11-11.
 - [x] C3-H8 (esp-hal ESP-NOW shutdown with queued and in-flight requests); both variants passed on the bench 2026-11-11.
 - [x] C3-H9 (esp-hal ESP-NOW TX-power read-back after a scan); passed on the bench 2026-11-11, three scans with the radio and handle levels unchanged.

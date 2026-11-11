@@ -117,6 +117,22 @@ loop {
 }
 ```
 
+## Example: ESP-NOW coordinator, peer and scouts
+
+The ESP-IDF ESP-NOW examples talk to each other across two boards.
+`idf_c3_espnow_coordinator` (ESP32-C3 Super Mini) and `idf_c6_espnow_coordinator` (ESP32-C6 DevKit, no status LED) are associated stations with ESP-NOW alongside; both run the shared echo app in `examples-shared/espnow_echo_app.rs`, which answers scan probes with the current channel and echoes every other frame.
+`idf_c3_espnow_peer` (ESP32-C3 Super Mini) owns its radio as a hidden SoftAP (`EspIdfEspNow::init_with_radio`) and runs the shared peer app in `examples-shared/espnow_peer_app.rs` on a `PeerSession` (`espnow::{PeerSession, PeerLinkConfig, EmbassyClock}`), the twin of `hal_c3_espnow_peer`: the session scans for the coordinator and rescans after 20 consecutive unacknowledged sends, and the app sends an 8-byte frame every 100 ms and logs its counters every 10 s.
+`idf_c3_espnow_scout` (SoftAP channel lock), `idf_c3_espnow_scout_promisc` (STA plus promiscuous bracket) and `idf_c3_espnow_sta_scout` are demos of the blocking API (`scan_for_peer_blocking`, `send_and_wait`): they scan for the coordinator and send a frame every second.
+
+```bash
+WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example idf_c6_espnow_coordinator
+ESPNOW_PEER_MAC="aa:bb:cc:dd:ee:ff" just build-example idf_c3_espnow_peer
+COORDINATOR_MAC="aa:bb:cc:dd:ee:ff" just build-example idf_c3_espnow_scout
+```
+
+The coordinator prints its station MAC at boot (`Coordinator STA MAC: …`); pass it to the peer as `ESPNOW_PEER_MAC` (it also accepts `COORDINATOR_MAC`) and to the scouts as `COORDINATOR_MAC`.
+The coordinator and peer examples are excluded from the published crate because they include a file outside the package.
+
 ## Tier capability differences
 
 The tiers share one API ([ADR 022](https://github.com/datenkollektiv/rustyfarian-network/blob/main/docs/adr/022-tier-parity-one-async-api.md)).

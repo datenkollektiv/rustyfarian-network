@@ -3,19 +3,24 @@
 //! Mirrors the "brain" role of a multi-board prop: the C6 stays associated to the router (so MQTT
 //! or other IP traffic could run) and uses ESP-NOW to talk to unassociated peers such as
 //! `hal_c3_espnow_peer`.
+//! Twin of `idf_c3_espnow_coordinator`: both run the same application body,
+//! `examples-shared/espnow_echo_app.rs`, so the two tiers answer peers alike.
+//! This file is setup only: Wi-Fi, ESP-NOW and the tasks around the shared app.
 //!
 //! * Connects the station and waits for a DHCPv4 lease **before** starting ESP-NOW; the radio
 //!   channel is then the access point's and stays stable (ESP-NOW started earlier lost most
 //!   frames in the field).
 //! * [`EspHalEspNow::from_controller`] borrows the controller; A-MPDU is switched off in the Wi-Fi
 //!   config, like the ESP-IDF tier's sdkconfig, so Block-Ack exchanges do not starve ESP-NOW RX.
-//! * `rx_task` receives every frame, registers unknown senders as peers (by STA MAC, channel 0 =
-//!   current channel) and echoes the payload back to the sender.
-//! * The main loop logs the station MAC and counters every 10 s, so the peer can be given
-//!   `ESPNOW_PEER_MAC` and the oversize-drop counter (frames above 250 B) can be watched.
+//! * The shared app receives every frame, registers unknown senders as peers (by STA MAC,
+//!   channel 0 = current channel), answers a scan probe (`0xF3`) with a `0xF4` reply that names
+//!   the current channel (ADR 025) and echoes every other payload back to the sender.
+//! * The shared app logs the counters and the channel every 10 s (`[app] rx=… reply_acked=…
+//!   reply_failed=… oversize_dropped=… channel=… heap_free=…`); the station MAC is printed at
+//!   boot, so the peer can be given `ESPNOW_PEER_MAC`.
 //!
-//! The ESP-NOW receive queue holds 10 frames (drop-oldest, not configurable); `rx_task` does
-//! nothing slow between receives.
+//! The ESP-NOW receive queue holds 10 frames (drop-oldest, not configurable); the receive loop
+//! does nothing slow between receives.
 //!
 //! Build-time environment (`option_env!`, never logged):
 //!
@@ -36,27 +41,25 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_println::println;
 use esp_radio::wifi::Interface;
-use rustyfarian_esp_hal_network::espnow::{
-    EspHalEspNow, EspHalEspNowError, EspNowConfig, EspNowDriver, PeerConfig,
-};
+use rustyfarian_esp_hal_network::espnow::{EspHalEspNow, EspNowConfig};
 use rustyfarian_esp_hal_network::wifi::{
     link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
 };
 use static_cell::StaticCell;
+
+#[path = "../../../examples-shared/espnow_echo_app.rs"]
+mod espnow_echo_app;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static LINK: WifiLink = WifiLink::new();
 
 const CONNECT_BACKOFF_MS: u64 = 5000;
-const STATS_SECS: u64 = 10;
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,
@@ -67,9 +70,9 @@ fn password() -> &'static str {
     option_env!("WIFI_PASS").unwrap_or_default()
 }
 
-static RX_FRAMES: AtomicU32 = AtomicU32::new(0);
-static TX_ACKED: AtomicU32 = AtomicU32::new(0);
-static TX_FAILED: AtomicU32 = AtomicU32::new(0);
+fn free_heap() -> usize {
+    esp_alloc::HEAP.free()
+}
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -132,64 +135,25 @@ async fn main(spawner: Spawner) {
 
     let mac = EspHalEspNow::sta_mac();
     println!(
-        "ESP-NOW up. STA MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (use as ESPNOW_PEER_MAC on the peer)",
+        "ESP-NOW up on channel {:?}. STA MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (use as ESPNOW_PEER_MAC on the peer)",
+        espnow.current_channel(),
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
 
     spawner.spawn(sender_task(espnow).unwrap());
-    spawner.spawn(rx_task(espnow).unwrap());
     spawner.spawn(link_task(&LINK, controller, stack).unwrap());
 
-    loop {
-        Timer::after(Duration::from_secs(STATS_SECS)).await;
-        println!(
-            "[espnow] rx={} reply_acked={} reply_failed={} oversize_dropped={} heap_free={} B",
-            RX_FRAMES.load(Ordering::Relaxed),
-            TX_ACKED.load(Ordering::Relaxed),
-            TX_FAILED.load(Ordering::Relaxed),
-            espnow.oversize_dropped(),
-            esp_alloc::HEAP.free()
-        );
-    }
+    let cfg = espnow_echo_app::EchoAppConfig {
+        oversize_dropped: &|| espnow.oversize_dropped(),
+        free_heap,
+    };
+    espnow_echo_app::run(espnow, &cfg).await;
 }
 
 /// Owns every async ESP-NOW transmission (`send_acked` and scan probes); never cancelled.
 #[embassy_executor::task]
 async fn sender_task(espnow: &'static EspHalEspNow) {
     espnow.run_sender().await
-}
-
-/// Receives frames and echoes each payload back to its sender.
-#[embassy_executor::task]
-async fn rx_task(espnow: &'static EspHalEspNow) {
-    loop {
-        let event = espnow.receive().await;
-        RX_FRAMES.fetch_add(1, Ordering::Relaxed);
-
-        // Unicast needs a peer entry; channel 0 follows the associated channel.
-        if !espnow.peer_exists(&event.mac) {
-            if let Err(e) = espnow.add_peer(&PeerConfig::new(event.mac)) {
-                println!("[espnow] add_peer failed: {:?}", e);
-                continue;
-            }
-        }
-        match espnow
-            .send_acked(
-                &event.mac,
-                event.payload(),
-                core::time::Duration::from_millis(100),
-            )
-            .await
-        {
-            Ok(()) => {
-                TX_ACKED.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(EspHalEspNowError::SendFailed | EspHalEspNowError::Timeout) => {
-                TX_FAILED.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => println!("[espnow] reply error: {}", e),
-        }
-    }
 }
 
 #[embassy_executor::task]

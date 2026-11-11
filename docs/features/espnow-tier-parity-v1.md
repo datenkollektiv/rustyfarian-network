@@ -71,3 +71,4 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - 2026-11-03 — Design review folded in: outcome classification, cancellation and timeout, scan ownership, receive in the trait
 - 2026-11-03 — Inventory and step plan written; B1–B6, names, juggler deps approved; two released ESP-IDF bugs found (stale ACK, oversize receive)
 - 2026-11-03 — Review contracts settled: atomic scan admission, preemption, shutdown, scan cancellation, broadcast refusal, unordered receive
+- 2026-11-11 — Plan Step 5 done inside the probe-reply feature: shared `examples-shared/espnow_echo_app.rs` on both coordinators, the IDF one on `block_on`

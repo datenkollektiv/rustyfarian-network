@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     let mut led = PinDriver::output(peripherals.pins.gpio8)?;
     led.set_high()?; // LED off (active low)
 
-    let scan_config = ScanConfig::new(b"scout-probe");
+    let scan_config = ScanConfig::for_peer();
 
     // STA mode: promiscuous bracket re-pins the channel before every send.
     let espnow = EspIdfEspNow::init_with_radio_sta(peripherals.modem, sys_loop, Some(nvs))?;

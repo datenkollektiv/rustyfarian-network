@@ -62,3 +62,17 @@ A future `ReceivedCommand` or context wrapper may bundle `CommandFrame` + sender
 **Neutral:**
 - Does not prevent a future `ReceivedCommand { frame: CommandFrame, sender: [u8; 6] }` wrapper if bundling proves necessary.
   Such a wrapper would live in `espnow-pure` alongside `EspNowEvent`, since the sender MAC is an ESP-NOW transport concept; reuse over UART or MQTT would define its own context type rather than borrowing one tied to MAC addressing.
+
+## Amendment 2026-11-11: System Tags
+
+The system range `0xF0..=0xFF` of `juggler::espnow::command` holds these tags; module tags are `0x01..=0xEF` and `0x00` is reserved.
+
+| Tag | Name | Payload | Since |
+|:----|:-----|:--------|:------|
+| `0xF0` | `TAG_PING` | request empty; response `[0xF0, 0x01]` | Phase 1 |
+| `0xF1` | `TAG_SELF_TEST` | request empty; response `[0xF1, 0x00]` pass or `[0xF1, 0x01]` fail | Phase 1 |
+| `0xF2` | `TAG_IDENTIFY` | request empty; response `[0xF2, module_type, version]` | Phase 1 |
+| `0xF3` | `TAG_PROBE` | `[0xF3, seq, tx_channel]`, the scan probe (`ProbeFrame`) | [ADR 025](025-espnow-probe-reply-carries-channel.md) |
+| `0xF4` | `TAG_PROBE_REPLY` | `[0xF4, seq, tx_channel, home_channel]`, the coordinator's answer (`ProbeReply`) | [ADR 025](025-espnow-probe-reply-carries-channel.md) |
+
+The probe and its reply follow this ADR: neither carries the sender MAC, the scan matches a reply to its probe by `seq` and `tx_channel` and takes the sender from the transport sidecar.

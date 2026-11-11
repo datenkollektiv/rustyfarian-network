@@ -181,12 +181,13 @@ Two examples form a pair (feature `espnow`, ESP32-C3 and ESP32-C6; ADR 020):
 * `examples/hal_c6_espnow_sta_coordinator.rs` (C6): the station associates and gets a DHCP lease first, then `EspHalEspNow::from_controller(&mut controller, EspNowConfig::default())` starts ESP-NOW on the settled channel (A-MPDU off in the Wi-Fi config).
   Each received frame registers its sender as a peer and is echoed back; counters (including `oversize_dropped`) are logged every 10 s, and the station MAC is printed once at boot.
 * `examples/hal_c3_espnow_peer.rs` (C3): `EspHalEspNow::new_owned(WIFI, EspNowConfig::default().with_tx_power(TxPowerLevel::Medium))` starts an unassociated station at 13 dBm (52 quarter-dBm) after `esp_rtos::start`.
-  `scan_for_peer` finds the coordinator (`ESPNOW_PEER_MAC`, optional `ESPNOW_CHANNEL` as first pin), then a frame goes out every 100 ms with the ACK counted and the failure rate logged every 10 s; 20 consecutive unacknowledged sends trigger a rescan.
-  This is the traffic pattern of hardware gate G-E1 (see `docs/ROADMAP.md`).
+  Its default scenario runs the shared peer app in `examples-shared/espnow_peer_app.rs` on a `PeerSession` (`espnow::{PeerSession, PeerLinkConfig, EmbassyClock}`, the twin of `idf_c3_espnow_peer`): the session scans for the coordinator (`ESPNOW_PEER_MAC`, optional `ESPNOW_CHANNEL` as first pin) and rescans after 20 consecutive unacknowledged sends, and the app sends a frame every 100 ms with the ACK counted and the failure rate logged every 10 s.
+  This is the traffic pattern of hardware gate G-E1 (see `docs/ROADMAP.md`); `ESPNOW_SCENARIO` selects a gate scenario instead.
 
 Async sends and scan probes need the sender runner: spawn `espnow.run_sender()` once in an `embassy_executor::task` (both examples do) before the first `send_acked` or `scan_for_peer`.
 Without it they return `NoSenderRunner`; the sync `send` / `send_and_wait` work without it.
 `EspHalEspNow` implements the shared `juggler::espnow::EspNowLink` (`send_acked`, `receive`, `scan_for_peer`, `pinned_channel`), so generic code runs on both tiers.
+The peer-link helper `PeerSession` (with `PeerLinkConfig`, `PeerLinkState`, `Clock`, `EmbassyClock` and `PeerSendError`) is re-exported from `espnow` on both tiers.
 `send_acked` refuses the broadcast address (`Broadcast`), and any application send during a scan fails with `ScanInProgress`.
 `scan_for_peer(&mac, &config)` needs a `new_owned` handle (`ControllerNotOwned` otherwise) and the driver keeps the pinned channel.
 

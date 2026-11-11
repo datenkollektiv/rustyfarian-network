@@ -23,8 +23,9 @@
 //!   [`EspHalEspNow::scan_for_peer`]) need one, the sender runner ([`EspHalEspNow::run_sender`])
 //!   must be spawned for the send helpers, and an `embassy-time` driver (provided by
 //!   `esp_rtos` with the `embassy` feature that `espnow` implies).
-//!   The same three methods and [`EspHalEspNow::pinned_channel`] form the shared
-//!   [`EspNowLink`] trait that the ESP-IDF tier implements too.
+//!   The same three methods, [`EspHalEspNow::pinned_channel`] and
+//!   [`EspHalEspNow::current_channel`] form the shared [`EspNowLink`] trait that the ESP-IDF
+//!   tier implements too.
 //! * `esp-radio` allows a single ESP-NOW instance per boot; a second constructor call returns
 //!   [`EspHalEspNowError::AlreadyInitialised`] while the first handle is alive.
 //!
@@ -58,6 +59,14 @@
 //!   Frames can reach 1470 bytes (ESP-NOW v2); frames above [`MAX_DATA_LEN`] (250) are dropped,
 //!   counted ([`EspHalEspNow::oversize_dropped`]) and reported with a rate-limited warning.
 //!   They are never truncated.
+//!   During a scan's reply wait (`reply_timeout` after each acknowledged probe, ADR 025) the
+//!   scan reads the receiver itself when no [`EspHalEspNow::receive`] is pending; the frames
+//!   it reads that are not its reply wait in a [`HOLD_CAPACITY`]-frame holding buffer (drop
+//!   oldest, counted by [`EspHalEspNow::held_dropped`]) that `receive` and `try_recv` drain
+//!   first.
+//!   A pending `receive` keeps the receiver and hands the reply to the scan instead.
+//!   Either way a `0xF4` reply to the outstanding probe never reaches the application; one that
+//!   arrives between probes is handed on like any frame.
 //! * Unicast sends report the MAC-layer ACK; broadcast sends always look successful.
 //! * The broadcast peer is pre-registered on the station interface; adding it again is a no-op.
 //! * Encrypted peers are rejected ([`EspHalEspNowError::EncryptionUnsupported`]); the fleet uses none.
@@ -101,11 +110,14 @@ mod driver;
 #[cfg(all(feature = "espnow", any(feature = "esp32c3", feature = "esp32c6")))]
 pub use driver::EspHalEspNow;
 
+#[cfg(feature = "embassy")]
+pub use juggler::espnow::EmbassyClock;
 pub use juggler::espnow::{
-    ClassifySend, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig, ScanConfig,
-    ScanError, ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
+    ClassifySend, Clock, EspNowDriver, EspNowEvent, EspNowLink, MacAddress, PeerConfig,
+    PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession, ScanConfig, ScanError, ScanResult,
+    SendOutcome, WifiInterface, BROADCAST_MAC, MAX_DATA_LEN,
 };
-use juggler::espnow::{Completion, GateRefusal, Refusal};
+use juggler::espnow::{Completion, GateRefusal, ProbeReply, Refusal};
 pub use juggler::wifi::TxPowerLevel;
 
 #[cfg(all(
@@ -412,10 +424,111 @@ pub(crate) fn existing_peer_is_idempotent(plan: &PeerPlan) -> bool {
     plan.mac == BROADCAST_MAC && plan.interface == WifiInterface::Sta
 }
 
+// ─── Reply tap and holding buffer (host-tested) ─────────────────────────────
+
+/// Frames a scan keeps for the application while it holds the receiver (ADR 025).
+pub const HOLD_CAPACITY: usize = 4;
+
+/// The one-slot mailbox of the reply tap: the probe reply the running scan waits for.
+///
+/// Armed by the scan from the moment a probe to `awaiting` is queued until the scan moves past
+/// its reply wait; the receive paths offer every frame to it.
+/// A newer reply replaces an unread one, since the machine matches the reply to the outstanding
+/// probe anyway.
+#[derive(Debug, Default)]
+pub(crate) struct ReplyMailbox {
+    /// The peer whose `0xF4` replies the tap takes; `None` while no probe is outstanding.
+    awaiting: Option<MacAddress>,
+    /// The latest reply from `awaiting` since the slot was last read.
+    reply: Option<ProbeReply>,
+}
+
+impl ReplyMailbox {
+    pub(crate) const fn new() -> Self {
+        Self {
+            awaiting: None,
+            reply: None,
+        }
+    }
+
+    /// Arms the tap for a probe to `mac`; a reply still in the slot answered an earlier probe
+    /// and is dropped.
+    pub(crate) fn arm(&mut self, mac: MacAddress) {
+        self.awaiting = Some(mac);
+        self.reply = None;
+    }
+
+    /// Disarms the tap: replies reach the application again.
+    pub(crate) fn disarm(&mut self) {
+        self.awaiting = None;
+        self.reply = None;
+    }
+
+    /// Offers a received frame; `true` when the tap took it (a `0xF4` reply from the awaited
+    /// peer), so it must not reach the application.
+    pub(crate) fn offer(&mut self, mac: &MacAddress, data: &[u8]) -> bool {
+        if self.awaiting.as_ref() != Some(mac) {
+            return false;
+        }
+        let Some(reply) = ProbeReply::parse(data) else {
+            return false;
+        };
+        self.reply = Some(reply);
+        true
+    }
+
+    /// Takes the unread reply, if any.
+    pub(crate) fn take(&mut self) -> Option<ProbeReply> {
+        self.reply.take()
+    }
+}
+
+/// Frames a scan read while it held the receiver that were not its reply, kept for the
+/// application.
+///
+/// At most [`HOLD_CAPACITY`]; when it is full the oldest frame is dropped and counted, like
+/// `esp-radio`'s own receive queue.
+#[derive(Debug)]
+pub(crate) struct HoldingBuffer {
+    frames: heapless::Deque<EspNowEvent, HOLD_CAPACITY>,
+    dropped: u32,
+}
+
+impl HoldingBuffer {
+    pub(crate) const fn new() -> Self {
+        Self {
+            frames: heapless::Deque::new(),
+            dropped: 0,
+        }
+    }
+
+    /// Keeps `event`; `true` when the oldest frame was dropped to make room.
+    pub(crate) fn push(&mut self, event: EspNowEvent) -> bool {
+        let evicted = self.frames.is_full() && self.frames.pop_front().is_some();
+        if evicted {
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+        // Room was just made (or was there), so the push cannot fail.
+        let _ = self.frames.push_back(event);
+        evicted
+    }
+
+    /// The oldest kept frame, if any.
+    pub(crate) fn pop(&mut self) -> Option<EspNowEvent> {
+        self.frames.pop_front()
+    }
+
+    /// Number of frames dropped since start (wraps at `u32::MAX`).
+    pub(crate) fn dropped(&self) -> u32 {
+        self.dropped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::time::Duration;
+    use juggler::espnow::ProbeFrame;
 
     const MAC: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
@@ -673,5 +786,84 @@ mod tests {
         let mut s = heapless::String::<64>::new();
         write!(s, "{}", EspHalEspNowError::PayloadTooLarge { len: 300 }).expect("fits");
         assert!(s.contains("300"));
+    }
+
+    const OTHER: MacAddress = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+    fn reply(seq: u8, tx_channel: u8, home: u8) -> ProbeReply {
+        ProbeReply::answering(&ProbeFrame { seq, tx_channel }, home)
+    }
+
+    #[test]
+    fn reply_mailbox_takes_only_replies_from_the_armed_peer() {
+        let mut mailbox = ReplyMailbox::new();
+        let wire = reply(1, 6, 11).encode();
+        assert!(!mailbox.offer(&MAC, &wire), "unarmed: nothing is taken");
+
+        mailbox.arm(MAC);
+        assert!(!mailbox.offer(&OTHER, &wire), "another peer's reply");
+        assert!(
+            !mailbox.offer(
+                &MAC,
+                &ProbeFrame {
+                    seq: 1,
+                    tx_channel: 6
+                }
+                .encode()
+            ),
+            "a probe is not a reply"
+        );
+        assert!(!mailbox.offer(&MAC, b"pong"), "an application payload");
+        assert_eq!(mailbox.take(), None);
+
+        assert!(mailbox.offer(&MAC, &wire));
+        assert_eq!(mailbox.take(), Some(reply(1, 6, 11)));
+        assert_eq!(mailbox.take(), None, "a reply is handed out once");
+
+        mailbox.disarm();
+        assert!(
+            !mailbox.offer(&MAC, &wire),
+            "disarmed: replies reach the app"
+        );
+    }
+
+    #[test]
+    fn reply_mailbox_keeps_the_newest_reply_and_arming_clears_the_slot() {
+        let mut mailbox = ReplyMailbox::new();
+        mailbox.arm(MAC);
+        assert!(mailbox.offer(&MAC, &reply(1, 6, 11).encode()));
+        assert!(mailbox.offer(&MAC, &reply(2, 7, 11).encode()));
+        assert_eq!(mailbox.take(), Some(reply(2, 7, 11)));
+
+        assert!(mailbox.offer(&MAC, &reply(2, 7, 11).encode()));
+        mailbox.arm(MAC);
+        assert_eq!(
+            mailbox.take(),
+            None,
+            "an unread reply to an earlier probe is dropped"
+        );
+    }
+
+    #[test]
+    fn holding_buffer_keeps_four_frames_drops_the_oldest_and_counts() {
+        let mut held = HoldingBuffer::new();
+        assert_eq!(held.pop().map(|e| e.mac), None);
+        for n in 1..=HOLD_CAPACITY as u8 {
+            assert!(!held.push(EspNowEvent::new(MAC, &[n])), "room for {n}");
+        }
+        assert_eq!(held.dropped(), 0);
+        assert!(held.push(EspNowEvent::new(OTHER, &[5])), "the fifth evicts");
+        assert_eq!(held.dropped(), 1);
+
+        let drained: heapless::Vec<u8, 8> = core::iter::from_fn(|| held.pop())
+            .map(|e| e.payload()[0])
+            .collect();
+        assert_eq!(
+            drained.as_slice(),
+            &[2, 3, 4, 5],
+            "oldest first, frame 1 gone"
+        );
+        assert!(held.pop().is_none());
+        assert_eq!(held.dropped(), 1, "draining drops nothing");
     }
 }

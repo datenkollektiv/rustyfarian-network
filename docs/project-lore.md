@@ -334,6 +334,7 @@ Fix: query the stored 15-character name and skip longer names before calling `xT
 **Rust `std::thread::Builder::name` does not reach FreeRTOS on ESP-IDF; every spawned thread's task is called `pthread`.**
 The name stays a Rust-side label, so `xTaskGetHandle`, task lists and stack reports cannot tell library threads apart.
 Fix: set `esp_pthread_cfg_t::thread_name` with `esp_pthread_set_cfg` on the spawning thread right before the spawn, and reset it afterwards; Rust's own stack size still overrides the configured one (see `name_next_threads` in `examples/common/spike.rs`).
+Since Step 8c the IDF MQTT library names its own threads `mqtt-events` and `mqtt-net` through `spawn_named` (`mqtt/task_name.rs`); note that `esp_pthread_get_cfg` zeroes its out-parameter before returning `ESP_ERR_NOT_FOUND`, so a caller must take `esp_pthread_get_default_config()` for the fallback instead of reusing the probe buffer, or `esp_pthread_set_cfg` rejects the all-zero `stack_size` with `ESP_ERR_INVALID_ARG` and the thread stays unnamed (caught in the Step 8c review).
 
 ---
 
@@ -345,7 +346,7 @@ A recursive mutex re-enters only for its owning task, so our thread waits on `ap
 Symptom: `[mqtt] connected (clean_session=...)` is logged, `is_connected()` stays `false`, keepalives stop, and the broker publishes the LWT.
 The older "blocks until SUBACK" explanation was wrong: `EspMqttClient::subscribe` returns a message id without waiting, which is why a plain `enqueue` (the `with_startup_message()` publish) hung just the same.
 A second, three-way cycle existed whenever `on_connect` was registered: a publisher holding the Rust client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop blocked on that mutex to hand `on_connect` its `client` argument.
-Fix (bug 001): the event-loop thread never takes the client mutex; one per-connect helper thread (`juggler::mqtt::spawn_connect_thread`) runs the startup publish, then `on_connect`, then the builder subscriptions.
+Fix (bug 001): the event-loop thread never takes the client mutex; since Step 8c (2026-11-11) the `mqtt-net` runner thread performs the connect work itself, one `juggler::mqtt::ConnectWorkMachine` action per turn (builder subscriptions, startup publish, `on_connect`, then the runtime catch-up), releasing the client lock and yielding after every step; the per-connect helper thread of 2026-09-27 to 2026-11-11 is gone.
 Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe()` inside it are safe.
 `is_connected()` still flips only after `on_connect` returns, through a generation-checked compare-and-swap (`juggler::mqtt::ConnectionEpoch`), so a stale helper after a fast reconnect cannot mark a dead connection connected.
 `MqttHandle::publish*`, `try_publish*`, `subscribe`, and `publish_acked` return `PublishAckError::WrongThread` from inside any callback, detected through the thread-local `juggler::mqtt::CallbackScope`.
@@ -365,6 +366,19 @@ Hardware check: `idf_c3_mqtt_callback_guard`.
 `src/mqtt/client.rs` (0.52 and 0.53) sets `disable_auto_reconnect = true` for `None`; the struct's own default is `Some(0)`, which esp-mqtt turns into its 10 s retry.
 Mapping an optional app setting with `.map(Duration::from_millis)` therefore switched reconnects off for every default config: the first connect still works, but after any mid-session disconnect the client stays silent until a reboot — no connect attempts, no errors.
 Fix (bug 005): always pass `Some(...)`, with `Duration::ZERO` when the app sets nothing; reproduce with `just mosquitto down` / `just mosquitto up`.
+
+**A free-heap trend that falls in doubling steps at doubling intervals is a growable collection gaining one entry per event, not a slow leak.**
+On the S3 soak the ESP-IDF tier lost 116, 288, 576 and 1152 B at about 1.5, 2.5, 5 and 9.5 min: `juggler::mqtt::PendingAcks::early` (a `HashMap`) grew by one entry per QoS 1 `try_publish`, because a fire-and-forget publish registers no waiter and `resolve` buffered every `Published` outcome until the next disconnect (bug 021).
+Read the step sizes and their timing before suspecting lwIP or esp-mqtt; the esp-hal twin running the same app stayed flat, which placed it on the std side.
+Fix: `early` is a `VecDeque` capped at `EARLY_ACK_CAPACITY` (8), oldest dropped first; it only has to bridge the gap between an enqueue returning its id and the publisher's `register`.
+See `docs/bugs/archive/021-mqtt-early-ack-buffer-grows-per-publish-2026-11-11.md`.
+
+**Running the MQTT connect work on the `mqtt-net` runner thread cannot deadlock on esp-mqtt's `api_lock`, and `esp_mqtt_client_reconnect`/`_disconnect` do not take that lock at all.**
+`api_lock` is taken by `esp_mqtt_client_start`, `subscribe`, `enqueue` and `stop`; `reconnect` and `disconnect` only set event-group bits, so the runner never blocked on it before Step 8c.
+The lock is released when the event-loop thread calls `EspMqttConnection::next()` again, and that thread never waits on the runner (it only does unbounded `Session::send`, inbound-queue pushes and `PendingAcks` calls), so a connect step blocked on `api_lock` ends within one `mqtt_task` iteration (at most `MQTT_NETWORK_TIMEOUT_MS` on a dead link).
+`esp_mqtt_client_subscribe` performs `esp_mqtt_write` on the caller's thread, so the runner stack must cover a transport write (TLS frames under `mqtts://`): size `RUNNER_STACK_SIZE` from a run with a SUBSCRIBE.
+Before Step 8c an empty connect plan (kept session, no startup message, no `on_connect`) reported `WorkDone` without the runtime catch-up, so the subscription tracker never went live and later `MqttHandle::subscribe` calls were stored instead of sent; the machine now emits `Finish` before `Report` even for an empty plan (host test `an_empty_plan_still_finishes_before_reporting_done`).
+See `tmp/step-8c-design.md` (session scratch) and ADR 017/023 amendments of 2026-11-11.
 
 ---
 
@@ -598,6 +612,10 @@ frames addressed to its MAC even while not associated, so a first-ACK-wins scan 
 onto the wrong channel.
 Fix: leave `ScanConfig::probe_confirmations` ≥ 1 with `confirmation_gap` longer than a
 typical scan dwell (defaults: 1 / 150 ms). See `crates/juggler/src/espnow/mod.rs`.
+
+**A MAC-layer ACK is not proof of the channel: adjacent 2.4 GHz channels overlap.**
+Channels are 5 MHz apart and a frame is 20 MHz wide, so a coordinator parked on channel 11 decodes and ACKs a probe sent on channel 10, at close range reliably and across a table often enough to flap; a first-ACK scan walking upwards from 1 pins the lower neighbour, and `probe_confirmations` repeats the same wrong ACK (bug 018, 0.7.0 bench, C3 scout against the hal C6 coordinator).
+Fix: the scan sends a tagged `0xF3` probe and trusts the coordinator's `0xF4` reply, which states its `home_channel` from `current_channel()`; an ACK without a reply is only a candidate settled after the whole sweep, so coordinators without the shared echo app are still found. See ADR 025.
 
 **`scan_for_peer` failure cascade leaves the radio on the last-probed channel.**
 A failed re-scan removed the peer entry and left the radio on (e.g.) ch 11, so the next

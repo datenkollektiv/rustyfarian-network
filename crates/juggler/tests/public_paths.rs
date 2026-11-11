@@ -521,14 +521,25 @@ fn espnow_public_paths() {
     assert_eq!(peer.interface, WifiInterface::Ap);
 
     // ScanConfig builder.
-    let scan = ScanConfig::new(b"probe")
+    let scan = ScanConfig::for_peer()
         .with_channels(&[1, 6, 11])
         .with_probe_confirmations(2)
         .with_confirmation_gap(core::time::Duration::from_millis(200))
         .with_probe_timeout(core::time::Duration::from_millis(50))
-        .with_burst_timeout(core::time::Duration::from_secs(5));
+        .with_burst_timeout(core::time::Duration::from_secs(5))
+        .with_reply_timeout(core::time::Duration::from_millis(20));
     assert_eq!(scan.channels, &[1, 6, 11]);
     assert_eq!(scan.probe_confirmations, 2);
+    assert_eq!(scan.reply_timeout, core::time::Duration::from_millis(20));
+    assert_eq!(
+        juggler::espnow::DEFAULT_REPLY_TIMEOUT,
+        core::time::Duration::from_millis(50)
+    );
+    // Deprecated for one release, still a public path.
+    #[allow(deprecated)]
+    let legacy = ScanConfig::new(b"probe");
+    #[allow(deprecated)]
+    let _: &[u8] = legacy.probe_data;
 
     // ScanResult.
     let _: ScanResult = ScanResult { channel: 6 };
@@ -917,13 +928,32 @@ fn provisioning_public_paths() {
 fn espnow_scan_public_paths() {
     use core::time::Duration;
     use juggler::espnow::{
-        ScanAction, ScanConfig, ScanError, ScanInput, ScanMachine, ScanResult, SendOutcome,
+        ProbeFrame, ProbeReply, ScanAction, ScanConfig, ScanError, ScanInput, ScanMachine,
+        ScanResult, SendOutcome, TAG_PROBE,
     };
 
     let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-    let mut machine = ScanMachine::new(mac, ScanConfig::new(b"probe").with_channels(&[6]), None);
+    let mut machine = ScanMachine::new(mac, ScanConfig::for_peer().with_channels(&[6]), None);
     assert_eq!(machine.mac(), &mac);
-    assert_eq!(machine.probe_data(), b"probe");
+    assert_eq!(machine.probe_frame(6), [TAG_PROBE, 0, 6]);
+    assert_eq!(
+        ProbeFrame::parse(&machine.probe_frame(6)),
+        Some(ProbeFrame {
+            seq: 0,
+            tx_channel: 6
+        })
+    );
+    let _ = ScanAction::AwaitReply {
+        until: Duration::ZERO,
+    };
+    let _ = ScanInput::Reply(ProbeReply {
+        seq: 1,
+        tx_channel: 6,
+        home_channel: 6,
+    });
+    // Deprecated for one release, still a public path.
+    #[allow(deprecated)]
+    let _: &[u8] = machine.probe_data();
 
     let t = Duration::ZERO;
     assert_eq!(machine.poll(t, ScanInput::Start), ScanAction::RemovePeer);

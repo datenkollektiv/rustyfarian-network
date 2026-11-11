@@ -1,0 +1,92 @@
+# ESP-NOW smoke run with a coordinator power cycle (runbook gate C3-I1).
+# `idf_c3_espnow_scout` in its DEFAULT scenario (leave `ESPNOW_SCENARIO` unset) against the ESP-IDF C6
+# coordinator `idf_c6_espnow_coordinator` on the shared echo app (an IDF C3 `idf_c3_espnow_coordinator` or the
+# hal `hal_c6_espnow_sta_coordinator` answer the same way); the coordinator follows its access point's channel.
+# The scout reads the coordinator's STA MAC at build time:
+#   COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-power-cycle --port <c3 port>
+# The default loop prints no counters line, so the steady phases are judged per send:
+#   TX #N: "hello #N" — ACK                       one line per second while the coordinator answers
+#   TX #N failed: <error> — re-scanning ...       a failed send, followed by a full scan
+#   Re-scan: coordinator now on channel N         the scan after a failed send found it again
+#   Re-scan failed: <error>                       the scan after a failed send ended not-found
+# Two halves: `--unattended` boots, finds the coordinator and watches 60 s of sends (one failed send fails the
+# step, there is no rate to judge); `--attended` asks a person to unplug the coordinator, judges that the scout
+# notices (failed send, then not-found scans), keeps it off for 20 s, asks to plug it in again and judges the
+# refind, a 15 s settle (the coordinator ACKs probes on passing channels while it still scans for its access
+# point, see the C3-I7 record), the first ACK and 30 s of steady sends.
+examples = ["idf_c3_espnow_scout"]
+
+# ── unattended half: coordinator on ────────────────────────────────────────────
+
+[[step]]
+say = "The scout boots in the default scenario and finds the coordinator (power it on if it is off)"
+arm = false       # printed during the reset
+expect = ['ESPNOW_SCENARIO=default', 'Coordinator found on channel (?P<ch>\d+) — starting send loop']
+reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 180
+
+[[step]]
+say = "The first send is acknowledged"
+arm = false
+expect = 'TX #\d+: "hello #\d+" — ACK'
+reject = 'TX #\d+ failed:|Re-scan|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 30
+
+[[step]]
+say = "Steady: 60 s of sends at 1 s, no failed send, no rescan, no reboot"
+arm = false
+duration = 60
+reject = 'TX #\d+ failed:|Re-scan|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+# ── attended half: coordinator off, then on again ──────────────────────────────
+
+[[step]]
+say = "UNPLUG the coordinator now (plug it in only when a later step says so)"
+confirm = "Is the coordinator unplugged?"
+attended = true   # a person acts; the sends repeat every second, so lines printed while you answer are not needed
+
+[[step]]
+say = "Coordinator off: a send fails and the rescan ends not-found"
+attended = true
+arm = false
+expect = ['TX #\d+ failed: .* — re-scanning \.\.\.', 'Re-scan failed:']
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+[[step]]
+say = "Keep the coordinator off for 20 s: failed sends and not-found scans only, no find, no hang, no reboot"
+attended = true
+arm = false
+duration = 20
+reject = 'Re-scan: coordinator now on channel|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "PLUG the coordinator in again (far edge of the table); a rescan finds it"
+attended = true   # a person powers the coordinator on
+arm = false
+expect = 'Re-scan: coordinator now on channel (?P<again>\d+)'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 180
+
+[[step]]
+say = "Let the coordinator settle for 15 s: while it still scans for its access point it ACKs probes on passing channels"
+attended = true
+arm = false
+duration = 15
+# Only a crash counts here: a find on a passing channel, failed sends and rescans are expected until the station is associated.
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+
+[[step]]
+say = "Settled: the sends are acknowledged again"
+attended = true
+arm = false
+expect = 'TX #\d+: "hello #\d+" — ACK'
+reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
+timeout = 60
+
+[[step]]
+say = "Steady after the power cycle: 30 s of sends, no failed send, no rescan, no reboot"
+attended = true
+arm = false
+duration = 30
+reject = 'TX #\d+ failed:|Re-scan|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('

@@ -87,6 +87,8 @@ impl SendOutcome {
 ///   probe whose send callback never fires blocks the scan and every later transmission until
 ///   the driver is dropped or shut down.
 /// * [`pinned_channel`](Self::pinned_channel) is the channel the driver pinned, if any.
+/// * [`current_channel`](Self::current_channel) is the channel the radio is on right now, read
+///   from the Wi-Fi driver; it is what a coordinator puts into a probe reply (ADR 025).
 ///
 /// The returned futures are not required to be `Send`, because the esp-hal ones are not
 /// (ADR 022).
@@ -125,6 +127,14 @@ where
 
     /// The channel the driver pinned (by a scan or at start), or `None` if it has none.
     fn pinned_channel(&self) -> Option<u8>;
+
+    /// The primary Wi-Fi channel the radio is on right now, or `None` when the driver cannot
+    /// read it (radio not started, or the Wi-Fi driver refused the query).
+    ///
+    /// Unlike [`pinned_channel`](Self::pinned_channel) this is the live radio state, so on a
+    /// caller-managed radio it follows the access point, and during a scan it follows the probes.
+    /// A coordinator answers a scan probe with it as the reply's `home_channel` (ADR 025).
+    fn current_channel(&self) -> Option<u8>;
 
     /// Stops the driver's asynchronous machinery; idempotent and never blocking.
     ///
@@ -196,7 +206,7 @@ mod tests {
         link.script_scan(Ok(ScanResult { channel: 6 }));
         link.queue_rx_event(EspNowEvent::new(PEER, b"pong"));
 
-        let (first, second, pin) = block_on(app(&link, &ScanConfig::new(b"probe")));
+        let (first, second, pin) = block_on(app(&link, &ScanConfig::for_peer()));
 
         assert_eq!(first, SendOutcome::NoAck);
         assert_eq!(second, SendOutcome::Acked);
@@ -236,7 +246,7 @@ mod tests {
         let link = MockEspNowLink::new();
         link.set_pinned_channel(Some(3));
         link.script_scan(Err(MockLinkError::Local));
-        let result = block_on(link.scan_for_peer(&PEER, &ScanConfig::new(b"p")));
+        let result = block_on(link.scan_for_peer(&PEER, &ScanConfig::for_peer()));
         assert!(result.is_err());
         assert_eq!(link.pinned_channel(), Some(3));
     }

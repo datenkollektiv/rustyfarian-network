@@ -132,7 +132,7 @@ clippy-ota-pure:
 # lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
 [group('build')]
 clippy-pure:
-    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,espnow --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
 
 # check the esp-idf ota runtime (features wifi,mqtt,ota) and its hardware example
 [group('build')]
@@ -164,10 +164,10 @@ clippy-provisioning-mqtt-tests:
 check-espnow:
     cargo check -p rustyfarian-esp-idf-network --features espnow --target-dir {{ idf_dir }}
 
-# lint the esp-idf espnow worker, its host-less unit tests and the four ESP-NOW examples (none can run on the host)
+# lint the esp-idf espnow worker, its host-less unit tests and the six ESP-NOW examples (none can run on the host)
 [group('build')]
 clippy-espnow:
-    cargo clippy -p rustyfarian-esp-idf-network --features espnow,wifi --lib --tests --example idf_c3_espnow_coordinator --example idf_c3_espnow_scout --example idf_c3_espnow_scout_promisc --example idf_c3_espnow_sta_scout --target-dir {{ idf_dir }} -- -D warnings
+    cargo clippy -p rustyfarian-esp-idf-network --features espnow,wifi --lib --tests --example idf_c3_espnow_coordinator --example idf_c6_espnow_coordinator --example idf_c3_espnow_peer --example idf_c3_espnow_scout --example idf_c3_espnow_scout_promisc --example idf_c3_espnow_sta_scout --target-dir {{ idf_dir }} -- -D warnings
 
 # Fully cleans esp-idf-sys before AND after: switching sdkconfig variants forces a CMake reconfigure.
 # ESP_IDF_SDKCONFIG_DEFAULTS paths MUST be absolute: embuild does not resolve relative overlay
@@ -331,6 +331,11 @@ fmt-check:
 doc:
     cargo doc --workspace --no-deps
 
+# build juggler rustdoc on the host with rustdoc warnings as errors (all features, like docs.rs, so every intra-doc link resolves)
+[group('test & lint')]
+doc-juggler:
+    RUSTDOCFLAGS="-D warnings" cargo doc --target {{ host_target }} -p juggler --all-features --no-deps
+
 # build and open docs in browser
 [group('test & lint')]
 doc-open:
@@ -394,7 +399,7 @@ test-lora:
 # run platform-independent ESP-NOW unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
 test-espnow: test-wifi
-    cargo test --target {{ host_target }} -p juggler --features espnow,mock,std espnow::worker
+    cargo test --target {{ host_target }} -p juggler --features espnow,mock,std espnow::
 
 # run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]

@@ -31,6 +31,9 @@ provisioning = ["wifi", "mqtt", "dep:heapless", "dep:zeroize"]
 # The NorFlash provisioning store (`provisioning::flash_store`): TLV records with
 # CRC and two-sector arbitration over `embedded-storage`. no_std, no alloc.
 flash-store = ["provisioning", "dep:embedded-storage"]
+# `espnow::EmbassyClock`: the `embassy-time` clock behind `espnow::PeerSession` on both tiers.
+# No time driver is selected here (ADR 021); the firmware brings its own.
+embassy = ["dep:embassy-time"]
 
 # Mock feature — test doubles for radio and ESP-NOW drivers
 # A single shared mock feature is used because only two domains have mocks with
@@ -38,9 +41,10 @@ flash-store = ["provisioning", "dep:embedded-storage"]
 # (uses std::collections::VecDeque); host-test environments always have alloc.
 mock = ["wifi", "lora", "espnow"]
 
-# std feature — enables the std-only helpers: in mqtt, the connect/subscriber
-# threads, CallbackScope, ConnectionEpoch, SubscribeClient (std::thread,
-# std::sync, anyhow::Result); with provisioning, provisioning::SessionState
+# std feature — enables the std-only helpers: in mqtt, CallbackScope,
+# SubscribeClient, Outbox and the deprecated connect/subscriber threads and
+# ConnectionEpoch (std::thread, std::sync, anyhow::Result); with provisioning,
+# provisioning::SessionState
 # (std::sync::Condvar). It implies mqtt, which provisioning enables anyway, so
 # a provisioning build only adds anyhow.
 # The merged crate is no_std by default; std is opt-in for platform crates.
@@ -63,6 +67,7 @@ zeroize = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 embedded-storage = { workspace = true, optional = true }
+embassy-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The RNG the real `lorawan_device` `Device` needs in the LoRa PHY bridge tests.

@@ -231,7 +231,7 @@ See `crates/*/examples/` for the full set, including Wi-Fi, MQTT, and LoRaWAN OT
 
 Bare-metal ESP-NOW (feature `espnow`, ESP32-C3 and ESP32-C6) has two examples that talk to each other.
 The C6 coordinator is an associated station with ESP-NOW alongside, and it echoes frames.
-The C3 peer uses an owned radio, scans for the coordinator, and sends a frame every 100 ms.
+The C3 peer uses an owned radio and runs the shared peer app on a `PeerSession`, which scans for the coordinator, sends a frame every 100 ms and rescans after 20 unacknowledged sends; `idf_c3_espnow_peer` is its ESP-IDF twin.
 
 ```bash
 just build-example hal_c6_espnow_sta_coordinator

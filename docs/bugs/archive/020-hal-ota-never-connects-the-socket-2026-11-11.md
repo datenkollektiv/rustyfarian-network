@@ -47,9 +47,6 @@ Boot 1 logs the fetch and the `Update server unreachable` error in the same seco
 ## Suggested Fix Area
 `EspHalOtaManager::connect`: parse the host as an IPv4 literal (this tier resolves no names), `socket.connect(IpEndpoint)` under the connect budget, log the embassy-net `ConnectError`, map a connect timeout to `DownloadTimeout` and a refused or failed connect to `ServerUnreachable`, and take the connect time off the header-phase budget.
 
-## Owner
-fluffi
-
 ## Links
 - Bug 004 (erase-once write path) is the next thing the same round trip checks on real flash.
 - `docs/features/ladder-closure-v1.md` (hal `fetch_and_apply` flow, gates C3-H5 and S3-H3).

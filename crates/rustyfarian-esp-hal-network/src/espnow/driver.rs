@@ -5,6 +5,7 @@ use core::future::poll_fn;
 use core::task::Poll;
 use core::time::Duration;
 
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
@@ -15,9 +16,9 @@ use esp_radio::esp_now::{
 use esp_radio::wifi::{ControllerConfig, WifiController};
 use juggler::espnow::{
     CancelOutcome, Completed, Completion, EspNowDriver, EspNowEvent, EspNowLink, GateRefusal,
-    JobEpoch, MacAddress, Next, OversizeLog, PeerConfig, Refusal, ScanAction, ScanConfig,
-    ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, ScanTeardown, SendKind, SendOutcome,
-    TxCore, TxId, WifiInterface,
+    JobEpoch, MacAddress, Next, OversizeLog, PeerConfig, ProbeReply, Refusal, ScanAction,
+    ScanConfig, ScanError, ScanGate, ScanInput, ScanMachine, ScanResult, ScanTeardown, SendKind,
+    SendOutcome, TxCore, TxId, WifiInterface,
 };
 use juggler::wifi::TxPowerLevel;
 
@@ -25,8 +26,8 @@ use super::cell::{Gate, Lease, SharedCopy, Singleton, TakeCell, WaiterList, Wake
 use super::{
     completion_result, existing_peer_is_idempotent, expired, gate_refusal_error, plan_peer,
     refusal_error, runner_wait_deadline, validate_channel, validate_frame_len, validate_tx_power,
-    EspHalEspNowError, EspNowConfig, PeerPlan, RadioError, DEFAULT_TX_POWER_QUARTER_DBM,
-    MAX_DATA_LEN,
+    EspHalEspNowError, EspNowConfig, HoldingBuffer, PeerPlan, RadioError, ReplyMailbox,
+    DEFAULT_TX_POWER_QUARTER_DBM, MAX_DATA_LEN,
 };
 
 /// Frames examined per [`EspNowDriver::try_recv`] call when the head of the queue is oversize.
@@ -112,8 +113,18 @@ pub struct EspHalEspNow {
     /// Serialises [`EspHalEspNow::receive`] callers: `esp-radio` keeps one receive waker.
     receive_gate: Gate<RECEIVE_WAITERS>,
     oversize: OversizeLog,
+    /// The reply tap of the running scan: a `0xF4` reply from the probed peer goes here instead
+    /// of to the application (ADR 025).
+    reply: Mutex<CriticalSectionRawMutex, RefCell<ReplyMailbox>>,
+    /// Wakes a scan that waits on the mailbox while an application `receive` holds the receiver.
+    reply_wake: Signal<CriticalSectionRawMutex, ()>,
+    /// Frames a scan read while it held the receiver; `receive` and `try_recv` drain them first.
+    held: Mutex<CriticalSectionRawMutex, RefCell<HoldingBuffer>>,
     /// The channel the driver keeps pinned: the configured one at start, then the last scan's.
     pinned: SharedCopy<Option<u8>>,
+    /// The probe sequence number the last scan ended on; the next scan continues it, so a
+    /// reply left over from the previous scan never matches a new probe.
+    scan_seq: SharedCopy<u8>,
     /// Declared last: released after the `esp-radio` parts have been dropped.
     _instance: Singleton<'static>,
 }
@@ -238,7 +249,11 @@ impl EspHalEspNow {
             runner_active: SharedCopy::new(false),
             receive_gate: Gate::new(),
             oversize: OversizeLog::new(),
+            reply: Mutex::new(RefCell::new(ReplyMailbox::new())),
+            reply_wake: Signal::new(),
+            held: Mutex::new(RefCell::new(HoldingBuffer::new())),
             pinned: SharedCopy::new(None),
+            scan_seq: SharedCopy::new(0),
             _instance: instance,
         }
     }
@@ -319,6 +334,78 @@ impl EspHalEspNow {
     /// `None` on a [`EspHalEspNow::from_controller`] handle before its first scan.
     pub fn pinned_channel(&self) -> Option<u8> {
         self.pinned.get()
+    }
+
+    /// The primary Wi-Fi channel the radio is on right now, `None` when the radio is not
+    /// started.
+    ///
+    /// Live radio state, unlike [`EspHalEspNow::pinned_channel`]: on a
+    /// [`EspHalEspNow::from_controller`] handle it follows the access point, and during a scan
+    /// it follows the probes.
+    /// A coordinator puts it into its probe reply as `home_channel` (ADR 025).
+    /// Read with the Wi-Fi driver's `esp_wifi_get_channel` (the query behind
+    /// `WifiController::channel`), so it works on both constructors and needs no controller
+    /// lease.
+    /// Same name and shape as `EspIdfEspNow::current_channel` (ADR 022).
+    pub fn current_channel(&self) -> Option<u8> {
+        radio_channel()
+    }
+
+    /// Number of received frames the holding buffer dropped since start.
+    ///
+    /// A scan that read more than [`HOLD_CAPACITY`](super::HOLD_CAPACITY) application frames during one reply wait
+    /// while no [`EspHalEspNow::receive`] was pending dropped the oldest ones; see the
+    /// [module documentation](super).
+    pub fn held_dropped(&self) -> u32 {
+        self.held.lock(|held| held.borrow().dropped())
+    }
+
+    /// Arms the reply tap for a probe to `mac` that is about to be queued.
+    fn arm_reply(&self, mac: MacAddress) {
+        self.reply.lock(|mailbox| mailbox.borrow_mut().arm(mac));
+        self.reply_wake.reset();
+    }
+
+    /// Disarms the reply tap: replies reach the application again.
+    fn disarm_reply(&self) {
+        self.reply.lock(|mailbox| mailbox.borrow_mut().disarm());
+    }
+
+    /// Offers a received frame to the reply tap; `true` when the tap took it, so the frame
+    /// must not reach the application.
+    fn offer_reply(&self, event: &EspNowEvent) -> bool {
+        let taken = self
+            .reply
+            .lock(|mailbox| mailbox.borrow_mut().offer(&event.mac, event.payload()));
+        if taken {
+            self.reply_wake.signal(());
+        }
+        taken
+    }
+
+    fn take_reply(&self) -> Option<ProbeReply> {
+        self.reply.lock(|mailbox| mailbox.borrow_mut().take())
+    }
+
+    /// Sets a frame the scan read aside for the application; a drop is logged like an
+    /// oversize one (the first and then every 32nd).
+    fn hold(&self, event: EspNowEvent) {
+        let dropped = self.held.lock(|held| {
+            let mut held = held.borrow_mut();
+            held.push(event).then(|| held.dropped())
+        });
+        if let Some(dropped) = dropped {
+            if OversizeLog::should_log(dropped) {
+                log::warn!(
+                    "ESP-NOW scan: holding buffer full, oldest application frame dropped, \
+                     {dropped} dropped in total"
+                );
+            }
+        }
+    }
+
+    fn pop_held(&self) -> Option<EspNowEvent> {
+        self.held.lock(|held| held.borrow_mut().pop())
     }
 
     /// Sends and reports the MAC-layer ACK.
@@ -602,6 +689,7 @@ impl EspHalEspNow {
             }
             ScanAction::SendProbe { .. }
             | ScanAction::WaitUntil(_)
+            | ScanAction::AwaitReply { .. }
             | ScanAction::Done(_)
             | ScanAction::Ignored => ScanInput::Failed,
         }
@@ -839,21 +927,37 @@ impl EspHalEspNow {
     /// one of them.
     /// No order among the waiting callers is promised.
     /// While a call is pending, [`EspNowDriver::try_recv`] returns `None`.
+    ///
+    /// Frames a running [`EspHalEspNow::scan_for_peer`] set aside (see the
+    /// [module documentation](super)) come first, oldest first.
+    /// A `0xF4` probe reply from the peer that scan probes is handed to the scan and never
+    /// returned here (ADR 025).
     pub async fn receive(&self) -> EspNowEvent {
         let _turn = self.receive_gate.acquire().await;
-        // Only this method takes the receiver out, and the gate lets one call in at a time, so
-        // the lease is always free; the retry only keeps this path panic-free.
+        // The gate lets one call in at a time, so the lease is free unless a scan holds the
+        // receiver for a reply wait (at most `reply_timeout` at a time); the frames that scan
+        // sets aside are served meanwhile.
         let mut receiver = loop {
             match self.receiver.lease() {
                 Some(lease) => break lease,
                 None => {
+                    if let Some(event) = self.pop_held() {
+                        return event;
+                    }
                     embassy_time::Timer::after_millis(RUNNER_LEASE_RETRY_MS).await;
                 }
             }
         };
+        // Only the holder of the receiver fills the holding buffer, so one look settles it.
+        if let Some(event) = self.pop_held() {
+            return event;
+        }
         loop {
             let frame = receiver.receive_async().await;
             if let Some(event) = self.event_from(frame) {
+                if self.offer_reply(&event) {
+                    continue;
+                }
                 return event;
             }
         }
@@ -899,6 +1003,17 @@ impl EspHalEspNow {
     /// sends keep failing with `ScanInProgress` for the few milliseconds of the frame).
     /// A cancelled scan keeps the previous pin; a peer found on the way is only confirmed in the
     /// synchronous tail of the scan, where the future cannot be dropped.
+    ///
+    /// After an acknowledged probe the scan waits `config.reply_timeout` for the peer's `0xF4`
+    /// reply, which names the peer's home channel and ends the scan there (ADR 025); an ACK
+    /// without a reply keeps its old meaning as the fallback.
+    /// With no [`EspHalEspNow::receive`] pending, the scan leases the receiver for that wait and
+    /// sets every frame that is not its reply aside in a [`HOLD_CAPACITY`](super::HOLD_CAPACITY)-frame holding buffer
+    /// (drop oldest, [`EspHalEspNow::held_dropped`]) that `receive` and `try_recv` drain first;
+    /// a pending `receive` keeps the receiver and hands the reply to the scan instead.
+    /// A reply to the outstanding probe never reaches the application; the tap is armed from a
+    /// probe's send until the scan moves past its reply wait, so a `0xF4` that arrives between
+    /// probes (a late or MAC-retransmitted one) is handed on like any frame.
     ///
     /// `config.probe_timeout` bounds queueing and the start of each probe: a probe that did not
     /// start in time is never sent and counts as a local failure (not as "no ACK").
@@ -952,7 +1067,8 @@ impl EspHalEspNow {
             })
         })
         .await?;
-        let mut machine = ScanMachine::new(*mac, *config, self.pinned.get());
+        let mut machine =
+            ScanMachine::new(*mac, *config, self.pinned.get()).with_first_seq(self.scan_seq.get());
         // Holds the exclusion and, on drop, runs the teardown of the machine's last state
         // (immediately, or after the probe on the air when the future was cancelled mid-probe).
         let mut guard = ScanGuard {
@@ -975,6 +1091,13 @@ impl EspHalEspNow {
                 Err(e) => break Err(e),
             };
             guard.teardown = machine.abort_teardown();
+            // The reply tap is armed from a probe's send until the scan moves past its reply
+            // wait: the reply can arrive right behind the ACK, before `AwaitReply` is issued.
+            match action {
+                ScanAction::SendProbe { .. } => self.arm_reply(*mac),
+                ScanAction::AwaitReply { .. } => {}
+                _ => self.disarm_reply(),
+            }
             input = match action {
                 ScanAction::SetChannel { channel } => {
                     let result = self.set_channel(channel);
@@ -986,7 +1109,9 @@ impl EspHalEspNow {
                 ScanAction::SendProbe {
                     channel, timeout, ..
                 } => {
-                    let result = self.send_probe(mac, machine.probe_data(), timeout).await;
+                    let result = self
+                        .send_probe(mac, &machine.probe_frame(channel), timeout)
+                        .await;
                     let outcome = SendOutcome::of(&result);
                     if let (SendOutcome::Local, Err(e)) = (outcome, &result) {
                         machine.log_fault(format_args!("probe on channel {channel} failed: {e:?}"));
@@ -1001,6 +1126,9 @@ impl EspHalEspNow {
                     .await;
                     ScanInput::Completed
                 }
+                ScanAction::AwaitReply { until } => {
+                    self.await_reply(start + to_embassy(until)).await
+                }
                 ScanAction::Done(result) => break result,
                 // ADR 023 decision 5: the loop breaks at `Done`, so a no-op answer means the
                 // machine was polled past its end, a driver bug.
@@ -1013,7 +1141,72 @@ impl EspHalEspNow {
         };
         guard.finish();
         self.pinned.set(machine.pinned_channel());
+        self.scan_seq.set(machine.seq());
         result.map_err(EspHalEspNowError::Scan)
+    }
+
+    /// Waits for the probed peer's reply until `deadline`: [`ScanInput::Reply`] for one,
+    /// [`ScanInput::Completed`] once the deadline passed or on shutdown.
+    ///
+    /// The tap is armed for the peer since the probe was queued, so a reply that arrived right
+    /// behind the ACK is already in the mailbox.
+    /// With no application `receive` pending the scan leases the receiver and reads the frames
+    /// itself, setting every frame that is not its reply aside in the holding buffer; while a
+    /// `receive` holds the receiver, that call feeds the mailbox and the scan waits on it, and
+    /// retries the lease every [`RUNNER_LEASE_RETRY_MS`]: that `receive` may return an
+    /// application frame (or be dropped) and leave the reply unread in `esp-radio`'s queue.
+    /// The deadline is checked before the mailbox, so a peer that streams replies the machine
+    /// ignores cannot hold the scan in its wait past `until`.
+    /// Cancel-safe: dropping the future returns the receiver, and the frames set aside stay for
+    /// the application.
+    async fn await_reply(&self, deadline: embassy_time::Instant) -> ScanInput {
+        loop {
+            if expired(Some(deadline), embassy_time::Instant::now()) {
+                return ScanInput::Completed;
+            }
+            if let Some(reply) = self.take_reply() {
+                return ScanInput::Reply(reply);
+            }
+            let Some(mut receiver) = self.receiver.lease() else {
+                let woken = embassy_time::with_deadline(
+                    deadline,
+                    select3(
+                        self.reply_wake.wait(),
+                        self.shutdown_wake.wait(),
+                        embassy_time::Timer::after_millis(RUNNER_LEASE_RETRY_MS),
+                    ),
+                )
+                .await;
+                match woken {
+                    Ok(Either3::First(())) | Ok(Either3::Third(())) => continue,
+                    Ok(Either3::Second(())) | Err(_) => return ScanInput::Completed,
+                }
+            };
+            let read = async {
+                loop {
+                    let frame = receiver.receive_async().await;
+                    let Some(event) = self.event_from(frame) else {
+                        continue;
+                    };
+                    if self.offer_reply(&event) {
+                        if let Some(reply) = self.take_reply() {
+                            return reply;
+                        }
+                        continue;
+                    }
+                    self.hold(event);
+                }
+            };
+            return match embassy_time::with_deadline(
+                deadline,
+                select(read, self.shutdown_wake.wait()),
+            )
+            .await
+            {
+                Ok(Either::First(reply)) => ScanInput::Reply(reply),
+                Ok(Either::Second(())) | Err(_) => ScanInput::Completed,
+            };
+        }
     }
 
     /// Waits until no frame is on the air and picks the scan up, then until no sync send holds
@@ -1100,11 +1293,19 @@ impl EspNowDriver for EspHalEspNow {
         Ok(())
     }
 
+    /// Frames a scan set aside come first; a probe reply the scan waits for is handed to it and
+    /// skipped (see [`EspHalEspNow::receive`]).
     fn try_recv(&self) -> Option<EspNowEvent> {
+        if let Some(event) = self.pop_held() {
+            return Some(event);
+        }
         for _ in 0..RX_SKIP_LIMIT {
             // Pop under the lock, convert (and free the frame) outside it.
             let frame = self.receiver.with_locked(|r| r.receive()).flatten()?;
             if let Some(event) = self.event_from(frame) {
+                if self.offer_reply(&event) {
+                    continue;
+                }
                 return Some(event);
             }
         }
@@ -1136,6 +1337,10 @@ impl EspNowLink for EspHalEspNow {
 
     fn pinned_channel(&self) -> Option<u8> {
         EspHalEspNow::pinned_channel(self)
+    }
+
+    fn current_channel(&self) -> Option<u8> {
+        EspHalEspNow::current_channel(self)
     }
 
     fn shutdown(&self) {
@@ -1219,6 +1424,7 @@ impl ScanGuard<'_> {
     /// The machine finished: end the exclusion.
     fn finish(mut self) {
         self.finished = true;
+        self.radio.disarm_reply();
         self.radio.release_scan(self.epoch);
     }
 }
@@ -1228,6 +1434,8 @@ impl Drop for ScanGuard<'_> {
         if self.finished {
             return;
         }
+        // Whatever ends the scan, the reply tap must not outlive it.
+        self.radio.disarm_reply();
         let outcome = self.radio.with_tx(|state, _| {
             state
                 .scan
@@ -1301,4 +1509,22 @@ fn radio_max_tx_power() -> Option<i8> {
     // It fails with an error code (read as `None`) when Wi-Fi is not started.
     let rc = unsafe { esp_wifi_get_max_tx_power(&mut power) };
     (rc == 0).then_some(power)
+}
+
+/// Reads the primary channel the radio is on, `None` when the driver refuses (not started).
+///
+/// The same `esp_wifi_get_channel` query that `WifiController::channel` runs, callable without
+/// the controller: a handle from `from_controller` never holds one.
+fn radio_channel() -> Option<u8> {
+    extern "C" {
+        fn esp_wifi_get_channel(primary: *mut u8, second: *mut u32) -> i32;
+    }
+    let mut primary: u8 = 0;
+    let mut second: u32 = 0;
+    // SAFETY: `esp_wifi_get_channel` is provided by esp-wifi-sys, always linked by every
+    // esp-radio build, and writes the primary channel and the secondary-channel enum to the two
+    // valid locals passed in. It fails with an error code (read as `None`) when Wi-Fi is not
+    // started.
+    let rc = unsafe { esp_wifi_get_channel(&mut primary, &mut second) };
+    (rc == 0).then_some(primary)
 }

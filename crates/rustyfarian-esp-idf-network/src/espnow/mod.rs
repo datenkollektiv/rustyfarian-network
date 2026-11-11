@@ -69,13 +69,14 @@ use esp_idf_svc::sys::{esp, EspError};
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi,
 };
-use juggler::espnow::{ClassifySend, EspNowLink, OversizeLog, SendKind};
 pub use juggler::espnow::{
-    EspNowDriver, EspNowEvent, MacAddress, PeerConfig, ScanConfig, ScanError, ScanResult,
-    SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
+    ClassifySend, Clock, EmbassyClock, EspNowDriver, EspNowEvent, EspNowLink, MacAddress,
+    PeerConfig, PeerLinkConfig, PeerLinkState, PeerSendError, PeerSession, ScanConfig, ScanError,
+    ScanResult, SendOutcome, WifiInterface, BROADCAST_MAC, DEFAULT_CONFIRMATION_GAP,
     DEFAULT_PROBE_CONFIRMATIONS, DEFAULT_PROBE_TIMEOUT, DEFAULT_RX_CHANNEL_CAPACITY,
     DEFAULT_SCAN_CHANNELS, MAX_DATA_LEN,
 };
+use juggler::espnow::{OversizeLog, SendKind};
 use juggler::wait_list::WaitList;
 
 use worker::{block_on, Worker};
@@ -186,6 +187,9 @@ impl From<ScanError> for EspIdfEspNowError {
 
 /// The receive queue shared by the C callback, [`EspNowDriver::try_recv`] and
 /// [`EspIdfEspNow::receive`]: a frame leaves it exactly once, whichever consumer pops it.
+///
+/// A `0xF4` probe reply that a running scan awaits never enters it: the callback offers every
+/// frame to the worker's reply tap first (ADR 025).
 struct RxQueue {
     frames: Mutex<VecDeque<EspNowEvent>>,
     capacity: usize,
@@ -484,9 +488,12 @@ impl EspIdfEspNow {
 
     /// Scan Wi-Fi channels to find one where the given peer responds, without blocking.
     ///
-    /// Registers the peer temporarily, probes each channel in
-    /// [`ScanConfig::channels`] by sending [`ScanConfig::probe_data`], and
-    /// returns the first channel where the peer ACKs the frame.
+    /// Registers the peer temporarily, probes each channel in [`ScanConfig::channels`] with the
+    /// `0xF3` probe frame, and returns the channel the peer names in its `0xF4` reply, or, for a
+    /// peer that only ACKs, the channel confirmed after the sweep (ADR 025).
+    /// A reply to the outstanding probe is taken from the receive callback by the scan and never
+    /// reaches [`receive`](Self::receive) or [`EspNowDriver::try_recv`]; a `0xF4` that arrives
+    /// between probes is queued like any frame.
     /// The scan runs on the `espnow-tx` thread; this future only waits for it.
     ///
     /// On success the peer is left registered with the discovered channel, and the driver keeps
@@ -603,6 +610,18 @@ impl EspIdfEspNow {
         self.worker.pinned_channel()
     }
 
+    /// The primary Wi-Fi channel the radio is on right now (`esp_wifi_get_channel`), or `None`
+    /// when the radio is not started.
+    ///
+    /// Unlike [`pinned_channel`](Self::pinned_channel) this is the live radio state: on a
+    /// caller-managed radio ([`init`](Self::init)) it follows the access point, and during a scan
+    /// it follows the probes.
+    /// A coordinator answers a scan probe with it as the reply's `home_channel` (ADR 025).
+    /// Same name and shape as `EspHalEspNow::current_channel` (ADR 022).
+    pub fn current_channel(&self) -> Option<u8> {
+        worker::current_channel()
+    }
+
     /// Initialise ESP-NOW, start the radio, and scan for a peer.
     ///
     /// Convenience constructor combining [`init_with_radio()`](Self::init_with_radio)
@@ -630,6 +649,8 @@ impl EspIdfEspNow {
     ///
     /// Frames above [`MAX_DATA_LEN`] never reach the queue: they are dropped and counted
     /// ([`oversize_dropped`](Self::oversize_dropped)).
+    /// Neither does a `0xF4` probe reply from the peer a running scan has probed: the scan takes
+    /// it (ADR 025); every other frame is delivered unchanged.
     ///
     /// Safe to call from several tasks or threads at once: each frame goes to exactly one
     /// consumer, and no order among waiting callers is promised.
@@ -739,14 +760,21 @@ impl EspIdfEspNow {
 
         let rx = Arc::new(RxQueue::new(capacity));
 
-        let callback_queue = Arc::clone(&rx);
-        esp_now
-            .register_recv_cb(move |info, data| callback_queue.push_frame(*info.src_addr, data))
-            .context("failed to register ESP-NOW receive callback")?;
-
         // One send callback for the driver's lifetime; the worker is the only sender, so it
         // always belongs to the frame in flight.
         let worker = worker::spawn(mode, initial_pin)?;
+
+        // The scan's reply tap sees every frame first; what it does not take goes to the queue.
+        let callback_queue = Arc::clone(&rx);
+        let reply_tap = worker.events();
+        esp_now
+            .register_recv_cb(move |info, data| {
+                if !reply_tap.probe_reply(info.src_addr, data) {
+                    callback_queue.push_frame(*info.src_addr, data);
+                }
+            })
+            .context("failed to register ESP-NOW receive callback")?;
+
         let events = worker.events();
         esp_now
             .register_send_cb(move |mac, status| {
@@ -881,6 +909,10 @@ impl EspNowLink for EspIdfEspNow {
 
     fn pinned_channel(&self) -> Option<u8> {
         EspIdfEspNow::pinned_channel(self)
+    }
+
+    fn current_channel(&self) -> Option<u8> {
+        EspIdfEspNow::current_channel(self)
     }
 
     fn shutdown(&self) {
