@@ -1,4 +1,4 @@
-# esp-hal broker hostname and runtime subscribe on the C6 (runbook C6-H5, hostname half).
+# esp-hal broker hostname and runtime subscribe on the C6 (hostname half).
 # Build and recipes use a LAN hostname for the local `just mosquitto` broker, which the board resolves through its
 # DHCP DNS server; a shell variable wins over `.env`:
 #   MQTT_HOST=bench-broker MQTT_PORT=1883 just bench c6 dns-subscribe

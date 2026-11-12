@@ -60,7 +60,7 @@ mod inner {
     /// The stored record is a [`ProvisioningConfig`] moved out of the store,
     /// never cloned, and heap-allocated exactly once (in `load_with`), so the
     /// roughly 1.3 KB record is boxed for its lifetime; one by-value copy still
-    /// crosses the boot task's stack during `load` and the `Box::new` (bug 002).
+    /// crosses the boot task's stack during `load` and the `Box::new`.
     /// Its secrets are scrubbed on drop through the `Box`.
     ///
     /// # Debug output
@@ -195,7 +195,7 @@ mod inner {
                 (WifiMqttClass::NotProvisioned, _) => Ok(WifiMqttLoadOutcome::NotProvisioned),
                 (WifiMqttClass::OtherProfile(p), _) => Ok(WifiMqttLoadOutcome::OtherProfile(p)),
                 // `cfg` is moved, never cloned, and boxed exactly once here so
-                // the ~1.3 KB record leaves the stack (bug 002).
+                // the ~1.3 KB record leaves the stack.
                 (WifiMqttClass::Ready(client_id), Some(cfg)) => {
                     Ok(WifiMqttLoadOutcome::Ready(WifiMqttBoot {
                         config: Box::new(cfg),
@@ -373,8 +373,7 @@ mod inner {
     /// on their own `httpd` tasks. The workspace's own examples run with
     /// `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` (`sdkconfig.defaults`). Before
     /// this contract was fixed, a 0.5.0 consumer with an 8000-byte main task
-    /// overflowed its stack right after logging `Provisioning event: Committed`
-    /// (see `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`).
+    /// overflowed its stack right after logging `Provisioning event: Committed`.
     ///
     /// # Errors
     ///

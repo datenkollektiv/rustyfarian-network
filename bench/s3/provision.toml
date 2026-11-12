@@ -1,5 +1,5 @@
-# esp-hal provisioning record with extras survives a reboot on the CrowPanel S3 (runbook S3-H2, scenario H1
-# of docs/runbooks/esp-hal-provisioning-extras-hardware-test.md, as C3-H1 and C6-H1).
+# esp-hal provisioning record with extras survives a reboot on the CrowPanel S3 (scenario H1
+# of docs/runbooks/esp-hal-provisioning-extras-hardware-test.md).
 # The store sits at offset 0x300000, a placeholder inside the factory app partition (see the example), so a
 # pass does not yet prove the real data partition layout.
 # The store must be blank, or the board boots `Already provisioned` and opens no portal: erase first, pinned to

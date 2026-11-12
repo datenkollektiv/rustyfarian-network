@@ -75,7 +75,7 @@ pub(crate) struct Session {
     inbound: Mutex<VecDeque<InboundMessage>>,
     arrivals: WaitList,
     dropped_inbound: AtomicU32,
-    /// The esp-mqtt client, once the station has an IP (bug 010), plus the
+    /// The esp-mqtt client, once the station has an IP, plus the
     /// publishes that arrived before it. The outbox owns its own lock, so no
     /// outer mutex is needed to reach the client.
     outbox: Arc<Outbox<SubscribableClient>>,

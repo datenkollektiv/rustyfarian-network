@@ -22,7 +22,7 @@ I (192295) rustyfarian_esp_idf_network::mqtt: [mqtt] disconnected
 | OTA worker     | Sleeps `restart_grace`, then calls the app's `RestartFn` with MQTT and Wi-Fi still up                                               | `crates/rustyfarian-esp-idf-network/src/ota/runtime/worker.rs:256-257` |
 | Health policy  | Calls the same `RestartFn` for `DeadlineAction::NoteAndRestart`                                                                     | `ota/runtime/health.rs:84`                                             |
 | `MqttHandle`   | Owns the client as `Arc<Mutex<SubscribableClient>>`; no `disconnect`/`stop`, the client is only destroyed when the last clone drops | `mqtt/mod.rs:1418-1428`                                                |
-| Auto-reconnect | Enabled since `2a3ac3f` (bug 005): during `restart_grace` the client may already try to reconnect after a drop                      | `mqtt/mod.rs:521`, `:1072`                                             |
+| Auto-reconnect | Enabled since `2a3ac3f`: during `restart_grace` the client may already try to reconnect after a drop                      | `mqtt/mod.rs:521`, `:1072`                                             |
 | `WiFiManager`  | No `disconnect`, although `EspWifi::disconnect` exists in esp-idf-svc 0.53                                                          | `wifi/mod.rs`; esp-idf-svc `src/wifi.rs:682`                           |
 | Consumer       | Can only restart; it holds no handle that could disconnect cleanly                                                                  | rgb-clock `src/ota/mod.rs:65`                                          |
 
@@ -47,7 +47,7 @@ Consequences:
 |                                           Decision | Reason                                                                     | Rejected Alternative                                   |
 |---------------------------------------------------:|:---------------------------------------------------------------------------|:-------------------------------------------------------|
 |              Disconnect is bounded and best-effort | A restart must never hang on an unreachable broker                         | Unbounded wait for the broker                          |
-| Auto-reconnect is disabled by a planned disconnect | Otherwise the client reconnects inside `restart_grace` after bug 005's fix | Leave reconnect on and accept a second session briefly |
+| Auto-reconnect is disabled by a planned disconnect | Otherwise the client reconnects inside `restart_grace` after the auto-reconnect fix | Leave reconnect on and accept a second session briefly |
 |                  Consumer keeps owning `RestartFn` | Apps decide how to restart (log flush, LED state)                          | Runtime calls `esp_restart` itself                     |
 
 ## Constraints

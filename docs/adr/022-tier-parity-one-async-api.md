@@ -11,7 +11,7 @@ Request U2g from `rustyfarian-knob` triggered this ADR: the knob runs one applic
 `juggler` already shares the decisions: `LinkMachine`, `LinkState`, back-off, `QoS`, `MqttConfig`, `TryPublishError<E>`, and the provisioning and OTA cores.
 No consumer code compiles against both tiers in any domain today.
 The root cause is that `rustyfarian-esp-idf-network` is blocking (std threads) while `rustyfarian-esp-hal-network` is async (embassy).
-No rule says how names and types must match across the tiers, so every feature drifted, U2f included (see [wifi-reconnect-and-suspend-v1](../features/wifi-reconnect-and-suspend-v1.md)).
+No rule says how names and types must match across the tiers, so every feature drifted, U2f included (see [wifi-reconnect-and-suspend-v1](../features/archive/wifi-reconnect-and-suspend-v1.md)).
 
 Two shared items are stale:
 
@@ -64,7 +64,7 @@ That feature lets embassy-time work on both tiers.
 2. Async is the primary API on both tiers.
    - The ESP-IDF tier gains its async surface as async wrappers over its existing worker threads (amended 2026-11-01 after the tier-parity Step 2 spike on an ESP32-C3).
    - The spike measured equal start-up, message load and outage recovery for both foundations; the native `esp-idf-svc` async types saved 15 to 25 KB of heap only by leaving out the library runtime.
-   - A port on the native types would have to rebuild reconnect, suspend, session confirmation, non-blocking publish and the ADR 017 guard, so the heap gap is closed in the library instead (bug 013).
+   - A port on the native types would have to rebuild reconnect, suspend, session confirmation, non-blocking publish and the ADR 017 guard, so the heap gap is closed in the library instead.
    - The firmware owns the executor, following the ADR 021 rule that libraries never select a provider.
 3. The existing blocking ESP-IDF API stays during 0.x as an additive change.
    - New features land async-first on both tiers.
@@ -114,7 +114,7 @@ That feature lets embassy-time work on both tiers.
 
 - The IDF tier carries two surfaces during 0.x.
 - IDF firmware needs an executor and an embassy-time driver.
-- The wrapper path costs 15 to 25 KB of heap against the native `esp-idf-svc` async types (Step 2, C3); the library is to close that gap through bug 013 (Step 8c), which is still open.
+- The wrapper path costs 15 to 25 KB of heap against the native `esp-idf-svc` async types (Step 2, C3); the library is to close that gap through Step 8c.
 - One `embassy-time-driver` (0.2.2) and no duplicate embassy crates in the IDF graph, verified by the Step 2 spike.
 - The IDF async path's hardware campaign ran: the C3 spike (Step 2, 2026-11-01) and the CrowPanel S3 one-app gate (Step 9, 2026-11-03).
 - Some API changes are breaking (IDF MQTT payload `&str` to `&[u8]`, IDF `is_connected` return type, IDF `with_startup_message` signature), so each needs a new name with deprecation or a deliberate 0.x minor break.
@@ -127,7 +127,8 @@ That feature lets embassy-time work on both tiers.
 
 - Answered 2026-11-02: the IDF examples use esp-idf-hal `block_on`, and the firmware chooses its executor (ADR 021); `embassy-executor` with `arch-std` on IDF is untested.
 - Answered 2026-11-01: `embassy-time-driver 0.2.2` from `esp-idf-svc` unifies in the IDF graph, with one copy and no duplicate embassy crates (Step 2 spike).
-- Open: is each of the three breaking items a break or a deprecation? Settled per step in Steps 10 and 11; `MqttBuilder::build(&wifi)` (Step 8b-2) and, for 0.7.0, the IDF `MqttBuilder::with_startup_message` signature and the two required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended` are the 0.x breaks approved so far.
+- Open: is each of the three breaking items a break or a deprecation?
+  Settled per step in Steps 10 and 11; `MqttBuilder::build(&wifi)` (Step 8b-2) and, for 0.7.0, the IDF `MqttBuilder::with_startup_message` signature and the two required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended` are the 0.x breaks approved so far.
 - Open: does the blocking IDF API become thin wrappers over the async one?
 - Answered 2026-11-01: the IDF async foundation is async wrappers over the existing worker threads (decision 2).
 
@@ -142,7 +143,7 @@ That feature lets embassy-time work on both tiers.
 ## References
 
 - [ADR 005](005-crate-naming-for-dual-hal-drivers.md), [ADR 016](016-crate-consolidation-for-publishing.md), [ADR 017](017-mqtt-callback-threading-contract.md), [ADR 019](019-esp-hal-async-mqtt-client.md), [ADR 020](020-esp-hal-espnow-owned-radio-and-sync-shim.md), [ADR 021](021-binary-owned-providers.md) — the tier and provider decisions this one builds on
-- `docs/features/wifi-reconnect-and-suspend-v1.md` — the U2f feature doc
+- `docs/features/archive/wifi-reconnect-and-suspend-v1.md` — the U2f feature doc
 - `docs/wifi-suspend-and-deep-sleep.md` — the starting point for the capability table
 - Upstream request U2g from `rustyfarian-knob` — one Wi-Fi + MQTT surface for both tiers
 - Supersedes nothing.

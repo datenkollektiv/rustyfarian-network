@@ -1,4 +1,4 @@
-# 10-minute MQTT soak (T6), esp-hal tier (part of runbook C6-H2).
+# 10-minute MQTT soak (T6), esp-hal tier.
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
 # Log prefix is `[app]`; ticks every 5 s, heap every 60 s.
 # Unattended on purpose (`--unattended` runs it at full length): read the heap trend afterwards from the

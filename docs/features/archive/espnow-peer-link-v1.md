@@ -6,7 +6,7 @@ desk-work: available
 # Feature: ESP-NOW Peer Link v1
 
 Goal: one tested policy decides when a peer scans for its coordinator and follows a channel change, on both tiers.
-Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1](espnow-tier-parity-v1.md) for the helper, not for the core.
+Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1](../espnow-tier-parity-v1.md) for the helper, not for the core.
 
 ## Decisions
 
@@ -42,7 +42,7 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 - [x] When is the state `Lost`: at the failure threshold, or only after a failed rescan? — from the threshold-triggered rescan until a scan succeeds or the coordinator is heard or ACKs on the last channel
 - [x] Helper shape: a loop that owns the sends, or an observer the app feeds its send results? — a `PeerSession` handle that owns the sends plus a `run` loop (plan Step 6)
 - [x] Does `PeerLink` absorb or sit beside the existing `PeerTracker` heartbeat tracker? — beside it; `PeerTracker` stays the heartbeat-timeout tracker
-- [ ] The consumer's in-project core (`rgb-puzzle-link`) was not found locally; compare once it is shared.
+- [ ] The consumer's in-project core (`rgb-puzzle-link`) was not found locally; compare once it is shared (deferred to the consumer).
 
 ## State
 - [x] Design approved
@@ -51,20 +51,15 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 - [x] Peer examples on both tiers use the helper
 - [x] Documentation updated
 
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
-
 <details><summary>Acceptance</summary>
 
 - Host tests: unrelated received frames, recovery during backoff, stale scan results, stale send results, `Local` outcomes never trigger a scan, boot-scan retry without traffic.
 - Mutation check on the threshold counting and the stale-id guard.
-- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- Hardware: bench check `c3/espnow-peer-session`.
 
 </details>
 
 ## Session Log
-- 2026-11-03 — Feature doc created via /feature dialog from `review-queue/rustyfarian-network-espnow-peer-link-v1.md`
-- 2026-11-03 — Design review folded in: outcome classes, timer contract, ordering and stale results, coordinator-only `PeerHeard`
-- 2026-11-03 — `PeerLink` core implemented in juggler, `SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`
-- 2026-11-03 — Helper shape settled (`PeerSession`), delivered by espnow-tier-parity-v1 Steps 6–7
-- 2026-11-11 — `PeerSession` landed in `juggler::espnow::session` (Step 6) and both peers run the shared `examples-shared/espnow_peer_app.rs` on it (Step 7: new `idf_c3_espnow_peer`, rewritten `hal_c3_espnow_peer`); READMEs and CHANGELOG updated; the bench check `bench/c3/espnow-peer-session.toml` judges C3-H3 and C6-H4 and awaits the run
-- 2026-11-11 — Review pass applied: a `run` dropped mid-scan hands the scan back (rule 3, host test), the failed-scan log follows the core's decision (retry delay or rule-5 relink), `EmbassyClock` clamps its deadline, the IDF tier re-exports `EspNowLink` and `ClassifySend`, the shared app logs local send errors at `debug` (an esp-hal `Timeout` no longer fails the soak), bench step 12 rejects crashes only, `just test-espnow` covers `espnow::session`
+- 2026-11-03 — Feature doc created from `review-queue/rustyfarian-network-espnow-peer-link-v1.md`, design review folded in, `PeerLink` core implemented (`SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`), helper shape settled as `PeerSession`
+- 2026-11-11 — `PeerSession` landed in `juggler::espnow::session` and both C3 peers run the shared `examples-shared/espnow_peer_app.rs`; review pass applied (a `run` dropped mid-scan hands the scan back, `EmbassyClock` clamps its deadline, local send errors log at `debug`)
+- 2026-11-12 — Bench check `c3/espnow-peer-session` passed on both tiers; archived ahead of espnow-tier-parity-v1, whose Step 9 docs are still open

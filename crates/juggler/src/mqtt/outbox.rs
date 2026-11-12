@@ -1,7 +1,7 @@
 //! Outbound publishes for a client that may not exist yet (ADR 022 decision 10).
 //!
 //! The ESP-IDF tier creates its `esp-mqtt` client only once the station has an
-//! IP (bug 010), and the esp-hal tier accepts publishes before the first
+//! IP, and the esp-hal tier accepts publishes before the first
 //! connect; both must therefore hold a publish until a client can take it.
 //! [`Outbox`] is that holding place, shared so both tiers behave alike: a
 //! publish with a client attached goes straight out, one without is queued in

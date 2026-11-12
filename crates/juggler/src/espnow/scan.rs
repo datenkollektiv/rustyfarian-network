@@ -45,7 +45,7 @@
 //! A probe is the three-byte [`ProbeFrame`] (`0xF3`, ADR 025) with a per-scan sequence number;
 //! [`ScanMachine::probe_frame`] builds it for the channel named by `SendProbe`.
 //! A peer running the echo app answers with a [`ProbeReply`] that states its home channel, and
-//! that reply wins: the scan ends on the stated channel without another probe (bug 018: an
+//! that reply wins: the scan ends on the stated channel without another probe (an
 //! adjacent channel decodes and ACKs the probe, so the ACK alone cannot name the channel).
 //! An ACK without a reply within [`ScanConfig::reply_timeout`] keeps the old meaning as a
 //! fallback for peers that do not reply: the first such channel is the candidate, the sweep
@@ -957,7 +957,7 @@ impl<'a> ScanMachine<'a> {
                     ScanAction::AwaitReply { until }
                 }
             }
-            // No reply: an ACK alone only nominates the channel (bug 018) until the sweep is
+            // No reply: an ACK alone only nominates the channel until the sweep is
             // over; back on the candidate, the confirmation rule settles it.
             (State::AwaitingReply { idx, done, .. }, ScanInput::Completed) => match self.phase {
                 Phase::Sweep => {
@@ -1248,7 +1248,7 @@ mod tests {
     struct Peer {
         /// The channel the peer sits on; probes on other channels are not ACKed.
         home: Option<u8>,
-        /// Adjacent channels on which the peer's radio still decodes and ACKs a probe (bug 018).
+        /// Adjacent channels on which the peer's radio still decodes and ACKs a probe.
         acks_also_on: Vec<u8>,
         /// The peer runs the echo app and answers a decoded probe with a `ProbeReply`.
         replies: bool,
@@ -1534,7 +1534,7 @@ mod tests {
         assert_eq!(r.seen().last(), Some(&Seen::Register(6)));
     }
 
-    // ── probe reply (bug 018) ─────────────────────────────────────────────
+    // ── probe reply ─────────────────────────────────────────────
 
     // Hand mutation checks (2026-11-11, `just test-espnow`), each applied, run and reverted:
     // - seq match: `reply.seq == probe.seq` dropped from the reply arm -> 454/2:
@@ -1788,7 +1788,7 @@ mod tests {
     // - home guard: the `!self.allowed.contains(home)` early return in `found_at` removed ->
     //   `a_reply_naming_a_forbidden_home_channel_never_switches_to_it`;
     // - table: `01` moved to the 1-13 row in `Country::channels` -> 9 fail, among them the
-    //   bug 017 regression above.
+    //   forbidden-channel regression above.
 
     fn world() -> ChannelSet {
         crate::wifi::Country::WORLD.channels()
@@ -1796,7 +1796,7 @@ mod tests {
 
     #[test]
     fn world_country_with_the_default_list_probes_only_1_to_11() {
-        // Bug 017: the default list names 12 and 13, which the world default forbids.
+        // The default list names 12 and 13, which the world default forbids.
         let m = machine(ScanConfig::for_peer(), Some(3)).with_allowed_channels(world());
         assert_eq!(m.not_allowed(), 2);
         let r = run(m, &Peer::absent(), D::ZERO);
@@ -2131,7 +2131,7 @@ mod tests {
 
     #[test]
     fn zero_confirmations_settle_the_legacy_candidate_without_a_confirmation_probe() {
-        // Adjusted for the probe reply: an ACK-only hit is settled after the sweep (bug 018).
+        // Adjusted for the probe reply: an ACK-only hit is settled after the sweep.
         let cfg = ScanConfig::for_peer().with_probe_confirmations(0);
         let r = run(machine(cfg, None), &Peer::legacy(3), D::ZERO);
         assert_eq!(r.result, Ok(ScanResult { channel: 3 }));
@@ -3153,7 +3153,7 @@ mod tests {
                     roams_to: Some(6),
                     ..Peer::legacy(1)
                 },
-                // Adjacent-channel ACKs (bug 018), with and without a decodable reply.
+                // Adjacent-channel ACKs, with and without a decodable reply.
                 Peer {
                     acks_also_on: alloc::vec![10, 12],
                     ..Peer::on(11)

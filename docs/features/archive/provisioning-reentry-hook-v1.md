@@ -6,7 +6,7 @@ desk-work: available
 # Feature: Provisioning re-entry hook v1
 
 An optional hook the consumer answers once per boot, before the store is read, so a held button can reopen the portal or request a factory reset.
-Part 6 of [`wifi-portal-fallback-v1.md`](./wifi-portal-fallback-v1.md); second consumer is spookhouse (`review-queue/archive/rustyfarian-network-reentry-hook-reply-v1.md`).
+Part 6 of [`wifi-portal-fallback-v1.md`](../wifi-portal-fallback-v1.md); second consumer is spookhouse (`review-queue/archive/rustyfarian-network-reentry-hook-reply-v1.md`).
 
 ## Decisions
 |                                                            Decision | Reason                                                                | Rejected Alternative                                       |
@@ -35,19 +35,17 @@ Part 6 of [`wifi-portal-fallback-v1.md`](./wifi-portal-fallback-v1.md); second c
 - [x] Spookhouse needs only `FactoryReset` today; `Portal` stays for routing its fallback portal through the hook later.
 - [x] One boot continuing into the portal is acceptable and preferred over a second restart.
 - [x] `FactoryReset` does not wait for a pending OTA image; the hook path must never mark the running image valid.
-- [ ] Does the esp-hal tier get the hook with its own boot bundle, tracked as a separate feature? (spookhouse: no demand)
+- [ ] Does the esp-hal tier get the hook with its own boot bundle, tracked as a separate feature? (spookhouse: no demand; deferred)
 
 ## State
 - [x] Design approved
 - [x] Core implementation
 - [x] Tests passing
 - [x] Documentation updated
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- [x] Hardware: bench check `c3/reentry`
 
 ## Session Log
-- 2026-10-27 — Feature doc created via /feature dialog; option (a) chosen, design approved upstream.
-- 2026-10-27 — Updated: core, example and docs implemented via workflow; hardware gate open.
-- 2026-10-27 — Updated: review findings fixed, host tests and `just verify` green; only the hardware gate remains.
-- 2026-10-28 — Updated: spookhouse reply closes three open questions, stored-flag hook pattern recorded; hardware gate still open.
-- 2026-11-11 — Updated: spookhouse bench report (C3 DevKitM, 7/7 cases, `None` and `FactoryReset` from a stored flag) recorded as second-consumer evidence on runbook gate C3-I4; report archived.
+- 2026-10-27 — Feature doc created via /feature dialog (option a); core, example and docs implemented, review findings fixed, host tests and `just verify` green
+- 2026-10-28 — Spookhouse reply closed three open questions; stored-flag hook pattern recorded
+- 2026-11-11 — Spookhouse bench report (C3 DevKitM, 7/7 cases, `None` and `FactoryReset` from a stored flag) recorded as second-consumer evidence next to bench check `c3/reentry`; report archived
+- 2026-11-12 — Archived: bench check `c3/reentry` passed, the esp-hal question deferred

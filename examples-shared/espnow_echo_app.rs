@@ -5,7 +5,7 @@
 //! It is bench-only: both crates exclude their coordinator example from the published package.
 //!
 //! The app answers a scan probe (`0xF3`, [`ProbeFrame`]) with a [`ProbeReply`] (`0xF4`) that
-//! names the channel the radio is on (ADR 025, bug 018), and echoes every other payload back to
+//! names the channel the radio is on (ADR 025), and echoes every other payload back to
 //! its sender verbatim.
 //! Unknown senders are registered as peers on the current channel first.
 //!

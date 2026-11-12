@@ -347,7 +347,7 @@ impl WifiLink {
                                 Either::Second(Err(e)) => {
                                     // A refused association arrives here, not as a
                                     // disconnect event, so the hint belongs on this
-                                    // line too (bug 011).
+                                    // line too.
                                     log::warn!(
                                         "[wifi] connect failed: {:?}{}",
                                         e,
@@ -440,7 +440,7 @@ impl WifiLink {
                                             // esp-radio reports a named reason, not the
                                             // ESP-IDF code, so the name is its `Debug`
                                             // form; the credentials hint is the one both
-                                            // tiers share (bug 011).
+                                            // tiers share.
                                             Ok(info) => log::warn!(
                                                 "{}",
                                                 Disconnected {
@@ -555,7 +555,7 @@ const _: fn() = || {
 /// reasons the shared [`reason_suggests_credentials`] lists are matched on their
 /// variants here: `4WAY_HANDSHAKE_TIMEOUT`, `NO_AP_FOUND`, `AUTH_FAIL` and
 /// `HANDSHAKE_TIMEOUT`. `reason_suggests_credentials` itself cannot be used
-/// because the numeric code is not exposed (bug 011).
+/// because the numeric code is not exposed.
 fn hal_disconnect_hint(reason: &DisconnectReason) -> &'static str {
     match reason {
         DisconnectReason::FourWayHandshakeTimeout
@@ -568,7 +568,7 @@ fn hal_disconnect_hint(reason: &DisconnectReason) -> &'static str {
 
 /// The same hint for a connect that never associated: esp-radio reports the
 /// rejection as [`ConnectionError::Failed`] carrying the reason a disconnect
-/// event would have, and a wrong password is the common cause (bug 011).
+/// event would have, and a wrong password is the common cause.
 fn connect_failure_hint(error: &ConnectionError) -> &'static str {
     match error {
         ConnectionError::Failed(info) => hal_disconnect_hint(&info.reason),

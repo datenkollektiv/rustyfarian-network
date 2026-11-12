@@ -87,7 +87,7 @@ let (espnow, result) = EspIdfEspNow::init_with_radio_scanning(
 ### Positive
 
 - Slaves auto-discover the coordinator's channel without application-level `unsafe`
-- No protocol changes are needed (MAC-layer ACK is the probe mechanism) — superseded 2026-11-11 by [ADR 025](025-espnow-probe-reply-carries-channel.md): the probe is a tagged `0xF3` frame and a `0xF4` reply carrying the coordinator's channel wins over the ACK, which stays the fallback (bug 018)
+- No protocol changes are needed (MAC-layer ACK is the probe mechanism) — superseded 2026-11-11 by [ADR 025](025-espnow-probe-reply-carries-channel.md): the probe is a tagged `0xF3` frame and a `0xF4` reply carrying the coordinator's channel wins over the ACK, which stays the fallback
 - Re-scanning is supported by calling `scan_for_peer()` again when the peer becomes unreachable
 - Configurable channel list supports non-EU regions
 

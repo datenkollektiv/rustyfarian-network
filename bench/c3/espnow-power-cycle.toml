@@ -1,4 +1,4 @@
-# ESP-NOW smoke run with a coordinator power cycle (runbook gate C3-I1).
+# ESP-NOW smoke run with a coordinator power cycle (ESP-IDF scout against the ESP-IDF C6 coordinator).
 # `idf_c3_espnow_scout` in its DEFAULT scenario (leave `ESPNOW_SCENARIO` unset) against the ESP-IDF C6
 # coordinator `idf_c6_espnow_coordinator` on the shared echo app (an IDF C3 `idf_c3_espnow_coordinator` or the
 # hal `hal_c6_espnow_sta_coordinator` answer the same way); the coordinator follows its access point's channel.
@@ -13,7 +13,7 @@
 # step, there is no rate to judge); `--attended` asks a person to unplug the coordinator, judges that the scout
 # notices (failed send, then not-found scans), keeps it off for 20 s, asks to plug it in again and judges the
 # refind, a 15 s settle (the coordinator ACKs probes on passing channels while it still scans for its access
-# point, see the C3-I7 record), the first ACK and 30 s of steady sends.
+# point, see the `espnow-cancel` check), the first ACK and 30 s of steady sends.
 examples = ["idf_c3_espnow_scout"]
 
 # ── unattended half: coordinator on ────────────────────────────────────────────

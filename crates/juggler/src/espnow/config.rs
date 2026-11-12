@@ -22,7 +22,7 @@ pub const MAX_TX_POWER_QUARTER_DBM: i8 = 84;
 /// TX power both tiers' owned-radio constructors apply when the config sets none: 13 dBm.
 ///
 /// The drivers' own defaults differ (ESP-IDF 20 dBm, esp-radio 5 dBm), and 20 dBm corrupts the
-/// frames and ACKs of an ESP32-C3 Super Mini (bug 022).
+/// frames and ACKs of an ESP32-C3 Super Mini.
 pub const DEFAULT_TX_POWER_QUARTER_DBM: i8 = 52;
 
 /// Why an [`EspNowConfig`] was refused.

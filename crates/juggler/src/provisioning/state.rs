@@ -98,7 +98,7 @@ pub enum WaitResolution {
 /// NOT a separately tracked "config present" flag. This matters because the
 /// committed [`ProvisioningConfig`](super::ProvisioningConfig) payload can be
 /// moved out of shared state with `take()` (to avoid cloning the ~1.3 KB
-/// struct onto a caller's stack — see `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`),
+/// struct onto a caller's stack),
 /// so a waiter observed after the payload is gone must still resolve
 /// `Committed` from `ProvisioningState::Committed` itself.
 /// `FactoryResetPending` resolves the waiter so an indefinite (no-timeout)

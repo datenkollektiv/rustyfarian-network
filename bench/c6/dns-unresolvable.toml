@@ -1,4 +1,4 @@
-# esp-hal broker hostname that does not resolve, on the C6 (runbook C6-H5, failure half).
+# esp-hal broker hostname that does not resolve, on the C6 (failure half).
 # Build with a name the board's DNS server answers NXDOMAIN for; a shell variable wins over `.env`:
 #   MQTT_HOST=no-such-broker.invalid MQTT_PORT=1883 just bench c6 dns-unresolvable
 # No broker is needed, so there is no setup. No person needed.

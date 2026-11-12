@@ -2167,7 +2167,7 @@ mod tests {
     // reply that follows the ACK from the same task was handed to the application.
     #[test]
     fn a_probe_reply_ends_the_scan_on_the_peers_home_channel() {
-        // Bug 018: the peer sits on 11, decodes and ACKs the probe sent on 10/6; its reply
+        // The peer sits on 11, decodes and ACKs the probe sent on 10/6; its reply
         // names 11, so the scan ends there without probing on, and without the candidate return.
         let fixture = Fixture::new(SOFTAP);
         fixture.edit(|state| {

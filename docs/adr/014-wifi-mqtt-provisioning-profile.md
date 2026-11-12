@@ -16,6 +16,7 @@ It only knows one schema: the beekeeper four-field set (Wi-Fi credentials + LoRa
 
 ADR 013 §4 deliberately locked that single four-field schema and rejected a generic host-defined schema, because centralised form validation is the load-bearing piece of `provisioning-pure`.
 ADR 013 also left an extras escape hatch: opaque `x_*` name/value pairs carried alongside the canonical fields.
+
 Those extras are unsuitable for MQTT credentials.
 They have no typed validation, no `Debug` redaction, and no secret handling in the portal.
 The portal pre-fills extras as plain non-secret values.
@@ -87,6 +88,7 @@ That feature gates only the two std-dependent items — `spawn_subscriber_thread
 The validators — `validate_client_id`, `CLIENT_ID_MAX_LEN`, and the topic validators — sit in the `no_std` core, as do `backoff.rs` and `status_colors.rs`, which have no std usage.
 `provisioning-pure` depends on `rustyfarian-network-pure` with `default-features = false`, picking up the validators without dragging in `std`.
 The MQTT consumers (`rustyfarian-esp-idf-mqtt`) keep the default `std` feature and are unaffected.
+
 This extraction landed **before Phase 1** of the feature plan (Phase 0, 2026-06-12), since Phase 1's MQTT validators delegate into it.
 The implementation also moved `QoS` and the `SubscribeClient` trait behind the `std` gate because the trait's `anyhow` dependency forced it.
 It also made `anyhow` itself optional behind `std`.
@@ -209,7 +211,7 @@ NVS/flash layout unchanged — both stores already round-trip empty strings.
 The IDF tier now loads the stored record as `juggler::provisioning::ProvisioningConfig`, the same type the HAL tier and the portal commit use; `StoredConfig` is removed.
 `ProvisioningConfig::ota_url()` returns `Option<&str>`, with `None` replacing the empty string described in the 2026-09-26 amendment.
 The NVS key layout in §4 is unchanged, and records written by 0.6.x firmware load unchanged.
-See `docs/features/provisioning-boot-identity-v1.md`.
+See `docs/features/archive/provisioning-boot-identity-v1.md`.
 
 ## References
 

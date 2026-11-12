@@ -21,14 +21,18 @@ An interim fix on 2026-10-31 stopped the chip features from selecting a console 
 
 Amended 2026-10-31: scheduler added as the fourth provider (request U2e).
 
-1. **Library crates of this workspace never select a provider.** `juggler`, `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network` select neither a `critical-section` provider, nor an `esp-println` console, nor a panic handler, nor the `esp-rtos` scheduler; the firmware does (on bare metal `esp-hal` itself is the only provider and is not a Cargo feature, so nothing is selected there).
+1. **Library crates of this workspace never select a provider.**
+   `juggler`, `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network` select neither a `critical-section` provider, nor an `esp-println` console, nor a panic handler, nor the `esp-rtos` scheduler; the firmware does (on bare metal `esp-hal` itself is the only provider and is not a Cargo feature, so nothing is selected there).
    A `#[cfg(test)]` provider that exists only in a crate's own unit-test binary (the hal crate's `host_critical_section`) is the binary's choice, not the library's.
-2. **The `esp-rtos` scheduler starts once per boot, and the firmware decides who starts it.** `rustyfarian-esp-hal-network` starts it only when the firmware passes `TIMG0` and `FROM_CPU_INTR0` through `with_peripherals` or `with_ap_peripherals`, and `init_async` / `init_softap_async` do so before they validate the configuration.
+2. **The `esp-rtos` scheduler starts once per boot, and the firmware decides who starts it.**
+   `rustyfarian-esp-hal-network` starts it only when the firmware passes `TIMG0` and `FROM_CPU_INTR0` through `with_peripherals` or `with_ap_peripherals`, and `init_async` / `init_softap_async` do so before they validate the configuration.
    A firmware that already called `esp_rtos::start` passes only `WIFI` through `with_wifi_scheduler_running` or `with_ap_wifi_scheduler_running`, and the library starts nothing.
    Either way `esp_rtos::start` runs once per boot, because a second call panics in `esp-rtos`.
    `ProvisioningBuilder` offers the same pair for the captive portal: `start` starts the scheduler from `TIMG0` and `FROM_CPU_INTR0` as its first step, before its own profile, SSID and password checks, and `start_scheduler_running` takes only `WIFI`, so the portal fallback of a scheduler-owning firmware is covered.
-3. **`rustyfarian-esp-hal-network` depends on neither `esp-println` nor `esp-backtrace`.** `wifi` and `lora` stop pulling them, the chip features forward nothing to them, and the docs.rs metadata lists no console.
-4. **Examples are firmware.** The crate's examples take both crates from `[target.<triple>.dev-dependencies]` tables for the four triples (C3, C6, S3, classic ESP32), each carrying the chip, `auto` + `log-04` for `esp-println` and `panic-handler` + `println` for `esp-backtrace`.
+3. **`rustyfarian-esp-hal-network` depends on neither `esp-println` nor `esp-backtrace`.**
+   `wifi` and `lora` stop pulling them, the chip features forward nothing to them, and the docs.rs metadata lists no console.
+4. **Examples are firmware.**
+   The crate's examples take both crates from `[target.<triple>.dev-dependencies]` tables for the four triples (C3, C6, S3, classic ESP32), each carrying the chip, `auto` + `log-04` for `esp-println` and `panic-handler` + `println` for `esp-backtrace`.
    Only a target triple can carry the chip once the library stops forwarding it, and the host triple is excluded, so host tests never compile either crate.
 5. **Lib-only checks need no console.** `just check-hal`, `just clippy-hal`, the docs.rs build and `just release-dry-run-hal` run with no console on the command line.
 

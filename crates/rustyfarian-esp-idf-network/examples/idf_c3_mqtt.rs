@@ -73,8 +73,7 @@ fn main() -> anyhow::Result<()> {
     let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), wifi_config)?;
 
     // No `get_ip` wait: the MQTT session is gated on the link, so it starts as
-    // soon as the station holds an IP and logs no failed attempt before that
-    // (bug 010).
+    // soon as the station holds an IP and logs no failed attempt before that.
 
     let lwt_topic = format!("{}/status", client_id);
     let lwt = LwtConfig::new(&lwt_topic, b"offline", QoS::AtLeastOnce, true);

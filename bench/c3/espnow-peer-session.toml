@@ -1,10 +1,10 @@
-# ESP-NOW peer session across a coordinator power cycle (runbook gates C3-H3 and C6-H4).
+# ESP-NOW peer session across a coordinator power cycle (esp-hal peer and ESP-IDF peer against the C6 coordinator).
 # Both peers run the shared peer app on `PeerSession` (parity plan Step 7) and print the same lines, so one set of
 # steps judges the hal peer `hal_c3_espnow_peer` and the ESP-IDF peer `idf_c3_espnow_peer` in turn.
 # The runbook pairs the C3 with the C6 in both directions, so run the check twice, with a different coordinator on
 # the C6 each time (`ESPFLASH_PORT=<c6 port> just run <coordinator>` before the run, note the printed STA MAC):
-#   idf_c6_espnow_coordinator      the hal peer half of the run counts for C3-H3 (hal peer, IDF coordinator)
-#   hal_c6_espnow_sta_coordinator  the IDF peer half of the run counts for C6-H4 (IDF peer, hal coordinator)
+#   idf_c6_espnow_coordinator      the hal peer half of the run is the esp-hal peer against an IDF coordinator
+#   hal_c6_espnow_sta_coordinator  the IDF peer half of the run is the ESP-IDF peer against an esp-hal coordinator
 # The other half of each run is a free extra; the coordinator follows its access point's channel.
 # The MAC is read at build time (both peers take `ESPNOW_PEER_MAC`); leave ESPNOW_SCENARIO unset (or `default`):
 #   ESPNOW_PEER_MAC=<coordinator STA MAC> just bench c3 espnow-peer-session --port <c3 port>
@@ -19,7 +19,7 @@
 # Two halves: `--unattended` boots, finds the coordinator and watches 60 s of sends with the cumulative failure rate
 # below 5 % and no rescan; `--attended` asks a person to unplug the coordinator, judges the threshold rescan and the
 # rising rescans counter, keeps it off for 20 s, asks to plug it in again, waits a 15 s settle (the coordinator ACKs
-# probes on passing channels while it still scans for its access point, see the C3-I7 record) and judges 30 s of
+# probes on passing channels while it still scans for its access point, see the `espnow-cancel` check) and judges 30 s of
 # acknowledged sends on the pinned channel.
 examples = ["hal_c3_espnow_peer", "idf_c3_espnow_peer"]
 

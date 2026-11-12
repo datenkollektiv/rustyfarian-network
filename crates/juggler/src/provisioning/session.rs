@@ -1,7 +1,6 @@
 //! The host-testable shared session state behind a provisioning portal.
 //!
-//! Moved out of `rustyfarian-esp-idf-network` so the commit/wait race fixed in
-//! `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md` and
+//! Moved out of `rustyfarian-esp-idf-network` so the commit/wait race fix and
 //! its sibling atomic-commit fix can carry a real host-run regression test
 //! (esp-idf-sys blocks host builds of that crate's own tests). Uses only
 //! `std::sync::{Arc, Mutex, Condvar}` and `std::time::{Duration, Instant}`,
@@ -27,8 +26,7 @@ pub enum SessionOutcome {
     ///
     /// Carries no payload: a caller that only needs the outcome discards the
     /// config, so returning it here would clone the ~1.3 KB
-    /// [`ProvisioningConfig`] onto the caller's stack for nothing (bug
-    /// `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`). A caller
+    /// [`ProvisioningConfig`] onto the caller's stack for nothing. A caller
     /// that needs the config should use [`SessionState::wait_committed`]
     /// instead.
     Committed,
@@ -96,8 +94,8 @@ impl SessionState {
     ///
     /// Polls the machine under the lock. On [`PortalAction::Committed`] the
     /// `payload` is published and the waiters are woken in the same critical
-    /// section, so a waiter never observes `Committed` without the config
-    /// (bug 002); on [`PortalAction::ResetAccepted`] the waiters are woken. A
+    /// section, so a waiter never observes `Committed` without the config;
+    /// on [`PortalAction::ResetAccepted`] the waiters are woken. A
     /// refused input is logged at `warn` and changes nothing. A poisoned mutex
     /// is reported as a refusal of the input from the last observable state,
     /// so a caller never mistakes it for success.
@@ -241,8 +239,7 @@ impl SessionState {
     /// the timer, so the total wait never exceeds the caller's requested
     /// duration.
     ///
-    /// The config is moved out of shared state with `take()`, never cloned
-    /// (bug `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`), so
+    /// The config is moved out of shared state with `take()`, never cloned, so
     /// it can only be returned once: a second call after a successful return
     /// resolves `Committed` from the state (see [`resolve_wait`]) but finds
     /// `guard.committed` already empty and returns `None` immediately without

@@ -23,7 +23,7 @@ Answers `review-queue/rustyfarian-network-boot-device-name-v1.md` (spookhouse) a
 
 ## Constraints
 - The library never erases or restarts, and `WifiMqttBoot::load` never claims the modem.
-- `ProvisioningConfig` is about 1.3 KB by value; it must be moved, never cloned, onto the boot task's stack (bug 002).
+- `ProvisioningConfig` is about 1.3 KB by value; it must be moved, never cloned, onto the boot task's stack.
 - The IDF NVS key layout (ADR 014 §4) does not change; only the in-memory type does.
 - Records written by 0.6.x firmware load unchanged on both tiers.
 - Breaking for `juggler` and the IDF tier, so it ships in 0.7.0 with CHANGELOG migration notes.
@@ -40,13 +40,9 @@ Answers `review-queue/rustyfarian-network-boot-device-name-v1.md` (spookhouse) a
 - [x] Core implementation
 - [x] Tests passing
 - [x] Documentation updated
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- [x] Hardware: "C3 hal provisioning extras (manual)" and `c6/provision`
 
 ## Session Log
-- 2026-10-27 — Feature doc created via /feature dialog
-- 2026-10-27 — Desk work landed: juggler `ota_url()` as `Option<&str>` and extras through `from_storage_parts`, IDF `load()` and `WifiMqttBoot` on `ProvisioningConfig` with `StoredConfig` removed, HAL `TAG_EXTRA` and the 1280 B read cap, CHANGELOG, ADR 014 and 015 amendments, runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`.
-  The hardware gate (HAL record with extras across a reboot on C3 and C6) is open; the runbook submits extras with the new `just portal-save` recipe.
-- 2026-10-27 — Final review asked for an IDF boot smoke at rgb-clock's 8000 B main-task stack before the 0.7.0 release, because the record crosses the stack once in `load`; added as scenario H4 in the runbook.
-- 2026-10-27 — `StoredConfig` removed outright instead of deprecated for one release (user decision); the IDF store's NVS logic moved to `juggler::provisioning::kv_store` with host tests for the 0.6.x key set and the write order.
-- 2026-10-30 — Bench test 5 of hal-provisioning-ap-ownership-v1 showed a HAL record without extras survives a reboot on an ESP32-C3 Mini-1, but only after bug 006 (esp-storage rejects the unaligned `record_len` read) was fixed; before it no record read back at all, so the extras runbook H1 would have failed. The extras variant of H1 and the C6 run stay open.
+- 2026-10-27 — Feature doc created and desk work landed (juggler `ota_url()` as `Option<&str>`, IDF `load()` and `WifiMqttBoot` on `ProvisioningConfig` with `StoredConfig` removed outright by user decision, IDF NVS logic in `juggler::provisioning::kv_store` with host tests for the 0.6.x key set and the write order, HAL `TAG_EXTRA` and the 1280 B read cap, ADR 014 and 015 amendments, runbook `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md` submitting extras with `just portal-save`); final review added an IDF boot smoke at rgb-clock's 8000 B main-task stack (scenario H4)
+- 2026-10-30 — A HAL record without extras survived a reboot on an ESP32-C3 only after the unaligned `record_len` read was fixed
+- 2026-11-12 — Archived: hardware covered by "C3 hal provisioning extras (manual)", `c6/provision` and "C3 portal prefill (manual)" (the rgb-clock 8000 B half is checked in that repository)

@@ -1,5 +1,5 @@
-# Shared-app MQTT scenarios on the CrowPanel S3, both tiers (runbook S3-H1 T5b, S3-B1 R1, and the
-# startup-message half of S3-B2); the suspend demo (R3, `wait_suspended`) is the `suspend` check.
+# Shared-app MQTT scenarios on the CrowPanel S3, both tiers (T5b, R1, and the
+# startup-message check); the suspend demo (R3, `wait_suspended`) is the `suspend` check.
 # Both examples run examples-shared/lwt_app.rs, so one set of steps judges both tiers (log prefix `[app]`).
 # Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md (T1, T4, T5b) and
 # docs/runbooks/wifi-reconnect-hardware-test.md (R1); serial lines and broker messages are judged here.
@@ -10,7 +10,7 @@
 # Still a person: the router pause. T5a (AP off) is not run: on a mesh the board roams to another node of
 # the same SSID, and the per-device pause covers the same link-loss path (as on the C6).
 # The broker is the local one from `just mosquitto` (T4 restarts it), so MQTT_HOST must be this machine's
-# LAN IPv4 (or a LAN hostname for the hal DNS line of S3-B2) that the board can reach, at build time and for
+# LAN IPv4 (or a LAN hostname for the hal DNS line) that the board can reach, at build time and for
 # the recipes; a shell variable wins over the dotenv file:
 #   MQTT_HOST=<this machine> MQTT_PORT=1883 just bench s3 mqtt-scenarios --port <s3 port>
 # Build WITHOUT MQTT_SUSPEND_DEMO: the demo's own disconnects would be judged as outages here.
@@ -40,7 +40,7 @@ timeout = 150
 arm = false       # Wi-Fi and the first CONNACK arrive during the reset
 
 [[step]]
-say = "T1: the startup message `online` is retained at the broker and live ticks arrive (S3-B2, first connect)"
+say = "T1: the startup message `online` is retained at the broker and live ticks arrive"
 # The retained status is replayed at subscribe (`retain=1`), then the ticks arrive live (`retain=0`).
 probe = ["just", "mqtt-watch", "{example}"]
 arm = false
@@ -61,7 +61,7 @@ reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-
 timeout = 60
 
 [[step]]
-say = "T4: the startup message `online` is retained again after the broker restart (S3-B2)"
+say = "T4: the startup message `online` is retained again after the broker restart"
 probe = ["just", "mqtt-status", "{example}"]
 arm = false
 expect = '^online$'
@@ -118,7 +118,7 @@ reject = '\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-
 timeout = 120
 
 [[step]]
-say = "T5b/R1: the startup message `online` is retained again after the Wi-Fi blip (S3-B2)"
+say = "T5b/R1: the startup message `online` is retained again after the Wi-Fi blip"
 attended = true
 probe = ["just", "mqtt-status", "{example}"]
 arm = false

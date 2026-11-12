@@ -40,9 +40,9 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 - The aborted-sleep case is covered: a `resume()` within 50 ms of `suspend()` leaves exactly one connect in flight.
 
 ## Open Questions
-- [ ] Add jitter to the back-off once a fleet of devices behind one AP needs it (deterministic delays resynchronise after an AP outage)?
+- [ ] Add jitter to the back-off once a fleet of devices behind one AP needs it (deterministic delays resynchronise after an AP outage)? (deferred)
 - [x] esp-mqtt's 10 s reconnect churn while Wi-Fi is stopped is documented as acceptable log noise; raise `reconnect_timeout` to quiet it, at the cost of a slower reconnect after resume.
-- [ ] Add a watchdog for a `Connecting` or fenced link that never sees its event, should a tier ever lose driver events (today both rely on in-order delivery)?
+- [ ] Add a watchdog for a `Connecting` or fenced link that never sees its event, should a tier ever lose driver events (today both rely on in-order delivery)? (deferred)
 
 ## State
 - [x] Design approved
@@ -50,19 +50,11 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 - [x] PR 2 (U2f-b): suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
 - [x] Tests passing
 - [x] Documentation updated
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- [x] Hardware: bench checks `s3/mqtt-scenarios` (attended) and `s3/suspend`, both tiers
 
 ## Session Log
-- 2026-10-31 — Feature doc created from request U2f after design review; reconnect policy moved into one pure machine at the maintainer's request
-- 2026-10-31 — PR 1 implemented on `reconnect-rework`: `LinkMachine` (8 host tests), IDF worker, `WifiLink` + `link_task`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, IDF `try_publish*` gate, bug 009, runbook `wifi-reconnect-hardware-test.md`; all 8 example builds green; hardware gate open
-- 2026-10-31 — PR 1 review applied: IDF first connect goes through the worker in every mode, `LinkWorker` joins before the driver drops, hal `run` resets on entry and counts an adopted link, machine adapter contract documented
-- 2026-11-01 — PR 2 implemented: suspend/resume on both tiers, IDF connect_count, MQTT_SUSPEND_DEMO, deep-sleep guide docs/wifi-suspend-and-deep-sleep.md, runbook R3; 14 machine tests; hardware gate open
-- 2026-11-01 — PR 2 review applied: hal handover published under the state lock, IDF stop fence moved into resume and the worker, adapters extracted to juggler `LinkHandover` / `LinkSupervisor` with host tests
-- 2026-11-01 — Second and third review applied: no fence timeout in resume (a lost `Stopped` expires after 5 s in the worker), back-off deadline kept under the core lock, failure-injection concurrency tests, radio difference between tiers made prominent
-- 2026-11-01 — Fourth review applied: the stop fence has no timeout, only `Stopped` re-admits link events; the in-order, no-loss event contract is documented and late-event tests cover delays beyond every timer
-- 2026-11-02 — R3 suspend/resume run on the CrowPanel S3 for both tiers, 3 cycles each, pass; `suspend` now reports readiness before the radio stops (removes a spurious MQTT retry, keeps one teardown error on IDF); R1 still needs a router pause
-- 2026-11-02 — R1 router pause run on the CrowPanel S3 (ESP-IDF): back-off 1000→30000 ms never higher, ticks `would block`, one teardown error, MQTT back 270 ms after `sta ip:`, no reboot; esp-hal R1 not run
-- 2026-11-11 — R3 on the bench for both tiers (`just bench s3 suspend` 13/13 each, three cycles, `wait_suspended` prompt, no reconnect while suspended, one connect per resume, will and `online` at the broker); the attended R1 run on both tiers timed out at the pause step with ticks still queued, so the esp-hal R1 cell and the IDF bench R1 stayed open
-- 2026-11-11 — esp-hal R1 on the bench (`just bench s3 mqtt-scenarios --attended` 10/10, `hal_esp32s3_mqtt_lwt`): `AuthenticationLeave` on the pause, back-off 1000→30000 ms never higher, ticks `would block`, will at the broker, `link up #2` and one connect after the unpause, no reboot; the esp-hal R1 cell is closed, the IDF bench R1 run follows
-- 2026-11-11 — IDF R1 on the bench too (`just bench s3 mqtt-scenarios --attended` 10/10, `idf_esp32s3_mqtt_lwt`): `AUTH_LEAVE` on the pause, one `ESP_FAIL` MQTT error, back-off capped at 30000 ms, will at the broker, `link up #2` after the unpause, no reboot; the state gate (R1 and R3, both tiers) is closed on the bench
+- 2026-10-31 — Feature doc created from request U2f; PR 1 implemented on `reconnect-rework` (`LinkMachine`, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, IDF `try_publish*` gate, IDF reconnect fix, runbook `wifi-reconnect-hardware-test.md`) and its review applied
+- 2026-11-01 — PR 2 implemented (suspend/resume on both tiers, `MQTT_SUSPEND_DEMO`, deep-sleep guide `docs/wifi-suspend-and-deep-sleep.md`, runbook R3); four review rounds moved the adapters into juggler `LinkHandover` / `LinkSupervisor` and left the stop fence without a timeout (only `Stopped` re-admits link events, in-order no-loss event contract documented)
+- 2026-11-02 — `suspend` now reports readiness before the radio stops; R3 and the ESP-IDF R1 passed on the CrowPanel S3
+- 2026-11-11 — R1 and R3 passed on both tiers as bench checks `s3/mqtt-scenarios` (attended) and `s3/suspend`; state gate closed
+- 2026-11-12 — Archived; the two open questions are deferred until a fleet or a tier needs them

@@ -31,7 +31,7 @@
 //! tier signals the waiter first and emits the event second, then responds:
 //! a callback that inspects the session then sees the terminal state its
 //! waiter was woken for. On `Committed` the payload is published together
-//! with the signal (bug 002: a waiter must never see `Committed` without it).
+//! with the signal: a waiter must never see `Committed` without it.
 //!
 //! # Out-of-phase input
 //!

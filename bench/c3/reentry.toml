@@ -1,4 +1,4 @@
-# BOOT re-entry hook outcomes, ESP-IDF tier (runbook C3-I4).
+# BOOT re-entry hook outcomes, ESP-IDF tier.
 # Needs a provisioned board: run `just run idf_c3_provision_mqtt` once and submit the portal form.
 # The hook watches BOOT (GPIO9, a strapping pin) for 2 s after its `press BOOT now` line: holding
 # BOOT through the reset enters download mode instead, and a press after the window is ignored.

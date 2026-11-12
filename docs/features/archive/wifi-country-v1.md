@@ -5,7 +5,7 @@ desk-work: available
 
 # Feature: Wi-Fi regulatory country v1
 
-Both tiers apply one configurable regulatory country on every radio start, and the ESP-NOW scan skips channels the country forbids (bug 017).
+Both tiers apply one configurable regulatory country on every radio start, and the ESP-NOW scan skips channels the country forbids.
 
 ## Decisions
 | Decision | Reason | Rejected Alternative |
@@ -27,19 +27,16 @@ Both tiers apply one configurable regulatory country on every radio start, and t
 - `init_with_radio_scanning` scans before a country can be set and always runs under WORLD.
 
 ## Open Questions
-- [ ] Does ESP-IDF write flash on a boot where the country already matches (bench check)?
-- [ ] Does stop/start after suspend keep the country on both tiers (read-back on the bench)?
+- [ ] Does ESP-IDF write flash on a boot where the country already matches (bench check)? (deferred)
+- [ ] Does stop/start after suspend keep the country on both tiers (read-back on the bench)? (deferred)
 
 ## State
 - [x] Design approved
 - [x] Core implementation
 - [x] Tests passing
 - [x] Documentation updated
-- [x] Hardware check passed
+- [x] Hardware check passed (`c3/espnow-cancel`)
 
 ## Session Log
-- 2026-11-11 — Feature doc created from the approved design; scope inside 0.7.0, fixes bug 017
-- 2026-11-11 — Core, both tier adapters, examples and tests implemented with `just verify` green (not run on hardware); ADR 026 accepted, CHANGELOG, ROADMAP and bug 017 closed, lore and the bench check updated; the bench checks C3-I7, C3-H6 and the boot country line are still owed
-- 2026-11-11 — Review fixes: owned ESP-NOW constructors take the start country (no double flash write), the write is never skipped while associated, both tier `espnow` modules re-export the country types, empty `WIFI_COUNTRY` means WORLD on both tiers, bug 017 moved to the archive, semver baseline v0.6.0
-- 2026-11-11 — ESP-NOW start settings moved into shared `juggler::espnow::EspNowConfig`, ESP-IDF got `init_with_radio_config` / `init_with_radio_sta_config` / `init_with_radio_scanning_config` (replacing the `_country` constructors), parity gap closed
-- 2026-11-11 — Hardware: `just bench c3 espnow-cancel` 10/10 on both tiers, country line at boot, not-found scans skip 12/13 with no fault; C3-I7 re-passed, C3-H6 passed
+- 2026-11-11 — Feature doc created from the approved design; core, both tier adapters, ADR 026 and the bench check implemented; review fixes (owned ESP-NOW constructors take the start country, no write skipped while associated, empty `WIFI_COUNTRY` means WORLD on both tiers); ESP-NOW start settings moved into shared `juggler::espnow::EspNowConfig`; bench check `c3/espnow-cancel` passed on both tiers with the country line at boot and not-found scans skipping 12/13
+- 2026-11-12 — Archived; the two open bench questions are deferred

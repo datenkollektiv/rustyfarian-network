@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     let wifi = WiFiManager::init(wifi_config)?;
     spike::name_next_threads(None);
 
-    // Proper order (bug 010): MQTT starts only once the station has an IP.
+    // Proper order: MQTT starts only once the station has an IP.
     let ip = loop {
         if let Some(ip) = wifi.get_ip(WIFI_IP_WAIT_SLICE_MS)? {
             break ip;

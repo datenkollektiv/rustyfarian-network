@@ -44,7 +44,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 - [x] Deprecate `juggler::wifi::WifiDriver` (`#[deprecated(note = "use the ADR 022 traits")]`), fix its implementor list; keep the re-exports with `#[allow(deprecated)]`.
 - [x] Log the state in `idf_esp32s3_mqtt_lwt` next to `connect #<n>`.
 - Done when: host tests cover the state mapping; `idf_esp32s3_mqtt_lwt` builds.
-- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md (runbook R1 shows `Connecting → Connected → Disconnected → Connected`).
+- Hardware: bench check `s3/mqtt-scenarios` (R1 shows `Connecting → Connected → Disconnected → Connected`).
 
 ## Phase 1 — The async IDF question, answered on hardware
 
@@ -57,7 +57,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 - Done when: both variants build, `cargo tree -i embassy-time-driver` shows one version, a C3 run publishes ticks with each, and the maintainer has accepted the ADR amendment.
 - Decided 2026-11-01 by the maintainer: spike both instead of assuming the adapter.
 - Decided 2026-11-01 by the maintainer after the hardware run: variant A, async wrappers over the existing worker threads (ADR 022 decision 2 amended).
-- Both variants create their MQTT client only after the station has an IP (bug 010 interim fix), so `wifi up after` means the IP on both.
+- Both variants create their MQTT client only after the station has an IP (network-gate interim fix), so `wifi up after` means the IP on both.
 - Both variants share `examples/common/spike.rs`: one bounded inbound queue with a drop counter, one `rx` drain, and one resource report (heap, minimum heap, stack high-water of `main` and of each worker task).
 - Hardware run (C3), identical for both: `just flash <example>`, `just monitor`, `just mqtt-watch`; record `wifi up after`, `mqtt up after`, the 5-minute resource lines, one `cmd` round trip (`just mqtt-pub`), a 50-message burst (`just mqtt-burst cmd 50`, then `rx` and `dropped rx`), and a 2-minute router pause.
 
@@ -86,11 +86,11 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 | esp-mqtt task stack, unused | 6 360 B | 7 380 B |
 | burst of 50: received / dropped | 4 / 46 | 4 / 46 |
 | outage: IP to MQTT up | 14 s (esp-mqtt retry) | 10.7 s (esp-mqtt retry) |
-| min free drop across the outage | 9 060 B (bug 013) | 588 B |
+| min free drop across the outage | 9 060 B | 588 B |
 | tick publish | `queued`, never waits | `published in 3 ms`, awaits the send |
 
-- Start-up, message load and LWT behaviour are equal; both foundations recover through esp-mqtt's retry timer, so bug 010 applies to both.
-- B's 15 to 25 KB heap advantage is the library runtime it leaves out: the 12 KB MQTT event-loop thread uses about 1 KB of its stack, and a 12 KB helper thread starts on every connect (bug 013).
+- Start-up, message load and LWT behaviour are equal; both foundations recover through esp-mqtt's retry timer, so the connect-before-IP problem applies to both.
+- B's 15 to 25 KB heap advantage is the library runtime it leaves out: the 12 KB MQTT event-loop thread uses about 1 KB of its stack, and a 12 KB helper thread starts on every connect.
 - B gives up what the library already provides: reconnect and suspend, session confirmation, `try_publish` without waiting, disconnect reasons, and the ADR 017 guard.
 
 ## Phase 2 — The shared contract and host-tested cores
@@ -122,7 +122,7 @@ Review points marked **R:** are decisions to settle when that step's detailed pl
 
 ### Step 6: MQTT session core
 
-- [x] `juggler::mqtt::SessionMachine` (sans-IO, no_std): network gate (no attempt without `NetworkUp`, `NetworkDown` closes the transport; bug 010), one connect work order for both tiers (`ConnectWork`: subscribe unless the broker kept the session, startup message, then `WorkDone`; bug 014), `SessionToken` stale-session guard, publish gate (`can_publish` only while ready), retry pacing (`SESSION_RETRY_MS` = 5 s while the network is up), connect count, shutdown.
+- [x] `juggler::mqtt::SessionMachine` (sans-IO, no_std): network gate (no attempt without `NetworkUp`, `NetworkDown` closes the transport), one connect work order for both tiers (`ConnectWork`: subscribe unless the broker kept the session, startup message, then `WorkDone`), `SessionToken` stale-session guard, publish gate (`can_publish` only while ready), retry pacing (`SESSION_RETRY_MS` = 5 s while the network is up), connect count, shutdown.
 - [x] `Close` also stops a driver's own retries: answered on `NetworkDown` or `Shutdown` during the retry pause and on a driver attempt while offline (review of 67c2cb8).
 - [x] A kept session (`session_present`) skips subscribing only if the last subscribing connect work completed; after a failed or interrupted one, and on the first session after boot, it subscribes again (review of 3d2c054).
 - [x] 19 host tests; mutation checks on the token guard, the network gate, the retry-pause stop and the subscription recovery.
@@ -149,7 +149,8 @@ Split into two reviewable chunks; the CrowPanel S3 rerun covers both after 7b.
 - [x] Kept as tier I/O: socket timeout, stall deadline, network watch, RST flush, publish retries, inbound drop-oldest queue.
 - [x] `impl MqttClient for MqttHandle`, `impl MqttMessage for InboundMessage`, compile-time parity check; log formats unchanged except `connected (…, n subscriptions kept)` for a kept session.
 - Done when: `just clippy-hal`, the seven hal examples and `hal_esp32s3_mqtt_lwt` build; the runner's host tests move to `juggler` or still pass.
-- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved. Passed on the CrowPanel S3, 2026-11-03 (T5a and T5b).
+- Gate: CrowPanel S3 rerun of the esp-hal MQTT runbook T5a/T5b (link loss) because link and runner logic moved.
+  Passed on the CrowPanel S3, 2026-11-03 (T5a and T5b).
 
 ### Step 8: IDF adopts the cores
 
@@ -165,17 +166,17 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 #### Step 8b-1: `MqttHandle` on the session machine
 
 - [x] `mqtt/session.rs`: one `Arc<Session>` holds the `SessionMachine`; state, `is_connected`, the `try_publish` gate and `connect_count` come from it (the epoch, `SessionPhase` and the counter are gone from the IDF tier).
-- [x] Bug 014: the helper thread runs the shared order (subscribe if the machine asks, startup message, `on_connect`, `WorkDone`); a failed subscribe or startup message reports `WorkFailed` and closes the transport from the helper thread (never from the event loop, ADR 017), so esp-mqtt reconnects and repeats the work.
+- [x] Connect work order: the helper thread runs the shared order (subscribe if the machine asks, startup message, `on_connect`, `WorkDone`); a failed subscribe or startup message reports `WorkFailed` and closes the transport from the helper thread (never from the event loop, ADR 017), so esp-mqtt reconnects and repeats the work.
 - [x] `MqttHandle::{wait_connected, receive, try_receive, dropped_inbound}`, `InboundMessage` (retain flag and QoS are not reported by esp-idf-svc 0.53); messages reach the queue only without an `on_message` callback.
 - [x] `impl MqttClient for MqttHandle` and a compile-time parity check; the waits use the new host-tested `juggler::wait_list::WaitList`.
 - [x] The receive queue gets whole messages: esp-mqtt's chunks are joined by the host-tested `juggler::mqtt::chunks::ChunkAssembler` (cap 16 KiB, broken sequences dropped and counted once); `on_message` keeps its contract and still sees only the first chunk of a long message (review of 3117e31).
 - [x] The `on_connect` flag is esp-idf-svc's session-present flag: docs and four examples no longer call it `is_clean` (three logged the opposite of the truth).
 
-#### Step 8b-2: network gate (bug 010)
+#### Step 8b-2: network gate
 
 - [x] `MqttBuilder::build(&wifi)` and `build_and_wait(&wifi, &mut led)` take the `WiFiManager`, so the network gate is mandatory; an approved 0.x break.
 - [x] The gate is fed by `WiFiManager::subscribe_ready(sink)` (one call per readiness transition, and the call returns the readiness as of registration under the link lock, so the seed and the subscription are atomic) rather than by polling or a second `IpEvent` subscription, because the station's lost-IP event is posted only after the netif IP-lost timer (120 s by default) and cannot close the gate during an outage (review of 0154998).
-- [x] The esp-mqtt client is created lazily at the first readiness: `EspMqttClient::new` starts the client task, which attempted a connection before the station had an IP (bug 010).
+- [x] The esp-mqtt client is created lazily at the first readiness: `EspMqttClient::new` starts the client task, which attempted a connection before the station had an IP.
 - [x] `mqtt/runner.rs` performs every `SessionAction` on one new runner thread (`mqtt-net`, 4 KiB stack): `Connect` creates the client once and later calls `esp_mqtt_client_reconnect`, and `Close` calls `esp_mqtt_client_disconnect`.
 - [x] A `Close` of a session whose driver already dropped its transport makes the runner report `Disconnected` itself and skip `esp_mqtt_client_disconnect`, because an idle esp-mqtt posts no event and the machine would otherwise stay in `Closing` for good (`SessionMachine::driver_idle`, review of 0154998).
 - [x] `Wait` arms a runner deadline instead of parking the event loop, and `Shutdown` nudges the reconnect, stops the client and drops it.
@@ -184,17 +185,17 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - [x] `juggler::mqtt::{NetworkGate, Outbox, PendingPublish}`: `NetworkGate` turns readiness observations into exactly one `NetworkUp` / `NetworkDown` edge, and `Outbox` holds up to `PUBLISH_QUEUE_DEPTH` (4) publishes until the client exists, dropping and counting the oldest when full.
 - [x] `MqttHandle::dropped_publish()` reports the outbox drops (esp-hal parity).
 - [x] Host tests cover `NetworkGate`, `Outbox`, `subscribe_ready` (including the readiness seed it returns at registration) and `SessionMachine::driver_idle` for every source of a `Close`, with mutation checks on the gate edges, the drop-oldest policy and an unanswered `Close` that blocks the next network-up.
-- [x] The bench run still gates the bug's closure (IDF runbook R1/R3, esp-hal T5a/T5b); `idf_c3_mqtt` dropped its pre-build IP wait, so the gate is the reproduction case. Bug 010 closed on 2026-11-02 after the C3 run of `idf_c3_async_mqtt`.
+- [x] The bench run still gates the bug's closure (IDF runbook R1/R3, esp-hal T5a/T5b); `idf_c3_mqtt` dropped its pre-build IP wait, so the gate is the reproduction case.
+  Confirmed on 2026-11-02 by the C3 run of `idf_c3_async_mqtt`.
 
 #### Step 8c: MQTT thread memory
 
-- [ ] Bug 013: right-size the MQTT event-loop thread stack (12 KB, about 1 KB used) and stop spawning a 12 KB helper thread on every connect; compare the minimum free heap with the Step 2 numbers.
-- [ ] The new `mqtt-net` runner thread (4 KiB) is part of the measuring scope.
-- [ ] The ESP-IDF T6 soak on the S3 (2026-11-03) drifted 2148 B in 10 min (206 836 → 204 688 B), outside the 1 KiB criterion; the 2026-11-08 bench soak (S3-I1) drifted 2136 B (206 564 → 204 428 B) with every tick on time, the same picture before the fix.
-  2026-11-11: the drift is bug 021, the `PendingAcks` early-ack buffer growing by one entry per fire-and-forget QoS 1 publish (a doubling staircase, not the thread stacks); capped at 8 entries; S3-I1 passed on 2026-11-11 02:33 with the heap flat over 10 min (206 908 → 206 916 B).
+- [x] No 12 KB helper thread per connect any more (the runner owns the connect work); closed 2026-11-12 with the S3 minimum-heap figures in the rustdoc of the IDF `mqtt` module.
+- [x] The `mqtt-net` runner thread is part of the measuring scope.
+- [x] The ESP-IDF S3 soak drift (about 2.1 KB per 10 min) was the `PendingAcks` early-ack buffer growing per fire-and-forget QoS 1 publish, capped at 8 entries; bench check `s3/soak` passed afterwards.
 
 - Done when: `just verify` (static assertions included) and `idf_esp32s3_mqtt_lwt` build pass.
-- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- Hardware: bench checks `s3/soak` and `s3/suspend`.
 
 ## Phase 4 — Proof and release checkpoint
 

@@ -1,4 +1,4 @@
-# Owned-radio ESP-NOW peer for 30 minutes at 100 ms, then a channel scan (runbook gate C3-H2, G-E1).
+# Owned-radio ESP-NOW peer for 30 minutes at 100 ms, then a channel scan (esp-hal peer).
 # `hal_c3_espnow_peer` in its default scenario against the hal C6 coordinator `hal_c6_espnow_sta_coordinator`
 # (or an IDF C3 `idf_c3_espnow_coordinator`); the coordinator follows its access point's channel.
 # The peer sends an 8-byte frame every 100 ms and prints its counters every 10 s:

@@ -114,8 +114,8 @@ pub enum ProvisioningEvent {
     },
     /// A station disassociated from the provisioning AP.
     ///
-    /// Fired by `wifi_task` since bug 008: the esp-radio wait method yields
-    /// both directions, and before the fix a leaving station was reported as
+    /// Fired by `wifi_task`: the esp-radio wait method yields
+    /// both directions, and an earlier version reported a leaving station as
     /// `ClientConnected { mac: None }`.
     ClientDisconnected {
         /// Client hardware (MAC) address as reported by the radio.
@@ -147,7 +147,7 @@ pub(crate) enum StationEvent {
     Left,
 }
 
-/// Map a radio station event to the session callback event (bug 008).
+/// Map a radio station event to the session callback event.
 ///
 /// `Joined` is `ClientConnected`, `Left` is `ClientDisconnected`; both carry
 /// the station MAC the radio reported.
@@ -1304,7 +1304,7 @@ mod tests {
         );
     }
 
-    // ── Bug 008: AP station event → ProvisioningEvent mapping ─────────────────
+    // ── AP station event → ProvisioningEvent mapping ─────────────────
 
     /// A station joining the AP maps to `ClientConnected` carrying its MAC.
     #[test]
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     /// A station leaving the AP maps to `ClientDisconnected`, never to
-    /// `ClientConnected` (bug 008 fired the wrong variant on every leave).
+    /// `ClientConnected` (an earlier version fired the wrong variant on every leave).
     #[test]
     fn station_event_left_is_client_disconnected_with_mac() {
         let mac = [0xa2, 0x00, 0x11, 0x22, 0xc4, 0xf4];

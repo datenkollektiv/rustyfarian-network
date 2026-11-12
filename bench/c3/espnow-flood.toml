@@ -1,5 +1,5 @@
 # ESP-NOW send-queue saturation and deadlines on both tiers
-# Runbook gates C3-I8 (ESP-IDF scout `idf_c3_espnow_scout`) and C3-H7 (hal peer `hal_c3_espnow_peer`), both with
+# ESP-IDF scout `idf_c3_espnow_scout` and hal peer `hal_c3_espnow_peer`, both with
 # `ESPNOW_SCENARIO=flood`, against a running
 # ESP-NOW coordinator (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
 # The hal peer reads the coordinator MAC from `ESPNOW_PEER_MAC`, so set both MAC variables;
@@ -12,14 +12,14 @@ examples = ["idf_c3_espnow_scout", "hal_c3_espnow_peer"]
 
 [[step]]
 say = "The first flood of 8 ends without a hang, followed by a good send"
-expect = ['ESPNOW-GATE C3-(I8|H7) PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)']
+expect = ['ESPNOW-GATE flood PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)']
 reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 120
 arm = false
 
 [[step]]
 say = "Two more floods pass, with no reboot in between"
-expect = ['ESPNOW-GATE C3-(I8|H7) PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)', 'ESPNOW-GATE C3-(I8|H7) PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)']
+expect = ['ESPNOW-GATE flood PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)', 'ESPNOW-GATE flood PASS: flood of 8: .*after-flood send (Ok|NoAck|SendFailed)']
 reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 30
 arm = false

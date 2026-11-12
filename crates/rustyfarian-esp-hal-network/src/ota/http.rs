@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn status_line_http10_is_accepted() {
-        // `just ota-serve` (Python's `http.server`) answers `HTTP/1.0`; bug 020.
+        // `just ota-serve` (Python's `http.server`) answers `HTTP/1.0`.
         assert_eq!(parse_status_line(b"HTTP/1.0 200 OK"), Ok(200));
         assert_eq!(parse_status_line(b"HTTP/1.0 404 Not Found\r\n"), Ok(404));
     }

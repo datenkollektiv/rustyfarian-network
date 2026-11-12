@@ -324,7 +324,7 @@ impl<F: NorFlash> ProvisioningStore<F> {
         // rejects a read whose length is not a multiple of it (4 B without
         // its `bytewise-read` feature), and a real record is rarely
         // word-sized, so reading exactly `record_len` bytes failed on every
-        // provisioned boot (bug 006). `MAX_RECORD_LEN` is a multiple of every
+        // provisioned boot. `MAX_RECORD_LEN` is a multiple of every
         // `READ_SIZE` in use, so the cap keeps the read aligned.
         debug_assert!(MAX_RECORD_LEN.is_multiple_of(F::READ_SIZE));
         let read_len = record_len
@@ -639,7 +639,7 @@ mod test_flash {
     /// [`MockFlash`] behind the esp-storage read contract: `READ_SIZE = 4`,
     /// and a read whose offset or length is not word-aligned is rejected with
     /// `NotAligned`, exactly as `esp_storage::FlashStorage` does without its
-    /// `bytewise-read` feature (bug 006).
+    /// `bytewise-read` feature.
     pub(super) struct MockFlashWordRead(pub(super) MockFlash);
 
     impl ErrorType for MockFlashWordRead {
@@ -938,7 +938,7 @@ mod tests {
         assert_eq!(mqtt.port(), 1883);
     }
 
-    /// Bug 006: esp-storage rejects a read whose length is not a multiple of
+    /// esp-storage rejects a read whose length is not a multiple of
     /// `READ_SIZE`, and a saved record is rarely word-sized, so the store must
     /// round its read up instead of reading exactly `record_len` bytes.
     #[test]

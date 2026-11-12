@@ -1,4 +1,4 @@
-# Wi-Fi connect and reconnect after the board is blocked on the router, esp-hal tier (runbook ES-H1).
+# Wi-Fi connect and reconnect after the board is blocked on the router, esp-hal tier.
 # Prints `Wi-Fi connected — IP: …` once and `Wi-Fi link ups: N` every 10 s; while blocked the library repeats `[wifi] connect failed` / `reconnecting in`.
 examples = ["hal_esp32_connect_async"]
 

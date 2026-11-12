@@ -28,8 +28,8 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 - The stale "MQTT reconnect after link-up" row is removed first; the Step 9 doc already does so.
 
 ## Open Questions
-- [ ] Who files the esp-radio request for `WifiController::{stop, start}`?
-- [ ] Who files the esp-idf-svc request to expose `retain` and `qos` in `EventPayload::Received`?
+- [ ] Who files the esp-radio request for `WifiController::{stop, start}`? (deferred to the Near term roadmap event)
+- [ ] Who files the esp-idf-svc request to expose `retain` and `qos` in `EventPayload::Received`? (deferred to the Near term roadmap event)
 - [x] Runtime subscribe on hal: copy the topic into `heapless` or require `&'static str` like the builder?
   Answered 2026-11-05: the topic is copied into a bounded `heapless` buffer (64 bytes), and a filter that is too long or invalid is refused with an error.
 - [x] Does `wait_suspended` need its own timeout, or is the hal's bounded supervisor transition enough?
@@ -44,13 +44,10 @@ Close the capability rows that remain after the ADR 022 Step 9 shared-app proof.
 - [x] `NetworkLink::wait_suspended` on both tiers
 - [x] Hal runtime `MqttHandle::subscribe`
 - [x] Hal DNS resolution
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- [x] Bench: `c6/dns-subscribe`, `c6/dns-unresolvable`, `s3/suspend`, `s3/dns-subscribe`, `s3/dns-unresolvable`, `s3/mqtt-scenarios`
 
 ## Session Log
 - 2026-11-03 — Feature doc created from the Step 9 capability-gap review.
-- 2026-11-05 — All four items landed in code, checked by host tests, `just verify`, `just clippy-hal` and example builds; the IDF `wait_suspended` returns at once, and the hardware runs of S3-B2 and C6-H5 are open in the release 0.7.0 runbook.
-- 2026-11-11 — Bench: C6-H5 passed 2026-11-10 (hostname broker and runtime subscribe); S3-B2 on both tiers has the startup message retained on the first connect and after a broker restart, and `wait_suspended` prompt in three suspend cycles; the Wi-Fi blip half and the S3 DNS line wait for the S3-H1 pause run.
-- 2026-11-11 — esp-hal S3-B2 blip half passed in the S3-H1 run (`online` retained again after the router pause); only the S3 DNS line remains, and C6-H5 already ran the hostname broker on the C6.
-- 2026-11-11 — ESP-IDF S3-B2 complete on the bench (`online` retained after the router pause as well); the IDF `with_startup_message` bench item is done.
-- 2026-11-11 — esp-hal S3 DNS line passed (`just bench s3 dns-subscribe` 5/5 with `MQTT_HOST=bench-broker`, `dns-unresolvable` 2/2); the feature is complete and left the roadmap, the two upstream asks moved to a Near term roadmap event
+- 2026-11-05 — All four items landed in code, checked by host tests, `just verify`, `just clippy-hal` and example builds; the IDF `wait_suspended` returns at once.
+- 2026-11-11 — Bench checks `c6/dns-subscribe`, `s3/mqtt-scenarios`, `s3/suspend`, `s3/dns-subscribe` and `s3/dns-unresolvable` passed; the feature left the roadmap and the two upstream asks moved to a Near term roadmap event
+- 2026-11-12 — Archived

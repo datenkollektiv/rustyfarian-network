@@ -1,5 +1,5 @@
-# Suspend/resume demo (R3) and `wait_suspended` on the CrowPanel S3, both tiers (runbook S3-B1 R3 and the
-# `wait_suspended` half of S3-B2). Both examples run examples-shared/lwt_app.rs (log prefix `[app]`).
+# Suspend/resume demo (R3) and `wait_suspended` on the CrowPanel S3, both tiers (R3 and the
+# `wait_suspended` half of the DNS line). Both examples run examples-shared/lwt_app.rs (log prefix `[app]`).
 # Steps follow R3 of docs/runbooks/wifi-reconnect-hardware-test.md: the app suspends 20 s at every full
 # minute of uptime; three cycles are judged, the second one at the broker (the will at the client-id takeover
 # and `online` right after), the first and third on serial. A probe step consumes the serial lines meanwhile,

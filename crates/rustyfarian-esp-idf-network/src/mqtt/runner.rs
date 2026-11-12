@@ -1,9 +1,9 @@
 //! The ESP-IDF session runner: network gate, retry pacing, the connect work and
-//! every esp-mqtt call in one place (ADR 022 decisions 2 and 10, bug 010).
+//! every esp-mqtt call in one place (ADR 022 decisions 2 and 10).
 //!
 //! esp-mqtt cannot be told to wait: `EspMqttClient::new` starts the client task,
 //! which attempts a connection immediately and reports `Host is unreachable`
-//! when the station has no IP yet (bug 010). The runner therefore creates the
+//! when the station has no IP yet. The runner therefore creates the
 //! client on the first `NetworkUp` — the station is associated and holds an IP —
 //! and from then on performs every [`SessionAction`] the shared
 //! [`SessionMachine`] asks for:
@@ -102,7 +102,7 @@ impl ClientConfig {
     /// Creates and starts the client, returning it and its event connection.
     ///
     /// esp-idf-svc starts the client task here, which is why the runner calls
-    /// this only once the station has an IP (bug 010).
+    /// this only once the station has an IP.
     ///
     /// The configuration stays usable after a failure, so a retry can succeed
     /// once whatever refused it (usually heap) recovers; the credential copies
@@ -119,7 +119,7 @@ impl ClientConfig {
             client_id: Some(self.client_id.as_str()),
             keep_alive_interval: Some(Duration::from_secs(self.keep_alive_secs)),
             // `None` makes esp-idf-svc set `disable_auto_reconnect`: the session
-            // machine paces every attempt (ADR 022, bug 010), so esp-mqtt must
+            // machine paces every attempt (ADR 022), so esp-mqtt must
             // not retry on its own; `esp_mqtt_client_reconnect` starts one.
             reconnect_timeout: None,
             task_stack: self.task_stack_size,

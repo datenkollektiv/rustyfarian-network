@@ -1,4 +1,4 @@
-# esp-hal broker hostname on the CrowPanel S3 (runbook S3-B2, the esp-hal DNS line), following c6/dns-subscribe.
+# esp-hal broker hostname on the CrowPanel S3, following c6/dns-subscribe.
 # Build and recipes use a LAN hostname for the local `just mosquitto` broker, which the board resolves through its
 # DHCP DNS server; a shell variable wins over the dotenv file:
 #   MQTT_HOST=bench-broker MQTT_PORT=1883 just bench s3 dns-subscribe --port <s3 port>

@@ -12,7 +12,7 @@ The two tiers disagreed about it.
 ESP-IDF 5.3.3 starts in country `01` (channels 1-11, 802.11d on) and keeps the country it was given in flash, so it survives a reflash.
 esp-radio 1.0.0-beta.1 sets a hard-coded `CountryInfo` (CN, channels 1-13, manual) once, at controller start, so the esp-hal tier allowed channels 12 and 13 that a world-safe radio refuses.
 
-[Bug 017](../bugs/archive/017-espnow-scan-cannot-set-channel-12-2026-11-10.md) showed the cost on the 0.7.0 bench.
+The 0.7.0 bench showed the cost.
 The ESP-IDF scout scanned the default channels 1-13, ESP-IDF rejected channel 12 with `ESP_ERR_INVALID_ARG`, and every not-found scan ended with a local failure instead of a clean not-found.
 The same mismatch affects a SoftAP: a channel outside the country silently becomes channel 1 on ESP-IDF.
 
@@ -121,6 +121,5 @@ They are listed in the CHANGELOG.
 - [ADR 022 — Tier Parity, One Async API](022-tier-parity-one-async-api.md)
 - [ADR 023 — Shared Logic Ladder](023-shared-logic-ladder.md)
 - [ADR 025 — ESP-NOW Probe Reply Carries the Coordinator's Channel](025-espnow-probe-reply-carries-channel.md) (the same scan, the reply rule)
-- [Bug 017 — The ESP-IDF scout's full ESP-NOW scan cannot set channel 12](../bugs/archive/017-espnow-scan-cannot-set-channel-12-2026-11-10.md)
-- [Feature: Wi-Fi regulatory country v1](../features/wifi-country-v1.md)
+- [Feature: Wi-Fi regulatory country v1](../features/archive/wifi-country-v1.md)
 - `crates/juggler/src/wifi/country.rs` (`Country`, `ChannelSet`, `CountryPort`, `apply_country`), `crates/juggler/src/espnow/scan.rs` (`ScanMachine::with_allowed_channels`)

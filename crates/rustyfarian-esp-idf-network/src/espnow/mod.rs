@@ -89,7 +89,7 @@ const SOFTAP_CHANNEL: u8 = 1;
 /// Applies the TX power of `config`, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm) when it sets none.
 ///
 /// The ESP-IDF driver starts at 20 dBm, which corrupts the frames and the ACKs of an ESP32-C3
-/// Super Mini (bug 022); the esp-hal tier applies the same default.
+/// Super Mini; the esp-hal tier applies the same default.
 fn apply_tx_power(config: &EspNowConfig) -> anyhow::Result<()> {
     let quarter_dbm = config.owned_tx_power_quarter_dbm();
     // SAFETY: plain FFI call into the Wi-Fi driver, which the caller has started;
@@ -451,7 +451,7 @@ impl EspIdfEspNow {
     ///    channel 1, which is the pin until a scan finds another.
     /// 3. The TX power ([`EspNowConfig::with_tx_power`]) after the start.
     ///    When the config sets none, [`DEFAULT_TX_POWER_QUARTER_DBM`] (13 dBm), as on the esp-hal
-    ///    tier: the driver's own 20 dBm corrupts the frames of an ESP32-C3 Super Mini (bug 022).
+    ///    tier: the driver's own 20 dBm corrupts the frames of an ESP32-C3 Super Mini.
     ///
     /// # Errors
     ///

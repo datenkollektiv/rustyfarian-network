@@ -1,5 +1,5 @@
 # ESP-NOW TX-power read-back after a scan on both tiers
-# Runbook gates C3-I10 (ESP-IDF scout `idf_c3_espnow_scout`) and C3-H9 (hal peer `hal_c3_espnow_peer`), both with
+# ESP-IDF scout `idf_c3_espnow_scout` and hal peer `hal_c3_espnow_peer`, both with
 # `ESPNOW_SCENARIO=txpower`, against a running
 # ESP-NOW coordinator (an IDF C3 `idf_c3_espnow_coordinator` or the hal C6 `hal_c6_espnow_sta_coordinator`).
 # The hal peer reads the coordinator MAC from `ESPNOW_PEER_MAC`, so set both MAC variables;
@@ -12,14 +12,14 @@ examples = ["idf_c3_espnow_scout", "hal_c3_espnow_peer"]
 
 [[step]]
 say = "The first scan restores the radio TX power"
-expect = ['ESPNOW-GATE C3-(I10|H9) PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))']
+expect = ['ESPNOW-GATE txpower PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))']
 reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-NOW scan: TX power not restored'
 timeout = 120
 arm = false
 
 [[step]]
 say = "Two more scans restore it, with no reboot in between"
-expect = ['ESPNOW-GATE C3-(I10|H9) PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))', 'ESPNOW-GATE C3-(I10|H9) PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))']
+expect = ['ESPNOW-GATE txpower PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))', 'ESPNOW-GATE txpower PASS: scan \d+ \(found[^)]*\): (TX power (?P<p>Some\(\d+\)) -> (?P=p)|radio TX power (?P<r>Some\(\d+\)) -> (?P=r), handle (?P<h>Some\(\d+\)) -> (?P=h))']
 reject = 'ESPNOW-GATE \S+ FAIL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \(|ESP-NOW scan: TX power not restored'
 timeout = 30
 arm = false

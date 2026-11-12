@@ -175,7 +175,7 @@ pub enum EspHalEspNowError {
     /// TX power outside `[8, 84]` quarter dBm.
     InvalidTxPower(i8),
     /// The handle was built from a caller-owned controller; change TX power and country on that
-    /// controller.
+    /// controller. `scan_for_peer` on a `from_controller` handle is refused with it too.
     ControllerNotOwned,
     /// Another [`EspHalEspNow`] is alive (`esp-radio` allows one instance).
     AlreadyInitialised,

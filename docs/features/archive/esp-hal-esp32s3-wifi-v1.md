@@ -28,8 +28,8 @@ Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (filed 2026
 ## Open Questions
 
 - [x] 72 KiB internal heap is enough (~26 KB free after lease); esp-radio allocates internal-only, so PSRAM cannot help Wi-Fi.
-- [ ] Does an S3 OTA slot swap work? Needs an OTA partition table and image server; deferred.
-- [ ] Optional `hal_esp32s3_provision_mqtt` example not written.
+- [x] Does an S3 OTA slot swap work? Yes: bench checks `s3/ota` and `s3/ota-rollback` on `hal_esp32s3_ota`.
+- [x] Optional `hal_esp32s3_provision_mqtt` example: written, bench check `s3/provision`.
 
 ## State
 
@@ -43,3 +43,4 @@ Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (filed 2026
 
 - 2026-10-13 — Feature doc created via /feature from upstream request U2
 - 2026-10-14 — Implemented; clippy-hal/verify green; CrowPanel STA join + DHCP validated
+- 2026-11-12 — Archived: S3 OTA and provisioning on the bench

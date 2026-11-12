@@ -297,7 +297,7 @@ impl TxPowerLevel {
 /// Station TX power both tiers apply when the firmware sets none: [`TxPowerLevel::Low`] (~8.5 dBm).
 ///
 /// PCB-antenna boards such as the ESP32-C3 Super Mini corrupt their own frames at high power
-/// (WPA2 auth deauths with reason 2 on the bare-metal blob, bug 022 for ESP-NOW); 8.5 dBm is the
+/// (WPA2 auth deauths with reason 2 on the bare-metal blob, broken ESP-NOW frames); 8.5 dBm is the
 /// level validated on both tiers.
 /// Both tiers apply [`WiFiConfig::station_tx_power_quarter_dbm`] verbatim, so this is the only
 /// place the default lives.
@@ -606,7 +606,7 @@ pub fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
 /// A router-initiated deauthentication (`AUTH_LEAVE`, `ASSOC_LEAVE`), a beacon
 /// loss or the library's own suspend are deliberately not in the set: they say
 /// nothing about the credentials, and the old unconditional hint sent users
-/// hunting for a typo after every suspend (bug 011).
+/// hunting for a typo after every suspend.
 pub fn reason_suggests_credentials(reason: u16) -> bool {
     matches!(reason, 15 | 201 | 202 | 204)
 }
@@ -630,7 +630,7 @@ pub fn credentials_hint(reason: u16) -> &'static str {
 /// The ESP-IDF tier logs this directly; the esp-hal tier shares the hint but not
 /// the code formatting, because esp-radio reports a named reason instead of the
 /// numeric code and `WifiLink` logs that name followed by [`credentials_hint`]'s
-/// text (bug 011).
+/// text.
 ///
 /// ```ignore
 /// log::warn!("[wifi] disconnected — {}", DisconnectReason(info.reason()));

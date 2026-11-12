@@ -1,4 +1,4 @@
-# esp-hal OTA rollback on the C3 Super Mini (runbook C3-H5, unhealthy image, rollback boot and reset check).
+# esp-hal OTA rollback on the C3 Super Mini (unhealthy image, rollback boot and reset check).
 # Run through `just bench-ota`; a check whose name contains `rollback` gets the served image built with
 # OTA_DEMO_UNHEALTHY=1 (`just ota-image-unhealthy`), and the baseline is built as usual:
 #   just bench-ota c3 ota-rollback hal_c3_ota 1.0.0 2.0.0 <this machine's LAN IPv4> --port <c3 port>

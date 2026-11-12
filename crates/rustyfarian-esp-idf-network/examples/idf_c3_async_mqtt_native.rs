@@ -4,8 +4,8 @@
 //! Nothing of this crate's Wi-Fi or MQTT runtime is used; the example does what a tier
 //! port built on the async types would have to do itself:
 //!
-//! * `join_with_backoff` joins and waits for the netif before the MQTT client exists
-//!   (bug 010), and `keep_link` rejoins after every drop with the shared back-off
+//! * `join_with_backoff` joins and waits for the netif before the MQTT client exists,
+//!   and `keep_link` rejoins after every drop with the shared back-off
 //!   constants (1 s doubling to 30 s);
 //! * `mqtt_events` pumps `EspAsyncMqttConnection`, feeds the host-tested
 //!   `juggler::mqtt::SessionPhase`, advances a `ConnectionEpoch` on every `Connected`
@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
     let url = format_broker_url(host, env::mqtt_port());
 
     block_on(async {
-        // Proper order (bug 010): MQTT starts only once the station has an IP.
+        // Proper order: MQTT starts only once the station has an IP.
         wifi.start().await?;
         join_with_backoff(&mut wifi).await;
         log::info!("[app] wifi up after {} ms", boot.elapsed().as_millis());

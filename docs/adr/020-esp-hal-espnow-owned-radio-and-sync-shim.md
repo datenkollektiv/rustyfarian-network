@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-10-30 by the maintainer; the implementation is in place and the hardware gates G-E1 and G-E2 in [esp-hal-espnow-v1.md](../features/esp-hal-espnow-v1.md) stay open.
+Accepted — 2026-10-30 by the maintainer; the implementation is in place and the hardware gates G-E1 and G-E2 in [esp-hal-espnow-v1.md](../features/archive/esp-hal-espnow-v1.md) stay open.
 Decision 1 and the Consequences were amended in place on 2026-10-30 after an external review (the settle window was replaced by the sender runner `EspHalEspNow::run_sender`) and on 2026-10-31 after a third review (probe deadlines, in-flight transmissions waited out, a single runner enforced).
 
 ## Context
@@ -22,7 +22,8 @@ The idf tier's `scan_for_peer` (ADR 009, with the confirmation gating of the roa
 
 ## Decision
 
-1. **Same contract.** `rustyfarian_esp_hal_network::espnow::EspHalEspNow` (feature `espnow`, chips `esp32c3` and `esp32c6`) implements the sync `juggler::espnow::EspNowDriver` with `&self`, backed by `critical_section::Mutex<RefCell<..>>` cells.
+1. **Same contract.**
+   `rustyfarian_esp_hal_network::espnow::EspHalEspNow` (feature `espnow`, chips `esp32c3` and `esp32c6`) implements the sync `juggler::espnow::EspNowDriver` with `&self`, backed by `critical_section::Mutex<RefCell<..>>` cells.
    The sender cell is leased for the duration of a sync send and returned afterwards, so no critical section spans the TX wait and a concurrent sync send receives `Busy`.
    Async sends and scan probes never touch the cell: they queue their frame for `EspHalEspNow::run_sender`, a runner that is spawned once in a task that is never cancelled, polls every send to completion and never drops a `SendFuture`.
    Only one runner runs per handle; a second concurrent runner logs an error and idles.
@@ -33,8 +34,10 @@ The idf tier's `scan_for_peer` (ADR 009, with the confirmation gating of the roa
    Both need `esp_rtos::start` and a heap; neither needs an embassy executor for the sync API.
 3. **One scan algorithm.** `juggler::espnow::ScanMachine` is a pure, clock-injected state machine (`ScanInput` in, `ScanAction` out) that reproduces `EspIdfEspNow::scan_for_peer` exactly.
    The hal tier drives it with `send_async_timeout` (through `send_probe`) and `embassy_time`; the idf tier has adopted it without behaviour change.
-4. **Channel stability is gated, not assumed.** The owned radio ships as an unassociated station; the mitigation ladder (per-send `set_channel`, hidden AP+STA, promiscuous bracket) is applied only if gate G-E1 fails, because ADR 012 showed the idle-scan drift is a blob property and the SoftAP-only answer changes the peer MAC.
-5. **Tuning.** `new_owned` disables AMPDU RX/TX through `ControllerConfig`, and `from_controller` leaves that to the caller; `esp-radio/coex` stays off; TX power is a quarter-dBm passthrough to `WifiController::set_max_tx_power`, applied by `new_owned` (default 13 dBm) and by `from_controller` only when the config sets a level.
+4. **Channel stability is gated, not assumed.**
+   The owned radio ships as an unassociated station; the mitigation ladder (per-send `set_channel`, hidden AP+STA, promiscuous bracket) is applied only if gate G-E1 fails, because ADR 012 showed the idle-scan drift is a blob property and the SoftAP-only answer changes the peer MAC.
+5. **Tuning.**
+   `new_owned` disables AMPDU RX/TX through `ControllerConfig`, and `from_controller` leaves that to the caller; `esp-radio/coex` stays off; TX power is a quarter-dBm passthrough to `WifiController::set_max_tx_power`, applied by `new_owned` (default 13 dBm) and by `from_controller` only when the config sets a level.
 
 ## Consequences
 
@@ -69,5 +72,5 @@ The idf tier's `scan_for_peer` (ADR 009, with the confirmation gating of the roa
 
 - [ADR 007](007-espnow-abstraction.md), [ADR 009](009-espnow-channel-scanning.md), [ADR 012](012-espnow-unassociated-sta-channel-stability.md)
 - [ADR 019](019-esp-hal-async-mqtt-client.md) — the other esp-hal tier decision on the same radio stack
-- `docs/features/esp-hal-espnow-v1.md` — feature doc, decisions and gates
+- `docs/features/archive/esp-hal-espnow-v1.md` — feature doc, decisions and gates
 - Upstream `esp-radio 1.0.0-beta.1`: `src/esp_now/mod.rs`, `src/wifi/mod.rs:2791,3189,3206`

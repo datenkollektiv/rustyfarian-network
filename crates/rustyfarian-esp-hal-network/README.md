@@ -191,7 +191,7 @@ The peer-link helper `PeerSession` (with `PeerLinkConfig`, `PeerLinkState`, `Clo
 `send_acked` refuses the broadcast address (`Broadcast`), and any application send during a scan fails with `ScanInProgress`.
 `scan_for_peer(&mac, &config)` needs a `new_owned` handle (`ControllerNotOwned` otherwise) and the driver keeps the pinned channel.
 
-```sh
+```bash
 WIFI_SSID="MyNetwork" WIFI_PASS="secret" just build-example hal_c6_espnow_sta_coordinator
 ESPNOW_PEER_MAC="aa:bb:cc:dd:ee:ff" just build-example hal_c3_espnow_peer
 ```

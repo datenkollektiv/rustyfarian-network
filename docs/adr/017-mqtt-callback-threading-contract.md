@@ -5,7 +5,7 @@
 Accepted — 2026-09-28.
 Implemented on `main` (commit 511b37f..2f2597a); ships in v0.5.1.
 Amended 2026-11-02: §2's plumbing (helper thread, work order, stale-session guard) is superseded by ADR 022 Steps 6, 8b-1 and 8b-2; the contract itself is unchanged.
-Amended 2026-11-11 (ADR 022 Step 8c, bug 013): §2 has no helper thread any more; the `mqtt-net` runner performs the connect work one step per turn; contract §1 and §3 are unchanged.
+Amended 2026-11-11 (ADR 022 Step 8c): §2 has no helper thread any more; the `mqtt-net` runner performs the connect work one step per turn; contract §1 and §3 are unchanged.
 
 ## Context
 
@@ -15,7 +15,7 @@ Events including `CONNECTED` and `DATA` are dispatched synchronously inside the 
 `esp-idf-svc` 0.53.0 blocks the mqtt task until the event-loop thread calls `EspMqttConnection::next()` again (line 797–799 in `src/mqtt/client.rs`).
 Any `esp_mqtt_client_*` call (publish, subscribe, etc.) made from a callback — `on_connect`, `on_message`, or `on_disconnect` — before calling `next()` again attempts to acquire the same lock while it is already held, deadlocking both tasks forever.
 
-Field evidence: rustyfarian-network bug 001 (local `on_connect` enqueue deadlock on startup publish), rgb-clock bug 001 (2026-09-28, `try_publish` from `on_message` rejection callback).
+Field evidence: a local `on_connect` enqueue deadlock on startup publish, and rgb-clock bug 001 (2026-09-28, `try_publish` from `on_message` rejection callback).
 
 ## Decision
 
@@ -43,10 +43,11 @@ Amended 2026-11-02 (ADR 022 Steps 6, 8b-1 and 8b-2): the helper is now the tier'
 The stale-session guard is now `juggler::mqtt::SessionToken`: `is_connected()` turns true only when the shared `SessionMachine` sees `WorkDone` for the current token, and a stale worker's report is ignored.
 `juggler::mqtt::spawn_connect_thread`, `juggler::mqtt::spawn_subscriber_thread` and `juggler::mqtt::ConnectionEpoch` are deprecated, used by no tier, and stay until 1.0.
 
-Amended 2026-11-11 (ADR 022 Step 8c, bug 013): the ESP-IDF tier runs no connect helper thread at all.
+Amended 2026-11-11 (ADR 022 Step 8c): the ESP-IDF tier runs no connect helper thread at all.
 The connect work runs on the `mqtt-net` runner thread itself, one step per loop turn, and each step takes the client lock only for its own esp-mqtt call: one SUBSCRIBE, the startup `enqueue`, the `on_connect` call, or the closing runtime catch-up.
 The step order, stop at the first failed SUBSCRIBE, startup publish or runtime catch-up (a failing `on_connect` is logged, never fatal), the closing catch-up before `WorkDone`, and the terminal report are the shared `juggler::mqtt::ConnectWorkMachine` (ADR 023 rung 3), performed through the narrow `juggler::mqtt::ConnectPort` by `juggler::mqtt::perform`.
 Before every step the runner asks `SessionMachine::is_current` for the work's `SessionToken`, and it abandons the work of a session that ended without reporting it.
+
 `on_connect` still runs under `CallbackScope` with `&mut EspMqttClient`, and the event-loop thread still never takes the client lock.
 A publisher thread that waits for the client lock gets it before the next step when it runs at the runner's priority (the runner yields after every step) or above (it preempts on the mutex give); a lower-priority publisher has no such guarantee.
 The `mqtt-connect` thread named in the 2026-11-02 amendment is gone, and so is the one-helper-thread wording in the Consequences and Alternatives sections below, which this amendment supersedes.
@@ -116,6 +117,5 @@ The calls that do take `api_lock` are `subscribe`, `enqueue` and `stop`, and the
 ## References
 
 - `docs/project-lore.md` § "MQTT Event Loop" — full context on the deadlock mechanism and the fix.
-- `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md` — initial bug report.
 - `docs/features/archive/mqtt-publish-acked-v1.md` — origin of the `WrongThread` error variant.
 - rgb-clock outbox `docs/outbox/rustyfarian-network-try-publish-from-callback.md` (external repo, field validation).

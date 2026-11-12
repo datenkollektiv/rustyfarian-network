@@ -1,4 +1,4 @@
-# esp-hal MQTT scenarios T1 to T5 on the C6 (runbook C6-H2; T6 is the `soak` check).
+# esp-hal MQTT scenarios T1 to T5 on the C6 (T6 is the `soak` check).
 # Steps follow docs/runbooks/esp-hal-mqtt-hardware-test.md; serial lines and broker messages are judged here.
 # Uses `setup`, `run`, `probe` and `serial_reject` (rustyfarian-bench v0.5.0 or later).
 # Probe output comes from `just mqtt-watch hal` (`retain=1` is the replay at subscribe, `retain=0` a live message)

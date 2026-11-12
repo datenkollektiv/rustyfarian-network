@@ -1,851 +1,456 @@
 # Project Lore
 
-This file records non-obvious technical discoveries: facts that caused surprising
-failures, took significant time to debug, or would save a future developer 30+
-minutes if known upfront.
-
+Non-obvious technical discoveries: pitfall reminders that cost real debugging time.
+Where an ADR, rustdoc or runbook already holds the full story, the entry is one line with a pointer.
 Refer to `CLAUDE.md` and the `/project-lore` skill for recording guidelines.
 
 ---
 
 ## Toolchain & Build
 
-**`rust-toolchain.toml` is required to activate the `esp` toolchain — `espup` alone is not enough.**
-Without this file, `cargo check` silently falls back to the host `stable` toolchain, which has no
-knowledge of `riscv32imac-esp-espidf`, producing the misleading error
-`can't find crate for 'core' / target may not be installed` even when `espup` is fully installed.
-Fix: add `rust-toolchain.toml` with `channel = "esp"` to the repo root;
-rustup then selects the correct toolchain automatically in any shell session without requiring
-`source ~/export-esp.sh`.
+**`rust-toolchain.toml` with `channel = "esp"` is required — `espup` alone is not enough.**
+Without it `cargo` falls back to host `stable` and reports `can't find crate for 'core' / target may not be installed` for `riscv32imac-esp-espidf`.
+With it, rustup picks the toolchain in any shell without `source ~/export-esp.sh`.
 
-**When `rust-toolchain.toml` pins `channel = "esp"`, every CI job must install the `esp` toolchain — not just the build job.**
-`rustup` reads `rust-toolchain.toml` for every `cargo` invocation, including `cargo fmt`.
-A CI job that installs only `stable` (e.g. via `dtolnay/rust-toolchain@stable`) will fail with
-`error: custom toolchain 'esp' specified in override file '...rust-toolchain.toml' is not installed`
-even though `cargo fmt` itself does not compile ESP-IDF code.
-Fix: replace `dtolnay/rust-toolchain@stable` in the `format` job with `esp-rs/xtensa-toolchain@v1.7.0`
-(`ldproxy: false` suffices — the linker proxy is not needed for a format check).
-The `esp` toolchain ships `rustfmt`, so no separate stable step is required.
+**Every CI job must install the `esp` toolchain, including `cargo fmt`.**
+rustup reads `rust-toolchain.toml` for every `cargo` call, so `dtolnay/rust-toolchain@stable` fails with `custom toolchain 'esp' ... is not installed`.
+Fix: `esp-rs/xtensa-toolchain@v1.7.0` (`ldproxy: false` suffices for a format check; the `esp` toolchain ships `rustfmt`).
 
-**`just fmt` must be run before `just verify` (and before every commit) — skipping it fails CI.**
-`just verify` calls `just fmt-check`, which only *detects* formatting drift (no compiler error to aid diagnosis); it does not fix it.
-Fix: always run `just fmt` then `just verify` in that order; see the `## Completion Gate` in `CLAUDE.md`.
+**`just verify` calls `fmt-check`, which only detects drift — run `just fmt` first, or CI fails with no compiler error.**
 
-**Every crate that builds examples against ESP-IDF needs a `build.rs` calling `embuild::espidf::sysenv::output()`.**
-`cargo:rustc-link-arg` emitted by `esp-idf-sys` does not propagate through transitive deps to the example binary's linker.
-`sysenv::output()` re-reads those args from `DEP_ESP_IDF_SVC_EMBUILD_LINK_ARGS` and re-emits them locally; without it, `ldproxy` panics with `Cannot locate argument '--ldproxy-linker <linker>'` despite a correct PATH.
-Fix: add the `build.rs`, and set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so embuild emits `--ldproxy-linker` as a real link arg, not just metadata.
+**Every crate building ESP-IDF examples needs a `build.rs` calling `embuild::espidf::sysenv::output()`.**
+`esp-idf-sys`'s `cargo:rustc-link-arg` does not propagate through transitive deps; `sysenv::output()` re-emits them from `DEP_ESP_IDF_SVC_EMBUILD_LINK_ARGS`.
+Without it `ldproxy` panics `Cannot locate argument '--ldproxy-linker <linker>'` despite a correct PATH.
+Also set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so embuild emits `--ldproxy-linker` as a real link arg.
 
-**`LIBCLANG_PATH` is the only env var from `~/export-esp.sh` needed for riscv32 (ESP32-C3/C6) projects.**
-The riscv32 cross-compiler is managed by `esp-idf-sys`'s CMake build and never needs to be on PATH; the Xtensa PATH entry only matters for Xtensa targets.
-`bindgen`/`esp-idf-sys` need `LIBCLANG_PATH` to locate the Clang headers — that is the only missing piece in a fresh shell.
-Fix: add `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` to `.envrc`.
-`~/.espup/esp-clang` is a stable symlink maintained by `espup`, so it survives `espup update` without manual edits.
+**`LIBCLANG_PATH` is the only `~/export-esp.sh` variable riscv32 (C3/C6) builds need.**
+The riscv32 cross-compiler is managed by `esp-idf-sys`'s CMake build; the Xtensa PATH entry matters only for Xtensa.
+Fix: `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` in `.envrc` (a stable symlink that survives `espup update`).
 
-**`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader that is incompatible with v5.3.3 app binaries.**
-When `espflash flash` runs without `--bootloader`, it writes its own bundled v5.5.1 bootloader.
-That bootloader uses a different MMU page size (32 KB vs 64 KB in v5.3.3) and may reject the app
-with `Image requires efuse blk rev <= v0.99, but chip is v1.3`.
-Fix: always pass `--bootloader <path>` pointing to the IDF-built bootloader that `esp-idf-sys`
-places at `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin`.
-Also pass `--ignore-app-descriptor` to prevent espflash from performing its own chip-model check.
-See `scripts/flash.sh` for the implemented solution.
+**`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader incompatible with v5.3.3 apps.**
+It uses another MMU page size (32 KB vs 64 KB) and may reject the app with `Image requires efuse blk rev <= v0.99, but chip is v1.3`.
+Fix: pass `--bootloader` with the IDF-built `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin`, plus `--ignore-app-descriptor`; see `scripts/flash.sh`.
 
-**Bare-metal Xtensa targets (`xtensa-esp32-none-elf`, `xtensa-esp32s3-none-elf`) require `-Tlinkall.x` and `-fno-stack-protector` in rustflags.**
-Without `-Tlinkall.x`, esp-hal's linker chain (which pulls in PAC-generated `device.x` providing ~60 peripheral interrupt stubs) is never processed, and every PAC interrupt vector appears as an undefined reference — burying the real cause in noise.
-Without `-C link-arg=-fno-stack-protector`, GCC 15.2 injects stack-guard calls into `esp_hal::init` that resolve to an undefined `__stack_chk_guard`.
-Fix: add both flags to `[target.xtensa-esp32*-none-elf]` sections in `.cargo/config.toml.dist`.
-RISC-V bare-metal targets are unaffected — GCC 15.2 does not inject stack protection there.
+**Bare-metal Xtensa targets need `-Tlinkall.x` and `-C link-arg=-fno-stack-protector`.**
+Without `-Tlinkall.x` the PAC `device.x` (~60 interrupt stubs) is never processed and every vector is an undefined reference.
+Without `-fno-stack-protector`, GCC 15.2 injects stack-guard calls into `esp_hal::init` that need an undefined `__stack_chk_guard`.
+Fix: both flags in the `[target.xtensa-esp32*-none-elf]` sections of `.cargo/config.toml.dist`; RISC-V is unaffected.
 
-**ESP32-C3 requires target `riscv32imc-esp-espidf` and `MCU=esp32c3` — not the workspace C6 defaults.**
-ESP32-C3 is `riscv32imc` (no atomics extension); ESP32-C6 is `riscv32imac`.
-Building C3 firmware with the C6 target produces an image whose ESP-IDF chip metadata (including `max_efuse_blk_rev`) is wrong, which the bootloader rejects.
-Fix: `scripts/flash.sh` and `scripts/build-example.sh` derive the chip from the example prefix (`idf_c3_*` → C3) and override both `MCU` and `--target`; new examples must follow the prefix convention.
+**ESP32-C3 needs target `riscv32imc-esp-espidf` and `MCU=esp32c3`, not the workspace C6 defaults.**
+A C6-target build carries wrong chip metadata (`max_efuse_blk_rev`) and the bootloader rejects it.
+`scripts/flash.sh` and `scripts/build-example.sh` derive chip and target from the example prefix (`idf_c3_*`); new examples must follow it.
 
-**`sdkconfig.defaults` must be placed at the workspace root for embuild to pick it up — not in the crate root.**
-In a Cargo workspace, `embuild` (used by `esp-idf-sys`) resolves `sdkconfig.defaults` relative to the workspace root (where the top-level `Cargo.toml` lives), not relative to the crate that's being built.
-Placing the file in a crate subdirectory (e.g. `crates/rustyfarian-esp-idf-network/sdkconfig.defaults`) is silently ignored: `esp-idf-sys` recompiles but CMake reconfigures without the custom settings, and the generated `sdkconfig` retains all defaults.
-Fix: place `sdkconfig.defaults` at the workspace root and declare it in `build.rs` as `cargo:rerun-if-changed=../../sdkconfig.defaults`.
-The main task stack is commonly the first setting needed: `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` is sufficient for full LoRaWAN OTAA crypto on ESP-IDF.
+**`sdkconfig.defaults` must sit at the workspace root; embuild silently ignores it in a crate directory.**
+Declare it in `build.rs` as `cargo:rerun-if-changed=../../sdkconfig.defaults`.
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` suffices for LoRaWAN OTAA crypto on ESP-IDF.
 
-**`sx126x 0.3` needs exactly one `critical-section` provider, and only the final binary may select it.**
-`sx126x` unconditionally depends on the `critical-section` crate, so the `_critical_section_1_0_acquire` / `_release` symbols must come from somewhere.
-`esp-idf-hal` (0.45+) provides them behind its `critical-section` feature, as a recursive FreeRTOS mutex (`xQueueTakeMutexRecursive`, `src/task.rs`) — it masks no interrupts and suspends no scheduler.
-`rustyfarian-esp-idf-power`'s `critical-section-impl` is an interrupt-masking alternative; enabling both fails with `multiple definition of '_critical_section_1_0_acquire'`.
-None at all fails with `undefined reference to '_critical_section_1_0_acquire'`.
-Fix: a library feature never enables a provider (the `lora` feature did until bug 007); the firmware, or the crate's examples via a dev-dependency, enables `esp-idf-hal/critical-section` or the power provider.
-`sx126x::reset()` runs an SPI transaction inside `critical_section::with`, and esp-idf-hal's SPI blocks on `spi_device_acquire_bus`, which is unsafe with interrupts masked; `EspIdfLoraRadio` therefore pulses NRST itself and never calls it.
+**`sx126x 0.3` needs exactly one `critical-section` provider, selected only by the final binary.**
+`esp-idf-hal` (0.45+) provides one behind its `critical-section` feature as a recursive FreeRTOS mutex (`xQueueTakeMutexRecursive`, `src/task.rs`): it masks no interrupts and suspends no scheduler.
+`rustyfarian-esp-idf-power`'s `critical-section-impl` masks interrupts; both together fail with `multiple definition of '_critical_section_1_0_acquire'`, none with `undefined reference`.
+Libraries never select one (ADR 021; the `lora` feature did until bug 007); `EspIdfLoraRadio` pulses NRST itself instead of `sx126x::reset()` — see rustdoc of `pulse_nrst`.
 
-**`just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`) — Xtensa IDF and bare-metal targets are never exercised.**
-A missing `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"` passes verify clean but `just build-example idf_esp32s3_*` panics with `Cannot locate argument '--ldproxy-linker <linker>'`.
-Fix: add a `[target.*]` section for every ESP-IDF target used by an example, in both `.cargo/config.toml` and `.cargo/config.toml.dist`.
-Completion gate: run `just build-example <name>` for every hardware example in addition to `just verify`.
+**`just verify` compiles only `riscv32imac-esp-espidf`, never Xtensa IDF or bare-metal targets.**
+A missing `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"` passes verify, then `just build-example idf_esp32s3_*` panics `Cannot locate argument '--ldproxy-linker <linker>'`.
+Fix: one `[target.*]` section per ESP-IDF target in both `.cargo/config.toml` and `.cargo/config.toml.dist`; run `just build-example <name>` for hardware examples.
 
-**Cross-repo git dependencies without `tag` or `rev` track the default branch — upstream version bumps that touch a `links = "..."` crate silently break workspace resolution.**
-A `links = "..."` declaration (e.g. `esp-println`, `esp-idf-sys`) tells Cargo only one version may exist in the dependency graph.
-When an unpinned git dep adopts a new release wave that bumps the linked crate, the workspace's existing constraint and the upstream's new constraint cannot coexist, producing `failed to select a version for <crate>` — the error names the linked crate, not the unpinned git dep that introduced the conflict.
-Fix: always pin cross-repo git deps with `tag = "vX.Y.Z"` (or `rev = "<sha>"`).
-Upstream release waves then cannot reach into this workspace without a deliberate, coordinated bump.
+**Unpinned cross-repo git deps break resolution when upstream bumps a `links = "..."` crate.**
+Only one version of a `links` crate (`esp-println`, `esp-idf-sys`) may exist, and the `failed to select a version for <crate>` error names the linked crate, not the unpinned dep.
+Fix: pin with `tag = "vX.Y.Z"` or `rev = "<sha>"`.
 
-**A crate-level `default-features = false` on a workspace-inherited dependency is silently ignored unless the workspace declaration also says `default-features = false`.**
-Cargo's workspace-deps inheritance rule: a crate inheriting a dep via `workspace = true` may override `features`, but a `default-features` override only takes effect when the workspace declaration **already** has `default-features = false`; otherwise every consumer pulls default features even when it wrote `default-features = false`.
-Cargo emits `warning: 'default-features' is ignored for <crate>, since 'default-features' was [not specified | true] for 'workspace.dependencies.<crate>'` — easy to miss because `cargo check` / `cargo clippy` still exit 0, so a `no_std` consumer can silently inherit an upstream `std` feature (this bit a `no_std` provisioning consumer inheriting `std` from the shared pure crate — both since consolidated into `juggler` — breaking the ADR 014 §2 `no_std` contract at the build layer while it held on paper).
-Fix when introducing a `no_std` consumer of a workspace-inherited dep:
-1. Set the workspace declaration to `default-features = false`.
-2. Every `std`-needing consumer opts back in with `features = ["std"]`.
-3. Re-run `just verify` — a secret `std`-gated use now surfaces as a compile error.
-Treat the `default-features is ignored` warning as a `-D warnings`-class finding even though it does not fail the build.
+**A crate-level `default-features = false` on a `workspace = true` dep is ignored unless the workspace declaration also says `default-features = false`.**
+Cargo only warns (`'default-features' is ignored for <crate>`), so a `no_std` consumer silently inherits `std` (this broke the ADR 014 §2 `no_std` contract of a provisioning consumer, now in `juggler`).
+Fix: workspace declaration `default-features = false`, `std` consumers add `features = ["std"]`, re-run `just verify`; treat the warning as `-D warnings`-class.
 
-**`ESP_IDF_SDKCONFIG_DEFAULTS` must list ABSOLUTE paths; a relative list silently applies NEITHER the base defaults nor the overlay, so a sdkconfig-override check passes while testing the wrong config.**
-`embuild`/`esp-idf-sys` does not resolve a relative `ESP_IDF_SDKCONFIG_DEFAULTS` entry against the cargo workspace root the way the default (unset) resolution of `sdkconfig.defaults` does.
-With `ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.sta-only.defaults"` the generated `.../esp-idf-sys-*/out/sdkconfig` reverts to IDF defaults (e.g. `CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584` instead of the workspace's `32768`) — proof both files were dropped.
-This produced a false pass for the STA-only check: `--features wifi` "compiled with SoftAP disabled" while SoftAP was actually still `y`.
-Fix: build the list from absolute paths — the `check-sta-only` recipe uses `ESP_IDF_SDKCONFIG_DEFAULTS="{{justfile_directory()}}/sdkconfig.defaults;{{justfile_directory()}}/sdkconfig.sta-only.defaults"`.
-Verify a config override actually took by grepping `out/sdkconfig` for the target symbol (a disabled kconfig is written `# CONFIG_X is not set`, not `CONFIG_X=n`), not by trusting compile success.
+**`ESP_IDF_SDKCONFIG_DEFAULTS` needs ABSOLUTE paths; a relative list silently applies neither base nor overlay.**
+Generated `.../esp-idf-sys-*/out/sdkconfig` then shows IDF defaults (`CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584`, not `32768`); this gave a false STA-only pass with SoftAP still `y`.
+Fix: `{{justfile_directory()}}/...` paths (see `check-sta-only`); verify by grepping `out/sdkconfig` (disabled = `# CONFIG_X is not set`, not `CONFIG_X=n`), never by compile success.
 
-**`just clean-idf` does not force an `esp-idf-sys` reconfigure for `cargo check`, because it removes `release/build/esp-idf-sys-*` while `cargo check` builds under `debug/`.**
-Switching sdkconfig variants needs a full CMake reconfigured; the release-only `rm -rf` is a no-op for the debug profile, so a `cargo check` after `just clean-idf` reuses the stale (wrong-variant) esp-idf-sys and can silently test the previous config.
-Fix for variant-switching check recipes: clean the package outright with `cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}` (profile-agnostic) before and after, rather than `just clean-idf`.
-A dedicated per-variant `--target-dir` looks cleaner (no cleans, cached re-runs) but each one carries a full ~1-2 GB esp-idf build tree, so a second IDF target dir overflows the sized RAM disk (`/Volumes/RustBuilds`, 8 GB) — the clean-in-place approach is what actually fits.
-Context: all three points here were found while building the STA-only `just check-sta-only` gate (see `docs/features/archive/wifi-softap-cfg-gate-v1.md`).
+**`just clean-idf` removes `release/build/esp-idf-sys-*`, but `cargo check` builds under `debug/`, so a variant switch reuses a stale esp-idf-sys.**
+Fix: `cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}` (profile-agnostic) before and after.
+A per-variant `--target-dir` would carry another 1-2 GB esp-idf tree and overflow the 8 GB RAM disk (`/Volumes/RustBuilds`).
+Context: `docs/features/archive/wifi-softap-cfg-gate-v1.md`.
 
-**A doctest in a `#[cfg(any(feature = "X", test))]`-gated module is silently NOT collected under `cargo test --no-default-features` — rustdoc does not set `cfg(test)`, so the module is invisible to the doc build.**
-Symptom: `Doc-tests <crate> … running 0 tests` even though you just added a `///`/`//!` example to that module, so a doctest "regression guard" never actually runs.
-Several tier modules are gated `#[cfg(any(feature = "<domain>", test))]` so their host-compilable parts run under `just test-<domain>-hal` (`cargo test --no-default-features`, which sets `cfg(test)`); the unit-test build sees the module but the separate rustdoc pass does not.
-Fix for a host-run re-export/parity guard: use a `#[cfg(test)] mod … { #[test] fn … }` (present under `cfg(test)`), not a doctest — see the `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs` and `docs/features/archive/ota-domain-reexport-parity-v1.md`.
-(A bare `pub use` also does not catch an *omitted* re-export: the tier crate still compiles; only a consumer-style `use` of the missing name fails, which is what the guard test provides.)
+**A doctest in a `#[cfg(any(feature = "X", test))]` module never runs under `--no-default-features`: rustdoc does not set `cfg(test)`.**
+Symptom: `Doc-tests <crate> … running 0 tests`.
+Fix: a `#[cfg(test)]` unit test, e.g. `reexport_parity_guard` in `crates/rustyfarian-esp-hal-network/src/ota/mod.rs`; a bare `pub use` also misses an omitted re-export, only a consumer-style `use` fails.
 
-**A shell export (e.g. a direnv `.envrc`) silently overrides the same key in `.env` for every `just` build.**
-`set dotenv-load` never overwrites a variable that is already in the environment, so a stale `MQTT_HOST` in `.envrc` wins over a correct `.env`, and the example binary connects to the wrong broker while `.env` looks right.
-The compile-time `Config — ... mqtt_host=... mqtt_port=...` log line printed by `examples/common/env.rs` is the source of truth for what was baked in; compare it against `.env` before debugging the network.
-Fix: keep build-time keys in `.env` only, remove them from `.envrc`, then `direnv reload` and rebuild (`build.rs` has `rerun-if-env-changed` for each key).
+**A shell export (direnv `.envrc`) silently overrides the same key in `.env`: `set dotenv-load` never overwrites.**
+The `Config — ... mqtt_host=... mqtt_port=...` line from `examples/common/env.rs` shows what was baked in.
+Fix: build-time keys only in `.env`, `direnv reload`, rebuild (`build.rs` has `rerun-if-env-changed` per key).
 
-**`ubuntu-latest` moved to Ubuntu 26.04, whose libxml2 2.14 ships `libxml2.so.16`, so ESP-IDF v5.3.3's prebuilt `esp-clang` 16 fails its install-time version check with `libxml2.so.2: cannot open shared object file` and every `esp-idf-sys` build on CI dies after 2-3 minutes.**
-The failing step is `idf_tools.py install` inside the `esp-idf-sys` build script, so `just check`, `just clippy`, `just check-sta-only` and `just build-example idf_*` all fail identically while `just fmt`, `cargo audit` and `lint-docs` stay green; the runner's `idf5.3_py3.14_env` venv name is the tell that the image changed.
-Nothing in the repository changed between the green and red runs; `just act <job>` reproduced green because act's image is still an older Ubuntu.
-Fix: pin the ESP-IDF-building jobs to `runs-on: ubuntu-24.04` (rust.yml, clippy.yml); `just act` maps that label to `catthehacker/ubuntu:act-24.04` (with `--pull=false`, the GHCR pull is denied without a login) because act has no default image for it.
-An ESP-IDF upgrade (`docs/features/esp-idf-v5-5-upgrade-v1.md`) is the only path back to `ubuntu-latest`, and only if its esp-clang links against the new libxml2 soname.
+**`ubuntu-latest` = Ubuntu 26.04 ships `libxml2.so.16`; ESP-IDF v5.3.3's prebuilt `esp-clang` 16 needs `libxml2.so.2`, so every `esp-idf-sys` CI build dies after 2-3 min.**
+The failing step is `idf_tools.py install`; `fmt`, `cargo audit` and `lint-docs` stay green, and the `idf5.3_py3.14_env` venv name is the tell.
+Fix: `runs-on: ubuntu-24.04` (rust.yml, clippy.yml); `just act` maps it to `catthehacker/ubuntu:act-24.04` with `--pull=false` (GHCR pull is denied without login).
+Only an ESP-IDF upgrade whose esp-clang links the new soname leads back to `ubuntu-latest` (`docs/features/esp-idf-v5-5-upgrade-v1.md`).
 
-**The esp toolchain's Xtensa LLVM backend crashes rustc (SIGSEGV after `Error while trying to spill A8 from class AR: Cannot scavenge register without an emergency spill slot!`) on a function with too many arguments.**
-Seen 2026-11-04 on `rustyfarian-esp-idf-network` with `wifi,mqtt` for `xtensa-esp32-espidf` and `xtensa-esp32s3-espidf` at opt-level 3, breaking `idf_esp32_mqtt` and the hardware-validated `idf_esp32s3_mqtt_lwt`.
-RISC-V IDF targets and the S3 LoRa-only build compiled the same code, and a rebuild after a full RAM-disk clean crashed again, so it is not a stale cache.
-The error names no function; an LLVM machine-IR dump located it in the IDF MQTT `connect_work` with eight arguments.
-Fix: bundle the arguments into one struct (`ConnectWork` in `crates/rustyfarian-esp-idf-network/src/mqtt/mod.rs`), and run `just build-xtensa-idf-mqtt` after widening any tier signature.
+**The Xtensa LLVM backend crashes rustc (`Cannot scavenge register without an emergency spill slot!`, SIGSEGV) on a function with many arguments.**
+Seen 2026-11-04 for `xtensa-esp32-espidf` / `xtensa-esp32s3-espidf` at opt-level 3 (eight-argument IDF MQTT `connect_work`); RISC-V built the same code, and a full clean did not help.
+The error names no function; an LLVM machine-IR dump found it.
+Fix: bundle the arguments into a struct; run `just build-xtensa-idf-mqtt` after widening a tier signature.
 
 ---
 
 ## esp-hal Bare-Metal Stack (esp-radio / esp-hal waves)
 
-**`esp-radio` gates bare-metal waves: `esp-radio 0.18` requires `esp-hal ~1.1`, so `esp-hal 1.2.x` waves fail at the resolver until an `esp-radio` targeting `1.2` ships.**
-Only `esp-radio 1.0.0-beta.1` targets `esp-hal ~1.2.0`; this workspace took the pre-release deliberately to stay in lockstep with `rustyfarian-ws2812 0.7.0`.
-Fix: read the sparse index (`curl -s https://index.crates.io/es/p-/esp-radio`) before planning a wave to confirm a non-prerelease targeting the target `esp-hal` minor.
-Re-pin to `1.0.0` when it ships.
+**`esp-radio` gates bare-metal waves: `esp-radio 0.18` needs `esp-hal ~1.1`; only the pre-release `1.0.0-beta.1` targets `~1.2.0`.**
+The workspace took the pre-release deliberately to stay in lockstep with `rustyfarian-ws2812 0.7.0`; re-pin to `1.0.0` when it ships.
+Before planning a wave, read `curl -s https://index.crates.io/es/p-/esp-radio` for a non-prerelease matching the target `esp-hal` minor.
 
-**The "`esp32s3` is LoRa-only, wifi/ota/provisioning FAIL TO COMPILE BY DESIGN" constraint (merge `45f2d67`, no rationale) was false — corrected 2026-10-14.**
-Every pinned crate (`esp-radio =1.0.0-beta.1`, `esp-storage 0.10`, `esp-bootloader-esp-idf 0.6`, `esp-rtos 0.4`, `esp-alloc 0.11`, `esp-backtrace 0.20`) has an `esp32s3` feature; the crate simply never forwarded it.
-The promised `compile_error!` never existed: S3 + `ota` + `embassy` silently compiled the stub `EspHalOtaManager`.
-Fix: before trusting a "by design" chip restriction, grep the registry `Cargo.toml` of each pinned dep for the chip feature (`~/.cargo/registry/src/*/<crate>-<ver>/Cargo.toml`); the `esp32` Wi-Fi gap is the same story (`esp-radio` supports it, the `esp32` feature forwards no chip).
+**"`esp32s3` is LoRa-only by design" (merge `45f2d67`) was false.**
+Every pinned crate (`esp-radio`, `esp-storage`, `esp-bootloader-esp-idf`, `esp-rtos`, `esp-alloc`, `esp-backtrace`) has an `esp32s3` feature the crate never forwarded, and the promised `compile_error!` never existed.
+Before trusting a chip restriction, grep `~/.cargo/registry/src/*/<crate>-<ver>/Cargo.toml` for the chip feature.
 
-**`minimq 0.13`'s default feature is `defmt`; declare it `default-features = false` or every binary needs a defmt global logger.**
-With the default on, `heapless/defmt`, `embedded-io-async/defmt` and `embassy-time/defmt` come along and the link fails on the missing `_defmt_*` symbols.
-With it off, minimq's log macros expand to no-ops (`src/lib.rs` `discard_log`), and the crate still type-checks for `riscv32imc` / `xtensa-esp32s3`.
-Found 2026-10-14 while resolving ADR 019 on `tmp/adr-mqtt-resolve`; `cargo tree -e features -p minimq` shows what a default pulls in.
+**`minimq 0.13` defaults to `defmt`: declare `default-features = false`, or the link fails on missing `_defmt_*` symbols.**
+The default drags in `heapless/defmt`, `embedded-io-async/defmt`, `embassy-time/defmt`; without it the log macros are no-ops; `cargo tree -e features -p minimq` shows the pull.
 
-**Hand `minimq::Session::connect` a `&mut TcpSocket`, never the socket by value — a failed or cancelled handshake drops the transport.**
-`Session::connect(io)` takes ownership and drops `io` on failure; with a `TcpSocket<'static>` built on `StaticCell` buffers that leaks the buffers for the rest of the boot.
-`embedded-io-async` has blanket `Read`/`Write` impls for `&mut T`, so `session.connect(&mut socket)` satisfies minimq's `Io` bound and the socket survives; `socket.abort()` then `socket.flush().await` returns it to CLOSED for the next attempt (embassy-net `tcp.rs` `abort()` docs).
-That post-abort `flush()` only completes once the RST is emitted, so skip it while the network is down and bound it while up (see the Wi-Fi-outage entry below).
-The runner in `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs` is the reference.
+**Hand `minimq::Session::connect` a `&mut TcpSocket`, never the socket by value.**
+`connect(io)` drops `io` on failure, leaking `StaticCell` buffers for the boot; `embedded-io-async` blanket impls for `&mut T` satisfy minimq's `Io` bound.
+`socket.abort()` then `flush().await` returns it to CLOSED; that `flush()` waits for the RST, so skip it while the network is down and bound it while up — see `mqtt/runner.rs`.
 
-**`riscv32imc` (ESP32-C3) has no atomic read-modify-write: `AtomicU32::fetch_add` is `E0599: no method named fetch_add` on the C3 target only, while the C6 (`imac`) build passes.**
-`core::sync::atomic` only exposes `load`/`store` there; use load + store for advisory counters, a `critical_section` block for anything that must be exact, or `portable-atomic`.
-Always run the C3 line of `just clippy-hal`, not just the C6 one.
+**`riscv32imc` (C3) has no atomic read-modify-write: `fetch_add` is `E0599` on the C3 only, the C6 (`imac`) passes.**
+Use load + store for advisory counters, `critical_section` for exact ones, or `portable-atomic`; always run the C3 line of `just clippy-hal`.
 
-**Bare-metal MQTT (`minimq`) costs ~150 B of heap on the ESP32-S3: free heap 25 928 B with Wi-Fi + MQTT connected versus 26 076 B with Wi-Fi alone, flat over a 10-minute soak with a broker restart (2026-10-14, CrowPanel).**
-All client memory is `StaticCell` `.bss` (~8 KiB: minimq 1 KiB RX + 2 KiB TX, TCP 2 × 1536 B, two 4-deep queues), so the knob's "does it fit beside Wi-Fi" question is answered by construction; see `docs/runbooks/esp-hal-mqtt-hardware-test.md` for the measurement procedure.
+**Bare-metal MQTT costs ~150 B heap on the S3: 25 928 B free with Wi-Fi + MQTT vs 26 076 B with Wi-Fi alone, flat over 10 min with a broker restart (2026-10-14).**
+All client memory is `StaticCell` `.bss` (~8 KiB: minimq 1 KiB RX + 2 KiB TX, TCP 2 × 1536 B, two 4-deep queues); procedure in `docs/runbooks/esp-hal-mqtt-hardware-test.md`.
 
-**A bare-metal `minimq` session stays `Connected` through a whole Wi-Fi outage because `embassy-net` `TcpSocket::flush()` waits for the peer's ACK, which never comes on a dead path.**
-Every `poll()`/`publish()`/PINGREQ path in `minimq 0.13.5` ends in a socket write plus flush, and its 5 s PINGRESP timeout is checked only around socket reads (`session/drive.rs`), so the runner parks inside `flush()` and never updates the state; smoltcp retransmits without a cap unless `TcpSocket::set_timeout` is set, and even then it clears the socket tuple only after the RST is emitted, so a post-abort `flush()` hangs too while the link is down.
-Seen on the CrowPanel S3 2026-10-16 (rustyfarian-knob hardware test T5; see `docs/adr/019-esp-hal-async-mqtt-client.md` "Amendment 2026-10-16"): state `Connected` for 3 min 7 s, five `try_publish` calls accepted after the drop, recovery 22 s after link-up via `Transport(ConnectionReset)`.
-Fix in `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs`: a polled `is_link_up() && is_config_up()` watch (500 ms, never `Stack::wait_*` — the stack has one state waker and consumer tasks use it) races `serve()`, `set_timeout(1.5 × keep-alive)` on the socket, and a `with_deadline` stall bound of socket timeout + keep-alive around every session await; `try_publish` `Ok` means queued, not delivered.
-Hardware re-run (runbook T5a/T5b) by the knob maintainer still pending as of 2026-10-17; ADR 019 amendment 2026-10-16 has the details.
+**esp-hal MQTT stays `Connected` through a Wi-Fi outage (`flush()` waits for a peer ACK) — see ADR 019 amendment 2026-10-16.**
 
-**ESP32-S3 bare-metal Wi-Fi runs on the same single 72 KiB internal heap as the C3 — no PSRAM region needed.**
-`esp-radio` and `esp-rtos` allocate only via `malloc_internal` / `InternalMemory`, so a PSRAM `esp-alloc` region could never serve Wi-Fi buffers anyway; add PSRAM only for application data.
-Validated 2026-10-14 on CrowPanel 1.28" ESP32-S3: `hal_esp32s3_connect_async` got a DHCP lease with ~26 KB heap free.
+**ESP32-S3 bare-metal Wi-Fi fits the same 72 KiB internal heap as the C3; PSRAM cannot serve Wi-Fi buffers (`malloc_internal` only, ADR 019 references).**
+`hal_esp32s3_connect_async` got a DHCP lease with ~26 KB free on the CrowPanel (2026-10-14).
 
-**`esp-storage 0.10` made `embedded-storage` trait impls an opt-in feature — `FlashStorage` silently stops implementing `NorFlash` after the bump.**
-Fix: enable `features = ["embedded-storage"]` on `esp-storage` for provisioning store's `NorFlash` bound; use inherent `FlashRegion::{capacity, write}` methods for OTA manager.
+**`esp-storage 0.10` made the `embedded-storage` impls opt-in: `FlashStorage` stops implementing `NorFlash`.**
+Fix: `features = ["embedded-storage"]` for the provisioning store; inherent `FlashRegion::{capacity, write}` in the OTA manager.
 
-**`esp-radio 1.0.0-beta.1` API: controller-only return, STA/AP as singletons (`Interface::station()` / `Interface::access_point()`), `StationConfig` takes typed `Ssid` / `Password` / `AuthenticationMethodConfig`.**
-`Ssid::try_from` / `Password::try_from` reject oversized input (0.18 truncated); empty password stays `Wpa2Personal("")` (scanning default).
-`Interface` panics on second `station()` call; use `try_station()` to probe.
+**`esp-radio 1.0.0-beta.1`: controller-only return, STA/AP singletons (`Interface::station()` / `access_point()`), typed `Ssid` / `Password` / `AuthenticationMethodConfig`.**
+`try_from` rejects oversized input (0.18 truncated); an empty password stays `Wpa2Personal("")`; a second `station()` panics, `try_station()` probes.
 
-**Two semver-incompatible `pennant` versions make `StatusLed` two different traits — trait identity is per crate version.**
-Symptom: `E0599 no method named set_color` on a `Ws2812Rmt` from `pennant 0.6` when a consumer imports `pennant 0.7::StatusLed`.
-Fix: keep tier crates on matching `pennant` versions; diagnose with `cargo tree -i pennant`.
+**Two semver-incompatible `pennant` versions make `StatusLed` two traits** (`E0599 no method named set_color`); keep matching versions, diagnose with `cargo tree -i pennant`.
 
-**`esp-radio 0.18` deleted the `smoltcp` feature and the `smoltcp::phy::Device` impl on `WifiDevice` — the bare-metal Wi-Fi controller is now async-only and tied to `embassy-net`.**
-The 0.17 `smoltcp` Cargo feature is gone; the `wifi` feature now pulls `embassy-net-driver` instead.
-Any blocking poll loop that drove `smoltcp::iface::Interface` directly off `WifiDevice` (the `WiFiManager::wait_connected` + DHCP path used in the network workspace before the upgrade) has no equivalent in 0.18 — the option is to drop the sync surface and route everything through `embassy-net`.
-Confirmed in `esp-radio-0.18.0/CHANGELOG.md` line 107 (`Support for the feature 'smoltcp' has been removed (#4870)`) and verified by grep against the unpacked source: zero `smoltcp` references in `wifi/mod.rs`, only `impl Driver for Interface<'_>` (`embassy_net_driver::Driver`) remains.
+**`esp-radio 0.18` removed the `smoltcp` feature and `WifiDevice`'s `smoltcp::phy::Device` impl; the Wi-Fi controller is async-only via `embassy-net-driver`** (CHANGELOG #4870).
 
-**`embassy-sync = =0.8.0` is a workspace-wide lock set by `esp-rtos 0.3.0`; many published async networking crates (incl. the `edge-net 0.7.x` family) still target `embassy-sync 0.7.2` and cannot coexist.**
-Cargo only allows one version of `embassy-sync` in the graph because the trait surface (`Mutex`, `Signal`, `CriticalSection`) is API-incompatible across the 0.7 → 0.8 boundary, and downgrading the workspace pin would break every other embassy-using crate.
-A crate evaluation that checks only license + transitive surface will miss this and fail at the resolver, not at the compiler.
-Fix: before adding any async networking crate to the bare-metal estate, run `cargo tree -i embassy-sync` or read the candidate's `Cargo.toml` and confirm it binds `embassy-sync 0.8.x`. Discovered during the ADR 015 Phase 2 substrate evaluation of `edge-dhcp 0.7.0` / `edge-nal-embassy 0.8.1` — both blocked, hand-rolled fallback proceeded per ADR 015 §3.
+**`embassy-net`'s `udp`, `tcp`, `proto-ipv4`, `dhcpv4`, `medium-ethernet` features are independent and off by default.**
+Missing ones show as `E0432: unresolved import 'embassy_net::udp'` or a `smoltcp` `compile_error!` deep in the graph.
+Fix: forward them on the consuming crate's `embassy-net` dep (`embassy` feature in `crates/rustyfarian-esp-hal-network/Cargo.toml`).
 
-**`embassy-net` feature flags `udp`, `tcp`, `proto-ipv4`, `dhcpv4`, and `medium-ethernet` are independently gated; pulling `embassy-net` into the graph enables none of them by default.**
-`UdpSocket`/`TcpSocket` live in `embassy_net::udp`/`embassy_net::tcp` behind their own feature flags, each adding a `smoltcp` module pair internally.
-Symptom when missing: `E0432: unresolved import 'embassy_net::udp'` (or `tcp`), OR an unrelated-looking `smoltcp` `compile_error!` deep in the dep graph when `proto-ipv4`/`medium-ethernet` are absent.
-Fix: forward every required feature on the *consuming crate's* `embassy-net` dep, not just the app-level network stack — `rustyfarian-esp-hal-network`'s `embassy` feature does this via `embassy-net?/{udp,tcp,dhcpv4,proto-ipv4,medium-ethernet}` (see its `Cargo.toml`). Applies to the DHCP/HTTP provisioning substrate and the OTA client alike.
+**`embassy-net::TcpSocket` server loop: `accept(port)` is listen and wait in one; `close()` only sends FIN; `flush()` must follow before reuse.**
+Without `flush()` the old connection lingers in FIN-WAIT and races the next accept; `abort()` (RST) also needs `flush()`.
+Pattern: `loop { accept; serve; close; flush.await }` — see `provisioning/portal.rs::run`.
 
-**`embassy-net::TcpSocket` server-side accept-loop: `accept(port)` is the listen-set AND the wait-point; `close()` is FIN-only; `flush()` must follow before reusing the socket.**
-There is no separate `listen()` + `wait_for_accept()` split — one `accept(port).await?` call puts the socket into listen mode on the given port and suspends until a connection arrives.
-After serving a request, `close()` only shuts the **write** half (sends FIN); `flush()` must be awaited next so smoltcp actually emits the FIN before the next `accept()` reuses the socket — without it, the previous connection lingers in FIN-WAIT and the next accept races against teardown.
-`abort()` is the same story (sends RST instead of FIN, still needs `flush()` to push the packet out). Pattern: `loop { socket.accept(port).await?; serve(socket); socket.close(); socket.flush().await; }`. Lives in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs::run`.
+**Bind workspace invariants at construction, not per call: host tests miss the call-site indirection.**
+`LeaseTable::allocate` once took `pool_start` per call and one of three call sites passed `server_ip`, so the phone got `192.168.4.1` and stalled on "IP configuration failure" — only on hardware.
+Fix: `LeaseTable::new(pool_start, lease_secs)`; likewise `build_response` hard-codes `Connection: close`.
 
-**Pass workspace invariants by binding-at-construction, not by per-call argument — host tests miss the call-site indirection.**
-The Phase 2 DHCP server's `LeaseTable::allocate(mac, requested, pool_start, ...)` took `pool_start` as a runtime arg; three call sites in `run` had to pass it, one passed `server_ip` (192.168.4.1) instead. Host tests called `LeaseTable::allocate` directly with the correct constant and never exercised the call-site indirection — the bug only surfaced on hardware when the phone got `192.168.4.1` for its DHCP lease and stalled on "IP configuration failure".
-Fix: when designing a `pub(crate)` state machine helper, bind workspace-invariant constants at construction (`LeaseTable::new(pool_start, lease_secs)` followed by `.allocate(mac, requested, now_secs)`) so the call site cannot get them wrong.
-The HTTP server applied this prospectively: `build_response` does NOT take `Connection: close` as a parameter — it's a server-wide invariant. Same principle for other private helpers in the spike.
+**`StaticCell<[u8; N]>` needs a compile-time `N`, so a runtime `buf_size` field cannot size it.**
+Spike code uses `const` buffer sizes and keeps the config fields as markers; production code should lift sizes to const generics.
 
-**`StaticCell<[u8; N]>` requires `N` to be a compile-time constant — runtime `config.buf_size: usize` fields cannot back the allocation.**
-The bare-metal substrate (DHCP / HTTP servers in `rustyfarian-esp-hal-network`) needs `'static`-lifetime socket buffers via `StaticCell`, but the buffer size lives in the type signature, so a `HttpServerConfig.rx_buf_size` field cannot drive a `StaticCell<[u8; rx_buf_size]>` allocation.
-The const-generic workaround (`HttpServer<const RX: usize, const TX: usize>`) propagates the generics through every consumer, which bloats the surface.
-Fix for spike-quality code: use `const` defaults for the `StaticCell` backing buffers and keep the `config.buf_size` fields as forward-compat documentation markers; for production code, lift the sizes to const generics on the server type.
+**`StationConfig::with_ssid(ssid.into())` is `E0283`; pass the `&str` directly** (the password setter still needs `.into()` for `Password`).
 
-**`StationConfig::with_ssid` accepts `&str` directly via `Into<Ssid>` — calling `.into()` first triggers `E0283`.**
-The compiler can't pick between `&str → Ssid` and `&str → &str` when the `&str.into()` is bare.
-Pass the `&str` literal directly: `StationConfig::default().with_ssid(ssid).with_password(password.into())`.
-The password setter still needs `.into()` because its parameter type is the more specific `Password`, not a trait object.
+**`esp-hal 1.1.0` RMT TX: `configure_tx(pin, config)` became `configure_tx(&config).unwrap().with_pin(pin)`** (see the `rustyfarian-ws2812` April 2026 CHANGELOG).
 
-**`esp-hal 1.1.0` split the RMT TX builder: `configure_tx(pin, config)` is gone — the new pattern is `configure_tx(&config).unwrap().with_pin(pin)`.**
-The pin moved from the `configure_tx` parameter to a chained `.with_pin(...)` call so that channel configuration can be reused independently of pin assignment.
-The reference migration is in the `rustyfarian-ws2812` repo's CHANGELOG entry for the April 2026 wave (file: `crates/rustyfarian-esp-hal-ws2812/examples/hal_c6_*.rs`).
+**C3/C6 Super Mini PCB antennas corrupt WPA2 auth frames at full TX power — see rustdoc of `juggler::wifi::STATION_TX_POWER_DEFAULT`.**
 
-**TX-power coupling on ESP32-C3/C6 Super Mini (PCB antenna reflects full TX, corrupting WPA2 auth frames).**
-November 2026: the station default is shared again, `juggler::wifi::STATION_TX_POWER_DEFAULT` = `TxPowerLevel::Low` (8.5 dBm) on both tiers, applied verbatim; the esp-radio coupling below no longer decides the station level.
-April 2026 (esp-radio 0.18): bare-metal blob transmits ~20 dBm; ESP-IDF clamps to 8.5 dBm. Workaround: call `esp_wifi_set_max_tx_power(34)` (8.5 dBm) after `set_config()`.
-September 2026 (esp-radio 1.0.0-beta.1): driver applies 5 dBm default inside `WifiController::new`; crate no longer forces TX power on unset default, instead inherits driver's own. At 5 dBm, C3 Super Mini joins cleanly (validated hardware 2026-09-26); couples effective default to `esp-radio`'s own — re-validate on every version bump. Pass `TxPowerLevel::Low` explicitly via `WiFiConfig::with_tx_power` to restore 8.5 dBm.
+**`embassy-executor 0.10` removed `Spawner::must_spawn`: write `spawner.spawn(my_task(arg).unwrap())`.**
+The `.unwrap()` belongs on the task call (`Result<SpawnToken, SpawnError>`); the compiler's suggested `.expect` placement after `spawn(...)` is wrong.
 
-**`embassy-executor 0.10` removed `Spawner::must_spawn`; `#[embassy_executor::task]` macros now return `Result<SpawnToken<...>, SpawnError>`.**
-Old: `spawner.must_spawn(my_task(arg));`
-New: `spawner.spawn(my_task(arg).unwrap());` — the `.unwrap()` goes on the **task call** (which returns `Result`), not on `spawner.spawn` (which returns `()`).
-The compiler hint `consider using Result::expect to unwrap the Result<SpawnToken, SpawnError>` is correct in spirit but its suggested edit is wrong (it places `.expect("REASON")` after the closing paren of `spawn`, where it would be applied to `()`).
+**`esp-rtos` panics `unwrap of self.time_driver.as_mut() failed: NoneError` on the first `.await` of any kind if `esp_rtos::start` never ran.**
+`WiFiManager::init_async` / `init_softap_async` call it, so a path without Wi-Fi (e.g. an already-provisioned branch, `hal_c3_provision_mqtt` 2026-06-18) has no scheduler.
+Fix: spin non-async on that path, or call `esp_rtos::start` with `TIMG0` + `FROM_CPU_INTR0`; since 2026-10-31 the `*_scheduler_running` variants and `ProvisioningBuilder::start_scheduler_running` let the firmware own it (ADR 021), and both `init_*` start the scheduler before validating.
 
-**The `esp-rtos 0.3.0` async executor panics `unwrap of self.time_driver.as_mut() failed: NoneError` on the *first* `.await` park if `esp_rtos::start` was never called — and `start` is the call that installs the time driver.**
-The executor reads the time driver every time a task parks, so this trips on *any* await, not just `Timer::after` — `core::future::pending().await` panics identically.
-In this workspace `esp_rtos::start(timg.timer0, from_cpu_intr0)` is invoked only inside `WiFiManager::init_async` / `init_softap_async` (`crates/rustyfarian-esp-hal-network/src/wifi/mod.rs`), so any code path that uses the async executor but brings up no Wi-Fi (e.g. the provisioning examples' already-provisioned branch) has no scheduler and panics at boot.
-Surfaced on hardware 2026-06-18: `hal_c3_provision_mqtt` logged the loaded config then panicked in the idle loop.
-Fix options: (a) on a no-Wi-Fi path, halt with a non-async spin loop instead of awaiting (what the provisioning examples now do); or (b) call `esp_rtos::start` yourself before awaiting, using the still-owned `TIMG0` + `FROM_CPU_INTR0`.
-Since 2026-10-31 the `*_scheduler_running` config variants (`with_wifi_scheduler_running`, `with_ap_wifi_scheduler_running`) let the firmware own `esp_rtos::start` (ADR 021, the fourth provider), and both `init_*` paths start the scheduler before validating, so a `ConfigureFailed` cannot strand the executor.
-`ProvisioningBuilder::start_scheduler_running` is the portal counterpart.
+**A missing `embassy-executor` dep surfaces as `no method named 'unwrap' found for ... impl Future` at every `spawn` site.**
+The `#[embassy_executor::task]` attribute cannot expand; the first error, `E0432: unresolved import embassy_executor`, is the cause.
+Fix: `embassy-executor` + `embassy-time` as workspace-pinned `[dev-dependencies]` when only examples use them.
 
-**A missing `embassy-executor` dependency makes `#[embassy_executor::task]` silently no-op and surfaces as misleading `no method named 'unwrap' found for ... impl Future<Output = ()>` errors, not a clear "macro not found".**
-When `embassy_executor` is unresolved, the `#[embassy_executor::task]` attribute cannot expand, so the annotated fn stays a plain `async fn` returning `impl Future` instead of the spawnable token the macro would produce; the real cause (`error[E0432]: unresolved import embassy_executor`) is buried above a cascade of `.unwrap()`-on-Future errors at every `spawner.spawn(task().unwrap())` call site.
-Hit 2026-06-18 when resuming `hal_c3_connect_async` validation: `rustyfarian-esp-hal-network` declared `embassy-net` + `static_cell` but never `embassy-executor` / `embassy-time`, so all three async examples failed to compile.
-Fix: the library doesn't use these crates — only the examples do — so add `embassy-executor` + `embassy-time` as `[dev-dependencies]` (workspace-pinned), not as `embassy`-feature optional deps. Read the *first* error (the unresolved import), not the cascade.
+**esp-hal joined the first AP of the SSID by channel, not the strongest (a -89 dBm mesh node next to a -20 dBm AP) — see rustdoc of `juggler::wifi::ApSelection`.**
+esp-radio's `WIFI_CONNECT_AP_BY_SIGNAL` only applies to all-channel scans; the `[wifi] link up` line shows bssid and rssi.
 
-**esp-radio's `StationConfig::default()` uses `ScanMethod::Fast`, so the esp-hal station joins the first AP of the SSID by channel, not the strongest; the ESP-IDF tier's `embedded-svc` default is `CompleteScan(Signal)`.**
-esp-radio hard-codes `WIFI_CONNECT_AP_BY_SIGNAL`, but ESP-IDF applies that sort only to an all-channel scan, so the setting looks right and does nothing.
-On the `iot` mesh SSID (2026-11-07) the CrowPanel S3 joined a -89 dBm node next to a -20 dBm AP: it got an IP, or sometimes associated without a DHCP lease, every TCP connect to the broker timed out, and it did not answer ping, even after a fresh boot, which looked like the router blocking it.
-Fix: both tiers now map the shared `juggler::wifi::ApSelection` (default `Strongest`) to their scan method explicitly, so neither driver default decides (esp-radio's `with_scan_method` needs its `unstable` feature, already on).
-Since 2026-11-08 both tiers log the joined AP on association (`[wifi] link up #N — bssid …, ch N, rssi -NN dBm`, the same text on both tiers), and the bench warns below -75 dBm; before that only the router's client view showed it.
+**esp-radio 1.0.0-beta.1 hard-codes country CN, channels 1-13 — see ADR 026.**
 
 ---
 
-**esp-radio 1.0.0-beta.1 hard-codes the Wi-Fi country as CN with channels 1-13 and manual control through `CountryInfo`.**
-Symptom: on esp-hal a scan or a SoftAP on channel 12 or 13 worked while the same firmware on ESP-IDF failed with `ESP_ERR_INVALID_ARG`.
-esp-radio sets the country once when the controller is created, and the library's `esp_wifi_set_country_code` call after `WifiController::new` takes effect, so do not rely on `ControllerConfig::country_info`.
-Re-check this on every esp-radio bump, because the `extern "C"` layout in `rustyfarian-esp-hal-network` is taken from esp-wifi-sys 0.3.0 (ADR 026).
-
 ## Flashing & Serial (espflash 4.x)
 
-**`espflash`'s auto-detect picks Bluetooth ports on Macs with paired headsets, then fails with the generic "Error while connecting to device".**
-On macOS every paired Bluetooth device shows up under `/dev/cu.*` (`/dev/cu.B21S-HC15130245`, `/dev/cu.fluffisNC700`, `/dev/cu.Bluetooth-Incoming-Port`, …) and `espflash`'s probe order can land on one of them before the actual USB-JTAG device (`/dev/cu.usbmodem1101`).
-The error message gives no hint about which port was tried.
-Fix: `scripts/detect-port.sh` filters candidates to USB serial devices only (`usbmodem*`, `usbserial*`, `SLAB_USBtoUART*`, `wchusbserial*` on macOS; `ttyUSB*`, `ttyACM*` on Linux) and only auto-picks when exactly one matches; otherwise it prints the candidate list and lets `espflash` error out with its own message.
-`flash.sh`, `just run`, `just monitor`, and `just erase-flash` all use the helper.
-`ESPFLASH_PORT=…` still wins when set explicitly.
+**`espflash` auto-detect picks Bluetooth `/dev/cu.*` ports on Macs and fails with "Error while connecting to device".**
+`scripts/detect-port.sh` keeps only USB serial devices (`usbmodem*`, `usbserial*`, `SLAB_USBtoUART*`, `wchusbserial*`; `ttyUSB*`, `ttyACM*` on Linux) and auto-picks only a single match; `ESPFLASH_PORT` wins.
 
-**`espflash monitor` from `just run` lingers after the user thinks it has exited and locks the port for the next flash.**
-Symptom: `[INFO ] Serial port: '/dev/cu.usbmodem1101'` followed by `Error: Failed to open serial port /dev/cu.usbmodem1101 — Error while connecting to device`.
-This is a *different* failure mode from auto-detect picking the wrong port — here the right port is selected but `open()` fails because another process holds it.
-Diagnose: `lsof /dev/cu.usbmodem1101` shows the holding `espflash` PID; kill it and retry.
-Common cause: closing a terminal tab without sending SIGINT to the foreground `espflash monitor`, leaving the process orphaned and still holding the FD.
+**A lingering `espflash monitor` holds the port: `Failed to open serial port ... Error while connecting to device`.**
+`lsof /dev/cu.usbmodem1101` shows the PID; usually a closed terminal tab without SIGINT.
 
-**A shell helper that prefixes `$PWD/` onto a caller-supplied directory silently breaks when the justfile passes an absolute path — which it does whenever the RAM disk is attached.**
-`find_idf_bootloader` in `scripts/lib.sh` globbed `"$PWD/$idf_dir/…"`, so with `idf_dir` = `/Volumes/RustBuilds/targets/idf/<project>` the pattern became `/Users/…/rustyfarian-network//Volumes/…` and matched nothing, while the bootloader sat exactly where it was expected.
-The symptom is self-contradictory output — `ensure-bootloader.sh` reports "building `idf_c3_connect` to populate it", the build succeeds, and `flash.sh` then warns "no IDF-built bootloader cached" — so every bare-metal flash rebuilt an IDF example (~12 s) and silently fell back to the espflash bundled bootloader, disabling the protection described above.
-Fix: normalise the directory before globbing (absolute stays as-is, relative gets `$PWD/`), and re-check after the populating build so a failed harvest cannot pass silently.
-The re-check is fatal only on `xtensa-*` targets, where the bundled bootloader is genuinely incompatible; on RISC-V it warns and lets `flash.sh` fall through, matching the `c6` path that has always relied on the bundled bootloader.
+**A helper that prefixes `$PWD/` onto a caller-supplied dir breaks when the justfile passes an absolute RAM-disk path.**
+`find_idf_bootloader` in `scripts/lib.sh` globbed `/Users/…/rustyfarian-network//Volumes/…`, so every bare-metal flash rebuilt an IDF example and fell back to the bundled bootloader.
+Fix: normalise before globbing and re-check after the populating build (fatal on `xtensa-*`, warning on RISC-V).
 
-**`cargo clean -p esp-idf-sys` does not force the bootloader to be rebuilt.**
-It removes cargo's fingerprints, but `release/build/esp-idf-sys-<hash>/out/` survives: the build script regenerates `out/sdkconfig` while the bootloader subproject can keep the old `bootloader.bin`.
-Any harvest that switches sdkconfig variants must also delete `release/build/esp-idf-sys-*` (what `just clean-idf` does) and then grep `out/sdkconfig` for the variant's rollback line.
+**`cargo clean -p esp-idf-sys` does not rebuild the bootloader: `out/` survives with the old `bootloader.bin`.**
+A variant-switching harvest must delete `release/build/esp-idf-sys-*` (`just clean-idf`) and grep `out/sdkconfig` for the rollback line.
 
-**Rollback protection of a bare-metal OTA image depends on the bootloader, which is built from the sdkconfig overlay, not the example's features.**
-`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is set only by `sdkconfig.ota.defaults`, so the bootloader cache is keyed by variant: `<chip>.bin` (generic) and `<chip>-ota.bin` (rollback on).
-`flash.sh` picks `-ota` whenever the example's features include `ota`, and `ensure-bootloader.sh --ota` builds it (c3 via `idf_c3_ota_runtime`, esp32s3 via `idf_esp32s3_mqtt_lwt` plus the `ota` feature).
+**Bare-metal OTA rollback depends on the bootloader, built from the sdkconfig overlay, not the example's features.**
+Only `sdkconfig.ota.defaults` sets `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`; cache files are `<chip>.bin` and `<chip>-ota.bin`.
+`flash.sh` picks `-ota` when the features include `ota`; `ensure-bootloader.sh --ota` builds it (c3 via `idf_c3_ota_runtime`, esp32s3 via `idf_esp32s3_mqtt_lwt` + `ota`).
 
-**The IDF-built v5.3.3 bootloader successfully boots bare-metal esp-hal images — verified 2026-09-26 on both RISC-V and Xtensa.**
-With the `$PWD/`-prefix cache fix in place, `just run hal_c3_connect_async_led` flashed an esp-hal 1.2.2 bare-metal binary together with the IDF v5.3.3 bootloader (harvested from an IDF example build) and it booted cleanly on ESP32-C3 (RISC-V): serial output shows `boot: ESP-IDF v5.3.3 2nd stage bootloader`, followed by Wi-Fi and DHCP coming up normally.
-The same workaround (`espflash flash --bootloader <path> --ignore-app-descriptor`) boots an `esp-bootloader-esp-idf 0.6` bare-metal image on Heltec WiFi LoRa 32 V3 (Xtensa ESP32-S3), validating the app-descriptor compat fix on both architecture families.
+**The IDF-built v5.3.3 bootloader boots bare-metal esp-hal images on RISC-V (C3) and Xtensa (Heltec V3 S3), verified 2026-09-26** with `--bootloader <path> --ignore-app-descriptor`.
 
-**The harvested bootloader is cached inside the RAM-disk target dir and does not survive reboot or detach — first bare-metal flash afterwards rebuilds the full IDF example (~1m26s) just to re-harvest the ~26 KB `bootloader.bin`.**
-The bottleneck is not the harvest operation itself (~12 s warm cache), but the full ESP-IDF CMake build that precedes it when the cache is cold.
-The stable cache is `<idf_dir>/bootloader/<chip>.bin` (generic) and `<chip>-ota.bin` (rollback-enabled), written by `scripts/ensure-bootloader.sh` and read by `flash.sh` without globbing; it still lives under `idf_dir`, so it does not survive a RAM-disk detach. A copy outside the RAM disk, keyed by chip and IDF version, remains unimplemented.
-Current mitigation: leave `just ramdisk` attached across multiple flashing sessions.
+**The bootloader cache `<idf_dir>/bootloader/<chip>[-ota].bin` lives on the RAM disk and dies with it; the first flash afterwards rebuilds a full IDF example (~1m26s).**
+A copy outside the RAM disk keyed by chip and IDF version is unimplemented; keep `just ramdisk` attached.
 
-**An ESP-IDF program's last console line can sit in the USB Serial/JTAG TX FIFO and never reach the host when nothing is written after it.**
-The secondary USB Serial/JTAG console (`usb_serial_jtag_vfs.c` without the driver) hands a partial 64-byte packet to the host only on a flush; `esp-idf-svc`'s logger `fwrite`s to newlib stdout, and the trailing packet of a long final line stayed queued, so the bench waited 120 s for a `ESPNOW-GATE … PASS` line the firmware had written (bug 019, 2026-11-11).
-It looks like a hang with no panic, watchdog or reboot; a JTAG halt (`openocd -f board/esp32c3-builtin.cfg` plus `riscv32-esp-elf-gdb`, both under `~/.espressif/tools`) showed `main` parked after the scenario, and each `reset run` over JTAG delivered the previous boot's line first.
-Fix: a scenario whose gate line is its last write calls `esp_idf_svc::sys::fsync(1)` (`console_fsync` flushes the FIFO and waits for the host) and logs a heartbeat afterwards; scenarios that keep logging never show this.
-See `docs/bugs/archive/019-idf-espnow-shutdown-mid-scan-hang-2026-11-11.md`.
+**An ESP-IDF program's last console line can stay in the USB Serial/JTAG TX FIFO: a partial 64-byte packet goes out only on a flush.**
+Looks like a hang with no panic or reboot; the line appears at the start of the next boot.
+Fix: `esp_idf_svc::sys::fsync(1)` after the last line, then a heartbeat.
 
 ---
 
 ## ESP-IDF Event Loop (`esp-idf-svc`)
 
-**`EspEventLoop::subscribe` requires the callback to accept the event type by value, not by reference.**
-The bound is `F: for<'a> FnMut(D::Data<'a>)`, so the callback signature must be
-`|event: WifiEvent<'_>|`, not `|event: &WifiEvent|`.
-Using a reference produces `E0631: type mismatch in closure arguments` with the note
-`expected closure signature 'for<'a> fn(WifiEvent<'a>) -> _' / found 'fn(&WifiEvent<'_>) -> _'`.
-The compiler's `help` suggestion (remove `&`) is correct and sufficient.
+**`EspEventLoop::subscribe` takes the event by value: `|event: WifiEvent<'_>|`, not `&WifiEvent`** (else `E0631`; the compiler's remove-`&` hint is right).
 
-**An `EspSubscription` must be stored for as long as events are needed — dropping it unregisters the handler.**
-`EspSystemEventLoop::subscribe` returns an `EspSystemSubscription<'static>` whose `Drop` impl
-automatically deregisters the callback.
-If the subscription is bound to a local variable that goes out of scope (e.g. inside an `if` branch),
-the handler fires zero times.
-Fix: store the subscription in the owning struct (e.g. as `Option<EspSystemSubscription<'static>>`).
+**Dropping an `EspSubscription` unregisters the handler; store it in the owning struct.**
 
-**The station's "IP lost" event arrives only after the netif IP-lost timer, 120 s by default — it cannot signal an outage.**
-On `esp_wifi_stop`/disconnect, `esp_netif_down` zeroes the IP and arms `esp_netif_ip_lost_timer`, which posts `IP_EVENT_STA_LOST_IP` after `CONFIG_ESP_NETIF_IP_LOST_TIMER_INTERVAL` (Kconfig default 120, `0` disables it); `IP_EVENT_STA_DHCP_DEASSIGNED` is only posted by the DHCP client's own deinit path.
-`esp-idf-svc` 0.53 maps `STA_LOST_IP` to `IpEvent::DhcpIpDeassigned`, so that variant is delayed rather than absent, and a consumer that gates work on it keeps treating the link as up for two minutes.
-Fix: gate on the link supervisor's readiness (`WiFiManager::subscribe_ready` or `is_ready`), which combines association and IP and reacts in milliseconds; keep `DhcpIpDeassigned` only as a slow catch-all.
-This is why the MQTT gate in tier-parity Step 8b-2 is fed by `LinkSupervisor::subscribe_ready` rather than a second `IpEvent` subscription.
+**`IP_EVENT_STA_LOST_IP` (esp-idf-svc 0.53 `IpEvent::DhcpIpDeassigned`) fires only after `CONFIG_ESP_NETIF_IP_LOST_TIMER_INTERVAL`, 120 s by default.**
+`esp_netif_down` arms `esp_netif_ip_lost_timer`; `IP_EVENT_STA_DHCP_DEASSIGNED` comes only from the DHCP client's deinit.
+Fix: gate on `WiFiManager::subscribe_ready` / `is_ready` (association + IP, milliseconds), which is why the MQTT gate uses `LinkSupervisor::subscribe_ready`.
 
 ---
 
 ## ESP-IDF FreeRTOS Tasks & Threads
 
-**`xTaskGetHandle` asserts and reboots the chip when the queried name is longer than 15 characters.**
-FreeRTOS stores task names cut to `configMAX_TASK_NAME_LEN - 1` (15) and asserts `strlen(pcNameToQuery) < 16` (`tasks.c:2855` in ESP-IDF v5.3.3), so querying a name as it was given at creation is not safe.
-`esp-idf-svc`'s `EspAsyncMqttClient` names its sender task `MQTT Sending task`, which FreeRTOS stores as `MQTT Sending ta`; querying the full name crashed the C3 spike `idf_c3_async_mqtt_native` once a minute (2026-11-01).
-Fix: query the stored 15-character name and skip longer names before calling `xTaskGetHandle` (see `MAX_TASK_NAME_LEN` in the IDF crate's `examples/common/spike.rs`).
+**`xTaskGetHandle` asserts (`strlen(pcNameToQuery) < 16`, `tasks.c:2855`) on a name over 15 characters.**
+Names are stored cut to 15: esp-idf-svc's `MQTT Sending task` is `MQTT Sending ta`, and querying the full name rebooted the C3 every minute; query the cut name (`MAX_TASK_NAME_LEN`).
 
-**Rust `std::thread::Builder::name` does not reach FreeRTOS on ESP-IDF; every spawned thread's task is called `pthread`.**
-The name stays a Rust-side label, so `xTaskGetHandle`, task lists and stack reports cannot tell library threads apart.
-Fix: set `esp_pthread_cfg_t::thread_name` with `esp_pthread_set_cfg` on the spawning thread right before the spawn, and reset it afterwards; Rust's own stack size still overrides the configured one (see `name_next_threads` in `examples/common/spike.rs`).
-Since Step 8c the IDF MQTT library names its own threads `mqtt-events` and `mqtt-net` through `spawn_named` (`mqtt/task_name.rs`); note that `esp_pthread_get_cfg` zeroes its out-parameter before returning `ESP_ERR_NOT_FOUND`, so a caller must take `esp_pthread_get_default_config()` for the fallback instead of reusing the probe buffer, or `esp_pthread_set_cfg` rejects the all-zero `stack_size` with `ESP_ERR_INVALID_ARG` and the thread stays unnamed (caught in the Step 8c review).
+**`std::thread::Builder::name` never reaches FreeRTOS: every thread's task is `pthread`.**
+Fix: `esp_pthread_set_cfg` with `thread_name` before the spawn — see rustdoc of `spawn_named` (`mqtt/task_name.rs`).
+`esp_pthread_get_cfg` zeroes its out-parameter on `ESP_ERR_NOT_FOUND`, so take `esp_pthread_get_default_config()` for the fallback, or `set_cfg` rejects the zero `stack_size` with `ESP_ERR_INVALID_ARG`.
 
 ---
 
 ## MQTT Event Loop (`esp-mqtt` / `esp-idf-svc`)
 
-**Any `esp_mqtt_client_*` call made from an `MqttBuilder` callback on the event-loop thread deadlocks the client for good.**
-esp-mqtt (IDF v5.3.3) dispatches `CONNECTED`, `DATA`, and the disconnect path from `esp_mqtt_task` while holding its recursive `api_lock`, and esp-idf-svc 0.53 parks that task until our event loop calls `next()` again.
-A recursive mutex re-enters only for its owning task, so our thread waits on `api_lock` while the mqtt task waits on our `next()`.
-Symptom: `[mqtt] connected (clean_session=...)` is logged, `is_connected()` stays `false`, keepalives stop, and the broker publishes the LWT.
-The older "blocks until SUBACK" explanation was wrong: `EspMqttClient::subscribe` returns a message id without waiting, which is why a plain `enqueue` (the `with_startup_message()` publish) hung just the same.
-A second, three-way cycle existed whenever `on_connect` was registered: a publisher holding the Rust client mutex while blocked on `api_lock` during the connect handshake, the parked mqtt task, and the event loop blocked on that mutex to hand `on_connect` its `client` argument.
-Fix (bug 001): the event-loop thread never takes the client mutex; since Step 8c (2026-11-11) the `mqtt-net` runner thread performs the connect work itself, one `juggler::mqtt::ConnectWorkMachine` action per turn (builder subscriptions, startup publish, `on_connect`, then the runtime catch-up), releasing the client lock and yielding after every step; the per-connect helper thread of 2026-09-27 to 2026-11-11 is gone.
-Because `on_connect` runs on that helper, `client.enqueue()` / `client.subscribe()` inside it are safe.
-`is_connected()` still flips only after `on_connect` returns, through a generation-checked compare-and-swap (`juggler::mqtt::ConnectionEpoch`), so a stale helper after a fast reconnect cannot mark a dead connection connected.
-`MqttHandle::publish*`, `try_publish*`, `subscribe`, and `publish_acked` return `PublishAckError::WrongThread` from inside any callback, detected through the thread-local `juggler::mqtt::CallbackScope`.
-User rule: from `on_connect` use the `client` argument, never `MqttHandle`; from `on_message` / `on_disconnect` never touch the client, hand the work to another thread.
-`rustyfarian-esp-idf-network` now needs `juggler` ≥ 0.5.1; see `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`.
+**Any `esp_mqtt_client_*` call from a callback on the event-loop thread deadlocks on esp-mqtt's recursive `api_lock` — see ADR 017 and rustdoc of the IDF `mqtt` module.**
+`subscribe` does not wait for a SUBACK; the block is the mqtt task parked while holding `api_lock` until our `next()`.
 
-**You cannot "release the event before `on_message`": esp-idf-svc 0.53 calls `receiver.done()` only inside `EspMqttConnection::next()`.**
-Dropping the borrowed event releases nothing, and the next `next()` blocks until the next event arrives, which re-parks the mqtt task while it holds `api_lock`.
-A working variant needs a pump thread, a dispatcher thread, and a bounded queue, and the pump must drop on overflow.
-esp-mqtt runs `deliver_publish` before it sends the QoS 1 PUBACK, so a dropped message is lost after the broker has seen it acknowledged.
-Rejected in ADR 017 in favour of the `WrongThread` guard.
-`try_lock` in `try_publish` never helped either, because the block is inside `esp_mqtt_client_enqueue`, not on the Rust mutex.
-Field-confirmed 2026-09-28: rustyfarian-rgb-clock on 0.5.0 hung for good on a `try_publish` from `on_message`.
-Hardware check: `idf_c3_mqtt_callback_guard`.
+**"Release the event before `on_message`" is impossible: esp-idf-svc 0.53 calls `receiver.done()` only inside `next()` — see ADR 017.**
 
-**`esp-idf-svc` reads `MqttClientConfiguration::reconnect_timeout: None` as "disable auto-reconnect", not "use the default".**
-`src/mqtt/client.rs` (0.52 and 0.53) sets `disable_auto_reconnect = true` for `None`; the struct's own default is `Some(0)`, which esp-mqtt turns into its 10 s retry.
-Mapping an optional app setting with `.map(Duration::from_millis)` therefore switched reconnects off for every default config: the first connect still works, but after any mid-session disconnect the client stays silent until a reboot — no connect attempts, no errors.
-Fix (bug 005): always pass `Some(...)`, with `Duration::ZERO` when the app sets nothing; reproduce with `just mosquitto down` / `just mosquitto up`.
+**`MqttClientConfiguration::reconnect_timeout: None` disables esp-mqtt auto-reconnect; the runner now sets it on purpose and paces reconnects itself — see rustdoc of `mqtt/runner.rs`; reproduce with `just mosquitto down`/`up`.**
 
-**A free-heap trend that falls in doubling steps at doubling intervals is a growable collection gaining one entry per event, not a slow leak.**
-On the S3 soak the ESP-IDF tier lost 116, 288, 576 and 1152 B at about 1.5, 2.5, 5 and 9.5 min: `juggler::mqtt::PendingAcks::early` (a `HashMap`) grew by one entry per QoS 1 `try_publish`, because a fire-and-forget publish registers no waiter and `resolve` buffered every `Published` outcome until the next disconnect (bug 021).
-Read the step sizes and their timing before suspecting lwIP or esp-mqtt; the esp-hal twin running the same app stayed flat, which placed it on the std side.
-Fix: `early` is a `VecDeque` capped at `EARLY_ACK_CAPACITY` (8), oldest dropped first; it only has to bridge the gap between an enqueue returning its id and the publisher's `register`.
-See `docs/bugs/archive/021-mqtt-early-ack-buffer-grows-per-publish-2026-11-11.md`.
+**A free-heap trend falling in doubling steps at doubling intervals is a growable collection gaining one entry per event, not a slow leak.**
+`PendingAcks::early` kept every fire-and-forget QoS 1 outcome (116, 288, 576, 1152 B at ~1.5, 2.5, 5, 9.5 min); the flat esp-hal twin placed it on the std side — see rustdoc of `EARLY_ACK_CAPACITY`.
 
-**Running the MQTT connect work on the `mqtt-net` runner thread cannot deadlock on esp-mqtt's `api_lock`, and `esp_mqtt_client_reconnect`/`_disconnect` do not take that lock at all.**
-`api_lock` is taken by `esp_mqtt_client_start`, `subscribe`, `enqueue` and `stop`; `reconnect` and `disconnect` only set event-group bits, so the runner never blocked on it before Step 8c.
-The lock is released when the event-loop thread calls `EspMqttConnection::next()` again, and that thread never waits on the runner (it only does unbounded `Session::send`, inbound-queue pushes and `PendingAcks` calls), so a connect step blocked on `api_lock` ends within one `mqtt_task` iteration (at most `MQTT_NETWORK_TIMEOUT_MS` on a dead link).
-`esp_mqtt_client_subscribe` performs `esp_mqtt_write` on the caller's thread, so the runner stack must cover a transport write (TLS frames under `mqtts://`): size `RUNNER_STACK_SIZE` from a run with a SUBSCRIBE.
-Before Step 8c an empty connect plan (kept session, no startup message, no `on_connect`) reported `WorkDone` without the runtime catch-up, so the subscription tracker never went live and later `MqttHandle::subscribe` calls were stored instead of sent; the machine now emits `Finish` before `Report` even for an empty plan (host test `an_empty_plan_still_finishes_before_reporting_done`).
-See `tmp/step-8c-design.md` (session scratch) and ADR 017/023 amendments of 2026-11-11.
+**The `mqtt-net` runner cannot deadlock on `api_lock` (ADR 023, dated 2026-11-11), and `esp_mqtt_client_reconnect` / `_disconnect` take no lock at all.**
+`api_lock` is taken by `start`, `subscribe`, `enqueue` and `stop`; reconnect and disconnect only set event-group bits.
+The event-loop thread never waits on the runner (only unbounded `Session::send`, inbound pushes, `PendingAcks`), so a blocked step ends within one `mqtt_task` iteration.
+Before Step 8c an empty connect plan skipped the runtime catch-up and later `MqttHandle::subscribe` calls were stored, not sent — see `an_empty_plan_still_finishes_before_reporting_done`.
 
 ---
 
 ## LoRaWAN / TTN v3 (EU868)
 
-**EUI byte order is the single most common cause of silent OTAA join failure.**
-TTN displays DevEUI/JoinEUI as big-endian hex strings; `lorawan-device` (and most embedded LoRaWAN stacks) expect the in-memory `[u8; 8]` in LSB-first order.
-`LoraConfig::from_hex_strings()` preserves the string order (MSB-first), so callers must `.reverse()` both EUIs before constructing `DevEui`/`AppEui`.
-Symptom of a mismatch: the network server logs a valid join request, but the device never sees the join-accept (or derives wrong session keys).
-Validation: log both EUIs as bytes and compare against the stack's documented order before flashing.
+**EUI byte order is the most common cause of silent OTAA join failure.**
+TTN shows DevEUI/JoinEUI MSB-first; `lorawan-device` expects LSB-first `[u8; 8]`, and `LoraConfig::from_hex_strings()` keeps string order, so `.reverse()` both EUIs.
+Symptom: the server logs a valid join request, the device never sees the accept (or derives wrong keys).
 
-**"Join-accept sent by TTN; device never joins" almost always means an RX window issue — not wrong keys.**
-RX1 opens ≈1 s after the TX burst ends; RX2 opens ≈2 s after; `RX_WINDOW_OFFSET_MS = -200` is a reasonable starting point — tune upward (less negative) if windows are still missed.
-Two common upstream causes are documented as separate entries below — DIO1 interrupt not delivered, and BUSY pin not handled — both block the radio completion event from reaching the LoRaWAN state machine in time.
+**"Join-accept sent by TTN, device never joins" almost always means an RX window issue, not wrong keys.**
+RX1 opens ≈1 s, RX2 ≈2 s after TX end; start with `RX_WINDOW_OFFSET_MS = -200` and tune less negative if windows are missed.
+Common upstream causes: DIO1 interrupt not delivered, BUSY pin not handled (below).
 
-**DIO1 interrupt isn’t delivered → radio events never reach the state machine.**
-The SX1262 signals TX/RX completion via DIO1.
-If the GPIO is unconfigured, wired to the wrong pin, or the interrupt handler does not set a flag
-visible to the polling loop, `nb_device::Event::RadioEvent` is never generated.
-Symptom: radio operations appear to hang; no downlinks are ever processed even with strong RF signal.
-Fix: configure DIO1 as an input with a rising-edge interrupt; store a flag (e.g. `AtomicBool`)
-that the `process()` loop checks on every tick.
-On ESP-IDF, `PinDriver` interrupts are one-shot, so poll `get_irq_status()` instead — see "LoRaWAN OTAA Join" below.
+**DIO1 interrupt not delivered → radio events never reach the state machine.**
+Without a working DIO1 path `nb_device::Event::RadioEvent` never fires and downlinks are never processed; on ESP-IDF poll `get_irq_status()` instead — see rustdoc of `EspIdfLoraRadio::irq_pending`.
 
-**BUSY pin isn’t handled → all SX1262 SPI commands time out.**
-The SX1262 asserts BUSY high during internal processing, and any SPI command issued while BUSY is high
-is silently ignored or produces corrupt results.
-Fix: poll BUSY low (with a bounded timeout) before issuing every SPI command in the driver.
+**BUSY pin not handled → SX1262 SPI commands issued while BUSY is high are ignored or corrupt; wait for BUSY low (bounded) before every command.**
 
-**Frame counter reuse after deep sleep causes TTN to reject uplinks.**
-TTN tracks `FCntUp` per device session and silently drops frames with a counter equal to or lower
-than the last accepted value (unless the "Reset frame counters" option is enabled, which weakens security).
-After deep sleep, `LorawanSessionData::fcnt_up` must be restored exactly and incremented before the
-next uplink — never reset to zero while the session is still valid.
-If session restore fails (CRC mismatch, RTC memory unreadable), force a full re-join rather than
-sending with a stale counter.
+**Frame counter reuse after deep sleep makes TTN drop uplinks.**
+TTN silently drops `FCntUp` ≤ the last accepted one (unless "Reset frame counters", which weakens security).
+Restore `LorawanSessionData::fcnt_up` exactly and increment it; if restore fails (CRC, RTC memory), re-join instead of sending a stale counter.
 
-**Downlinks only arrive in the RX windows immediately after an uplink — there is no push delivery.**
-Queuing a downlink in TTN Console does not transmit it until the next uplink's RX1 or RX2 window.
-If the device is idle (no uplinks), the queued downlink sits indefinitely.
-Implication for OTA command validation (port 10): always trigger a test uplink first, then check
-whether the downlink arrives in that uplink's receive window.
+**Downlinks arrive only in the RX windows after an uplink** — see `docs/runbooks/ttn-otaa-validation.md` Step 6.
 
 ---
 
 ## sx126x 0.3 API
 
-**`LoraCodingRate` not `LoRaCodingRate`**
-In `sx126x 0.3`, the coding rate type is `op::modulation::LoraCodingRate` (lowercase `o` in `Lora`), NOT `LoRaCodingRate`.
-The bandwidth and spread-factor types DO use the `LoRa` prefix (`LoRaBandWidth`, `LoRaSpreadFactor`).
-The inconsistency is in the crate itself — match the actual crate spelling exactly.
+**`LoraCodingRate`, not `LoRaCodingRate`** (but `LoRaBandWidth`, `LoRaSpreadFactor`).
 
-**`set_low_dr_opt` not `set_low_data_rate_opt`**
-The LDRO setter on `LoraModParams` is `.set_low_dr_opt(bool)`, not `.set_low_data_rate_opt(bool)`.
-The compiler's `help:` suggestion is reliable — always check it when method names differ from docs or specs.
+**`set_low_dr_opt`, not `set_low_data_rate_opt`**, on `LoraModParams`.
 
-**`OutputPin<Error = GpioError>` required for ANT pin**
-`sx126x 0.3`'s `SX126x::new` uses a single `TPINERR` type variable for ALL pin error types: `TNRST: OutputPin<Error = TPINERR>`, `TBUSY: InputPin<Error = TPINERR>`, etc.
-Rust infers `TPINERR = GpioError` from the concrete `PinDriver` types.
-Any generic `ANT` parameter must therefore also declare `OutputPin<Error = GpioError>` — a bare `OutputPin` bound causes a type mismatch error.
-Import `esp_idf_hal::gpio::GpioError` and write: `where ANT: OutputPin<Error = GpioError>`.
+**`ANT` needs `OutputPin<Error = GpioError>`: `SX126x::new` uses one `TPINERR` for all pins, inferred as `esp_idf_hal::gpio::GpioError`.**
 
-**`sx126x::init()` aborts with `spi_master: check_trans_valid(1052): rx length > tx length in full duplex mode` on ESP32-S3.**
-`sx126x` issues register and buffer reads as `Operation::Write` + `Operation::Read` pairs; `esp-idf-hal 0.46` translates `Operation::Read(buf)` into an `spi_transaction_t` with `tx_buffer = NULL` and `length = rxlength = buf.len() * 8`.
-On ESP32-S3 (ESP-IDF v5.3.3) a null TX buffer collapses the effective TX length to zero at the hardware level, so the C driver's `rxlength <= txlength` full-duplex check fails — even though at the Rust level `rxlength == length`.
-Half-duplex mode is NOT a fix: `SOC_SPI_HD_BOTH_INOUT_SUPPORTED` is undefined on ESP32-S3, so half-duplex rejects the simultaneous-TX+RX `TransferInPlace` calls `sx126x` uses for `get_status` and friends.
-Fix: wrap the `SpiDeviceDriver` in a `FullDuplexDevice` adapter that rewrites each `Operation::Read(buf)` into `Operation::Transfer(buf, &zeroes[..buf.len()])` (the SX1262 ignores MOSI during read phases, so zeroed TX is harmless) — see `FullDuplexDevice` in `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`.
-The zero-scratch buffer must be sized to the actual read length (allocated per transaction), not a fixed cap: `read_buffer` can read a full 255-byte downlink payload, and a short TX slice re-triggers the same error.
-The bare-metal `hal_esp32s3_join` example never hit this because it hand-issues `Operation::Transfer(&mut rx, &tx)` with equal-length buffers.
-
-**`FullDuplexDevice::transaction` must not allocate unconditionally — `sx126x::reset()` calls it inside `critical_section::with`.**
-`sx126x 0.3`'s `reset()` wraps `spi.transaction(&mut [Operation::DelayNs(200_000)])` in `critical_section::with`, which on ESP-IDF disables interrupts and suspends the FreeRTOS scheduler.
-Any heap allocation (including `Vec::with_capacity`) inside a critical section deadlocks the main task: the allocator tries to acquire a mutex that is held by a task the suspended scheduler can never reschedule — the task watchdog fires every 5 s with the backtrace ending at `memcpy`.
-Symptom: `init()` hangs at the first `reset()` call; TWDT backtrace ends at `memcpy | <-CORRUPTED`; no SPI error log (unlike the `check_trans_valid` error above).
-Fix: add a no-allocation fast path at the top of `transaction`:
-```rust
-if !operations.iter().any(|op| matches!(op, Operation::Read(_))) {
-    return self.inner.transaction(operations);
-}
-```
-This forwards `DelayNs`, `Write`, and `TransferInPlace` operations directly, with zero allocation.
-The slow path (Vec-based rewrite for `Read` operations) is safe because all six `Read` call sites in `sx126x 0.3` (`read_register`, `read_buffer`, `get_irq_status`, `get_packet_status`, `get_rx_buffer_status`, `get_device_errors`) are NOT inside `critical_section::with` — only `reset()` is, and it uses only `DelayNs`.
+**`check_trans_valid(1052): rx length > tx length in full duplex mode` on ESP32-S3 — see rustdoc of `FullDuplexDevice`.**
+Half-duplex is no fix (`SOC_SPI_HD_BOTH_INOUT_SUPPORTED` undefined on S3 breaks `TransferInPlace`); `hal_esp32s3_join` never hit it because it issues equal-length `Transfer`s.
 
 ---
 
 ## CodeQL / GitHub Advanced Security
 
-**CodeQL's `rust/hard-coded-cryptographic-value` query flags string literals reaching parameters named `password`, `credential`, or similar — even in test code.**
-The query traces taint from any string literal into a credential-named parameter and raises a Critical alert regardless of context; test helpers like `WiFiConfig::new("ssid", "pass")` trigger it on the second parameter.
+**`rust/hard-coded-cryptographic-value` flags string literals reaching `password`/`credential`-named parameters, also in test code.**
 
-**Renaming the constant or routing it through a helper does NOT clear the alert.**
-This was recorded here as a fix and is wrong — it cost a second failed remediation attempt (PR #91, 2026-08-18).
-The query is interprocedural taint tracking: the *source* is the literal, not the binding name, and flow follows `const` bindings and function calls to the sink.
-`const TEST_PSK: &str = "open-sesame"` passed through `test_config()` is the same finding as the inline literal.
-Evidence: that exact shape was already in `crates/juggler/src/wifi/mod.rs` and the alerts stayed open.
-
-Tricks that *do* silence it — building the value from a `[u8; N]` via `core::str::from_utf8`, for instance — work by breaking CodeQL's dataflow at an unmodelled conversion, not by removing the hardcoded value.
-They are obfuscation, they make the fixture unreadable, and they regress silently when the query pack adds the missing flow summary.
-Do not use them.
+**Renaming the constant or routing it through a helper does NOT clear it (PR #91, 2026-08-18).**
+The query is interprocedural taint tracking: the source is the literal, flow follows `const` bindings and calls.
+Breaking dataflow (e.g. `[u8; N]` via `core::str::from_utf8`) is obfuscation that regresses when the query pack learns the flow; do not use it.
 
 **Correct handling: generate the fixture at runtime from real entropy.**
-This removes the key material from the source — what the rule actually asks for — and the alert closes on its own.
-Both sites in this workspace use a `OnceLock<String>` filled from `std::collections::hash_map::RandomState`, generated once per test process:
-`test_psk()` in `crates/juggler/src/test_support.rs` (16 hex digits) and `test_nonce()` in `crates/rustyfarian-esp-hal-network/src/provisioning/portal.rs` (8 hex digits).
+`OnceLock<String>` from `RandomState`: `test_psk()` in `crates/juggler/src/test_support.rs`, `test_nonce()` in the provisioning portals.
+A test comparing against a request body builds it at runtime too (`alloc::format!`) and derives the mismatching value from the fixture, so it cannot flake; it checks match versus mismatch, not a value.
+Dismissal ("Used in tests") stays valid only for externally fixed values; path exclusion would also drop production code in inline `#[cfg(test)]` files.
 
-**A test that compares the fixture against a request body is not a blocker** — build the body at runtime too.
-The `nonce_matches` test formats both bodies with `alloc::format!("_nonce={}&...")`, and `test_nonce_mismatch()` returns the bitwise complement so the mismatch assertion cannot flake on an unlucky draw.
-What such a test verifies is match-versus-mismatch behaviour, not any particular value, so nothing is lost.
+**Examples are scanned too: an empty `option_env!` fallback (`env_or!("WIFI_PASS", "")`) trips the query.**
+The PR check reports only new findings, so older identical shapes stay invisible there.
+Fix: `fn password() -> &'static str { option_env!("WIFI_PASS").unwrap_or_default() }`; LoRa examples use `unwrap_or_default()` for EUIs and AppKey so `from_hex_strings` fails fast (the old all-zero AppKey literal was a real hard-coded key).
+Rule: never write a literal for a password, PSK, key, nonce or token, and never give one a non-empty default.
+Alerts on `/security/code-scanning` reflect the default branch (close only after merge to `main`) and need repo write access plus `security-events` to read; read the real locations before editing.
 
-Dismissal ("Used in tests" in the code scanning UI) remains valid where a fixture genuinely pins an externally-fixed value, but prefer generation.
-Path-based exclusion via a CodeQL config is not an option for fixtures in inline `#[cfg(test)]` modules, since ignoring the file would also drop the production code in it from analysis.
+**A `const` holding an `option_env!` credential is flagged; the same value returned from a `fn` is not** (`const AP_PSK` vs `fn ap_psk()`, PR #112); the bot's `= None` suggestion would have removed the WPA2 portal path.
 
-**Example code is scanned too, and an empty-string `option_env!` fallback for a credential is enough to trip the query.**
-On 2026-09-27 the PR check flagged `pub const WIFI_PASS: &str = env_or!("WIFI_PASS", "")` in `crates/rustyfarian-esp-idf-network/examples/common/env.rs` as Critical `rust/hard-coded-cryptographic-value` ("This hard-coded value is used as a password."), one path per example that passes it to `WiFiConfig::new(ssid, password)` — four paths, a five-file suggested changeset.
-The PR check only reports findings the PR introduces, so the identical `const PASSWORD` shape in the older examples did not appear there; it is the same finding and was fixed in the same pass.
-There is no secret in the source: the real value is baked in from the build environment via `option_env!` and the literal is the "unset" placeholder, yet the taint source is still a string literal reaching a credential-named sink.
-The same shape lived in every `idf_*_connect*`, `idf_c3_espnow_*`, and `hal_*_connect_async*` example, and the LoRa examples went further with an all-zero 32-hex `LORAWAN_APP_KEY` literal — an actual hard-coded key.
-Fix (branch `fix/mqtt-on-connect-deadlock`): remove the literal instead of dismissing — `fn password() -> &'static str { option_env!("WIFI_PASS").unwrap_or_default() }` yields the same empty string from `impl Default for &str` with no literal in the source, and the LoRa examples use `unwrap_or_default()` for EUIs and AppKey so `LoraConfig::from_hex_strings` fails fast at startup instead of attempting a join with a zero key.
-This is not the obfuscation the previous entry warns about: the placeholder value is gone, not hidden, and behaviour for a set variable is unchanged.
-Rule for new examples and tests: never write a literal for anything named like a password, PSK, key, nonce, or token — read it from the environment with a type-default fallback or generate it at runtime — and never give such a value a non-empty default.
-
-Two further mechanics that wasted time:
-alerts on `/security/code-scanning` are per-branch and reflect the **default branch**, so nothing closes until the change merges to `main` and the push-triggered scan reruns;
-and the alert list is not public — reading it needs repo write access plus `security-events`, so a fix cannot be targeted from a clone alone.
-Always read the real alert locations before editing; both failed attempts guessed at them.
-
-**`rust/hard-coded-cryptographic-value` fires on a `const` item holding an `option_env!` credential, but not on the same `option_env!` returned from a `fn`.**
-`const AP_PSK: Option<&str> = option_env!("PROVISION_AP_PSK")` passed to `ap_password` was reported Critical on PR #112 (2026-10-30); `fn ap_psk() -> Option<&'static str> { option_env!("PROVISION_AP_PSK") }` cleared it, the same shape as `mqtt_password()` in the MQTT examples.
-The bot's suggested fix was `const AP_PSK: Option<&str> = None`, which would have removed the WPA2 portal path from the examples; the `fn` keeps the knob.
-
-**`rust/cleartext-logging` taints every value read through a struct that carries a credential, so `log::info!("... channel={}", config.ap.channel)` is reported even though the channel is not secret.**
-The `SoftAP configured` line in `init_softap_async` was flagged twice on PR #112: first for an auth label derived from `config.ap.password.is_some()`, then again with only `ssid.len()`, `channel` and `max_connections` interpolated.
-Fix: log only values that never passed through the credential-bearing struct (the provisioning layer logs the SSID length from the resolver output), or a fixed message; the CHANGELOG notes the fixed message (2026-10-30).
-Recurred 2026-11-01 in `MqttBuilder::build` (broker URL and client id): a library log line can be clean for months and turn tainted the day an example first calls `with_auth`/`with_username_only`, so grep library `log::` calls for any read from a config type that has a credential builder.
+**`rust/cleartext-logging` taints every field read through a struct that carries a credential (e.g. `config.ap.channel`).**
+Log only values that never passed through such a struct, or a fixed message.
+A library log line can turn tainted the day an example first calls `with_auth` / `with_username_only` (`MqttBuilder::build`, 2026-11-01); grep library `log::` calls for reads from credential-bearing config types.
 
 ---
 
 ## OTA MVP — Three-Crate Triad
 
-**`#![no_std]` test code cannot use `format!` or `.to_string()` even on the host target.**
-The `cargo test` harness links against `std`, but the crate's `#![no_std]` attribute still blocks implicit `std` imports inside `#[cfg(test)] mod tests` blocks.
-Workaround: use `core::fmt::Write` into a `heapless::String` buffer, or explicitly `use alloc::string::ToString` if the crate has `extern crate alloc`.
-Surface: building tests for the `ota` domain in `crates/juggler/`.
+**`#![no_std]` test modules cannot use `format!` / `.to_string()` even on the host**; use `core::fmt::Write` into `heapless::String`, or `use alloc::string::ToString`.
 
-**`esp-idf-svc 0.52.x` requires `embedded-svc 0.29`, not `0.28`.**
-Pinning `embedded-svc = "0.28"` in `[workspace.dependencies]` while `esp-idf-svc 0.52` transitively pulls `0.29` produces a silent trait-version mismatch: `Headers::content_len` is defined in both crate versions, but `EspHttpConnection` only implements it for `0.29`.
-The error surfaces at compile time in code that calls `client.content_len()` and is non-obvious because both `embedded-svc` versions exist in the dep graph and the trait import lookups can collide.
-Fix: declare `embedded-svc = "0.29"` to align with the version `esp-idf-svc 0.52` pulls.
+**`esp-idf-svc 0.52.x` needs `embedded-svc 0.29`; pinning `0.28` gives a silent trait-version mismatch on `Headers::content_len`.**
 
-**`esp-storage 0.9.0` changed `FlashStorage::new()` from zero-arg to taking `esp_hal::peripherals::FLASH<'d>`.**
-Older versions of `esp-storage` exposed `FlashStorage::new()` with no arguments; the 0.9 release made the peripheral explicit and consumes ownership.
-Any wrapper crate must expose this peripheral in its public constructor or store `FlashStorage` directly — `EspHalOtaManager::new()` therefore takes `(config, FLASH<'d>)` and is generic over `'d`.
-Calling `FlashStorage::new()` more than once per boot panics.
-Surface: `crates/rustyfarian-esp-hal-network/src/ota/manager.rs`.
+**`esp-storage 0.9.0` `FlashStorage::new` takes `FLASH<'d>`; a second call per boot panics** — hence `EspHalOtaManager::new(config, FLASH<'d>)`.
 
-**Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon.**
-`u64::from_str` accepts a leading `+`, but RFC 7230 §3.3.2 requires `1*DIGIT` (no sign).
-A permissive parser paired with a stricter upstream cache becomes a request-smuggling primitive.
-Similarly, RFC 7230 §3.2.4 forbids whitespace between header name and colon — accepting `Content-Length\t: 0` makes the name fail case-insensitive comparison and silently disables the duplicate-CL check.
-Both rejections live in `crates/rustyfarian-esp-hal-network/src/ota/http.rs::parse_header` and `HeaderState::feed`; the dedicated host tests cover both vectors.
+**Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon** (request smuggling) — see rustdoc of `parse_header` and `HeaderState::feed` in `ota/http.rs`.
 
-**An immediate `[ota] update failed … Update server unreachable` with nothing in the server log means the esp-hal OTA client never connected the socket, not that the network dropped it.**
-`EspHalOtaManager::fetch_and_apply` takes a fresh `TcpSocket` and, until bug 020, wrote the `GET` onto it without a `connect`; embassy-net fails the write at once and `fetch_get` folds every write error into `ServerUnreachable` without a log line.
-Tell the cases apart by timing: a blocked route times out after `timeout_secs` (30 s in the examples), a missing connect fails in the same second as the `fetching` line.
-Fix: the manager connects inside its `DownloadAction::Connect` step (IPv4 literal only, embassy-net `ConnectError` logged), and a hal OTA run needs the router rule for the image port just like the broker port.
-The next layer bit too: `parse_status_line` accepted only `HTTP/1.1 `, while Python's `http.server` behind `just ota-serve` answers `HTTP/1.0 200 OK` (`OTA HTTP error: BadStatusLine`); an HTTP/1.1 client processes 1.0 responses, so the parser takes both.
-See `docs/bugs/archive/020-hal-ota-never-connects-the-socket-2026-11-11.md`.
+**A same-second `[ota] update failed … Update server unreachable` with nothing in the server log means no TCP connect happened; a blocked route times out after `timeout_secs`.**
+The manager wrote the `GET` onto an unconnected socket; it also accepted only `HTTP/1.1 ` while `just ota-serve` answers `HTTP/1.0` (`BadStatusLine`); a hal OTA run needs a router rule for the image port.
 
-**Logging URLs that may contain RFC 3986 userinfo leaks credentials.**
-Plain `http://user:pass@host/...` is legal per RFC 3986 §3.2.1 even when HTTPS is rejected; logging the URL verbatim spills credentials into `espflash monitor` output.
-Strip `userinfo` (split at `://`, drop everything up to the last `@` in the authority) before any log call.
-The actual HTTP request must still use the original URL — only the log surface gets the redacted form.
-See `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs::url_for_log`.
+**Logging a URL with RFC 3986 userinfo leaks credentials** — see rustdoc of `url_for_log`.
 
 ---
 
 ## OTA Consumer Runtime
 
-**ESP-IDF NVS `set` replaces a key stored with another type — no `ESP_ERR_NVS_TYPE_MISMATCH` on write.**
-On a typed read, NVS returns "not found" if the key holds another type; but on `nvs_set_u8` / `nvs_set_u32`, ESP-IDF v5.3.3 `nvs_storage.cpp` `Storage::writeItem` (lines 397, 474, 514) looks the key up with `ItemType::ANY`, writes the new entry, then erases the old one — all in one commit — so `set` succeeds even if the key was previously a string or a different numeric type (with `CONFIG_NVS_LEGACY_DUP_KEYS_COMPATIBILITY` off; under the legacy mode an unreachable duplicate would linger, but a typed read never sees it).
-Consequence: repairing a corrupt (wrong-type) key needs no remove-then-set window; a direct `set` clears both the old entry and its type tag in a single operation — see `repair_corrupt` in `crates/juggler/src/ota/persist/store.rs`.
+**NVS `set` of a key stored with another type replaces it in one commit — see rustdoc of `OtaKv`** (ESP-IDF v5.3.3 `Storage::writeItem` looks the key up with `ItemType::ANY`).
 
-**serde silently ignores `deny_unknown_fields` on unit variants of an internally tagged enum.**
-The derive macro `#[serde(tag = "status", deny_unknown_fields)]` has a known limitation: `deny_unknown_fields` is silently ignored for unit variants (`Downloading`) in an internally tagged enum.
-Test: `{"status":"downloading","x":1}` deserializes as `OtaStatus::Downloading` with no error, even though the schema forbids unknown fields.
-Consequence: the wire status deserializer is hand-written (`crates/juggler/src/ota/wire/status.rs`) to enforce strict field rejection.
-Also: `FieldValue` and `FieldKey` visitors pre-check JSON shape (the first `{` and the `status` value); error messages are fixed text and never quote the input, so type confusion or out-of-range numbers cannot leak the wire format for fuzzing.
+**serde ignores `deny_unknown_fields` on unit variants of an internally tagged enum — see rustdoc in `ota/wire/status.rs`.**
 
-**`EspOta::new()` returns `ESP_ERR_INVALID_STATE` (0x103) while another `EspOta` is alive.**
-`esp-idf-svc 0.53.0` `src/ota.rs` lines 455–461 guard `EspOta` as a process singleton via a static `taken` flag: if true, `EspOta::new()` fails with `ESP_ERR_INVALID_STATE`; the same error from a later read of an open handle is a plain failure, not "busy".
-This workspace's boot-facts reader treats `ESP_ERR_INVALID_STATE` from `new()` only as "handle in use" and retries boundedly (`read_hardware_facts` in `crates/rustyfarian-esp-idf-network/src/ota/boot_facts.rs`).
-Consequence: the busy-code constant is pinned via compile-time assertions (line 64: `assert!(BUSY_CODE == 0x103)`), and this module must be re-checked on an `esp-idf-svc` bump, because a move to another error code would silently break busy detection.
+**`EspOta::new()` returns `ESP_ERR_INVALID_STATE` (0x103) while another `EspOta` lives — see rustdoc of `ota/boot_facts.rs`; re-check on every `esp-idf-svc` bump.**
 
-**A delivered rollback report's stale `rb_id` can swallow a new report after attempt-counter loss.**
-Delivered reports keep their `rb_id` (the id of the failed attempt) for deduplication at the backend.
-If `att_ctr` is lost (NVS corruption, power loss), the next attempt id restarts from stored records.
-If `next_attempt_id()` floored only against `att_ctr` (not `rb_id`/`att_id`/`rq_id`), and the counter is lost, a new attempt could reissue the same id as a stale delivered report.
-The reconcile logic then sees: old report with `rb_id=X`, new attempt with `att_id=X`, checks if the report is pending (`rb == 1`), finds it is not (`rb == 0`, delivered), and silently adopts nothing — the new report is lost and never sent.
-Fix (lines 559–564 in `store.rs`): `next_attempt_id()` floors at the highest id from all four keys (`att_ctr`, `att_id`, `rb_id`, `rq_id`), and only a still-pending report (`rb == 1`) is adopted; a delivered report (`rb == 0`) with a matching id is not, so a fresh report is created.
-Test coverage: `crates/juggler/src/ota/persist/tests/counter_loss.rs` lines 104–119 (`a_lost_counter_does_not_swallow_the_next_rollback_report`) and lines 122–134 (`a_delivered_report_with_the_attempts_id_is_not_adopted`).
-Lesson: never let an id that is still referenced (in any stored record) be reissued; when a counter is lost, all stored ids become floor references.
+**After `att_ctr` loss a reissued attempt id swallowed a delivered report's `rb_id` — see rustdoc of `next_attempt_id`.**
+Only a pending report (`rb == 1`) is adopted; regression tests in `crates/juggler/src/ota/persist/tests/counter_loss.rs`.
 
-**Any OTA status can reach subscribers twice: esp-mqtt resends a QoS 1 publish whose PUBACK is not handled within 1 s.**
-`MQTT_DEFAULT_RETRANSMIT_TIMEOUT_MS` is 1000 (`esp-mqtt` `mqtt_config.h`), the workspace `MqttClientConfiguration` keeps the default, and the runtime publishes every status at QoS 1.
-The partition erase after `downloading` stalls the chip for about 6.5 s (until `OTA write session started`), so a status published just before it is resent and the broker forwards the duplicate.
-Found in runbook P12 (2026-10-07): six `repair` commands during the erase gave six `busy` plus one dropped rejection; the same burst after the erase gave exactly six plus none, and a probe showed the broker does not upgrade QoS 0 publishes.
-Consequence: count rejections only outside the erase window, and treat every status as at-least-once — deduplicate `rolled_back` by `epoch` and `attempt_id`; see `docs/runbooks/ota-hardware-test.md` P12.
+**Any OTA status can arrive twice (QoS 1 resend after 1 s, triggered by the ~6.5 s partition erase) — see `docs/runbooks/ota-hardware-test.md`.**
 
 ---
 
 ## ESP-NOW
 
-The detailed analysis, decision, and consequence trail for the channel-stability work
-lives in [ADR 012](adr/012-espnow-unassociated-sta-channel-stability.md).
-The entries below are pitfall reminders only — when behaviour drifts, update the ADR and
-the rustdoc on `EspIdfEspNow`, not this section.
+The channel-stability analysis lives in [ADR 012](adr/012-espnow-unassociated-sta-channel-stability.md); update the ADR and the `EspIdfEspNow` rustdoc, not this section.
 
-**An ESP32-C3 Super Mini at 20 dBm breaks ESP-NOW in both directions (bug 022).**
-2026-11-11: the ESP-IDF scout found no coordinator for minutes, or the coordinator's replies were about 90 % `NoAck` although it received every frame; it came and went with board and cable position.
-A MAC-layer ACK is a transmission of the receiver, so a TX-power fault on the C3 looks like the *peer's* sends failing.
-An alternating series on one bench (scout at 80 vs 52 quarter dBm, fresh boot each run) gave 1 of 3 vs 3 of 3 clean runs, 1 of 5 vs 9 of 10 over the night; A-MPDU, a reply delay, a coordinator reset and coordinator uptime changed nothing.
-Fix: both tiers' owned radios default to 13 dBm through the shared `EspNowConfig::owned_tx_power_quarter_dbm()`; bisect radio faults with the scout's `ESPNOW_TX_POWER` and one variable per run.
+**An ESP32-C3 Super Mini at 20 dBm breaks ESP-NOW both ways — see rustdoc of `DEFAULT_TX_POWER_QUARTER_DBM`.**
+A MAC ACK is the receiver's transmission, so a C3 TX-power fault looks like the peer's sends failing; bisect with the scout's `ESPNOW_TX_POWER`, one variable per run.
 
-**Unassociated STA radio drifts off `esp_wifi_set_channel` within ms.**
-Symptom: coordinator (AP-locked) receives every scan probe but zero data frames; scout's
-send callback fires `FAIL` ~30 ms after each TX (7 × 802.11 short-retry).
-Fix (ESP-IDF tier): use `init_with_radio` (SoftAP) so the beacon schedule holds the channel. See ADR 012.
+**Unassociated STA drifts off `esp_wifi_set_channel` within ms (coordinator gets probes, zero data; `FAIL` ~30 ms after TX) — use `init_with_radio`, see ADR 012.**
 
-**Promiscuous-bracket per-send re-pin is fundamentally racy — and protects TX but not ACK reception.**
-`set_promiscuous(false)` is a FreeRTOS task-switch trigger; the Wi-Fi driver task can preempt before `esp_now_send` and return `ESP_ERR_ESPNOW_CHAN` (0x3069) on a meaningful fraction of sends.
-Even when TX succeeds, the background scanner can hop off-channel before the coordinator's 802.11 ACK arrives — the frame is delivered but `send_and_wait` sees `FAIL` (~10–20 % `"scout-probe"` retries in `init_with_radio_sta` despite ~99 % end-to-end delivery).
-Fix (ESP-IDF tier): prefer SoftAP (`init_with_radio`); fall back to `init_with_radio_sta` only when SoftAP conflicts with BLE or a user-facing AP. See ADR 012.
+**Promiscuous-bracket re-pinning races (`ESP_ERR_ESPNOW_CHAN` 0x3069, ACKs missed off-channel) — prefer SoftAP, see ADR 012.**
 
-**Roaming peers cause false-positive channel detection in `scan_for_peer`.**
-A peer's STA briefly visits every channel during an AP roam scan and hardware-ACKs unicast
-frames addressed to its MAC even while not associated, so a first-ACK-wins scan latches
-onto the wrong channel.
-Fix: leave `ScanConfig::probe_confirmations` ≥ 1 with `confirmation_gap` longer than a
-typical scan dwell (defaults: 1 / 150 ms). See `crates/juggler/src/espnow/mod.rs`.
+**A peer mid-AP-roam hardware-ACKs unicast probes on every channel it visits, so first-ACK-wins latches the wrong channel — keep `ScanConfig::probe_confirmations` ≥ 1 with `confirmation_gap` longer than a scan dwell (defaults 1 / 150 ms), see `crates/juggler/src/espnow/mod.rs`.**
 
-**A MAC-layer ACK is not proof of the channel: adjacent 2.4 GHz channels overlap.**
-Channels are 5 MHz apart and a frame is 20 MHz wide, so a coordinator parked on channel 11 decodes and ACKs a probe sent on channel 10, at close range reliably and across a table often enough to flap; a first-ACK scan walking upwards from 1 pins the lower neighbour, and `probe_confirmations` repeats the same wrong ACK (bug 018, 0.7.0 bench, C3 scout against the hal C6 coordinator).
-Fix: the scan sends a tagged `0xF3` probe and trusts the coordinator's `0xF4` reply, which states its `home_channel` from `current_channel()`; an ACK without a reply is only a candidate settled after the whole sweep, so coordinators without the shared echo app are still found. See ADR 025.
+**Adjacent 2.4 GHz channels overlap, so a MAC ACK does not prove the channel — see ADR 025.**
 
-**`scan_for_peer` failure cascade leaves the radio on the last-probed channel.**
-A failed re-scan removed the peer entry and left the radio on (e.g.) ch 11, so the next
-`send_and_wait` aborted before TX with "peer not found", adding an extra round-trip
-before recovery.
-Fix: the `Err` branch of `scan_for_peer` restores both the peer registration and the
-radio channel from `pinned_channel`. See `crates/rustyfarian-esp-idf-network/src/espnow/mod.rs`.
+**A failed `scan_for_peer` once left the radio on the last-probed channel with the peer removed; the `Err` branch restores both from `pinned_channel`** (`crates/rustyfarian-esp-idf-network/src/espnow/mod.rs`).
 
-**esp-hal ESP-NOW: never hold a critical section across a send.**
-`esp-radio`'s `SendWaiter::wait` and `Drop` busy-spin on a flag that the send callback sets from an interrupt; a lock that masks interrupts makes the wait spin forever.
-`EspHalEspNow` therefore takes the sender out of a cell, sends with the lock released and returns it through a drop guard; a concurrent sync send gets `Busy`.
-`esp-radio` has one global send-callback flag and no sequence number, so a dropped `SendFuture` can be attributed to the next send; only a never-dropped runner fixes it, which is why `EspHalEspNow::run_sender` polls every async transmission to completion.
-See `crates/rustyfarian-esp-hal-network/src/espnow/` and ADR 020.
+**esp-hal ESP-NOW: never hold a critical section across a send (`SendWaiter` spins on an interrupt-set flag) — see ADR 020.**
 
-**Host tests need a test-only `critical-section` implementation, not `critical-section/std`.**
-`critical-section/std` selects `restore-state-bool`, which cannot coexist with the `restore-state-none` that `esp-idf-hal/critical-section` selects in a workspace-wide clippy run.
-`src/lib.rs` therefore defines `host_critical_section` (`#[cfg(test)]`, `()` restore state), which exists only in the lib unit-test binary; integration tests and doctests that touch the ESP-NOW cells do not link.
+**Host tests need the test-only `host_critical_section`, not `critical-section/std` (`restore-state-bool` clashes with esp-idf-hal's `restore-state-none` in workspace clippy).**
+It exists only in the lib unit-test binary, so integration tests and doctests touching the ESP-NOW cells do not link.
 
-**ESP32-C3 log output over USB needs `esp-println/auto`, not `uart`.**
-Super Mini boards have no UART bridge, only the USB-Serial-JTAG port; the `uart` printer writes to UART0 pins and the USB monitor stays empty.
-`auto` checks the USB SOF flag at runtime and falls back to UART0.
-`auto` excludes `uart` and `jtag-serial`, and zero consoles is rejected too (`assert_unique_used_features!` panics with `Currently enabled: none`); the knob's own `auto` collided with the `esp32s3` feature's `uart`, so since 2026-10-31 `rustyfarian-esp-hal-network` depends on neither `esp-println` nor `esp-backtrace` (ADR 021): the firmware selects the console and the panic handler, the examples take both crates from per-target-triple dev-dependencies (only a target triple can carry the chip), and lib-only checks never compile them.
-A day-long interim that kept both crates as optional deps of `wifi` and `lora` and passed the console on the command line (`--features ...,esp-println/auto` in `just check-hal` / `clippy-hal` and the docs.rs metadata, plus a `cfg(target_os = "none")` dev-dependency for the examples) was reverted the same day, because it still forced `esp-backtrace`'s panic handler into every `wifi` firmware.
+**C3 Super Mini logs over USB need `esp-println/auto`, not `uart`: there is no UART bridge, and `auto` checks the USB SOF flag at runtime — firmware selects the console, see ADR 021.**
 
-**A scan interrupted by `shutdown()` ends as `Err(Shutdown)` or `Err(Scan(Aborted))`, and a harness must accept both.**
-The worker publishes `Aborted` for the running scan, but a caller polling its `ScanTicket` sees the shutdown flag first and returns `Shutdown`; the juggler host test accepts the pair, and the IDF scout's shutdown scenario failed its own check until it did too (2026-11-11, found in the bug 019 lines).
+**A scan interrupted by `shutdown()` ends `Err(Shutdown)` or `Err(Scan(Aborted))`; a harness must accept both.**
+The worker publishes `Aborted`, but a caller polling its `ScanTicket` may see the shutdown flag first.
 
 ---
 
-**ESP-IDF stores the Wi-Fi country in flash, and the library re-applies the configured country on every start.**
-The stored country survives a reflash, and the ESP-IDF default is `01` (channels 1-11, 802.11d on).
-A country written directly through `esp_wifi_set_country_code` therefore does not survive the next start, so set it with `Country` or `set_country` instead.
-`apply_country` reads the country first and writes only when the code or the 802.11d policy differs or the station is associated (the radio then reports the AP's country), so a boot with an unchanged country costs no flash write (bug 017, ADR 026).
-An owned ESP-NOW radio from `init_with_radio` that is then given another country by `set_country` still writes twice per boot (to `01` and back); start it with `init_with_radio_config(.., EspNowConfig::default().with_country(country))` instead.
-
 ## SoftAP Provisioning
 
-**A SoftAP channel outside the country silently becomes channel 1 on ESP-IDF.**
-Symptom: a portal configured on channel 12 or 13 under the default `01` comes up on channel 1 with no error.
-`validate_ap_config` rejects such a channel, so the fix is to set the country first with `ProvisioningBuilder::with_country` (or `WiFiConfig::with_country` and `ApConfig::with_country`) before using channel 12 or 13.
+**ESP-IDF keeps the Wi-Fi country in flash; set it with `Country` / `set_country`, not raw `esp_wifi_set_country_code` — see ADR 026.**
 
-**The ESP-IDF AP netif silently retains a non-default subnet across firmware revisions — `softap.ap_ip()` may report `192.168.71.1` (or other) instead of the documented `192.168.4.1`.**
-No code in this workspace sets a custom AP IP, and the `esp-idf-svc` AP wrapper exposes no
-`set_ip_info()`. The netif state appears to be persisted by ESP-IDF (likely via the Wi-Fi NVS
-partition's netif/DHCPS records, which survive `CONFIG_ESP_WIFI_NVS_ENABLED=n` because that flag
-only disables Wi-Fi credential caching, not the netif config blob).
-Symptom: captive-portal browsers fail to reach the documented `http://192.168.4.1/`; the DHCP
-server lease log shows clients getting `192.168.71.2` (i.e. the AP self-assigned `192.168.71.1`).
-The library logs `Provisioning AP up at 192.168.71.1`, but any hardcoded `192.168.4.1` URL
-literal in example/log code is wrong.
-Fix: pin the AP netif explicitly before `wifi.start()` via the raw FFI sequence
-`esp_netif_dhcps_stop → esp_netif_set_ip_info → esp_netif_dhcps_start` on
-`wifi.ap_netif().handle()` (requires `use esp_idf_svc::handle::RawHandle;`). See
-`SoftApManager::start` / `pin_ap_netif_ip` in `rustyfarian-esp-idf-network` (`wifi` module). A full `espflash
-erase-flash` also clears the stale netif state but does not prevent recurrence.
+**A SoftAP channel outside the country silently becomes channel 1 on ESP-IDF — see ADR 026.**
 
-**ESP-IDF httpd's default request-header buffer (`CONFIG_HTTPD_MAX_REQ_HDR_LEN = 512 B`) is too small for modern browsers and silently returns `HTTP 431 Request Header Fields Too Large` on form POSTs.**
-Symptom: a form submission from any iOS/Safari/Chrome captive portal probe produces in the device
-log:
-```
-W httpd_parse: parse_block: request URI/header too long
-W httpd_txrx: httpd_resp_send_err: 431 Request Header Fields Too Large
-```
-The body is never read because the request line plus headers (User-Agent + Accept-* + Cookie +
-Sec-* + Referer) overflow the 512 B parse block. Modern browsers regularly send 800–1500 B of
-headers.
-Fix: set `CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048` in `sdkconfig.defaults` at the workspace root, then
-clean `target/<target>/release/build/esp-idf-sys-*/` to force a CMake reconfigure (the same
-`sdkconfig.defaults` lore that applies to `CONFIG_ESP_MAIN_TASK_STACK_SIZE`). The setting is
-compile-time only; there is no runtime equivalent on `EspHttpServer::Configuration`.
+**The ESP-IDF AP netif can keep a stale subnet (`192.168.71.1` instead of `192.168.4.1`) across firmware — see rustdoc of `pin_ap_netif_ip`.**
+`CONFIG_ESP_WIFI_NVS_ENABLED=n` does not prevent it; `espflash erase-flash` clears it only until recurrence.
 
-**`EspHttpServer` does not set `Cache-Control` by default — captive-portal browsers cache the form HTML aggressively across reflashes.**
-Symptom: HTML or behaviour changes in the portal handler are not reflected in the browser even
-after a fresh `just run`; reconnecting to the SoftAP shows the previous form. Common on iOS
-Safari and macOS captive-portal sheets, which treat `/hotspot-detect.html`-style probes as
-cacheable.
-Fix: explicitly set `Cache-Control: no-store` on the `GET /` response by using
-`request.into_response(200, Some("OK"), &headers)` with
-`("Cache-Control", "no-store")` and `("Content-Type", "text/html; charset=utf-8")` instead of
-`request.into_ok_response()`. Without this, reconnecting to the SoftAP is the only reliable way
-to invalidate the cached HTML.
+**ESP-IDF httpd's 512 B header buffer returns `431 Request Header Fields Too Large` to browsers — see the `idf_c3_provision_mqtt` example docs (`CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048`).**
 
-**Provisioning UI: `juggler::wifi::validate_password` enforces only `<= PASSWORD_MAX_LEN` — empty is treated as "open network", but a 1–7-character non-empty password is silently accepted by the pure crate even though WPA2-Personal requires `>= 8`.**
-Symptom: a user typing a 4-char test password gets a "successfully provisioned" log
-(`Already provisioned: ... wifi_pass len=4 (secret)`), but the STA association will fail at boot
-because WPA2-Personal needs >= 8 bytes (`AP_PASSWORD_MIN_LEN`).
-Fix: `juggler::provisioning::form::validate_wifi_password` adds a `TooShort { min: 8 }` error when
-the value is non-empty and below the floor; the form adds `minlength="8"` to the input (HTML5
-`minlength` is only enforced when the field is non-empty, so open networks still work).
+**`EspHttpServer` sets no `Cache-Control`; captive-portal sheets cache the form across reflashes.**
+Fix: `request.into_response(200, Some("OK"), &headers)` with `Cache-Control: no-store`, not `into_ok_response()`.
 
-**`ProvisioningStore::open(flash, base_offset, total_bytes)` takes `total_bytes` as the size of the partition region at `base_offset` — NOT an absolute extent from flash offset 0.**
-The original bounds check compared `base_offset + STORE_SIZE` against `min(total_bytes, capacity)`,
-which conflated the region size with an absolute ceiling and rejected any store opened at a real
-offset: the examples' `0x300000` (3 MiB) offset panicked at boot with
-`OffsetOutOfBounds { end: 3153920, limit: 8192 }`.
-The 128 host tests never caught it because they only used `base_offset` 0 / 4096, where the two
-interpretations numerically coincide — it surfaced on the first on-hardware run (ESP32-C3,
-2026-06-18). This is the same class as the DHCP `LeaseTable::allocate` lore: host tests can
-enshrine a wrong invariant when they never exercise a realistic parameter.
-Fix: check that the declared region `[base_offset, base_offset + total_bytes)` fits
-`flash.capacity()`; regression-guarded by `store_open_accepts_region_at_high_offset_within_capacity`.
+**`juggler::wifi::validate_password` only checks the maximum; a 1–7 byte password was accepted although WPA2-Personal needs ≥ 8.**
+`validate_wifi_password` returns `TooShort { min: 8 }` for non-empty short values, and the form sets `minlength="8"` (empty still means open network).
 
-**esp-storage 0.10 `ReadNorFlash::read` rejects any read whose length is not a multiple of `READ_SIZE` (4 B without the `bytewise-read` feature), so `ProvisioningStore` never read a committed record back on hardware.**
-`try_read_sector` read exactly `record_len` bytes (146 B for a `wifi_mqtt` record), which fails with `NotAligned` and surfaces as `StoreError::Flash`, while blank flash passes because the clamped 1280 B read is aligned.
-The host mocks declare `READ_SIZE = 1`, so 204 tests passed; the hal store had never been read back across a reboot on a device until 2026-10-29 (ESP32-C3 Mini-1).
-Fix: round the read up to `F::READ_SIZE` and decode the `record_len` prefix; `MockFlashWordRead` enforces the contract in `store_reads_back_record_through_word_aligned_flash`; see `docs/bugs/006-hal-store-unaligned-read-2026-10-29.md`.
+**`ProvisioningStore::open`'s `total_bytes` is the region size at `base_offset` — see its rustdoc.**
+Host tests at offsets 0/4096 hid the old check until `0x300000` panicked `OffsetOutOfBounds { end: 3153920, limit: 8192 }` on hardware; guard: `store_open_accepts_region_at_high_offset_within_capacity`.
 
-**One board broadcasts a different `{prefix}-{MAC}` provisioning SSID under esp-hal and ESP-IDF, because the two stacks derive the AP MAC differently.**
-ESP-IDF `esp_read_mac(ESP_MAC_WIFI_SOFTAP)` adds one to the last base-MAC byte (`a0:..:c4:f5`), while `esp_hal::efuse::interface_mac_address(AccessPoint)` sets the locally-administered bit in the first byte (`a2:..:c4:f4`), and esp-radio uses the same esp-hal function for the AP it brings up.
-Each suffix matches its own stack's real BSSID, so this is parity of format, not of bytes; do not "fix" the hal side to mimic ESP-IDF or the suffix stops matching the broadcast MAC.
+**esp-storage 0.10 `read` rejects lengths not a multiple of `READ_SIZE` (4 B), so a committed record never read back on hardware.**
+Blank flash passed (aligned 1280 B read) and host mocks used `READ_SIZE = 1`; `MockFlashWordRead` now enforces the contract.
 
-**An IDF device that "reopens the portal on every boot" can be a portal crash, not a lost record: `POST /save` overflowed the 10 KB httpd stack in the shared `juggler` `parse_form`.**
-`parse_form` keeps fixed-size field buffers on the stack (a 4.5 KB frame), and with the 1.7 KB handler frame `/save` needs about 12 KB, so the task hit a stack protection fault before the commit and the next boot found no record.
-Fix (2026-11-08): `HTTPD_STACK_SIZE` 16384 in `crates/rustyfarian-esp-idf-network/src/provisioning/portal.rs`; measure frames from the ELF prologues (`llvm-objdump -d`, `addi sp, sp, -N`, a large frame spans several) instead of guessing.
-The panic's "Stack memory" dump printed the submitted form, Wi-Fi password included, so treat a pasted httpd panic as a credential leak.
+**One board broadcasts different `{prefix}-{MAC}` SSIDs under esp-hal and ESP-IDF.**
+ESP-IDF adds one to the last base-MAC byte (`…:c4:f5`); `esp_hal::efuse::interface_mac_address(AccessPoint)` sets the locally-administered bit in the first byte (`a2:…:c4:f4`), as does esp-radio's AP.
+Each matches its own BSSID; do not make the hal side mimic ESP-IDF.
+
+**An IDF device reopening the portal every boot can be a `POST /save` stack overflow, not a lost record — see rustdoc of `HTTPD_STACK_SIZE`.**
+Measure frames from ELF prologues (`llvm-objdump -d`, `addi sp, sp, -N`); the panic's stack dump printed the form, Wi-Fi password included, so a pasted httpd panic is a credential leak.
 
 ---
 
 ## Mermaid Diagrams in Markdown
 
-**Mermaid `timeline` event descriptions reserve `:`, `;`, `"`, and HTML entities as syntax tokens.**
-The parser separates a period from its events on `:` and treats `;` as a section terminator, so any of these characters mid-text get tokenised as `INVALID` with a misleading message like:
-```
-Parse error on line N:
-...ome event text ; rest of text
------------------------^
-Expecting 'EOF', 'SPACE', 'NEWLINE', 'title', 'acc_title', 'acc_descr',
-'acc_descr_multiline_value', 'section', 'period', 'event', got 'INVALID'
-```
-Concrete triggers observed in `docs/ROADMAP.md`:
-- `;` anywhere inside an event description (most common) — replace with `,` or `—`.
-- `::` from Rust paths (e.g. `MqttBuilder::build`) — replace with `.` or rephrase.
-- **bare `:`** in file-line references (e.g. `store.rs:141`) or URLs (e.g. `mqtt://host:1883`) — rewrite as `store.rs line 141` / `mqtt //host 1883`, or move the reference out of the event text entirely. **`:` is reserved everywhere in event text, not just when followed by a space.**
-- `: ` from Rust trait bounds (e.g. `<D: WifiDriver>`) — rephrase in prose.
-- `"..."` quoted words — drop the quotes; em-dashes already provide emphasis.
-- HTML entities like `&lt;` / `&gt;` — the embedded `;` re-triggers the same parser path; rephrase rather than escape.
-Em-dashes (`—`), `×`, `==`, `..`, `/`, and parentheses render fine.
-Fix: catch these locally via `just lint-docs`, which runs `scripts/lint-docs.sh` to parse every fenced ```mermaid block in every `*.md` file through `mermaid-cli` (`mmdc` via `npx`).
-The check is not folded into `just verify` or `just ci` because it pulls a Node toolchain on first run — invoke it explicitly when touching `docs/ROADMAP.md` or any other diagram-bearing markdown.
+**Mermaid `timeline` event text reserves `:`, `;`, `"`, and HTML entities; they fail as `Parse error ... got 'INVALID'`.**
+- `;` → `,` or `—`.
+- `::` (Rust paths) → `.` or rephrase.
+- bare `:` anywhere (`store.rs:141`, `mqtt://host:1883`) → `store.rs line 141`, or move it out of the event.
+- `: ` in trait bounds (`<D: WifiDriver>`) → prose.
+- `"..."` → drop the quotes.
+- `&lt;` / `&gt;` → rephrase (the `;` re-triggers the error).
+Em-dashes, `×`, `==`, `..`, `/` and parentheses are fine.
+`just lint-docs` parses every fenced mermaid block via `mermaid-cli`; it is outside `just verify` because it pulls Node.
 
-**`mmdc`-vs-IDE renderer divergence.**
-`mmdc` (the `mermaid-cli` `just lint-docs` invokes) has been observed accepting bare `:` strings (e.g. `store.rs:141`) that the IDE's Mermaid preview renderer rejects with the same `'INVALID'` parse error documented above.
-The IDE typically ships a newer Mermaid runtime than `npx mermaid-cli` resolves, and its parser is stricter on the colon rule.
-Treat a clean `just lint-docs` as a necessary but not sufficient signal — always visually verify the rendered diagram in the IDE after editing any `timeline` / `gantt` event text.
-The `technical-writer` agent in `.claude/agents/technical-writer.md` encodes this divergence and is the mandated delegate for any non-trivial `docs/ROADMAP.md` edit.
+**`mmdc` accepts bare `:` strings the IDE's newer Mermaid rejects; a clean `just lint-docs` is necessary, not sufficient — check the rendered diagram.**
+The `technical-writer` agent encodes this and is mandated for non-trivial `docs/ROADMAP.md` edits.
 
 ---
 
 ## SX1262 TCXO Init — `sx126x 0.3` Missing `ClearDeviceErrors` Bug
 
-**`sx126x 0.3`'s `init()` hangs forever on BUSY when a TCXO is used — missing `ClearDeviceErrors` before `Calibrate`.**
-
-The SX1262 datasheet (§13.3.6, Rev 2.2) documents that when `SetDIO3AsTCXOCtrl` is issued, the chip **immediately sets `XOSC_START_ERR` (DeviceErrors bit 5)** because the crystal has not yet had time to stabilise. This is expected behaviour. However, if `Calibrate` is issued while `XOSC_START_ERR` is set, the calibration FSM interprets the flag as "oscillator not ready" and aborts immediately, leaving BUSY asserted indefinitely — i.e. the chip hangs.
-
-`sx126x 0.3`'s monolithic `init()` calls `set_dio3_as_tcxo_ctrl`, waits on BUSY (once, correctly), then immediately calls `calibrate` **without** issuing `ClearDeviceErrors` first. On a board where no TCXO is fitted (or where `tcxo_opts` is None), this does not matter — there is no `XOSC_START_ERR` to clear. On the Heltec WiFi LoRa 32 V3 (TCXO mandatory), the bug causes a permanent BUSY-stuck hang. The symptom is: the example prints `DevEUI loaded` then nothing more — the main task spins at `sx126x::wait_on_busy` (line 548 in the 0.3.0 source) and the ESP-IDF task watchdog fires every 5 s.
-
-**The mandatory init sequence for any SX1262 board with a TCXO (datasheet §9.6 + §13.3.6):**
-1. `SetDIO3AsTCXOCtrl(voltage, delay)` — powers the TCXO; `XOSC_START_ERR` is set immediately (expected)
-2. wait BUSY
-3. `ClearDeviceErrors()` — mandatory acknowledgement; clears `XOSC_START_ERR`
-4. wait BUSY
-5. `Calibrate(0x7F)` — all blocks; the FSM now uses the TCXO reference
-6. wait BUSY
-
-**Secondary issue: `sx126x::wait_on_busy` is unbounded.** The crate spins with `while let Ok(true) = self.busy_pin.is_high() {}` — no timeout, no yield. This starves the FreeRTOS IDLE task, causes task-watchdog fires every 5 s, and hides which command stalled. The fix (implemented in `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`) replaces the opaque `init()` call with a step-by-step instrumented sequence where every command is logged before issuance, and busy-waits poll `get_status()` over SPI with a 1 ms `FreeRtos::delay_ms` yield and a 500-iteration (500 ms) hard cap. On timeout, `get_device_errors()` is read and logged before returning `LoraError::BusyTimeout`.
-
-**Also: TCXO startup delay was increased from 5 ms to 10 ms** as a conservative cold-start margin. The Heltec V3 TCXO is rated ≤2 ms, but 10 ms gives 5× headroom against oscillator startup jitter; the field is internal to the chip and does not extend the BUSY-wait — it tells the SX1262 how long to wait internally before driving any XOSC-dependent operation after the TCXO power rail is enabled.
-
-Fix is in: `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`, functions `init_sx1262` and `wait_busy_spi`.
+**`sx126x 0.3`'s `init()` hangs on BUSY with a TCXO: it calibrates without `ClearDeviceErrors` after `SetDIO3AsTCXOCtrl` — see rustdoc of `juggler::lora::sx1262` (sequence and bounded BUSY wait).**
+Symptom on the Heltec V3: `DevEUI loaded`, then a spin in `sx126x::wait_on_busy` (0.3.0 source line 548) and a task-watchdog fire every 5 s.
+The TCXO delay is 10 ms (was 5 ms; rated ≤ 2 ms) as cold-start margin; it is chip-internal and does not lengthen the BUSY wait.
 
 ---
 
 ## LoRaWAN OTAA Join (TTN EU868) — RX path & driver loop
 
-First successful OTAA join on hardware: Heltec WiFi LoRa 32 V3, `sx126x 0.3`, `lorawan-device 0.12.2`, ESP-IDF v5.3.3, TTN EU868. These five facts each cost multiple flash cycles to find; the radio bring-up being correct is not enough — RX delivery and timing dominate.
+First hardware join: Heltec WiFi LoRa 32 V3, `sx126x 0.3`, `lorawan-device 0.12.2`, ESP-IDF v5.3.3, TTN EU868; RX delivery and timing dominated.
 
-**`esp-idf-hal` `PinDriver` GPIO interrupts are ONE-SHOT — poll the SX1262 IRQ register instead of relying on the DIO1 edge.**
-The driver auto-disables the interrupt on every firing (to avoid IWDT loops) and requires `enable_interrupt()` to be re-armed from a *non-ISR* context after each notification.
-Symptom: DIO1 delivered exactly one edge per boot (the TxDone), and every subsequent RxDone was missed — the radio had `rx_done=true` latched in its IRQ register (visible only via a polled read at window teardown) but the firmware's DIO1-driven loop never saw it, so the join-accept was received-but-undelivered.
-Because the DIO1 `PinDriver` is moved into the `SX126x` driver and cannot be re-armed from the event loop, the fix is to **poll `get_irq_status()` over SPI each loop tick** and deliver `RadioEvent(Phy)` when RxDone/TxDone/Timeout/CrcErr is set — see `EspIdfLoraRadio::irq_pending` / `LoraRadioAdapter::irq_pending` and the loop in `examples/idf_esp32s3_join.rs`. Polling GetIrqStatus is safe to issue while the radio is in RX.
-This was the final blocker; it masked every earlier "no DIO1 during RX" symptom. Refs: esp-rs `PinDriver` docs, esp-idf-hal issue #349.
+**`esp-idf-hal` `PinDriver` interrupts are one-shot, so DIO1 delivered only TxDone — poll the IRQ register (esp-idf-hal issue #349).**
+Re-arming needs `enable_interrupt()` from a non-ISR context, and the pin is moved into `SX126x`, so the loop cannot re-arm it; the polling is in `examples/idf_esp32s3_join.rs` and `idf_esp32s3_lora_uplink.rs`.
 
-**`lorawan-device 0.12` `Response::TimeoutRequest(ms)` is an ABSOLUTE timestamp (`TimestampMs`), not a relative delay.**
-The driver loop must assign `next_timeout = ms`, never `elapsed + ms`. Adding `elapsed` opens RX1/RX2 roughly twice as late and the join-accept is missed.
-Confirmed in `nb_device/mod.rs:125` (`TimeoutRequest(TimestampMs)`) and the crate's own tests asserting `TimeoutRequest(5000/5100/6000/6100)` — absolute RX1 open/close, RX2 open/close stamps in the device timeline (epoch ≈ TX start).
+**`Response::TimeoutRequest(ms)` is an ABSOLUTE timestamp; `DownlinkReceived` ends a `send()` cycle — see rustdoc of `juggler::lora::ticker`.**
 
-**An SF12 join-accept cannot be received in RX1 — join at a faster data rate.**
-`lorawan-device` hard-caps the RX1 window close at the inter-window gap: `min(get_rx_window_duration_ms, t_rx2 − t_rx1)` = 1000 ms for EU868 OTAA (`nb_device::state::WaitingForRx`). It issues `CancelRx` at that close, aborting reception mid-packet. An SF12 accept (with TTN's CFList, ~1.8 s airtime) can never complete in 1000 ms — the radio detects the preamble (`preamble=true`) and is then torn down.
-Fix: `device.set_datarate(region::DR::_5)` (SF7/BW125) **before** `device.join(...)`. At SF7 the accept is ~70 ms and fits RX1 comfortably; RX2 stays SF12/869.525 and only it benefits from a large `RX_WINDOW_DURATION_MS` (set to 3000) — RX1 is auto-capped, so the long duration extends only RX2 (no overlap). TTN alternates RX1/RX2 by gateway duty-cycle (868.x is the 1 % band, 869.525 the 10 % band), so both windows must work.
+**An SF12 join-accept (~1.8 s) cannot finish in RX1 (capped at 1000 ms) — join at DR5, see rustdoc of `idf_esp32s3_join` and `juggler::lora` `RX_WINDOW_DURATION_MS`.**
+TTN alternates RX1 and RX2 by gateway duty cycle (868.x is the 1 % band, 869.525 the 10 % band), so both windows must work.
 
-**LoRaWAN downlinks carry no PHY-layer CRC — RX packet params must use `LoRaCrcType::CrcOff`.**
-TX (uplink) keeps `CrcOn`. With CRC on for RX, the SX1262 mis-handles the absent CRC bytes. Set `CrcOff` only in `prepare_rx`. (Downlinks also use inverted IQ — `LoRaInvertIq::Inverted` — which matches the gateway's `invert_polarization=true`; that part was already correct.)
+**Downlinks carry no PHY CRC: RX must use `CrcOff` — see rustdoc in `juggler::lora`.**
 
-**Compile-time credentials via `option_env!` need explicit `.env` wiring or the device silently transmits all-zero EUIs.**
-Three independent gaps caused a join-request with `dev_eui=0000000000000000` (TTN ignores it, no accept): (1) the justfile must `set dotenv-load`; (2) the `.env` keys must be named `LORAWAN_DEV_EUI` / `LORAWAN_APP_EUI` / `LORAWAN_APP_KEY` — the old template used `LORA_*` (no "WAN"), so `option_env!("LORAWAN_*")` resolved to `None`; (3) `build.rs` must declare `cargo:rerun-if-env-changed=LORAWAN_*` because Cargo does not track env vars used by `option_env!`/`env!`, so changing a credential otherwise reuses a stale binary.
-EUIs are entered MSB-first (TTN display order); the example `.reverse()`s DevEUI and AppEUI before `DevEui::from`/`AppEui::from`; AppKey is unchanged. JoinEUI/AppEUI all-zeros is valid in TTN. A `build.rs` `cargo:warning` now flags empty/all-zero credentials at build time. `.env` is gitignored (public repo) and must stay so.
+**Compile-time `option_env!` credentials need `.env` wiring, or the device sends `dev_eui=0000000000000000`.**
+Three gaps: the justfile needs `set dotenv-load`; keys must be `LORAWAN_DEV_EUI` / `LORAWAN_APP_EUI` / `LORAWAN_APP_KEY` (not `LORA_*`); `build.rs` needs `cargo:rerun-if-env-changed=LORAWAN_*`.
+EUIs are entered MSB-first and reversed in the example; AppKey is unchanged; an all-zero JoinEUI is valid; `build.rs` warns on empty or all-zero credentials; `.env` stays gitignored.
 
-**`lorawan-device 0.12` `Response::DownlinkReceived` is TERMINAL for a `send()` cycle — break the event loop on it, do not keep polling.**
-Once a valid downlink is received in RX1, the state machine cancels RX2 and emits no further `TimeoutRequest`/radio events, so a loop that waits for a later `RxComplete` spins until its own safety guard.
-Symptom: the first temperature uplink (`examples/idf_esp32s3_lora_uplink.rs`) reached TTN (`FCntUp=0`) and TTN answered with a MAC-command downlink (`LinkADRReq`, `FCntDown=0`, RxDone len=13) — but the inner loop only logged `DownlinkReceived` and continued, hit the 30 s guard, and falsely reported "session expired or timeout". The join flow never exposes this because the post-join path receives no downlink.
-Fix: treat `DownlinkReceived` as success (`break true`) alongside `RxComplete`. The clean-uplink-no-downlink case already completes via `RxComplete` after both windows close.
-
-**TTN Live Data shows only the raw `frm_payload` unless an Uplink payload formatter is configured — the decoder is not applied by default.**
-The Application > Payload formatters > Uplink **Formatter type** defaults to "None"; the JavaScript decoder must be selected explicitly (**Custom JavaScript formatter**) and saved before `temperature_c` (or any decoded field) appears in Live Data or is forwarded to integrations. Decoder and step-by-step are in the `idf_esp32s3_lora_uplink` example doc comment.
+**TTN Live Data shows only raw `frm_payload` until an Uplink payload formatter is set — see the `idf_esp32s3_lora_uplink` example docs.**
 
 ---
 
 ## crates.io Publishing
 
-**Publish ESP cross-compiled crates against their real target — never `--no-verify`.**
-`cargo publish` verify-builds against the **host target** by default, which fails for an ESP-IDF crate (`esp-idf-svc`/`esp-idf-hal`/`esp-idf-sys` + `build.rs` reject `aarch64-apple-darwin`/CI x86). The tempting workaround is `--no-verify`, but that skips verification entirely. The sibling `rustyfarian-ws2812` workspace established the correct convention: publish each crate against its real cross-target so the verify-build actually runs where the code compiles.
-Fix (the `just release-publish*` recipes): IDF crate → `cargo +esp publish --target riscv32imac-esp-espidf --target-dir {{ idf_dir }}`; bare-metal HAL crate → `cargo publish --target riscv32imac-unknown-none-elf -Zbuild-std=core,alloc`; pure crate → `--target {{ host_target }}`.
+**Publish ESP crates against their real target, never `--no-verify`.**
+Host-target verify fails for the IDF crate; the `just release-publish*` recipes use `cargo +esp publish --target riscv32imac-esp-espidf --target-dir {{ idf_dir }}` (IDF), `cargo publish --target riscv32imac-unknown-none-elf -Zbuild-std=core,alloc` (HAL), `--target {{ host_target }}` (pure).
 
-**The HAL-crate publish/dry-run needs `-Zbuild-std=core,alloc` because the workspace default `build-std` is `["std", "panic_abort"]`.**
-`.cargo/config.toml` sets `[build] target = "riscv32imac-esp-espidf"` and `[unstable] build-std = ["std", "panic_abort"]` — correct for the IDF default target, but it cannot build `std` for a bare-metal `riscv32imac-unknown-none-elf` target. (This differs from `rustyfarian-ws2812`, whose default target *is* bare-metal, so its HAL publish needs no override.) Same override the `check-hal*` recipes use.
+**The HAL publish needs `-Zbuild-std=core,alloc` because the workspace `build-std = ["std", "panic_abort"]` cannot build `std` for bare metal** (`rustyfarian-ws2812` defaults to bare metal and needs no override).
 
-**The two `-network` crates cannot be `cargo publish --dry-run`'d until `juggler` is live on crates.io.**
-Their packaged manifest drops the local `path` and resolves `juggler ^0.4` against the crates.io index, so a dry-run fails with `no matching package named 'juggler' found` until juggler is published. This is inherent (the same staging `ws2812` documents). Workflow: Stage 1 `just release-publish juggler` → wait for indexing → Stage 2 `just release-dry-run-idf` / `release-dry-run-hal` (now resolve) → Stage 3 `just release-publish-idf` / `-hal`. Pre-juggler, `just release-dry-run` validates the dependents via `cargo package --list` only.
+**The `-network` crates cannot be dry-run until `juggler` is on crates.io (`no matching package named 'juggler' found`).**
+Stage 1 `just release-publish juggler`, wait for indexing, Stage 2 `just release-dry-run-idf` / `-hal`, Stage 3 `just release-publish-idf` / `-hal`; before that `just release-dry-run` uses `cargo package --list`.
 
-**crates.io publish authenticates via the `CARGO_REGISTRY_TOKEN` env var (from `.envrc`/direnv) — no `cargo login` needed.**
-`cargo publish` reads `CARGO_REGISTRY_TOKEN` from the environment automatically. A first publish of a *new* crate name also requires the token to carry the "publish new crates" scope and not be allowlisted to other crate names — scopes are visible only in the crates.io web UI (`/settings/tokens`), never via the API; the `/me` endpoint confirms validity but not scope.
+**Publishing reads `CARGO_REGISTRY_TOKEN` from the environment; no `cargo login`.**
+A new crate name needs the "publish new crates" scope and no allowlist to other names; scopes show only in the web UI (`/settings/tokens`), `/me` confirms validity only.

@@ -4,9 +4,9 @@ Requested by `rustyfarian-rgb-clock` (first consumer) and Watchtower v2 (second 
 The decision core (`decide_offer`, `reconcile`, `OtaError::code`) ships unreleased on `main`.
 Goal: lift the generic download hardening, wire contract, record store, and runtime into the library so both consumers reuse it.
 
-**Status: All sub-projects (A–D) implemented.**
+**Status: All sub-projects (A–D) implemented, released in 0.6.0.**
 
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+Hardware: bench check `c3/ota-runtime` (0.7.0 rows P2, P7, P13, P14 and P17).
 
 ## Decomposition
 
@@ -282,17 +282,16 @@ The runtime deliberately differs from the first consumer's hand-written layer in
 
 ## Hardware Validation State
 
-**Sub-project A:** Host-tested via juggler deadline tests + IDF error mapping.
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+**Sub-project A:** Host-tested via juggler deadline tests + IDF error mapping; hardware via bench check `c3/ota-runtime`.
 
 **Sub-projects B–D:** Host-tested via `just test-ota` (FaultKv crash-matrix, adoption and repair, write sequences, boot reconciliation).
 Library runbook at `docs/runbooks/ota-hardware-test.md` documents the test matrix.
 The clock's own hardware passes (2026-09-28) are evidence for the clock's code, not validation of the extracted runtime.
 C and D are complete only when the clock has adopted the runtime and the runbook passes on the reference example and on both consumers, with a per-scenario result for each.
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Open Questions
+
+Deferred past 0.6.0, none blocks the runtime:
 
 - Confirm the repair wire names: `{"action":"repair"}`, `repaired{records}`, `repair_failed`, `repair_not_needed`.
 - Confirm that the manifest fetch keeps the HTTP client's default redirect policy (`FollowNone` deliberately not set).
@@ -316,7 +315,7 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
 - [x] Both consumers' preliminary review received (C/D API, hook wiring, clock adoption path).
 - [x] A hardware check (ESP32-C3 runbook: P10/P11, 2026-10-08).
 - [x] C + D hardware validation: library runbook 21/21 on ESP32-C3 (`2a3ac3f`, 2026-10-08) and rgb-clock adoption tests passed (2026-10-09).
-- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- [x] 0.7.0 rerun of rows P2, P7, P13, P14 and P17: bench check `c3/ota-runtime`.
 - [x] `cargo semver-checks` recipe added and run against v0.5.0 before 0.6.0 release (`just release-semver-check`).
 
 ## Session Log
@@ -332,5 +331,6 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
 - 2026-10-06 — D design approved: module layout, OtaConfig/OtaSubmitter/OtaRuntime/OtaHandle; health policy; reboot contract.
 - 2026-10-06 — D implemented; `idf_c3_ota_runtime` example builds; runbook doc added.
 - 2026-10-06 — Old layouts (ef7818b..a14f555: `rb_from`/`rb_conf`, missing ids) no longer supported; missing ids are corrupt, cleared by `repair_corrupt`.
-- 2026-10-08 — Hardware validation: runbook 21/21 on ESP32-C3 (campaign 2, local broker); bug 005 (MQTT never auto-reconnected) found and fixed on the way.
+- 2026-10-08 — Hardware validation: runbook 21/21 on ESP32-C3 (campaign 2, local broker); MQTT never auto-reconnected, found and fixed on the way.
 - 2026-10-09 — rgb-clock adoption tests passed; remaining before 0.6.0: `cargo semver-checks` recipe; Watchtower v2 validation follows separately.
+- 2026-11-12 — Bench check `c3/ota-runtime` passed; archived with the open questions deferred

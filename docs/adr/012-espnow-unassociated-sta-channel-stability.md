@@ -15,13 +15,11 @@ The coordinator logs confirm it: only `"scout-probe"` frames appear, never `"hel
 
 ### Root cause
 
-`scan_for_peer` calls `esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE)` immediately before each
-unicast probe.
+`scan_for_peer` calls `esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE)` immediately before each unicast probe.
 The channel is set to 1, the probe goes out, the coordinator ACKs, the scan returns.
 `send_and_wait` then transmits a data frame without resetting the channel.
-Between `scan_for_peer` returning and `esp_now_send` executing, the ESP-IDF Wi-Fi driver's
-internal state machine (running at higher scheduler priority inside the binary blob) has hopped
-the radio to a different channel.
+
+Between `scan_for_peer` returning and `esp_now_send` executing, the ESP-IDF Wi-Fi driver's internal state machine (running at higher scheduler priority inside the binary blob) has hopped the radio to a different channel.
 The data frame is transmitted on the wrong channel.
 The coordinator (AP-locked to channel 1) never receives it.
 Seven 802.11 MAC-layer retry attempts exhaust in ~30 ms; the send callback fires `FAIL`.
@@ -71,7 +69,10 @@ on Variant 1.
 
 See *Hardware validation — Approach A* below.
 
-*Pros:* No API change. No breaking change. Minimal code delta. Transparent to callers.
+*Pros:* No API change.
+No breaking change.
+Minimal code delta.
+Transparent to callers.
 
 *Cons:* As confirmed by hardware testing, the community reports of this trick "working" describe
 using it **once at boot** to set a fixed channel before `esp_now_init`, not as a per-send
@@ -116,19 +117,24 @@ Full hardware re-validation needed.
 Both coordinator and scout agree on a fixed channel at compile-time.
 The unassociated scout calls `esp_wifi_set_channel` once at boot and sends directly.
 
-*Pros:* Simplest implementation. No per-send overhead. Eliminates scan latency.
+*Pros:* Simplest implementation.
+No per-send overhead.
+Eliminates scan latency.
 
 *Cons:* If the coordinator's AP is on a different channel, all frames fail.
-Inflexible. Eliminates the channel auto-discovery capability added in ADR 009.
+Inflexible.
+Eliminates the channel auto-discovery capability added in ADR 009.
 
 **Approach D — Caller responsibility, document the constraint**
 
 Document that callers must manage the channel themselves.
 No library change.
 
-*Pros:* Zero library change. Zero risk.
+*Pros:* Zero library change.
+Zero risk.
 
-*Cons:* Bug manifests silently. Every consumer re-discovers the root cause independently.
+*Cons:* Bug manifests silently.
+Every consumer re-discovers the root cause independently.
 
 ### Hardware validation — Approach A (2026-06-10)
 

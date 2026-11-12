@@ -565,7 +565,7 @@ pub struct Lease {
 pub struct LeaseTable {
     entries: [Option<Lease>; POOL_SIZE],
     /// First address in the pool — bound at construction; per-call sites cannot
-    /// override it.  See `docs/project-lore.md` "esp-hal April 2026 Stack" for
+    /// override it.  See `docs/project-lore.md` "esp-hal Bare-Metal Stack" for
     /// the rationale (the original API passed this per-call and caused the
     /// 2026-06-15 hardware-only-surfacing offer-the-server's-own-IP bug).
     pool_start: Ipv4Addr,

@@ -1,8 +1,7 @@
 //! Internal helper for scrubbing secret [`heapless::String`] buffers before
 //! their memory is released.
 //!
-//! See bug 003 (`docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md`):
-//! the Wi-Fi password, MQTT password, LoRaWAN AppKey, and extra-field values a
+//! The Wi-Fi password, MQTT password, LoRaWAN AppKey, and extra-field values a
 //! [`ProvisioningConfig`](crate::provisioning::ProvisioningConfig) carries must
 //! not linger as readable bytes in freed stack or heap memory once the value
 //! holding them is dropped.

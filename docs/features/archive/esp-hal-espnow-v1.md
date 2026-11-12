@@ -82,13 +82,13 @@ Paths such as `esp_now/mod.rs:645` or `wifi/mod.rs:3206` in the table below are 
 
 ## Open Questions
 - [x] Sender runner task that owns every transmission (removes the settle-window hazard); API change for `send_async` — done 2026-10-30: `EspHalEspNow::run_sender`, async senders return `NoSenderRunner` without it
-- Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+- Hardware: G-E1 is the bench check `c3/espnow-soak`; G-E2 moved to a downstream project.
 
 Resolved on 2026-10-30 (see Decisions): sync shim vs async trait, `esp_rtos` requirement, AMPDU/coex knobs, TX power default.
 The 5 dBm default is not trusted for room-scale props: the consumer's idf firmware needed a 13 dBm cap because of receiver saturation at close range, so the opposite direction (too little power) must be measured as well; the passthrough makes both cases a one-line change.
 
 ## Validation plan
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
+Bench checks `c3/espnow-soak` and `c3/espnow-peer-session`.
 
 ## State
 - [x] Design approved — 2026-10-30 by the maintainer (ADR 020 Accepted)
@@ -97,8 +97,6 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
 - [x] Documentation updated — README, AGENTS.md, ROADMAP, CHANGELOG, lore (2026-10-30)
 - [x] Examples — `hal_c6_espnow_sta_coordinator`, `hal_c3_espnow_peer` (2026-10-30)
 - [x] Implemented (no board was flashed as of 2026-10-30)
-
-Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7.0-hardware-test.md
 
 ## Implementation notes (2026-10-30)
 
@@ -164,7 +162,8 @@ Hardware: covered by the release 0.7.0 hardware run, see ../runbooks/release-0.7
   `run_sender` is enforced single: it claims `runner_active` through `Singleton`, and a second concurrent runner logs an error and does nothing.
   `remaining()` was replaced by the pure `expired(deadline, now)` helper, with a host test.
   Gates G-E1 and G-E2 stay open; no board was flashed.
-- 2026-11-11 — Release 0.7.0 bench decisions: gate G-E2 (coordinator with two peers, the coexistence question) moves to a downstream project, which runs the two-peer coex test; G-E1 stays in runbook gate C3-H2 as the 30-minute soak only, and the mixed-fleet pairings run through C3-H3 and C6-H4 after parity Step 7; no board was flashed.
+- 2026-11-11 — Release 0.7.0 bench decisions: gate G-E2 (coordinator with two peers, the coexistence question) moves to a downstream project; G-E1 is the bench check `c3/espnow-soak` (30-minute soak), and the mixed-fleet pairings run as `c3/espnow-peer-session`.
 
 </details>
-- 2026-11-11 — G-E1 passed on the bench: `just bench c3 espnow-soak --unattended` 5/5, 30 minutes at 100 ms, 18 099 sends with 0 failures on channel 11 against the hal C6 coordinator (gate C3-H2); archive together with the parity pair once C3-H3 and C6-H4 have run
+
+- 2026-11-12 — G-E1 (`c3/espnow-soak`) and `c3/espnow-peer-session` passed on the bench; archived

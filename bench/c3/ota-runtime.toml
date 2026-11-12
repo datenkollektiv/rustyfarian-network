@@ -1,4 +1,4 @@
-# ESP-IDF OTA consumer runtime on the C3 Super Mini (runbook C3-I5, the 0.7.0 subset of
+# ESP-IDF OTA consumer runtime on the C3 Super Mini (the 0.7.0 subset of
 # `docs/runbooks/ota-hardware-test.md`: P2, P7, P13, P14 and P17), chained on one board in one run.
 # Prerequisites, all in the shell that starts the run (the shell beats the dotenv file):
 #   export MQTT_HOST=<this machine's LAN IPv4> MQTT_PORT=1883 OTA_HOST=<same IPv4> OTA_PORT=8000

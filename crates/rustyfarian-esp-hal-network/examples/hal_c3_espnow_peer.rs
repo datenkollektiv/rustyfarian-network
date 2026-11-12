@@ -41,16 +41,16 @@
 //!
 //! `ESPNOW_SCENARIO` selects a hardware gate scenario of
 //! `docs/runbooks/release-0.7.0-hardware-test.md`.
-//! Each scenario logs lines that start with `ESPNOW-GATE <gate> PASS` or `ESPNOW-GATE <gate> FAIL`.
+//! Each scenario logs lines that start with `ESPNOW-GATE <scenario> PASS` or `ESPNOW-GATE <scenario> FAIL`.
 //! The scenarios drive the driver directly, without the session.
 //!
-//! | `ESPNOW_SCENARIO` | Gate   | What it does                                                                  |
-//! |:------------------|:-------|:------------------------------------------------------------------------------|
-//! | `cancel`          | C3-H6  | Drops `scan_for_peer` mid-run (delay cycles 3 to 250 ms), then scans again    |
-//! | `flood`           | C3-H7  | Eight concurrent `send_acked` (1 ms and 400 ms deadlines), then one more send |
-//! | `shutdown`        | C3-H8  | Queues sends, starts a scan, calls `shutdown` mid-scan, sends and scans again |
-//! | `shutdown-queued` | C3-H8  | Queues sends and calls `shutdown` before any scan, sends and scans again      |
-//! | `txpower`         | C3-H9  | Reads the radio TX power before and after each scan and compares them         |
+//! | `ESPNOW_SCENARIO` | What it does                                                                  |
+//! |:------------------|:------------------------------------------------------------------------------|
+//! | `cancel`          | Drops `scan_for_peer` mid-run (delay cycles 3 to 250 ms), then scans again    |
+//! | `flood`           | Eight concurrent `send_acked` (1 ms and 400 ms deadlines), then one more send |
+//! | `shutdown`        | Queues sends, starts a scan, calls `shutdown` mid-scan, sends and scans again |
+//! | `shutdown-queued` | Queues sends and calls `shutdown` before any scan, sends and scans again      |
+//! | `txpower`         | Reads the radio TX power before and after each scan and compares them         |
 //!
 //! `shutdown` and `shutdown-queued` end the driver for good, so each runs one check and then
 //! parks; reset the board to repeat it.
@@ -93,7 +93,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Retry delay of the gate scenarios' first scan (the default scenario backs off in the session).
 const RESCAN_BACKOFF_MS: u64 = 2000;
 
-/// Set by `sender_task` once `run_sender` has returned (gate C3-H8).
+/// Set by `sender_task` once `run_sender` has returned.
 static SENDER_RETURNED: AtomicBool = AtomicBool::new(false);
 
 /// Gate scenario selected at build time; `default` keeps the plain peer behaviour.
@@ -375,7 +375,7 @@ fn radio_state(espnow: &EspHalEspNow, coordinator: &MacAddress) -> RadioState {
     }
 }
 
-/// C3-H6: scan, cancel a scan by dropping its future, scan again.
+/// `cancel`: scan, cancel a scan by dropping its future, scan again.
 ///
 /// The cancel delay cycles through short values so that some cancels land mid-probe.
 /// A cancelled or not-found scan must leave the pinned channel, TX power and peer as they were
@@ -402,7 +402,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
                 Timer::after(Duration::from_millis(50)).await;
                 let after = radio_state(espnow, coordinator);
                 gate(
-                    "C3-H6",
+                    "cancel",
                     before == after,
                     format_args!(
                         "scan cancelled after {} ms, state {:?} -> {:?}",
@@ -411,7 +411,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
                 );
             }
             Ok(_) => println!(
-                "[C3-H6] scan ended within {} ms, before the cancel; not a cancel sample",
+                "[cancel] scan ended within {} ms, before the cancel; not a cancel sample",
                 delay
             ),
         }
@@ -421,7 +421,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
             Ok(found) => {
                 let ok = known.is_none_or(|k| k == found.channel);
                 gate(
-                    "C3-H6",
+                    "cancel",
                     ok,
                     format_args!(
                         "scan after cancel found the coordinator on channel {} (earlier {:?})",
@@ -433,7 +433,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
             Err(EspHalEspNowError::Scan(e @ ScanError::NotFound { .. })) => {
                 let after = radio_state(espnow, coordinator);
                 gate(
-                    "C3-H6",
+                    "cancel",
                     before == after,
                     format_args!(
                         "not-found scan ended ({:?}), state {:?} -> {:?}, coordinator earlier on {:?}",
@@ -442,7 +442,7 @@ async fn scenario_cancel(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
                 );
             }
             Err(e) => gate(
-                "C3-H6",
+                "cancel",
                 false,
                 format_args!("scan after cancel failed: {}", e),
             ),
@@ -469,7 +469,7 @@ async fn timed_send(
     (idx, timeout_ms, start.elapsed().as_millis(), result)
 }
 
-/// C3-H7: more concurrent `send_acked` futures than queue slots, with short and long deadlines.
+/// `flood`: more concurrent `send_acked` futures than queue slots, with short and long deadlines.
 ///
 /// Passes when the flood ends without a hang, every result is a real result or a `Timeout`
 /// delivered close to its deadline, and a later send still runs, which shows the sender runner
@@ -489,7 +489,7 @@ async fn scenario_flood(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
         .await;
         match flood {
             Err(_) => gate(
-                "C3-H7",
+                "flood",
                 false,
                 format_args!("the flood did not end within 10 s (hang)"),
             ),
@@ -520,7 +520,7 @@ async fn scenario_flood(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
                     let _ = write!(problems, " send after the flood ended {};", class(&after));
                 }
                 gate(
-                    "C3-H7",
+                    "flood",
                     problems.is_empty(),
                     format_args!(
                         "flood of {}:{}; after-flood send {}; problems:{}",
@@ -536,7 +536,7 @@ async fn scenario_flood(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
     }
 }
 
-/// C3-H8: shut the driver down with sends queued (and, with `with_scan`, a scan running).
+/// `shutdown` and `shutdown-queued`: shut the driver down with sends queued (and, with `with_scan`, a scan running).
 ///
 /// A send that was queued when the scan began is dropped by the scan as `ScanInProgress`;
 /// that is accepted in the `shutdown` variant, and `shutdown-queued` expects `Shutdown`.
@@ -544,6 +544,11 @@ async fn scenario_flood(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
 /// Afterwards a send must return `Shutdown`, a scan must end without touching the radio, and
 /// `run_sender` must have returned.
 async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with_scan: bool) -> ! {
+    let shutdown_tag = if with_scan {
+        "shutdown"
+    } else {
+        "shutdown-queued"
+    };
     const SENDS: usize = 8;
     const CHANNELS: [u8; 65] = {
         let mut list = [0u8; 65];
@@ -582,7 +587,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
     .await;
     let Ok((sends, scan, ())) = outcome else {
         gate(
-            "C3-H8",
+            shutdown_tag,
             false,
             format_args!("queued requests did not end within 10 s of shutdown (hang)"),
         );
@@ -644,7 +649,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
     }
     espnow.shutdown();
     gate(
-        "C3-H8",
+        shutdown_tag,
         problems.is_empty(),
         format_args!(
             "shutdown{}: sends{}; later send {}; later scan {}; run_sender returned={}; problems:{}",
@@ -663,7 +668,7 @@ async fn scenario_shutdown(espnow: &EspHalEspNow, coordinator: &MacAddress, with
     halt().await
 }
 
-/// C3-H9: the radio TX power must be the same before and after each scan.
+/// `txpower`: the radio TX power must be the same before and after each scan.
 async fn scenario_txpower(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! {
     let scan = ScanConfig::for_peer();
     let mut scans = 0u32;
@@ -677,7 +682,7 @@ async fn scenario_txpower(espnow: &EspHalEspNow, coordinator: &MacAddress) -> ! 
         let ok =
             before.is_some() && before == after && shadow_before == shadow_after && result.is_ok();
         gate(
-            "C3-H9",
+            "txpower",
             ok,
             format_args!(
                 "scan {} ({}): radio TX power {:?} -> {:?}, handle {:?} -> {:?} quarter dBm",

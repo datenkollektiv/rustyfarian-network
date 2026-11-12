@@ -61,7 +61,7 @@ Since commit `9604a9d` (2026-10-27), `WifiMqttBoot::load` hands out juggler's `P
    The second consumer needs a distinct variant for its log line and OLED state.
 4. **Never end the boot on a Wi-Fi timeout** in this profile: below the threshold, back off and retry (or restart) rather than returning an error that ends `app_main`.
    The second consumer needs a load failure to keep the node running, with no `?` on the join path.
-5. **Hardware re-entry trigger**: an optional hook the consumer answers once per boot, before the store is read; see [`provisioning-reentry-hook-v1.md`](./provisioning-reentry-hook-v1.md).
+5. **Hardware re-entry trigger**: an optional hook the consumer answers once per boot, before the store is read; see [`provisioning-reentry-hook-v1.md`](./archive/provisioning-reentry-hook-v1.md).
    The library reports the answer as an outcome; the consumer owns the GPIO, the hold time and the erase.
 
 Only the consumer erases, on an explicit request (a `FactoryReset` hook answer or the portal's factory-reset outcome); the counter-driven path never calls `erase_all`.
@@ -139,6 +139,6 @@ Options to weigh:
 
 ## Session Log
 
-- 2026-10-08 — Created from the `rustyfarian-rgb-clock` request (mistyped password left the C3 dark); 2026-10-27 — a second consumer recorded, re-entry hook proposed, BOOT-at-reset option reworded.
-- 2026-10-27 — Updated: re-entry hook decided (option a, consumer erases) and split into `provisioning-reentry-hook-v1.md`.
+- 2026-10-08 — Created from the `rustyfarian-rgb-clock` request (mistyped password left the C3 dark).
+- 2026-10-27 — A second consumer recorded, BOOT-at-reset option reworded, re-entry hook decided (option a, consumer erases) and split into `archive/provisioning-reentry-hook-v1.md`.
 - 2026-10-28 — Updated: counter phase planned — separate credential and network-absent counters, threshold 5, FallbackPortal outcome, 10 min window, counts in rf_prov.

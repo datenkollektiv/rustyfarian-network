@@ -101,8 +101,7 @@ pub const APP_KEY_HEX_LEN: usize = 32;
 ///   the caller copies out of an accessor.
 /// - A panic dump that prints live stack frames while the config is still
 ///   alive exposes it regardless; keeping fewer copies on the stack is the
-///   mitigation for that case
-///   (bug 002, `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`).
+///   mitigation for that case.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProvisioningConfig {
     pub(crate) wifi_ssid: heapless::String<{ crate::wifi::SSID_MAX_LEN }>,
@@ -461,7 +460,7 @@ mod tests {
     }
 
     /// A clone taken out of a config is scrubbed on its own drop, not only
-    /// through the owning config (bug 003 follow-up).
+    /// through the owning config.
     #[test]
     fn drop_scrubs_cloned_extra_field_value() {
         use core::mem::ManuallyDrop;

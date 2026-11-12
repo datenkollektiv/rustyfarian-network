@@ -424,8 +424,7 @@ impl ProvisioningSession {
     /// The returned [`ProvisioningConfig`] is a by-value struct of `heapless`
     /// buffers, roughly 1.3 KB on a 32-bit target. It is moved (not cloned) out
     /// of the session onto the caller's stack, so the caller's task needs
-    /// headroom for it in addition to its own frames — see
-    /// `docs/bugs/archive/002-provisioning-config-stack-clone-2026-09-27.md`. The exact
+    /// headroom for it in addition to its own frames. The exact
     /// per-target figure is `core::mem::size_of::<ProvisioningConfig>()`, which
     /// is usable in a `const` assertion against the caller's own stack budget;
     /// the struct's layout follows the `heapless` bounds in `juggler`, so no

@@ -875,7 +875,7 @@ struct PendingInner {
     /// [`PendingAcks::register`] and capped at [`EARLY_ACK_CAPACITY`] entries:
     /// a fire-and-forget publish registers no waiter, so without the cap every
     /// `Published` event of a QoS 1 `try_publish` stayed here until the next
-    /// disconnect (bug 021, one entry per tick on the S3 soak).
+    /// disconnect (one entry per tick on the S3 soak).
     early: std::collections::VecDeque<(MessageId, AckOutcome)>,
 }
 
@@ -2070,8 +2070,7 @@ mod tests {
         wait_for_count(&log, 1);
     }
 
-    /// Regression test for the three-way connect-time deadlock cycle (see
-    /// `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`): a publisher
+    /// Regression test for the three-way connect-time deadlock cycle: a publisher
     /// blocked on esp-mqtt's `api_lock` during the handshake holds the client
     /// mutex indefinitely — that lock can only be released once the event
     /// loop thread returns to `next()`. `spawn_connect_thread` is the only
@@ -2162,8 +2161,7 @@ mod tests {
         );
     }
 
-    /// Regression test for `docs/bugs/archive/001-on-connect-enqueue-deadlock-2026-09-27.md`
-    /// "Remaining Items": the stale-helper protection (`ConnectionEpoch`)
+    /// Regression test: the stale-helper protection (`ConnectionEpoch`)
     /// cannot cancel a running `on_connect` — it can only stop it from
     /// flipping the connected flag after the fact.
     ///
@@ -2359,7 +2357,7 @@ mod tests {
         use super::{AckOutcome, PendingAcks, EARLY_ACK_CAPACITY};
         let acks = PendingAcks::new();
         // Fire-and-forget QoS 1 publishes resolve without ever registering a
-        // waiter (bug 021): the buffer must not grow with them.
+        // waiter: the buffer must not grow with them.
         for id in 0..1000u32 {
             acks.resolve(id, AckOutcome::Acked);
         }

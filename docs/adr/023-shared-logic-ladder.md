@@ -6,6 +6,7 @@ Accepted (2026-11-04).
 Decisions 5 and 6 amended (2026-11-05): decision 5 for the explicit `Ignored` variants, decision 6 to cover finite and persistent lifecycles; the closure evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
 Decisions 1 and 10 amended (2026-11-05): decision 1 for the flattened machines and the IDF ESP-NOW worker core, decision 10 for the port instance.
 Decisions 1, 5, 6, 9 and 10 amended (2026-11-11, ADR 022 Step 8c): decision 1 for `ConnectWorkMachine`, decision 5 for its explicit `Ignored`, decision 6 for its finite lifecycle and the connect-step exception, decision 9 for the runner's lock invariant, decision 10 for `ConnectPort`.
+
 Refines [ADR 022](022-tier-parity-one-async-api.md) decision 10; it does not supersede it.
 The review rule and the ports-and-adapters split stand, and "behaviour lives in sans-IO machines" becomes "behaviour lives in `juggler` on the lowest rung that fits".
 `rustyfarian-power` ADR-004 and `rustyfarian-peripherals` ADR-010 adopt the same ladder.

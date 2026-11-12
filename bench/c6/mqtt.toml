@@ -1,4 +1,4 @@
-# MQTT smoke with a router block, ESP-IDF tier (runbook C6-I2).
+# MQTT smoke with a router block, ESP-IDF tier.
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
 # Prints `[app] mqtt connected — …`, `[app] heartbeat N sent` and `[app] mqtt disconnected — will reconnect automatically`.
 examples = ["idf_c6_mqtt"]

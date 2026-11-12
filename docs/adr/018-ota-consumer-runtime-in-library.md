@@ -198,6 +198,7 @@ Admission is opened by boot reconciliation on an eligible validated boot and by 
 **OtaKv trait adoption:** supersedes "Rejected: persistent record store as a pluggable trait" above.
 C implements a key-level `OtaKv` trait in juggler, not a record-level one, so the per-key write order (the crash-consistency guarantee) lives in host-testable code.
 The IDF crate cannot run host tests; a record-level trait would push that order back into untested code.
+
 `OtaStore<K: OtaKv>` holds all record semantics, write ordering and boot orchestration as generic code under the `ota-wire` feature (`no_std`).
 It has two implementors: `EspNvsKv` (IDF production) and the `cfg(test)` `FaultKv` (host fault injection).
 Reads take `&self`, writes `&mut self`; the consumer serialises access with a `Mutex<OtaStore<_>>`.
@@ -215,5 +216,5 @@ The older clock layouts of commits `ef7818b..a14f555` (`rb_from` / `rb_conf`, re
 - [ADR 017](017-mqtt-callback-threading-contract.md) — MQTT callback threading and the channel-based handoff pattern
 - `docs/runbooks/ota-hardware-test.md` — hardware validation runbook for the OTA consumer runtime (21 physical scenarios (P1–P21) and 5 host scenarios (H1–H5))
 - `docs/features/archive/ota-decision-core-v1.md` — archived decision-core feature doc; this ADR reverses decisions from its introduction and "Decisions" section
-- `docs/features/ota-consumer-runtime-v1.md` § "Sub-project B: Pure wire contract" — B design rationale, rejected alternatives, and tests
-- `docs/features/ota-consumer-runtime-v1.md` § "Sub-project C: Record store and boot reconciliation" — Storage API decision and complete C requirements
+- `docs/features/archive/ota-consumer-runtime-v1.md` § "Sub-project B: Pure wire contract" — B design rationale, rejected alternatives, and tests
+- `docs/features/archive/ota-consumer-runtime-v1.md` § "Sub-project C: Record store and boot reconciliation" — Storage API decision and complete C requirements

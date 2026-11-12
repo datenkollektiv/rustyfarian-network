@@ -11,7 +11,7 @@
 //! attempt, and no attempt and no retry happens while the link is down or
 //! suspended. When the IP returns, the session reconnects at once instead of
 //! waiting for a retry timer. Both tiers share this behaviour through
-//! `juggler::mqtt::SessionMachine` (ADR 022, bug 010).
+//! `juggler::mqtt::SessionMachine` (ADR 022).
 //!
 //! # Quick start
 //!
@@ -246,7 +246,7 @@ const STACK_HEADROOM: usize = 2048;
 
 /// Bytes of the runner stack in use at the deepest point seen (`uxTaskGetStackHighWaterMark`).
 ///
-/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c, bug 013): 3 096 B over five plain
+/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c): 3 096 B over five plain
 /// `mqtt://` connects with suspend cycles (one SUBSCRIBE and a startup enqueue each).
 /// `RUNNER_STACK_SIZE` keeps 8 KiB instead of the rule's 6 KiB because the TLS write of a
 /// SUBSCRIBE under `mqtts://` runs on this thread and has not been measured.
@@ -254,7 +254,7 @@ const RUNNER_STACK_MEASURED_USE: usize = 3096;
 
 /// Bytes of the event-loop stack in use at the deepest point seen (`uxTaskGetStackHighWaterMark`).
 ///
-/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c, bug 013): 1 636 B over five connects
+/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c): 1 636 B over five connects
 /// with suspend cycles; `BUILDER_EVENT_LOOP_STACK_SIZE` stays at its 8 KiB floor.
 const BUILDER_EVENT_LOOP_STACK_MEASURED_USE: usize = 1636;
 
@@ -908,7 +908,7 @@ impl<'a> MqttBuilder<'a> {
     ///
     /// Called once with `(topic, payload)` per whole message: a message above
     /// esp-mqtt's receive buffer arrives in several `Received` events, and the
-    /// callback is run after they were reassembled (bug 015).
+    /// callback is run after they were reassembled.
     /// A message above `MAX_INBOUND_PAYLOAD_LEN` is dropped and counted in
     /// [`MqttHandle::dropped_inbound`] instead of being delivered truncated.
     /// Do not call any [`MqttHandle`] method from it — such calls return an error
@@ -989,7 +989,7 @@ impl<'a> MqttBuilder<'a> {
     ///
     /// `network` is the Wi-Fi link the session is gated on: no broker attempt
     /// happens until the station is associated and holds an IP, and none happens
-    /// while the link is down or suspended (bug 010). The esp-mqtt client is
+    /// while the link is down or suspended. The esp-mqtt client is
     /// created at that first readiness, so a normal boot logs no connection
     /// error, and the reconnect after an outage starts as soon as the IP is back
     /// instead of waiting for a retry timer.
@@ -1107,7 +1107,7 @@ impl<'a> MqttBuilder<'a> {
         });
 
         // The runner creates the client and hands its event connection over here,
-        // so this thread does nothing until the station has an IP (bug 010).
+        // so this thread does nothing until the station has an IP.
         let (connection_tx, connection_rx) = std::sync::mpsc::channel::<EspMqttConnection>();
 
         spawn_named(c"mqtt-events", BUILDER_EVENT_LOOP_STACK_SIZE, move || {
@@ -1174,8 +1174,8 @@ impl<'a> MqttBuilder<'a> {
                         }
                         // The runner decides the connect work from this input:
                         // subscriptions (unless a kept session's completed),
-                        // startup message, `on_connect`, and only then ready
-                        // (bug 014). This thread never acts on the session.
+                        // startup message, `on_connect`, and only then ready.
+                        // This thread never acts on the session.
                         session_for_thread.send(SessionInput::Connected { session_present });
                         log::debug!("[mqtt] event loop stack: {} B unused", stack_unused_here());
                     }
@@ -1209,7 +1209,7 @@ impl<'a> MqttBuilder<'a> {
                         // esp-mqtt splits a message above its receive buffer into
                         // chunks: the first carries the topic, the follow-ups only
                         // an offset. Assemble them, so the callback and the receive
-                        // queue both see whole messages (bug 015).
+                        // queue both see whole messages.
                         let chunk = match (details, topic) {
                             (Details::Complete, Some(topic)) => {
                                 Some(Chunk::Complete { topic, data })

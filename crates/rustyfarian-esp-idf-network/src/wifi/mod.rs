@@ -549,7 +549,7 @@ impl WiFiManager {
 
     /// Registers a sink told once whenever [`is_ready`](Self::is_ready) flips,
     /// for a worker that must gate its own work on the link — the MQTT session
-    /// (bug 010) uses it instead of polling or a second event subscription.
+    /// uses it instead of polling or a second event subscription.
     ///
     /// Returns the readiness at the moment of registration, taken under the same
     /// lock as the registration, so no transition can slip between the two:
@@ -680,7 +680,7 @@ impl LinkWorker {
                 WifiEvent::StaStopped => events.send(LinkEvent::Stopped),
                 WifiEvent::StaDisconnected(info) => {
                     // The shared line names the reason and adds the credentials
-                    // hint only for reasons that point at them (bug 011), so a
+                    // hint only for reasons that point at them, so a
                     // router deauth or our own suspend no longer blames them.
                     log::warn!(
                         "{}",

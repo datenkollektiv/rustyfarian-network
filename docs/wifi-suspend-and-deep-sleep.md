@@ -2,7 +2,7 @@
 
 Both tiers can park the station and bring it back within the same boot, which is what a deep-sleep firmware needs when a sleep attempt can be aborted.
 Suspend is a state of the running stack: nothing is dropped or re-created, and the reconnect supervisor (`juggler::wifi::LinkMachine`) pauses until resume.
-Design and decisions: `docs/features/wifi-reconnect-and-suspend-v1.md`; hardware protocol: runbook R3 in `docs/runbooks/wifi-reconnect-hardware-test.md`.
+Design and decisions: `docs/features/archive/wifi-reconnect-and-suspend-v1.md`; hardware protocol: runbook R3 in `docs/runbooks/wifi-reconnect-hardware-test.md`.
 
 ## API
 

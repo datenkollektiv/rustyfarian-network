@@ -258,7 +258,7 @@ impl<R: LinkRadio> LinkSupervisor<R> {
     ///
     /// Readiness is [`is_ready`](Self::is_ready), the same value the
     /// `wait_ready` futures complete on, so a consumer that must gate work on
-    /// the link (the MQTT session, bug 010) needs neither a second event source
+    /// the link (the MQTT session) needs neither a second event source
     /// nor a poll.
     ///
     /// The seed and the registration happen under one lock, so no transition can

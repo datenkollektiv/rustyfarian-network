@@ -1,4 +1,4 @@
-# esp-hal OTA round trip on the C3 Super Mini (runbook C3-H5, happy path; the rollback half is `c3/ota-rollback`).
+# esp-hal OTA round trip on the C3 Super Mini (happy path; the rollback half is `c3/ota-rollback`).
 # Run through `just bench-ota`, which builds the served image, exports the baseline's build-time variables
 # (FIRMWARE_VERSION, OTA_HOST, OTA_PORT, OTA_PATH, OTA_SHA256, OTA_TARGET_VERSION) for the runner's build step,
 # and then runs this check; the setup starts `just ota-serve` on this machine and the teardown stops it:

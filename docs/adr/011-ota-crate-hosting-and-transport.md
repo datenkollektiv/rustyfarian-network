@@ -41,16 +41,15 @@ reusable HTTP client as part of `rustyfarian-network`.
 
 The constraints `esp-hal = "=1.0.0"` and `esp-bootloader-esp-idf = "=0.4.0"`
 are load-bearing across the workspace (see the demo's
-`docs/project-lore.md` "Boot & Flash") and frame the dependency surface
+`docs/project-lore.md` "Flashing & Serial (espflash 4.x)") and frame the dependency surface
 the OTA crates can introduce.
 
 ## Decision
 
 ### 1. The three OTA crates live inside `rustyfarian-network`
 
-`ota-pure`, `rustyfarian-esp-idf-ota`, and `rustyfarian-esp-hal-ota` are
-added to `crates/` in this workspace alongside the existing `wifi`,
-`lora`, and `espnow` triads. No new sibling repository is created.
+`ota-pure`, `rustyfarian-esp-idf-ota`, and `rustyfarian-esp-hal-ota` are added to `crates/` in this workspace alongside the existing `wifi`, `lora`, and `espnow` triads.
+No new sibling repository is created.
 
 ### 2. HTTP/1.1 GET is hand-rolled inside `rustyfarian-esp-hal-ota` as an internal transport
 
@@ -134,9 +133,9 @@ self-test, watchdog integration) are deferred to `ota-hardened-v1`.
 
 ### On crate hosting
 
-The `rustyfarian-ws2812` precedent argued for a separate repository per
-peripheral family. Applied here it would produce `rustyfarian-ota`. We
-considered that path and rejected it for three reasons.
+The `rustyfarian-ws2812` precedent argued for a separate repository per peripheral family.
+Applied here it would produce `rustyfarian-ota`.
+We considered that path and rejected it for three reasons.
 
 First, OTA's runtime dependency surface is dominated by what
 `rustyfarian-network` already provides: Wi-Fi association
@@ -223,19 +222,16 @@ the demo binary or in `ota-hardened-v1`, not in the MVP library API.
 
 ### Positive
 
-- **Single workspace to navigate** — OTA, Wi-Fi, MQTT, LoRa, and
-  ESP-NOW share one `Cargo.toml`, one `justfile`, one `deny.toml`, one
-  CI configuration. Pin discipline is centralised.
+- **Single workspace to navigate** — OTA, Wi-Fi, MQTT, LoRa, and ESP-NOW share one `Cargo.toml`, one `justfile`, one `deny.toml`, one CI configuration.
+  Pin discipline is centralised.
 - **HTTP scope stays honest** — the README's "out of scope" note
   remains true for general-purpose clients. Consumers know
   `rustyfarian-network` is connectivity and firmware-update plumbing, not a
   reusable HTTP protocol library.
-- **No premature dependencies** — the workspace does not adopt
-  `reqwless`, `httparse`, or any other HTTP/TLS library at the MVP
-  stage. Hardened can revisit with full information.
-- **Demo and library boundaries are clean** — partition sizing and
-  health criteria live in the demo and this ADR, not in the library
-  API. The library stays policy-free.
+- **No premature dependencies** — the workspace does not adopt `reqwless`, `httparse`, or any other HTTP/TLS library at the MVP stage.
+  Hardened can revisit with full information.
+- **Demo and library boundaries are clean** — partition sizing and health criteria live in the demo and this ADR, not in the library API.
+  The library stays policy-free.
 
 ### Negative
 
@@ -247,8 +243,8 @@ the demo binary or in `ota-hardened-v1`, not in the MVP library API.
   feature in this workspace also needs HTTP, the temptation will be to
   extract the OTA client. That extraction is acceptable when there is a
   second consumer; until then, the client stays internal.
-- **The 1 MiB slot size leaves ~1.86 MiB of flash unused** on each
-  ESP32-C3 demo device. Acceptable in a demo context.
+- **The 1 MiB slot size leaves ~1.86 MiB of flash unused** on each ESP32-C3 demo device.
+  Acceptable in a demo context.
 
 ### Implications
 

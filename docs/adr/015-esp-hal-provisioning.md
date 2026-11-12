@@ -231,12 +231,14 @@ The HAL record store now persists portal extras with a new repeatable TLV tag `T
 The value layout is `key_len` (1 byte), then the key, then the value.
 `MAX_RECORD_LEN` grows from 512 B to 1280 B: a worst-case `wifi_mqtt` record is 508 B, and 8 extras at 80 B each (1 + 13 + 64 plus the 2-byte TLV header) add 640 B, giving 1148 B.
 Sector size, `STORE_SIZE` and `LAYOUT_VER` are unchanged, because the decoder skips unknown tags: records without extras are byte-identical to 0.6.x, and new firmware reads 0.6.x records with empty extras.
+
 `StoreError::ExtrasNotSupported` is removed, and `StoreError::MalformedField { tag }` reports an empty or duplicate extra key, a bad key length, an over-cap key or value, or a ninth extra.
 Downgrade caveat: 0.6.x firmware caps its read at 512 B, so a record with extras that exceeds 512 B fails decode there.
 `pick_active` then falls back to the other sector, so the device quietly boots the previous credentials, or reports unprovisioned if the other sector is empty.
+
 The portal's 2048 B request cap (security-checklist item 3) is unchanged: a maximum configuration with 8 extras fits it only when the values need no percent-encoding, and a fully percent-encoded one is answered with 413 rather than stored (host test `max_config_with_eight_extras_fits_cap_only_when_unencoded`).
 The provisioning task stack guidance was re-derived as an analytic upper bound (about 12.5 KiB transient including the portal's parsed config, about 20.5 KiB peak, recommended minimum 24 KiB); the figures are not measured.
-See `docs/features/provisioning-boot-identity-v1.md` and `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`.
+See `docs/features/archive/provisioning-boot-identity-v1.md` and `docs/runbooks/esp-hal-provisioning-extras-hardware-test.md`.
 
 ## Amendment 2026-10-29 — Provisioning owns SoftAP bring-up (SSID parity)
 
@@ -244,10 +246,11 @@ See `docs/features/provisioning-boot-identity-v1.md` and `docs/runbooks/esp-hal-
 `PortalConfig` is the single SSID, channel and password source on both tiers.
 The hal default SSID is now `{prefix}-{MAC}`, derived through the shared `juggler::provisioning::resolve_softap_ssid` and the new `softap_mac()` efuse read, and `ssid_override` is used verbatim when set.
 The `SoftApHandle` parameter and the validation-only zero-MAC check in `start()` are removed.
+
 `init_softap_async`, `ApConfig` and `ApConfigExt` stay public for non-provisioning SoftAP users.
 The session keeps the AP MAC for the per-device-name pre-fill feature instead of discarding it.
 Both changes are breaking (the `start()` signature and the default SSID rename) and are documented in `CHANGELOG.md` with migration notes.
-See [hal-provisioning-ap-ownership-v1](../features/archive/hal-provisioning-ap-ownership-v1.md) and [ssid-override-v1](../features/ssid-override-v1.md) for the full contract.
+See [hal-provisioning-ap-ownership-v1](../features/archive/hal-provisioning-ap-ownership-v1.md) and [ssid-override-v1](../features/archive/ssid-override-v1.md) for the full contract.
 
 ## References
 

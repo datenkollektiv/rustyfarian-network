@@ -4,7 +4,7 @@
 
 Accepted — 2026-10-14 (client, shared types, runtime model); the maintainer chose IP-literal broker addresses over DNS.
 
-The canonical sign-off anchor is the State checklist in [esp-hal-mqtt-v1.md](../features/esp-hal-mqtt-v1.md).
+The canonical sign-off anchor is the State checklist in [esp-hal-mqtt-v1.md](../features/archive/esp-hal-mqtt-v1.md).
 
 ## Context
 
@@ -16,7 +16,7 @@ The estate pins the September 2026 wave: `esp-hal =1.2.2`, `esp-radio =1.0.0-bet
 Any client must bind those versions without a second copy of a trait-bearing crate on the public boundary.
 `embassy-net 0.8` itself depends on `embassy-sync 0.7.2` and `embedded-io-async 0.7.0`, so both `embassy-sync` majors already coexist in `Cargo.lock`; the real constraint is that no client may hand *us* `embassy-sync 0.7` types.
 
-The ESP-IDF tier's behaviour is the parity target (ADR 017, bug 005): LWT, a retained "online" publish on every (re)connect, resubscribe after reconnect, auto-reconnect, and a non-blocking `try_publish` that reports `WouldBlock`.
+The ESP-IDF tier's behaviour is the parity target (ADR 017): LWT, a retained "online" publish on every (re)connect, resubscribe after reconnect, auto-reconnect, and a non-blocking `try_publish` that reports `WouldBlock`.
 Its callback contract does not translate: there are no helper threads on a single-core embassy executor, so ADR 017's `WrongThread` guard has no equivalent here.
 
 On the S3, `esp-radio` and `esp-rtos` allocate only from internal RAM (`malloc_internal`), and the validated S3 Wi-Fi example leaves ~26 KB of a 72 KiB heap free (lore, 2026-10-14).
@@ -87,7 +87,7 @@ Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, pe
 ### Positive
 
 - One dependency family already in the pinned wave; `cargo tree` on the scratch crate (`tmp/adr-mqtt-resolve`) resolves `minimq 0.13.5` next to `esp-radio 1.0.0-beta.1` with `embassy-sync 0.8.0` untouched.
-- No heap growth and no callbacks, so the two IDF-tier failure classes (bug 001 deadlock, callback misuse) are structurally absent.
+- No heap growth and no callbacks, so the two IDF-tier failure classes (the `api_lock` deadlock, callback misuse) are structurally absent.
 - One config surface for both tiers; consumers keep `MqttConfig::new(host, port, id).with_lwt(...)` verbatim.
 
 ### Negative
@@ -132,7 +132,7 @@ Non-goal: the HAL tier does not replay unacknowledged in-flight QoS 1 publishes 
 
 ## References
 
-- `docs/features/esp-hal-mqtt-v1.md` — feature doc and sign-off anchor.
+- `docs/features/archive/esp-hal-mqtt-v1.md` — feature doc and sign-off anchor.
 - Upstream request U2b from the `rustyfarian-knob` esp-hal parity quest (filed 2026-10-14, S3 as a first-class chip, knob as a consumer).
 - [ADR 015](015-esp-hal-provisioning.md) — bare-metal estate constraints and the hand-rolled fallback rule.
 - [ADR 017](017-mqtt-callback-threading-contract.md) — IDF-tier callback contract this ADR deliberately does not port.

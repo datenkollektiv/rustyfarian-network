@@ -1,4 +1,4 @@
-# MQTT smoke with a router block, esp-hal tier (C6 smoke; the full T1 to T6 stay runbook C6-H2).
+# MQTT smoke with a router block, esp-hal tier (smoke; the full T1 to T6 are `mqtt-scenarios` and `soak`).
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
 # Log prefix is `[app]`.
 examples = ["hal_c6_mqtt_lwt"]

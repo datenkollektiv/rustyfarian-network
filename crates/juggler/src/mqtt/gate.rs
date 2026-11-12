@@ -1,4 +1,4 @@
-//! Network gate shared by both tiers (bug 010, ADR 022 decision 10).
+//! Network gate shared by both tiers (ADR 022 decision 10).
 //!
 //! The session machine must be told when the link becomes ready and when it
 //! stops being ready, and nothing else. A duplicate [`SessionInput::NetworkUp`]

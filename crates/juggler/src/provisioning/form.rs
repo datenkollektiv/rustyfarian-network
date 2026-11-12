@@ -76,8 +76,7 @@ pub struct ExtraField {
 
 impl Drop for ExtraField {
     /// Scrubs the value (possibly a secret) before the memory is released;
-    /// the key is not a secret and is left as-is. See bug 003
-    /// (`docs/bugs/archive/003-provisioning-config-no-drop-scrub-2026-09-27.md`).
+    /// the key is not a secret and is left as-is.
     fn drop(&mut self) {
         crate::provisioning::secret::scrub(&mut self.value);
     }

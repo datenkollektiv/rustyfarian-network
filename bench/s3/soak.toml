@@ -1,4 +1,4 @@
-# 10-minute MQTT soak (T6), both tiers on the shared lwt_app (runbook S3-I1 for the idf twin).
+# 10-minute MQTT soak (T6), both tiers on the shared lwt_app.
 # Needs `.env` (WIFI_*, MQTT_HOST as an IPv4) pointing at a running broker (`just doctor` checks it).
 # Log prefix is `[app]`; ticks every 5 s, heap every 60 s.
 # Unattended on purpose (`--unattended` runs it at full length): read the heap trend afterwards from the

@@ -10,7 +10,7 @@ Supersedes the "No protocol changes are needed" consequence of [ADR 009](009-esp
 [ADR 009](009-espnow-channel-scanning.md) chose active probe scanning: the scan walks the channel list, sends a unicast probe on each and takes the first MAC-layer ACK as the coordinator's channel.
 The ACK is produced by the 802.11 hardware of whichever radio decodes the frame, and that is not the same thing as the channel the coordinator is parked on.
 
-[Bug 018](../bugs/archive/018-espnow-scan-finds-adjacent-channel-2026-11-10.md) showed this on the 0.7.0 bench: with the C3 scout and the C6 coordinator on router channel 11, `scan_for_peer` found the coordinator on channel 10, then on 11, and gate C3-I7 failed its same-channel step.
+The 0.7.0 bench showed this: with the C3 scout and the C6 coordinator on router channel 11, `scan_for_peer` found the coordinator on channel 10, then on 11, and the `c3/espnow-cancel` check failed its same-channel step.
 2.4 GHz channels are 5 MHz apart while a frame is 20 MHz wide, so a probe sent on an adjacent channel is decoded and ACKed, at close range reliably and at opposite ends of a table still often enough to flap.
 `ScanConfig::probe_confirmations` does not help, because the adjacent-channel ACK repeats as reliably as the real one.
 The scan walks the list upwards from 1, so the adjacent hit below the real channel wins.
@@ -83,7 +83,7 @@ The shared echo app in `examples-shared/espnow_echo_app.rs`, compiled into `idf_
 ### Negative
 
 - A scan against a coordinator that does not reply is slower than before: it sweeps the whole list (one `reply_timeout` per ACKed channel) before it settles the candidate, instead of returning on the first ACK.
-- The reply is a protocol change; a coordinator built before 0.7.0 is found by the fallback only, with bug 018's adjacent-channel risk intact.
+- The reply is a protocol change; a coordinator built before 0.7.0 is found by the fallback only, with the adjacent-channel risk intact.
 - On esp-hal, application frames that arrive during a scan with no `receive()` pending are held in a four-frame buffer and may be dropped under load; the drop is counted, not silent.
 - The wait for a reply adds up to `reply_timeout` to a scan that found the coordinator by ACK on the right channel but gets no answer.
 - A reply is trusted without a confirmation round, and `home_channel` is the coordinator's live radio channel at that instant.
@@ -92,7 +92,7 @@ The shared echo app in `examples-shared/espnow_echo_app.rs`, compiled into `idf_
 
 ### Neutral
 
-- Bug 018 stays open until the 0.7.0 bench reruns C3-I7 and C3-H6 with the shared echo app on the coordinator; the gates now require the found channel to equal the coordinator's.
+- The fix was confirmed when the 0.7.0 bench reran `c3/espnow-cancel` on both tiers with the shared echo app on the coordinator (the checks require the found channel to equal the coordinator's) and passed on 2026-11-11.
 - The rgb-puzzle coordinator may adopt the echo app or stay ACK-only; the fallback covers it either way.
 
 ## References
@@ -101,7 +101,6 @@ The shared echo app in `examples-shared/espnow_echo_app.rs`, compiled into `idf_
 - [ADR 010 — ESP-NOW Command Frame Without Transport Metadata](010-espnow-command-frame-without-transport-metadata.md) (system-tag table extended)
 - [ADR 012 — ESP-NOW Unassociated STA Channel Stability](012-espnow-unassociated-sta-channel-stability.md) (earlier false positives)
 - [ADR 022 — Tier Parity, One Async API](022-tier-parity-one-async-api.md)
-- [Bug 018 — An ESP-NOW scan at close range reports the coordinator on an adjacent channel](../bugs/archive/018-espnow-scan-finds-adjacent-channel-2026-11-10.md)
-- [Feature: ESP-NOW Probe Reply Carries the Coordinator's Channel v1](../features/espnow-probe-reply-channel-v1.md)
-- Runbook [release 0.7.0 hardware test](../runbooks/release-0.7.0-hardware-test.md), gates C3-I7 and C3-H6
+- [Feature: ESP-NOW Probe Reply Carries the Coordinator's Channel v1](../features/archive/espnow-probe-reply-channel-v1.md)
+- Runbook [release 0.7.0 hardware test](../runbooks/release-0.7.0-hardware-test.md), check `c3/espnow-cancel`
 - `crates/juggler/src/espnow/command.rs` (`ProbeFrame`, `ProbeReply`), `crates/juggler/src/espnow/scan.rs` (`ScanMachine`)

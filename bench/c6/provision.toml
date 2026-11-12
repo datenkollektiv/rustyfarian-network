@@ -1,4 +1,4 @@
-# esp-hal provisioning record with extras survives a reboot on the C6 (runbook C6-H1, scenario H1 of
+# esp-hal provisioning record with extras survives a reboot on the C6 (scenario H1 of
 # docs/runbooks/esp-hal-provisioning-extras-hardware-test.md).
 # The store must be blank, or the board boots `Already provisioned` and opens no portal: erase first, pinned to
 # the C6, because `erase-flash` takes the first matching port:
