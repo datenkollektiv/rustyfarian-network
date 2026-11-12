@@ -2,8 +2,8 @@
 id: 013
 title: Minimum free heap dropped 9 KB across an IDF Wi-Fi and MQTT reconnect
 captured-on: 2026-11-01
-doc-version: 2
-status: open-observation
+doc-version: 3
+status: closed
 kind: observation
 ---
 
@@ -30,3 +30,4 @@ low
 - 2026-11-01 — Updated: variant B comparison (588 B drop) points at the per-connect helper thread
 - 2026-11-11 — S3 bench figures (`idf_esp32s3_mqtt_lwt`, free heap, not the minimum): the `suspend` run lost 860 B across three suspend/resume reconnects (`connect #1` 206 760 B → `connect #4` 205 900 B), and the 2026-11-08 10-min soak drifted 2136 B with no reconnect; the fix is still open
 - 2026-11-11 — The steady-state soak drift (2136 B per 10 min) is a separate defect, bug 021: `PendingAcks::early` kept one entry per fire-and-forget QoS 1 publish; fixed with a cap of 8, S3-I1 rerun pending. The reconnect minimum-heap peak of this observation stays open (Step 8c stack sizes).
+- 2026-11-12 — Closed: Step 8c (runner owns the connect work, no per-connect 12 KiB helper thread) measured on the CrowPanel S3, `idf_esp32s3_mqtt_lwt` with `MQTT_SUSPEND_DEMO=1`, five connects each: minimum free heap 188 104 → 187 416 B on the pre-change build, 201 076 → 199 116 B now (+11.7 KB at connect #4, flat from #4); stack use `mqtt-net` 3 096 B, `mqtt-events` 1 636 B (both 8 KiB, the runner kept at 8 KiB until an `mqtts://` run); logs `tmp/8c-t2-serial.log` and `bench/s3/logs/idf_esp32s3_mqtt_lwt-20261112-011106.log`

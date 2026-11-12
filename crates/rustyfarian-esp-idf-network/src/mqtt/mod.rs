@@ -246,15 +246,17 @@ const STACK_HEADROOM: usize = 2048;
 
 /// Bytes of the runner stack in use at the deepest point seen (`uxTaskGetStackHighWaterMark`).
 ///
-/// Provisional (Step 8c, bug 013) until the CrowPanel S3 run across
-/// `just bench s3 suspend`, `mqtt-scenarios` and `soak` replaces it.
-const RUNNER_STACK_MEASURED_USE: usize = 6144;
+/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c, bug 013): 3 096 B over five plain
+/// `mqtt://` connects with suspend cycles (one SUBSCRIBE and a startup enqueue each).
+/// `RUNNER_STACK_SIZE` keeps 8 KiB instead of the rule's 6 KiB because the TLS write of a
+/// SUBSCRIBE under `mqtts://` runs on this thread and has not been measured.
+const RUNNER_STACK_MEASURED_USE: usize = 3096;
 
 /// Bytes of the event-loop stack in use at the deepest point seen (`uxTaskGetStackHighWaterMark`).
 ///
-/// Provisional (Step 8c, bug 013) until the CrowPanel S3 run across
-/// `just bench s3 suspend`, `mqtt-scenarios` and `soak` replaces it.
-const BUILDER_EVENT_LOOP_STACK_MEASURED_USE: usize = 6144;
+/// Measured on the CrowPanel S3 on 2026-11-12 (Step 8c, bug 013): 1 636 B over five connects
+/// with suspend cycles; `BUILDER_EVENT_LOOP_STACK_SIZE` stays at its 8 KiB floor.
+const BUILDER_EVENT_LOOP_STACK_MEASURED_USE: usize = 1636;
 
 const _: () = assert!(RUNNER_STACK_SIZE >= RUNNER_STACK_MEASURED_USE + STACK_HEADROOM);
 const _: () = assert!(

@@ -560,7 +560,7 @@ mod driver {
             // both steps 2 and 3 precede it.
             //
             // Upstream: esp-rs/esp-hal #3488, espressif/arduino-esp32 #6767.
-            set_tx_power_or_log(config.tx_power.to_quarter_dbm());
+            set_tx_power_or_log("", config.tx_power);
 
             // 5. Power save (non-fatal if it fails).
             let ps = map_power_save(config.power_save);
@@ -860,7 +860,7 @@ mod driver {
             // provided by esp-wifi-sys, always linked by esp-radio, and only valid
             // after `esp_wifi_start()`.  `to_quarter_dbm()` returns values in
             // [8, 78], within the SDK-documented valid range [8, 84].
-            set_tx_power_or_log(config.ap.tx_power.to_quarter_dbm());
+            set_tx_power_or_log("softap ", config.ap.tx_power);
 
             // Nothing from `config.ap` is interpolated here: the struct carries
             // the AP password, so CodeQL reports any value read through it
@@ -913,16 +913,26 @@ mod driver {
     /// `set_config()` call in both `init_async` and `init_softap_async`.
     /// Calling it before start returns `ESP_ERR_WIFI_NOT_STARTED` (0x3002),
     /// which this function logs at `warn` and ignores.
-    fn set_tx_power_or_log(quarter_dbm: i8) {
+    /// Sets the TX power after start and logs the result in the ESP-IDF tier's words
+    /// (`[wifi] tx power set to …`, `[wifi] softap tx power set to …`); `label` is `""` or `"softap "`.
+    fn set_tx_power_or_log(label: &str, level: TxPowerLevel) {
         extern "C" {
             fn esp_wifi_set_max_tx_power(power: i8) -> i32;
         }
+        let quarter_dbm = level.to_quarter_dbm();
         // SAFETY: `esp_wifi_set_max_tx_power` is provided by esp-wifi-sys,
         // always linked by every esp-radio build.  It is only valid after
         // `esp_wifi_start()`.  `to_quarter_dbm()` returns values in [8, 78],
         // within the SDK-documented valid range [8, 84].
         let rc = unsafe { esp_wifi_set_max_tx_power(quarter_dbm) };
-        if rc != 0 {
+        if rc == 0 {
+            log::info!(
+                "[wifi] {}tx power set to {:?} ({} quarter-dBm)",
+                label,
+                level,
+                quarter_dbm
+            );
+        } else {
             log::warn!(
                 "esp_wifi_set_max_tx_power({}) failed with code {:#010x} (non-fatal)",
                 quarter_dbm,
