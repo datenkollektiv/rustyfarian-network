@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-12
+
 ### Added
 
 - Tier parity (ADR 022, ADR 023): Wi-Fi, MQTT, ESP-NOW, OTA, provisioning and LoRa logic of both tiers now runs on shared `juggler` cores, so one application body compiles against either tier crate; both crate READMEs list the remaining tier capability differences.
@@ -49,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `juggler::lora::{LorawanPhy, map_rf_config, LorawanTimeline, classify_response, requested_deadline, TickEvent, Outcome, IrqOutcome, classify_irq, ldro_required, RadioErrorKind}` (incl. `LorawanPhy::phy_due`, `RadioErrorKind::tx_in_progress`), PHY constants, `Region::{default_rf_hz, image_calibration_hz}` and `juggler::lora::sx1262::{init, InitError, InitStep, BRING_UP_ORDER, take_irq_status, irq_read_mask}`, re-exported by both tiers' `lora`.
 - Examples: shared app bodies in `examples-shared/` (`lwt_app`, `espnow_echo_app`, `espnow_peer_app`); new `idf_esp32s3_mqtt_lwt`, `idf_c6_mqtt`, `idf_c6_espnow_coordinator`, `idf_c3_espnow_peer`, `idf_c3_async_mqtt`, `idf_c3_async_mqtt_native`, `hal_esp32_connect_async`, `hal_esp32s3_connect_async`, `hal_esp32_mqtt_lwt`, `hal_c3_mqtt_lwt`, `hal_c6_mqtt_lwt`, `hal_esp32s3_mqtt_lwt`, `hal_esp32s3_provision_mqtt`, `hal_c3_ota`, `hal_esp32s3_ota`, `hal_c6_espnow_sta_coordinator` and `hal_c3_espnow_peer`.
 - Example build-time switches `MQTT_SUSPEND_DEMO`, `MQTT_ON_CONNECT_DEMO`, `ESPNOW_SCENARIO`, `OTA_DEMO_UNHEALTHY`, `PROVISION_AP_PSK` and `PORTAL_SSID_OVERRIDE`, and just recipes `build-all-examples`, `build-xtensa-idf-mqtt` and `flash-ota-baseline`.
+- `juggler::espnow::ScanConfig` implements `Copy`.
 
 ### Changed
 
@@ -333,7 +336,9 @@ This release introduces an OTA MVP across both stacks, completes the April 2026 
 - Examples: `idf_c3_connect`, `idf_c3_mqtt`, `idf_esp32_mqtt`; hardware reference `docs/heltec-wifi-lora-32-v3.md`
 - CI: pure-crate test job for all host tests (`rustyfarian-network-pure`, `wifi-pure`, `lora-pure`, `espnow-pure`)
 
-[Unreleased]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/datenkollektiv/rustyfarian-network/compare/v0.2.1...v0.3.0
