@@ -19,10 +19,7 @@ env:
 
 jobs:
   clippy:
-    # Pinned to 24.04: `ubuntu-latest` moved to 26.04 (libxml2 2.14, soname libxml2.so.16),
-    # where ESP-IDF v5.3.3's prebuilt esp-clang 16 fails to load libxml2.so.2 during
-    # `idf_tools.py install`, so every esp-idf-sys build dies (CI breakage 2026-10-30).
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -36,11 +33,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The key covers the file that selects the ESP-IDF build: a restored esp-idf-sys
+      # CMake tree from another ESP_IDF_VERSION fails to configure.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-
-      - name: Setup cargo config
-        run: cp .cargo/config.toml.dist .cargo/config.toml
+        with:
+          key: idf-${{ hashFiles('.cargo/config.toml') }}
 
       - name: Setup just
         uses: extractions/setup-just@v4

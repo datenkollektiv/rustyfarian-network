@@ -91,8 +91,16 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32c6"
 # Note: this variable is not used by the pio builder (`cargo build --features pio`)
 # scripts/flash.sh and scripts/build-example.sh override MCU per chip from the example name.
-ESP_IDF_VERSION = "v5.3.3"
+ESP_IDF_VERSION = "v6.1"
 ESP_IDF_TOOLS_INSTALL_DIR = "global"
+# The workspace root is a virtual manifest, so `cargo metadata` names no root package and
+# esp-idf-sys would read no `package.metadata.esp-idf-sys` at all; this crate's
+# `extra_components` (the ESP-IDF v6 managed component `espressif/mqtt`) would be skipped.
+ESP_IDF_SYS_ROOT_CRATE = "rustyfarian-esp-idf-network"
+# esp-idf-sys runs `cargo metadata` in embuild's workspace dir, which it guesses from the
+# target dir; on the RAM disk that guess lands outside the workspace and the metadata
+# (including ESP_IDF_SYS_ROOT_CRATE above) is silently dropped.
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
 # embuild (used by esp-idf-sys) checks RUSTC_LINKER to detect ldproxy and emit
 # --ldproxy-linker as a rustc-link-arg.  Cargo only sets RUSTC_LINKER for the
 # host-side build script when it is explicitly present here.

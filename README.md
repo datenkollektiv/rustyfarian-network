@@ -247,13 +247,11 @@ After cloning, run the one-time setup before building or running examples:
 
 ```bash
 just setup-toolchain
-just setup-cargo-config
 ```
 
-`setup-cargo-config` copies `.cargo/config.toml.dist` to `.cargo/config.toml`, which
-configures linker settings and target-specific flags for ESP32, ESP32-S3, and bare-metal
-Xtensa targets.
-Without this step, builds for those targets will fail with linker or toolchain errors.
+The committed `.cargo/config.toml` pins ESP-IDF v6.1 and configures the linker and target-specific flags for every ESP-IDF and bare-metal target.
+Cargo never reads it when this workspace is a dependency, so it does not affect consumers.
+Override a value locally with an environment variable (`MCU=esp32c3`) or a `--config <file>` overlay instead of editing it.
 
 ### Build target isolation (optional RAM disk)
 

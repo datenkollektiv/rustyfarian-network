@@ -127,7 +127,7 @@ Not checked: the hal form prefill (gap 57), and a stalled client (headers with a
 
 #### ESP-IDF v5.5 coexistence soak
 
-N/A in 0.7.0; it runs with the ESP-IDF v5.5.5 bump ([feature doc](../features/esp-idf-v5-5-upgrade-v1.md)).
+N/A in 0.7.0; it runs with the ESP-IDF v6.1 bump ([feature doc](../features/esp-idf-v6-1-upgrade-v1.md)).
 
 1. On a board with Wi-Fi STA and ESP-NOW on one radio (the consumer's ESP32-C6 brain firmware; this repository has no such ESP-IDF C6 example), soak with one STA peer and one ESP-NOW-only peer.
 2. Run the OTA and provisioning checks (`c3/ota-runtime`, C3 portal prefill) on the bumped build.

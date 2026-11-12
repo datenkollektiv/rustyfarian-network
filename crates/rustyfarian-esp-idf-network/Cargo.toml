@@ -20,6 +20,12 @@ features = ["wifi", "mqtt", "lora", "espnow", "ota", "provisioning"]
 # Note: docs.rs will use its own esp-idf build environment; the esp-idf-sys
 # crate is pre-built by docs.rs when the target is recognized.
 
+# ESP-IDF v6 moved esp-mqtt out of the IDF tree into the managed component `espressif/mqtt`.
+# esp-idf-sys honours `extra_components` of the root crate and its direct dependencies, so a
+# firmware depending on this crate gets the component without declaring it itself.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mqtt", version = "^1.0.0" }
+
 [package.metadata.cargo-machete]
 # False positive: `embuild` is a build-dependency used in build.rs
 # (embuild::espidf::sysenv::output()); cargo-machete does not scan build.rs.

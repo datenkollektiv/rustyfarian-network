@@ -61,7 +61,7 @@ The ESP-IDF and esp-hal tiers implement the traits and hardware lifecycle; they 
 All build, test, lint, and flash operations go through `just` recipes — never invoke `cargo` directly for these.
 
 ```bash
-just setup                 # idempotent: create .cargo/config.toml if missing, install ESP toolchain via espup, run doctor
+just setup                 # idempotent: install ESP toolchain via espup, run doctor
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
 just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets, incl. the two ESP-NOW examples (not in verify)

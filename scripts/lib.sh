@@ -31,6 +31,17 @@ bootloader_cache_path() {
     printf '%s/bootloader/%s%s.bin' "$(abs_dir "$idf_dir")" "$chip" "$suffix"
 }
 
+# pinned_idf_version <workspace_root>
+# Prints the ESP-IDF version esp-idf-sys builds: $ESP_IDF_VERSION when exported (cargo's [env]
+# never overrides an existing variable), else the pin in .cargo/config.toml.
+pinned_idf_version() {
+    if [ -n "${ESP_IDF_VERSION:-}" ]; then
+        printf '%s' "$ESP_IDF_VERSION"
+        return 0
+    fi
+    sed -n 's/^ESP_IDF_VERSION *= *"\(.*\)".*/\1/p' "$1/.cargo/config.toml"
+}
+
 # find_idf_bootloader_out <idf_target> <idf_dir>
 # Prints the esp-idf-sys out dir (the one holding build/bootloader/bootloader.bin) of the
 # single IDF build for <idf_target>. Prints nothing when no such build exists.

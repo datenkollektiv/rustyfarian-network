@@ -83,4 +83,4 @@ TTN v3 EU868 OTAA validation checklist: [runbooks/ttn-otaa-validation.md](runboo
 
 | # | Item                                                                                                                       |
 |--:|:---------------------------------------------------------------------------------------------------------------------------|
-| 1 | Evaluate ESP-IDF v5.5.5 — contains the v5.5.2 fix for "ESP-NOW send failure when coexistence is enabled"; requested by a downstream project, see `docs/features/esp-idf-v5-5-upgrade-v1.md` |
+| 1 | Move the ESP-IDF tier to v6.1 in lockstep with `rustyfarian-esp-idf-ws2812` and `rustyfarian-power`; the v5.5.2 ESP-NOW coexistence fix is included; see `docs/features/esp-idf-v6-1-upgrade-v1.md` |

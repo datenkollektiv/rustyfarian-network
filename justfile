@@ -482,7 +482,7 @@ build-xtensa-idf-mqtt:
     just build-example idf_esp32_mqtt
     just build-example idf_esp32s3_mqtt_lwt
 
-# ensure the IDF-built v5.3.3 bootloader is cached for the chip (variant: generic | ota)
+# ensure the IDF-built bootloader of the pinned ESP-IDF is cached for the chip (variant: generic | ota)
 [group('examples')]
 ensure-bootloader chip variant="generic":
     scripts/ensure-bootloader.sh {{ if variant == "ota" { "--ota" } else { "" } }} "{{ chip }}" "{{ idf_dir }}"
@@ -591,6 +591,11 @@ clean:
     cargo clean --target-dir {{ hal_dir }}
     cargo clean --target-dir {{ idf_dir }}
     find tmp -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
+
+# remove every esp-idf-sys build (all triples and profiles in target/, target/ide and the idf dir); run once after changing ESP_IDF_VERSION, whose stale bootloader CMake cache otherwise fails with "does not match the source"
+[group('maintenance')]
+clean-idf-sys:
+    rm -rf target/*/*/build/esp-idf-sys-* target/*/*/*/build/esp-idf-sys-* {{ idf_dir }}/*/*/build/esp-idf-sys-*
 
 # clean only the ESP-IDF crate's build artifacts (needed after sdkconfig changes or chip switch)
 [group('maintenance')]
@@ -784,7 +789,7 @@ verify:
 [group('ci')]
 ci: fmt-check deny check clippy check-ota-pure check-ota-wire-pure
 
-# run all CI workflows locally via act (requires Docker + act); the ESP-IDF jobs are pinned to ubuntu-24.04, which act has no default image for
+# run all CI workflows locally via act (requires Docker + act)
 [group('ci')]
 act *job:
     #!/usr/bin/env bash
@@ -792,7 +797,7 @@ act *job:
     if [ -z "{{ job }}" ]; then
         just act fmt && just act clippy && just act check-and-test && just act audit
     else
-        act -j "{{ job }}" --pull=false -P ubuntu-24.04=catthehacker/ubuntu:act-24.04
+        act -j "{{ job }}" --pull=false
     fi
 
 # ── release ───────────────────────────────────────────────────────────────
@@ -848,33 +853,15 @@ release-publish-hal:
 
 # ── setup ─────────────────────────────────────────────────────────────────
 
-# initialize the development environment: cargo config, ESP-IDF toolchain, and tooling check
+# initialize the development environment: ESP-IDF toolchain and tooling check
 [group('setup')]
 setup:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -f .cargo/config.toml ]; then
-        echo "Copying .cargo/config.toml.dist to .cargo/config.toml..."
-        cp .cargo/config.toml.dist .cargo/config.toml
-    else
-        echo ".cargo/config.toml already exists"
-    fi
     echo "Installing ESP-IDF toolchain..."
     espup install
     echo "Checking development tooling..."
     just doctor
-
-# set up local cargo config from the template (or print message if it exists)
-[group('setup')]
-setup-cargo-config:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -f .cargo/config.toml ]; then
-        echo ".cargo/config.toml already exists; delete it first to re-create from template"
-        exit 0
-    fi
-    cp .cargo/config.toml.dist .cargo/config.toml
-    echo "Created .cargo/config.toml from template"
 
 # install the ESP-IDF toolchain via espup
 [group('setup')]

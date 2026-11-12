@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# ensure-bootloader.sh — ensure the IDF-built v5.3.3 bootloader is cached for a chip
+# ensure-bootloader.sh — ensure the IDF-built bootloader of the pinned ESP-IDF is cached for a chip
 # Usage: scripts/ensure-bootloader.sh [--ota] <chip> [idf_dir]   chip: c3 | c6 | esp32 | esp32s3
 #
 # Writes one stable file per chip and variant:
 #   <idf_dir>/bootloader/<chip>.bin      generic (IDF defaults, rollback off)
 #   <idf_dir>/bootloader/<chip>-ota.bin  --ota (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y, OTA overlay)
-# plus a <chip>[-ota].meta sidecar naming the esp-idf-sys build the file was harvested from.
+# plus a <chip>[-ota].meta sidecar naming the esp-idf-sys build the file was harvested from and
+# its ESP-IDF version; a cache from another version (or without one) is rebuilt.
 # flash.sh reads these files and never globs the build tree.
 #
 # Each populate runs: clean esp-idf-sys -> build one representative example (with the OTA overlay
@@ -14,9 +15,10 @@ set -euo pipefail
 # Cleaning before and after keeps the two variants from sharing one esp-idf-sys build, so the
 # generic bootloader cannot inherit the rollback setting of an OTA build.
 #
-# espflash 4.x bundles an ESP-IDF v5.5.1 bootloader that rejects both v5.3.3 IDF
-# binaries (32 KB MMU page mismatch) and bare-metal esp-hal binaries (app descriptor
-# format). The v5.3.3 bootloader built by esp-idf-sys works for both.
+# espflash 4.x bundles its own bootloader, which rejected bare-metal esp-hal binaries
+# (app descriptor format) and, while the pin was ESP-IDF v5.3.3, IDF binaries too
+# (32 KB MMU page mismatch). The bootloader esp-idf-sys builds for the pinned ESP-IDF
+# (.cargo/config.toml) boots both.
 #
 # c6 and esp32 build idf_c6_mqtt and idf_esp32_mqtt. A missing RISC-V bootloader (c3, c6) is
 # non-fatal for the generic variant: flash.sh then falls back to the espflash bundled one.
@@ -101,10 +103,20 @@ fi
 
 cache="$(bootloader_cache_path "$idf_dir" "$chip" "$variant")"
 meta="${cache%.bin}.meta"
+idf_version="$(pinned_idf_version "$workspace_root")"
+if [ -z "$idf_version" ]; then
+    printf 'Error: no ESP_IDF_VERSION exported or pinned in %s/.cargo/config.toml.\n' "$workspace_root" >&2
+    exit 1
+fi
 
 if [ -f "$cache" ]; then
-    printf 'Bootloader already cached for %s (%s): %s\n' "$chip" "$variant" "$cache"
-    exit 0
+    if grep -qxF "idf_version=$idf_version" "$meta" 2>/dev/null; then
+        printf 'Bootloader already cached for %s (%s, ESP-IDF %s): %s\n' "$chip" "$variant" "$idf_version" "$cache"
+        exit 0
+    fi
+    # A bootloader from another ESP-IDF version (or one cached before the meta recorded it) is stale.
+    printf 'Cached %s bootloader for %s is not from ESP-IDF %s — rebuilding it.\n' "$variant" "$chip" "$idf_version"
+    rm -f "$cache" "$meta"
 fi
 
 # Feature list of the representative example; the OTA variant always needs the ota feature.
@@ -179,8 +191,8 @@ mkdir -p "$(dirname "$cache")"
 tmp="$cache.tmp.$$"
 cp "$out/build/bootloader/bootloader.bin" "$tmp"
 mv "$tmp" "$cache"
-printf 'source_out=%s\nvariant=%s\nexample=%s\nfeatures=%s\nsdkconfig=%s\n' \
-    "$out" "$variant" "$example" "$features" "$rollback_line" > "$meta"
+printf 'source_out=%s\nvariant=%s\nexample=%s\nfeatures=%s\nsdkconfig=%s\nidf_version=%s\n' \
+    "$out" "$variant" "$example" "$features" "$rollback_line" "$idf_version" > "$meta"
 
 # Leave no esp-idf-sys output behind that a later build of another variant could reuse.
 clean_idf_sys
