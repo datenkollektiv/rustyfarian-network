@@ -1,5 +1,7 @@
 /target
 Cargo.lock
+# ESP-IDF component manager locks (espressif/mqtt), one per chip; a library leaves them to the firmware, like Cargo.lock
+components_*.lock
 .embuild
 
 .env
@@ -15,9 +17,6 @@ CLAUDE.md
 /archive/
 /audit/
 /release/
-
-# Local cargo config (use .cargo/config.toml.dist as template)
-.cargo/config.toml
 
 # bench run artefacts (rustyfarian-bench): per-run serial logs and results (results record board MACs)
 bench/*/logs/

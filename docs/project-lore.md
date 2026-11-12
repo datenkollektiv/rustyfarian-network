@@ -27,14 +27,15 @@ Also set `RUSTC_LINKER = "ldproxy"` in `.cargo/config.toml` `[env]` so embuild e
 The riscv32 cross-compiler is managed by `esp-idf-sys`'s CMake build; the Xtensa PATH entry matters only for Xtensa.
 Fix: `export LIBCLANG_PATH="$HOME/.espup/esp-clang"` in `.envrc` (a stable symlink that survives `espup update`).
 
-**`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader incompatible with v5.3.3 apps.**
-It uses another MMU page size (32 KB vs 64 KB) and may reject the app with `Image requires efuse blk rev <= v0.99, but chip is v1.3`.
-Fix: pass `--bootloader` with the IDF-built `target/<target>/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin`, plus `--ignore-app-descriptor`; see `scripts/flash.sh`.
+**`espflash 4.x` bundles an ESP-IDF v5.5.1 bootloader that rejected the v5.3.3 apps and rejects bare-metal esp-hal apps.**
+It uses another MMU page size (32 KB vs 64 KB) and may reject the app with `Image requires efuse blk rev <= v0.99, but chip is v1.3`; whether it accepts v6.1 IDF apps is untested.
+Fix: `scripts/flash.sh` passes `--bootloader` with the IDF-built bootloader of the pinned ESP-IDF, plus `--ignore-app-descriptor`.
+`scripts/ensure-bootloader.sh` records `idf_version=` in the cache's `.meta` and rebuilds a cache from another version, so an `ESP_IDF_VERSION` bump never flashes a stale bootloader.
 
 **Bare-metal Xtensa targets need `-Tlinkall.x` and `-C link-arg=-fno-stack-protector`.**
 Without `-Tlinkall.x` the PAC `device.x` (~60 interrupt stubs) is never processed and every vector is an undefined reference.
 Without `-fno-stack-protector`, GCC 15.2 injects stack-guard calls into `esp_hal::init` that need an undefined `__stack_chk_guard`.
-Fix: both flags in the `[target.xtensa-esp32*-none-elf]` sections of `.cargo/config.toml.dist`; RISC-V is unaffected.
+Fix: both flags in the `[target.xtensa-esp32*-none-elf]` sections of `.cargo/config.toml`; RISC-V is unaffected.
 
 **ESP32-C3 needs target `riscv32imc-esp-espidf` and `MCU=esp32c3`, not the workspace C6 defaults.**
 A C6-target build carries wrong chip metadata (`max_efuse_blk_rev`) and the bootloader rejects it.
@@ -51,7 +52,7 @@ Libraries never select one (ADR 021; the `lora` feature did until bug 007); `Esp
 
 **`just verify` compiles only `riscv32imac-esp-espidf`, never Xtensa IDF or bare-metal targets.**
 A missing `[target.xtensa-esp32s3-espidf]` section with `linker = "ldproxy"` passes verify, then `just build-example idf_esp32s3_*` panics `Cannot locate argument '--ldproxy-linker <linker>'`.
-Fix: one `[target.*]` section per ESP-IDF target in both `.cargo/config.toml` and `.cargo/config.toml.dist`; run `just build-example <name>` for hardware examples.
+Fix: one `[target.*]` section per ESP-IDF target in `.cargo/config.toml`; run `just build-example <name>` for hardware examples.
 
 **Unpinned cross-repo git deps break resolution when upstream bumps a `links = "..."` crate.**
 Only one version of a `links` crate (`esp-println`, `esp-idf-sys`) may exist, and the `failed to select a version for <crate>` error names the linked crate, not the unpinned dep.
@@ -80,8 +81,19 @@ Fix: build-time keys only in `.env`, `direnv reload`, rebuild (`build.rs` has `r
 
 **`ubuntu-latest` = Ubuntu 26.04 ships `libxml2.so.16`; ESP-IDF v5.3.3's prebuilt `esp-clang` 16 needs `libxml2.so.2`, so every `esp-idf-sys` CI build dies after 2-3 min.**
 The failing step is `idf_tools.py install`; `fmt`, `cargo audit` and `lint-docs` stay green, and the `idf5.3_py3.14_env` venv name is the tell.
-Fix: `runs-on: ubuntu-24.04` (rust.yml, clippy.yml); `just act` maps it to `catthehacker/ubuntu:act-24.04` with `--pull=false` (GHCR pull is denied without login).
-Only an ESP-IDF upgrade whose esp-clang links the new soname leads back to `ubuntu-latest` (`docs/features/esp-idf-v5-5-upgrade-v1.md`).
+ESP-IDF v6.1's esp-clang (`esp-21.1.3_20260408`) has no libxml2 dependency (checked in `rustyfarian-ws2812` 2026-11-12), so the v6.1 pin runs on `ubuntu-latest` again.
+Fix: never move the CI runner off `ubuntu-24.04` while pinned to v5.3.3; see `docs/features/esp-idf-v6-1-upgrade-v1.md`.
+
+**Changing `ESP_IDF_VERSION` fails every target dir that holds an older esp-idf-sys build with `CMake Error: The source ".../v6.1/components/bootloader/subproject/CMakeLists.txt" does not match the source ".../v5.3.3/..."`.**
+The bootloader sub-build keeps its old `CMakeCache.txt`; `target/ide` (used by `just check`, inside `just verify`) is easy to forget next to the idf dir.
+Fix: `just clean-idf-sys` once after the bump.
+In CI the same stale tree comes back from `Swatinem/rust-cache`, whose fallback restore ignores the pin; every job that builds esp-idf-sys sets `key: idf-${{ hashFiles('.cargo/config.toml') }}` (as in `rustyfarian-power`).
+
+**In this virtual-manifest workspace esp-idf-sys reads no `package.metadata.esp-idf-sys`, so `extra_components` (the ESP-IDF v6 managed `espressif/mqtt`) are silently skipped.**
+Symptom: `cannot find 'mqtt' in 'esp_idf_svc'` and missing `sys::esp_mqtt_client_*` while every other domain builds.
+`cargo metadata` names no root package for a virtual manifest, and on the RAM disk esp-idf-sys runs it in embuild's guessed workspace dir (the target dir's parent); the only trace is `cargo:warning=cargo metadata exited with an error: could not find Cargo.toml in /Volumes/RustBuilds/targets/idf` in the esp-idf-sys build `output` file.
+Fix: `[env]` `ESP_IDF_SYS_ROOT_CRATE = "rustyfarian-esp-idf-network"` and `CARGO_WORKSPACE_DIR = { value = "", relative = true }` in `.cargo/config.toml`, then `just clean-idf-sys`.
+A consumer firmware is a real root package, and esp-idf-sys merges `extra_components` from its direct dependencies, so it needs neither.
 
 **The Xtensa LLVM backend crashes rustc (`Cannot scavenge register without an emergency spill slot!`, SIGSEGV) on a function with many arguments.**
 Seen 2026-11-04 for `xtensa-esp32-espidf` / `xtensa-esp32s3-espidf` at opt-level 3 (eight-argument IDF MQTT `connect_work`); RISC-V built the same code, and a full clean did not help.

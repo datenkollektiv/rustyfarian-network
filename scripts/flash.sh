@@ -8,9 +8,9 @@ set -euo pipefail
 # Chip and crate are auto-detected from the example name.
 # MCU and Cargo target are set per chip so the image matches the physical hardware.
 # Required features are read from the example's required-features in Cargo.toml.
-# The IDF-built v5.3.3 bootloader is used instead of the espflash-bundled one:
-# espflash 4.x bundles ESP-IDF v5.5.1, which is incompatible with v5.3.3 binaries
-# (32 KB MMU page mismatch) and produces the "efuse blk rev" boot failure.
+# The IDF-built bootloader of the pinned ESP-IDF is used instead of the espflash-bundled
+# one, which rejects bare-metal binaries and rejected the v5.3.3 IDF binaries
+# (32 KB MMU page mismatch, the "efuse blk rev" boot failure).
 # Examples whose features include `ota` get the rollback-enabled bootloader
 # (<idf_dir>/bootloader/<chip>-ota.bin, see scripts/ensure-bootloader.sh --ota).
 #

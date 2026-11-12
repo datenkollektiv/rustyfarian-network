@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `rustyfarian-esp-idf-network` `WiFiManager::wait_connected()` is now async and returns `()`, the same call as on esp-hal; blocking callers move to `wait_connected_timeout(timeout_ms)`.
 - `rustyfarian-esp-hal-network` the link supervisor `WifiLink` is now `WiFiManager`, the IDF name; `WiFiManager::init_async` and `init_softap_async` are unchanged, and firmware declares `static LINK: WiFiManager = WiFiManager::new();`.
 - `rustyfarian-esp-hal-network` `AP_IP` is spelled `core::net::Ipv4Addr` (the same type as before).
+- **Breaking:** `rustyfarian-esp-idf-network` is built and validated against ESP-IDF v6.1 (was v5.3.3), in step with `rustyfarian-esp-idf-ws2812`; firmware sets `ESP_IDF_VERSION = "v6.1"` and deletes its old `esp-idf-sys-*` build directories once (here: `just clean-idf-sys`).
+- `rustyfarian-esp-idf-network` declares the managed component `espressif/mqtt` (ESP-IDF v6 moved esp-mqtt out of the IDF tree) via `[[package.metadata.esp-idf-sys.extra_components]]`, so a firmware that depends on the crate directly needs no entry of its own.
+- `.cargo/config.toml` is committed; `.cargo/config.toml.dist` and `just setup-cargo-config` are gone, and CI runs on `ubuntu-latest` again (ESP-IDF v6.1's esp-clang no longer needs `libxml2.so.2`).
+- `just ensure-bootloader` records the ESP-IDF version of a cached bootloader and rebuilds a cache from another version.
 
 ### Deprecated
 
