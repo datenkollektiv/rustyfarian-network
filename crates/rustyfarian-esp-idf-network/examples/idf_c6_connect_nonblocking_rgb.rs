@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
 
     // Phase 3: steady dim green while waiting for DHCP.
     led.set_color(RGB8::new(0, 20, 0))?;
-    let ip = wifi.wait_connected(30_000)?;
+    let ip = wifi.wait_connected_timeout(30_000)?;
     log::info!("Connected — IP: {}", ip);
 
     thread::sleep(Duration::from_secs(5));

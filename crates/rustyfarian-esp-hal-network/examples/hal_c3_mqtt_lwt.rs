@@ -50,7 +50,7 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::mqtt::{LwtConfig, MqttBuilder, MqttRunner, QoS};
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 use static_cell::StaticCell;
 
@@ -61,7 +61,7 @@ mod lwt_app;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 const KEEP_ALIVE_SECS: u64 = 30;
 

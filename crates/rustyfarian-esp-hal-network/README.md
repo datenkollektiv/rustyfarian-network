@@ -98,10 +98,10 @@ The caller spawns one task that hands the `WifiController` to `link_task` and on
 use embassy_executor::Spawner;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {

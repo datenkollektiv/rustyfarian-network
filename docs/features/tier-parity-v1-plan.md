@@ -216,7 +216,11 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 
 ### Step 10: Wi-Fi names and value types
 
-- [ ] One config and owner naming scheme (**R:** `WiFiManager` on both versus a new shared name), `wait_connected` on hal replacing `wait_for_ip` (deprecated alias), `core::net::Ipv4Addr` for addresses.
+- [x] Owner name: `WiFiManager` on both tiers (decided 2026-11-12); on hal the supervisor formerly named `WifiLink` becomes `WiFiManager`, `init_async` / `init_softap_async` stay associated functions on it, and `WifiLink` remains a `#[deprecated]` type alias.
+- [x] Configs keep their tier names `IdfWifiConfig` / `HalWifiConfig`, because firmware only builds them through `with_peripherals`.
+- [x] IDF `wait_connected()` becomes async and returns `()` like hal (an approved 0.x break); the blocking variant moves to `wait_connected_timeout(timeout_ms) -> Result<Ipv4Addr>`, and `get_ip` stays.
+- [x] hal `AsyncWifiHandle::wait_for_ip` is deprecated in favour of `WiFiManager::wait_connected` plus `ip()`.
+- [x] `ip() -> Option<Ipv4Addr>` on both tiers, with addresses spelled `core::net::Ipv4Addr` (already the same type as `std::net::Ipv4Addr` and smoltcp 0.12's `Ipv4Address`).
 
 ### Step 11: MQTT shape
 

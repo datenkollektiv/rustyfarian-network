@@ -1,6 +1,6 @@
 # Runbook: Wi-Fi Reconnect Hardware Test (both tiers)
 
-Run this after any change to `juggler::wifi::LinkMachine`, the IDF `WiFiManager` reconnect worker or the esp-hal `WifiLink`, and for the outage protocol.
+Run this after any change to `juggler::wifi::LinkMachine`, the IDF `WiFiManager` reconnect worker or the esp-hal `WiFiManager` supervisor, and for the outage protocol.
 It covers a router-side outage (R1, R2) and the radio suspend/resume cycle (R3) on the two S3 LWT examples, one result per tier.
 
 Both examples compile `examples-shared/lwt_app.rs` (ADR 022, one application on two tiers), so the app's own lines start with `[app]`, both tiers print the same `[wifi]` and `[mqtt]` library lines, and the tier shows only in the `[app] start <example> (esp-hal|esp-idf)` boot line.

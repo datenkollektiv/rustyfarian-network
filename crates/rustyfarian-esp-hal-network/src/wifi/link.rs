@@ -1,8 +1,8 @@
 //! Library-owned station supervision for the bare-metal tier.
 //!
-//! The firmware declares one `static LINK: WifiLink = WifiLink::new();`, spawns
+//! The firmware declares one `static LINK: WiFiManager = WiFiManager::new();`, spawns
 //! [`link_task`] with the [`WifiController`] and the `Stack` from
-//! `AsyncWifiHandle`, and never writes a reconnect loop again. `WifiLink::run` drives the shared
+//! `AsyncWifiHandle`, and never writes a reconnect loop again. `WiFiManager::run` drives the shared
 //! [`LinkMachine`]: connect, wait for the link to drop, back off 1 s doubling to
 //! 30 s, reconnect. A controller that is already associated when `run` starts is
 //! adopted as connected and counted as an association.
@@ -10,21 +10,21 @@
 //! # Readiness
 //!
 //! While associated, `run` checks the stack's IPv4 configuration every
-//! [`NETWORK_POLL_MS`] and reports it to the machine, so [`WifiLink::is_ready`]
-//! and [`WifiLink::wait_connected`] mean "associated with an IP", the same as on
+//! [`NETWORK_POLL_MS`] and reports it to the machine, so [`WiFiManager::is_ready`]
+//! and [`WiFiManager::wait_connected`] mean "associated with an IP", the same as on
 //! the ESP-IDF tier. The stack is polled because embassy-net keeps only one state
 //! waker, which belongs to the firmware.
-//! `WifiLink` implements [`juggler::wifi::NetworkLink`] (ADR 022).
+//! `WiFiManager` implements [`juggler::wifi::NetworkLink`] (ADR 022).
 //!
 //! # Suspend and resume
 //!
-//! [`WifiLink::suspend`] and [`WifiLink::resume`] are non-blocking signals for the
+//! [`WiFiManager::suspend`] and [`WiFiManager::resume`] are non-blocking signals for the
 //! main loop: the state flips at once and `run` reacts at whichever await it is
 //! in (connect, wait for disconnect, back-off). Suspend disconnects the station
 //! (bounded by [`SUSPEND_DISCONNECT_TIMEOUT_MS`]) and parks the supervisor, with
 //! the radio still powered (unlike the ESP-IDF tier, which stops it); no
 //! reconnect happens until `resume`, which connects with a fresh back-off.
-//! [`WifiLink::is_suspended`] turns `true` once that disconnect has finished, so a
+//! [`WiFiManager::is_suspended`] turns `true` once that disconnect has finished, so a
 //! firmware can wait a bounded time before deep sleep:
 //!
 //! ```ignore
@@ -38,13 +38,13 @@
 //!
 //! # Lifecycle
 //!
-//! Run at most one `run` per `WifiLink` at a time; the controller is a singleton,
+//! Run at most one `run` per `WiFiManager` at a time; the controller is a singleton,
 //! so a second concurrent supervisor cannot exist anyway.
 //! `run` resets the machine on entry, so a supervisor that was cancelled (for
 //! example inside a `select`) can be started again on the same `static`; a
 //! suspend issued before `run` starts is kept.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::net::Ipv4Addr;
 use core::pin::pin;
 use core::task::Poll;
@@ -65,8 +65,8 @@ use juggler::wifi::{
     CREDENTIALS_HINT,
 };
 
-/// Upper bound on the disconnect that [`WifiLink::suspend`] triggers (milliseconds);
-/// [`WifiLink::is_suspended`] turns `true` when it finishes or this bound passes.
+/// Upper bound on the disconnect that [`WiFiManager::suspend`] triggers (milliseconds);
+/// [`WiFiManager::is_suspended`] turns `true` when it finishes or this bound passes.
 pub const SUSPEND_DISCONNECT_TIMEOUT_MS: u64 = 500;
 
 /// How often a parked or idle supervisor re-checks the controller (milliseconds).
@@ -75,12 +75,16 @@ const RECHECK_MS: u64 = 1_000;
 /// How often `run` checks the stack's IPv4 configuration while associated (milliseconds).
 pub const NETWORK_POLL_MS: u64 = 500;
 
-/// Tasks that [`WifiLink::wait_connected`] wakes directly; more waiters re-check
+/// Tasks that [`WiFiManager::wait_connected`] wakes directly; more waiters re-check
 /// every [`NETWORK_POLL_MS`] instead.
 const READY_WAITERS: usize = 4;
 
 /// Station link supervisor; one per firmware, declared as a `static`.
-pub struct WifiLink {
+///
+/// [`init_async`](Self::init_async) brings the radio up and returns the
+/// handle whose controller and stack [`run`](Self::run) supervises.
+/// Named `WifiLink` before 0.8.0; the deprecated alias still works.
+pub struct WiFiManager {
     /// The machine and the action `suspend`/`resume` hand to `run`, changed
     /// together under one lock so the handover always matches the latest call.
     handover: Mutex<CriticalSectionRawMutex, RefCell<LinkHandover>>,
@@ -90,9 +94,11 @@ pub struct WifiLink {
     ready_wakers: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<READY_WAITERS>>>,
     /// Tasks in [`wait_suspended`](Self::wait_suspended); woken when a park ends.
     suspend_wakers: Mutex<CriticalSectionRawMutex, RefCell<WakerSlots<READY_WAITERS>>>,
+    /// The stack's IPv4 address as `run` last polled it, for [`ip`](Self::ip).
+    ip: Mutex<CriticalSectionRawMutex, Cell<Option<Ipv4Addr>>>,
 }
 
-impl WifiLink {
+impl WiFiManager {
     /// A supervisor with the shared back-off defaults.
     pub const fn new() -> Self {
         Self {
@@ -100,6 +106,7 @@ impl WifiLink {
             wake: Signal::new(),
             ready_wakers: Mutex::new(RefCell::new(WakerSlots::new())),
             suspend_wakers: Mutex::new(RefCell::new(WakerSlots::new())),
+            ip: Mutex::new(Cell::new(None)),
         }
     }
 
@@ -136,7 +143,19 @@ impl WifiLink {
         self.with(|h| h.is_ready())
     }
 
-    /// Completes once the station is associated and has its IPv4 configuration.
+    /// The station's IPv4 address while [`is_ready`](Self::is_ready), else `None`.
+    ///
+    /// `run` refreshes it every [`NETWORK_POLL_MS`] while associated, so a renewed
+    /// lease with a new address shows up within that period.
+    pub fn ip(&self) -> Option<Ipv4Addr> {
+        if !self.is_ready() {
+            return None;
+        }
+        self.ip.lock(|ip| ip.get())
+    }
+
+    /// Completes once the station is associated and has its IPv4 configuration;
+    /// read the address with [`ip`](Self::ip).
     ///
     /// Up to four waiting tasks are woken directly; further ones re-check every
     /// [`NETWORK_POLL_MS`], so many waiters never wake each other in a loop.
@@ -264,11 +283,12 @@ impl WifiLink {
 
     /// Reports the stack's IPv4 configuration to the machine.
     fn report_network(&self, stack: Stack<'static>) {
+        let ip = stack.config_v4().map(|config| config.address.address());
+        self.ip.lock(|cached| cached.set(ip));
         let up = stack.is_config_up();
         if up == self.is_ready() {
             return;
         }
-        let ip = stack.config_v4().map(|config| config.address.address());
         self.poll_with_ip(
             if up {
                 LinkInput::NetworkUp
@@ -492,61 +512,72 @@ impl WifiLink {
     }
 }
 
-impl Default for WifiLink {
+/// Former name of [`WiFiManager`], the link owner's name on both tiers (ADR 022).
+#[deprecated(
+    since = "0.8.0",
+    note = "use `WiFiManager`, the name both tiers share (ADR 022)"
+)]
+pub type WifiLink = WiFiManager;
+
+impl Default for WiFiManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Embassy task wrapper around [`WifiLink::run`] so a firmware spawns the
+/// Embassy task wrapper around [`WiFiManager::run`] so a firmware spawns the
 /// supervisor in one line.
 #[embassy_executor::task]
 pub async fn link_task(
-    link: &'static WifiLink,
+    link: &'static WiFiManager,
     controller: WifiController<'static>,
     stack: Stack<'static>,
 ) -> ! {
     link.run(controller, stack).await
 }
 
-impl NetworkLink for WifiLink {
+impl NetworkLink for WiFiManager {
     type Error = core::convert::Infallible;
 
     fn state(&self) -> LinkState {
-        WifiLink::state(self)
+        WiFiManager::state(self)
     }
 
     fn is_suspended(&self) -> bool {
-        WifiLink::is_suspended(self)
+        WiFiManager::is_suspended(self)
     }
 
     fn connect_count(&self) -> u32 {
-        WifiLink::connect_count(self)
+        WiFiManager::connect_count(self)
+    }
+
+    fn ip(&self) -> Option<Ipv4Addr> {
+        WiFiManager::ip(self)
     }
 
     fn suspend(&self) -> Result<(), Self::Error> {
-        WifiLink::suspend(self);
+        WiFiManager::suspend(self);
         Ok(())
     }
 
     fn resume(&self) -> Result<(), Self::Error> {
-        WifiLink::resume(self);
+        WiFiManager::resume(self);
         Ok(())
     }
 
     async fn wait_connected(&self) {
-        WifiLink::wait_connected(self).await
+        WiFiManager::wait_connected(self).await
     }
 
     async fn wait_suspended(&self) {
-        WifiLink::wait_suspended(self).await
+        WiFiManager::wait_suspended(self).await
     }
 }
 
-/// Tier parity check (ADR 022): fails to compile if `WifiLink` stops implementing `NetworkLink`.
+/// Tier parity check (ADR 022): fails to compile if `WiFiManager` stops implementing `NetworkLink`.
 const _: fn() = || {
     fn implements<T: NetworkLink>() {}
-    implements::<WifiLink>();
+    implements::<WiFiManager>();
 };
 
 /// The credentials hint for an esp-radio disconnect reason.

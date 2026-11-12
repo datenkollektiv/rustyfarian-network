@@ -32,7 +32,7 @@
 //!   skips the state check, so it can enqueue while disconnected; those messages go
 //!   out after the next connect.
 //!
-//! While Wi-Fi is suspended (`WifiLink::suspend`) the client has no call of its
+//! While Wi-Fi is suspended (`WiFiManager::suspend`) the client has no call of its
 //! own; it sends no DISCONNECT, so the broker keeps the will armed:
 //!
 //! * **State:** the network watch sees the link down within 500 ms and ends the

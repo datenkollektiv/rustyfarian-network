@@ -78,7 +78,7 @@
 //! let wifi = WiFiManager::new(modem, sys_loop, Some(nvs), config, Some(&mut led))?;
 //! ```
 
-use std::net::Ipv4Addr;
+use core::net::Ipv4Addr;
 use std::thread;
 use std::time::Duration;
 
@@ -471,14 +471,22 @@ impl WiFiManager {
         Ok(())
     }
 
+    /// Completes once the station is associated and has its IP address; the same
+    /// call as on the esp-hal tier (ADR 022). Read the address with [`ip`](Self::ip).
+    ///
+    /// Has no timeout of its own; blocking code uses
+    /// [`wait_connected_timeout`](Self::wait_connected_timeout).
+    pub async fn wait_connected(&self) {
+        self.wait_ready().await
+    }
+
     /// Blocks until the Wi-Fi station is associated and an IP address is
     /// assigned via DHCP.
     ///
     /// Returns the assigned IPv4 address, or `Err` if the timeout elapses.
-    /// The bare-metal counterpart in `rustyfarian-esp-hal-network` is
-    /// `AsyncWifiHandle::wait_for_ip().await` (`esp-radio 0.18` made the
-    /// HAL Wi-Fi surface async-only).
-    pub fn wait_connected(&self, timeout_ms: u64) -> anyhow::Result<Ipv4Addr> {
+    /// Named `wait_connected(timeout_ms)` before 0.8.0; the async
+    /// [`wait_connected`](Self::wait_connected) took that name for tier parity.
+    pub fn wait_connected_timeout(&self, timeout_ms: u64) -> anyhow::Result<Ipv4Addr> {
         self.get_ip(timeout_ms)?
             .ok_or_else(|| anyhow::anyhow!("Wi-Fi connection timeout after {} ms", timeout_ms))
     }
@@ -502,15 +510,9 @@ impl WiFiManager {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            if self.link.supervisor.is_ready() {
-                match self.wifi.wifi().sta_netif().get_ip_info() {
-                    Ok(ip_info) if !ip_info.ip.is_unspecified() => {
-                        log::debug!("[wifi] ip {}", ip_info.ip);
-                        return Ok(Some(ip_info.ip));
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::debug!("get_ip_info transient error: {}", e),
-                }
+            if let Some(ip) = self.ip() {
+                log::debug!("[wifi] ip {}", ip);
+                return Ok(Some(ip));
             }
 
             if start.elapsed() >= timeout {
@@ -519,6 +521,24 @@ impl WiFiManager {
             }
 
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// The station's IPv4 address while [`is_ready`](Self::is_ready), else `None`.
+    ///
+    /// A transient ESP-IDF error reading the address is logged at `debug` level
+    /// and reported as `None`.
+    pub fn ip(&self) -> Option<Ipv4Addr> {
+        if !self.link.supervisor.is_ready() {
+            return None;
+        }
+        match self.wifi.wifi().sta_netif().get_ip_info() {
+            Ok(ip_info) if !ip_info.ip.is_unspecified() => Some(ip_info.ip),
+            Ok(_) => None,
+            Err(e) => {
+                log::debug!("get_ip_info transient error: {}", e);
+                None
+            }
         }
     }
 
@@ -580,8 +600,8 @@ impl WiFiManager {
     /// Completes once the station is associated and has its IP address, woken by
     /// the reconnect worker; cancelling the wait leaves nothing behind.
     ///
-    /// The async counterpart of the blocking [`wait_connected`](Self::wait_connected);
-    /// generic code reaches it as [`NetworkLink::wait_connected`].
+    /// The future behind [`wait_connected`](Self::wait_connected), returned without
+    /// an `async fn` so it can be stored by name.
     pub fn wait_ready(&self) -> impl core::future::Future<Output = ()> + '_ {
         self.link.supervisor.wait_ready()
     }
@@ -741,6 +761,10 @@ impl NetworkLink for WiFiManager {
 
     fn connect_count(&self) -> u32 {
         WiFiManager::connect_count(self)
+    }
+
+    fn ip(&self) -> Option<Ipv4Addr> {
+        WiFiManager::ip(self)
     }
 
     fn suspend(&self) -> anyhow::Result<()> {

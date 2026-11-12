@@ -1,7 +1,7 @@
 //! Suspend bookkeeping for a supervisor whose radio calls run apart from the
 //! callers of `suspend`/`resume`.
 //!
-//! The esp-hal `WifiLink` runs the radio on one task while `suspend`/`resume`
+//! The esp-hal `WiFiManager` runs the radio on one task while `suspend`/`resume`
 //! arrive from other tasks. The adapter keeps a [`LinkHandover`] under one lock
 //! and only *wakes* the runner, so a state transition and the action it hands
 //! over are published together: however `suspend` and `resume` interleave,

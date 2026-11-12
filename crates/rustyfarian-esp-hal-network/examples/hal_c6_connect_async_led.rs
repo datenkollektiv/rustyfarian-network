@@ -39,13 +39,13 @@ use esp_radio::wifi::Interface;
 use pennant::{PulseEffect, StatusLed};
 use rgb::RGB8;
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 use rustyfarian_esp_hal_ws2812::{buffer_size, Ws2812Rmt, RMT_CLK_DIV};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,

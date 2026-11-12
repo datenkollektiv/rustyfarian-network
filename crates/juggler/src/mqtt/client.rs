@@ -225,6 +225,18 @@ mod tests {
         }
 
         #[test]
+        fn ip_is_reported_only_while_connected() {
+            let link = MockLink::new();
+            let addr = core::net::Ipv4Addr::new(192, 168, 1, 23);
+            link.set_ip(Some(addr));
+            assert_eq!(link.ip(), None);
+            link.associate();
+            assert_eq!(link.ip(), Some(addr));
+            link.lose_link();
+            assert_eq!(link.ip(), None);
+        }
+
+        #[test]
         fn wait_suspended_completes_once_the_suspend_took_effect() {
             use core::future::Future;
             use core::task::{Context, Poll, Waker};
