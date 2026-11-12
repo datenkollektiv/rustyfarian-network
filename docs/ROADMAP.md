@@ -34,7 +34,7 @@ timeline
               : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally (feature-doc)
               : ESP-NOW scan-burst TX power — scan boosts to max, near-field peers fail (feature-doc)
               : Portal defaults from build-time env — one helper builds the defaults for three consumers (feature-doc)
-    Near term : Release 0.7.0 — ladder-closure waiver pass, archive finished feature docs, condense CHANGELOG, semver check, crates.io token, staged publish of juggler then both tiers, tag
+    Near term : Release 0.7.0 (done v0.7.0)
               : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 bench run, plus bug 007 (LoRa forces a critical-section provider)
               : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
               : README 2D crate-status table — protocols × HAL tiers with maturity per cell, also fixes the stale stub text and the Wi-Fi/MQTT-only vision line

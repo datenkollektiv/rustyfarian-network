@@ -97,7 +97,7 @@ That feature lets embassy-time work on both tiers.
    - A port trait is narrow: one driver call or one event mapping per method, no decisions.
    - Time and wake-ups are injected: clocks as parameters, and `embassy-sync` primitives, which are `no_std` and run on the host.
    - The machines are tested on the host without an executor; the traits' async methods are tested through mocks with a polling `block_on`.
-   - Each tier keeps its own public type names for the runners' handles (`WiFiManager`, `WifiLink`, `MqttHandle`).
+   - The runners' handles share one name per role, as decision 5 requires (`WiFiManager`, `MqttHandle`) (amended 2026-11-12 in tier-parity Step 10: the hal link supervisor `WifiLink` is renamed `WiFiManager`, the IDF name; `WifiLink` stays as a deprecated alias).
    - Review rule: a branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
 
 ## Consequences

@@ -66,6 +66,7 @@ async fn ready_marker(mqtt: &impl MqttClient) {
 async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtAppConfig<'_>) {
     let mut tick: u32 = 0;
     let mut last_link = link.state();
+    let mut last_ip = None;
     let mut last_state = mqtt.state();
     let mut was_connected = false;
     let mut secs_since_heap_log: u64 = 0;
@@ -114,6 +115,12 @@ async fn tick_loop(link: &impl NetworkLink, mqtt: &impl MqttClient, cfg: &LwtApp
         if link_state != last_link {
             log::info!("[app] wifi link {:?} -> {:?}", last_link, link_state);
             last_link = link_state;
+        }
+
+        let ip = link.ip();
+        if ip != last_ip {
+            log::info!("[app] wifi ip {:?}", ip);
+            last_ip = ip;
         }
 
         let state = mqtt.state();

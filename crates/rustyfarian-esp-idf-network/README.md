@@ -13,7 +13,7 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 
 | Feature        | What it gates                                                  | Enables juggler feature | Chip support | Notes                                                      |
 |:---------------|:---------------------------------------------------------------|:------------------------|:-------------|:-----------------------------------------------------------|
-| `wifi`         | Wi-Fi STA/AP manager, LED status feedback                      | `wifi`                  | All          | Blocking API; includes softAP lifecycle.                   |
+| `wifi`         | Wi-Fi STA/AP manager, LED status feedback                      | `wifi`                  | All          | Blocking and async API; includes softAP lifecycle.         |
 | `mqtt`         | MQTT client with builder and automatic reconnection            | `mqtt`, `std`           | All          | Requires `wifi` for bootstrap (compile-checked).           |
 | `lora`         | SX1262 radio driver, LoRaWAN OTAA/ADR support                  | `lora`                  | All          | Firmware selects one `critical-section` provider (below).  |
 | `espnow`       | ESP-NOW peer-to-peer messaging, broadcast mode                 | `espnow`                | All          | No Wi-Fi required; works in AP or isolation.               |
@@ -22,7 +22,8 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 
 **Special notes:**
 
-- All features use **blocking APIs** — no async/await.
+- Wi-Fi, MQTT and ESP-NOW offer async methods next to the blocking API (`WiFiManager::wait_connected`, `MqttHandle::receive`, `EspNowLink`); the firmware brings the executor (ADR 021).
+- OTA and provisioning are blocking only.
 - `mqtt` and `provisioning` implicitly depend on `wifi` for bootstrap (compile error if `wifi` is omitted).
 - Dual SPI support via `esp-idf-hal` abstractions; no board-specific SPI routing code needed.
 - `lora` needs exactly one `critical-section` provider, selected by the firmware: `esp-idf-hal`'s `critical-section` feature (a recursive FreeRTOS mutex) or `rustyfarian-esp-idf-power`'s `critical-section-impl` (interrupt masking).

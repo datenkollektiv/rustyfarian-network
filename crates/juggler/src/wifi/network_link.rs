@@ -1,10 +1,12 @@
 //! [`NetworkLink`] — the station-link surface both tiers implement (ADR 022).
 //!
 //! Firmware that is generic over `NetworkLink` runs unchanged on the ESP-IDF
-//! `WiFiManager` and the esp-hal `WifiLink`; only the setup code differs.
+//! `WiFiManager` and the esp-hal `WiFiManager`; only the setup code differs.
 //! The behaviour behind it lives in [`LinkMachine`](super::LinkMachine) and
 //! [`LinkHandover`](super::LinkHandover), sans-IO state machines that each tier
 //! drives with a thin runner.
+
+use core::net::Ipv4Addr;
 
 use super::LinkState;
 
@@ -35,6 +37,10 @@ pub trait NetworkLink {
 
     /// Associations completed since boot; a change means a new link session.
     fn connect_count(&self) -> u32;
+
+    /// The station's IPv4 address while it is associated and has its IP
+    /// configuration (what [`wait_connected`](Self::wait_connected) waits for), else `None`.
+    fn ip(&self) -> Option<Ipv4Addr>;
 
     /// Takes the station down and stops reconnecting until [`resume`](Self::resume).
     fn suspend(&self) -> Result<(), Self::Error>;

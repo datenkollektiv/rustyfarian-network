@@ -2,7 +2,7 @@
 //!
 //! Demonstrates [`WiFiConfig::connect_nonblocking`]: [`WiFiManager::init`] returns
 //! immediately after initiating association.
-//! The firmware calls [`WiFiManager::wait_connected`] to block until the link is up.
+//! The firmware calls [`WiFiManager::wait_connected_timeout`] to block until the link is up.
 //!
 //! `WIFI_SSID` and `WIFI_PASS` must be set as environment variables **at build time**.
 //! With [direnv](https://direnv.net/) and a populated `.envrc`, these are set automatically.
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         .with_peripherals(peripherals.modem, sys_loop, Some(nvs));
     let wifi = WiFiManager::init(config)?;
 
-    let ip = wifi.wait_connected(30_000)?;
+    let ip = wifi.wait_connected_timeout(30_000)?;
     log::info!("Wi-Fi connected — IP: {}", ip);
 
     Ok(())

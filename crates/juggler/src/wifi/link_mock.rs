@@ -1,6 +1,7 @@
 //! [`MockLink`] — a [`NetworkLink`] test double for firmware host tests.
 
 use core::cell::Cell;
+use core::net::Ipv4Addr;
 use core::task::Poll;
 
 use super::{LinkState, NetworkLink};
@@ -18,6 +19,7 @@ pub struct MockLink {
     state: Cell<LinkState>,
     suspended: Cell<bool>,
     connects: Cell<u32>,
+    ip: Cell<Option<Ipv4Addr>>,
     /// When `true`, `suspend` and `resume` fail with [`MockLinkError`].
     pub fail_calls: Cell<bool>,
 }
@@ -29,6 +31,7 @@ impl MockLink {
             state: Cell::new(LinkState::Idle),
             suspended: Cell::new(false),
             connects: Cell::new(0),
+            ip: Cell::new(None),
             fail_calls: Cell::new(false),
         }
     }
@@ -37,6 +40,11 @@ impl MockLink {
     pub fn associate(&self) {
         self.state.set(LinkState::Connected);
         self.connects.set(self.connects.get() + 1);
+    }
+
+    /// Sets the address [`NetworkLink::ip`] reports while the link is `Connected`.
+    pub fn set_ip(&self, ip: Option<Ipv4Addr>) {
+        self.ip.set(ip);
     }
 
     /// Simulates a lost link that the machine retries after a back-off.
@@ -64,6 +72,14 @@ impl NetworkLink for MockLink {
 
     fn connect_count(&self) -> u32 {
         self.connects.get()
+    }
+
+    fn ip(&self) -> Option<Ipv4Addr> {
+        if self.state.get() == LinkState::Connected {
+            self.ip.get()
+        } else {
+            None
+        }
     }
 
     fn suspend(&self) -> Result<(), Self::Error> {

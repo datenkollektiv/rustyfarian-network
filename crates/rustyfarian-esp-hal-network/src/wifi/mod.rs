@@ -16,7 +16,7 @@
 //!
 //! ```ignore
 //! use rustyfarian_esp_hal_network::wifi::{
-//!     link_task, AsyncWifiHandle, WiFiManager, WiFiConfig, WiFiConfigExt, WifiLink,
+//!     link_task, AsyncWifiHandle, WiFiManager, WiFiConfig, WiFiConfigExt,
 //! };
 //!
 //! let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -25,9 +25,11 @@
 //! let config = WiFiConfig::new("MyNetwork", "password123")
 //!     .with_peripherals(peripherals.TIMG0, peripherals.FROM_CPU_INTR0, peripherals.WIFI);
 //! let AsyncWifiHandle { controller, stack, runner } = WiFiManager::init_async(config)?;
-//! static LINK: WifiLink = WifiLink::new();
-//! spawner.spawn(link_task(&LINK, controller).unwrap());
-//! // spawn `runner.run().await` in a second task; LINK reconnects forever
+//! static WIFI: WiFiManager = WiFiManager::new();
+//! spawner.spawn(link_task(&WIFI, controller, stack).unwrap());
+//! // spawn `runner.run().await` in a second task; WIFI reconnects forever
+//! WIFI.wait_connected().await;
+//! log::info!("ip {:?}", WIFI.ip());
 //! ```
 //!
 //! A firmware that already called `esp_rtos::start` itself (for example because it
@@ -156,8 +158,7 @@ compile_error!(
 ))]
 mod driver {
     use embassy_net::{
-        Config as NetConfig, DhcpConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
-        StaticConfigV4,
+        Config as NetConfig, DhcpConfig, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
     };
     use esp_hal::timer::timg::TimerGroup;
     use esp_radio::wifi::ap::AccessPointConfig;
@@ -172,6 +173,8 @@ mod driver {
         TxPowerLevel, WiFiConfig, WifiPowerSave,
     };
     use static_cell::StaticCell;
+
+    use super::link::WiFiManager;
 
     /// Who starts the `esp-rtos` scheduler that `esp-radio` requires.
     ///
@@ -356,14 +359,6 @@ mod driver {
         pub runner: Runner<'static, Interface>,
     }
 
-    /// Bare-metal Wi-Fi manager namespace.
-    ///
-    /// Since `esp-radio 0.18` the controller is async-only, so this type is a
-    /// unit struct that exposes the [`init_async`][WiFiManager::init_async]
-    /// constructor.  All useful work happens on the returned
-    /// [`AsyncWifiHandle`] and the spawned tasks driving it.
-    pub struct WiFiManager;
-
     impl WiFiManager {
         /// Initialises the Wi-Fi radio (and the `esp-rtos` scheduler when built via
         /// [`with_peripherals`][WiFiConfigExt::with_peripherals]), applies the station
@@ -376,10 +371,10 @@ mod driver {
         /// This function returns as soon as the controller has been configured
         /// and the `embassy-net` stack has been built.  No connection attempt
         /// has been made yet.  Spawn [`link_task`] with the controller (or call
-        /// [`WifiLink::run`] from your own task): it performs the initial
+        /// [`WiFiManager::run`] from your own task): it performs the initial
         /// association and every reconnect with the shared back-off.  Callers that need to know when DHCP has completed must
-        /// `await` [`AsyncWifiHandle::wait_for_ip`] (or poll
-        /// `Stack::wait_config_up` directly).
+        /// `await` [`WiFiManager::wait_connected`] on the supervising `static`
+        /// and read [`WiFiManager::ip`].
         ///
         /// # Heap requirement
         ///
@@ -523,7 +518,7 @@ mod driver {
             // 3. Apply station credentials.  `WifiController::new` already applied
             //    an empty StationConfig (which starts the radio driver via
             //    esp_wifi_start).  This call updates the SSID/password so
-            //    the first `connect_async` in `WifiLink::run` uses the real credentials.
+            //    the first `connect_async` in `WiFiManager::run` uses the real credentials.
             //    `Ssid`/`Password` reject oversized values instead of truncating;
             //    `validate_ssid`/`validate_password` above already enforce the
             //    same limits, so a failure here is a driver-level surprise.
@@ -623,6 +618,10 @@ mod driver {
         /// For more control (custom timeout, concurrent LED animation),
         /// poll [`embassy_net::Stack::config_v4`] directly alongside other
         /// futures with `embassy_futures::select`.
+        #[deprecated(
+            since = "0.8.0",
+            note = "use `WiFiManager::wait_connected` and `WiFiManager::ip`, the calls both tiers share (ADR 022)"
+        )]
         pub async fn wait_for_ip(&self) -> embassy_net::StaticConfigV4 {
             self.stack.wait_config_up().await;
             self.stack
@@ -638,7 +637,7 @@ mod driver {
     /// Clients obtain addresses in the `192.168.4.0/24` subnet via DHCP (when a
     /// DHCP server is running on top of the AP stack).  The provisioning crate
     /// references this constant so the AP IP is never restated as a magic literal.
-    pub const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
+    pub const AP_IP: core::net::Ipv4Addr = core::net::Ipv4Addr::new(192, 168, 4, 1);
 
     /// SoftAP configuration bundled with the hardware peripherals needed for init.
     ///
@@ -965,7 +964,7 @@ pub(crate) use driver::Scheduler;
 ))]
 pub use driver::{
     ApConfigExt, AsyncWifiHandle, HalApConfig, HalWifiConfig, SoftApHandle, WiFiConfigExt,
-    WiFiManager, WifiError, AP_IP,
+    WifiError, AP_IP,
 };
 
 #[cfg(all(
@@ -1016,7 +1015,9 @@ mod link;
         feature = "esp32"
     )
 ))]
-pub use link::{link_task, WifiLink, NETWORK_POLL_MS, SUSPEND_DISCONNECT_TIMEOUT_MS};
+// `WifiLink` is the deprecated former name of `WiFiManager` (ADR 022).
+#[allow(deprecated)]
+pub use link::{link_task, WiFiManager, WifiLink, NETWORK_POLL_MS, SUSPEND_DISCONNECT_TIMEOUT_MS};
 
 /// Returns the MAC address the SoftAP broadcasts.
 ///

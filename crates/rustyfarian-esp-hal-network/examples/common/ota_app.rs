@@ -30,7 +30,7 @@ use esp_hal::peripherals::FLASH;
 use rustyfarian_esp_hal_network::ota::{
     decide_update, hex_to_bytes, EspHalOtaManager, OtaManagerConfig, UpdateDecision, Version,
 };
-use rustyfarian_esp_hal_network::wifi::WifiLink;
+use rustyfarian_esp_hal_network::wifi::WiFiManager;
 use static_cell::StaticCell;
 
 /// Version of the running image; `FIRMWARE_VERSION` (set by `just ota-image` and the flash
@@ -82,7 +82,7 @@ const SOCKET_TX_LEN: usize = 1024;
 const HEALTH_DWELL_SECS: u64 = 5;
 
 /// Runs the OTA round trip once, then idles; never returns.
-pub async fn run(link: &'static WifiLink, stack: Stack<'static>, flash: FLASH<'static>) -> ! {
+pub async fn run(link: &'static WiFiManager, stack: Stack<'static>, flash: FLASH<'static>) -> ! {
     let mut manager = match EspHalOtaManager::new(OtaManagerConfig { timeout_secs: 30 }, flash) {
         Ok(m) => m.with_deadline(Duration::from_secs(300)),
         Err(e) => fatal("OTA manager", &e),

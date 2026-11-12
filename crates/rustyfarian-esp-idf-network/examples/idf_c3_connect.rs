@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         WiFiConfig::new(SSID, password()).with_peripherals(peripherals.modem, sys_loop, Some(nvs));
     let wifi = WiFiManager::init(config)?;
 
-    let ip = wifi.wait_connected(30_000)?;
+    let ip = wifi.wait_connected_timeout(30_000)?;
     log::info!("Wi-Fi connected — IP: {}", ip);
 
     Ok(())

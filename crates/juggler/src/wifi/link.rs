@@ -3,7 +3,7 @@
 //! [`LinkMachine`] decides *when* to (re)connect; the tier decides *how*.
 //! Feed it a [`LinkInput`], perform the returned [`LinkAction`], repeat.
 //! The ESP-IDF tier runs it on a worker thread fed by the system event loop,
-//! the esp-hal tier inside `WifiLink::run`.
+//! the esp-hal tier inside `WiFiManager::run`.
 //!
 //! Back-off starts at [`RECONNECT_BACKOFF_BASE_MS`], doubles per failed
 //! attempt or link loss, caps at [`RECONNECT_BACKOFF_MAX_MS`] and resets on

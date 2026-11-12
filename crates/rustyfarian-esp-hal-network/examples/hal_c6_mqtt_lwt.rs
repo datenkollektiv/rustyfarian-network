@@ -46,13 +46,13 @@ use rustyfarian_esp_hal_network::mqtt::{
     LwtConfig, MqttBuilder, MqttConfig, MqttHandle, MqttRunner, QoS, TryPublishError,
 };
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 const TICK_SECS: u64 = 5;
 const HEAP_LOG_SECS: u64 = 60;

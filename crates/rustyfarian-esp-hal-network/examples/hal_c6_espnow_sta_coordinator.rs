@@ -52,7 +52,7 @@ use esp_println::println;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::espnow::{EspHalEspNow, EspNowConfig};
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, Country, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, Country, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 use static_cell::StaticCell;
 
@@ -61,7 +61,7 @@ mod espnow_echo_app;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 const CONNECT_BACKOFF_MS: u64 = 5000;
 

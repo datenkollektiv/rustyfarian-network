@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WiFiManager::ip() -> Option<Ipv4Addr>` on both tiers: the station's address while ready (tier parity Step 10, ADR 022).
+- `rustyfarian-esp-idf-network` `WiFiManager::wait_connected_timeout(timeout_ms) -> Result<Ipv4Addr>`: the blocking wait under its new name.
+- `juggler::wifi::MockLink::set_ip`: the address the mock reports while `Connected`.
+
+### Changed
+
+- **Breaking:** `juggler::wifi::NetworkLink` requires `fn ip(&self) -> Option<core::net::Ipv4Addr>`, so generic code can read the station address; both tiers forward to `WiFiManager::ip`.
+- **Breaking:** `rustyfarian-esp-idf-network` `WiFiManager::wait_connected()` is now async and returns `()`, the same call as on esp-hal; blocking callers move to `wait_connected_timeout(timeout_ms)`.
+- `rustyfarian-esp-hal-network` the link supervisor `WifiLink` is now `WiFiManager`, the IDF name; `WiFiManager::init_async` and `init_softap_async` are unchanged, and firmware declares `static LINK: WiFiManager = WiFiManager::new();`.
+- `rustyfarian-esp-hal-network` `AP_IP` is spelled `core::net::Ipv4Addr` (the same type as before).
+
+### Deprecated
+
+- `rustyfarian-esp-hal-network` `wifi::WifiLink`: a type alias of `WiFiManager`.
+- `rustyfarian-esp-hal-network` `AsyncWifiHandle::wait_for_ip`: use `WiFiManager::wait_connected` and `WiFiManager::ip`.
+
 ## [0.7.0] - 2026-11-12
 
 ### Added

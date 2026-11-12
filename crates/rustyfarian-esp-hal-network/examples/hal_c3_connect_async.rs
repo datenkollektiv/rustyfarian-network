@@ -34,12 +34,12 @@ use esp_backtrace as _;
 use esp_println::println;
 use esp_radio::wifi::Interface;
 use rustyfarian_esp_hal_network::wifi::{
-    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager, WifiLink,
+    link_task, AsyncWifiHandle, WiFiConfig, WiFiConfigExt, WiFiManager,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static LINK: WifiLink = WifiLink::new();
+static LINK: WiFiManager = WiFiManager::new();
 
 const SSID: &str = match option_env!("WIFI_SSID") {
     Some(s) => s,

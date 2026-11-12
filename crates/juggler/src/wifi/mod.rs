@@ -322,7 +322,7 @@ pub struct WiFiConfig<'a> {
     pub password: &'a str,
     /// How the ESP-IDF `WiFiManager` constructor waits for the link (see
     /// [`ConnectMode::effective_timeout_secs`]). The esp-hal tier ignores it: a
-    /// firmware there waits through `WifiLink::wait_connected`.
+    /// firmware there waits through `WiFiManager::wait_connected`.
     pub connect_mode: ConnectMode,
     pub power_save: WifiPowerSave,
     pub tx_power: TxPowerLevel,
@@ -629,7 +629,7 @@ pub fn credentials_hint(reason: u16) -> &'static str {
 ///
 /// The ESP-IDF tier logs this directly; the esp-hal tier shares the hint but not
 /// the code formatting, because esp-radio reports a named reason instead of the
-/// numeric code and `WifiLink` logs that name followed by [`credentials_hint`]'s
+/// numeric code and the esp-hal `WiFiManager` logs that name followed by [`credentials_hint`]'s
 /// text.
 ///
 /// ```ignore
