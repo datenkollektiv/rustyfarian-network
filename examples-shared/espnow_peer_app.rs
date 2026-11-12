@@ -1,4 +1,4 @@
-//! One ESP-NOW peer application for both tiers (ADR 022, parity plan Step 7).
+//! One ESP-NOW peer application for both tiers (ADR 022).
 //!
 //! `idf_c3_espnow_peer` and `hal_c3_espnow_peer` include this file with
 //! `#[path = "../../../examples-shared/espnow_peer_app.rs"] mod espnow_peer_app;`.

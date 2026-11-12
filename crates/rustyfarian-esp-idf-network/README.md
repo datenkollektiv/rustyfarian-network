@@ -147,6 +147,12 @@ Design detail: [Wi-Fi suspend, resume and deep sleep](https://github.com/datenko
 | Inbound retain and QoS | Not reported (retain is always false, QoS always `AtMostOnce`)                         | Reported                                                         |
 | Executor               | std threads; `block_on` for the async app                                              | `esp-rtos` plus the embassy executor                             |
 | Suspend call           | Blocking; the radio is stopped when it returns, so `wait_suspended()` is ready at once | Non-blocking signal; `wait_suspended()` completes once suspended |
+| ESP-NOW sender         | Worker thread `espnow-tx` (6 KiB stack), started by the constructors, joined on drop    | `run_sender()` in a firmware task; without it async sends and scans fail with `NoSenderRunner` |
+| ESP-NOW sync send      | `send_and_wait(mac, data, timeout_ms)` queues behind async sends; `send` gives up after `SEND_QUEUE_DEADLINE` (1 s) | `send_and_wait(mac, data)`, no timeout; bypasses the queue and returns `Busy` while a send is in flight |
+| ESP-NOW blocking scan  | `scan_for_peer_blocking`, `init_with_radio_scanning`                                   | Async `scan_for_peer` only                                       |
+| ESP-NOW receive queue  | 32 frames by default (`init_with_capacity` sets it); a frame at a full queue is dropped and counted in a warning | 10 frames, fixed by `esp-radio`; drops the oldest |
+| ESP-NOW `try_recv`     | Draws from the same queue as `receive`; a frame taken there is not seen by `receive`   | Returns `None`                                                   |
+| ESP-NOW stop           | `shutdown()` or drop                                                                   | `shutdown()` only; no `Drop`, because futures borrow the handle  |
 
 ## Integration with juggler
 

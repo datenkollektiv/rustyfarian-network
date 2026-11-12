@@ -18,7 +18,7 @@ ADRs in `docs/adr/` document each architectural split.
 
 | Pure (no_std + optional `std`)      | ESP-IDF (std)                                          | esp-hal (no_std bare-metal)                            |
 |:------------------------------------|:-------------------------------------------------------|:-------------------------------------------------------|
-| **`juggler`** (Phase 1 ✓ merged)    | **`rustyfarian-esp-idf-network`** (Phases 2–3 ✓ merged) | **`rustyfarian-esp-hal-network`** (Phases 2–3 ✓ merged) |
+| **`juggler`** (✓ merged)    | **`rustyfarian-esp-idf-network`** (✓ merged) | **`rustyfarian-esp-hal-network`** (✓ merged) |
 
 Domain features are feature-gated per crate:
 

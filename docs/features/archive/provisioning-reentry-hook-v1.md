@@ -6,7 +6,7 @@ desk-work: available
 # Feature: Provisioning re-entry hook v1
 
 An optional hook the consumer answers once per boot, before the store is read, so a held button can reopen the portal or request a factory reset.
-Part 6 of [`wifi-portal-fallback-v1.md`](../wifi-portal-fallback-v1.md); second consumer is spookhouse (`review-queue/archive/rustyfarian-network-reentry-hook-reply-v1.md`).
+Part 6 of [`wifi-portal-fallback-v1.md`](../wifi-portal-fallback-v1.md); second consumer is spookhouse (reply of 2026-10-28).
 
 ## Decisions
 |                                                            Decision | Reason                                                                | Rejected Alternative                                       |

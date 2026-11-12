@@ -1,5 +1,5 @@
 # ESP-NOW peer session across a coordinator power cycle (esp-hal peer and ESP-IDF peer against the C6 coordinator).
-# Both peers run the shared peer app on `PeerSession` (parity plan Step 7) and print the same lines, so one set of
+# Both peers run the shared peer app on `PeerSession` and print the same lines, so one set of
 # steps judges the hal peer `hal_c3_espnow_peer` and the ESP-IDF peer `idf_c3_espnow_peer` in turn.
 # The runbook pairs the C3 with the C6 in both directions, so run the check twice, with a different coordinator on
 # the C6 each time (`ESPFLASH_PORT=<c6 port> just run <coordinator>` before the run, note the printed STA MAC):

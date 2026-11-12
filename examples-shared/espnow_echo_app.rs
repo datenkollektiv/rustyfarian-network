@@ -1,4 +1,4 @@
-//! One ESP-NOW coordinator application for both tiers (ADR 022, parity plan Step 5).
+//! One ESP-NOW coordinator application for both tiers (ADR 022).
 //!
 //! `idf_c3_espnow_coordinator` and `hal_c6_espnow_sta_coordinator` include this file with
 //! `#[path = "../../../examples-shared/espnow_echo_app.rs"] mod espnow_echo_app;`.

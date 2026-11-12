@@ -11,7 +11,7 @@
 //!   shared app drains.
 //! * Everything else — the 5 s tick on `<prefix>/tick`, link and MQTT state logs, the free
 //!   heap, and the suspend demo — is the shared app, and its lines start with `[app]`.
-//! * Measurement lines (Step 8c): after each `[app] connect #N free heap` line the
+//! * Measurement lines: after each `[app] connect #N free heap` line the
 //!   shared app adds `[app] connect #N min free heap: Y B` and one `[app] stack unused <name>: N B`
 //!   per task (`main`, `mqtt-events`, `mqtt-net`, `mqtt_task`), and after the minute heap line
 //!   `[app] heap min free: Y B`. The library names its own tasks (`mqtt-events`, `mqtt-net`).

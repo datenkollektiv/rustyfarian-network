@@ -372,7 +372,7 @@ impl<F: NorFlash> ProvisioningStore<F> {
     /// bounded read — a 12-byte header read followed by a read of exactly
     /// `record_len` bytes (≤ `MAX_RECORD_LEN` = 1280 B) — so the transient
     /// read-buffer contribution is ~1280 B, not the 4 KiB it was before the
-    /// Phase 2B optimisation.
+    /// bounded-read optimisation.
     ///
     /// `plan_save` also holds two `Option<DecodedRecord>` and `decode_record`
     /// builds an extras vector, so the buffers are not the whole story.

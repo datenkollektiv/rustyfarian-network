@@ -5,10 +5,9 @@ desk-work: available
 
 # Feature: ESP-NOW Tier Parity v1
 
-Goal: ESP-NOW consumer code is exchangeable between the tiers ([ADR 022](../adr/022-tier-parity-one-async-api.md), Phase 6 of the [tier-parity plan](tier-parity-v1-plan.md)).
-Prerequisite for [espnow-peer-link-v1](archive/espnow-peer-link-v1.md).
-Plan: [espnow-tier-parity-v1-plan](espnow-tier-parity-v1-plan.md), with the step list and the approved breaking changes.
-Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md), with the extraction rules and the scope findings.
+Goal: ESP-NOW consumer code is exchangeable between the tiers ([ADR 022](../../adr/022-tier-parity-one-async-api.md), Phase 6 of the [tier-parity plan](../tier-parity-v1-plan.md)).
+Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
+The breaking changes are in `CHANGELOG.md` (0.7.0), the remaining tier differences in the crate READMEs' capability tables, and the esp-hal design in [ADR 020](../../adr/020-esp-hal-espnow-owned-radio-and-sync-shim.md).
 
 ## Decisions
 
@@ -28,7 +27,7 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - ADR 020 holds: on esp-hal the trait sits on the `run_sender` runner.
 - ADR 012 holds: scanning needs a driver-owned radio on ESP-IDF.
 - esp-hal ESP-NOW is unreleased, so its API changes freely.
-- ESP-IDF breaks B1–B6 and the `scan_for_peer` rename are approved (2026-11-03); see the plan.
+- ESP-IDF breaks B1–B6 and the `scan_for_peer` rename are approved (2026-11-03); see `CHANGELOG.md`.
 - Every step ends with `just fmt`, `just verify`, `just clippy-hal` and `just build-example` for touched examples.
 
 ## Requirements
@@ -42,10 +41,10 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - Receive is part of the shared trait (`async` receive returning the sender MAC), because the peer link counts received frames and portable apps must not need a tier receive path.
 
 ## Open Questions
-- [x] Trait and method names: `send_async` / `recv_async` (esp-hal today) or `send` / `receive`? — `EspNowLink` with `send_acked` / `receive`, see the plan
+- [x] Trait and method names: `send_async` / `recv_async` (esp-hal today) or `send` / `receive`? — `EspNowLink` with `send_acked` / `receive`
 - [x] Does the trait cover receive, or does each tier keep its own receive path? — yes, see Requirements
 - [x] Do the sync `send_and_wait` forms converge (ESP-IDF takes `timeout_ms`, esp-hal does not)? — no, a capability row; esp-hal's sync send spins in esp-radio
-- [ ] Stack and heap cost of the `espnow-tx` worker, measured against the old per-connect MQTT helper thread.
+- [x] Stack and heap cost of the `espnow-tx` worker, measured against the old per-connect MQTT helper thread. — 6 KiB stack (`CHANGELOG.md`); the comparison was not measured
 
 ## State
 - [x] Design approved
@@ -56,7 +55,7 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - [x] Parity compile check on both tiers
 - [x] Tests passing
 - [x] Hardware: `c3/espnow-peer-session` passed on both tiers (plan Step 8)
-- [ ] Documentation updated (plan Step 9: README capability rows, ADR 020 amendment, ADR 022 gap table, roadmap hygiene, archive)
+- [x] Documentation updated (README capability rows, ADR 020 amendment, archive)
 
 <details><summary>Acceptance</summary>
 
@@ -70,3 +69,4 @@ Inventory: [espnow-tier-parity-v1-inventory](espnow-tier-parity-v1-inventory.md)
 - 2026-11-03 — Feature doc created, split from the peer-link request; design review folded in; inventory and step plan written, B1–B6, names and juggler deps approved; two released ESP-IDF bugs found (stale ACK, oversize receive); review contracts settled
 - 2026-11-11 — Plan Steps 5 to 7 done: shared echo app on both coordinators (inside the probe-reply feature), `PeerSession` in juggler, shared `examples-shared/espnow_peer_app.rs` in `idf_c3_espnow_peer` and `hal_c3_espnow_peer`
 - 2026-11-12 — Bench check `c3/espnow-peer-session` passed on both tiers; espnow-peer-link-v1 archived; Step 9 docs open
+- 2026-11-12 — Step 9 done: capability rows in both READMEs, ADR 020 amended; plan and inventory deleted (their content lives in the code, `CHANGELOG.md`, the READMEs and the ADRs); archived

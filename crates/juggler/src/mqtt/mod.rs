@@ -738,16 +738,16 @@ pub trait SubscribeClient {
 /// skipped) should react to `false` by confirming/cleaning up whatever
 /// bookkeeping was expecting the thread to run.
 ///
-/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// Dated 2026-11-11: the ESP-IDF tier now runs the work
 /// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
 /// helper thread exists any more.
 ///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
 #[deprecated(
-    note = "no tier spawns a connect helper through this since tier-parity Step 8b-2: \
+    note = "no tier spawns a connect helper through this since the network gate: \
             the ESP-IDF session runs its connect work on its own worker and reports \
-            to `SessionMachine` (since Step 8c the ESP-IDF tier runs that work on its \
+            to `SessionMachine` (since 2026-11-11 the ESP-IDF tier runs that work on its \
             mqtt-net runner thread); slated for removal in 1.0 (ADR 022)"
 )]
 pub fn spawn_connect_thread<C, F>(
@@ -811,14 +811,14 @@ where
 /// failure (logged internally as a warning) is not actionable here — the next
 /// reconnect will simply retry.
 ///
-/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// Dated 2026-11-11: the ESP-IDF tier now runs the work
 /// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
 /// subscriber thread exists any more.
 ///
 /// Requires the `std` feature (uses `std::thread` and `std::sync`).
 #[cfg(feature = "std")]
 #[deprecated(
-    note = "no tier uses it since tier-parity Step 8b-2; the session machine's connect \
+    note = "no tier uses it since the network gate; the session machine's connect \
             work covers subscriptions, and it is slated for removal in 1.0 (ADR 022)"
 )]
 pub fn spawn_subscriber_thread<C>(
@@ -1104,7 +1104,7 @@ pub struct EpochToken(u32);
 /// is already in flight — see the "Stale-thread safety" section of
 /// [`spawn_connect_thread`] for what a stale helper can and cannot do.
 ///
-/// Dated 2026-11-11 (tier-parity Step 8c): the ESP-IDF tier now runs the work
+/// Dated 2026-11-11: the ESP-IDF tier now runs the work
 /// on its runner thread, one [`ConnectWorkMachine`] action per turn, so no
 /// helper thread exists any more and no stale helper can race this epoch.
 ///
@@ -1115,7 +1115,7 @@ pub struct EpochToken(u32);
 #[cfg(feature = "std")]
 #[deprecated(
     note = "the shared `SessionMachine` guards stale sessions with `SessionToken` since \
-            tier-parity Step 8b-1, and no tier uses this epoch; slated for removal in \
+            `MqttHandle` moved onto it, and no tier uses this epoch; slated for removal in \
             1.0 (ADR 022)"
 )]
 #[derive(Default, Debug)]

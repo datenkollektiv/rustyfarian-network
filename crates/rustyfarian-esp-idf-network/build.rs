@@ -17,7 +17,7 @@ fn main() {
     // Enables the suspend/resume demo in the S3 LWT examples; without a trigger
     // the example keeps the value it was last compiled with.
     println!("cargo:rerun-if-env-changed=MQTT_SUSPEND_DEMO");
-    // Enables the measurement `on_connect` in `idf_esp32s3_mqtt_lwt` (Step 8c).
+    // Enables the measurement `on_connect` in `idf_esp32s3_mqtt_lwt`.
     println!("cargo:rerun-if-env-changed=MQTT_ON_CONNECT_DEMO");
     println!("cargo:rerun-if-env-changed=OTA_URL");
     // Rerun triggers for the OTA runtime example (firmware version, topic prefix).

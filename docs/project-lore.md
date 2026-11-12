@@ -235,7 +235,7 @@ Fix: `esp_pthread_set_cfg` with `thread_name` before the spawn — see rustdoc o
 **The `mqtt-net` runner cannot deadlock on `api_lock` (ADR 023, dated 2026-11-11), and `esp_mqtt_client_reconnect` / `_disconnect` take no lock at all.**
 `api_lock` is taken by `start`, `subscribe`, `enqueue` and `stop`; reconnect and disconnect only set event-group bits.
 The event-loop thread never waits on the runner (only unbounded `Session::send`, inbound pushes, `PendingAcks`), so a blocked step ends within one `mqtt_task` iteration.
-Before Step 8c an empty connect plan skipped the runtime catch-up and later `MqttHandle::subscribe` calls were stored, not sent — see `an_empty_plan_still_finishes_before_reporting_done`.
+Before the MQTT thread memory change an empty connect plan skipped the runtime catch-up and later `MqttHandle::subscribe` calls were stored, not sent — see `an_empty_plan_still_finishes_before_reporting_done`.
 
 ---
 

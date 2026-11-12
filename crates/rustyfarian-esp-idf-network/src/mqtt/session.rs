@@ -1,5 +1,5 @@
 //! Session state shared by the runner thread, the event-loop thread and every
-//! [`MqttHandle`](super::MqttHandle) clone (ADR 022, tier-parity Step 8b).
+//! [`MqttHandle`](super::MqttHandle) clone (ADR 022).
 //!
 //! The shared [`SessionMachine`] is the single source of state, readiness, the
 //! publish gate and the connect count. Its mutex is never held across a client

@@ -5,7 +5,6 @@ desk-work: available
 
 # Feature: Wi-Fi reconnect and radio suspend/resume on both tiers v1
 
-Request U2f from `rustyfarian-knob` (milestone M8, `review-queue/rustyfarian-network-u2f-reconnect-and-suspend-resume.md`).
 The IDF `WiFiManager` connected once and only logged `StaDisconnected`, so a router outage left the station down until reboot.
 On esp-hal every example carried its own copy of the reconnect loop, so a fix there had seven places to land.
 Neither tier could take the radio down before deep sleep and bring it back in the same boot.
@@ -46,14 +45,14 @@ Neither tier could take the radio down before deep sleep and bring it back in th
 
 ## State
 - [x] Design approved
-- [x] PR 1 (U2f-a): `LinkMachine` without suspend, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, publish parity
-- [x] PR 2 (U2f-b): suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
+- [x] PR 1: `LinkMachine` without suspend, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, publish parity
+- [x] PR 2: suspend inputs, `suspend()`/`resume()` on both tiers, demo flag, deep-sleep docs
 - [x] Tests passing
 - [x] Documentation updated
 - [x] Hardware: bench checks `s3/mqtt-scenarios` (attended) and `s3/suspend`, both tiers
 
 ## Session Log
-- 2026-10-31 — Feature doc created from request U2f; PR 1 implemented on `reconnect-rework` (`LinkMachine`, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, IDF `try_publish*` gate, IDF reconnect fix, runbook `wifi-reconnect-hardware-test.md`) and its review applied
+- 2026-10-31 — Feature doc created; PR 1 implemented on `reconnect-rework` (`LinkMachine`, IDF worker, `WifiLink`, 7 hal examples converted, `idf_esp32s3_mqtt_lwt`, IDF `try_publish*` gate, IDF reconnect fix, runbook `wifi-reconnect-hardware-test.md`) and its review applied
 - 2026-11-01 — PR 2 implemented (suspend/resume on both tiers, `MQTT_SUSPEND_DEMO`, deep-sleep guide `docs/wifi-suspend-and-deep-sleep.md`, runbook R3); four review rounds moved the adapters into juggler `LinkHandover` / `LinkSupervisor` and left the stop fence without a timeout (only `Stopped` re-admits link events, in-order no-loss event contract documented)
 - 2026-11-02 — `suspend` now reports readiness before the radio stops; R3 and the ESP-IDF R1 passed on the CrowPanel S3
 - 2026-11-11 — R1 and R3 passed on both tiers as bench checks `s3/mqtt-scenarios` (attended) and `s3/suspend`; state gate closed

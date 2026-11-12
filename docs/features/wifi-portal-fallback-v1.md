@@ -70,7 +70,7 @@ Only the consumer erases, on an explicit request (a `FactoryReset` hook answer o
 
 Spookhouse benched a counter: failed joins are classified and counted in NVS (`sh_net`), limit 5, restart into a fallback portal that keeps and pre-fills the record, 10 min timeout, count cleared on a BOOT erase, a commit, and when the portal opens.
 Spookhouse migrates to the library counter and drops its own once it lands; rgb-clock remains the first consumer.
-Source: `review-queue/archive/rustyfarian-network-reentry-hook-reply-v1.md`.
+Source: spookhouse's reply of 2026-10-28.
 
 </details>
 
@@ -113,9 +113,9 @@ A fallback portal on a deployed node is therefore open by default unless the con
 
 Options to weigh:
 
-- [ ] Allow only the Wi-Fi fields in fallback mode; the MQTT broker stays as stored (changing it still needs a factory reset).
-- [ ] Protect the fallback portal with a WPA2 passphrase derived from the device (printed on a label).
-- [ ] Require physical presence, BOOT held ≥3 s and sampled after boot, to unlock broker changes.
+- [x] Allow only the Wi-Fi fields in fallback mode; the MQTT broker stays as stored (changing it still needs a factory reset). (rgb-clock: wanted, removes the OTA takeover path)
+- [ ] Protect the fallback portal with a WPA2 passphrase derived from the device (printed on a label). (rgb-clock: not needed, its clocks have no label)
+- [ ] Require physical presence, BOOT held ≥3 s and sampled after boot, to unlock broker changes. (rgb-clock: not wanted, the factory reset covers broker changes)
   - On ESP32-C3 GPIO9 is a strapping pin, so BOOT held at reset enters download mode instead of the portal.
 - [x] Count only credential failures toward the threshold; network-absent boots never open the portal (network-absent has its own threshold; 0 = never).
 
@@ -123,12 +123,14 @@ Options to weigh:
 
 - [x] Default threshold and portal window for the `WifiMqttDevice` profile (5 credential failures, 10 min).
 - [x] Should a repeated `NO_AP_FOUND` (renamed SSID) open the portal at all, or only credential failures? (yes, on its own higher threshold)
-- [ ] Default network-absent threshold — 20 boots proposed, 0 disables.
-- [ ] Does the esp-hal tier need the same fallback now, or is it tracked separately? (spookhouse: no demand)
-- [ ] Should the non-blocking connect path become the default for this profile, so reasons are available without a second code path?
+- [x] Default network-absent threshold — 20 boots proposed, 0 disables. (rgb-clock: 20; a router off overnight must not open the AP)
+- [x] Does the esp-hal tier need the same fallback now, or is it tracked separately? (later; spookhouse and rgb-clock have no demand)
+- [ ] Should the non-blocking connect path become the default for this profile, so reasons are available without a second code path? (rgb-clock: no preference, it only logs the reason)
 - [x] Re-entry hook vs consumer-owned trigger: hook with outcomes, consumer erases (2026-10-27).
 - [ ] Acceptance: a host test or bench run shows `ProvisioningStore::load` returns the pre-fallback record after a fallback portal times out with no commit.
 - [ ] Acceptance: no `erase_all` call on the counter-driven fallback path, checkable in review.
+- [ ] Acceptance (rgb-clock): a mistyped password on the IDF clock opens the portal after 5 boots without anyone touching it, and the stored broker is unchanged afterwards.
+- [x] A consumer may ignore `FallbackPortal` while an OTA image is pending verification, since the library cannot know the OTA state (rgb-clock enforces this).
 
 ## State
 
@@ -142,3 +144,4 @@ Options to weigh:
 - 2026-10-08 — Created from the `rustyfarian-rgb-clock` request (mistyped password left the C3 dark).
 - 2026-10-27 — A second consumer recorded, BOOT-at-reset option reworded, re-entry hook decided (option a, consumer erases) and split into `archive/provisioning-reentry-hook-v1.md`.
 - 2026-10-28 — Updated: counter phase planned — separate credential and network-absent counters, threshold 5, FallbackPortal outcome, 10 min window, counts in rf_prov.
+- 2026-11-12 — Updated: rgb-clock's reply of 2026-11-01 folded in (Wi-Fi-only fallback wanted, threshold 20, esp-hal later); it adopts the re-entry hook with 0.7.0

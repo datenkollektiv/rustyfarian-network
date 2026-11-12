@@ -9,7 +9,7 @@ The canonical sign-off anchor is the State checklist in [esp-hal-mqtt-v1.md](../
 ## Context
 
 `docs/ROADMAP.md` gates the bare-metal MQTT domain behind an "async MQTT decision ADR" and names `minimq` as the intended base.
-Three consumers now wait on it: the rgb-puzzle brain (ESP32-C6), `rustyfarian-rgb-clock` (ADR 015) and `rustyfarian-knob` (ESP32-S3, request U2b).
+Three consumers now wait on it: the rgb-puzzle brain (ESP32-C6), `rustyfarian-rgb-clock` (ADR 015) and `rustyfarian-knob` (ESP32-S3).
 The bare-metal estate is async-only: `esp-radio 1.0.0-beta.1` exposes Wi-Fi solely through `embassy-net` (ADR 015, lore "esp-hal Bare-Metal Stack").
 
 The estate pins the September 2026 wave: `esp-hal =1.2.2`, `esp-radio =1.0.0-beta.1`, `esp-rtos =0.4.0`, `embassy-net =0.8.0`, `embassy-time =0.5.1`, `embassy-sync =0.8.0`, `heapless 0.9`.
@@ -133,7 +133,6 @@ Non-goal: the HAL tier does not replay unacknowledged in-flight QoS 1 publishes 
 ## References
 
 - `docs/features/archive/esp-hal-mqtt-v1.md` — feature doc and sign-off anchor.
-- Upstream request U2b from the `rustyfarian-knob` esp-hal parity quest (filed 2026-10-14, S3 as a first-class chip, knob as a consumer).
 - [ADR 015](015-esp-hal-provisioning.md) — bare-metal estate constraints and the hand-rolled fallback rule.
 - [ADR 017](017-mqtt-callback-threading-contract.md) — IDF-tier callback contract this ADR deliberately does not port.
 - `docs/project-lore.md` § "esp-hal Bare-Metal Stack", § "MQTT Event Loop".

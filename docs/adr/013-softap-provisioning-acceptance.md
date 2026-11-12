@@ -7,7 +7,7 @@ The four-field framing in this document is historical and reflects the v1 accept
 
 ## Context
 
-The `rustyfarian-beekeeper` project's Milestone 5 (Field Provisioning) needs a
+The `rustyfarian-beekeeper` project needs a
 captive-portal SoftAP provisioning flow so beekeepers can configure devices in
 the field without a build toolchain.
 A feature request was filed asking that the capability live in `rustyfarian-network` as a reusable crate
@@ -58,11 +58,11 @@ already provided here, and every Rustyfarian field device will need
 provisioning eventually.
 
 Scheduling is **Long-term**, not Near or Midterm.
-Implementation does not preempt the currently blocked Phase 5 TTN v3 OTAA
+Implementation does not preempt the currently blocked TTN v3 OTAA
 validation, the active `esp-hal` Wi-Fi async polish, or the open MQTT
 subscribe-during-shutdown race fix.
 The roadmap entry sits below those workstreams and is picked up when capacity
-opens or when the beekeeper Milestone 5 timeline forces the issue —
+opens or when the beekeeper timeline forces the issue —
 whichever comes first.
 
 The alternatives identified in the feature request are rejected:
@@ -170,7 +170,7 @@ declining would push the implementation into a worse architectural location
 Deferring to Long-term, rather than Midterm, honours a separate principle:
 the workspace prefers to finish the workstreams it has started before opening
 new ones.
-Phase 5 TTN validation, the bare-metal Wi-Fi polish, and the MQTT
+TTN validation, the bare-metal Wi-Fi polish, and the MQTT
 subscribe-race fix are all in flight; adding provisioning to Near or Midterm
 would dilute attention without changing the beekeeper timeline materially.
 
@@ -228,7 +228,7 @@ Centralising those rules is what `*-pure` crates are for.
   re-implementations across downstream firmware.
 - **HTTP scope stays honest** — the README's general-purpose HTTP out-of-scope
   line survives; only the provisioning line changes.
-- **Beekeeper Milestone 5 unblocks cleanly when capacity opens** — the
+- **Beekeeper unblocks cleanly when capacity opens** — the
   requesting downstream gets the architectural surface it asked for, in the
   shape it asked for, without having to host the implementation itself.
 
@@ -239,7 +239,7 @@ Centralising those rules is what `*-pure` crates are for.
   `VISION.md` and the README must be updated to reflect this when the ADR
   lands; both files still describe the workspace as Wi-Fi/MQTT-first.
 - **A Long-term commitment now exists with a downstream timeline attached** —
-  beekeeper Milestone 5 will eventually push on this; if the rest of the
+  beekeeper will eventually push on this; if the rest of the
   Long-term roadmap shifts, the beekeeper schedule reacts.
 - **The four-field schema is opinionated** — host applications that need
   fundamentally different provisioning data (no LoRaWAN, no OTA) carry unused

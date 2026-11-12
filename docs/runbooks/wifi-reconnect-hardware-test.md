@@ -1,9 +1,9 @@
 # Runbook: Wi-Fi Reconnect Hardware Test (both tiers)
 
-Run this after any change to `juggler::wifi::LinkMachine`, the IDF `WiFiManager` reconnect worker or the esp-hal `WifiLink`, and for the `rustyfarian-knob` M8 outage protocol.
+Run this after any change to `juggler::wifi::LinkMachine`, the IDF `WiFiManager` reconnect worker or the esp-hal `WifiLink`, and for the outage protocol.
 It covers a router-side outage (R1, R2) and the radio suspend/resume cycle (R3) on the two S3 LWT examples, one result per tier.
 
-Both examples compile `examples-shared/lwt_app.rs` (ADR 022 Step 9), so the app's own lines start with `[app]`, both tiers print the same `[wifi]` and `[mqtt]` library lines, and the tier shows only in the `[app] start <example> (esp-hal|esp-idf)` boot line.
+Both examples compile `examples-shared/lwt_app.rs` (ADR 022, one application on two tiers), so the app's own lines start with `[app]`, both tiers print the same `[wifi]` and `[mqtt]` library lines, and the tier shows only in the `[app] start <example> (esp-hal|esp-idf)` boot line.
 
 **Reference device:** CrowPanel 1.28" HMI ESP32-S3 (`hal_esp32s3_mqtt_lwt` and `idf_esp32s3_mqtt_lwt`, console on the USB-Serial-JTAG port).
 
@@ -22,7 +22,7 @@ Facts the checks do not encode:
 
 - R1, IDF: the reconnect follows the `sta ip:` line within about a second, with no `Error transport connect` and no `[mqtt] reconnecting in` line, because the session is gated on the link; ticks `queued` between the pause and `[mqtt] disconnected` may arrive after the reconnect (esp-mqtt outbox, QoS 1), a `would block` tick never does.
 - R1: the app samples the MQTT state every 5 s and may miss a short `Connecting` phase; check each retry by its per-attempt lines (`[mqtt] connecting to`, `[mqtt] reconnecting in`, plus `[mqtt] tcp connect failed` on hal and `Transport connected` on IDF).
-- R1: record the time from the un-pause to the first `queued` tick; expect under 45 s on hal (back-off at most 30 s plus the MQTT connect) and under 35 s on IDF (at most one 30 s Wi-Fi back-off plus the connect).
+- R1: record the time from the un-pause to the first `queued` tick; expect under about 75 s on both tiers (up to two 30 s back-off periods when the router has not re-admitted the device yet, plus the MQTT connect; on hal a timed-out first TCP connect adds the 10 s MQTT retry).
 - R3, IDF: the suspend logs `[wifi] disconnected — reason 8` and one `[mqtt] error` plus `[mqtt] disconnected` as the transport's dying gasp; a tick `queued` between the suspend and `[mqtt] disconnected` may still reach the broker after the resume.
 - R3: on resume IDF reconnects at esp-mqtt's next retry (up to about 10 s), hal within seconds; the minute `[app] heap free` line must stay stable across cycles.
 
@@ -42,7 +42,7 @@ Earlier results; the 0.7.0 results are in the [release runbook](release-0.7.0-ha
 - R2 pass on an ESP32-C3: hal with the hint on `FourWayHandshakeTimeout` and the ladder capped at 30000 ms (`tmp/c3-r2-hal3.log`); IDF with the hint on `reason 15`, none on `205`, capped at 30000 ms (`tmp/c3-r2-idf-async4.log`).
 - R3 pass on both tiers (CrowPanel S3): 3 cycles each, broker `offline` then `online`; hal `link up #2/#3`, no retry line, `demo: resume` to `[mqtt] connected` sub-second; IDF gate parks before the drop, 3.6 s from `demo: resume` to `[mqtt] connected` (3.5 s association, 80 ms MQTT connect).
   On IDF the suspend still logs one `[mqtt] error: ESP_FAIL` when the radio stops under esp-mqtt; suppressing it would need `suspend` to wait for the client to close, which no handshake offers today.
-- 2026-11-03, `f81d83e` plus the Step 9 shared app:
+- 2026-11-03, `f81d83e` plus the shared app:
   - R1 hal: `[wifi] disconnected — AuthenticationLeave`, back-off 1000 to 30000 ms, `wifi link Connected -> Backoff`, `mqtt state Connected -> Disconnected`, ticks `would block`, broker `offline`; one attempt after the unblock still failed `AuthenticationExpired` (the router had not applied the removal yet), the next reached `link up #2`, `connect #2 free heap: 25880 B` and `tick #38 queued`.
   - R1 IDF: `reason 2 (AUTH_EXPIRE)` then `reason 205 (CONNECTION_FAIL)`, ladder up to 30000 ms (attempt 8), broker `offline`; `sta ip: 192.168.31.179` about 21 s after the unblock, `[mqtt] network up, connecting` 110 ms later, `connect #2 free heap: 205724 B`, `tick #95 queued`.
   - R3 hal: three cycles, `link up` and `connect` #2 to #4, heap flat at 25 928 B, no retry line while suspended.

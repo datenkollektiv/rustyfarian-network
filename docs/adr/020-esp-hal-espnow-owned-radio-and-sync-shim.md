@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted — 2026-10-30 by the maintainer; the implementation is in place and the hardware gates G-E1 and G-E2 in [esp-hal-espnow-v1.md](../features/archive/esp-hal-espnow-v1.md) stay open.
+Accepted — 2026-10-30 by the maintainer; the implementation is in place, the hardware gate G-E1 passed as bench check `c3/espnow-soak`, and the hardware gate G-E2 moved to the downstream consumer project, see [esp-hal-espnow-v1.md](../features/archive/esp-hal-espnow-v1.md).
 Decision 1 and the Consequences were amended in place on 2026-10-30 after an external review (the settle window was replaced by the sender runner `EspHalEspNow::run_sender`) and on 2026-10-31 after a third review (probe deadlines, in-flight transmissions waited out, a single runner enforced).
+Amended in place on 2026-11-12 after ESP-NOW tier parity (ADR 022): the async helpers were renamed and the driver keeps the pinned channel, see Decision 1 and Decision 3.
 
 ## Context
 
@@ -28,12 +29,12 @@ The idf tier's `scan_for_peer` (ADR 009, with the confirmation gating of the roa
    Async sends and scan probes never touch the cell: they queue their frame for `EspHalEspNow::run_sender`, a runner that is spawned once in a task that is never cancelled, polls every send to completion and never drops a `SendFuture`.
    Only one runner runs per handle; a second concurrent runner logs an error and idles.
    Async callers serialize on an async mutex and wait for their own completion, so they receive `NoSenderRunner` when no runner is active, not `Busy`.
-   Inherent async helpers (`recv_async`, `send_async`, `send_async_timeout`, an async `scan_for_peer`) serve embassy tasks; a timeout is an absolute `embassy_time` deadline that bounds queueing and the start of transmission.
+   The async helpers serve embassy tasks: `send_acked` (a method of the shared `juggler::espnow::EspNowLink` trait, taking a `Duration` timeout), `receive` and `scan_for_peer(&mac, &config)`; a timeout is an absolute `embassy_time` deadline that bounds queueing and the start of transmission.
    The runner drops a request whose deadline passed before its transmission started, unsent; a transmission that has already started is waited out, and the caller returns its real result even when that is later than the deadline.
 2. **Two constructors.** Caller-managed (the controller of a joined station, brain) and owned radio (unassociated station, no SSID, no `embassy-net`; matrix and nunchuk).
    Both need `esp_rtos::start` and a heap; neither needs an embassy executor for the sync API.
 3. **One scan algorithm.** `juggler::espnow::ScanMachine` is a pure, clock-injected state machine (`ScanInput` in, `ScanAction` out) that reproduces `EspIdfEspNow::scan_for_peer` exactly.
-   The hal tier drives it with `send_async_timeout` (through `send_probe`) and `embassy_time`; the idf tier has adopted it without behaviour change.
+   The hal tier drives it with probes queued on the shared `TxCore` send queue that `run_sender` takes, and `embassy_time`; the idf tier has adopted it without behaviour change.
 4. **Channel stability is gated, not assumed.**
    The owned radio ships as an unassociated station; the mitigation ladder (per-send `set_channel`, hidden AP+STA, promiscuous bracket) is applied only if gate G-E1 fails, because ADR 012 showed the idle-scan drift is a blob property and the SoftAP-only answer changes the peer MAC.
 5. **Tuning.**
@@ -49,10 +50,10 @@ The idf tier's `scan_for_peer` (ADR 009, with the confirmation gating of the roa
 
 ### Negative
 
-- `send` blocks for the TX duration (about 1-30 ms) because `SendWaiter::drop` spins; async tasks should prefer `send_async`, which needs the sender runner.
+- `send` blocks for the TX duration (about 1-30 ms) because `SendWaiter::drop` spins; async tasks should prefer `send_acked`, which needs the sender runner.
 - The receive queue is 10 frames and drop-oldest; it cannot be enlarged without an upstream `esp-radio` change.
 - Everything rests on `#[instability::unstable]` `esp-radio` APIs pinned at `=1.0.0-beta.1`.
-- Channel drift on the unassociated station is unproven until G-E1 passes.
+- G-E1 passed (`c3/espnow-soak`), so the unassociated station showed no channel drift and the mitigation ladder of decision 4 stays unapplied.
 - A cancelled caller only stops waiting: the runner finishes the transmission and discards its result, so a late send callback cannot be taken as the next send's completion (`esp-radio` has one global send-callback flag and no sequence number).
   A timed-out caller whose transmission has started waits it out and gets the real result, and a request still queued at its deadline is dropped unsent, so the timeout bounds queueing and the start of transmission, not an in-flight transmission.
   The cost is a firmware requirement: `run_sender` must be spawned once (a second runner is rejected), and without it the async senders return `NoSenderRunner`.

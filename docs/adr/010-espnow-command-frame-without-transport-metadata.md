@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The ESP-NOW Peripheral Command Framework (Phase 1) introduces a `CommandFrame` struct for parsing binary commands in `espnow-pure`.
+The ESP-NOW Peripheral Command Framework introduces a `CommandFrame` struct for parsing binary commands in `espnow-pure`.
 A key design question was whether `CommandFrame` should include the sender MAC address or remain payload-only, with transport metadata passed separately at the dispatch site.
 
 The sender MAC is useful for routing responses, sender allowlisting, rate limiting, and deduplication.
@@ -44,7 +44,7 @@ It does not carry the sender MAC, RSSI, or any other transport metadata.
 
 The caller is responsible for threading transport metadata from `EspNowEvent` to the command handler at the dispatch site.
 
-A future `ReceivedCommand` or context wrapper may bundle `CommandFrame` + sender MAC for queuing and async dispatch (Phase 2 scope), but `CommandFrame` itself remains transport-independent.
+A future `ReceivedCommand` or context wrapper may bundle `CommandFrame` + sender MAC for queuing and async dispatch, but `CommandFrame` itself remains transport-independent.
 
 ## Consequences
 
@@ -69,9 +69,9 @@ The system range `0xF0..=0xFF` of `juggler::espnow::command` holds these tags; m
 
 | Tag | Name | Payload | Since |
 |:----|:-----|:--------|:------|
-| `0xF0` | `TAG_PING` | request empty; response `[0xF0, 0x01]` | Phase 1 |
-| `0xF1` | `TAG_SELF_TEST` | request empty; response `[0xF1, 0x00]` pass or `[0xF1, 0x01]` fail | Phase 1 |
-| `0xF2` | `TAG_IDENTIFY` | request empty; response `[0xF2, module_type, version]` | Phase 1 |
+| `0xF0` | `TAG_PING` | request empty; response `[0xF0, 0x01]` | Initial command framework |
+| `0xF1` | `TAG_SELF_TEST` | request empty; response `[0xF1, 0x00]` pass or `[0xF1, 0x01]` fail | Initial command framework |
+| `0xF2` | `TAG_IDENTIFY` | request empty; response `[0xF2, module_type, version]` | Initial command framework |
 | `0xF3` | `TAG_PROBE` | `[0xF3, seq, tx_channel]`, the scan probe (`ProbeFrame`) | [ADR 025](025-espnow-probe-reply-carries-channel.md) |
 | `0xF4` | `TAG_PROBE_REPLY` | `[0xF4, seq, tx_channel, home_channel]`, the coordinator's answer (`ProbeReply`) | [ADR 025](025-espnow-probe-reply-carries-channel.md) |
 

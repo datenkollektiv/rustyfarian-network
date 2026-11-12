@@ -4,7 +4,7 @@
 //! build selects `esp-println/auto` through the crate's dev-dependency.
 //! The firmware starts the `esp-rtos` scheduler itself in `main` and hands Wi-Fi only
 //! the `WIFI` peripheral (`with_wifi_scheduler_running`), the boot shape of a firmware
-//! that must also run without Wi-Fi (rustyfarian-knob, request U2e).
+//! that must also run without Wi-Fi (ADR 021).
 //!
 //! Sibling of `idf_esp32s3_mqtt_lwt`: same environment keys, same topics, same 5 s tick, and
 //! the same application body — `examples-shared/lwt_app.rs` is compiled into both examples,

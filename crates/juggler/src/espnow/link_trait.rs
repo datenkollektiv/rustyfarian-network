@@ -177,7 +177,7 @@ mod tests {
     ///
     /// The test below proves the generic API is usable.
     /// It is not tier-parity evidence: that is the per-tier compile checks and the shared
-    /// example (plan Step 5).
+    /// example.
     async fn app<L>(link: &L, config: &ScanConfig<'_>) -> (SendOutcome, SendOutcome, Option<u8>)
     where
         L: EspNowLink,

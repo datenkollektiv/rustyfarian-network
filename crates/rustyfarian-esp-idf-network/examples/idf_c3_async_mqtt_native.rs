@@ -1,4 +1,4 @@
-//! Tier-parity spike, variant B (ADR 022, plan Step 2): the same app on `esp-idf-svc`'s
+//! Tier-parity spike, variant B (ADR 022): the same app on `esp-idf-svc`'s
 //! native async types, `AsyncWifi` and `EspAsyncMqttClient`.
 //!
 //! Nothing of this crate's Wi-Fi or MQTT runtime is used; the example does what a tier

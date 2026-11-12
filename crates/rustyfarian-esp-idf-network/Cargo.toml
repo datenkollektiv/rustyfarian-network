@@ -105,7 +105,7 @@ esp-idf-hal                = { workspace = true, features = ["critical-section"]
 rustyfarian-esp-idf-ws2812 = { workspace = true }
 ssd1306                    = { workspace = true }
 embedded-graphics          = { workspace = true }
-# Tier-parity spike (ADR 022, Step 2): the async examples use embassy-time on
+# Tier-parity spike (ADR 022): the async examples use embassy-time on
 # esp-idf-svc's time driver, embassy-futures for `join` and embassy-sync channels.
 esp-idf-svc                = { workspace = true, features = ["embassy-time-driver"] }
 embassy-time               = { workspace = true }

@@ -75,7 +75,7 @@ impl RadioErrorKind for LoraError {
 /// # Implementation status
 ///
 /// [`new`][Self::new] currently returns `Ok` with a stub instance.
-/// Hardware integration is planned as part of Phase 5 TTN v3 (EU868) validation.
+/// Hardware integration is planned as part of TTN v3 (EU868) validation.
 pub struct EspHalLoraRadio<S: StatusLed> {
     _led: S,
     last_rssi: i16,

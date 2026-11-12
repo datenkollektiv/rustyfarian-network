@@ -86,7 +86,7 @@ The captive-portal substrate is a PRIVATE implementation detail behind `pub(crat
 The architectural commitment is that private-substrate boundary, not any particular crate family.
 
 The portal needs three protocols bare-metal does not provide: an HTTP server, a DHCP *server*, and a captive-portal DNS catch-all.
-The `edge-net` family by ivmarkov — one version-consistent no-alloc stack covering all three (`edge-http`, `edge-dhcp`, `edge-captive` over `edge-nal-embassy`) — is the preferred first implementation candidate, to be validated by the Phase 2 integration spike before being treated as final.
+The `edge-net` family by ivmarkov — one version-consistent no-alloc stack covering all three (`edge-http`, `edge-dhcp`, `edge-captive` over `edge-nal-embassy`) — is the preferred first implementation candidate, to be validated by the integration spike before being treated as final.
 The feature doc pins the exact spike-target versions of the family as a "Locked at planning pass" row.
 
 Fallback rule: if the spike fails on executor fit, single-client ergonomics, or binary size, the documented runner-up (all-hand-rolled) proceeds WITHOUT a new ADR — because the architectural commitment is the private-substrate boundary, not the crate family.
@@ -182,7 +182,7 @@ The provisioning crate is a consumer of a Wi-Fi handle, not a radio owner.
 The preference turns on coverage, not on any single protocol.
 picoserve is the better-known HTTP server, but a captive portal is not just an HTTP server — it is an HTTP server *and* a DHCP server *and* a DNS catch-all, and `embassy-net` supplies none of those three.
 The only option that covers all three from one coherent, version-consistent, no-alloc source is the edge-net family, which is why it is the preferred first candidate, at the cost of a supply-chain surface (`cargo deny`-reviewable) and a single-client HTTP server that a captive portal never strains.
-The preference is held lightly on purpose: the Phase 2 integration spike validates it against real executor fit, single-client ergonomics, and binary size, and on failure the hand-rolled runner-up proceeds per the §3 fallback rule without a new ADR — because the locked architecture is the private-substrate boundary, not the crate family.
+The preference is held lightly on purpose: the integration spike validates it against real executor fit, single-client ergonomics, and binary size, and on failure the hand-rolled runner-up proceeds per the §3 fallback rule without a new ADR — because the locked architecture is the private-substrate boundary, not the crate family.
 Hand-rolling all three is the highest-control option, but the workspace's hand-rolled precedent is one HTTP client, and three protocols — including a DHCP server with RFC 2131 §4.1 destination logic — is a much larger correctness surface than the precedent justifies, which is why it is the fallback rather than the first pick.
 
 ### On the hand-rolled store over the KV crates
@@ -209,7 +209,7 @@ The honest trade is to accept that the two tiers store credentials in different 
 ### Negative
 
 - **The workspace grows a fourth `esp-hal` crate** — `rustyfarian-esp-hal-provisioning` joins `-wifi`, `-lora`, `-ota`.
-- **The dependency surface grows by the edge-net family** (~6 crates) if the Phase 2 spike confirms the preferred candidate — a `cargo deny` review item at that point; the hand-rolled fallback adds none.
+- **The dependency surface grows by the edge-net family** (~6 crates) if the integration spike confirms the preferred candidate — a `cargo deny` review item at that point; the hand-rolled fallback adds none.
 - **The flash-while-radio constraint shapes the commit flow** — flash writes with the radio active risk a cache-disabled crash (the `esp-idf#10079` precedent; single-core C3/C6 ROM flash routines disable interrupts).
   The mitigation is independent of the store crate choice: enable the `esp-storage` `critical-section` feature and write credentials only at a quiescent moment — after the portal commits, with the radio stopped or immediately before the host reboots.
   Provisioning is inherently configure-then-restart, so the natural commit flow is *write store → emit `Committed` → host reboots* with the radio already quiesced.
@@ -265,7 +265,7 @@ See [hal-provisioning-ap-ownership-v1](../features/archive/hal-provisioning-ap-o
 - `crates/provisioning-pure/src/profile.rs` — `SchemaProfile`, `LoraFields`, `MqttFields`; the `no_std` profile mechanism reused unchanged.
 - `docs/ROADMAP.md` — the `rustyfarian-esp-hal-mqtt` future entry (Long term) the provisioned MQTT credentials' consumer is gated behind.
 - [esp-radio CHANGELOG](https://github.com/esp-rs/esp-hal/blob/main/esp-radio/CHANGELOG.md) — the `1.0.0-beta.0` (2026-06-03) removal of `Interfaces` and rename of `wifi::new` to `WifiController::new`; the reason the AP path pins to `=0.18.0`.
-- [edge-net](https://github.com/ivmarkov/edge-net) — `edge-http` / `edge-dhcp` / `edge-captive` / `edge-nal` / `edge-nal-embassy`, the preferred no-alloc captive-portal family pending the Phase 2 spike.
+- [edge-net](https://github.com/ivmarkov/edge-net) — `edge-http` / `edge-dhcp` / `edge-captive` / `edge-nal` / `edge-nal-embassy`, the preferred no-alloc captive-portal family pending the integration spike.
 - [picoserve](https://crates.io/crates/picoserve) — the HTTP-only alternative evaluated and rejected on partial coverage.
 - [sequential-storage](https://crates.io/crates/sequential-storage) and [ekv](https://crates.io/crates/ekv) — the KV-over-flash alternatives evaluated and rejected for the store.
 - [esp-storage](https://crates.io/crates/esp-storage) — the `embedded-storage 0.3` `NorFlash` provider, with the `critical-section` feature backing the flash-while-radio mitigation.

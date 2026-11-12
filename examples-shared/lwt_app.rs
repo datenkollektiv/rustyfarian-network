@@ -1,4 +1,4 @@
-//! One application for both tiers (ADR 022, Step 9).
+//! One application for both tiers (ADR 022).
 //!
 //! `idf_esp32s3_mqtt_lwt`, `hal_esp32s3_mqtt_lwt`, `hal_c3_mqtt_lwt` and `hal_esp32_mqtt_lwt`
 //! include this file with

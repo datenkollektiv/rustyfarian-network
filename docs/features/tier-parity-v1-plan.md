@@ -7,7 +7,7 @@
 **Architecture:** Shared async-capable traits in `juggler` define the surface.
 Behaviour lives in generic, host-tested cores in `juggler` (ports and adapters, the strategy pattern, ADR 022 decision 10); each tier implements only narrow port traits and keeps its type names through aliases.
 A static assertion per tier and one shared example module prove the surface compiles on both.
-Wi-Fi and MQTT go first (upstream request U2g), the other domains follow as their own features.
+Wi-Fi and MQTT go first, the other domains follow as their own features.
 
 **Tech Stack:** Rust 1.95 (`esp` toolchain, native `async fn` in traits, `core::net`), `esp-idf-svc 0.53`, `esp-hal 1.2.2` + `esp-radio 1.0.0-beta.1`, embassy (`embassy-time 0.5.1`, `embassy-time-driver 0.2.2`, `embassy-executor 0.10.0`).
 
@@ -210,7 +210,7 @@ Split into three reviewable chunks; the bench run for both tiers comes after Ste
 - Gate: hardware (knob maintainer) — passed on the CrowPanel S3, 2026-11-03.
 - Follow-up: a downstream rgb-clock task once its esp-hal firmware enables `mqtt` and Phase 6 closes provisioning and OTA parity; until then the in-repo LWT pair is the one-app proof.
 - The removed Step 9 detail doc (bench checklist, `[app]` gate comparison commands, packaging checks) stays in history at `ea640fb:docs/features/tier-parity-v1-step-9.md`.
-- Checkpoint: release 0.7.0 with U2f and Steps 1–9, after Step 8c.
+- Checkpoint: release 0.7.0 with Wi-Fi reconnect and suspend and Steps 1–9, after Step 8c.
 
 ## Phase 5 — Remaining Wi-Fi and MQTT shape alignment
 

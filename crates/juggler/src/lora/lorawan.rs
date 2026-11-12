@@ -21,7 +21,7 @@ use heapless::Vec;
 
 // ─── Session data ─────────────────────────────────────────────────────────────
 
-/// Persistent LoRaWAN session state saved across deep sleep cycles (Phase 7).
+/// Persistent LoRaWAN session state saved across deep sleep cycles (planned deep-sleep feature).
 ///
 /// All fields that the OTAA join accept frame populates are included so that
 /// `restore_from_sleep` can reconstruct the full session without a re-join.
@@ -58,8 +58,8 @@ pub struct LorawanSessionData {
     /// safe to compare with `== 1`.
     pub valid: u8,
     pub _pad: [u8; 3],
-    /// CRC-32 over key session fields (Phase 7: integrity check in RTC memory).
-    /// Initialised to 0 now; the Phase 7 implementation writes the real checksum.
+    /// CRC-32 over key session fields (planned: integrity check in RTC memory).
+    /// Initialised to 0 now; the planned deep-sleep feature writes the real checksum.
     pub crc32: u32,
 }
 

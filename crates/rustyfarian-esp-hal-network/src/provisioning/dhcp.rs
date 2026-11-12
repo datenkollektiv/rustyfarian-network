@@ -1,10 +1,10 @@
 //! Minimal DHCP server substrate for the SoftAP captive-portal (ADR 015 §3
-//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-network` in Phase 2B).
+//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-network`).
 //!
 //! ## Why it exists
 //!
 //! The `edge-net` family (`edge-dhcp`, `edge-http`, `edge-captive`) was the
-//! preferred Phase 2 substrate (ADR 015 §3), but its `embassy-sync 0.7`
+//! preferred substrate (ADR 015 §3), but its `embassy-sync 0.7`
 //! dependency conflicts with the workspace-pinned `embassy-sync 0.8`.
 //! ADR 015 §3 explicitly permits the hand-rolled fallback to proceed without a
 //! new ADR — the architectural commitment is the private-substrate boundary,
@@ -68,8 +68,8 @@ pub(crate) const PACKET_BUF: usize = 548;
 ///
 /// Keeping the two coupled at the source — rather than via comments — means
 /// a future tuning pass cannot raise one without raising the other and
-/// silently reintroducing the 548-vs-1024 truncation hazard the Phase 2A
-/// hardening closed.  Option-heavy DHCP REQUESTs (DDNS, vendor-class
+/// silently reintroducing the 548-vs-1024
+/// truncation hazard the earlier hardening closed.  Option-heavy DHCP REQUESTs (DDNS, vendor-class
 /// identifiers, PXE) routinely exceed the BOOTP 548-byte minimum, so the
 /// receive buffer must match the socket buffer exactly.
 pub(crate) const SOCKET_BUF_LEN: usize = 1024;
@@ -769,7 +769,7 @@ pub(crate) enum RequestOutcome {
 /// `decide_request_nak_still_records_mac_lease` host test so any change
 /// fails CI loudly rather than drifting silently.
 ///
-/// Phase 2B portal promotion will decouple candidate-lookup from commit
+/// The planned portal promotion will decouple candidate-lookup from commit
 /// (introduce `LeaseTable::probe` + `LeaseTable::commit_lease`); at that
 /// point this function becomes side-effect-free on Nak/Drop/Ignore and
 /// the lock-down test will be updated to assert the absence of the
@@ -902,7 +902,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
     // allocate the wrong IPs.  Refuse to start instead.
     if let Err(reason) = validate_pool_geometry(config.pool_start, config.pool_end, POOL_SIZE) {
         log::error!(
-            "DHCP config invalid: pool_start={} pool_end={} — {} (LeaseTable is fixed at POOL_SIZE={}, lives within a single /24, and must not cross the last-octet 255 wraparound; Phase 2 will lift these constraints via const generics)",
+            "DHCP config invalid: pool_start={} pool_end={} — {} (LeaseTable is fixed at POOL_SIZE={}, lives within a single /24, and must not cross the last-octet 255 wraparound; a later change will lift these constraints via const generics)",
             config.pool_start,
             config.pool_end,
             reason.as_str(),
@@ -1138,7 +1138,7 @@ pub async fn run(stack: embassy_net::Stack<'static>, config: DhcpServerConfig) -
 /// `ciaddr` should receive replies at that address per RFC 2131 §4.3.2).
 /// For a single-client captive-portal scenario this is acceptable — there
 /// is exactly one phone associating at a time, no DHCP relay, and the AP
-/// netif is the only adjacent broadcast domain.  Phase 2 proper, which
+/// netif is the only adjacent broadcast domain.  The planned move, which
 /// migrates this module into `rustyfarian-esp-hal-network`, should
 /// add a unicast path for renew/rebind transitions.
 #[cfg(all(
@@ -1703,8 +1703,8 @@ mod tests {
     /// See `decide_request` # Mutation note: `allocate` writes a slot
     /// under the client's MAC even when the response is Nak, because the
     /// spike preserves prior behaviour where a malformed REQUEST gets
-    /// happy-accident recovery from the next DISCOVER.  Phase 2B will
-    /// introduce probe/commit; until then this test pins the current
+    /// happy-accident recovery from the next DISCOVER.  A planned
+    /// probe/commit change will fix that; until then this test pins the current
     /// behaviour so any silent drift fails CI loudly.
     #[test]
     fn decide_request_nak_still_records_mac_lease() {
@@ -1724,11 +1724,11 @@ mod tests {
         );
         // Side effect we are pinning here: even though the response is
         // Nak, `allocate` claimed a pool slot under the client's MAC.
-        // Phase 2B probe/commit will replace this assertion with
+        // The planned probe/commit will replace this assertion with
         // `assert!(table.find_by_mac(&mac).is_none())`.
         assert!(
             table.find_by_mac(&mac).is_some(),
-            "spike preserves Nak-still-mutates-leases (see `decide_request` # Mutation note); Phase 2B will introduce probe/commit"
+            "spike preserves Nak-still-mutates-leases (see `decide_request` # Mutation note); a planned probe/commit change will fix it"
         );
     }
 

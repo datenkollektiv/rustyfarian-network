@@ -20,7 +20,7 @@
 //! # Real-hardware use
 //!
 //! Real-hardware use requires `esp-storage = { features = ["critical-section"] }`
-//! in the consuming binary. This is a Phase 2 concern; the
+//! in the consuming binary. This is the consuming binary's concern; the
 //! cache-disable-during-flash-write hazard is tracked in esp-idf#10079.
 
 /// Minimal DHCP server substrate for the SoftAP captive-portal.

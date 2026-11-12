@@ -6,7 +6,6 @@ desk-work: available
 
 # Feature: Per-device name pre-fill v1
 
-Source: review-queue request `rustyfarian-network-per-device-name-prefill-v1.md` (spookhouse bug 009, rgb-clock), filed 2026-10-27.
 Today `PortalConfig::device_name` is one fixed string per firmware, so every device saved unchanged shares a name, an MQTT client ID and a topic tree.
 Done when two devices running one firmware, saved without touching `dev_name`, store different names and connect with different client IDs.
 
@@ -52,7 +51,7 @@ Done when two devices running one firmware, saved without touching `dev_name`, s
 - [x] Two-device hardware check: distinct names and client IDs with `mqtt_client` blank; a shared `mqtt_client` default collides as documented (closed 2026-10-30)
 
 ## Session Log
-- 2026-10-29 — Feature doc created via /feature dialog from the review-queue request
+- 2026-10-29 — Feature doc created via /feature dialog
 - 2026-10-30 — Upstream gate cleared: hal-provisioning-ap-ownership-v1 merged (PR #112), the esp-hal session exposes the AP MAC
 - 2026-10-30 — Implementation landed uncommitted across juggler and both tiers via a workflow run; the four provisioning examples use `MacSuffixed`; the two-device hardware check is open for the user.
 - 2026-10-30 — External review accepted: client-ID default caveat and warning, uniqueness qualified to the last two MAC bytes and the derived SSID, one `Fixed` truncation policy via `DeviceName::resolve`, migration note for stored names, host integration test over two MACs; step 1 of the hardware check passed on a C3 (SSID `Rustyfarian-7B5D`).

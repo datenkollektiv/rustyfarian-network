@@ -51,6 +51,13 @@ pub enum ReentryGate<T> {
 /// `open` is not called for `Portal` or `FactoryReset`, so those answers never
 /// touch the stored record.
 ///
+/// The caller owns the button sampling policy inside `hook`. Poll for a
+/// window of about 2 s after a visible "press BOOT now" prompt rather than
+/// reading once: an esp-hal app reaches the hook about 250 ms after reset,
+/// too early for a press, and BOOT (GPIO9 on the ESP32-C3) cannot be held
+/// through reset because it is a strapping pin. `idf_c3_provision_mqtt`
+/// shows the window.
+///
 /// # Errors
 ///
 /// Returns the error from `open` when it runs and fails.

@@ -2,7 +2,7 @@
 //!
 //! Mirrors the "matrix"/"nunchuk" role of a multi-board prop.
 //! Twin of `idf_c3_espnow_peer`: both run the same application body,
-//! `examples-shared/espnow_peer_app.rs`, on a [`PeerSession`] (ESP-NOW parity Step 7).
+//! `examples-shared/espnow_peer_app.rs`, on a [`PeerSession`].
 //! This file is setup, plus the gate scenarios below.
 //!
 //! * [`EspHalEspNow::new_owned`] starts an unassociated station (the chip keeps its STA MAC),

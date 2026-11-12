@@ -5,7 +5,7 @@
 Accepted (2026-11-04).
 Decisions 5 and 6 amended (2026-11-05): decision 5 for the explicit `Ignored` variants, decision 6 to cover finite and persistent lifecycles; the closure evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
 Decisions 1 and 10 amended (2026-11-05): decision 1 for the flattened machines and the IDF ESP-NOW worker core, decision 10 for the port instance.
-Decisions 1, 5, 6, 9 and 10 amended (2026-11-11, ADR 022 Step 8c): decision 1 for `ConnectWorkMachine`, decision 5 for its explicit `Ignored`, decision 6 for its finite lifecycle and the connect-step exception, decision 9 for the runner's lock invariant, decision 10 for `ConnectPort`.
+Decisions 1, 5, 6, 9 and 10 amended (2026-11-11, MQTT thread memory work): decision 1 for `ConnectWorkMachine`, decision 5 for its explicit `Ignored`, decision 6 for its finite lifecycle and the connect-step exception, decision 9 for the runner's lock invariant, decision 10 for `ConnectPort`.
 
 Refines [ADR 022](022-tier-parity-one-async-api.md) decision 10; it does not supersede it.
 The review rule and the ports-and-adapters split stand, and "behaviour lives in sans-IO machines" becomes "behaviour lives in `juggler` on the lowest rung that fits".
@@ -118,7 +118,7 @@ This repo differs from the siblings in three ways that change the wording, not t
 - Machines are `no_std` and free of async; inputs, actions and the machine are small `Copy` values where practical.
 - Rung 2 and 3 machines need state-transition tests in `juggler`.
 - A change to a rung-3 machine re-runs the bench for each flow it drives.
-  Dated 2026-11-11: the bench rerun for the Step 8c change to `ConnectWorkMachine` is the S3 check set `suspend`, `mqtt-scenarios`, `mqtt-lwt`, `connect`, `dns-subscribe`, `dns-unresolvable` and `soak` on both tiers; the runs are pending, and the constraint is met only when they pass.
+  Dated 2026-11-11: the bench rerun for the MQTT thread memory change to `ConnectWorkMachine` is the S3 check set `suspend`, `mqtt-scenarios`, `mqtt-lwt`, `connect`, `dns-subscribe`, `dns-unresolvable` and `soak` on both tiers; the runs are pending, and the constraint is met only when they pass.
 
 ## Alternatives Considered
 

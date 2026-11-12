@@ -1,6 +1,6 @@
 //! ESP32-S3 SX1262 Bring-Up — Heltec WiFi LoRa 32 V3
 //!
-//! Phase 5, Step 2: SX1262 hardware bring-up.
+//! SX1262 hardware bring-up for the TTN EU868 validation.
 //!
 //! Runs the shared SX1262 bring-up, `juggler::lora::sx1262::init` (re-exported as
 //! `rustyfarian_esp_hal_network::lora::sx1262`), the same step order the ESP-IDF

@@ -6,7 +6,7 @@ desk-work: available
 # Feature: Provisioning boot identity on one juggler type v1
 
 Both tiers hand out the stored record as `juggler::provisioning::ProvisioningConfig`, so a consumer reads the device name and OTA URL without a second store read and no `Debug` on the boot path prints a secret.
-Answers `review-queue/rustyfarian-network-boot-device-name-v1.md` (spookhouse) and subsumes the roadmap item "StoredConfig Debug redaction".
+Subsumes the roadmap item "StoredConfig Debug redaction".
 
 ## Decisions
 |                                                     Decision | Reason                                                                                                                                           | Rejected Alternative                        |

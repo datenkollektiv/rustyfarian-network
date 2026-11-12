@@ -4,8 +4,8 @@
 
 Accepted — 2026-09-28.
 Implemented on `main` (commit 511b37f..2f2597a); ships in v0.5.1.
-Amended 2026-11-02: §2's plumbing (helper thread, work order, stale-session guard) is superseded by ADR 022 Steps 6, 8b-1 and 8b-2; the contract itself is unchanged.
-Amended 2026-11-11 (ADR 022 Step 8c): §2 has no helper thread any more; the `mqtt-net` runner performs the connect work one step per turn; contract §1 and §3 are unchanged.
+Amended 2026-11-02: §2's plumbing (helper thread, work order, stale-session guard) is superseded by the MQTT session core, the `MqttHandle` session machine and the network gate (ADR 022); the contract itself is unchanged.
+Amended 2026-11-11 (ADR 022, MQTT thread memory): §2 has no helper thread any more; the `mqtt-net` runner performs the connect work one step per turn; contract §1 and §3 are unchanged.
 
 ## Context
 
@@ -15,7 +15,7 @@ Events including `CONNECTED` and `DATA` are dispatched synchronously inside the 
 `esp-idf-svc` 0.53.0 blocks the mqtt task until the event-loop thread calls `EspMqttConnection::next()` again (line 797–799 in `src/mqtt/client.rs`).
 Any `esp_mqtt_client_*` call (publish, subscribe, etc.) made from a callback — `on_connect`, `on_message`, or `on_disconnect` — before calling `next()` again attempts to acquire the same lock while it is already held, deadlocking both tasks forever.
 
-Field evidence: a local `on_connect` enqueue deadlock on startup publish, and rgb-clock bug 001 (2026-09-28, `try_publish` from `on_message` rejection callback).
+Field evidence: a local `on_connect` enqueue deadlock on startup publish, and an rgb-clock field report (2026-09-28, `try_publish` from `on_message` rejection callback).
 
 ## Decision
 
@@ -39,11 +39,11 @@ The event-loop thread never takes the client mutex directly.
 
 `is_connected()` flips only after `on_connect` returns, via generation-checked `juggler::mqtt::ConnectionEpoch`, so stale reconnect helpers cannot mark a newer connection as connected if an older helper still runs.
 
-Amended 2026-11-02 (ADR 022 Steps 6, 8b-1 and 8b-2): the helper is now the tier's own worker thread, named `mqtt-connect` on the ESP-IDF tier, and it runs the builder subscriptions first, then the `with_startup_message()` publish, then `on_connect` — the order both tiers share.
+Amended 2026-11-02 (ADR 022, MQTT session core and network gate): the helper is now the tier's own worker thread, named `mqtt-connect` on the ESP-IDF tier, and it runs the builder subscriptions first, then the `with_startup_message()` publish, then `on_connect` — the order both tiers share.
 The stale-session guard is now `juggler::mqtt::SessionToken`: `is_connected()` turns true only when the shared `SessionMachine` sees `WorkDone` for the current token, and a stale worker's report is ignored.
 `juggler::mqtt::spawn_connect_thread`, `juggler::mqtt::spawn_subscriber_thread` and `juggler::mqtt::ConnectionEpoch` are deprecated, used by no tier, and stay until 1.0.
 
-Amended 2026-11-11 (ADR 022 Step 8c): the ESP-IDF tier runs no connect helper thread at all.
+Amended 2026-11-11 (ADR 022, MQTT thread memory): the ESP-IDF tier runs no connect helper thread at all.
 The connect work runs on the `mqtt-net` runner thread itself, one step per loop turn, and each step takes the client lock only for its own esp-mqtt call: one SUBSCRIBE, the startup `enqueue`, the `on_connect` call, or the closing runtime catch-up.
 The step order, stop at the first failed SUBSCRIBE, startup publish or runtime catch-up (a failing `on_connect` is logged, never fatal), the closing catch-up before `WorkDone`, and the terminal report are the shared `juggler::mqtt::ConnectWorkMachine` (ADR 023 rung 3), performed through the narrow `juggler::mqtt::ConnectPort` by `juggler::mqtt::perform`.
 Before every step the runner asks `SessionMachine::is_current` for the work's `SessionToken`, and it abandons the work of a session that ended without reporting it.
@@ -72,7 +72,7 @@ Contract §1 and §3 are unchanged.
 ### Negative
 
 - Behavior change: a callback call that used to hang now fails with an error — acceptable in a patch release for safety.
-- Step 8c (2026-11-11) adds three `unsafe` blocks, all FFI: the `esp_pthread_get_cfg` and `esp_pthread_set_cfg` calls that name a library thread, the restore of the caller's pthread configuration, and the `uxTaskGetStackHighWaterMark` self-measurement.
+- The MQTT thread memory change (2026-11-11) adds three `unsafe` blocks, all FFI: the `esp_pthread_get_cfg` and `esp_pthread_set_cfg` calls that name a library thread, the restore of the caller's pthread configuration, and the `uxTaskGetStackHighWaterMark` self-measurement.
 - Known limit: `is_connected()` confirms before subscriptions are sent (ROADMAP row notes this).
 - A running `on_connect` cannot be cancelled by a disconnect.
 - The deprecated legacy `MqttManager` has no guard (out of scope).

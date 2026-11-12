@@ -19,7 +19,7 @@ Latent crash (code reading, not bench-verified): `sx126x` 0.3.0 `reset()` runs `
 
 ## Linked Artefact
 `crates/rustyfarian-esp-idf-network/Cargo.toml` feature `lora`; `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs` `FullDuplexDevice::transaction` and `init_sx1262` step 1; `docs/project-lore.md` "Toolchain & Build" sx126x entry.
-Filed upstream by `rustyfarian-beekeeper` as `review-queue/rustyfarian-network-lora-critical-section-provider-v1.md` (2026-10-29).
+Filed by `rustyfarian-beekeeper` (2026-10-29).
 
 ## Reproduction Confidence
 high (link failure); low (interrupt-masking crash, code reading only)
@@ -51,9 +51,9 @@ The `lora` feature pins esp-idf-hal's mutex provider, a second provider fails to
 Claude Code (asks 1-3), user (ask 4, bench).
 
 ## Links
-`review-queue/rustyfarian-network-lora-critical-section-provider-v1.md`; `rustyfarian-peripherals` lore "ESP-IDF — critical-section backend ISR safety" (2026-10-28); `docs/project-lore.md` "Toolchain & Build".
+`rustyfarian-peripherals` lore "ESP-IDF — critical-section backend ISR safety" (2026-10-28); `docs/project-lore.md` "Toolchain & Build".
 
 ## Session Log
-- 2026-10-30 — Promoted from the beekeeper review-queue item straight to defect via /bug
+- 2026-10-30 — Promoted from the beekeeper report straight to defect via /bug
 - 2026-10-30 — Asks 1-3 fixed: `lora` drops `esp-idf-hal/critical-section` (examples get it via dev-dependency), `pulse_nrst` replaces `sx126x::reset()`, comment, lore, README and rustdoc corrected (plus the gitignored, developer-local `CLAUDE.md` row); `just verify` green, both LoRa examples build
 - 2026-10-30 — Open hardware gate (ask 4): OTAA join on a Heltec V3 with `rustyfarian-esp-idf-power`'s `critical-section-impl` as the only provider; also re-confirm the join with esp-idf-hal's provider after the NRST change

@@ -15,7 +15,7 @@ Goal: consumer code is exchangeable between `rustyfarian-esp-idf-network` and `r
 | IDF async as wrappers over the existing worker threads | Spike: equal behaviour, native types only saved the runtime they omit | `esp-idf-svc` `AsyncWifi` / `EspAsyncMqttClient`  |
 | Blocking IDF API stays during 0.x                      | Additive change                                                       | Removing it now                                   |
 | Per-tier type aliases over generic cores               | Consumers never spell the generics                                    | Generic public types                              |
-| Wi-Fi and MQTT first                                   | Upstream request U2g                                                  | All domains at once                               |
+| Wi-Fi and MQTT first                                   | A consumer needed both first                                                  | All domains at once                               |
 | MQTT gate fed by link readiness notifications          | Instant edges on one source of truth (IDF lost-IP is 120 s late)      | Polling `is_ready`; second `IpEvent` subscription |
 | Shared `examples-shared/lwt_app.rs` via `#[path]`      | Bench-only harness; app code stays out of the published crates        | Shipping it in a crate                            |
 | IDF examples on `block_on`                             | Runs on the C3 spike path, no new dependency                          | `embassy-executor` `arch-std`, a new dependency   |

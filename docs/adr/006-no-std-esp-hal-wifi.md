@@ -87,7 +87,7 @@ No breaking change for existing consumers.
 
 ### Phased implementation
 
-1. This ADR (Phase 1)
+1. This ADR
 2. Create `wifi-pure` skeleton with `WifiDriver` trait and moved types; update `rustyfarian-esp-idf-wifi` with `pub use` re-exports
 3. Create `rustyfarian-esp-hal-wifi` stub (compile-only, `EspHalWifiManager` returns errors)
 4. Add `check-wifi-pure`, `check-wifi-hal`, `test-wifi` to `justfile`; add bare-metal target blocks to `.cargo/config.toml.dist`

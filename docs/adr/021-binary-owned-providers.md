@@ -12,14 +12,14 @@ Each is selected through Cargo features on a crate that the binary and its libra
 Three findings in two days showed the workspace's library crates making that choice:
 
 - Bug 007 ([007-lora-forces-critical-section-provider-2026-10-30.md](../bugs/007-lora-forces-critical-section-provider-2026-10-30.md)): the IDF `lora` feature enabled a `critical-section` provider, so a firmware that enabled another one hit `multiple definition of _critical_section_1_0_acquire`; the provider was removed from the feature.
-- The `rustyfarian-knob` U2d request: the `esp32s3` chip feature of `rustyfarian-esp-hal-network` forwarded `esp-println?/uart`, and the knob's own `auto` console failed `esp-println 0.18`'s build script with `Currently enabled: uart, auto`.
-- While fixing U2d: the `wifi` feature forced `esp-backtrace` with `panic-handler` into every firmware, although the library source references neither `esp_println` nor `esp_backtrace` — it never prints and never installs a panic handler.
+- The `esp32s3` chip feature of `rustyfarian-esp-hal-network` forwarded `esp-println?/uart`, and the knob's own `auto` console failed `esp-println 0.18`'s build script with `Currently enabled: uart, auto`.
+- The `wifi` feature forced `esp-backtrace` with `panic-handler` into every firmware, although the library source references neither `esp_println` nor `esp_backtrace` — it never prints and never installs a panic handler.
 
 An interim fix on 2026-10-31 stopped the chip features from selecting a console but kept both crates as optional dependencies of `wifi` and `lora`, which still forced the panic handler and made every lib-only check pass `esp-println/auto` on the command line.
 
 ## Decision
 
-Amended 2026-10-31: scheduler added as the fourth provider (request U2e).
+Amended 2026-10-31: scheduler added as the fourth provider.
 
 1. **Library crates of this workspace never select a provider.**
    `juggler`, `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network` select neither a `critical-section` provider, nor an `esp-println` console, nor a panic handler, nor the `esp-rtos` scheduler; the firmware does (on bare metal `esp-hal` itself is the only provider and is not a Cargo feature, so nothing is selected there).
@@ -91,5 +91,4 @@ The captive-portal fallback of that firmware calls `.start_scheduler_running(spa
 
 - [bug 007](../bugs/007-lora-forces-critical-section-provider-2026-10-30.md) — the `critical-section` precedent on the IDF tier
 - `docs/features/archive/esp-hal-binary-owned-console-and-panic-handler-v1.md` — feature doc, decisions, constraints and gate
-- `review-queue/archive/rustyfarian-network-u2d-esp-hal-println-uart-forward.md` — the `rustyfarian-knob` U2d request
 - [ADR 006](006-no-std-esp-hal-wifi.md), [ADR 019](019-esp-hal-async-mqtt-client.md), [ADR 020](020-esp-hal-espnow-owned-radio-and-sync-shim.md) — the other esp-hal tier decisions

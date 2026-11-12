@@ -1,5 +1,5 @@
 //! DNS catch-all server substrate for the SoftAP captive-portal (ADR 015 §3
-//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-network` in Phase 2B).
+//! hand-rolled fallback; promoted from `rustyfarian-esp-hal-network`).
 //!
 //! The codec and its answer policy live in [`juggler::provisioning::dns`],
 //! shared with the ESP-IDF tier: `A` and `ANY` queries get the AP IP, every

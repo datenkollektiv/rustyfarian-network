@@ -5,7 +5,7 @@ desk-work: available
 
 # Feature: ESP32-S3 Wi-Fi, provisioning and OTA on the esp-hal tier v1
 
-Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (filed 2026-10-13, contribution offered with CrowPanel validation hardware).
+Wi-Fi on the ESP32-S3 with esp-hal, filed 2026-10-13 by the `rustyfarian-knob` application, with a contribution of CrowPanel validation hardware.
 
 ## Decisions
 
@@ -41,6 +41,6 @@ Upstream request U2 from the `rustyfarian-knob` esp-hal parity quest (filed 2026
 
 ## Session Log
 
-- 2026-10-13 — Feature doc created via /feature from upstream request U2
+- 2026-10-13 — Feature doc created via /feature
 - 2026-10-14 — Implemented; clippy-hal/verify green; CrowPanel STA join + DHCP validated
 - 2026-11-12 — Archived: S3 OTA and provisioning on the bench

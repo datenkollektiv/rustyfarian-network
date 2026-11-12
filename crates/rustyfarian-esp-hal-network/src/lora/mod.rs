@@ -15,7 +15,7 @@
 //! TX methods return [`driver::LoraError::TransmitFailed`],
 //! RX methods return [`driver::LoraError::ReceiveFailed`], and
 //! configuration methods return [`driver::LoraError::RadioInitFailed`].
-//! Hardware integration is planned as part of the Phase 5 TTN validation.
+//! Hardware integration is planned as part of the TTN EU868 OTAA validation.
 //!
 //! # LED status
 //!

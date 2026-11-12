@@ -64,6 +64,7 @@ Neither tier has an MQTT suspend call: `esp_mqtt_client_stop` sends DISCONNECT, 
 - The broker publishes the will 1.5 × keep-alive after the last packet, because the client never sent DISCONNECT.
 - A suspend shorter than that ends in a client-id takeover on reconnect: the broker publishes the will as it drops the old session, then the new session's startup message, so a retained `offline` is followed by `online` within a second.
 - A firmware that wants a clean `offline` instead publishes it with an acknowledged publish before `suspend()`.
+- The same holds for a last value that must arrive: esp-hal drops the message queued at the suspend instant (at most one), so publish it acknowledged before `suspend()`.
 - The ESP-IDF retry churn is harmless log noise; a longer `MqttConfig::with_reconnect_timeout` quiets it but delays the reconnect after resume by up to the same value.
 
 ## Validation status

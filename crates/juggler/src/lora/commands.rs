@@ -1,15 +1,15 @@
 //! LoRaWAN downlink command protocol.
 //!
-//! All command parsing lives here — OTA commands (Port 10, Phase 5) and
-//! telemetry interval commands (Port 11, Phase 7) will both be decoded from
-//! this module. No separate `telemetry.rs` is needed; Phase 7 extends this file.
+//! All command parsing lives here — OTA commands (Port 10) and
+//! telemetry interval commands (Port 11, planned) will both be decoded from
+//! this module. No separate `telemetry.rs` is needed; the planned telemetry feature extends this file.
 //!
 //! This module has no hardware dependencies and can be tested on any host.
 
 /// LoRaWAN port number for OTA downlink commands.
 pub const OTA_COMMAND_PORT: u8 = 10;
 
-/// LoRaWAN port number for telemetry configuration commands (Phase 7).
+/// LoRaWAN port number for telemetry configuration commands (planned).
 pub const TELEMETRY_CONFIG_PORT: u8 = 11;
 
 /// OTA command received via LoRaWAN downlink on [`OTA_COMMAND_PORT`].

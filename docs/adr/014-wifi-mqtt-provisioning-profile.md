@@ -89,7 +89,7 @@ The validators — `validate_client_id`, `CLIENT_ID_MAX_LEN`, and the topic vali
 `provisioning-pure` depends on `rustyfarian-network-pure` with `default-features = false`, picking up the validators without dragging in `std`.
 The MQTT consumers (`rustyfarian-esp-idf-mqtt`) keep the default `std` feature and are unaffected.
 
-This extraction landed **before Phase 1** of the feature plan (Phase 0, 2026-06-12), since Phase 1's MQTT validators delegate into it.
+This extraction landed **before the MQTT validators** of the feature plan (2026-06-12), since those validators delegate into it.
 The implementation also moved `QoS` and the `SubscribeClient` trait behind the `std` gate because the trait's `anyhow` dependency forced it.
 It also made `anyhow` itself optional behind `std`.
 
@@ -185,7 +185,7 @@ Bumping `schema_ver` to 2 while reading absent-`profile` v1 records as `lorawan`
 - **`parse_form`'s signature breaks** — it gains a profile parameter.
   Acceptable: all public APIs are experimental.
 - **`rustyfarian-network-pure` gains a `no_std`-safe surface** — `provisioning-pure` depends on it (`default-features = false`) for `validate_client_id`.
-  That requires the `#![cfg_attr(not(feature = "std"), no_std)]` extraction in §2 to land before Phase 1.
+  That requires the `#![cfg_attr(not(feature = "std"), no_std)]` extraction in §2 to land before the MQTT validators.
   This is bounded work, not free.
 
 ### Implications
@@ -195,7 +195,7 @@ These landed with acceptance on 2026-06-12 and are recorded for the follow-throu
 - `docs/ROADMAP.md` gains an entry for the Wi-Fi + MQTT profile.
 - Any `VISION.md` / `README.md` / `CHANGELOG.md` wording that describes the schema as "four-field" is updated to reflect two profiles.
   (The "four-field" phrasing appeared in `docs/ROADMAP.md`, `CHANGELOG.md`, and ADR 013; it was not in `VISION.md` or the README, both of which were checked when the ADR landed.)
-- The feature doc's seven open questions are signed off and Phases 1–4 are implemented.
+- The feature doc's seven open questions are signed off and the first four implementation phases are implemented.
 
 ## Amendment 2026-09-26 — OTA URL optional for WifiMqttDevice
 

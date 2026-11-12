@@ -3,7 +3,7 @@
 Requested by the rgb-puzzle brain (2026-10-12, planning a bare-metal variant of its ESP32-C6 firmware, which bridges the puzzle to a game-master dashboard over MQTT).
 `docs/ROADMAP.md:59` lists "bare-metal MQTT domain in rustyfarian-esp-hal-network — minimq-based (after async MQTT ADR)" as long term, and ADR 015 notes `rustyfarian-rgb-clock`'s bare-metal milestone needs it too.
 This document turns that roadmap line into a concrete request with three downstream consumers.
-`rustyfarian-knob` (ESP32-S3, request U2b, 2026-10-14) joined as the third consumer and makes `esp32s3` a first-class chip of the domain.
+`rustyfarian-knob` (ESP32-S3, 2026-10-14) joined as the third consumer and makes `esp32s3` a first-class chip of the domain.
 ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision; this doc holds the plan and the sign-off.
 
 ## Consumers
@@ -49,7 +49,7 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 |             Shared config types in juggler | One `MqttConfig`/`LwtConfig` across tiers keeps consumer config code tier-agnostic     | Duplicate types per tier                    |
 |    Behavioural parity over callback parity | Callbacks on helper threads (ADR 017) do not translate to a single-core async executor | Emulating threads on embassy                |
 |                 `minimq =0.13.5` (ADR 019) | Managed session, no alloc, binds the pinned `embassy-time`/`embedded-io-async`         | `rust-mqtt` (no connection mgmt), hand-roll |
-| `esp32s3` in every `mqtt` arm from day one | Knob (U2b) ships S3 in lockstep; S3 Wi-Fi is validated on `main`                       | Add S3 after C6 validation                  |
+| `esp32s3` in every `mqtt` arm from day one | Knob ships S3 in lockstep; S3 Wi-Fi is validated on `main`                       | Add S3 after C6 validation                  |
 |     Static `StaticCell` buffers, zero heap | S3 keeps ~26 KB heap after Wi-Fi; esp-radio allocates internal-only                    | Heap-allocated queues                       |
 | Network watch (polled 500 ms) + socket timeout 1.5 × keep-alive + stall deadline of socket timeout + keep-alive; queue kept across reconnect (2026-10-16) | T5 found the runner parked in `TcpSocket::flush`; one `Stack` waker slot forbids `wait_*` in the runner | Socket timeout only; `Stack::wait_link_down`; drain the queue on session end |
 
@@ -80,6 +80,6 @@ ADR 019 (`docs/adr/019-esp-hal-async-mqtt-client.md`) holds the client decision;
 
 ## Session Log
 - 2026-10-12 — Feature doc created from the rgb-puzzle brain esp-hal variant gap analysis; expands the long-term roadmap line into a request.
-- 2026-10-14 — Folded knob request U2b (third consumer, `esp32s3`, S3 example); ADR 019 accepted (minimq, IPv4-only); feature implemented; S3 T1/T2/T4/T6 pass, heap 25 928 B after connect and after a 10-min soak.
+- 2026-10-14 — Folded in the knob as third consumer (`esp32s3`, S3 example); ADR 019 accepted (minimq, IPv4-only); feature implemented; S3 T1/T2/T4/T6 pass, heap 25 928 B after connect and after a 10-min soak.
 - 2026-10-16 — Knob maintainer ran T1/T3/T5 on the CrowPanel (`d9e3b62`); T5 found the client stuck `Connected` through a 3 min Wi-Fi outage because `TcpSocket::flush` waits for a peer ACK that never comes and minimq's ping timeout never runs inside a flush; fix: a polled network watch (link + IP config, 500 ms) races the session, `Disconnected` is set before the socket abort, the post-abort flush is bounded, the network-lost path waits for the network instead of the 10 s pause, the socket gets a 1.5 × keep-alive timeout, and every session await is bounded by a stall deadline of socket timeout + keep-alive (outcome `transport stalled`) for a dead host whose TCP reset cannot be routed; `try_publish` now documents queued-not-delivered (unacknowledged in-flight messages are lost, one at most on a network drop); runbook T5 split into AP-off and router-pause variants.
 - 2026-11-12 — Archived: feature complete; 0.7.0 hardware results live in the bench checks

@@ -1,7 +1,7 @@
 //! ESP-NOW peer for the ESP32-C3 Super Mini (ESP-IDF): owned SoftAP radio, no AP connection.
 //!
 //! ESP-IDF twin of `hal_c3_espnow_peer`: both run the same application body,
-//! `examples-shared/espnow_peer_app.rs`, on a [`PeerSession`] (ESP-NOW parity Step 7).
+//! `examples-shared/espnow_peer_app.rs`, on a [`PeerSession`].
 //! This file is setup only: the radio, ESP-NOW, the session and one `block_on`.
 //!
 //! * [`EspIdfEspNow::init_with_radio`] starts the Wi-Fi radio as a hidden SoftAP on channel 1;

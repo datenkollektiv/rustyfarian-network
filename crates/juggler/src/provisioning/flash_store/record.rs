@@ -285,7 +285,7 @@ pub(crate) fn encode_record(
             }
         }
         SchemaProfile::LorawanFieldDevice => {
-            // LoRaWAN fields are not yet stored in Phase 1 (no TAG_* for EUIs/AppKey
+            // LoRaWAN fields are not yet stored (no TAG_* for EUIs/AppKey
             // in the locked table). The profile discriminator is stored; the LoRa
             // fields themselves will be added when TAG_* constants are allocated in a
             // future layout revision. For now encode an empty TLV section so decode

@@ -1,4 +1,4 @@
-//! Tier-parity spike, variant A (ADR 022, plan Step 2): async app over the existing
+//! Tier-parity spike, variant A (ADR 022): async app over the existing
 //! `WiFiManager` and `MqttHandle` worker threads.
 //!
 //! The application is plain `async` code run by `esp_idf_svc::hal::task::block_on`;

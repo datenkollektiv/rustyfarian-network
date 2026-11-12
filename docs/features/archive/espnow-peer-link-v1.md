@@ -6,7 +6,7 @@ desk-work: available
 # Feature: ESP-NOW Peer Link v1
 
 Goal: one tested policy decides when a peer scans for its coordinator and follows a channel change, on both tiers.
-Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1](../espnow-tier-parity-v1.md) for the helper, not for the core.
+Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1](espnow-tier-parity-v1.md) for the helper, not for the core.
 
 ## Decisions
 
@@ -60,6 +60,6 @@ Requested by rustbox-rgb-puzzle (2026-10-31); depends on [espnow-tier-parity-v1]
 </details>
 
 ## Session Log
-- 2026-11-03 — Feature doc created from `review-queue/rustyfarian-network-espnow-peer-link-v1.md`, design review folded in, `PeerLink` core implemented (`SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`), helper shape settled as `PeerSession`
+- 2026-11-03 — Feature doc created, design review folded in, `PeerLink` core implemented (`SendOutcome::Error` renamed `Local`, esp-hal probe timeouts count as `Local`), helper shape settled as `PeerSession`
 - 2026-11-11 — `PeerSession` landed in `juggler::espnow::session` and both C3 peers run the shared `examples-shared/espnow_peer_app.rs`; review pass applied (a `run` dropped mid-scan hands the scan back, `EmbassyClock` clamps its deadline, local send errors log at `debug`)
-- 2026-11-12 — Bench check `c3/espnow-peer-session` passed on both tiers; archived ahead of espnow-tier-parity-v1, whose Step 9 docs are still open
+- 2026-11-12 — Bench check `c3/espnow-peer-session` passed on both tiers; archived ahead of espnow-tier-parity-v1, which followed the same day

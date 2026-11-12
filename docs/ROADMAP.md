@@ -30,9 +30,10 @@ For history, see `CHANGELOG.md` and `docs/features/archive/`.
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : ESP-NOW tier parity (ADR 022 Phase 6) — mixed-fleet bench check passed on both tiers 2026-11-12, only Step 9 docs and archive remain (feature-doc)
-              : Tier parity — ADR 022 Step 8c, then Steps 10 and 11 after 0.7.0 (feature-doc)
+    Ready     : Tier parity — only the remaining Wi-Fi and MQTT name alignment is left after 0.7.0 (feature-doc)
               : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally (feature-doc)
+              : ESP-NOW scan-burst TX power — scan boosts to max, near-field peers fail (feature-doc)
+              : Portal defaults from build-time env — one helper builds the defaults for three consumers (feature-doc)
     Near term : Release 0.7.0 — ladder-closure waiver pass, archive finished feature docs, condense CHANGELOG, semver check, crates.io token, staged publish of juggler then both tiers, tag
               : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 bench run, plus bug 007 (LoRa forces a critical-section provider)
               : LoRa pure-side polish — LoraConfig builder + from_hex_strings Result return
@@ -47,6 +48,8 @@ timeline
               : OTA security model doc — threat model and signed-manifest question
               : Contract tests beyond Wi-Fi and MQTT — ADR 022 conformance suites for LoRa and ESP-NOW
               : LoRa post-adoption backlog — PartialEq on responses, heapless Deque FIFO in the mock, CRC-32 in restore_from_sleep, LorawanDevice process wiring
+              : Portal peer MACs — ESP-NOW peers collected in the provisioning portal, plus an ESP-NOW-only profile, design questions open (feature-doc)
+              : Boot policy helper — pure decision for the load, portal and restart flow, waits for a consumer (feature-doc)
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
 ```
@@ -74,7 +77,7 @@ Positive findings worth keeping in mind (no action):
 
 ## Midterm detail
 
-Phase 5 TTN v3 EU868 OTAA validation checklist: [runbooks/ttn-otaa-validation.md](runbooks/ttn-otaa-validation.md).
+TTN v3 EU868 OTAA validation checklist: [runbooks/ttn-otaa-validation.md](runbooks/ttn-otaa-validation.md).
 
 ### Research
 
