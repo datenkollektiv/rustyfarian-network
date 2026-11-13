@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-idf-network` declares the managed component `espressif/mqtt` (ESP-IDF v6 moved esp-mqtt out of the IDF tree) via `[[package.metadata.esp-idf-sys.extra_components]]`, so a firmware that depends on the crate directly needs no entry of its own.
 - `.cargo/config.toml` is committed; `.cargo/config.toml.dist` and `just setup-cargo-config` are gone, and CI runs on `ubuntu-latest` again (ESP-IDF v6.1's esp-clang no longer needs `libxml2.so.2`).
 - `just ensure-bootloader` records the ESP-IDF version of a cached bootloader and rebuilds a cache from another version.
+- CI runs on the shared `datenkollektiv/rustyfarian-ci@v1` workflows and actions: host checks on stable, the ESP-IDF and bare-metal jobs on the shared Xtensa and ESP-IDF setup, and each job runs one `just ci-<job>` recipe.
 
 ### Deprecated
 

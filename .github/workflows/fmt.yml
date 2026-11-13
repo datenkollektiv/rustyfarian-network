@@ -14,27 +14,8 @@ concurrency:
   group: fmt-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   fmt:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.7.0
-        with:
-          default: true
-          ldproxy: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup just
-        uses: extractions/setup-just@v4
-
-      - name: Check formatting
-        run: just fmt-check
+    uses: datenkollektiv/rustyfarian-ci/.github/workflows/host-checks.yml@v1
+    with:
+      check: fmt

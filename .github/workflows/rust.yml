@@ -14,113 +14,104 @@ concurrency:
   group: rust-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check-and-test:
+  test:
+    uses: datenkollektiv/rustyfarian-ci/.github/workflows/host-checks.yml@v1
+    with:
+      check: test
+
+  deny:
+    uses: datenkollektiv/rustyfarian-ci/.github/workflows/host-checks.yml@v1
+    with:
+      check: deny
+
+  # Workspace check on the ESP-IDF default target, plus the pure OTA checks (ESP toolchain: -Zbuild-std and riscv32imc).
+  check:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      XTENSA_VERSION: "1.97.0.0"
+      # Must match ESP_IDF_VERSION in .cargo/config.toml: setup-esp-idf exports it, which wins over cargo's [env].
+      IDF_VERSION: v6.1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.7.0
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
-          default: true
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.XTENSA_VERSION }}
+          # RISC-V-only job: the esp toolchain is installed only when an Xtensa target is listed.
+          buildtargets: esp32
 
-      # The key covers the file that selects the ESP-IDF build: a restored esp-idf-sys
-      # CMake tree from another ESP_IDF_VERSION fails to configure.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-esp-idf@v1
         with:
-          key: idf-${{ hashFiles('.cargo/config.toml') }}
+          idf-version: ${{ env.IDF_VERSION }}
+          mcu: esp32c6
 
-      - name: Setup just
-        uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A restored esp-idf-sys CMake tree from another IDF version or sdkconfig fails to configure.
+          key: check-${{ env.XTENSA_VERSION }}-${{ env.IDF_VERSION }}-${{ hashFiles('.cargo/config.toml', 'sdkconfig*.defaults') }}
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+      - uses: extractions/setup-just@v4
 
-      - name: Deny (licenses, advisories, bans)
-        run: just deny
+      - run: just ci-check
 
-      - name: Check workspace
-        run: just check
-
-      - name: Test (all platform-independent unit tests)
-        run: just test
-
+  # Wi-Fi with SoftAP disabled (STA-only consumers): reconfigures esp-idf-sys with the sta-only sdkconfig overlay.
   check-sta-only:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      XTENSA_VERSION: "1.97.0.0"
+      IDF_VERSION: v6.1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.7.0
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
-          default: true
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.XTENSA_VERSION }}
+          buildtargets: esp32
 
-      # The key covers the file that selects the ESP-IDF build: a restored esp-idf-sys
-      # CMake tree from another ESP_IDF_VERSION fails to configure.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-esp-idf@v1
         with:
-          key: idf-${{ hashFiles('.cargo/config.toml') }}
+          idf-version: ${{ env.IDF_VERSION }}
+          mcu: esp32c6
 
-      - name: Setup just
-        uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-sta-only-${{ env.XTENSA_VERSION }}-${{ env.IDF_VERSION }}-${{ hashFiles('.cargo/config.toml', 'sdkconfig*.defaults') }}
 
-      - name: Check STA-only (wifi feature with SoftAP disabled)
-        run: just check-sta-only
+      - uses: extractions/setup-just@v4
 
+      - run: just ci-check-sta-only
+
+  # Smoke build of one ESP-IDF example and one bare-metal example (RISC-V, both link).
   build-examples:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      XTENSA_VERSION: "1.97.0.0"
+      IDF_VERSION: v6.1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Setup ESP-RS toolchain (RISC-V + Xtensa)
-        uses: esp-rs/xtensa-toolchain@v1.7.0
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
-          default: true
-          # ldproxy IS required here: this job links an ESP-IDF binary
-          # (`just build-example idf_c3_connect`), and `.cargo/config.toml`
-          # sets `linker = "ldproxy"` for the *-espidf targets. The
-          # `ldproxy: false` guidance in CLAUDE.md applies only to the format
-          # job, which runs `cargo fmt` and never links.
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.XTENSA_VERSION }}
+          buildtargets: esp32
 
-      # The key covers the file that selects the ESP-IDF build: a restored esp-idf-sys
-      # CMake tree from another ESP_IDF_VERSION fails to configure.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+      # build-example.sh sets MCU per example; this value is only the default for the job.
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-esp-idf@v1
         with:
-          key: idf-${{ hashFiles('.cargo/config.toml') }}
+          idf-version: ${{ env.IDF_VERSION }}
+          mcu: esp32c3
 
-      - name: Setup just
-        uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-examples-${{ env.XTENSA_VERSION }}-${{ env.IDF_VERSION }}-${{ hashFiles('.cargo/config.toml', 'sdkconfig*.defaults') }}
 
-      - name: Build IDF example (idf_c3_connect)
-        run: just build-example idf_c3_connect
+      - uses: extractions/setup-just@v4
 
-      - name: Build bare-metal example (hal_c3_connect_async)
-        run: just build-example hal_c3_connect_async
-
-      # `just verify` lints only the workspace default target, so the bare-metal
-      # crate is otherwise never linted on riscv32imc/riscv32imac. Run it here
-      # rather than in `verify` to keep local pre-commit runs fast.
-      - name: Clippy the bare-metal crate on its own targets
-        run: just clippy-hal
+      - run: just ci-build-examples

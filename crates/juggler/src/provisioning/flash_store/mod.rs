@@ -727,9 +727,7 @@ mod test_flash {
             }
             let start_sector = start / Self::ERASE_SIZE;
             let end_sector = end / Self::ERASE_SIZE;
-            for s in start_sector..end_sector {
-                self.erased[s] = true;
-            }
+            self.erased[start_sector..end_sector].fill(true);
             Ok(())
         }
 
@@ -746,9 +744,11 @@ mod test_flash {
             }
             let start_sector = start / Self::ERASE_SIZE;
             let end_sector = end.div_ceil(Self::ERASE_SIZE);
-            for s in start_sector..end_sector {
+            for (s, &erased) in
+                (start_sector..end_sector).zip(&self.erased[start_sector..end_sector])
+            {
                 assert!(
-                    self.erased[s],
+                    erased,
                     "write to non-erased sector {s} — real flash would refuse this"
                 );
             }
@@ -757,9 +757,7 @@ mod test_flash {
             for (i, &b) in bytes.iter().enumerate() {
                 self.data[start + i] &= b;
             }
-            for s in start_sector..end_sector {
-                self.erased[s] = false;
-            }
+            self.erased[start_sector..end_sector].fill(false);
             Ok(())
         }
     }

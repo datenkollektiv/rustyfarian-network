@@ -78,9 +78,13 @@ just run <name>            # flash + serial monitor
 just bench <target>        # guided on-device check via the pinned rustyfarian-bench release (bench/README.md); interactive, the operator runs it
 just mqtt-watch [target] [seconds]  # timestamped broker watch; target hal (default), idf, all, a client id or a filter; seconds bounds the run
 just portal-save <host> <extras> <key_len> <value_len>  # post the provisioning form with x_* extras to a running SoftAP portal (positional args)
+just ci-fmt ci-deny ci-test ci-clippy ci-audit  # CI host jobs on stable (RUSTUP_TOOLCHAIN=stable); ci-check, ci-check-sta-only, ci-clippy-idf, ci-clippy-hal, ci-build-examples need the ESP toolchain
 ```
 
 Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unformatted code.
+CI (`.github/workflows`) calls the shared `datenkollektiv/rustyfarian-ci@v1` workflow for host checks and the shared Xtensa/ESP-IDF setup actions for the rest; every job runs one `just ci-<job>` recipe (the `ci` group), so a local `just ci-<job>` reproduces it.
+`just act [job]` runs the GitHub Actions jobs locally via act (Docker); `RUSTYFARIAN_CI=../rustyfarian-ci just act <job>` tests an unpushed checkout of the shared workflows.
+The ESP-IDF jobs' `IDF_VERSION` must equal `ESP_IDF_VERSION` in `.cargo/config.toml`.
 `just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
 `just verify` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac`/`xtensa-esp32s3` before committing changes to it.
 The pure tier (`juggler`) iterates fast without the ESP toolchain — see `just test` (all tests), or target specific domains via `-p juggler --features wifi,mock` etc.

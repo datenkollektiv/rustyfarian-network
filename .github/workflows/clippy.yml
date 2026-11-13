@@ -14,34 +14,64 @@ concurrency:
   group: clippy-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
+  # Host lint of the pure juggler crate: stable, no ESP toolchain.
   clippy:
+    uses: datenkollektiv/rustyfarian-ci/.github/workflows/host-checks.yml@v1
+    with:
+      check: clippy
+
+  # Workspace lint on the ESP-IDF default target (riscv32imac-esp-espidf).
+  clippy-idf:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      XTENSA_VERSION: "1.97.0.0"
+      # Must match ESP_IDF_VERSION in .cargo/config.toml: setup-esp-idf exports it, which wins over cargo's [env].
+      IDF_VERSION: v6.1
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Setup ESP-RS toolchain (RISC-V)
-        uses: esp-rs/xtensa-toolchain@v1.7.0
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
-          default: true
-          ldproxy: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.XTENSA_VERSION }}
+          # RISC-V-only job: the esp toolchain is installed only when an Xtensa target is listed.
+          buildtargets: esp32
 
-      # The key covers the file that selects the ESP-IDF build: a restored esp-idf-sys
-      # CMake tree from another ESP_IDF_VERSION fails to configure.
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-esp-idf@v1
         with:
-          key: idf-${{ hashFiles('.cargo/config.toml') }}
+          idf-version: ${{ env.IDF_VERSION }}
+          mcu: esp32c6
 
-      - name: Setup just
-        uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A restored esp-idf-sys CMake tree from another IDF version or sdkconfig fails to configure.
+          key: clippy-idf-${{ env.XTENSA_VERSION }}-${{ env.IDF_VERSION }}-${{ hashFiles('.cargo/config.toml', 'sdkconfig*.defaults') }}
 
-      - name: Run clippy
-        run: just clippy
+      - uses: extractions/setup-just@v4
+
+      - run: just ci-clippy-idf
+
+  # Bare-metal esp-hal tier on its own targets (riscv32imc, riscv32imac, xtensa-esp32s3, xtensa-esp32).
+  clippy-hal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      XTENSA_VERSION: "1.97.0.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
+        with:
+          version: ${{ env.XTENSA_VERSION }}
+          buildtargets: esp32,esp32s3
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-hal-${{ env.XTENSA_VERSION }}-${{ hashFiles('.cargo/config.toml') }}
+
+      - uses: extractions/setup-just@v4
+
+      - run: just ci-clippy-hal

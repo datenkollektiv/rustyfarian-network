@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # esp-idf-sys is a `links` crate: the esp-idf stack must move in lockstep.
+      esp-idf:
+        patterns: ["esp-idf-*", "embuild"]
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

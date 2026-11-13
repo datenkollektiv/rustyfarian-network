@@ -40,6 +40,10 @@ idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targ
 bench_dir := env("RUSTYFARIAN_BENCH", "")
 bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.5.0 rustyfarian-bench" }
 
+# act: a local rustyfarian-ci checkout if RUSTYFARIAN_CI points at one, otherwise the pushed @v1.
+ci_dir := env("RUSTYFARIAN_CI", "")
+ci_repo_flag := if ci_dir != "" { '--local-repository "datenkollektiv/rustyfarian-ci@v1=' + absolute_path(ci_dir) + '"' } else { "" }
+
 # ── env ───────────────────────────────────────────────────────────────────
 
 # show RAM disk status, resolved target dirs, sccache, required/optional tooling, and MQTT broker reachability (.env)
@@ -789,16 +793,56 @@ verify:
 [group('ci')]
 ci: fmt-check deny check clippy check-ota-pure check-ota-wire-pure
 
-# run all CI workflows locally via act (requires Docker + act)
+# CI job (fmt.yml): format check on stable, no ESP toolchain
 [group('ci')]
-act *job:
+ci-fmt: fmt-check
+
+# CI job (rust.yml): cargo-deny licenses, advisories, bans and sources, on stable
+[group('ci')]
+ci-deny: deny
+
+# CI job (rust.yml): all platform-independent host unit tests, on stable
+[group('ci')]
+ci-test: test
+
+# CI job (clippy.yml): lint the pure juggler crate on the host, on stable
+[group('ci')]
+ci-clippy: clippy-pure clippy-ota-pure
+
+# CI job (rust.yml): workspace check and the pure OTA checks on the ESP-IDF default target
+[group('ci')]
+ci-check: check check-ota-pure check-ota-wire-pure
+
+# CI job (rust.yml): check the Wi-Fi STA-only build with SoftAP disabled (ESP-IDF)
+[group('ci')]
+ci-check-sta-only: check-sta-only
+
+# CI job (clippy.yml): lint the whole workspace on the ESP-IDF default target
+[group('ci')]
+ci-clippy-idf: clippy
+
+# CI job (clippy.yml): lint the bare-metal esp-hal tier on its own C3/C6/S3/classic ESP32 targets
+[group('ci')]
+ci-clippy-hal: clippy-hal
+
+# CI job (rust.yml): build the ESP-IDF and bare-metal smoke examples
+[group('ci')]
+ci-build-examples:
+    just build-example idf_c3_connect
+    just build-example hal_c3_connect_async
+
+# CI job (audit.yml): cargo-audit advisories
+[group('ci')]
+ci-audit: audit
+
+# run the CI jobs locally via act: all jobs, or one (`just act fmt`; requires Docker + act)
+[group('ci')]
+act job="":
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "{{ job }}" ]; then
-        just act fmt && just act clippy && just act check-and-test && just act audit
-    else
-        act -j "{{ job }}" --pull=false
-    fi
+    for j in {{ if job == "" { "fmt clippy test deny audit clippy-idf clippy-hal check check-sta-only build-examples" } else { job } }}; do
+        act -j "$j" --pull=false -P ubuntu-latest=catthehacker/ubuntu:act-latest {{ ci_repo_flag }}
+    done
 
 # ── release ───────────────────────────────────────────────────────────────
 
