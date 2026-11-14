@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.cargo/config.toml` is committed; `.cargo/config.toml.dist` and `just setup-cargo-config` are gone, and CI runs on `ubuntu-latest` again (ESP-IDF v6.1's esp-clang no longer needs `libxml2.so.2`).
 - `just ensure-bootloader` records the ESP-IDF version of a cached bootloader and rebuilds a cache from another version.
 - CI runs on the shared `datenkollektiv/rustyfarian-ci@v1` workflows and actions: host checks on stable, the ESP-IDF and bare-metal jobs on the shared Xtensa and ESP-IDF setup, and each job runs one `just ci-<job>` recipe.
+- `just`: `ota-cmd` is now `ota-push`, `ota-sub` is now `ota-status`, and `release-semver-check` is now `semver` (rustyfarian family recipe contract).
+- `just verify` is the offline host-only gate; the device tiers moved to `just verify-idf` and `just verify-hal`, and `just ci` runs all three plus `deny`.
+- `just setup [esp|tools]` replaces `setup` and `setup-toolchain`.
 
 ### Deprecated
 

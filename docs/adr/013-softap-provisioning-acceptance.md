@@ -267,7 +267,7 @@ Centralising those rules is what `*-pure` crates are for.
 
 ## References
 
-- `docs/features/softap-provisioning-v1.md` — feature doc carrying the request from
+- `docs/features/archive/softap-provisioning-v1.md` — feature doc carrying the request from
   `rustyfarian-beekeeper`.
 - ADR 004 — `esp-hal` LoRa tier accepted (precedent for promoting a non-goal
   on downstream demand).

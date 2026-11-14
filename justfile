@@ -32,8 +32,8 @@ idf_target := "riscv32imac-esp-espidf"
 export ESPFLASH_PORT := env("ESPFLASH_PORT", "")
 
 ramdisk := "/Volumes/RustBuilds"
-hal_dir := if path_exists(ramdisk + "/targets/hal") == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
-idf_dir := if path_exists(ramdisk + "/targets/idf") == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
+hal_dir := if shell('scripts/ramdisk-mounted.sh "$1"', ramdisk) == "true" { ramdisk + "/targets/hal/" + file_name(justfile_directory()) } else { "target/hal" }
+idf_dir := if shell('scripts/ramdisk-mounted.sh "$1"', ramdisk) == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
 
 # Guided bench runner: a local rustyfarian-bench checkout if RUSTYFARIAN_BENCH points at one,
 # otherwise the pinned release from GitHub (the scenarios need >= v0.5.0 for `probe`, `run`, `setup`/`teardown` and prompt placeholders).
@@ -176,7 +176,7 @@ clippy-espnow:
 # Fully cleans esp-idf-sys before AND after: switching sdkconfig variants forces a CMake reconfigure.
 # ESP_IDF_SDKCONFIG_DEFAULTS paths MUST be absolute: embuild does not resolve relative overlay
 # lists against the workspace root (relative silently applies neither file → false pass).
-# check that --features wifi still compiles with SoftAP disabled (STA-only consumers)
+[doc('check that --features wifi still compiles with SoftAP disabled (STA-only consumers)')]
 [group('build')]
 check-sta-only:
     cargo clean -p esp-idf-sys --target-dir {{ idf_dir }}
@@ -198,13 +198,8 @@ check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-ota
 check-hal-stub:
     cargo check -p rustyfarian-esp-hal-network --no-default-features --target-dir {{ hal_dir }}
 
-# alias for check-hal-stub (ota domain)
-[group('build')]
-check-ota-hal: check-hal-stub
-
-# alias for check-hal-stub (provisioning domain)
-[group('build')]
-check-provisioning-hal: check-hal-stub
+alias check-ota-hal := check-hal-stub
+alias check-provisioning-hal := check-hal-stub
 
 # check the esp-hal provisioning crate cross-compiles cleanly to both bare-metal targets
 [group('build')]
@@ -224,38 +219,19 @@ check-ota-hal-embassy:
 test-hal:
     cargo test --target {{ host_target }} -p rustyfarian-esp-hal-network --no-default-features
 
-# alias for test-hal
-[group('test & lint')]
-test-dhcp: test-hal
-
-# alias for test-hal
-[group('test & lint')]
-test-http: test-hal
-
-# alias for test-hal
-[group('test & lint')]
-test-dns: test-hal
-
-# alias for test-hal
-[group('test & lint')]
-test-ota-hal: test-hal
-
-# alias for test-hal
-[group('test & lint')]
-test-provisioning-hal: test-hal
-
-# alias for test-hal (includes the lora re-export parity guard)
-[group('test & lint')]
-test-lora-hal: test-hal
+alias test-dhcp := test-hal
+alias test-http := test-hal
+alias test-dns := test-hal
+alias test-ota-hal := test-hal
+alias test-provisioning-hal := test-hal
+alias test-lora-hal := test-hal
 
 # check the esp-hal lora domain cross-compiles for ESP32-C6 (bare-metal)
 [group('build')]
 check-lora-hal:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features lora,esp32c6,rt --target-dir {{ hal_dir }}
 
-# alias for check-hal-stub (wifi domain)
-[group('build')]
-check-wifi-hal: check-hal-stub
+alias check-wifi-hal := check-hal-stub
 
 # check the esp-hal wifi crate with the opt-in `embassy` feature (ESP32-C6 + ESP32-C3)
 [group('build')]
@@ -276,6 +252,7 @@ check-espnow-hal:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
+[group('build')]
 check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy check-mqtt-hal-embassy check-espnow-hal
 
 # check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
@@ -284,9 +261,9 @@ check-network-pure-no-std:
     cargo check -p juggler --no-default-features
     cargo check -p juggler --no-default-features --features flash-store
 
-# Lints all four domains (wifi, lora, ota, provisioning) on both RISC-V targets.
+# Lints all six domains (wifi, mqtt, espnow, lora, ota, provisioning) on both RISC-V targets, plus the Xtensa targets that support them.
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
-# run clippy on the esp-hal network crate (bare-metal targets: ESP32-C6 + ESP32-C3)
+[doc('run clippy on the esp-hal network crate (bare-metal targets: ESP32-C6, ESP32-C3, ESP32-S3, ESP32)')]
 [group('build')]
 clippy-hal:
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c6,unstable,rt,embassy -- -D warnings
@@ -360,14 +337,14 @@ deny:
 audit:
     cargo audit
 
-# Known exceptions (build-only `embuild`, the reserved `lorawan-device`) are suppressed via
+# The known exception (build-only `embuild`) is suppressed via
 # `[package.metadata.cargo-machete] ignored` in Cargo.toml with justification comments.
-# find unused declared dependencies across the workspace
+[doc('find unused declared dependencies across the workspace')]
 [group('test & lint')]
 machete:
     cargo machete --with-metadata
 
-# update dependencies (pass package flags to update specific crates, e.g. just update -p led-effects)
+# update dependencies (pass package flags to update specific crates, e.g. just update -p pennant)
 [group('test & lint')]
 update *args:
     cargo update {{ args }}
@@ -443,6 +420,7 @@ build-example example:
 
 # build every example of both tier crates (discovered from examples/*.rs, common/ skipped) via build-example;
 # optional filter = example name prefix (e.g. `hal_`, `idf_c3`); stops at the first failure unless KEEP_GOING=1
+[doc('build every example of both tier crates via build-example (optional filter = example name prefix)')]
 [group('examples')]
 build-all-examples filter="":
     #!/usr/bin/env bash
@@ -479,8 +457,9 @@ build-all-examples filter="":
     done
     [ ${#failed[@]} -eq 0 ]
 
-# build one Xtensa ESP-IDF wifi+mqtt example per chip (esp32, esp32s3); `just verify` compiles only RISC-V, and the Xtensa
+# build one Xtensa ESP-IDF wifi+mqtt example per chip (esp32, esp32s3); `just verify-idf` compiles only RISC-V, and the Xtensa
 # LLVM backend once failed here with "Cannot scavenge register without an emergency spill slot"
+[doc('build one Xtensa ESP-IDF wifi+mqtt example per chip (esp32, esp32s3)')]
 [group('examples')]
 build-xtensa-idf-mqtt:
     just build-example idf_esp32_mqtt
@@ -662,7 +641,7 @@ ota-image-unhealthy version deadline="" example="idf_c3_ota_runtime":
 
 # publish OTA manifest command for version (fails if not built)
 [group('ota')]
-ota-cmd version:
+ota-push version:
     scripts/ota-mqtt.sh cmd "{{ version }}"
 
 # publish tampered manifest command (kind: target|checksum)
@@ -692,7 +671,7 @@ ota-burst count kind:
 
 # subscribe to OTA status topic with ISO timestamps (topic: default status)
 [group('ota')]
-ota-sub topic="status":
+ota-status topic="status":
     scripts/ota-mqtt.sh sub "{{ topic }}"
 
 # flash the baseline of a bare-metal OTA example: it fetches target_version's image (built by ota-image) from ota_host
@@ -722,6 +701,7 @@ flash-ota-baseline example baseline target_version ota_host:
 # bench OTA round trip: build the served image (unhealthy when the check name contains `rollback`), export the
 # baseline's build-time variables for the runner's build step, then run the bench check, e.g.
 # `just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 192.168.40.146 --port /dev/cu.usbmodem2101`
+[doc('bench OTA round trip: build the served image, export the baseline build-time variables, run the bench check')]
 [group('ota')]
 bench-ota board check example baseline target_version ota_host *args:
     #!/usr/bin/env bash
@@ -749,7 +729,7 @@ bench-ota board check example baseline target_version ota_host *args:
 #        just ota-serve 10240        (throttle to 10 KB/s)
 #        just ota-serve 0 102400     (full speed, then stall after 100 KiB: download_timeout test)
 # Port: OTA_PORT (default 8000), the same variable `ota-image` writes into the URLs.
-# serve OTA images from target/ota/ over HTTP with optional throttle
+[doc('serve OTA images from target/ota/ over HTTP with optional throttle')]
 [group('ota')]
 ota-serve rate="0" stall="0":
     #!/usr/bin/env bash
@@ -761,37 +741,32 @@ ota-serve rate="0" stall="0":
     exec python3 scripts/ota-server.py target/ota "${OTA_PORT:-8000}" "{{ rate }}" "{{ stall }}"
 
 # Port: LOCAL_MQTT_PORT (default 1883); `up` prints the MQTT_HOST and MQTT_PORT to use.
-# manage a local test MQTT broker: just mosquitto up | down | status | restart
+[doc('manage a local test MQTT broker: just mosquitto up | down | status | restart')]
 [group('ota')]
 mosquitto action:
     @scripts/mosquitto.sh "{{ action }}"
 
 # ── ci ────────────────────────────────────────────────────────────────────
 
-# full pre-commit verification: format, check, lint (local use only — modifies files)
+# local pre-commit gate: format (modifies files), then verify
 [group('ci')]
-pre-commit: fmt check clippy
+pre-commit: fmt verify
 
-# non-modifying full verification: fails on any anomaly; suggests fix recipe on failure
+# read-only, offline, host-only gate: format check, host lints and host tests
 [group('ci')]
-verify:
-    just fmt-check || (echo; echo "Formatting issues found — run 'just pre-commit' to auto-fix."; echo; exit 1)
-    just ci
-    just check-idf
-    just clippy-provisioning-tests
-    just clippy-provisioning-mqtt-tests
-    just clippy-ota-pure
-    just clippy-pure
-    just clippy-ota-mqtt-idf
-    just clippy-espnow
-    just check-hal
-    just check-no-credential-logging
-    just check-library-never-reboots
-    just test
+verify: fmt-check clippy-pure clippy-ota-pure check-no-credential-logging check-library-never-reboots test
 
-# CI-equivalent verification (non-modifying): format check, deny, check, lint
+# ESP-IDF device checks and lints on the workspace default RISC-V target (needs the ESP toolchain)
 [group('ci')]
-ci: fmt-check deny check clippy check-ota-pure check-ota-wire-pure
+verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clippy-provisioning-mqtt-tests clippy-ota-mqtt-idf clippy-espnow
+
+# bare-metal esp-hal device checks (needs the ESP toolchain for -Zbuild-std)
+[group('ci')]
+verify-hal: check-hal check-ota-wire-pure
+
+# CI-equivalent: verify, deny, then the device gates
+[group('ci')]
+ci: verify deny verify-idf verify-hal
 
 # CI job (fmt.yml): format check on stable, no ESP toolchain
 [group('ci')]
@@ -851,16 +826,16 @@ act job="":
 release-publish-validate:
     scripts/release-validate.sh
 
-# check semver compatibility against v0.5.0 tag (tool-checkable crates only; manual review for cross-target crates)
+# check semver compatibility against v0.7.0 tag (tool-checkable crates only; manual review for cross-target crates)
 [group('release')]
-release-semver-check:
+semver:
     scripts/release-semver-check.sh
 
 # juggler gets a full `cargo publish --dry-run` (host-buildable); the two -network crates get
-# `cargo package --list` because their `cargo publish --dry-run` resolves `juggler ^0.5` against
+# `cargo package --list` because their `cargo publish --dry-run` resolves `juggler ^0.7` against
 # the crates.io index, which only succeeds AFTER juggler is published — their real dry-run therefore
 # happens as the ordered publish proceeds.
-# pre-publish packaging validation (needs a clean tree)
+[doc('pre-publish packaging validation (needs a clean tree)')]
 [group('release')]
 release-dry-run:
     cargo publish --dry-run -p juggler --target {{ host_target }} --all-features
@@ -897,17 +872,27 @@ release-publish-hal:
 
 # ── setup ─────────────────────────────────────────────────────────────────
 
-# initialize the development environment: ESP-IDF toolchain and tooling check
+# install what a fresh clone is missing: component esp (ESP-IDF toolchain, ldproxy, espflash) or tools (cargo-deny, cargo-audit); empty = both; idempotent; ends with doctor
 [group('setup')]
-setup:
+setup component="":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Installing ESP-IDF toolchain..."
-    espup install
-    echo "Checking development tooling..."
+    ensure() { command -v "$1" >/dev/null 2>&1 || cargo install --locked --target {{ host_target }} "$2"; }
+    case "{{ component }}" in
+        ""|esp|tools) ;;
+        *) echo "setup: unknown component '{{ component }}' (use esp or tools)" >&2; exit 1 ;;
+    esac
+    if [ -z "{{ component }}" ] || [ "{{ component }}" = esp ]; then
+        ensure espup espup
+        if ! rustup toolchain list | awk '/^esp/ { found = 1 } END { exit !found }'; then
+            echo "Installing ESP-IDF toolchain..."
+            espup install
+        fi
+        ensure ldproxy ldproxy
+        ensure espflash espflash
+    fi
+    if [ -z "{{ component }}" ] || [ "{{ component }}" = tools ]; then
+        ensure cargo-deny cargo-deny
+        ensure cargo-audit cargo-audit
+    fi
     just doctor
-
-# install the ESP-IDF toolchain via espup
-[group('setup')]
-setup-toolchain:
-    espup install

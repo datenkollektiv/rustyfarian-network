@@ -104,7 +104,7 @@ action_up() {
     if is_running; then
         pid=$(cat "$pid_file")
         echo "[mosquitto] already running (pid $pid, listening on 0.0.0.0:$port)"
-        
+
         # Detect and print LAN IP for convenience
         # shellcheck disable=SC1091
         if [ -f "$(dirname "$0")/lib.sh" ]; then
@@ -116,18 +116,18 @@ action_up() {
         fi
         return 0
     fi
-    
+
     # Check if port is already in use by another process
     if port_ready "$port" 2>/dev/null; then
         echo "Error: port $port is already in use by another process" >&2
         exit 1
     fi
-    
+
     generate_config
-    
+
     # Start mosquitto in background
     "$mosquitto_bin" -c "$config_file" -d
-    
+
     # Write pid to file (mosquitto -d doesn't write the pid)
     # Wait a moment for the process to start, then find its pid
     sleep 0.5
@@ -139,7 +139,7 @@ action_up() {
         echo "Error: failed to start mosquitto" >&2
         exit 1
     fi
-    
+
     # Wait for port to be ready (up to 5 seconds)
     local attempts=0
     while [ $attempts -lt 10 ]; do
@@ -161,7 +161,7 @@ action_up() {
         sleep 0.5
         attempts=$((attempts + 1))
     done
-    
+
     echo "Error: mosquitto did not become ready within 5 seconds" >&2
     exit 1
 }
@@ -172,10 +172,10 @@ action_down() {
         echo "[mosquitto] not running"
         return 0
     fi
-    
+
     pid=$(cat "$pid_file")
     echo "[mosquitto] stopping (pid $pid)"
-    
+
     # Try graceful shutdown first
     if kill -TERM "$pid" 2>/dev/null; then
         # Wait for graceful shutdown (up to 3 seconds)
@@ -189,7 +189,7 @@ action_down() {
             sleep 0.5
             attempts=$((attempts + 1))
         done
-        
+
         # Force kill if still running
         echo "[mosquitto] force killing"
         kill -9 "$pid" 2>/dev/null || true
@@ -198,7 +198,7 @@ action_down() {
         # Process not running; clean up pid file
         rm -f "$pid_file"
     fi
-    
+
     echo "[mosquitto] stopped"
 }
 
@@ -207,7 +207,7 @@ action_status() {
     if is_running; then
         pid=$(cat "$pid_file")
         echo "[mosquitto] running (pid $pid, listening on 0.0.0.0:$port)"
-        
+
         # Show last few log lines if available
         if [ -f "$log_file" ]; then
             echo ""
@@ -216,7 +216,7 @@ action_status() {
         fi
     else
         echo "[mosquitto] not running"
-        
+
         # Show last few log lines from previous run if available
         if [ -f "$log_file" ]; then
             echo ""

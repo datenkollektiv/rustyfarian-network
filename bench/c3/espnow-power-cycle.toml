@@ -2,6 +2,7 @@
 # `idf_c3_espnow_scout` in its DEFAULT scenario (leave `ESPNOW_SCENARIO` unset) against the ESP-IDF C6
 # coordinator `idf_c6_espnow_coordinator` on the shared echo app (an IDF C3 `idf_c3_espnow_coordinator` or the
 # hal `hal_c6_espnow_sta_coordinator` answer the same way); the coordinator follows its access point's channel.
+# Prerequisite: the coordinator is powered and running before the run starts.
 # The scout reads the coordinator's STA MAC at build time:
 #   COORDINATOR_MAC=<coordinator STA MAC> just bench c3 espnow-power-cycle --port <c3 port>
 # The default loop prints no counters line, so the steady phases are judged per send:
@@ -19,7 +20,7 @@ examples = ["idf_c3_espnow_scout"]
 # ── unattended half: coordinator on ────────────────────────────────────────────
 
 [[step]]
-say = "The scout boots in the default scenario and finds the coordinator (power it on if it is off)"
+say = "The scout boots in the default scenario and finds the coordinator"
 arm = false       # printed during the reset
 expect = ['ESPNOW_SCENARIO=default', 'Coordinator found on channel (?P<ch>\d+) — starting send loop']
 reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)'

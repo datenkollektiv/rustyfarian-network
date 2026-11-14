@@ -65,7 +65,7 @@ else
     tail -20 /tmp/release-dryrun-juggler.log >&2
     exit 1
 fi
-# The two -network crates depend on `juggler ^0.5`. A `cargo publish --dry-run` for
+# The two -network crates depend on `juggler ^0.7`. A `cargo publish --dry-run` for
 # them resolves juggler against the crates.io index (the published manifest drops the
 # path), which only succeeds AFTER juggler is published — so a standalone dry-run is
 # not possible here. Their packaging/contents are validated above in [3/5] via
@@ -90,7 +90,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "Publish via the just recipes, in staged dependency order (clean tree + CARGO_REGISTRY_TOKEN):"
 echo "  Stage 1: just release-publish juggler        # wait ~2-5 min to index"
-echo "  Stage 2: just release-dry-run-idf            # now resolves juggler ^0.5 from the index"
+echo "  Stage 2: just release-dry-run-idf            # now resolves juggler ^0.7 from the index"
 echo "           just release-dry-run-hal"
 echo "  Stage 3: just release-publish-idf            # cargo +esp publish, --target riscv32imac-esp-espidf"
 echo "           just release-publish-hal            # -Zbuild-std=core,alloc --target riscv32imac-unknown-none-elf"

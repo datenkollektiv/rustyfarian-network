@@ -9,7 +9,7 @@ flash = ["env", "ESPFLASH_PORT={port}", "just", "flash", "{example}"]
 
 [boards.c3]
 chip = "esp32c3"
-name = "ESP32-C3 Super Mini"
+name = "ESP32-C3 SuperMini"
 checks = ["connect", "mqtt-lwt", "mqtt"]   # first, in this order; the rest follow by name
 
 [boards.c6]

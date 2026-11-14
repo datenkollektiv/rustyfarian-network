@@ -80,7 +80,7 @@ Sizes are crate constants in v1, following the `StaticCell` lore entry; const ge
 ### 6. Chips and scope
 
 Every `mqtt` cfg arm covers `esp32c3`, `esp32c6` and `esp32s3` from the first commit, mirroring the Wi-Fi arms.
-Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, persistent sessions, and STA + ESP-NOW + MQTT coexistence (tracked in `esp-hal-espnow-v1.md`).
+Out of scope for v1: TLS, QoS 2 publishes, runtime (un)subscribe after build, persistent sessions, and STA + ESP-NOW + MQTT coexistence (tracked in `docs/features/archive/esp-hal-espnow-v1.md`).
 
 ## Consequences
 

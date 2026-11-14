@@ -194,7 +194,7 @@ let mqtt = MqttBuilder::new(mqtt_config)
     .on_message(|topic, data| {
         println!("Received on {}: {:?}", topic, data);
     })
-    .build()?;
+    .build(&wifi)?;
 
 mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
 ```
@@ -220,7 +220,7 @@ let mqtt = MqttBuilder::new(mqtt_config)
     .on_message(|topic, data| {
         println!("Received on {}: {:?}", topic, data);
     })
-    .build()?;
+    .build(&wifi)?;
 ```
 
 ## LED Status Feedback
@@ -276,7 +276,7 @@ The Wi-Fi credentials of the coordinator are compile-time only (`WIFI_SSID`, `WI
 After cloning, run the one-time setup before building or running examples:
 
 ```bash
-just setup-toolchain
+just setup esp
 ```
 
 The committed `.cargo/config.toml` pins ESP-IDF v6.1 and configures the linker and target-specific flags for every ESP-IDF and bare-metal target.

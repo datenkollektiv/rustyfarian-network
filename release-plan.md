@@ -24,9 +24,9 @@ Before any publication attempt:
 
 - [ ] Working tree clean on `prepare-crates-publishing` (untracked `review-queue/` and `tmp/` are OK)
 - [ ] `just fmt` clean (all code formatted)
-- [ ] `just verify` passes (`fmt-check` + `cargo deny` + `cargo check` + `cargo clippy`)
+- [ ] `just ci` passes (`verify` + `deny` + `verify-idf` + `verify-hal`: host checks and tests, advisories, both device tiers)
 - [ ] `just test` passes (all pure-crate host tests on `juggler`)
-- [ ] `just release-semver-check` (semver compatibility check against v0.5.0)
+- [ ] `just semver` (semver compatibility check against v0.7.0)
 - [ ] At least one hardware example builds per tier via `just build-example <name>` (sanity check, not exhaustive):
   - ESP-IDF example: `just build-example idf_c3_connect`
   - Bare-metal example: `just build-example hal_c3_connect_async`

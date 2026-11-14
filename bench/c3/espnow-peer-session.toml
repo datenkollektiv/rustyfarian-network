@@ -6,6 +6,7 @@
 #   idf_c6_espnow_coordinator      the hal peer half of the run is the esp-hal peer against an IDF coordinator
 #   hal_c6_espnow_sta_coordinator  the IDF peer half of the run is the ESP-IDF peer against an esp-hal coordinator
 # The other half of each run is a free extra; the coordinator follows its access point's channel.
+# Prerequisite: the coordinator is powered and running before the run starts.
 # The MAC is read at build time (both peers take `ESPNOW_PEER_MAC`); leave ESPNOW_SCENARIO unset (or `default`):
 #   ESPNOW_PEER_MAC=<coordinator STA MAC> just bench c3 espnow-peer-session --port <c3 port>
 # The peer sends an 8-byte frame every 100 ms and prints its counters every 10 s:
@@ -33,7 +34,7 @@ reject = 'FATAL|set ESPNOW_PEER_MAC|PANIC|panicked|Guru Meditation|abort\(\)'
 timeout = 60
 
 [[step]]
-say = "The first scan finds the coordinator (power it on if it is off)"
+say = "The first scan finds the coordinator"
 arm = false
 expect = '\[espnow\] coordinator found on channel (?P<ch>\d+)'
 reject = 'FATAL|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('

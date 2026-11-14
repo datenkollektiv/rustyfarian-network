@@ -32,7 +32,7 @@ It pushes real firmware updates over MQTT to a device and records one result per
 | `OTA_HOST`         | auto-detected             | LAN address of the test machine, never `localhost`; detected from the default route  |
 | `OTA_PORT`         | 8000                      | HTTP port for image delivery                                                         |
 
-Terminals: 1 `just ota-serve` (image server, foreground), 2 `just ota-sub` (statuses with ISO timestamps), 3 `just monitor` (reattach after resets), 4 every scenario step.
+Terminals: 1 `just ota-serve` (image server, foreground), 2 `just ota-status` (statuses with ISO timestamps), 3 `just monitor` (reattach after resets), 4 every scenario step.
 Use plain `just` recipes for all steps, no shell variables and no manual `mosquitto_pub`.
 P10, P11, P12 and P18 switch the server mode in terminal 1: Ctrl-C, then start the new mode.
 
@@ -132,13 +132,13 @@ just ota-flash 1.0.0
 
 ### P2: First update
 
-Bench: `c3/ota-runtime` (`just ota-image 1.1.0`, `just ota-cmd 1.1.0`).
+Bench: `c3/ota-runtime` (`just ota-image 1.1.0`, `just ota-push 1.1.0`).
 `applied` follows at least 30 s after the reboot; slots: before `running=ota_0`, after the reboot `running=ota_1 (PendingVerify)`, after the next reset `running=ota_1 (Valid)`.
 
 ### P3: Up to date
 
 ```bash
-just ota-cmd 1.1.0
+just ota-push 1.1.0
 ```
 
 **Expected:** `{"status":"failed","reason":"up_to_date"}`; no `downloading`, no reboot.
@@ -155,7 +155,7 @@ just ota-pub not-json
 
 ```bash
 just ota-image 1.0.0
-just ota-cmd 1.0.0
+just ota-push 1.0.0
 ```
 
 **Expected:** `{"status":"failed","reason":"downgrade"}`; no `downloading`.
@@ -166,7 +166,7 @@ just ota-cmd 1.0.0
 just ota-image 1.2.0
 just ota-cmd-tampered 1.2.0 target
 just ota-cmd-tampered 1.2.0 checksum
-just ota-cmd 1.2.0
+just ota-push 1.2.0
 ```
 
 **Expected statuses:**
@@ -190,7 +190,7 @@ Bench: `c3/ota-runtime` (`just ota-rollback 1.2.0`): the device reboots at once 
 ### P8: Refused re-offer
 
 ```bash
-just ota-cmd 1.2.0
+just ota-push 1.2.0
 ```
 
 **Expected:** `{"status":"failed","reason":"previously_rolled_back"}`.
@@ -199,7 +199,7 @@ just ota-cmd 1.2.0
 
 ```bash
 just ota-image 1.3.0
-just ota-cmd 1.3.0
+just ota-push 1.3.0
 ```
 
 **Expected:** `downloading`, `swap_pending`, `applied` for 1.3.0.
@@ -218,7 +218,7 @@ just ota-serve 0 102400
 ```
 
 ```bash
-just ota-cmd 1.4.0
+just ota-push 1.4.0
 ```
 
 **Expected:** `{"status":"downloading"}`, about 60 s later `{"status":"failed","reason":"download_timeout"}`; no reboot, `[ota] the failed attempt was cleared`, slots unchanged.
@@ -232,7 +232,7 @@ just ota-serve 0 1
 ```
 
 ```bash
-just ota-cmd 1.4.0
+just ota-push 1.4.0
 ```
 
 **Expected:** only `{"status":"failed","reason":"manifest_fetch"}`, after about 10 s; no `downloading`.
@@ -246,7 +246,7 @@ just ota-serve 20000
 ```
 
 ```bash
-just ota-cmd 1.4.0
+just ota-push 1.4.0
 ```
 
 Wait for `downloading`, then for `[ota] … OTA write session started` in the serial log (the partition erase is over), then send the burst:
@@ -263,14 +263,14 @@ Afterwards restart the normal server in terminal 1 with `just ota-serve`.
 
 ### P13: Unhealthy image, 60 s deadline
 
-Bench: `c3/ota-runtime` (`just ota-image-unhealthy 1.5.0 60`, `just ota-cmd 1.5.0`).
+Bench: `c3/ota-runtime` (`just ota-image-unhealthy 1.5.0 60`, `just ota-push 1.5.0`).
 Never flash this image: a flashed image is not pending verification and is never rolled back.
 The rollback starts about 60 s after boot (61.5 s observed).
 Send the re-offer of 1.5.0 before P14, because the refusal record holds only the most recent rolled-back version; after P14 1.5.0 is offerable again.
 
 ### P14: Unhealthy image, default deadline
 
-Bench: `c3/ota-runtime` (`just ota-image-unhealthy 1.6.0`, `just ota-cmd 1.6.0`); rollback about 120 s after boot (121.5 s observed).
+Bench: `c3/ota-runtime` (`just ota-image-unhealthy 1.6.0`, `just ota-push 1.6.0`); rollback about 120 s after boot (121.5 s observed).
 Build the next image without the unhealthy flag.
 
 ### P15: Startup admission on a validated boot
@@ -282,7 +282,7 @@ just ota-image 1.7.0
 Press RST (or re-attach `just monitor`, which resets the chip), and as soon as serial shows the MQTT connection run:
 
 ```bash
-just ota-cmd 1.7.0
+just ota-push 1.7.0
 ```
 
 **Expected:** `downloading` straight away, no `pending_verify`, then `swap_pending` and `applied` for 1.7.0; the boot is validated (`slot released: true`), so admission opens when the runtime starts.
@@ -294,13 +294,13 @@ Commands sent within milliseconds of each other hit the single busy slot, so sen
 ```bash
 just ota-image 1.8.0
 just ota-image 1.9.0
-just ota-cmd 1.8.0
+just ota-push 1.8.0
 ```
 
 Wait about 5 s for the reboot (serial shows `running=… (PendingVerify)`), then send these three, about 2 s apart:
 
 ```bash
-just ota-cmd 1.9.0
+just ota-push 1.9.0
 ```
 
 ```bash
@@ -327,7 +327,7 @@ The update (1.9.0) is retained and runs after 1.8.0 is applied; rollback and rep
 
 ### P17: Rollback report across a broker outage
 
-Bench: `c3/ota-runtime` (`just ota-rollback <v> && just mosquitto down`, at least 10 s down, `just mosquitto up`, `just ota-cmd <next>` as soon as serial shows `[mqtt] connected`).
+Bench: `c3/ota-runtime` (`just ota-rollback <v> && just mosquitto down`, at least 10 s down, `just mosquitto up`, `just ota-push <next>` as soon as serial shows `[mqtt] connected`).
 The device reconnects about 4 s after its reboot, so run the rollback and the broker stop together; while the broker is down serial shows `Error transport connect` about every 15 s.
 `{"status":"failed","reason":"report_pending"}` appears between `rolled_back` and `downloading` only if the offer arrives before the report is acknowledged; the offer is retained and runs afterwards.
 
@@ -344,19 +344,19 @@ just ota-serve 20000
 ```
 
 ```bash
-just ota-cmd 1.11.0
+just ota-push 1.11.0
 ```
 
 After `downloading`, unplug the board's power and plug it back in (no reflash, no reset).
 
 **Expected:** the old image runs (`[ota] slots: running=<old slot> (Valid)`), `[ota] boot reconciliation: Settled(NoRequest), slot released: true, report pending: false` (the interrupted attempt is cleared silently), no `rolled_back`.
-Then restart the normal server with `just ota-serve` and complete the update with `just ota-cmd 1.11.0`.
+Then restart the normal server with `just ota-serve` and complete the update with `just ota-push 1.11.0`.
 
 ### P19: Reset during pending verification
 
 ```bash
 just ota-image 1.12.0
-just ota-cmd 1.12.0
+just ota-push 1.12.0
 ```
 
 After the reboot, while serial shows `PendingVerify` and before `applied`, press RST (or restart `just monitor`).
@@ -367,7 +367,7 @@ After the reboot, while serial shows `PendingVerify` and before `applied`, press
 {"status":"rolled_back","reason":"bootloader","attempt_id":<n>,"epoch":<e>}
 ```
 
-`just ota-cmd 1.12.0` then answers `failed{previously_rolled_back}`.
+`just ota-push 1.12.0` then answers `failed{previously_rolled_back}`.
 
 ### P20: Repair on a healthy device
 
@@ -381,7 +381,7 @@ just ota-repair
 
 The reporter thread delivers `rolled_back`, publishes rejections, and retries the attempt clean-up after `ApplyNotRecorded`.
 Each schedule is host-tested alone in `crates/juggler/src/ota/runtime/report.rs`; their interleaving lives in the IDF reporter loop and is only observable here.
-The bench check does not send the burst, so run P17 by hand: send the burst as soon as serial shows `[mqtt] connected` after `just mosquitto up`, before the next `just ota-cmd`; commands sent while the device is offline are lost (QoS 0).
+The bench check does not send the burst, so run P17 by hand: send the burst as soon as serial shows `[mqtt] connected` after `just mosquitto up`, before the next `just ota-push`; commands sent while the device is offline are lost (QoS 0).
 
 ```bash
 just ota-burst 6 invalid
@@ -426,7 +426,7 @@ Per scenario: the library commit (`git rev-parse --short HEAD`), the consumer co
 | An update runs again after every reconnect                               | The command was published retained                                                       | Clear it with `mosquitto_pub -r -n -t "$OTA_TOPIC_PREFIX/command"`; never publish with `-r`                    |
 | Every update answers `up_to_date` or `downgrade`                         | The image was built without `FIRMWARE_VERSION`, or the campaign reuses old versions      | Build with `just ota-image <version>`; increase the major version for a new campaign on the same board         |
 | `just ota-image` fails with "larger than the … OTA slot"                 | The image exceeds 1.875 MiB                                                              | Reduce the image or change `partitions.ota.csv`                                                                |
-| An unhealthy image is never rolled back                                  | It was flashed instead of pushed, so it was never pending verification                   | Push it with `just ota-cmd <version>`                                                                          |
+| An unhealthy image is never rolled back                                  | It was flashed instead of pushed, so it was never pending verification                   | Push it with `just ota-push <version>`                                                                          |
 | Every later image is unhealthy or rolls back early                       | `OTA_DEMO_UNHEALTHY` or `OTA_FAILURE_DEADLINE_SECS` is still exported in the environment | Unset both and rebuild                                                                                         |
 | Startup error naming `OTA_DEMO_UNHEALTHY` or `OTA_FAILURE_DEADLINE_SECS` | Value other than `1`, or a deadline not above the 30 s dwell                             | Fix the value and rebuild                                                                                      |
 | Offers answer `report_pending`                                           | A `rolled_back` report is waiting for the broker                                         | Restore the broker connection; the report is retried every 10 s                                                |

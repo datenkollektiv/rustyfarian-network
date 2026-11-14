@@ -89,7 +89,7 @@ let mqtt = MqttBuilder::new(mqtt_config)
     .on_message(|topic, data| {
         println!("Message on {}: {:?}", topic, data);
     })
-    .build()?;
+    .build(&wifi)?;
 
 while !mqtt.is_connected() {
     std::thread::sleep(std::time::Duration::from_millis(100));

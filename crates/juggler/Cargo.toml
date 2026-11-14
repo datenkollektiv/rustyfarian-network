@@ -37,9 +37,9 @@ flash-store = ["provisioning", "dep:embedded-storage"]
 embassy = ["dep:embassy-time"]
 
 # Mock feature — test doubles for radio and ESP-NOW drivers
-# A single shared mock feature is used because only two domains have mocks with
-# non-trivial test dependencies: wifi and lora. MockEspNowDriver requires alloc
-# (uses std::collections::VecDeque); host-test environments always have alloc.
+# A single shared mock feature covers the three domains with mocks: wifi, lora
+# and espnow. MockEspNowDriver requires alloc
+# (uses alloc::collections::VecDeque); host-test environments always have alloc.
 mock = ["wifi", "lora", "espnow"]
 
 # std feature — enables the std-only helpers: in mqtt, CallbackScope,
@@ -52,8 +52,7 @@ mock = ["wifi", "lora", "espnow"]
 std = ["mqtt", "dep:anyhow"]
 
 [dependencies]
-# Always-present: used by backoff, status_colors (zero-dep, always-on modules)
-# and by domain modules that reference log macros.
+# Always-present: used by the domain modules that reference log macros.
 log = { workspace = true }
 
 # Domain-optional deps (dep: prefix prevents feature auto-naming)

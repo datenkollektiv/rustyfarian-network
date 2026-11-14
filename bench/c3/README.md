@@ -1,4 +1,4 @@
-# Bench — ESP32-C3 Super Mini
+# Bench — ESP32-C3 SuperMini
 
 | Check | Example(s) | What it proves | Prerequisites |
 |:--|:--|:--|:--|

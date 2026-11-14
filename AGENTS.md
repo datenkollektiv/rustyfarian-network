@@ -61,15 +61,18 @@ The ESP-IDF and esp-hal tiers implement the traits and hardware lifecycle; they 
 All build, test, lint, and flash operations go through `just` recipes — never invoke `cargo` directly for these.
 
 ```bash
-just setup                 # idempotent: install ESP toolchain via espup, run doctor
+just setup [esp|tools]     # idempotent: esp = espup toolchain + ldproxy + espflash, tools = cargo-deny + cargo-audit; then doctor
 just fmt                   # cargo fmt — modifies files
-just verify                # fmt-check + deny + check + clippy + all host tests — non-modifying, must pass clean
-just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets, incl. the two ESP-NOW examples (not in verify)
-just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify; they cannot run on host)
-just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests with the mqtt feature (in verify)
+just verify                # fmt-check + host lints + guard scripts + all host tests — offline, host-only, non-modifying
+just verify-idf            # ESP-IDF tier: workspace check + clippy, per-domain checks and lints (riscv32imac-esp-espidf)
+just verify-hal            # bare-metal tier: per-domain cross-checks and the no_std OTA wire check
+just ci                    # verify + deny + verify-idf + verify-hal
+just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets, incl. the two ESP-NOW examples (not in the local gates; CI runs it as ci-clippy-hal)
+just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify-idf; they cannot run on host)
+just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests with the mqtt feature (in verify-idf)
 just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
-just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify)
-just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify)
+just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify-idf)
+just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify-idf)
 just test                  # all platform-independent unit tests (no ESP toolchain needed; in verify)
 just build-example <name>  # build a hardware example with auto-detected chip + target
 just build-all-examples [prefix]  # build every tier example (optional name prefix); stops at the first failure unless KEEP_GOING=1
@@ -85,8 +88,8 @@ Run `just fmt` before `just verify` — the latter's `fmt-check` will reject unf
 CI (`.github/workflows`) calls the shared `datenkollektiv/rustyfarian-ci@v1` workflow for host checks and the shared Xtensa/ESP-IDF setup actions for the rest; every job runs one `just ci-<job>` recipe (the `ci` group), so a local `just ci-<job>` reproduces it.
 `just act [job]` runs the GitHub Actions jobs locally via act (Docker); `RUSTYFARIAN_CI=../rustyfarian-ci just act <job>` tests an unpushed checkout of the shared workflows.
 The ESP-IDF jobs' `IDF_VERSION` must equal `ESP_IDF_VERSION` in `.cargo/config.toml`.
-`just verify` only compiles the workspace default target (`riscv32imac-esp-espidf`); use `just build-example <name>` to validate Xtensa IDF and bare-metal targets.
-`just verify` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac`/`xtensa-esp32s3` before committing changes to it.
+`just verify` compiles no device target; `just verify-idf` compiles the workspace default target (`riscv32imac-esp-espidf`), `just verify-hal` the bare-metal checks, and `just build-example <name>` validates Xtensa IDF and bare-metal examples.
+`just verify-idf` also lints only that target — run `just clippy-hal` to lint the bare-metal crate on `riscv32imc`/`riscv32imac`/`xtensa-esp32s3` before committing changes to it.
 The pure tier (`juggler`) iterates fast without the ESP toolchain — see `just test` (all tests), or target specific domains via `-p juggler --features wifi,mock` etc.
 Bare-metal and ESP-IDF builds are isolated into `target/hal` and `target/idf` (host/IDE builds use `target/ide`); this routing is automatic.
 On macOS, `just ramdisk attach` optionally backs those directories with a RAM disk for faster builds, and `just doctor` reports the resolved target dirs and RAM disk status.
