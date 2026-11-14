@@ -10,11 +10,11 @@
 //! | `wifi` | `wifi` | none |
 //! | `mqtt` | `mqtt` (no_std subset) | none |
 //! | `std` | `mqtt` (full, incl. `CallbackScope`, `SubscribeClient`, `Outbox`, `PendingAcks`) | `anyhow` |
-//! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device` |
+//! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device`, `sx126x`, `embedded-hal` |
 //! | `espnow` | `espnow` | none (implies wifi, for the country channel set) |
 //! | `ota` | `ota` | `heapless`, `sha2` |
 //! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
-//! | `provisioning` | `provisioning` | `heapless` (implies wifi+mqtt+lora) |
+//! | `provisioning` | `provisioning` | `heapless`, `zeroize` (implies wifi+mqtt) |
 //! | `flash-store` | `provisioning::flash_store` | `embedded-storage` (implies `provisioning`) |
 //! | `embassy` | `espnow::EmbassyClock` | `embassy-time` (no time driver, ADR 021) |
 //! | `mock` | `wifi::mock`, `lora::mock`, `espnow::mock` | (implies wifi+lora+espnow) |
@@ -31,7 +31,8 @@
 //!   unlock the `std`-specific helpers (see `std` feature below).
 //!
 //! - **`lora`** — LoRa radio primitives, regional config, and LoRaWAN Class A
-//!   protocol state machine. Requires `heapless`, `nb`, and `lorawan-device`.
+//!   protocol state machine. Requires `heapless`, `nb`, `lorawan-device`,
+//!   `sx126x`, and `embedded-hal`.
 //!
 //! - **`espnow`** — ESP-NOW peer tracking, command parsing, and liveness
 //!   detection. Zero external dependencies.
@@ -46,11 +47,11 @@
 //!
 //! - **`provisioning`** — SoftAP captive-portal form parsing, field validation,
 //!   and provisioning state machine. **This is a meta-feature that enables
-//!   `wifi`, `mqtt`, and `lora`** because the two shipped `SchemaProfile`s
+//!   `wifi` and `mqtt`** because the two shipped `SchemaProfile`s
 //!   — `WifiMqttDevice` and `LorawanFieldDevice` — reuse validation types from
-//!   those domains and are part of the public provisioning API. This coupling is
-//!   intentional; consumers may instead depend on only the domain features they
-//!   need. Requires `heapless`.
+//!   those domains and are part of the public provisioning API. `lora` is not
+//!   implied, so a Wi-Fi + MQTT device does not pull `lorawan-device`; enable it
+//!   alongside for `LoraFields::to_lora_config`. Requires `heapless` and `zeroize`.
 //!
 //! ### Utility features
 //!

@@ -1,7 +1,7 @@
 # Runbook: esp-hal Provisioning Extras Hardware Test
 
 Run this after any change to the `rustyfarian-esp-hal-network` provisioning record format, and before the release that ships `TAG_EXTRA`.
-It proves the hardware gate of `docs/features/provisioning-boot-identity-v1.md` (a HAL record with extras survives a reboot) and checks the provisioning task stack against the analytic figures in the example doc blocks.
+It proves the hardware gate of `docs/features/archive/provisioning-boot-identity-v1.md` (a HAL record with extras survives a reboot) and checks the provisioning task stack against the analytic figures in the example doc blocks.
 
 **Reference devices:** an ESP32-C3 (`hal_c3_provision_mqtt`), an ESP32-C6 (`hal_c6_provision_mqtt`) and the CrowPanel S3 (`hal_esp32s3_provision_mqtt`).
 

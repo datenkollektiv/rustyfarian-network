@@ -15,7 +15,7 @@ examples = ["idf_c3_ota_runtime"]
 setup = [
   ["sh", "-c", "scripts/espflash.sh erase-flash"],
   ["sh", "-c", "mkdir -p tmp; pkill -f scripts/ota-server.py || true; (nohup just ota-serve > tmp/bench-ota-serve.log 2>&1 &); sleep 1; curl -sf -o /dev/null http://127.0.0.1:$OTA_PORT/"],
-  ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; : > tmp/bench-ota-status.log; (nohup just ota-sub >> tmp/bench-ota-status.log 2>&1 &); sleep 1"],
+  ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; : > tmp/bench-ota-status.log; (nohup just ota-status >> tmp/bench-ota-status.log 2>&1 &); sleep 1"],
 ]
 teardown = [["sh", "-c", "pkill -f scripts/ota-server.py || true; pkill -f 'mosquitto_sub.*/ota/status' || true"]]
 
@@ -32,7 +32,7 @@ timeout = 90
 
 [[step]]
 say = "P2: offer 1.1.0; the device downloads it, reboots into it and marks it valid"
-run = ["sh", "-c", "echo MARK-P2 >> tmp/bench-ota-status.log; just ota-cmd 1.1.0"]
+run = ["sh", "-c", "echo MARK-P2 >> tmp/bench-ota-status.log; just ota-push 1.1.0"]
 arm = false
 expect = ['\[ota\] attempt \d+ begun', 'OTA example 1\.1\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
 reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
@@ -51,7 +51,7 @@ timeout = 60
 
 [[step]]
 say = "P7 setup: offer 1.2.0 and let it become valid"
-run = ["sh", "-c", "echo MARK-P7SETUP >> tmp/bench-ota-status.log; just ota-cmd 1.2.0"]
+run = ["sh", "-c", "echo MARK-P7SETUP >> tmp/bench-ota-status.log; just ota-push 1.2.0"]
 arm = false
 expect = ['OTA example 1\.2\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
 reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
@@ -85,7 +85,7 @@ timeout = 60
 
 [[step]]
 say = "P13: offer the unhealthy 1.5.0 (60 s deadline); it never turns healthy and rolls back to 1.1.0"
-run = ["sh", "-c", "echo MARK-P13 >> tmp/bench-ota-status.log; just ota-cmd 1.5.0"]
+run = ["sh", "-c", "echo MARK-P13 >> tmp/bench-ota-status.log; just ota-push 1.5.0"]
 arm = false
 expect = ['OTA example 1\.5\.0 starting', 'OTA_DEMO_UNHEALTHY=1', '\[ota\] health deadline reached with the slot still pending; rolling back', 'OTA example 1\.1\.0 starting']
 reject = '\[ota\] download failed|PANIC|panicked|Guru Meditation|abort\(\)'
@@ -102,7 +102,7 @@ timeout = 60
 
 [[step]]
 say = "P13: a re-offer of 1.5.0 is refused as previously rolled back"
-run = ["sh", "-c", "echo MARK-P13RE >> tmp/bench-ota-status.log; just ota-cmd 1.5.0"]
+run = ["sh", "-c", "echo MARK-P13RE >> tmp/bench-ota-status.log; just ota-push 1.5.0"]
 probe = ["scripts/bench-ota-status-since.sh", "MARK-P13RE"]
 arm = false
 expect = '"status":"failed","reason":"previously_rolled_back"'
@@ -114,7 +114,7 @@ timeout = 30
 
 [[step]]
 say = "P14: offer the unhealthy 1.6.0 (default 120 s deadline); it rolls back to 1.1.0"
-run = ["sh", "-c", "echo MARK-P14 >> tmp/bench-ota-status.log; just ota-cmd 1.6.0"]
+run = ["sh", "-c", "echo MARK-P14 >> tmp/bench-ota-status.log; just ota-push 1.6.0"]
 arm = false
 expect = ['OTA example 1\.6\.0 starting', 'OTA_DEMO_UNHEALTHY=1', '\[ota\] health deadline reached with the slot still pending; rolling back', 'OTA example 1\.1\.0 starting']
 reject = '\[ota\] download failed|failure deadline overridden|PANIC|panicked|Guru Meditation|abort\(\)'
@@ -133,7 +133,7 @@ timeout = 60
 
 [[step]]
 say = "P17 setup: offer 1.9.0 and let it become valid"
-run = ["sh", "-c", "echo MARK-P17SETUP >> tmp/bench-ota-status.log; just ota-cmd 1.9.0"]
+run = ["sh", "-c", "echo MARK-P17SETUP >> tmp/bench-ota-status.log; just ota-push 1.9.0"]
 arm = false
 expect = ['OTA example 1\.9\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
 reject = '\[ota\] download failed|\[ota\] command failed|PANIC|panicked|Guru Meditation|abort\(\)'
@@ -163,7 +163,7 @@ reject = '\[mqtt\] connected|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|r
 
 [[step]]
 say = "P17: start the broker again (the status subscriber restarts with it); the device reconnects"
-run = ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; just mosquitto up; (nohup just ota-sub >> tmp/bench-ota-status.log 2>&1 &); sleep 1"]
+run = ["sh", "-c", "pkill -f 'mosquitto_sub.*/ota/status' || true; just mosquitto up; (nohup just ota-status >> tmp/bench-ota-status.log 2>&1 &); sleep 1"]
 arm = false
 expect = '\[mqtt\] connected \(session present'
 reject = 'PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
@@ -171,7 +171,7 @@ timeout = 90
 
 [[step]]
 say = "P17: offer 1.10.0 right after the reconnect; it is applied once the report is delivered"
-run = ["sh", "-c", "just ota-cmd 1.10.0"]
+run = ["sh", "-c", "just ota-push 1.10.0"]
 arm = false
 expect = ['OTA example 1\.10\.0 starting', '\[ota\] image \S+ is healthy; the slot is marked valid']
 reject = '\[ota\] download failed|PANIC|panicked|Guru Meditation|abort\(\)'

@@ -279,7 +279,7 @@ impl<R: LoraRadio> LorawanDevice<R> {
         //   };
         //   match self.inner.handle_event(event) { ... }
         //
-        // See docs/ROADMAP.md §"Main Loop Timing — Critical Constraint".
+        // See the lora-pure item in docs/ROADMAP.md.
         Ok(LorawanResponse::NoUpdate)
     }
 

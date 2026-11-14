@@ -70,7 +70,7 @@ impl RadioErrorKind for LoraError {
 ///
 /// Accepts a `StatusLed` implementation for visual feedback:
 /// - Use [`pennant::NoLed`] for headless configurations.
-/// - Use `rustyfarian_esp_hal_ws2812::Ws2812RmtDriver` for WS2812 LED feedback.
+/// - Use `rustyfarian_esp_hal_ws2812::Ws2812Rmt` for WS2812 LED feedback.
 ///
 /// # Implementation status
 ///

@@ -4,9 +4,9 @@
 //! with per-domain + chip feature gates:
 //!
 //! - [`wifi`] — async STA + SoftAP Wi-Fi via `esp-radio 1.0.0-beta.1` (pre-release, exact-pinned)
-//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
+//!   (requires `embassy`; supported on `esp32c3`, `esp32c6`, `esp32`, `esp32s3`)
 //! - [`mqtt`] — async MQTT 5 client over the Wi-Fi `embassy-net` stack (`minimq`, ADR 019)
-//!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`, `esp32s3`)
+//!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`, `esp32`, `esp32s3`)
 //! - [`espnow`] — ESP-NOW over `esp-radio` `esp_now`, implementing `juggler::espnow::EspNowDriver` (ADR 020)
 //!   (requires `wifi` + `embassy`; supported on `esp32c3`, `esp32c6`)
 //! - [`lora`] — synchronous LoRa stub via embedded-hal SPI + GPIO
@@ -29,7 +29,7 @@
 //! | `embassy` | Async executor + embassy-net stack |
 //! | `esp32c3` | Target chip ESP32-C3 |
 //! | `esp32c6` | Target chip ESP32-C6 |
-//! | `esp32` | Target chip ESP32 (lora + ota only) |
+//! | `esp32` | Target chip ESP32 (wifi, mqtt, lora, ota) |
 //! | `esp32s3` | Target chip ESP32-S3 |
 //! | `unstable` | Forward `esp-hal/unstable` |
 //! | `rt` | Forward `esp-hal/rt` |

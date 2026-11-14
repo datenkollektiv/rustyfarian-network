@@ -253,5 +253,5 @@ Follow-through items (not decided in this ADR, but implied):
 - [Cargo Book — Features](https://doc.rust-lang.org/cargo/reference/features.html) — the additive-features principle this ADR relies on within a tier.
 - [Cargo Book — Publishing](https://doc.rust-lang.org/cargo/reference/publishing.html) — crates.io publication workflow and versioning.
 - `AGENTS.md` § Architecture — the current three-tier structure and the pure-first rule.
-- `docs/release-plan.md` (when created) — publication checklist and pre-release validation steps.
+- `release-plan.md` — publication checklist and pre-release validation steps.
 - `docs/features/archive/crate-consolidation-3-crates-v1.md` — implementation plan, migration table, testing strategy, and per-phase status tracking.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# release-semver-check.sh — semver compatibility check against v0.6.0 tag
+# release-semver-check.sh — semver compatibility check against v0.7.0 tag
 # Usage: scripts/release-semver-check.sh
 #
-# Compares current tree with v0.6.0 tag for all three published crates.
-# 0.7.0 is a pre-1.0 minor release — breaking changes are allowed but must be
+# Compares current tree with v0.7.0 tag for all three published crates.
+# 0.8.0 is a pre-1.0 minor release — breaking changes are allowed but must be
 # documented. Tool verdict is informational; interpretation requires the CHANGELOG.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ host_target="$("$SCRIPT_DIR/host-target.sh")"
 set +e  # Don't exit on tool failure; report and continue
 
 echo "════════════════════════════════════════════════════════════════════════"
-echo "SEMVER CHECK: current tree vs. v0.6.0 tag (pre-1.0 minor release — breaking changes allowed)"
+echo "SEMVER CHECK: current tree vs. v0.7.0 tag (pre-1.0 minor release — breaking changes allowed)"
 echo "════════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -21,7 +21,7 @@ echo ""
 
 echo "[1/3] juggler (host target: $host_target, all-features)"
 echo "────────────────────────────────────────────────────────────────────────"
-if cargo semver-checks -p juggler --baseline-rev v0.6.0 --target "$host_target" --all-features; then
+if cargo semver-checks -p juggler --baseline-rev v0.7.0 --target "$host_target" --all-features; then
     juggler_pass=1
     echo "✓ juggler: no semver violations"
 else
@@ -38,11 +38,11 @@ echo "Not checked by the tool: cargo-semver-checks builds rustdoc in a placehold
 echo "crate outside the workspace, so rust-toolchain.toml (esp), .cargo/config.toml"
 echo "and build-std do not apply; on 2026-10-09 rustdoc failed with"
 echo "'output of --print=file-names missing' (also with RUSTUP_TOOLCHAIN=esp)."
-echo "Check by hand: git diff v0.6.0..HEAD -- crates/<crate>/src | grep -E '^-\s*pub '"
+echo "Check by hand: git diff v0.7.0..HEAD -- crates/<crate>/src | grep -E '^-\s*pub '"
 echo ""
 echo "Workaround: manual review of CHANGELOG.md [Unreleased] section instead."
 echo "This crate's semver compatibility is tracked through:"
-echo "  1. CHANGELOG.md [Unreleased] → [0.7.0] entry documents breaking changes"
+echo "  1. CHANGELOG.md [Unreleased] → [0.8.0] entry documents breaking changes"
 echo "  2. Downstream integrations verify compatibility at integration time"
 echo ""
 idf_pass=0  # Cannot check with this tool; defer to manual review
@@ -57,11 +57,11 @@ echo "Not checked by the tool: cargo-semver-checks builds rustdoc in a placehold
 echo "crate outside the workspace, so rust-toolchain.toml (esp), .cargo/config.toml"
 echo "and build-std do not apply; on 2026-10-09 rustdoc failed with"
 echo "'output of --print=file-names missing' (also with RUSTUP_TOOLCHAIN=esp)."
-echo "Check by hand: git diff v0.6.0..HEAD -- crates/<crate>/src | grep -E '^-\s*pub '"
+echo "Check by hand: git diff v0.7.0..HEAD -- crates/<crate>/src | grep -E '^-\s*pub '"
 echo ""
 echo "Workaround: manual review of CHANGELOG.md [Unreleased] section instead."
 echo "This crate's semver compatibility is tracked through:"
-echo "  1. CHANGELOG.md [Unreleased] → [0.7.0] entry documents breaking changes"
+echo "  1. CHANGELOG.md [Unreleased] → [0.8.0] entry documents breaking changes"
 echo "  2. Downstream integrations verify compatibility at integration time"
 echo ""
 hal_pass=0  # Cannot check with this tool; defer to manual review
@@ -79,7 +79,7 @@ echo "  rustyfarian-esp-hal-network:     ⊘ Tool limitation (manual review requ
 echo ""
 echo "Manual verification checklist:"
 echo "  1. Review CHANGELOG.md [Unreleased] for documented breaking changes"
-echo "  2. Confirm CHANGELOG entries match semver requirements for 0.7.0 (minor)"
+echo "  2. Confirm CHANGELOG entries match semver requirements for 0.8.0 (minor)"
 echo "  3. For tool limitations above: verify integration tests pass"
 echo ""
 

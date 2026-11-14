@@ -60,7 +60,7 @@ esp-println = { version = "=0.18.0", default-features = false }
 # declares it directly any more.
 
 # Embassy async ecosystem (opt-in via the `embassy` feature on HAL crates) — exact pins
-# aligned with what `esp-rtos 0.3.0` pulls transitively. Mismatched minors produce
+# aligned with what `esp-rtos 0.4.0` pulls transitively. Mismatched minors produce
 # duplicate Signal/Channel types that don't interoperate at task boundaries.
 embassy-executor = { version = "=0.10.0", default-features = false }
 embassy-net = { version = "=0.8.0", default-features = false }
