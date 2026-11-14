@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
@@ -20,14 +19,21 @@ jobs:
   analyze:
     name: Analyze Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      XTENSA_VERSION: "1.97.0.0"
     steps:
       - uses: actions/checkout@v5
 
+      # Installed as non-default; rust-toolchain.toml (channel = "esp") selects it in the checkout.
       - name: Install Xtensa Rust toolchain
-        uses: esp-rs/xtensa-toolchain@v1.7.0
+        uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
-          default: true
-          ldproxy: false
+          version: ${{ env.XTENSA_VERSION }}
+          buildtargets: esp32
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
