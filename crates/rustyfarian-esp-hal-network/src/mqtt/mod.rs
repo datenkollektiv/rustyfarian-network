@@ -28,7 +28,7 @@
 //!   runner queue; queue entries survive a reconnect and go out in order, messages
 //!   already handed to the session but not yet acknowledged by the broker do not (one
 //!   at most when the network drops, more if the broker itself dies) — QoS 1 is
-//!   at-least-once within one broker session only. [`MqttHandle::publish_with`]
+//!   at-least-once within one broker session only. [`MqttHandle::publish`]
 //!   skips the state check, so it can enqueue while disconnected; those messages go
 //!   out after the next connect.
 //!
@@ -39,7 +39,7 @@
 //!   session; [`MqttHandle::state`] leaves `Connected` and the runner waits for
 //!   the network, so there is no retry churn while suspended.
 //! * **Publishing:** [`MqttHandle::try_publish`] returns `WouldBlock`;
-//!   [`MqttHandle::publish_with`] still enqueues for the next session.
+//!   [`MqttHandle::publish`] still enqueues for the next session.
 //! * **Broker view:** the will goes out after 1.5 × keep-alive; a shorter suspend
 //!   ends in a client-id takeover on reconnect (will, then the startup message).
 //! * **After `resume`:** the runner connects as soon as the link and DHCP are up,
@@ -178,23 +178,43 @@ pub struct InboundMessage {
 
 impl juggler::mqtt::MqttMessage for InboundMessage {
     fn topic(&self) -> &str {
-        self.topic.as_str()
+        InboundMessage::topic(self)
     }
 
     fn payload(&self) -> &[u8] {
-        self.payload.as_slice()
+        InboundMessage::payload(self)
     }
 
     fn retained(&self) -> bool {
-        self.retained
+        InboundMessage::retained(self)
     }
 
     fn qos(&self) -> QoS {
-        self.qos
+        InboundMessage::qos(self)
     }
 }
 
 impl InboundMessage {
+    /// Topic the broker delivered the message on.
+    pub fn topic(&self) -> &str {
+        self.topic.as_str()
+    }
+
+    /// Message payload.
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    /// Whether the broker flagged the message as retained.
+    pub fn retained(&self) -> bool {
+        self.retained
+    }
+
+    /// QoS the broker delivered the message with.
+    pub fn qos(&self) -> QoS {
+        self.qos
+    }
+
     /// Copies topic and payload into the fixed-capacity fields.
     ///
     /// Returns `None` when either exceeds its cap; the runner then drops the message.

@@ -127,9 +127,13 @@ That feature lets embassy-time work on both tiers.
 
 - Answered 2026-11-02: the IDF examples use esp-idf-hal `block_on`, and the firmware chooses its executor (ADR 021); `embassy-executor` with `arch-std` on IDF is untested.
 - Answered 2026-11-01: `embassy-time-driver 0.2.2` from `esp-idf-svc` unifies in the IDF graph, with one copy and no duplicate embassy crates (ESP32-C3 spike).
-- Open: is each of the three breaking items a break or a deprecation?
-  Settled per step in the remaining name alignment; `MqttBuilder::build(&wifi)` (the network gate) and, for 0.7.0, the IDF `MqttBuilder::with_startup_message` signature and the two required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended` are the 0.x breaks approved so far.
-- Open: does the blocking IDF API become thin wrappers over the async one?
+- Answered 2026-11-14: each breaking item is a 0.x break, not a deprecation, because a deprecation cannot free a name the shared API needs.
+  - 0.7.0 broke `MqttBuilder::build(&wifi)` (the network gate), the IDF `MqttBuilder::with_startup_message` signature and the required trait methods `MqttClient::subscribe` and `NetworkLink::wait_suspended`.
+  - 0.8.0 breaks the IDF `wait_connected()` (now async), `NetworkLink::ip`, the IDF Wi-Fi `is_connected()` (`anyhow::Result<bool>` to `bool`), the esp-hal `suspend()` / `resume()` (`()` to `Result<(), Infallible>`), the IDF `try_publish` / `try_publish_retained` payload (`&str` to `&[u8]`) and the IDF `publish`, which becomes the shared async `publish(topic, payload, qos, retain)`; the IDF sync drop-oldest publish moves to `enqueue`.
+  - The MQTT `is_connected` already returned `bool` on both tiers, and the inbound payload was already `&[u8]`.
+- Answered 2026-11-14: no, the blocking IDF methods that remain after 0.8.0 stay separate front-ends over the same `juggler` cores and worker threads.
+  - Wrapping the async methods in `block_on` would pick an executor inside the library (ADR 021) and deadlock a caller that already runs inside one.
+  - Deprecating the blocking surface stays a later, separate decision (decision 3).
 - Answered 2026-11-01: the IDF async foundation is async wrappers over the existing worker threads (decision 2).
 
 ## Alternatives Considered

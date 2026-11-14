@@ -125,7 +125,12 @@ fn main() -> anyhow::Result<()> {
         }
 
         let payload = counter.to_string();
-        if let Err(e) = handle.publish(&heartbeat_topic, &payload) {
+        if let Err(e) = handle.enqueue(
+            &heartbeat_topic,
+            payload.as_bytes(),
+            QoS::AtLeastOnce,
+            false,
+        ) {
             log::warn!("[app] heartbeat publish failed: {:#}", e);
         } else {
             log::info!("[app] heartbeat {} sent", counter);

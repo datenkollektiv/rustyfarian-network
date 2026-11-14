@@ -30,8 +30,7 @@ For history, see `CHANGELOG.md` and `docs/features/archive/`.
 timeline
     title rustyfarian-network Roadmap
 
-    Ready     : Tier parity — only the remaining Wi-Fi and MQTT name alignment is left after 0.7.0 (feature-doc)
-              : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally (feature-doc)
+    Ready     : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally (feature-doc)
               : ESP-NOW scan-burst TX power — scan boosts to max, near-field peers fail (feature-doc)
               : Portal defaults from build-time env — one helper builds the defaults for three consumers (feature-doc)
     Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 bench run, plus bug 007 (LoRa forces a critical-section provider)
@@ -42,6 +41,8 @@ timeline
               : LED/timeout dedup — extract the status-LED pulse and timeout-poll loop shared by the ESP-IDF Wi-Fi paths and MqttBuilder.build_and_wait
               : OTA download progress callback — user-facing progress for the OTA session
               : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)
+              : Provisioning tier parity — async wait_committed on IDF, one on_event shape, esp-hal boot helpers load_with_reentry and run_wifi_mqtt_portal (ADR 022)
+              : OTA tier parity — one manager name across tiers (OtaSession, EspHalOtaManager), MQTT OTA runtime on esp-hal (ADR 022)
 
     Mid term  : LoRa TTN OTAA validation — first downlink (FPort 10) and session persistence remain (runbook)
               : OTA security model doc — threat model and signed-manifest question

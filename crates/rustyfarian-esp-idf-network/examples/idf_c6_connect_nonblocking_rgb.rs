@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
 
     // Phase 1: blue pulse while waiting for association.
     loop {
-        if wifi.is_connected()? {
+        if wifi.is_connected() {
             break;
         }
         led.set_color(pulse.update((0, 0, 255)))?;

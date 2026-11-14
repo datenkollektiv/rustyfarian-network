@@ -274,8 +274,14 @@ Design detail: [Wi-Fi suspend, resume and deep sleep](https://github.com/datenko
 |:-----------------------|:---------------------------------------------------------------------------------------|:-----------------------------------------------------------------|
 | Radio while suspended  | Stopped (`esp_wifi_stop`)                                                              | Powered, station disconnected                                    |
 | Broker address         | Hostname or IPv4 (DNS via lwIP)                                                        | IPv4 literal or DNS name (no IPv6)                               |
-| Inbound messages       | Callback and/or the `receive()` queue                                                  | `receive()` channel; no callback                                 |
+| Inbound messages       | `on_message` callback and/or the `receive()` queue                                     | `receive()` channel; no callback                                 |
 | Inbound retain and QoS | Not reported (retain is always false, QoS always `AtMostOnce`)                         | Reported                                                         |
+| MQTT lifecycle hooks   | `on_connect` and `on_disconnect` callbacks                                             | None; watch `state()` and `connect_count()`                      |
+| MQTT message limits    | Inbound payload up to `MAX_INBOUND_PAYLOAD_LEN` (16 KiB), `INBOUND_QUEUE_DEPTH` 8, no topic cap | Topic `MAX_TOPIC_LEN` (64 B), payload `MAX_PAYLOAD_LEN` (256 B), `INBOUND_QUEUE_DEPTH` 4 |
+| MQTT sync publish      | `enqueue` does not wait for queue room, drops the oldest held message when the queue is full, and can block on esp-mqtt's lock during a reconnect | None; `try_publish` refuses with `WouldBlock`                    |
+| Acknowledged publish   | `publish_acked` blocks until the broker's PUBACK (QoS 1)                               | None; `publish` returning `Ok` means queued                      |
+| MQTT setup             | `build(&wifi)` returns the handle; `build_and_wait` blocks with a status LED           | `build(stack)` once per boot returns the handle and an `MqttRunner` for a firmware task; `'static` config and topics; the handle is `Copy` |
+| MQTT stop              | The client stops when the last `MqttHandle` clone drops                                | Never; `MqttRunner::run` does not return                         |
 | Executor               | std threads; `block_on` for the async app                                              | `esp-rtos` plus the embassy executor                             |
 | Suspend call           | Blocking; the radio is stopped when it returns, so `wait_suspended()` is ready at once | Non-blocking signal; `wait_suspended()` completes once suspended |
 | ESP-NOW sender         | Worker thread `espnow-tx` (6 KiB stack), started by the constructors, joined on drop    | `run_sender()` in a firmware task; without it async sends and scans fail with `NoSenderRunner` |

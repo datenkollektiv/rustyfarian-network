@@ -46,21 +46,43 @@ pub struct InboundMessage {
     pub payload: Vec<u8>,
 }
 
-impl MqttMessage for InboundMessage {
-    fn topic(&self) -> &str {
+impl InboundMessage {
+    /// Topic the message was published to.
+    pub fn topic(&self) -> &str {
         &self.topic
     }
 
-    fn payload(&self) -> &[u8] {
+    /// Message body.
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
-    fn retained(&self) -> bool {
+    /// Always `false`, esp-idf-svc 0.53 does not report the retain flag.
+    pub fn retained(&self) -> bool {
         false
     }
 
-    fn qos(&self) -> QoS {
+    /// Always [`QoS::AtMostOnce`], esp-idf-svc 0.53 does not report the delivery QoS.
+    pub fn qos(&self) -> QoS {
         QoS::AtMostOnce
+    }
+}
+
+impl MqttMessage for InboundMessage {
+    fn topic(&self) -> &str {
+        InboundMessage::topic(self)
+    }
+
+    fn payload(&self) -> &[u8] {
+        InboundMessage::payload(self)
+    }
+
+    fn retained(&self) -> bool {
+        InboundMessage::retained(self)
+    }
+
+    fn qos(&self) -> QoS {
+        InboundMessage::qos(self)
     }
 }
 

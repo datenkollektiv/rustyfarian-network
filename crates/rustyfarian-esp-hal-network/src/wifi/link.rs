@@ -28,7 +28,7 @@
 //! firmware can wait a bounded time before deep sleep:
 //!
 //! ```ignore
-//! LINK.suspend();
+//! let _ = LINK.suspend();
 //! let _ = with_timeout(
 //!     Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS),
 //!     LINK.wait_suspended(),
@@ -45,6 +45,7 @@
 //! suspend issued before `run` starts is kept.
 
 use core::cell::{Cell, RefCell};
+use core::convert::Infallible;
 use core::net::Ipv4Addr;
 use core::pin::pin;
 use core::task::Poll;
@@ -223,7 +224,10 @@ impl WiFiManager {
     /// 1.5 × keep-alive. Before deep sleep, wait (bounded) for
     /// [`is_suspended`](Self::is_suspended); the reset after sleep re-initialises
     /// the radio.
-    pub fn suspend(&self) {
+    ///
+    /// Never fails; it returns `Result<(), Infallible>` so the call has the same
+    /// shape as the ESP-IDF `WiFiManager::suspend` (ADR 022).
+    pub fn suspend(&self) -> Result<(), Infallible> {
         // Readiness falls before the station goes down, as on the ESP-IDF tier.
         let (woken, change) = self.with(|h| (h.suspend(), h.take_ready_change()));
         self.report_ready(change, None);
@@ -231,6 +235,7 @@ impl WiFiManager {
             log::info!("{}", Lifecycle::SuspendRequested);
             self.wake.signal(());
         }
+        Ok(())
     }
 
     /// Leaves suspend and connects with a fresh back-off.
@@ -238,13 +243,16 @@ impl WiFiManager {
     /// Non-blocking and idempotent; a no-op unless suspended. Safe right after
     /// [`suspend`](Self::suspend), even before the disconnect ran: the supervisor
     /// keeps an association that is still up, or the attempt still in flight.
-    pub fn resume(&self) {
+    ///
+    /// Never fails; the `Result` matches the ESP-IDF `WiFiManager::resume`.
+    pub fn resume(&self) -> Result<(), Infallible> {
         let (woken, change) = self.with(|h| (h.resume(), h.take_ready_change()));
         self.report_ready(change, None);
         if woken {
             log::info!("{}", Lifecycle::ResumeRequested);
             self.wake.signal(());
         }
+        Ok(())
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut LinkHandover) -> R) -> R {
@@ -537,7 +545,7 @@ pub async fn link_task(
 }
 
 impl NetworkLink for WiFiManager {
-    type Error = core::convert::Infallible;
+    type Error = Infallible;
 
     fn state(&self) -> LinkState {
         WiFiManager::state(self)
@@ -556,13 +564,11 @@ impl NetworkLink for WiFiManager {
     }
 
     fn suspend(&self) -> Result<(), Self::Error> {
-        WiFiManager::suspend(self);
-        Ok(())
+        WiFiManager::suspend(self)
     }
 
     fn resume(&self) -> Result<(), Self::Error> {
-        WiFiManager::resume(self);
-        Ok(())
+        WiFiManager::resume(self)
     }
 
     async fn wait_connected(&self) {
@@ -579,6 +585,31 @@ const _: fn() = || {
     fn implements<T: NetworkLink>() {}
     implements::<WiFiManager>();
 };
+
+/// Concrete tier parity check (ADR 022): consumer code calls `WiFiManager`
+/// directly, often without importing `NetworkLink`, so these calls must compile
+/// with the same names, arguments and return shapes on both tiers. The trait check
+/// above cannot see an inherent method that hides a trait method with another
+/// signature; this one fails on it. Keep the body identical to its twin in the
+/// ESP-IDF tier (`rustyfarian-esp-idf-network` `wifi/mod.rs`).
+#[allow(dead_code)]
+mod concrete_parity {
+    use crate::wifi::{LinkState, WiFiManager};
+    use core::net::Ipv4Addr;
+
+    async fn calls(wifi: &WiFiManager) {
+        let _: LinkState = wifi.state();
+        let _: bool = wifi.is_connected();
+        let _: bool = wifi.is_ready();
+        let _: bool = wifi.is_suspended();
+        let _: u32 = wifi.connect_count();
+        let _: Option<Ipv4Addr> = wifi.ip();
+        let _: Result<(), _> = wifi.suspend();
+        let _: Result<(), _> = wifi.resume();
+        let _: () = wifi.wait_connected().await;
+        let _: () = wifi.wait_suspended().await;
+    }
+}
 
 /// The credentials hint for an esp-radio disconnect reason.
 ///

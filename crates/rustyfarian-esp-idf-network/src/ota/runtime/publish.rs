@@ -12,7 +12,7 @@ use crate::mqtt::{MqttHandle, QoS, TryPublishError};
 /// A busy client is retried `status_publish_retries` times, `status_publish_delay` apart; after that the status is dropped and logged.
 /// That bound covers only contention on the client mutex: once the mutex is won, `enqueue` can block on esp-mqtt's `api_lock` for one reconnect handshake, so a status published before a restart is best-effort in both directions (it can be dropped, or it can delay the restart).
 /// This is not a deadlock: the event loop never waits for the publisher, it only hands commands to a channel.
-/// Blocking `publish_with` is deliberately not used: it could stall the worker on a dead link.
+/// Blocking `enqueue` is deliberately not used: it could stall the worker on a dead link.
 pub(super) fn publish_status(
     mqtt: &MqttHandle,
     topic: &str,

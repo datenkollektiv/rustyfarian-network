@@ -5,7 +5,7 @@
 //! - **Connect path** — `with_startup_message(..)` plus an `on_connect` that publishes a retained "online" status through its `client` argument.
 //!   Pass: `is_connected()` becomes `true` and the heartbeat loop starts.
 //! - **Message path** — the device subscribes to `{client_id}/echo` and publishes to it from the main loop every 2 s.
-//!   `on_message` then deliberately calls `MqttHandle::try_publish` and `MqttHandle::publish`, which must fail fast with `PublishAckError::WrongThread` instead of hanging.
+//!   `on_message` then deliberately calls `MqttHandle::try_publish` and `MqttHandle::enqueue`, which must fail fast with `PublishAckError::WrongThread` instead of hanging.
 //!   Pass: every status line shows `received` tracking `sent` and `guard_hits` growing by two per echo.
 //!
 //! No host-side MQTT client is needed — the echo loop runs on the device itself.
@@ -116,17 +116,17 @@ fn main() -> anyhow::Result<()> {
                 return;
             };
 
-            match handle.try_publish(&echo_for_cb, "from-callback") {
+            match handle.try_publish(&echo_for_cb, b"from-callback") {
                 Err(TryPublishError::Other(e)) if is_wrong_thread(&e) => {
                     guard_hits_cb.fetch_add(1, Ordering::Relaxed);
                 }
                 other => log::error!("[guard] try_publish from on_message: {other:?}"),
             }
-            match handle.publish(&echo_for_cb, "from-callback") {
+            match handle.enqueue(&echo_for_cb, b"from-callback", QoS::AtLeastOnce, false) {
                 Err(e) if is_wrong_thread(&e) => {
                     guard_hits_cb.fetch_add(1, Ordering::Relaxed);
                 }
-                other => log::error!("[guard] publish from on_message: {other:?}"),
+                other => log::error!("[guard] enqueue from on_message: {other:?}"),
             }
         })
         .build(&wifi)?;
@@ -151,7 +151,12 @@ fn main() -> anyhow::Result<()> {
     let mut sent: u32 = 0;
     loop {
         if handle.is_connected() {
-            match handle.publish(&echo_topic, &sent.to_string()) {
+            match handle.enqueue(
+                &echo_topic,
+                sent.to_string().as_bytes(),
+                QoS::AtLeastOnce,
+                false,
+            ) {
                 Ok(()) => sent += 1,
                 Err(e) => log::warn!("[guard] echo publish failed: {e:#}"),
             }

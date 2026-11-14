@@ -5,7 +5,7 @@ desk-work: available
 
 # Feature: ESP-NOW Tier Parity v1
 
-Goal: ESP-NOW consumer code is exchangeable between the tiers ([ADR 022](../../adr/022-tier-parity-one-async-api.md), Phase 6 of the [tier-parity plan](../tier-parity-v1-plan.md)).
+Goal: ESP-NOW consumer code is exchangeable between the tiers ([ADR 022](../../adr/022-tier-parity-one-async-api.md), Phase 6 of [tier-parity-v1](tier-parity-v1.md)).
 Prerequisite for [espnow-peer-link-v1](espnow-peer-link-v1.md).
 The breaking changes are in `CHANGELOG.md` (0.7.0), the remaining tier differences in the crate READMEs' capability tables, and the esp-hal design in [ADR 020](../../adr/020-esp-hal-espnow-owned-radio-and-sync-shim.md).
 
