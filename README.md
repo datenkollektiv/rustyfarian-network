@@ -196,7 +196,7 @@ let mqtt = MqttBuilder::new(mqtt_config)
     })
     .build(&wifi)?;
 
-mqtt.publish_with("status", b"online", QoS::AtMostOnce, false)?;
+mqtt.enqueue("status", b"online", QoS::AtMostOnce, false)?;
 ```
 
 ### LWT and Retained Messages

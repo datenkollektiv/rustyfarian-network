@@ -36,9 +36,10 @@ wifi.resume()?;
 ## Deep sleep on esp-hal
 
 Call `suspend()`, wait up to 500 ms for `is_suspended()`, then sleep; the reset on wake re-initialises the radio, so no resume is needed on that path.
+`suspend()` and `resume()` return `Result<(), Infallible>` on esp-hal, the same shape as on ESP-IDF.
 
 ```rust
-LINK.suspend();
+let _ = LINK.suspend();
 let deadline = Instant::now() + Duration::from_millis(SUSPEND_DISCONNECT_TIMEOUT_MS);
 while !LINK.is_suspended() && Instant::now() < deadline {
     Timer::after_millis(10).await;
@@ -46,7 +47,7 @@ while !LINK.is_suspended() && Instant::now() < deadline {
 if sleep_still_wanted() {
     rtc.sleep_deep(&[&wake_source]);
 }
-LINK.resume();
+let _ = LINK.resume();
 ```
 
 ## MQTT while suspended

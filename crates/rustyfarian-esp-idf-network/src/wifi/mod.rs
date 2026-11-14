@@ -215,8 +215,8 @@ impl StatusLed for NoLed {
 /// logged with its reason and answered with a 1 s back-off that doubles up to
 /// 30 s and resets on `StaConnected`. The blocking modes only wait for the link
 /// until their timeout, so a failed first association is retried within it.
-/// [`is_connected`](Self::is_connected) keeps reporting the driver's
-/// event-tracked state, so it is `false` for the whole outage.
+/// [`is_connected`](Self::is_connected) follows the supervisor's
+/// [`state`](Self::state), so it is `false` for the whole outage.
 ///
 /// [`suspend`](Self::suspend) and [`resume`](Self::resume) park and restart the
 /// station within the same boot, for example around deep sleep.
@@ -542,9 +542,10 @@ impl WiFiManager {
         }
     }
 
-    /// Returns whether the WiFi is currently connected.
-    pub fn is_connected(&self) -> anyhow::Result<bool> {
-        Ok(self.wifi.is_connected()?)
+    /// `true` while the station is associated ([`LinkState::Connected`]); the same
+    /// call as on the esp-hal tier and the `NetworkLink` default.
+    pub fn is_connected(&self) -> bool {
+        self.state() == LinkState::Connected
     }
 
     /// The reconnect supervisor's view of the link, including
@@ -590,6 +591,34 @@ impl WiFiManager {
     /// stopped. Stays `false` after a suspend whose stop failed.
     pub fn is_suspended(&self) -> bool {
         self.link.supervisor.is_suspended()
+    }
+
+    /// Completes once a [`suspend`](Self::suspend) has stopped the radio, and stays
+    /// pending while nothing is suspended (the `NetworkLink` contract), also after a
+    /// suspend whose stop failed.
+    /// `suspend` stops the radio before it returns, so after a successful suspend
+    /// this completes at once.
+    pub async fn wait_suspended(&self) {
+        core::future::poll_fn(|cx| {
+            if self.is_suspended() {
+                return core::task::Poll::Ready(());
+            }
+            let mut wakers = self
+                .suspend_wakers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                wakers.push(cx.waker().clone());
+            }
+            drop(wakers);
+            // A suspend that finished between the check and the registration.
+            if self.is_suspended() {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await
     }
 
     /// Associations since boot; a change means a new link session.
@@ -779,32 +808,8 @@ impl NetworkLink for WiFiManager {
         self.wait_ready().await
     }
 
-    /// Completes once a [`WiFiManager::suspend`] has stopped the radio, and stays
-    /// pending while nothing is suspended (the `NetworkLink` contract), also after a
-    /// suspend whose stop failed.
-    /// `suspend` stops the radio before it returns, so after a successful suspend
-    /// this completes at once.
     async fn wait_suspended(&self) {
-        core::future::poll_fn(|cx| {
-            if self.is_suspended() {
-                return core::task::Poll::Ready(());
-            }
-            let mut wakers = self
-                .suspend_wakers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                wakers.push(cx.waker().clone());
-            }
-            drop(wakers);
-            // A suspend that finished between the check and the registration.
-            if self.is_suspended() {
-                core::task::Poll::Ready(())
-            } else {
-                core::task::Poll::Pending
-            }
-        })
-        .await
+        WiFiManager::wait_suspended(self).await
     }
 }
 
@@ -813,6 +818,31 @@ const _: fn() = || {
     fn implements<T: NetworkLink>() {}
     implements::<WiFiManager>();
 };
+
+/// Concrete tier parity check (ADR 022): consumer code calls `WiFiManager`
+/// directly, often without importing `NetworkLink`, so these calls must compile
+/// with the same names, arguments and return shapes on both tiers. The trait check
+/// above cannot see an inherent method that hides a trait method with another
+/// signature; this one fails on it. Keep the body identical to its twin in the
+/// esp-hal tier (`rustyfarian-esp-hal-network` `wifi/link.rs`).
+#[allow(dead_code)]
+mod concrete_parity {
+    use crate::wifi::{LinkState, WiFiManager};
+    use core::net::Ipv4Addr;
+
+    async fn calls(wifi: &WiFiManager) {
+        let _: LinkState = wifi.state();
+        let _: bool = wifi.is_connected();
+        let _: bool = wifi.is_ready();
+        let _: bool = wifi.is_suspended();
+        let _: u32 = wifi.connect_count();
+        let _: Option<Ipv4Addr> = wifi.ip();
+        let _: Result<(), _> = wifi.suspend();
+        let _: Result<(), _> = wifi.resume();
+        let _: () = wifi.wait_connected().await;
+        let _: () = wifi.wait_suspended().await;
+    }
+}
 
 /// The station calls of the ESP-IDF driver; events arrive through the
 /// system event loop in the order the driver posts them.

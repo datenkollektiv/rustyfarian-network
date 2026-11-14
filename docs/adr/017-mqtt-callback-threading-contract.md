@@ -21,7 +21,7 @@ Field evidence: a local `on_connect` enqueue deadlock on startup publish, and an
 
 ### 1. Guard: callback detection and fast-fail
 
-Every `MqttHandle` method that touches the client (`publish`, `publish_with`, `subscribe`, etc.) calls `ensure_not_in_callback()` first.
+Every `MqttHandle` method that touches the client (`publish`, `enqueue`, `subscribe`, etc.) calls `ensure_not_in_callback()` first.
 If the caller is on the event-loop thread inside a callback, it returns `PublishAckError::WrongThread` (for `anyhow`-wrapped methods) or `TryPublishError::Other` (for the `try_*` family).
 
 Detection uses a thread-local depth counter `juggler::mqtt::CallbackScope`, entered for the whole event-loop thread and around each `on_connect` invocation, not a `ThreadId` comparison.

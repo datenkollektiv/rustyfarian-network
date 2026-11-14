@@ -27,7 +27,7 @@
 //!     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
 //!     .build(&wifi)?;
 //!
-//! handle.publish("status", "online")?;
+//! handle.enqueue("status", b"online", QoS::AtLeastOnce, false)?;
 //! ```
 //!
 //! [`QoS`], [`MqttConfig`], [`LwtConfig`] and [`TryPublishError`] are shared
@@ -65,7 +65,7 @@
 //! ```ignore
 //! use rustyfarian_esp_idf_network::mqtt::TryPublishError;
 //!
-//! match handle.try_publish("sensors/temp", "22.5") {
+//! match handle.try_publish("sensors/temp", b"22.5") {
 //!     Ok(()) => log::info!("published"),
 //!     Err(TryPublishError::WouldBlock) => { /* skip this tick, retry next */ }
 //!     Err(TryPublishError::Other(e)) => log::warn!("publish failed: {}", e),
@@ -152,10 +152,9 @@ pub use pennant::{SimpleLed, StatusLed};
 #[allow(deprecated)]
 use juggler::mqtt::connection_wait_iterations;
 use juggler::mqtt::{
-    format_broker_url, in_callback, next_state, validate_broker_host, validate_broker_port,
-    validate_client_id, validate_publish_topic, validate_subscribe_filter, AckOutcome,
-    CallbackScope, MqttClient, MqttEvent, NetworkGate, PendingAcks, PendingPublish, SessionInput,
-    SubscribeClient, TryClient,
+    format_broker_url, in_callback, next_state, validate_broker_host, AckOutcome, CallbackScope,
+    MqttClient, MqttEvent, NetworkGate, PendingAcks, PendingPublish, SessionInput, SubscribeClient,
+    TryClient,
 };
 
 mod connect_port;
@@ -179,7 +178,9 @@ use task_name::spawn_named;
 // is 8 KiB because ESP-IDF's 6144-byte default overflows during TLS
 // negotiation error paths — corrupting the heap and crashing `pthread_exit`.
 pub use juggler::mqtt::{
-    LwtConfig, MqttConfig, MqttConnectionState, QoS, DEFAULT_MQTT_TASK_STACK_SIZE,
+    topic_matches_filter, validate_broker_port, validate_client_id, validate_publish_topic,
+    validate_subscribe_filter, LwtConfig, MqttConfig, MqttConnectionState, QoS,
+    DEFAULT_MQTT_TASK_STACK_SIZE,
 };
 
 /// Error returned by the `try_publish*` family when the publish cannot
@@ -327,12 +328,11 @@ pub enum PublishAckError {
     /// would self-deadlock on that mutex instead. Detected via a callback
     /// scope entered around each callback, not by comparing thread identity.
     /// Also returned, wrapped in [`anyhow::Error`], by [`MqttHandle::publish`],
-    /// [`publish_with`], [`publish_retained`], the `try_publish*` family, and
+    /// [`enqueue`], the `try_publish*` family, and
     /// [`subscribe`](MqttHandle::subscribe). A programming error; fix the call
     /// site.
     ///
-    /// [`publish_with`]: MqttHandle::publish_with
-    /// [`publish_retained`]: MqttHandle::publish_retained
+    /// [`enqueue`]: MqttHandle::enqueue
     WrongThread,
     /// A local, non-broker failure: topic validation rejected the publish, the
     /// underlying `enqueue` call failed, or the client mutex was poisoned. Says
@@ -751,7 +751,7 @@ type OnMessageCallback = Box<dyn Fn(&str, &[u8]) + Send + 'static>;
 ///     .on_message(|topic, data| log::info!("msg on {}: {:?}", topic, data))
 ///     .build()?;
 ///
-/// handle.publish("events/boot", "ok")?;
+/// handle.enqueue("events/boot", b"ok", QoS::AtLeastOnce, false)?;
 /// ```
 pub struct MqttBuilder<'a> {
     config: MqttConfig<'a>,
@@ -1382,7 +1382,7 @@ impl<'a> MqttBuilder<'a> {
 /// ```ignore
 /// let handle2 = handle.clone();
 /// std::thread::spawn(move || {
-///     handle2.publish("sensors/temp", "22.5").unwrap();
+///     handle2.enqueue("sensors/temp", b"22.5", QoS::AtLeastOnce, false).unwrap();
 /// });
 /// ```
 #[derive(Clone)]
@@ -1427,21 +1427,7 @@ impl MqttHandle {
         Ok(())
     }
 
-    /// Publishes a message with QoS 1 and no retain flag.
-    pub fn publish(&self, topic: &str, payload: &str) -> anyhow::Result<()> {
-        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
-    }
-
-    /// Publishes a retained message with QoS 1.
-    ///
-    /// Retained messages are stored by the broker and delivered to new
-    /// subscribers immediately.  Use for persistent device state (e.g.
-    /// online/offline status).
-    pub fn publish_retained(&self, topic: &str, payload: &str) -> anyhow::Result<()> {
-        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
-    }
-
-    /// Publishes a message with explicit QoS and retain control.
+    /// Hands a message to the session synchronously, with explicit QoS and retain control.
     ///
     /// # Arguments
     ///
@@ -1458,11 +1444,13 @@ impl MqttHandle {
     /// that, messages wait in esp-mqtt's outbox and can still go out after a
     /// reconnect (QoS 1).
     ///
-    /// This synchronous method cannot wait: when all [`PUBLISH_QUEUE_DEPTH`]
-    /// slots are taken, the oldest held message is dropped and counted (see
-    /// [`dropped_publish`](Self::dropped_publish)). The shared
-    /// [`MqttClient::publish`] trait method waits for room instead and never
-    /// evicts.
+    /// This synchronous method does not wait for room: when all
+    /// [`PUBLISH_QUEUE_DEPTH`] slots are taken, the oldest held message is
+    /// dropped and counted (see [`dropped_publish`](Self::dropped_publish)). The
+    /// async [`publish`](Self::publish) waits for room instead and never evicts.
+    /// It can still block: on the client mutex while the runner performs a
+    /// connect step, and inside esp-mqtt's enqueue, which waits for esp-mqtt's
+    /// internal lock during a reconnect (seconds, not microseconds).
     ///
     /// # Threading
     ///
@@ -1470,20 +1458,57 @@ impl MqttHandle {
     /// `on_message`, `on_disconnect`). Such a call returns an error carrying
     /// [`PublishAckError::WrongThread`] instead of hanging. Safe to call from
     /// any other thread at any time, including before the first connect.
-    pub fn publish_with(
+    pub fn enqueue(
         &self,
         topic: &str,
         payload: &[u8],
         qos: QoS,
         retain: bool,
     ) -> anyhow::Result<()> {
-        self.ensure_not_in_callback()
-            .context("publish_with rejected")?;
+        self.ensure_not_in_callback().context("enqueue rejected")?;
         validate_publish_topic(topic)
             .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
         log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
         self.session
             .publish(PendingPublish::new(topic, payload, qos, retain));
+        Ok(())
+    }
+
+    /// Waits until the outbox has room, then hands the message over.
+    ///
+    /// Same name, arguments and return shape as the esp-hal `MqttHandle::publish`;
+    /// only the error type differs.
+    ///
+    /// `Ok(())` means the message was admitted, not that the broker received it.
+    /// A call made while disconnected is admitted too: before the station has an
+    /// IP it is held in [`PUBLISH_QUEUE_DEPTH`] slots and sent once the client
+    /// exists; after that, messages wait in esp-mqtt's outbox and can still go
+    /// out after a reconnect (QoS 1). Never evicts a queued message (unlike the
+    /// synchronous [`enqueue`](Self::enqueue)); a message esp-mqtt then refuses
+    /// is dropped and counted in [`dropped_publish`](Self::dropped_publish).
+    ///
+    /// Polling the future does synchronous work: it takes the client mutex,
+    /// which the runner holds during a connect step, and with a client attached
+    /// it calls esp-mqtt's enqueue, which waits for esp-mqtt's internal lock
+    /// during a reconnect. An executor that runs other tasks on the same thread
+    /// stalls for that time.
+    ///
+    /// Must not be awaited from inside any callback; such a call returns an
+    /// error carrying [`PublishAckError::WrongThread`].
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> anyhow::Result<()> {
+        self.ensure_not_in_callback().context("publish rejected")?;
+        validate_publish_topic(topic)
+            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
+        log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
+        self.session
+            .publish_waiting(PendingPublish::new(topic, payload, qos, retain))
+            .await;
         Ok(())
     }
 
@@ -1582,8 +1607,8 @@ impl MqttHandle {
     /// `on_disconnect`, or `on_connect` it returns [`TryPublishError::Other`]
     /// wrapping [`PublishAckError::WrongThread`] (see
     /// [`try_publish_with`](Self::try_publish_with)).
-    pub fn try_publish(&self, topic: &str, payload: &str) -> Result<(), TryPublishError> {
-        self.try_publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
+    pub fn try_publish(&self, topic: &str, payload: &[u8]) -> Result<(), TryPublishError> {
+        self.try_publish_with(topic, payload, QoS::AtLeastOnce, false)
     }
 
     /// Non-blocking retained publish with QoS 1 — non-blocking only when
@@ -1595,8 +1620,8 @@ impl MqttHandle {
     /// [`try_publish_with`](Self::try_publish_with)), or while the mutex is held, and
     /// [`TryPublishError::Other`] wrapping [`PublishAckError::WrongThread`]
     /// from inside any callback.
-    pub fn try_publish_retained(&self, topic: &str, payload: &str) -> Result<(), TryPublishError> {
-        self.try_publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
+    pub fn try_publish_retained(&self, topic: &str, payload: &[u8]) -> Result<(), TryPublishError> {
+        self.try_publish_with(topic, payload, QoS::AtLeastOnce, true)
     }
 
     /// Non-blocking publish with explicit QoS and retain control.
@@ -1755,7 +1780,7 @@ impl MqttHandle {
     /// (it does not wait for a SUBACK) and releases it and yields after every
     /// step, so while a step runs:
     ///
-    /// - [`publish_with`](MqttHandle::publish_with) may block until the
+    /// - [`enqueue`](MqttHandle::enqueue) may block until the
     ///   runner releases the mutex; from a thread at the runner's priority or above it then gets the lock before the next
     ///   step and the publish may go out between two steps
     /// - [`try_publish_with`](MqttHandle::try_publish_with) may return
@@ -1840,9 +1865,9 @@ impl MqttHandle {
     /// `dropped_publish`.
     ///
     /// A publish that arrives before the station has an IP waits in
-    /// [`PUBLISH_QUEUE_DEPTH`] slots. The synchronous `publish*` methods drop
-    /// the oldest held entry when all slots are taken; the shared
-    /// [`MqttClient::publish`] waits for room instead. A message esp-mqtt
+    /// [`PUBLISH_QUEUE_DEPTH`] slots. The synchronous [`enqueue`](Self::enqueue)
+    /// drops the oldest held entry when all slots are taken; the async
+    /// [`publish`](Self::publish) waits for room instead. A message esp-mqtt
     /// refuses is counted here too, whichever method published it.
     pub fn dropped_publish(&self) -> u32 {
         self.session.dropped_publish()
@@ -1876,11 +1901,7 @@ impl MqttClient for MqttHandle {
         MqttHandle::subscribe(self, topic, qos)
     }
 
-    /// Waits until the outbox has room, then hands the message over.
-    ///
-    /// Never evicts a queued message (unlike the synchronous
-    /// [`publish_with`](MqttHandle::publish_with)); a message esp-mqtt then
-    /// refuses is dropped and counted in [`dropped_publish`](MqttHandle::dropped_publish).
+    /// Waits until the outbox has room, see [`MqttHandle::publish`].
     async fn publish(
         &self,
         topic: &str,
@@ -1888,14 +1909,7 @@ impl MqttClient for MqttHandle {
         qos: QoS,
         retain: bool,
     ) -> anyhow::Result<()> {
-        self.ensure_not_in_callback().context("publish rejected")?;
-        validate_publish_topic(topic)
-            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
-        log::debug!("[mqtt] publishing to '{}': {} bytes", topic, payload.len());
-        self.session
-            .publish_waiting(PendingPublish::new(topic, payload, qos, retain))
-            .await;
-        Ok(())
+        MqttHandle::publish(self, topic, payload, qos, retain).await
     }
 
     async fn wait_connected(&self) {
@@ -1912,6 +1926,38 @@ const _: fn() = || {
     fn implements<T: MqttClient>() {}
     implements::<MqttHandle>();
 };
+
+/// Concrete tier parity check (ADR 022): consumer code calls `MqttHandle` and
+/// `InboundMessage` directly, often without importing `MqttClient`, so these calls
+/// must compile with the same names, arguments and return shapes on both tiers.
+/// The trait check above cannot see an inherent method that hides a trait method
+/// with another signature; this one fails on it. Keep the body identical to its
+/// twin in the esp-hal tier (`rustyfarian-esp-hal-network` `mqtt/runner.rs`).
+#[allow(dead_code)]
+mod concrete_parity {
+    use crate::mqtt::{InboundMessage, MqttConnectionState, MqttHandle, QoS, TryPublishError};
+
+    async fn calls(mqtt: &MqttHandle) {
+        let _: MqttConnectionState = mqtt.state();
+        let _: bool = mqtt.is_connected();
+        let _: u32 = mqtt.connect_count();
+        let _: u32 = mqtt.dropped_inbound();
+        let _: u32 = mqtt.dropped_publish();
+        let _: Result<(), TryPublishError> = mqtt.try_publish("t", b"p");
+        let _: Result<(), TryPublishError> = mqtt.try_publish_retained("t", b"p");
+        let _: Result<(), TryPublishError> =
+            mqtt.try_publish_with("t", b"p", QoS::AtLeastOnce, false);
+        let _: Result<(), _> = mqtt.publish("t", b"p", QoS::AtLeastOnce, false).await;
+        let _: Result<(), _> = mqtt.subscribe("t", QoS::AtMostOnce);
+        let _: () = mqtt.wait_connected().await;
+        let _: Option<InboundMessage> = mqtt.try_receive();
+        let message: InboundMessage = mqtt.receive().await;
+        let _: &str = message.topic();
+        let _: &[u8] = message.payload();
+        let _: bool = message.retained();
+        let _: QoS = message.qos();
+    }
+}
 
 /// The message published on every (re)connect, owned by the runner, which
 /// borrows it for each connect step.

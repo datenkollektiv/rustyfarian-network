@@ -171,7 +171,7 @@ async fn app(boot: Instant, wifi: &WiFiManager, mqtt: &MqttHandle, tick_topic: &
             tick,
             spike::heap_free()
         );
-        match mqtt.try_publish(tick_topic, &payload) {
+        match mqtt.try_publish(tick_topic, payload.as_bytes()) {
             Ok(()) => log::info!("[app] tick #{} queued", tick),
             Err(TryPublishError::WouldBlock) => {
                 log::info!("[app] tick #{} would block (mqtt {:?})", tick, state)
