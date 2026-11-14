@@ -12,11 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WiFiManager::ip() -> Option<Ipv4Addr>` on both tiers: the station's address while ready (tier parity Step 10, ADR 022).
 - `rustyfarian-esp-idf-network` `WiFiManager::wait_connected_timeout(timeout_ms) -> Result<Ipv4Addr>`: the blocking wait under its new name.
 - `juggler::wifi::MockLink::set_ip`: the address the mock reports while `Connected`.
+- `rustyfarian-esp-idf-network` `WiFiManager::wait_suspended()` as an inherent async method, so the call needs no `NetworkLink` import (esp-hal parity).
+- `MqttHandle::publish(topic, payload, qos, retain)` as an inherent async method on both tiers, the same call as `MqttClient::publish` (tier parity Step 11, ADR 022).
+- `InboundMessage::{topic, payload, retained, qos}` accessors on both tiers, so reading a message needs no trait import.
+- `rustyfarian-esp-idf-network` `mqtt` re-exports the `juggler` validators (`validate_publish_topic`, `validate_subscribe_filter`, `validate_client_id`, `validate_broker_port`, `topic_matches_filter`), as esp-hal does.
 
 ### Changed
 
 - **Breaking:** `juggler::wifi::NetworkLink` requires `fn ip(&self) -> Option<core::net::Ipv4Addr>`, so generic code can read the station address; both tiers forward to `WiFiManager::ip`.
 - **Breaking:** `rustyfarian-esp-idf-network` `WiFiManager::wait_connected()` is now async and returns `()`, the same call as on esp-hal; blocking callers move to `wait_connected_timeout(timeout_ms)`.
+- **Breaking:** `rustyfarian-esp-idf-network` `WiFiManager::is_connected()` returns `bool` (`state() == LinkState::Connected`), as on esp-hal and in `NetworkLink`; drop the `?`.
+- **Breaking:** `rustyfarian-esp-hal-network` `WiFiManager::suspend()` and `resume()` return `Result<(), Infallible>` (was `()`), the same shape as on ESP-IDF; callers that ignore it write `let _ = LINK.suspend();`.
+- **Breaking:** `rustyfarian-esp-idf-network` `MqttHandle::try_publish` and `try_publish_retained` take a `&[u8]` payload (was `&str`), as on esp-hal; pass `text.as_bytes()` or `b"..."`.
+- **Breaking:** `rustyfarian-esp-idf-network` `MqttHandle::publish` is the shared async `publish(topic, payload, qos, retain)`, which waits for queue room; the sync method that drops the oldest held message when the queue is full is now `enqueue(topic, payload, qos, retain)`, and the sync `publish(topic, &str)`, `publish_retained` and `publish_with` are gone (`handle.publish(t, &s)` becomes `handle.enqueue(t, s.as_bytes(), QoS::AtLeastOnce, false)`).
 - `rustyfarian-esp-hal-network` the link supervisor `WifiLink` is now `WiFiManager`, the IDF name; `WiFiManager::init_async` and `init_softap_async` are unchanged, and firmware declares `static LINK: WiFiManager = WiFiManager::new();`.
 - `rustyfarian-esp-hal-network` `AP_IP` is spelled `core::net::Ipv4Addr` (the same type as before).
 - **Breaking:** `rustyfarian-esp-idf-network` is built and validated against ESP-IDF v6.1 (was v5.3.3), in step with `rustyfarian-esp-idf-ws2812`; firmware sets `ESP_IDF_VERSION = "v6.1"` and deletes its old `esp-idf-sys-*` build directories once (here: `just clean-idf-sys`).
@@ -32,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `rustyfarian-esp-hal-network` `wifi::WifiLink`: a type alias of `WiFiManager`.
 - `rustyfarian-esp-hal-network` `AsyncWifiHandle::wait_for_ip`: use `WiFiManager::wait_connected` and `WiFiManager::ip`.
+- `rustyfarian-esp-hal-network` `MqttHandle::publish_with`: use `MqttHandle::publish`, the name the ESP-IDF tier shares.
 
 ## [0.7.0] - 2026-11-12
 

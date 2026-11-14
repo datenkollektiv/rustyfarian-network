@@ -262,7 +262,10 @@ impl MqttHandle {
     /// `Ok(())` means accepted into the queue, not delivered; the per-session rule of
     /// [`try_publish`](Self::try_publish) applies once the runner has handed the
     /// message to the session.
-    pub async fn publish_with(
+    ///
+    /// Same name, arguments and return shape as the ESP-IDF `MqttHandle::publish`;
+    /// only the error type differs. QoS 2 is downgraded to QoS 1 on this tier.
+    pub async fn publish(
         &self,
         topic: &str,
         payload: &[u8],
@@ -272,6 +275,21 @@ impl MqttHandle {
         let request = PublishRequest::new(topic, payload, clamp_qos(qos), retain)?;
         self.shared.publish_q.send(request).await;
         Ok(())
+    }
+
+    /// Queues a publish, waiting for queue space; the former name of [`publish`](Self::publish).
+    #[deprecated(
+        since = "0.8.0",
+        note = "use publish(topic, payload, qos, retain), the name the ESP-IDF tier shares"
+    )]
+    pub async fn publish_with(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttError> {
+        self.publish(topic, payload, qos, retain).await
     }
 
     /// Subscribes to a topic filter while the client runs.
@@ -345,7 +363,7 @@ impl MqttClient for MqttHandle {
         qos: QoS,
         retain: bool,
     ) -> Result<(), MqttError> {
-        self.publish_with(topic, payload, qos, retain).await
+        MqttHandle::publish(self, topic, payload, qos, retain).await
     }
 
     async fn wait_connected(&self) {
@@ -362,6 +380,38 @@ const _: fn() = || {
     fn implements<T: MqttClient>() {}
     implements::<MqttHandle>();
 };
+
+/// Concrete tier parity check (ADR 022): consumer code calls `MqttHandle` and
+/// `InboundMessage` directly, often without importing `MqttClient`, so these calls
+/// must compile with the same names, arguments and return shapes on both tiers.
+/// The trait check above cannot see an inherent method that hides a trait method
+/// with another signature; this one fails on it. Keep the body identical to its
+/// twin in the ESP-IDF tier (`rustyfarian-esp-idf-network` `mqtt/mod.rs`).
+#[allow(dead_code)]
+mod concrete_parity {
+    use crate::mqtt::{InboundMessage, MqttConnectionState, MqttHandle, QoS, TryPublishError};
+
+    async fn calls(mqtt: &MqttHandle) {
+        let _: MqttConnectionState = mqtt.state();
+        let _: bool = mqtt.is_connected();
+        let _: u32 = mqtt.connect_count();
+        let _: u32 = mqtt.dropped_inbound();
+        let _: u32 = mqtt.dropped_publish();
+        let _: Result<(), TryPublishError> = mqtt.try_publish("t", b"p");
+        let _: Result<(), TryPublishError> = mqtt.try_publish_retained("t", b"p");
+        let _: Result<(), TryPublishError> =
+            mqtt.try_publish_with("t", b"p", QoS::AtLeastOnce, false);
+        let _: Result<(), _> = mqtt.publish("t", b"p", QoS::AtLeastOnce, false).await;
+        let _: Result<(), _> = mqtt.subscribe("t", QoS::AtMostOnce);
+        let _: () = mqtt.wait_connected().await;
+        let _: Option<InboundMessage> = mqtt.try_receive();
+        let message: InboundMessage = mqtt.receive().await;
+        let _: &str = message.topic();
+        let _: &[u8] = message.payload();
+        let _: bool = message.retained();
+        let _: QoS = message.qos();
+    }
+}
 
 /// Message the runner publishes right after every successful connect.
 #[derive(Clone, Copy)]

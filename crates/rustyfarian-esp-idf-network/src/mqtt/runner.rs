@@ -36,7 +36,7 @@
 //! check are at most one step late. The runner takes the client lock only for
 //! one bounded connect step at a time, releases it and yields after every
 //! step, so a publisher thread at the runner's priority or above that waits
-//! for the lock (`publish_with`, `publish_acked`, the outbox drain; any
+//! for the lock (`enqueue`, `publish_acked`, the outbox drain; any
 //! `std::thread`-spawned publisher) gets it before the next step, while
 //! readiness (`try_publish`, `is_connected`, `wait_connected`) stays gated on
 //! `WorkDone`. It never holds the lock while a callback could be
@@ -385,7 +385,7 @@ impl Runner {
                 // ready, it does not preempt the giver (a higher-priority
                 // waiter already ran). One yield per step hands the CPU to a
                 // same-priority publisher that waits for the lock
-                // (`publish_with`, `publish_acked`, the outbox drain), so it
+                // (`enqueue`, `publish_acked`, the outbox drain), so it
                 // takes the lock before the next step.
                 std::thread::yield_now();
             }

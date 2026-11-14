@@ -50,7 +50,7 @@ use esp_idf_svc::{
     },
     nvs::EspDefaultNvsPartition,
 };
-use rustyfarian_esp_idf_network::mqtt::MqttBuilder;
+use rustyfarian_esp_idf_network::mqtt::{MqttBuilder, QoS};
 use rustyfarian_esp_idf_network::wifi::{WiFiConfig, WiFiManager};
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
 use std::time::{Duration, Instant};
@@ -182,7 +182,7 @@ fn main() -> anyhow::Result<()> {
             press_count += 1;
             if handle.is_connected() {
                 let payload = format!("pressed #{}", press_count);
-                match handle.publish(EVENTS_TOPIC, &payload) {
+                match handle.enqueue(EVENTS_TOPIC, payload.as_bytes(), QoS::AtLeastOnce, false) {
                     Ok(()) => log::info!("[btn] published: {}", payload),
                     Err(e) => log::warn!("[btn] publish failed: {:#}", e),
                 }
@@ -196,7 +196,7 @@ fn main() -> anyhow::Result<()> {
             last_periodic = Instant::now();
             if handle.is_connected() {
                 let payload = format!("heartbeat presses={}", press_count);
-                match handle.publish(EVENTS_TOPIC, &payload) {
+                match handle.enqueue(EVENTS_TOPIC, payload.as_bytes(), QoS::AtLeastOnce, false) {
                     Ok(()) => log::info!("[periodic] published: {}", payload),
                     Err(e) => log::warn!("[periodic] publish failed: {:#}", e),
                 }
