@@ -35,7 +35,7 @@ jobs:
       # Must match ESP_IDF_VERSION in .cargo/config.toml: setup-esp-idf exports it, which wins over cargo's [env].
       IDF_VERSION: v6.1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
@@ -66,7 +66,7 @@ jobs:
       XTENSA_VERSION: "1.97.0.0"
       IDF_VERSION: v6.1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
@@ -95,7 +95,7 @@ jobs:
       XTENSA_VERSION: "1.97.0.0"
       IDF_VERSION: v6.1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
@@ -126,7 +126,7 @@ jobs:
       # Must match ESP_IDF_VERSION in .cargo/config.toml: setup-esp-idf exports it, which wins over cargo's [env].
       IDF_VERSION: v6.1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
@@ -156,7 +156,7 @@ jobs:
       CARGO_TERM_COLOR: always
       XTENSA_VERSION: "1.97.0.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: datenkollektiv/rustyfarian-ci/.github/actions/setup-xtensa@v1
         with:
