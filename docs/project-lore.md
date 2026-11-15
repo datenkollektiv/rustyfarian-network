@@ -82,7 +82,7 @@ Fix: build-time keys only in `.env`, `direnv reload`, rebuild (`build.rs` has `r
 **`ubuntu-latest` = Ubuntu 26.04 ships `libxml2.so.16`; ESP-IDF v5.3.3's prebuilt `esp-clang` 16 needs `libxml2.so.2`, so every `esp-idf-sys` CI build dies after 2-3 min.**
 The failing step is `idf_tools.py install`; `fmt`, `cargo audit` and `lint-docs` stay green, and the `idf5.3_py3.14_env` venv name is the tell.
 ESP-IDF v6.1's esp-clang (`esp-21.1.3_20260408`) has no libxml2 dependency (checked in `rustyfarian-ws2812` 2026-11-12), so the v6.1 pin runs on `ubuntu-latest` again.
-Fix: never move the CI runner off `ubuntu-24.04` while pinned to v5.3.3; see `docs/features/esp-idf-v6-1-upgrade-v1.md`.
+Fix: never move the CI runner off `ubuntu-24.04` while pinned to v5.3.3; see `docs/features/archive/esp-idf-v6-1-upgrade-v1.md`.
 
 **Changing `ESP_IDF_VERSION` fails every target dir that holds an older esp-idf-sys build with `CMake Error: The source ".../v6.1/components/bootloader/subproject/CMakeLists.txt" does not match the source ".../v5.3.3/..."`.**
 The bootloader sub-build keeps its old `CMakeCache.txt`; `target/ide` (used by `just check`, inside `just verify`) is easy to forget next to the idf dir.

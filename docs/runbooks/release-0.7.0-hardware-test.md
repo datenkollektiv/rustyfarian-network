@@ -3,7 +3,7 @@
 This is the one hardware run before the release 0.7.0 tag, and each feature doc points here.
 The bench is the source of truth: the header of `bench/<board>/<check>.toml` holds the procedure, `bench/<board>/results.jsonl` the verdict of every run, and `bench/<board>/logs/` the serial log.
 This file lists the checks, the manual checks the bench has no file for, the results, and the flows each check covers.
-The closure evidence for the ladder retrofit is in [ladder-closure-v1](../features/ladder-closure-v1.md).
+The closure evidence for the ladder retrofit is in [ladder-closure-v1](../features/archive/ladder-closure-v1.md).
 Use only the `just` recipes named here or in the check headers.
 
 ## Scope
@@ -127,7 +127,7 @@ Not checked: the hal form prefill (gap 57), and a stalled client (headers with a
 
 #### ESP-IDF v5.5 coexistence soak
 
-N/A in 0.7.0; it runs with the ESP-IDF v6.1 bump ([feature doc](../features/esp-idf-v6-1-upgrade-v1.md)).
+N/A in 0.7.0; it runs with the ESP-IDF v6.1 bump ([feature doc](../features/archive/esp-idf-v6-1-upgrade-v1.md)).
 
 1. On a board with Wi-Fi STA and ESP-NOW on one radio (the consumer's ESP32-C6 brain firmware; this repository has no such ESP-IDF C6 example), soak with one STA peer and one ESP-NOW-only peer.
 2. Run the OTA and provisioning checks (`c3/ota-runtime`, C3 portal prefill) on the bumped build.
@@ -245,8 +245,8 @@ Runs up to the C6 runs of 2026-11-10 used a local rustyfarian-bench checkout (`R
 ## Flow to check map
 
 ADR 023 requires the bench for every flow that a rung-3 machine change drives.
-Rows marked deferred have no check in this run; each needs a new check or an explicit waiver before the release tag, and [ladder-closure-v1](../features/ladder-closure-v1.md) records why and the next step.
-**Waiver (2026-11-12, maintainer):** all deferred rows below and the open boxes in [ladder-closure-v1](../features/ladder-closure-v1.md) are waived for 0.7.0 and carried into the next release, with no further bench run before the tag.
+Rows marked deferred have no check in this run; each needs a new check or an explicit waiver before the release tag, and [ladder-closure-v1](../features/archive/ladder-closure-v1.md) records why and the next step.
+**Waiver (2026-11-12, maintainer):** all deferred rows below and the open boxes in [ladder-closure-v1](../features/archive/ladder-closure-v1.md) are waived for 0.7.0 and carried into the next release, with no further bench run before the tag.
 
 <details>
 <summary>Flow to check map (76 flows)</summary>

@@ -508,6 +508,7 @@ impl DieTempSensor {
             // The Default impl for this struct zero-initialises all fields, so
             // we only set the fields we care about.
             clk_src: 0,
+            ..Default::default()
         };
 
         let mut handle: temperature_sensor_handle_t = core::ptr::null_mut();

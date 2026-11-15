@@ -38,6 +38,7 @@
 - 2026-11-09 — Bench: C6 checks, gap 41 resolved, C3 manual provisioning checks.
 - 2026-11-11 — Release bench scope applied (fleet tests and consumer-firmware checks moved downstream, OTA rerun limited to rows P2, P7, P13, P14 and P17); `PeerSession` landed (gap 2).
 - 2026-11-12 — Gate IDs replaced by bench check names; hardware closure synced with the bench results.
+- 2026-11-15 — Archived after the 0.7.0 release; open gaps carried into the next release per the 2026-11-12 waiver, pointer in docs/ROADMAP.md.
 
 ## Scope and evidence basis
 
@@ -123,7 +124,7 @@ Each box is ticked only where a host test, a compile check or a build result exi
 
 ## Hardware closure
 
-Every hardware item of this release passed (or has an N/A waiver); see the results table of [release-0.7.0-hardware-test](../runbooks/release-0.7.0-hardware-test.md#results).
+Every hardware item of this release passed (or has an N/A waiver); see the results table of [release-0.7.0-hardware-test](../../runbooks/release-0.7.0-hardware-test.md#results).
 
 - [ ] LoRa (deferred out of 0.7.0): IDF OTAA join and uplink on the Heltec V3 and esp-hal SX1262 bring-up; bug 007 still needs the critical-section provider variant.
 
@@ -420,6 +421,7 @@ Each item names the next step, and no item names an owner.
 18. The IDF MQTT handle drop and shutdown has no gate; next step: add a drop step to an existing C3 MQTT run.
 19. Inbound chunking has no gate, because no step sends a payload above the receive buffer; next step: send 3000 B and 20 KB payloads with `just mqtt-pub`.
 20. The tier loops are not host-tested (IDF Wi-Fi worker, IDF ESP-NOW worker, hal ESP-NOW `driver.rs`, hal `WifiLink::run`, both MQTT runners); next step: the radio-port refactor that the ESP-NOW plan tracks.
+    Partly resolved 2026-11-15 (verified in code): the IDF Wi-Fi loop is `juggler::wifi::supervisor` and the IDF ESP-NOW loop is `juggler::espnow::worker`, both host-tested in juggler (`crates/juggler/src/wifi/supervisor.rs`, `crates/juggler/src/espnow/worker.rs`); the hal ESP-NOW `driver.rs` (no test module), `WifiLink::run` (`crates/rustyfarian-esp-hal-network/src/wifi/link.rs`, no test module) and both MQTT runners (`crates/rustyfarian-esp-idf-network/src/mqtt/runner.rs`, `crates/rustyfarian-esp-hal-network/src/mqtt/runner.rs`) remain without host tests.
 21. The `rustyfarian-esp-idf-network` unit tests are compiled by clippy, but no `just` recipe executes them; next step: add a recipe that runs them on the target, or record that they run only on hardware.
 22. LoRa is deferred out of 0.7.0; the LoRa join and uplink check uses esp-idf-hal's mutex provider, so it does not close bug 007, and the hal `LoraRadio` driver is a stub, so the bring-up check covers the bring-up only; next step: run the LoRa checks, then a join and uplink variant with the `rustyfarian-esp-idf-power` critical-section provider for bug 007, and decide the hal driver scope.
 23. Fixed 2026-11-06: `lorawan-device` panicked on a non-TxDone response during `SendingData`, which the `StillTxing` mapping could deliver (CONFIRMED by source); `LorawanPhy::phy_due` and the `tx_in_progress` refusal prevent it (test `a_premature_phy_event_during_an_uplink_does_not_panic_the_device`); the LoRa join and uplink check still confirms it on hardware.
@@ -428,6 +430,7 @@ Each item names the next step, and no item names an owner.
 26. The hal `connect_async` has no library-side timeout; next step: decide whether to add one in `WifiLink::run`.
 27. The hal portal phases are bounded in code since the 2026-11-06 F4 fix, but no bench step holds an idle or stalled connection open; next step: the stalled-client step of C3 hal provisioning extras (manual).
 28. Small adapter duplications have a `juggler` home: the inbound drop-oldest queue, the connect-work failure loop, the provisioning error block, the OTA URL-shape rule, the EUI byte reversal, the 200 us NRST constant and the `hal_disconnect_hint` set; next step: one follow-up per item, each with tier parity.
+    Partly resolved 2026-11-15 (verified in code): the connect-work failure loop is `juggler::mqtt::ConnectWorkMachine` (`crates/juggler/src/mqtt/connect_work.rs`, landed 2026-11-11); the EUI reversal is still inline in `crates/rustyfarian-esp-idf-network/examples/idf_esp32s3_join.rs` and `idf_esp32s3_lora_uplink.rs`, the NRST pulse is still a local constant in `crates/rustyfarian-esp-idf-network/src/lora/sx1262_driver.rs`, and `hal_disconnect_hint` is still in `crates/rustyfarian-esp-hal-network/src/wifi/link.rs`.
 29. Build coverage is complete: all 38 examples build, `just clippy-hal` covers the hal S3 Wi-Fi build that `just verify` does not, and `just build-xtensa-idf-mqtt` passes (the earlier LLVM spill failures are superseded); next step: rerun `just clippy-hal` and `build-all-examples` after any hal change.
 30. ESP-NOW on IDF for C6, S3 and classic has no example and no gate, and the runbook matrix does not mark it N/A; next step: mark the cells N/A in the runbook or add a gate.
 31. ESP32 classic provisioning is not wired on hal, and an unsupported chip gets no `compile_error!`; next step: add a `compile_error!`, or wire the chip.
