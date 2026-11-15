@@ -7,6 +7,7 @@
 Both tiers run the September 2026 stack.
 The bare-metal tier pins `esp-hal 1.2.2` and `esp-radio 1.0.0-beta.1`, a pre-release to re-pin to `1.0.0` when it ships.
 The ESP-IDF tier pins `esp-idf-svc 0.53` and `esp-idf-hal 0.47`.
+The ESP-IDF tier builds against ESP-IDF v6.1.
 Tier parity (ADR 022) is the primary API goal, with both tiers on shared `juggler` cores.
 For history, see `CHANGELOG.md` and `docs/features/archive/`.
 
@@ -43,6 +44,7 @@ timeline
               : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)
               : Provisioning tier parity — async wait_committed on IDF, one on_event shape, esp-hal boot helpers load_with_reentry and run_wifi_mqtt_portal (ADR 022)
               : OTA tier parity — one manager name across tiers (OtaSession, EspHalOtaManager), MQTT OTA runtime on esp-hal (ADR 022)
+              : Ladder closure code leftovers — TxCore Ignored action, hal connect timeout, OtaState next_state deprecation, DeferredRestore removal (archived ladder-closure gaps)
 
     Mid term  : LoRa TTN OTAA validation — first downlink (FPort 10) and session persistence remain (runbook)
               : OTA security model doc — threat model and signed-manifest question
@@ -50,6 +52,7 @@ timeline
               : LoRa post-adoption backlog — PartialEq on responses, heapless Deque FIFO in the mock, CRC-32 in restore_from_sleep, LorawanDevice process wiring
               : Portal peer MACs — ESP-NOW peers collected in the provisioning portal, plus an ESP-NOW-only profile, design questions open (feature-doc)
               : Boot policy helper — pure decision for the load, portal and restart flow, waits for a consumer (feature-doc)
+              : Next release hardware test — ladder closure bench gaps plus the ESP-IDF v6.1 chip checks (C6 coexistence soak, callback guard, espflash bootloader)
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
 ```
@@ -78,9 +81,5 @@ Positive findings worth keeping in mind (no action):
 ## Midterm detail
 
 TTN v3 EU868 OTAA validation checklist: [runbooks/ttn-otaa-validation.md](runbooks/ttn-otaa-validation.md).
-
-### Research
-
-| # | Item                                                                                                                       |
-|--:|:---------------------------------------------------------------------------------------------------------------------------|
-| 1 | Move the ESP-IDF tier to v6.1 in lockstep with `rustyfarian-esp-idf-ws2812` and `rustyfarian-power`; the v5.5.2 ESP-NOW coexistence fix is included; see `docs/features/esp-idf-v6-1-upgrade-v1.md` |
+Ladder closure gaps: [features/archive/ladder-closure-v1.md](features/archive/ladder-closure-v1.md#remaining-gaps-and-deferrals).
+ESP-IDF v6.1 deferred chip checks: [features/archive/esp-idf-v6-1-upgrade-v1.md](features/archive/esp-idf-v6-1-upgrade-v1.md#open-items).

@@ -43,7 +43,7 @@ That objection is now solved, and the maintainer decided on 2026-11-12 to move t
 - `juggler` is unaffected (pure `no_std`); `rustyfarian-esp-hal-network` is unaffected (esp-hal tier).
 
 ## Validation plan
-1. Per-chip example builds for C3, C6, S3 and classic ESP32 (`just build-example <name>`), in progress 2026-11-12.
+1. Per-chip example builds for C3, C6, S3 and classic ESP32 (`just build-example <name>`).
 2. Hardware: run the hardware gate on each chip the release claims.
 3. ESP-NOW coexistence soak on the C6 with the v6.1 build.
 4. Release as the next minor together with `rustyfarian-esp-idf-ws2812`; consumers bump `ESP_IDF_VERSION` in lockstep and re-run their flash-and-test checklist.
@@ -51,19 +51,24 @@ That objection is now solved, and the maintainer decided on 2026-11-12 to move t
 ## Open items
 - [ ] Per-chip example builds complete for C3, C6, S3 and ESP32.
 - [ ] Hardware runs on each claimed chip (none run on v6.1 yet).
+  Deferred 2026-11-15 to the full hardware test before the next release (maintainer decision).
 - [ ] ESP-NOW coexistence soak on the C6 with v6.1.
+  Deferred 2026-11-15 to the full hardware test before the next release (maintainer decision).
 - [x] Re-check that esp-mqtt in `espressif/mqtt` 1.1.0 still holds `MQTT_API_LOCK` during event dispatch; ADR 017 and the MQTT callback contract depend on it.
   Source-checked 2026-11-12: `esp_mqtt_task` locks at `mqtt_client.c` line 1982 and unlocks at 2164/2175, with both `esp_mqtt_dispatch_event_with_msgid` calls inside, the same shape as v5.3.3 (1580–1734).
 - [ ] Hardware re-run of `idf_c3_mqtt_callback_guard` on v6.1 (the bug 001 gate).
+  Deferred 2026-11-15 to the full hardware test before the next release (maintainer decision).
 - [ ] Confirm whether the espflash-bundled bootloader accepts v6.1 app images; ws2812 verified only the IDF-built v6.1 bootloader, and only on ESP32-C3.
+  Deferred 2026-11-15 to the full hardware test before the next release (maintainer decision).
 
 ## State
 - [x] Design approved
 - [x] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Tests passing (host tests and `just verify` green, `just check-idf-all` passes on v6.1)
+- [x] Documentation updated (CHANGELOG Unreleased has the three v6.1 entries, `docs/project-lore.md` has the v6.x entries)
 
 ## Session Log
 - 2026-10-11 — Feature doc created from a downstream project's maintenance audit; supersedes the bare roadmap research note.
 - 2026-11-10 — Deferred from 0.7.0 to the next release, coordinated with `rustyfarian-esp-idf-ws2812`; the ESP-IDF coexistence soak marked N/A for 0.7.0.
 - 2026-11-12 — Target changed from v5.5.5 to v6.1 by maintainer decision; `.cargo/config.toml` committed, `extra_components` added, `just check-idf-all` passes on v6.1 with no Rust source changes.
+- 2026-11-15 — Closed without hardware runs by maintainer decision; the chip checks move to the full hardware test before the next release; archived.

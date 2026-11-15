@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-11-04).
-Decisions 5 and 6 amended (2026-11-05): decision 5 for the explicit `Ignored` variants, decision 6 to cover finite and persistent lifecycles; the closure evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
+Decisions 5 and 6 amended (2026-11-05): decision 5 for the explicit `Ignored` variants, decision 6 to cover finite and persistent lifecycles; the closure evidence is in [ladder-closure-v1](../features/archive/ladder-closure-v1.md).
 Decisions 1 and 10 amended (2026-11-05): decision 1 for the flattened machines and the IDF ESP-NOW worker core, decision 10 for the port instance.
 Decisions 1, 5, 6, 9 and 10 amended (2026-11-11, MQTT thread memory work): decision 1 for `ConnectWorkMachine`, decision 5 for its explicit `Ignored`, decision 6 for its finite lifecycle and the connect-step exception, decision 9 for the runner's lock invariant, decision 10 for `ConnectPort`.
 
@@ -49,7 +49,7 @@ This repo differs from the siblings in three ways that change the wording, not t
      The post-update health policy runs on the app's main thread of the IDF tier only, so `HealthMachine` became the pure `poll_decision`, `after_unhealthy`, `deadline_plan` and `SlotReads`, driven by sequential code.
      The `rolled_back` report delivery and the completion retry run on the IDF reporter thread only, so `ReporterMachine` and `CompletionRetry` became the plain-data `ReportPace` and `CompletionBackoff` with the pure `after_publish` and `completion_step`.
      The released machines (`HealthMachine`, `ReporterMachine`, `CompletionRetry`, with `HealthAction`, `HealthEvent` and `ViewStep`) stay as deprecated wrappers over the same functions for one release.
-     `ScanGate` and `PortalMachine` stay at rung 3: the IDF tier runs both from threads (the `espnow-tx` worker and `httpd` handlers) and the hal tier from cooperative async, so decision 2 trigger one holds; the evidence is in [ladder-closure-v1](../features/ladder-closure-v1.md).
+     `ScanGate` and `PortalMachine` stay at rung 3: the IDF tier runs both from threads (the `espnow-tx` worker and `httpd` handlers) and the hal tier from cooperative async, so decision 2 trigger one holds; the evidence is in [ladder-closure-v1](../features/archive/ladder-closure-v1.md).
    - Dated 2026-11-05: the IDF ESP-NOW transmit and scan loop moved into `juggler::espnow::EspNowWorker<R: EspNowRadio>` (`std`), so the IDF adapter keeps only its one-call port.
      The worker runs on the IDF tier alone, as `LinkSupervisor` does, but it sits on `TxCore`, `ScanGate` and `ScanMachine`, which the hal tier also runs under its cooperative runner.
      Decision 2 trigger one therefore holds for the shared core, and the worker is its thread-side driver.
@@ -65,7 +65,7 @@ This repo differs from the siblings in three ways that change the wording, not t
 5. A rung-3 machine answers out-of-phase input with an explicit no-op action, so a host test of a tier loop can detect it.
    `LinkAction::None` and `SessionAction::None` currently mean both "nothing to do" and "input ignored".
    The ladder retrofit before the next release brings every existing machine onto this rule.
-   Dated 2026-11-05: the retrofit added explicit `Ignored` variants to `LinkAction`, `SessionAction`, `ScanAction` and others (see the CHANGELOG), so `None` no longer means "input ignored" on those enums; `TxCore` has no `Ignored` variant yet, which stays open in [ladder-closure-v1](../features/ladder-closure-v1.md).
+   Dated 2026-11-05: the retrofit added explicit `Ignored` variants to `LinkAction`, `SessionAction`, `ScanAction` and others (see the CHANGELOG), so `None` no longer means "input ignored" on those enums; `TxCore` has no `Ignored` variant yet, which stays open in [ladder-closure-v1](../features/archive/ladder-closure-v1.md#open-questions).
    `ScanGate` has no `Ignored` variant either: a stale epoch answers `Cancelled::Stale` and changes nothing, admission answers `GateRefusal`, and a stale `release` does nothing.
    Dated 2026-11-11: `ConnectWorkMachine` answers input after its terminal action, and a second `Start`, with an explicit `WorkAction::Ignored` that leaves its state unchanged; the IDF runner logs an error and drops the work, and the hal `serve` returns.
 6. Every rung-3 flow has a defined lifecycle, and its tier loop bounds every wait.
@@ -74,18 +74,18 @@ This repo differs from the siblings in three ways that change the wording, not t
    `PortalMachine` is request-driven, so each request is one `poll` and there is no loop bound.
    Its terminal states (`Committed`, `FactoryResetPending`) answer later input with `Refused`, which both tiers map to HTTP 409, and a bad nonce answers `Forbidden`.
    A persistent service never terminates, such as `LinkMachine` (Wi-Fi), `SessionMachine` (MQTT) or `TxCore` (ESP-NOW worker), but every iteration between waits is bounded by a tick, a timeout or a budget, such as the 500 ms `NETWORK_POLL_MS` and `POLL_TICK` ticks or the Wi-Fi back-off deadline.
-   Tier loops differ on `Ignored`: the IDF MQTT runner counts it and logs at 16 in a row, the esp-hal runner restarts; see [ladder-closure-v1](../features/ladder-closure-v1.md).
+   Tier loops differ on `Ignored`: the IDF MQTT runner counts it and logs at 16 in a row, the esp-hal runner restarts; see [ladder-closure-v1](../features/archive/ladder-closure-v1.md).
    Five waits are exceptions: a frame already on the air is waited out with no bound (ADR 020, on both ESP-NOW tiers), the IDF Wi-Fi and ESP-NOW workers block on their event source while idle, which relies on the driver event contract, the esp-hal `run_sender` blocks on its wake signal with no deadline while the queue is empty, and the IDF MQTT runner's connect step waits on esp-mqtt's `api_lock` and on the user's `on_connect` with no bound (dated 2026-11-11 below).
    Dated 2026-11-05: on esp-hal, `shutdown` wakes `run_sender`, which returns after the frame on the air has finished, so it is the one esp-hal persistent service with a defined exit; the esp-hal MQTT runner and `WifiLink::run` never return.
    Dated 2026-11-11: `ConnectWorkMachine` is finite per connect, and it reaches a terminal action, `Report` (`WorkDone` or `WorkFailed`) or `Abandon`, within its plan length plus two actions; the IDF tier drops a work that answers `Ignored` and logs an error, and the hal `serve` returns.
    The IDF connect step is the fifth exception: a step waits on esp-mqtt's `api_lock` for at most `MQTT_NETWORK_TIMEOUT_MS` on a dead link, and on the user's `on_connect` with no bound, since ADR 017 asks for a short callback and the tier warns past 1 s.
    On ESP-IDF the MQTT runner closes the session and returns when its last handle drops or its inputs close, `EspNowWorker::stop` joins the `espnow-tx` thread (also on drop), and `LinkSupervisor` joins its worker on drop.
    A second `run_sender` parks forever by design, after it logs an error.
-   The exceptions and the open gaps are listed in [ladder-closure-v1](../features/ladder-closure-v1.md).
+   The exceptions and the open gaps are listed in [ladder-closure-v1](../features/archive/ladder-closure-v1.md#remaining-gaps-and-deferrals).
 7. Review rule (from [ADR 022](022-tier-parity-one-async-api.md) decision 10): a branch in a tier adapter that is not an error or event mapping is logic and moves into `juggler`.
 8. Per-chip behaviour is a runtime value passed in by the tier, not a `cfg` gate inside a machine.
    The ESP32-C3 TX-power clamp lives in the hal adapter, and the SoftAP gate (`esp_idf_esp_wifi_softap_support`) is tier build configuration.
-   Dated 2026-11-05: no C3-specific clamp exists, because the hal adapter calls `set_tx_power_or_log` on every chip, always on the AP path and on the STA path only when `tx_power` is not the default; the drift is recorded in [ladder-closure-v1](../features/ladder-closure-v1.md).
+   Dated 2026-11-05: no C3-specific clamp exists, because the hal adapter calls `set_tx_power_or_log` on every chip, always on the AP path and on the STA path only when `tx_power` is not the default; the drift is recorded in [ladder-closure-v1](../features/archive/ladder-closure-v1.md).
 9. Tier-specific facts stay in the adapters: esp-mqtt `api_lock` and callback threading ([ADR 017](017-mqtt-callback-threading-contract.md)), worker threads, radio register calls, and provider selection ([ADR 021](021-binary-owned-providers.md)).
     Dated 2026-11-11: the IDF MQTT runner takes the client lock only for one bounded connect step at a time, and never while a callback could be parking the mqtt task; the event-loop thread never takes it ([ADR 017](017-mqtt-callback-threading-contract.md)), and the runner owns the connect work's thread, so no connect helper thread exists.
 10. A port trait is narrow: one driver call or one event mapping per method, with no decisions.

@@ -46,10 +46,12 @@ timeout = 2
 [[step]]
 say = "Cycle 1: the link state follows, MQTT drops within a second, the session state follows, ticks would block"
 # `[wifi] suspended` precedes the `wait_suspended` line and is consumed by the step above.
+# The library's `[mqtt] disconnected` is not expected here: on ESP-IDF v6.1 it lands before the `wait_suspended`
+# line and is consumed by the step above too, so the app's own state line proves the drop.
 # IDF prints its `[wifi] disconnected — reason 8` and one `[mqtt] error` here; both are expected.
 # The tick issued in the same loop pass as the suspend request may still be `queued`; the next one would block.
 arm = false
-expect = ['\[app\] wifi link Connected -> Suspended', '\[mqtt\] disconnected', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+expect = ['\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
 reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 15
 
@@ -96,8 +98,9 @@ timeout = 2
 
 [[step]]
 say = "Cycle 3: the radio stops, MQTT drops, states follow, ticks would block"
+# As in cycle 1, the app's state line proves the drop; `[mqtt] disconnected` may precede `wait_suspended`.
 arm = false
-expect = ['\[app\] wifi link Connected -> Suspended', '\[mqtt\] disconnected', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
+expect = ['\[app\] wifi link Connected -> Suspended', '\[app\] mqtt state Connected -> Disconnected', '\[app\] tick #\d+ would block \(mqtt Disconnected\)']
 reject = '\[wifi\] reconnecting in|\[wifi\] connect requested|\[app\] tick #\d+ failed|PANIC|panicked|Guru Meditation|abort\(\)|ESP-ROM:|rst:0x[0-9a-f]+ \('
 timeout = 15
 
