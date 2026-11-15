@@ -26,7 +26,7 @@ jobs:
     env:
       XTENSA_VERSION: "1.97.0.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Installed as non-default; rust-toolchain.toml (channel = "esp") selects it in the checkout.
       - name: Install Xtensa Rust toolchain
