@@ -12,11 +12,11 @@ The Design section remains an illustrative sketch; where the code deviated, the 
 
 |                                                                                         Decision | Reason                                                                                                                                                                           | Rejected Alternative                                                                                                                                          |
 |-------------------------------------------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|                                            Provisioning lives in `rustyfarian-network` workspace | Runtime dependency surface is dominated by Wi-Fi/NVS plumbing already provided here (same argument as ADR 011 for OTA)                                                           | In-beekeeper module (violates "drivers live in shared crates"); separate `rustyfarian-provisioning` repo (duplicates Wi-Fi pinning)                           |
+|                                            Provisioning lives in `rustyfarian-network` workspace | Runtime dependency surface is dominated by Wi-Fi/NVS plumbing already provided here (same argument as ADR 011 for OTA)                                                           | In-application module (violates "drivers live in shared crates"); separate `rustyfarian-provisioning` repo (duplicates Wi-Fi pinning)                           |
 |               Two crates at acceptance: `provisioning-pure` + `rustyfarian-esp-idf-provisioning` | Matches the established `*-pure` + `rustyfarian-esp-idf-*` triad used by wifi/lora/espnow/ota                                                                                    | Single combined crate (breaks host-testability of the form/state-machine logic)                                                                               |
 |                                           Bare-metal `rustyfarian-esp-hal-provisioning` deferred | No bare-metal downstream has requested it; speculative work would mean a `no_std` HTTP server with no consumer                                                                   | Build the bare-metal crate up front for "dual-HAL completeness"                                                                                               |
 |                                                      Captive-portal HTTP server is internal-only | Preserves the README's "general-purpose HTTP clients out of scope" line; mirrors ADR 011's private OTA HTTP client                                                               | Export the HTTP server as a reusable workspace API (would need a wider vision change)                                                                         |
-|        Four-field provisionable schema (Wi-Fi creds + LoRaWAN OTAA keys + OTA URL + device name) | Matches the requesting downstream's needs verbatim; also the union of NVS fields every Rustyfarian field device stores today                                                     | Wi-Fi credentials only (forces beekeeper to build half of what it asked for); generic host-defined schema (scatters validation rules across every downstream) |
+|        Four-field provisionable schema (Wi-Fi creds + LoRaWAN OTAA keys + OTA URL + device name) | Matches the requesting downstream's needs verbatim; also the union of NVS fields every Rustyfarian field device stores today                                                     | Wi-Fi credentials only (forces the downstream project to build half of what it asked for); generic host-defined schema (scatters validation rules across every downstream) |
 |                                                                BLE provisioning stays a non-goal | No downstream has asked for it; ESP-IDF BLE stack is a substantial new dependency; SoftAP solves the same problem on hardware every device already uses                          | Accept BLE provisioning alongside SoftAP                                                                                                                      |
 
 ### Locked at planning pass (signed off 2026-06-11)
@@ -67,10 +67,10 @@ The original proposals are retained below as the rationale of record.
 ### 1. SoftAP SSID derivation — Resolved: configurable prefix and last-two-MAC-bytes hex suffix
 
 - `derive_softap_ssid(prefix, mac)` produces `{prefix}-{XXXX}` where `XXXX` is the uppercase hex of the AP MAC's last two bytes, truncated so the SSID fits 32 bytes.
-  Workspace default prefix is `Rustyfarian`; beekeeper passes `Beekeeper` to get its `Beekeeper-XXXX`.
-  The MAC suffix guarantees uniqueness when several unprovisioned devices sit on the same table — the exact beekeeper field scenario.
+  Workspace default prefix is `Rustyfarian`; a downstream project passes its own prefix, e.g. `Sensor`, to get `Sensor-XXXX`.
+  The MAC suffix guarantees uniqueness when several unprovisioned devices sit on the same table — the exact downstream field scenario.
   The derivation lives in `provisioning-pure` so it is host-testable and reusable by a future `esp-hal` triad.
-  Rejected: fixed `Beekeeper-` prefix (couples a workspace crate to one downstream user's branding).
+  Rejected: a fixed downstream prefix (couples a workspace crate to one downstream user's branding).
 
 ### 2. NVS namespace and key layout — Resolved: single namespace `rf_prov`, one key per field, hex-string LoRa values
 
@@ -91,7 +91,7 @@ The original proposals are retained below as the rationale of record.
 - Schema: `{"schema":1,"device_name":"…","firmware_version":"…","state":"awaiting_submission","provisioned":false,"uptime_s":42,"extra":{…}}`.
   Required fields are `schema`, `state`, and `provisioned`; `device_name`, `firmware_version`, `uptime_s`, and `extra` are optional conveniences, and the exact payload above is illustrative, not a frozen external contract.
   Live battery and LoRa telemetry are explicit v1 non-goals — the provisioning crate has no ADC or LoRa-stack access, and adding one would violate ADR 013's two-crate decision.
-  The builder accepts `with_status_entry(key, value)` string pairs rendered under `"extra"`, so beekeeper injects a battery reading it measured itself.
+  The builder accepts `with_status_entry(key, value)` string pairs rendered under `"extra"`, so a downstream project injects a battery reading it measured itself.
   This keeps `/status` session-scoped per ADR 013 §3.
 
 ### 5. Factory-reset hook — Resolved: event callback enum plus explicit `erase_all()` on the store
@@ -432,8 +432,7 @@ Gate: `just lint-docs`.
 ## Session Log
 
 - 2026-06-11 — Feature doc stub created alongside ADR 013; original feature
-  request was archived into this doc by acceptance and the review-queue file
-  was deleted.
+  request was archived into this doc by acceptance.
 - 2026-06-11 — Walked through Decisions, Constraints, Open Questions, and State
   via `/feature`; confirmed all sections are correct as written and that the
   6 open questions are intentionally left for the implementer when work starts.

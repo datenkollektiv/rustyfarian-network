@@ -94,4 +94,4 @@ Leave the existing `init()` unchanged for devices that manage Wi-Fi themselves.
 ## References
 
 - [ADR 007 — ESP-NOW Abstraction Layer](007-espnow-abstraction.md)
-- Review-queue item "init-with-radio-defaults-to-softap" (processed; this ADR is its outcome)
+- Feature request "init-with-radio-defaults-to-softap" (this ADR is its outcome)

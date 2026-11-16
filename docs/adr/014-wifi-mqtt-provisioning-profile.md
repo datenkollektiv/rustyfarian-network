@@ -12,7 +12,7 @@ No issue tracker exists in this workspace by convention.
 A new ESP32 downstream, `rustyfarian-rgb-clock`, needs SoftAP provisioning.
 It is the first device in the workspace that wants Wi-Fi credentials, an MQTT broker, an OTA URL, and a device name — and no LoRaWAN at all.
 The provisioning triad shipped on the `soft-ap` branch ([ADR 013](013-softap-provisioning-acceptance.md), [feature doc](../features/archive/softap-provisioning-v1.md)).
-It only knows one schema: the beekeeper four-field set (Wi-Fi credentials + LoRaWAN OTAA keys + OTA URL + device name).
+It only knows one schema: the downstream four-field set (Wi-Fi credentials + LoRaWAN OTAA keys + OTA URL + device name).
 
 ADR 013 §4 deliberately locked that single four-field schema and rejected a generic host-defined schema, because centralised form validation is the load-bearing piece of `provisioning-pure`.
 ADR 013 also left an extras escape hatch: opaque `x_*` name/value pairs carried alongside the canonical fields.
@@ -128,7 +128,7 @@ No collision with a host extension is possible today, and `profile` joins the re
 
 Existing provisioned devices are not re-provisioned.
 `load` treats `schema_ver == 1` with an absent `profile` key as the `lorawan` profile.
-Beekeeper-class devices already in the field keep working untouched.
+Downstream LoRaWAN devices already in the field keep working untouched.
 
 The commit-guard ordering from ADR 013 is preserved: the `profile` key is written before `schema_ver`, so a torn write never reads as provisioned with an unknown profile.
 
@@ -166,7 +166,7 @@ Accepting a `mqtts://` scheme in the portal would promise a transport the consum
 
 A device must know, at boot, which profile it was provisioned with, so it loads the right field group and builds the right runtime config.
 A `profile` discriminator key is the minimal addition that answers this.
-Bumping `schema_ver` to 2 while reading absent-`profile` v1 records as `lorawan` is a zero-migration upgrade: deployed beekeeper devices are correct by default.
+Bumping `schema_ver` to 2 while reading absent-`profile` v1 records as `lorawan` is a zero-migration upgrade: deployed downstream devices are correct by default.
 
 ## Consequences
 
@@ -202,7 +202,7 @@ These landed with acceptance on 2026-06-12 and are recorded for the follow-throu
 The `ota_url` field is now optional for the `WifiMqttDevice` profile.
 An absent or empty value is accepted and stored as an empty string; `ProvisioningConfig::ota_url()` returns `""`, meaning "no OTA configured".
 A non-empty value is still validated (plain `http://` with a non-empty host, max 128 bytes; `https://` rejected per ADR 011).
-`LorawanFieldDevice` keeps `ota_url` required — beekeeper field devices rely on OTA.
+`LorawanFieldDevice` keeps `ota_url` required — downstream field devices rely on OTA.
 Motivation: `rustyfarian-rgb-clock` uses `WifiMqttDevice` but implements no OTA; users previously had to invent a placeholder URL.
 NVS/flash layout unchanged — both stores already round-trip empty strings.
 

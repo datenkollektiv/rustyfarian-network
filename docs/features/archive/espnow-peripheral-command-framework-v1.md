@@ -53,6 +53,6 @@ The `espnow-pure` crate is the natural home: `no_std`, zero dependencies, alread
 
 ## Session Log
 
-- 2026-04-05 — Feature doc created from the review queue proposal; scoped to Phase 1 only (frame envelope + system tags)
+- 2026-04-05 — Feature doc created from a feature proposal; scoped to Phase 1 only (frame envelope + system tags)
 - 2026-04-05 — MAC-in-frame decision resolved via industry research; captured in ADR 010
 - 2026-04-10 — Implemented: `command` module in `espnow-pure` with `CommandFrame<'a>` zero-copy parser, `parse_frame()`, `is_system_tag()`/`is_module_tag()` predicates, `SystemCommand` enum with `parse_system_command()`, response helpers (`PONG_RESPONSE`, `SELF_TEST_PASS/FAIL`, `identify_response()`). 19 tests covering parsing, tag ranges, roundtrips. `just test-espnow` (50 tests) and `just verify` pass clean.

@@ -1,14 +1,14 @@
 # Feature: STA-only `wifi` feature (cfg-gate SoftAP) v1
 
 Gate the SoftAP surface of the `wifi` module behind `#[cfg(esp_idf_esp_wifi_softap_support)]` so the `wifi` feature of `rustyfarian-esp-idf-network` compiles on ESP-IDF builds with `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n`.
-Sourced from an upstream feature request filed by the rustyfarian-beekeeper consumer.
+Sourced from an upstream feature request filed by a downstream project.
 
 ## Problem
 
 `SoftApManager::ap_ip` and `pin_ap_netif_ip` call `EspWifi::ap_netif()` unconditionally, but that method is `#[cfg(esp_idf_esp_wifi_softap_support)]` in `esp-idf-svc` (0.52.1, `src/wifi.rs:1664`).
 Any consumer that sets `CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n` and enables `features = ["wifi"]` therefore fails with `E0599: no method named ap_netif`.
 The coupling was introduced by the v0.4.0 crate consolidation, which folded the former STA-only `rustyfarian-esp-idf-wifi` crate and `SoftApManager` into one `wifi` module.
-Beekeeper's applied workaround (`CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y`) reverses a deliberate flash/RAM optimisation and should become unnecessary.
+The downstream project's applied workaround (`CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y`) reverses a deliberate flash/RAM optimisation and should become unnecessary.
 
 ## Scope and end state
 
@@ -81,10 +81,10 @@ All criteria met; SoftAP-enabled default build is unchanged; STA-only capability
 5. The `espnow` question is resolved and, if needed, the same treatment applied.
 6. Rustdoc on gated items states the sdkconfig requirement.
 7. The SoftAP-disabled check runs as a `just` recipe (e.g. `just check-sta-only`) and in CI.
-8. Beekeeper (or an equivalent STA-only consumer configuration) can return `CONFIG_ESP_WIFI_SOFTAP_SUPPORT` to `n` and build `features = ["wifi"]`.
+8. The downstream project (or an equivalent STA-only consumer configuration) can return `CONFIG_ESP_WIFI_SOFTAP_SUPPORT` to `n` and build `features = ["wifi"]`.
 
 ## Session Log
 
-- 2026-07-08 — Feature doc created from the beekeeper upstream request after triage confirmed the regression is unaddressed (`wifi/mod.rs:645` and `:716` still call `ap_netif()` unguarded; no `esp_idf_esp_wifi_softap_support` cfg anywhere in the workspace). Chose the request's preferred option 1 (IDF cfg, no new Cargo feature); added the `provisioning` `compile_error!` and the espnow verification question, both discovered during triage.
+- 2026-07-08 — Feature doc created from the downstream project's upstream request after triage confirmed the regression is unaddressed (`wifi/mod.rs:645` and `:716` still call `ap_netif()` unguarded; no `esp_idf_esp_wifi_softap_support` cfg anywhere in the workspace). Chose the request's preferred option 1 (IDF cfg, no new Cargo feature); added the `provisioning` `compile_error!` and the espnow verification question, both discovered during triage.
 - 2026-07-08 — Implemented. `SoftApManager` + `pin_ap_netif_ip` gated `#[cfg(esp_idf_esp_wifi_softap_support)]` in `src/wifi/mod.rs` with rustdoc requirement statements. Provisioning module gated `#[all(feature = "provisioning", esp_idf_esp_wifi_softap_support)]` in `src/lib.rs` with targeted `compile_error!` for the disabled case. Added `[lints.rust]` check-cfg declaration in `Cargo.toml` for clean `cargo check` on SoftAP-disabled builds. Created `sdkconfig.sta-only.defaults` workspace-root overlay (`CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n`). Added `just check-sta-only` recipe: uses `cargo clean -p esp-idf-sys` before and after (not `just clean-idf`, which only removes release artifacts), passes ABSOLUTE overlay paths via `{{justfile_directory()}}` to ensure embuild correctly stages the overlay, and runs `cargo check` to verify compile. Verified `espnow` compiles SoftAP-disabled (uses ungated `Configuration::AccessPoint`, never calls `ap_netif()`). SoftAP-enabled default build unchanged; STA-only capability verified by the new check build. Hardware-in-the-loop validated on 2026-07-08: with SoftAP disabled the generated sdkconfig shows `# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set`, `--features wifi` compiles clean (zero warnings, after gating the now-unused `AccessPointConfiguration`/`AuthMethod` imports), and `--features provisioning` fails with exactly the single `compile_error!` (no E0432/E0599 cascade). SoftAP-enabled `just check-wifi`/`check-provisioning` unchanged. An initial relative-path version of the recipe was a false pass—caught and fixed during this validation.
 - 2026-07-09 — PR review round. Generalized the `provisioning` `compile_error!` text from "set CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y in sdkconfig.defaults" to "enable CONFIG_ESP_WIFI_SOFTAP_SUPPORT in the ESP-IDF sdkconfig used for this build" to avoid assuming downstream consumers use this repo's sdkconfig layout. Considered isolating `check-sta-only` in a dedicated `--target-dir` to avoid the before/after `cargo clean -p esp-idf-sys` (reviewer suggestion), but rejected: a second target dir incurs a full ~1–2 GB esp-idf build tree, overflowing the 8 GB RAM disk with `No space left on device`; re-validated the in-place clean recipe as the correct fit. Trimmed the CHANGELOG entry to a tighter user-facing summary, deferring the deep build-system rationale to this feature doc.
