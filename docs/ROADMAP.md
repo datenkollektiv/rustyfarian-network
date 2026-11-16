@@ -32,6 +32,7 @@ timeline
     title rustyfarian-network Roadmap
 
     Ready     : Shared disconnect-reason vocabulary — one juggler DisconnectReason enum with name and code for both tiers, esp-hal maps esp-radio reasons locally (feature-doc)
+              : Wi-Fi portal fallback — credential and network-absent counters reopen the portal after repeated failed boots, IDF first, builds on the reason vocabulary (feature-doc)
               : ESP-NOW scan-burst TX power — scan boosts to max, near-field peers fail (feature-doc)
               : Portal defaults from build-time env — one helper builds the defaults for three consumers (feature-doc)
     Near term : LoRa hardware validation deferred from 0.7.0 — Heltec V3 ESP32-S3 bench run, plus bug 007 (LoRa forces a critical-section provider)
@@ -52,7 +53,7 @@ timeline
               : LoRa post-adoption backlog — PartialEq on responses, heapless Deque FIFO in the mock, CRC-32 in restore_from_sleep, LorawanDevice process wiring
               : Portal peer MACs — ESP-NOW peers collected in the provisioning portal, plus an ESP-NOW-only profile, design questions open (feature-doc)
               : Boot policy helper — pure decision for the load, portal and restart flow, waits for a consumer (feature-doc)
-              : Next release hardware test — ladder closure bench gaps plus the ESP-IDF v6.1 chip checks (C6 coexistence soak, callback guard, espflash bootloader)
+              : Next release hardware test — ladder closure bench gaps plus the ESP-IDF v6.1 chip checks (C6 coexistence soak, C6 and classic ESP32 chip checks, attended router steps)
 
     Long term : Full EspHalLoraRadio hardware driver (after TTN validation)
 ```

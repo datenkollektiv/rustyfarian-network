@@ -48,7 +48,7 @@ The trigger holds BOOT (GPIO9) for 3 s, sampled after boot, then erases `rf_prov
 A boot-level fallback in `rustyfarian-esp-idf-network::provisioning`, opt-in through `BootConfig` (or a new policy struct), so the `WifiMqttDevice` profile gets it with one setting.
 Since commit `9604a9d` (2026-10-27), `WifiMqttBoot::load` hands out juggler's `ProvisioningConfig`.
 
-1. **Classify each failed connect** as credential failure (`4WAY_HANDSHAKE_TIMEOUT`, `HANDSHAKE_TIMEOUT`, `AUTH_FAIL`, `MIC_FAILURE`, repeated `AUTH_EXPIRE`), network absent (`NO_AP_FOUND`: SSID renamed, or router off), or transient (everything else, e.g. beacon timeout, association leave, DHCP timeout), using a pure host-testable classifier next to `juggler::wifi::wifi_disconnect_reason_name` (`crates/juggler/src/wifi/mod.rs:401`).
+1. **Classify each failed connect** as credential failure (`4WAY_HANDSHAKE_TIMEOUT`, `HANDSHAKE_TIMEOUT`, `AUTH_FAIL`, `MIC_FAILURE`, repeated `AUTH_EXPIRE`), network absent (`NO_AP_FOUND`: SSID renamed, or router off), or transient (everything else, e.g. beacon timeout, association leave, DHCP timeout), using a pure host-testable classifier in `juggler::wifi` that maps the `DisconnectReason` kinds of the [disconnect-reason vocabulary feature](./disconnect-reason-vocabulary-v1.md).
    The second consumer needs the same three classes.
 2. **Keep two counters** in NVS, one per class: credential failures open the portal at 5 consecutive failed boots (configurable), and network-absent boots use their own higher threshold (20 proposed; 0 means never).
    Counting never erases, and the counts survive power cycles.
@@ -88,6 +88,8 @@ Source: spookhouse's reply of 2026-10-28.
 | Counts clear on join, commit, and portal open | A timed-out portal retries afresh instead of reopening at once | Keep the count across a portal timeout |
 | Counts live in library-owned reserved keys in `rf_prov` | A consumer `erase_all` clears them with the record | A separate library NVS namespace |
 | Re-entry trigger: pre-load hook returning an outcome | One entry point and outcome set; the library never erases | Library erases on a `FactoryReset` answer |
+| Non-blocking connect is the `WifiMqttDevice` default | The classifier needs each attempt's reason; the blocking path ends in a bare timeout | Blocking connect with the last reason carried in the timeout error |
+| Classifier builds on `juggler::wifi::DisconnectReason` | The vocabulary lands first and replaces `wifi_disconnect_reason_name(u16)` for both tiers | Classify raw `u16` reason codes |
 
 ## Constraints
 
@@ -97,6 +99,7 @@ Source: spookhouse's reply of 2026-10-28.
 - The counter keys join `CANONICAL_KEYS` in `crates/juggler/src/provisioning/kv_store.rs`, so `erase_all` removes them.
 - The new reserved keys need an ADR 014 §4 amendment.
 - 0.6.x firmware ignores the new keys, so a downgrade still boots the stored record.
+- The classifier and counter policy live in `juggler` and are shared by both tiers; the esp-hal boot wiring is a recorded ADR 022 tier-parity gap and follows as a separate feature.
 
 ## Security
 
@@ -124,8 +127,8 @@ Options to weigh:
 - [x] Default threshold and portal window for the `WifiMqttDevice` profile (5 credential failures, 10 min).
 - [x] Should a repeated `NO_AP_FOUND` (renamed SSID) open the portal at all, or only credential failures? (yes, on its own higher threshold)
 - [x] Default network-absent threshold — 20 boots proposed, 0 disables. (rgb-clock: 20; a router off overnight must not open the AP)
-- [x] Does the esp-hal tier need the same fallback now, or is it tracked separately? (later; spookhouse and rgb-clock have no demand)
-- [ ] Should the non-blocking connect path become the default for this profile, so reasons are available without a second code path? (rgb-clock: no preference, it only logs the reason)
+- [x] Does the esp-hal tier need the same fallback now, or is it tracked separately? (tracked separately as a tier-parity gap (ADR 022) since rgb-clock's request of 2026-11-16, which adds esp-hal demand from its clock; the classifier and counter policy live in `juggler` and are shared by both tiers; the esp-hal boot wiring follows as its own feature when rgb-clock files that request)
+- [x] Should the non-blocking connect path become the default for this profile, so reasons are available without a second code path? (yes: the `WifiMqttDevice` profile connects non-blocking, the classifier reads each failed attempt's disconnect reason from the link worker, and part 4 follows from it without a second code path)
 - [x] Re-entry hook vs consumer-owned trigger: hook with outcomes, consumer erases (2026-10-27).
 - [ ] Acceptance: a host test or bench run shows `ProvisioningStore::load` returns the pre-fallback record after a fallback portal times out with no commit.
 - [ ] Acceptance: no `erase_all` call on the counter-driven fallback path, checkable in review.
@@ -134,7 +137,7 @@ Options to weigh:
 
 ## State
 
-- [ ] Design approved
+- [x] Design approved
 - [ ] Core implementation
 - [ ] Tests passing
 - [ ] Documentation updated
@@ -145,3 +148,4 @@ Options to weigh:
 - 2026-10-27 — A second consumer recorded, BOOT-at-reset option reworded, re-entry hook decided (option a, consumer erases) and split into `archive/provisioning-reentry-hook-v1.md`.
 - 2026-10-28 — Updated: counter phase planned — separate credential and network-absent counters, threshold 5, FallbackPortal outcome, 10 min window, counts in rf_prov.
 - 2026-11-12 — Updated: rgb-clock's reply of 2026-11-01 folded in (Wi-Fi-only fallback wanted, threshold 20, esp-hal later); it adopts the re-entry hook with 0.7.0
+- 2026-11-16 — Design approved (parts 1–4): non-blocking connect is the profile default, the classifier builds on the disconnect-reason vocabulary, esp-hal recorded as a parity gap after rgb-clock's change of demand; Ready-band roadmap row added.
