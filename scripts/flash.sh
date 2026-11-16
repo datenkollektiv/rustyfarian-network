@@ -16,6 +16,12 @@ set -euo pipefail
 #
 # FLASH_DRY_RUN=1 builds and resolves the bootloader as usual but prints the espflash
 # command instead of running it.
+#
+# FLASH_SAVE_IMAGE=<path> flashes nothing: it builds as usual and saves the merged whole-flash
+# image (IDF-built bootloader at 0x0, partition table, app, padded with 0xFF to the flash size)
+# to <path>, with the same chip, bootloader and partition table arguments as the flash.
+# The padding blanks NVS and otadata, and no port is detected. A missing IDF-built
+# bootloader is fatal here, because the espflash bundled one fails to boot.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
@@ -31,6 +37,28 @@ run_espflash() {
         return 0
     fi
     espflash "$@"
+}
+
+# write_image <elf> <bootloader> <missing-bootloader warning>
+# Flashes the ELF with the cached bootloader (or warns and falls back to the espflash bundled
+# one), or with FLASH_SAVE_IMAGE set saves the merged image instead. Reads example, chip, mcu,
+# port_args, image_args and erase_args.
+write_image() {
+    local elf="$1" bl="$2" warning="$3"
+    if [ -n "${FLASH_SAVE_IMAGE:-}" ]; then
+        if [ ! -f "$bl" ]; then
+            printf 'Error: no IDF-built bootloader cached for %s at %s; a merged image needs it.\n' "$chip" "$bl" >&2
+            exit 1
+        fi
+        printf 'Saving merged image of %s with bootloader %s to %s...\n' "$example" "$bl" "$FLASH_SAVE_IMAGE"
+        run_espflash save-image --chip "$mcu" --merge ${image_args[@]+"${image_args[@]}"} --bootloader "$bl" --ignore-app-descriptor "$elf" "$FLASH_SAVE_IMAGE"
+    elif [ -f "$bl" ]; then
+        printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
+        run_espflash flash ${port_args[@]+"${port_args[@]}"} ${image_args[@]+"${image_args[@]}"} ${erase_args[@]+"${erase_args[@]}"} --bootloader "$bl" --ignore-app-descriptor "$elf"
+    else
+        printf '%s\n' "$warning" >&2
+        run_espflash flash ${port_args[@]+"${port_args[@]}"} ${image_args[@]+"${image_args[@]}"} ${erase_args[@]+"${erase_args[@]}"} --ignore-app-descriptor "$elf"
+    fi
 }
 
 if [ $# -lt 1 ]; then
@@ -54,11 +82,18 @@ case "$(printf '%s' "$example" | cut -d_ -f2)" in
     esp32s3) port_chip=esp32s3 ;;
     *) port_chip="" ;;
 esac
+# Saving an image talks to no board, so no port is detected (a probe resets the board).
 port_args=()
-detected_port="$("$SCRIPT_DIR/detect-port.sh" "$port_chip")"
-if [ -n "$detected_port" ]; then
-    port_args=(--port "$detected_port")
+if [ -z "${FLASH_SAVE_IMAGE:-}" ]; then
+    detected_port="$("$SCRIPT_DIR/detect-port.sh" "$port_chip")"
+    if [ -n "$detected_port" ]; then
+        port_args=(--port "$detected_port")
+    fi
 fi
+# Partition table and flash size shape the image itself; erasing otadata applies to a flash only
+# (a saved image blanks it through the padding).
+image_args=()
+erase_args=()
 
 # Extract prefix to determine HAL type
 prefix=$(printf '%s' "$example" | cut -d_ -f1)
@@ -87,7 +122,8 @@ case "$prefix" in
             if apply_ota_sdkconfig "$workspace_root" "$idf_dir"; then
                 # espflash must write the same two-slot table and erase otadata, so a re-flash never
                 # boots a stale slot left over from an earlier OTA test.
-                port_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb --erase-parts otadata)
+                image_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb)
+                erase_args+=(--erase-parts otadata)
             fi
         fi
 
@@ -116,13 +152,8 @@ case "$prefix" in
         fi
 
         bl=$(bootloader_cache_path "$idf_dir" "$chip" "$bl_variant")
-        if [ -f "$bl" ]; then
-            printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            run_espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
-        else
-            printf 'Warning: IDF-built bootloader not cached, using espflash default (may fail on boot).\n' >&2
-            run_espflash flash "${port_args[@]}" --ignore-app-descriptor "$idf_dir/$target/release/examples/$example"
-        fi
+        write_image "$idf_dir/$target/release/examples/$example" "$bl" \
+            'Warning: IDF-built bootloader not cached, using espflash default (may fail on boot).'
         ;;
 
     hal)
@@ -152,7 +183,8 @@ case "$prefix" in
             bl_variant=ota
             bl_flag="--ota"
             workspace_root="$(cd "$SCRIPT_DIR/.." && pwd)"
-            port_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb --erase-parts otadata)
+            image_args+=(--partition-table "$workspace_root/partitions.ota.csv" --flash-size 4mb)
+            erase_args+=(--erase-parts otadata)
         fi
 
         # Ensure the stable IDF-built bootloader for this chip and variant is cached
@@ -171,13 +203,8 @@ case "$prefix" in
         fi
 
         bl=$(bootloader_cache_path "$idf_dir" "$chip" "$bl_variant")
-        if [ -f "$bl" ]; then
-            printf 'Flashing %s with bootloader %s...\n' "$example" "$bl"
-            run_espflash flash "${port_args[@]}" --bootloader "$bl" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
-        else
-            printf 'Warning: no IDF-built bootloader cached for %s; using espflash default (may fail on boot for some chips).\n' "$chip" >&2
-            run_espflash flash "${port_args[@]}" --ignore-app-descriptor "$hal_dir/$hal_target/release/examples/$example"
-        fi
+        write_image "$hal_dir/$hal_target/release/examples/$example" "$bl" \
+            "Warning: no IDF-built bootloader cached for $chip; using espflash default (may fail on boot for some chips)."
         ;;
 
     *)

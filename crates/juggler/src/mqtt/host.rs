@@ -63,8 +63,8 @@ mod tests {
     #[test]
     fn literal_is_classified_without_dns() {
         assert_eq!(
-            classify_broker_host(" 192.168.31.5 "),
-            Ok(BrokerHost::Ipv4(Ipv4Addr::new(192, 168, 31, 5)))
+            classify_broker_host(" 192.168.1.5 "),
+            Ok(BrokerHost::Ipv4(Ipv4Addr::new(192, 168, 1, 5)))
         );
     }
 

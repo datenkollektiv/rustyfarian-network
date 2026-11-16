@@ -144,7 +144,7 @@ mod tests {
     fn link_up_text_is_pinned() {
         let up = |count, adopted, ap| alloc::format!("{}", LinkUp { count, adopted, ap });
         let ap = JoinedAp {
-            bssid: [0x72, 0xd7, 0x9a, 0xca, 0xb9, 0x44],
+            bssid: [0x02, 0x00, 0x00, 0xca, 0xfe, 0x01],
             channel: 11,
             rssi: -42,
         };
@@ -152,11 +152,11 @@ mod tests {
         assert_eq!(up(4, true, None), "[wifi] link up #4 (adopted)");
         assert_eq!(
             up(1, false, Some(ap)),
-            "[wifi] link up #1 — bssid 72:d7:9a:ca:b9:44, ch 11, rssi -42 dBm"
+            "[wifi] link up #1 — bssid 02:00:00:ca:fe:01, ch 11, rssi -42 dBm"
         );
         assert_eq!(
             up(2, true, Some(ap)),
-            "[wifi] link up #2 (adopted) — bssid 72:d7:9a:ca:b9:44, ch 11, rssi -42 dBm"
+            "[wifi] link up #2 (adopted) — bssid 02:00:00:ca:fe:01, ch 11, rssi -42 dBm"
         );
     }
 

@@ -6,6 +6,8 @@
 build = ["just", "build-example", "{example}"]
 # `just flash` takes no port; scripts/detect-port.sh reads ESPFLASH_PORT, so the detected port is pinned that way.
 flash = ["env", "ESPFLASH_PORT={port}", "just", "flash", "{example}"]
+# Only `submit` runs it: the merged whole-flash image (repo bootloader at 0x0) for the remote bench; may hold Wi-Fi credentials.
+image = ["just", "save-image", "{example}", "{image}"]
 
 [boards.c3]
 chip = "esp32c3"

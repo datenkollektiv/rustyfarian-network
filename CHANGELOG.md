@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MqttHandle::publish(topic, payload, qos, retain)` as an inherent async method on both tiers, the same call as `MqttClient::publish` (tier parity Step 11, ADR 022).
 - `InboundMessage::{topic, payload, retained, qos}` accessors on both tiers, so reading a message needs no trait import.
 - `rustyfarian-esp-idf-network` `mqtt` re-exports the `juggler` validators (`validate_publish_topic`, `validate_subscribe_filter`, `validate_client_id`, `validate_broker_port`, `topic_matches_filter`), as esp-hal does.
+- `just save-image <example> <image>`: the merged whole-flash image (the repo's IDF-built bootloader at `0x0`, partition table, app) with the same arguments as `just flash`; `bench/bench.toml` uses it as the `image` command, so `rustyfarian-bench submit` needs no `--image`.
+- `just pi-submit <board> <example> [args]`: submits a bench check to the remote bench with the pinned rustyfarian-bench release (now v0.6.0), the bench URL, token and optional CA read from the SOPS secrets file (`scripts/bench-remote-env.sh`).
 
 ### Changed
 
