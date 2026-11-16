@@ -44,17 +44,75 @@ bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-
 ci_dir := env("RUSTYFARIAN_CI", "")
 ci_repo_flag := if ci_dir != "" { '--local-repository "datenkollektiv/rustyfarian-ci@v1=' + absolute_path(ci_dir) + '"' } else { "" }
 
+# SOPS-encrypted dotenv secrets (git-ignored, see .sops.yaml); the age key comes from .envrc
+secrets_env := justfile_directory() / "shared-secrets/secrets.env"
+
 # ── env ───────────────────────────────────────────────────────────────────
 
-# show RAM disk status, resolved target dirs, sccache, required/optional tooling, and MQTT broker reachability (.env)
+# show RAM disk status, resolved target dirs, sccache, required/optional tooling, MQTT broker reachability (.env), and the optional router automation (just router)
 [group('env')]
 doctor:
-    @scripts/doctor.sh "{{ ramdisk }}" "{{ hal_dir }}" "{{ idf_dir }}"
+    @scripts/doctor.sh "{{ ramdisk }}" "{{ hal_dir }}" "{{ idf_dir }}" "{{ secrets_env }}"
 
 # manage the RAM disk: just ramdisk attach | detach
 [group('env')]
 ramdisk action:
     @scripts/ramdisk.sh "{{ action }}"
+
+# edit the SOPS-encrypted secrets (ROUTER_* for `just router`) in $EDITOR; creates the file on first use
+[group('env')]
+secrets-edit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$(dirname "{{ secrets_env }}")"
+    rc=0
+    sops "{{ secrets_env }}" || rc=$?
+    # 200 is sops' "file has not been modified", not an error
+    if [ "$rc" -eq 200 ]; then
+        exit 0
+    fi
+    exit "$rc"
+
+# decrypt the secrets file in place for hand edits; leaves PLAINTEXT on disk until `just encrypt` (`just secrets-edit` avoids that); no-op when already plaintext
+[group('env')]
+[confirm("Decrypt the secrets file IN PLACE? It stays PLAINTEXT on disk until `just encrypt` (hint: `just secrets-edit` edits without writing plaintext). Do you really want to run this? [y/N]")]
+decrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f="{{ secrets_env }}"
+    [ -f "$f" ] || { echo "decrypt: $f is missing" >&2; exit 1; }
+    if ! grep -q '^sops_version=' "$f"; then
+        echo "decrypt: $f is already plaintext"
+        exit 0
+    fi
+    sops --decrypt --in-place "$f"
+    chmod 600 "$f"
+    echo "decrypt: $f is PLAINTEXT now; run 'just encrypt' when done"
+
+# encrypt the secrets file in place for the recipients in .sops.yaml; no-op when already encrypted
+[group('env')]
+encrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f="{{ secrets_env }}"
+    [ -f "$f" ] || { echo "encrypt: $f is missing" >&2; exit 1; }
+    if grep -q '^sops_version=' "$f"; then
+        echo "encrypt: $f is already encrypted"
+        exit 0
+    fi
+    sops --encrypt --in-place "$f"
+    chmod 600 "$f"
+    echo "encrypt: $f is encrypted"
+
+# re-encrypt every file in shared-secrets/ for the recipients in .sops.yaml (run after a recipient change)
+[group('env')]
+secrets-updatekeys:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    for f in "{{ justfile_directory() }}"/shared-secrets/*; do
+        sops updatekeys -y "$f"
+    done
 
 # ── build ──────────────────────────────────────────────────────────────────
 
@@ -559,6 +617,11 @@ mqtt-burst topic count target="":
 [group('examples')]
 mqtt-status target="":
     mosquitto_sub -h "${MQTT_HOST}" -p "${MQTT_PORT:-1883}" ${MQTT_USER:+-u "$MQTT_USER"} ${MQTT_PASS:+-P "$MQTT_PASS"} -t "$(scripts/mqtt-topic.sh "{{ target }}")/status" -C 1 -W 5
+
+# block, unblock or check a bench board on the router, e.g. `just router block {mac}` from a bench step; acts only on ROUTER_BENCH_MACS (ROUTER_* from the SOPS secrets, see scripts/router.sh)
+[group('examples')]
+router action mac:
+    @scripts/router.sh "{{ action }}" "{{ mac }}" "{{ secrets_env }}"
 
 # submit the provisioning form with x_* extras to a running SoftAP portal (WIFI_*, MQTT_*, OTA_URL, DEVICE_NAME from the dotenv file); positional args, e.g. `just portal-save 192.168.4.1 8 13 64`; extras 9, key_len 14 or value_len 65 exceed the caps and return 400; key_len must be at least 5
 [group('examples')]

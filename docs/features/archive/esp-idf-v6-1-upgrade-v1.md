@@ -49,7 +49,8 @@ That objection is now solved, and the maintainer decided on 2026-11-12 to move t
 4. Release as the next minor together with `rustyfarian-esp-idf-ws2812`; consumers bump `ESP_IDF_VERSION` in lockstep and re-run their flash-and-test checklist.
 
 ## Open items
-- [ ] Per-chip example builds complete for C3, C6, S3 and ESP32.
+- [x] Per-chip example builds complete for C3, C6, S3 and ESP32.
+  `just build-all-examples idf_` 2026-11-15: 23 of 23 built (16 C3, 3 C6, 3 S3, 1 ESP32).
 - [ ] Hardware runs on each claimed chip (none run on v6.1 yet).
   Deferred 2026-11-15 to the full hardware test before the next release (maintainer decision).
 - [ ] ESP-NOW coexistence soak on the C6 with v6.1.

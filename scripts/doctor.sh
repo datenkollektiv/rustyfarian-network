@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# doctor.sh — check development prerequisites (RAM disk, sccache, tooling, MQTT broker)
-# Usage: scripts/doctor.sh <ramdisk> <hal_dir> <idf_dir>
+# doctor.sh — check development prerequisites (RAM disk, sccache, tooling, MQTT broker, router automation)
+# Usage: scripts/doctor.sh <ramdisk> <hal_dir> <idf_dir> [secrets_env]
 
 ramdisk="$1"
 hal_dir="$2"
 idf_dir="$3"
+secrets_env="${4:-}"
 
 if [ -d "$ramdisk" ]; then
     if [ -d "$ramdisk/targets/hal" ] && [ -d "$ramdisk/targets/idf" ]; then
@@ -160,3 +161,56 @@ check_cmd cargo-outdated cargo-outdated optional    "cargo install cargo-outdate
 check_cmd espflash       espflash       optional    "cargo install espflash        (needed for: just flash, just run)"
 check_cmd mosquitto_pub  mosquitto_pub  optional    "brew install mosquitto        (needed for: just ota-* runbook commands)"
 check_cmd mosquitto_sub  mosquitto_sub  optional    "brew install mosquitto        (needed for: just ota-status)"
+
+# --- Router automation (optional) — `just router` for unattended bench router steps ---
+# Without it the router steps still run attended (`just bench … --attended`): a person blocks the board.
+# Reports presence and state only: the secrets are decrypted in memory and only key names are checked.
+router_hint="(optional, needed for: just router; without it run the router steps --attended)"
+check_cmd sops sops optional "brew install sops  $router_hint"
+check_cmd jq   jq   optional "brew install jq    $router_hint"
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$repo_root/.sops.yaml" ]; then
+    printf "  sops rules ok       .sops.yaml\n"
+else
+    printf "  sops rules --       .sops.yaml missing  %s\n" "$router_hint"
+fi
+
+age_key=0
+if [ -n "${SOPS_AGE_KEY:-}" ]; then
+    printf "  age key    ok       SOPS_AGE_KEY set\n"
+    age_key=1
+elif [ -n "${SOPS_AGE_KEY_FILE:-}" ] && [ -f "$SOPS_AGE_KEY_FILE" ]; then
+    printf "  age key    ok       SOPS_AGE_KEY_FILE %s\n" "$SOPS_AGE_KEY_FILE"
+    age_key=1
+else
+    printf "  age key    --       neither SOPS_AGE_KEY nor SOPS_AGE_KEY_FILE set (.envrc)  %s\n" "$router_hint"
+fi
+
+if [ -z "$secrets_env" ] || [ ! -f "$secrets_env" ]; then
+    printf "  secrets    --       %s missing (create: just secrets-edit)  %s\n" "${secrets_env:-secrets file}" "$router_hint"
+elif ! grep -q '^sops_version=' "$secrets_env"; then
+    printf "  secrets    WARN     %s is PLAINTEXT on disk (run: just encrypt)\n" "$secrets_env"
+else
+    printf "  secrets    ok       encrypted\n"
+    if [ "$age_key" -eq 1 ] && command -v sops >/dev/null 2>&1; then
+        if names=$(sops -d "$secrets_env" 2>/dev/null | sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p'); then
+            router_keys="$(printf '%s\n' "$names" | grep '^ROUTER_' | tr '\n' ' ' || true)"
+            if printf '%s\n' "$names" | grep -qx ROUTER_BENCH_MACS; then
+                printf "  secrets    ok       decrypts; keys: %s\n" "$router_keys"
+            else
+                printf "  secrets    --       decrypts (keys: %s), but ROUTER_BENCH_MACS is missing (just router refuses every board)\n" "${router_keys:-none}"
+            fi
+        else
+            printf "  secrets    --       cannot decrypt with this age key  %s\n" "$router_hint"
+        fi
+    fi
+fi
+
+if [ -z "${ROUTER_BACKEND:-}" ]; then
+    printf "  router     --       ROUTER_BACKEND not set (.envrc)  %s\n" "$router_hint"
+elif [ -x "$ROUTER_BACKEND" ]; then
+    printf "  router     ok       backend %s\n" "$ROUTER_BACKEND"
+else
+    printf "  router     --       ROUTER_BACKEND %s is not an executable file\n" "$ROUTER_BACKEND"
+fi
