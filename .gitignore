@@ -7,6 +7,12 @@ components_*.lock
 .env
 .envrc
 
+# secrets (SOPS + age): secrets/ is plaintext and machine-local; shared-secrets/ is SOPS-encrypted
+# but stays local too, because this repository is public; so does the SOPS config
+secrets/
+shared-secrets/
+.sops.yaml
+
 .idea/
 .claude/
 .claudeignore
