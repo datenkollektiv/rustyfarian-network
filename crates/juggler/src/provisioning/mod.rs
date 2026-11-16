@@ -30,6 +30,7 @@ pub mod defaults;
 pub mod device_name;
 pub mod dns;
 pub mod error;
+pub mod fallback;
 #[cfg(feature = "flash-store")]
 pub mod flash_store;
 pub mod form;
@@ -59,7 +60,11 @@ pub use config::{
 pub use defaults::PortalDefaults;
 pub use device_name::{derive_device_name, DeviceName};
 pub use error::{Field, FieldError, FieldErrors, ValidationError};
-pub use form::{parse_form, ExtraField};
+pub use fallback::{
+    FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, FallbackStep, JoinRecorder,
+    CREDENTIAL_THRESHOLD_DEFAULT, FALLBACK_PORTAL_WINDOW_DEFAULT, NETWORK_ABSENT_THRESHOLD_DEFAULT,
+};
+pub use form::{parse_form, parse_wifi_form, ExtraField};
 #[cfg(feature = "std")]
 pub use kv_store::{KvProvisioningStore, ProvisioningKv};
 pub use portal::{

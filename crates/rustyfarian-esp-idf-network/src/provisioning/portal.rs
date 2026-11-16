@@ -33,11 +33,11 @@ use esp_idf_svc::http::Method;
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
 use juggler::provisioning::templates::{
     template_for, COMMITTED_HTML, FACTORY_RESET_HTML, PROBE_PATHS, RESUBMIT_HINT,
-    SESSION_FINISHED_BODY,
+    SESSION_FINISHED_BODY, WIFI_FALLBACK_PORTAL_HTML,
 };
 use juggler::provisioning::{
-    body_nonce_matches, parse_form, Field, FieldErrors, PortalAction, PortalDefaults, PortalInput,
-    Prefill, ProvisioningConfig, SchemaProfile,
+    body_nonce_matches, parse_form, parse_wifi_form, Field, FieldError, FieldErrors, PortalAction,
+    PortalDefaults, PortalInput, Prefill, ProvisioningConfig, SchemaProfile, ValidationError,
 };
 
 use crate::provisioning::store::ProvisioningStore;
@@ -64,6 +64,29 @@ const MAX_URI_HANDLERS: usize = 12;
 /// is well under 1 KB; 2 KB is a generous cap. Larger bodies get `413`.
 const MAX_BODY_LEN: usize = 2048;
 
+/// Which form the portal serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortalForm {
+    /// The profile's full form, with the factory-reset button.
+    Full,
+    /// The fallback portal's Wi-Fi-only form: `POST /save` changes only the
+    /// SSID and password of the stored record, and `/factory-reset` is not
+    /// served, so an open fallback portal cannot change the MQTT broker.
+    // Only the `mqtt`-gated fallback runner selects it.
+    #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
+    WifiOnly,
+}
+
+impl PortalForm {
+    /// The HTML template this form renders for `profile`.
+    fn template(self, profile: SchemaProfile) -> &'static str {
+        match self {
+            PortalForm::Full => template_for(profile),
+            PortalForm::WifiOnly => WIFI_FALLBACK_PORTAL_HTML,
+        }
+    }
+}
+
 /// Builds and starts the portal HTTP server.
 ///
 /// `ap_ip` backs the probe-route redirects; `nonce` is the per-session token
@@ -82,7 +105,9 @@ pub(crate) fn start(
     status_entries: Arc<Vec<(String, String)>>,
     profile: SchemaProfile,
     defaults: Arc<PortalDefaultsOwned>,
+    form: PortalForm,
 ) -> anyhow::Result<EspHttpServer<'static>> {
+    let template = form.template(profile);
     let config = Configuration {
         http_port: HTTP_PORT,
         max_uri_handlers: MAX_URI_HANDLERS,
@@ -102,7 +127,7 @@ pub(crate) fn start(
             let stored = load_stored(&store_for_load);
             let defaults = defaults_for_load.as_borrowed();
             let prefill = Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
-            let html = render_form(profile, &nonce, &prefill, &FieldErrors::new());
+            let html = render_form(template, &nonce, &prefill, &FieldErrors::new());
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
             let headers = [
@@ -131,7 +156,7 @@ pub(crate) fn start(
                     let prefill =
                         Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
                     let html = render_form_with_banner(
-                        profile,
+                        template,
                         &nonce,
                         &prefill,
                         "Request body too large — please try again.",
@@ -151,7 +176,10 @@ pub(crate) fn start(
             // The form is parsed only behind a valid nonce; `PortalMachine`
             // sequences the rest (nonce → gate → persist → commit).
             let nonce_ok = body_nonce_matches(body.as_bytes(), &nonce);
-            let parsed = nonce_ok.then(|| parse_form(&body, profile));
+            let parsed = nonce_ok.then(|| match form {
+                PortalForm::Full => parse_form(&body, profile),
+                PortalForm::WifiOnly => parse_wifi_form_against_store(&body, &store),
+            });
             let form_valid = matches!(parsed, Some(Ok(_)));
             match (
                 state.poll(PortalInput::Save {
@@ -172,15 +200,23 @@ pub(crate) fn start(
                     let defaults = defaults.as_borrowed();
                     let prefill =
                         Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
-                    let html = render_form(profile, &nonce, &prefill, &errors);
+                    let html = render_form(template, &nonce, &prefill, &errors);
                     let mut response = request.into_status_response(400)?;
                     response.write_all(html.as_bytes())?;
                 }
                 (PortalAction::Persist, Some(Ok(config))) => {
+                    // The fallback form changes only the Wi-Fi pair, through
+                    // the journaled replacement: a failed write keeps the old
+                    // record, so a later timeout still retries it.
                     let persist = store
                         .lock()
                         .map_err(|_| anyhow::anyhow!("store mutex poisoned"))
-                        .and_then(|mut s| s.save(&config));
+                        .and_then(|mut s| match form {
+                            PortalForm::Full => s.save(&config),
+                            PortalForm::WifiOnly => {
+                                s.save_wifi_credentials(config.wifi_ssid(), config.wifi_password())
+                            }
+                        });
                     let saved = match persist {
                         Ok(()) => Some(config),
                         Err(e) => {
@@ -200,7 +236,7 @@ pub(crate) fn start(
                             let prefill =
                                 Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
                             let html = render_form_with_banner(
-                                profile,
+                                template,
                                 &nonce,
                                 &prefill,
                                 "Could not save credentials to flash. Please try again.",
@@ -258,7 +294,9 @@ pub(crate) fn start(
         })?;
     }
 
-    {
+    // The fallback portal offers no factory reset: after a remote reset the
+    // full portal would let anyone in range change the MQTT broker.
+    if form == PortalForm::Full {
         let state = state.clone();
         let nonce = nonce.clone();
         let on_event = on_event.clone();
@@ -433,18 +471,38 @@ fn load_stored(store: &Arc<std::sync::Mutex<ProvisioningStore>>) -> Option<Provi
     }
 }
 
+/// Parses the Wi-Fi-only fallback form against the stored record.
+///
+/// The fallback portal only starts over a stored record, so a missing one (a
+/// store error) rejects the submission as a whole instead of saving a record
+/// built from nothing.
+// The large `Err` is intentional, as on `parse_form`.
+#[allow(clippy::result_large_err)]
+fn parse_wifi_form_against_store(
+    body: &str,
+    store: &Arc<std::sync::Mutex<ProvisioningStore>>,
+) -> Result<ProvisioningConfig, FieldErrors> {
+    match load_stored(store) {
+        Some(stored) => parse_wifi_form(body, &stored),
+        None => {
+            log::error!("POST /save: no stored record to apply the Wi-Fi fields to");
+            let mut errors = FieldErrors::new();
+            let _ = errors.push(FieldError {
+                field: Field::Form,
+                error: ValidationError::Missing,
+            });
+            Err(errors)
+        }
+    }
+}
+
 /// Substitutes pre-fill values and rendered errors into the active profile's
 /// template.
 ///
 /// Secret inputs (`wifi_pass`, `app_key`, `mqtt_pass`) carry no placeholder
 /// substitution and are always emitted empty.
-fn render_form(
-    profile: SchemaProfile,
-    nonce: &str,
-    prefill: &Prefill<'_>,
-    errors: &FieldErrors,
-) -> String {
-    render_template(profile, nonce, prefill, &render_errors(errors))
+fn render_form(template: &str, nonce: &str, prefill: &Prefill<'_>, errors: &FieldErrors) -> String {
+    render_template(template, nonce, prefill, &render_errors(errors))
 }
 
 /// Renders the form with a non-field-specific banner instead of per-field
@@ -452,36 +510,56 @@ fn render_form(
 /// data itself was never validated and the per-field error model would
 /// misrepresent the cause.
 fn render_form_with_banner(
-    profile: SchemaProfile,
+    template: &str,
     nonce: &str,
     prefill: &Prefill<'_>,
     message: &str,
 ) -> String {
-    render_template(profile, nonce, prefill, &render_banner(message))
+    render_template(template, nonce, prefill, &render_banner(message))
 }
 
 fn render_template(
-    profile: SchemaProfile,
+    template: &str,
     nonce: &str,
     prefill: &Prefill<'_>,
     errors_html: &str,
 ) -> String {
     // Every profile shares the Core/OTA placeholders; the profile-specific
     // ones (`{{DEV_EUI}}` / `{{JOIN_EUI}}` for LoRaWAN, `{{MQTT_*}}` for
-    // Wi-Fi+MQTT) simply do not appear in the other profile's template, so the
-    // corresponding `replace` calls are no-ops there. No `{{MQTT_PASS}}`
-    // placeholder exists in any template — the secret is never pre-filled.
-    template_for(profile)
-        .replace("{{NONCE}}", &html_escape(nonce))
-        .replace("{{ERRORS}}", errors_html)
-        .replace("{{WIFI_SSID}}", &html_escape(prefill.wifi_ssid))
-        .replace("{{DEV_EUI}}", &html_escape(prefill.dev_eui))
-        .replace("{{JOIN_EUI}}", &html_escape(prefill.join_eui))
-        .replace("{{MQTT_URI}}", &html_escape(&prefill.mqtt_uri))
-        .replace("{{MQTT_USER}}", &html_escape(prefill.mqtt_user))
-        .replace("{{MQTT_CLIENT}}", &html_escape(prefill.mqtt_client))
-        .replace("{{OTA_URL}}", &html_escape(prefill.ota_url))
-        .replace("{{DEV_NAME}}", &html_escape(prefill.dev_name))
+    // Wi-Fi+MQTT) simply do not appear in the other profile's template (nor in
+    // the Wi-Fi-only fallback template), so the corresponding `replace` calls
+    // are no-ops there. No `{{MQTT_PASS}}` placeholder exists in any
+    // template — the secret is never pre-filled.
+    // One pass: a submitted SSID such as `{{MQTT_URI}}` must not pull the
+    // stored broker into the Wi-Fi-only fallback page.
+    let nonce = html_escape(nonce);
+    let wifi_ssid = html_escape(prefill.wifi_ssid);
+    let dev_eui = html_escape(prefill.dev_eui);
+    let join_eui = html_escape(prefill.join_eui);
+    let mqtt_uri = html_escape(&prefill.mqtt_uri);
+    let mqtt_user = html_escape(prefill.mqtt_user);
+    let mqtt_client = html_escape(prefill.mqtt_client);
+    let ota_url = html_escape(prefill.ota_url);
+    let dev_name = html_escape(prefill.dev_name);
+    let mut out = String::with_capacity(template.len() + errors_html.len());
+    juggler::provisioning::templates::fill_placeholders(
+        template,
+        |key| match key {
+            "NONCE" => Some(nonce.as_str()),
+            "ERRORS" => Some(errors_html),
+            "WIFI_SSID" => Some(wifi_ssid.as_str()),
+            "DEV_EUI" => Some(dev_eui.as_str()),
+            "JOIN_EUI" => Some(join_eui.as_str()),
+            "MQTT_URI" => Some(mqtt_uri.as_str()),
+            "MQTT_USER" => Some(mqtt_user.as_str()),
+            "MQTT_CLIENT" => Some(mqtt_client.as_str()),
+            "OTA_URL" => Some(ota_url.as_str()),
+            "DEV_NAME" => Some(dev_name.as_str()),
+            _ => None,
+        },
+        |piece| out.push_str(piece),
+    );
+    out
 }
 
 /// Renders a freeform banner (`<div class="errors">…</div>`) used when the
@@ -734,7 +812,12 @@ pub(super) mod tests {
             SchemaProfile::LorawanFieldDevice,
         ] {
             let p = Prefill::select(None, profile, &defaults, "rgb-clock");
-            let html = render_form(profile, &test_nonce(), &p, &FieldErrors::new());
+            let html = render_form(
+                template_for(profile),
+                &test_nonce(),
+                &p,
+                &FieldErrors::new(),
+            );
             assert!(html.contains("value=\"rgb-clock\""));
         }
     }
@@ -757,7 +840,7 @@ pub(super) mod tests {
             "rgb-clock",
         );
         let html = render_form(
-            SchemaProfile::WifiMqttDevice,
+            template_for(SchemaProfile::WifiMqttDevice),
             &test_nonce(),
             &p,
             &FieldErrors::new(),
@@ -765,6 +848,17 @@ pub(super) mod tests {
         assert!(!html.contains(&wifi_password));
         assert!(!html.contains(&mqtt_pass));
         assert!(html.contains("mqtt://stored.local:8883"));
+
+        let html = render_form(
+            PortalForm::WifiOnly.template(SchemaProfile::WifiMqttDevice),
+            &test_nonce(),
+            &p,
+            &FieldErrors::new(),
+        );
+        assert!(!html.contains(&wifi_password));
+        assert!(!html.contains(&mqtt_pass));
+        assert!(!html.contains("stored.local"));
+        assert!(html.contains("value=\"StoredNet\""));
     }
 
     #[test]

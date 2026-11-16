@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InboundMessage::{topic, payload, retained, qos}` accessors on both tiers, so reading a message needs no trait import.
 - `rustyfarian-esp-idf-network` `mqtt` re-exports the `juggler` validators (`validate_publish_topic`, `validate_subscribe_filter`, `validate_client_id`, `validate_broker_port`, `topic_matches_filter`), as esp-hal does.
 - `just save-image <example> <image>`: the merged whole-flash image (the repo's IDF-built bootloader at `0x0`, partition table, app) with the same arguments as `just flash`; `bench/bench.toml` uses it as the `image` command, so `rustyfarian-bench submit` needs no `--image`.
+- `juggler` portal-fallback core (`docs/features/wifi-portal-fallback-v1.md`): `wifi::JoinFailure::of(DisconnectReason)` and `wifi::JoinAttempts` classify a failed join as credentials, network absent or transient (`AUTH_EXPIRE` counts as credentials from its second occurrence in one boot, `AUTH_EXPIRE_REPEAT`); `provisioning::FallbackPolicy` (thresholds 5 and 20, `0` = never) turns persisted `FailureCounts` into a `FallbackDecision`.
+  `KvProvisioningStore::{load,save,clear}_failure_counts` keep the counts in the reserved `rf_prov` keys `wifi_fail_cred` and `wifi_fail_noap`; `save` (a commit) and `erase_all` remove them, `load` ignores them, and 0.6.x records without them read as zero counts.
+  `KvProvisioningStore::save_wifi_credentials` (`ProvisioningStore::save_wifi_credentials` on ESP-IDF), used by the fallback portal's Wi-Fi-only form, replaces the stored SSID and password through a journal in the reserved `rf_prov` keys `wifi_ssid_old`, `wifi_pass_old` and `wifi_pending`, so a failed write leaves the old record readable; `save` clears the journal and `erase_all` removes its keys.
+- `rustyfarian-esp-idf-network` portal fallback for the `WifiMqttDevice` profile (opt-in): `WifiMqttBoot::load_with_fallback(nvs, policy, reentry, client_id_fn)` returns the new `WifiMqttLoadOutcome::FallbackPortal { reason, failures }` once a failure counter reached its threshold, `WifiMqttBoot::wait_for_join(&wifi, window) -> JoinOutcome` classifies a boot's failed joins from their disconnect reasons and updates the counters without ever failing, and `run_wifi_mqtt_fallback_portal` serves a Wi-Fi-only form that keeps the stored broker, offers no factory reset and closes after 10 min (`FALLBACK_PORTAL_WINDOW_DEFAULT`).
+  A transient window leaves the boot uncounted, and a boot counted as network absent moves its count to credentials when a later window of the same boot shows credential failures; a boot still counts at most once.
+  A bundle from `load_with_fallback` connects non-blocking; `ProvisioningStore::{load,save,clear}_failure_counts` expose the counters; `juggler` adds `provisioning::{JoinRecorder, parse_wifi_form}`, `templates::WIFI_FALLBACK_PORTAL_HTML` and `templates::fill_placeholders`, a one-pass renderer the IDF portal now uses, so a submitted SSID such as `{{MQTT_URI}}` cannot pull the stored broker into the page.
+  A consumer that keeps running after `JoinOutcome::NotJoined` calls `wait_for_join` again until it returns `Joined`, so a late join clears the counters; `idf_c3_provision_mqtt` restarts at once on a credential failure and otherwise stays up for a stay that doubles per network-absent boot (about 14 h to the default 20).
+  The esp-hal tier has no fallback yet (ADR 022 gap).
 - `just pi-submit <board> <example> [args]`: submits a bench check to the remote bench with the pinned rustyfarian-bench release (now v0.6.0), the bench URL, token and optional CA read from the SOPS secrets file (`scripts/bench-remote-env.sh`).
 
 ### Changed
@@ -27,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `rustyfarian-esp-hal-network` `WiFiManager::suspend()` and `resume()` return `Result<(), Infallible>` (was `()`), the same shape as on ESP-IDF; callers that ignore it write `let _ = LINK.suspend();`.
 - **Breaking:** `rustyfarian-esp-idf-network` `MqttHandle::try_publish` and `try_publish_retained` take a `&[u8]` payload (was `&str`), as on esp-hal; pass `text.as_bytes()` or `b"..."`.
 - **Breaking:** `rustyfarian-esp-idf-network` `MqttHandle::publish` is the shared async `publish(topic, payload, qos, retain)`, which waits for queue room; the sync method that drops the oldest held message when the queue is full is now `enqueue(topic, payload, qos, retain)`, and the sync `publish(topic, &str)`, `publish_retained` and `publish_with` are gone (`handle.publish(t, &s)` becomes `handle.enqueue(t, s.as_bytes(), QoS::AtLeastOnce, false)`).
+- **Breaking:** `juggler::wifi::DisconnectReason` is an enum of the `wifi_err_reason_t` kinds with `from_code(u16)`, `name()`, `code() -> Option<u16>` and `suggests_credentials()`, re-exported by both tiers; it replaces the `DisconnectReason(u16)` newtype and the free functions `wifi_disconnect_reason_name`, `reason_suggests_credentials` and `credentials_hint` (`wifi_disconnect_reason_name(c)` becomes `DisconnectReason::from_code(c).name()`).
+  `lines::Disconnected::new(reason)` builds the shared disconnect line with the credentials hint where it applies.
+  Codes 4, 6 and 7 take their ESP-IDF v6.1 names, so the log text changes from `ASSOC_EXPIRE`, `NOT_AUTHED` and `NOT_ASSOCED` to `DISASSOC_DUE_TO_INACTIVITY`, `CLASS2_FRAME_FROM_NONAUTH_STA` and `CLASS3_FRAME_FROM_NONASSOC_STA`.
+- `rustyfarian-esp-hal-network` names disconnect reasons like ESP-IDF: `[wifi] disconnected — reason 8 (ASSOC_LEAVE)` instead of `AssociationLeave`, and `[wifi] connect failed: reason 2 (AUTH_EXPIRE)` instead of esp-radio's `Debug` form; the rare 802.11 reasons esp-radio names log as `reason 25 (unmapped)`, as on ESP-IDF, and only esp-radio's catch-all (code 1 and the codes it does not know) logs as `reason ? (UNSPECIFIED)`.
+- `rustyfarian-esp-idf-network` the Wi-Fi module's last unprefixed log line now starts with `[wifi]` (`[wifi] get_ip_info transient error`).
 - `rustyfarian-esp-hal-network` the link supervisor `WifiLink` is now `WiFiManager`, the IDF name; `WiFiManager::init_async` and `init_softap_async` are unchanged, and firmware declares `static LINK: WiFiManager = WiFiManager::new();`.
 - `rustyfarian-esp-hal-network` `AP_IP` is spelled `core::net::Ipv4Addr` (the same type as before).
 - **Breaking:** `rustyfarian-esp-idf-network` is built and validated against ESP-IDF v6.1 (was v5.3.3), in step with `rustyfarian-esp-idf-ws2812`; firmware sets `ESP_IDF_VERSION = "v6.1"` and deletes its old `esp-idf-sys-*` build directories once (here: `just clean-idf-sys`).
@@ -44,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-hal-network` `wifi::WifiLink`: a type alias of `WiFiManager`.
 - `rustyfarian-esp-hal-network` `AsyncWifiHandle::wait_for_ip`: use `WiFiManager::wait_connected` and `WiFiManager::ip`.
 - `rustyfarian-esp-hal-network` `MqttHandle::publish_with`: use `MqttHandle::publish`, the name the ESP-IDF tier shares.
+
+### Fixed
+
+- `rustyfarian-esp-idf-network` `run_wifi_mqtt_portal` (and the new fallback runner): a save or factory reset accepted just before `portal_timeout` that finished during shutdown was reported as `PortalExitedWithoutCommit`; the outcome is now settled from the session state after the server has stopped, via the new `juggler::provisioning::SessionOutcome::settled`.
 
 ## [0.7.0] - 2026-11-12
 

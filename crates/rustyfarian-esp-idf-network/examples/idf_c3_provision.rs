@@ -9,6 +9,9 @@
 //!    (the `idf_c3_connect` pattern), or run the provisioning portal.
 //! 4. After the portal commits, restart so the device boots into normal mode.
 //!
+//! The portal fallback after repeated failed Wi-Fi joins is an opt-in of the
+//! `WifiMqttDevice` profile only; see `idf_c3_provision_mqtt`.
+//!
 //! The library never reboots or erases on its own; the `esp_idf_svc::hal::reset::restart()`
 //! call below lives in this **example**, not the crate.
 //!

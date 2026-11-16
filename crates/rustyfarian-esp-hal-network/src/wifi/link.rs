@@ -57,13 +57,13 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
 use esp_radio::wifi::ConnectionError;
-use esp_radio::wifi::DisconnectReason;
+use esp_radio::wifi::DisconnectReason as RadioReason;
 use esp_radio::wifi::WifiController;
 use juggler::waker_slots::{poll_ready, ReadyPoll, WakerSlots};
 use juggler::wifi::lines::{ByDebug, Disconnected, Lifecycle, LinkUp, NetworkReady, Reconnecting};
 use juggler::wifi::{
-    IdleWait, JoinedAp, LinkAction, LinkHandover, LinkInput, LinkState, NetworkLink,
-    CREDENTIALS_HINT,
+    DisconnectReason, IdleWait, JoinedAp, LinkAction, LinkHandover, LinkInput, LinkState,
+    NetworkLink, CREDENTIALS_HINT,
 };
 
 /// Upper bound on the disconnect that [`WiFiManager::suspend`] triggers (milliseconds);
@@ -374,13 +374,9 @@ impl WiFiManager {
                                 Either::Second(Ok(_)) => break Ok(()),
                                 Either::Second(Err(e)) => {
                                     // A refused association arrives here, not as a
-                                    // disconnect event, so the hint belongs on this
-                                    // line too.
-                                    log::warn!(
-                                        "[wifi] connect failed: {:?}{}",
-                                        e,
-                                        connect_failure_hint(&e)
-                                    );
+                                    // disconnect event, so the reason and hint belong
+                                    // on this line too.
+                                    log_connect_failure(&e);
                                     break Err(self.poll(LinkInput::ConnectFailed));
                                 }
                             }
@@ -400,7 +396,7 @@ impl WiFiManager {
                     .await
                     {
                         Ok(Ok(info)) => {
-                            log::debug!("[wifi] disconnect reason: {:?}", info.reason);
+                            log::debug!("[wifi] disconnect {}", shared_reason(&info.reason));
                             log::info!("{}", Lifecycle::Suspended);
                         }
                         Ok(Err(e)) => {
@@ -465,16 +461,11 @@ impl WiFiManager {
                                     }
                                     Either3::Second(result) => {
                                         match result {
-                                            // esp-radio reports a named reason, not the
-                                            // ESP-IDF code, so the name is its `Debug`
-                                            // form; the credentials hint is the one both
-                                            // tiers share.
+                                            // The same line and hint as the ESP-IDF tier,
+                                            // via the shared reason kind.
                                             Ok(info) => log::warn!(
                                                 "{}",
-                                                Disconnected {
-                                                    reason: ByDebug(&info.reason),
-                                                    hint: hal_disconnect_hint(&info.reason)
-                                                }
+                                                Disconnected::new(shared_reason(&info.reason))
                                             ),
                                             Err(e) => log::warn!(
                                                 "{}",
@@ -611,30 +602,107 @@ mod concrete_parity {
     }
 }
 
-/// The credentials hint for an esp-radio disconnect reason.
+/// The shared reason kind for an esp-radio disconnect reason.
 ///
-/// esp-radio reports a named reason rather than the ESP-IDF code, so the four
-/// reasons the shared [`reason_suggests_credentials`] lists are matched on their
-/// variants here: `4WAY_HANDSHAKE_TIMEOUT`, `NO_AP_FOUND`, `AUTH_FAIL` and
-/// `HANDSHAKE_TIMEOUT`. `reason_suggests_credentials` itself cannot be used
-/// because the numeric code is not exposed.
-fn hal_disconnect_hint(reason: &DisconnectReason) -> &'static str {
+/// esp-radio reports a named reason and no numeric code, so each named kind of
+/// [`DisconnectReason`] is matched on its variant here and carries its ESP-IDF code
+/// on this tier too. The rarer 802.11 reasons esp-radio also names (TDLS, QoS, fast
+/// transition) become `Unmapped` with their code, as on ESP-IDF; only esp-radio's
+/// catch-all, which folds code 1 with every code it does not know, becomes
+/// `Unspecified` without a code.
+fn shared_reason(reason: &RadioReason) -> DisconnectReason {
     match reason {
-        DisconnectReason::FourWayHandshakeTimeout
-        | DisconnectReason::HandshakeTimeout
-        | DisconnectReason::NoAccessPointFound
-        | DisconnectReason::AuthenticationFailed => CREDENTIALS_HINT,
-        _ => "",
+        RadioReason::AuthenticationExpired => DisconnectReason::AuthExpire,
+        RadioReason::AuthenticationLeave => DisconnectReason::AuthLeave,
+        RadioReason::DisassociatedDueToInactivity => DisconnectReason::DisassocDueToInactivity,
+        RadioReason::AssociationTooMany => DisconnectReason::AssocTooMany,
+        RadioReason::Class2FrameFromNonAuthenticatedStation => {
+            DisconnectReason::Class2FrameFromNonauthSta
+        }
+        RadioReason::Class3FrameFromNonAssociatedStation => {
+            DisconnectReason::Class3FrameFromNonassocSta
+        }
+        RadioReason::AssociationLeave => DisconnectReason::AssocLeave,
+        RadioReason::AssociationNotAuthenticated => DisconnectReason::AssocNotAuthed,
+        RadioReason::DisassociatedPowerCapabilityBad => DisconnectReason::DisassocPwrcapBad,
+        RadioReason::DisassociatedUnsupportedChannel => DisconnectReason::DisassocSupchanBad,
+        RadioReason::BssTransitionDisassociated => DisconnectReason::BssTransitionDisassoc,
+        RadioReason::IeInvalid => DisconnectReason::IeInvalid,
+        RadioReason::MicFailure => DisconnectReason::MicFailure,
+        RadioReason::FourWayHandshakeTimeout => DisconnectReason::FourWayHandshakeTimeout,
+        RadioReason::GroupKeyUpdateTimeout => DisconnectReason::GroupKeyUpdateTimeout,
+        RadioReason::IeIn4wayDiffers => DisconnectReason::IeIn4wayDiffers,
+        RadioReason::GroupCipherInvalid => DisconnectReason::GroupCipherInvalid,
+        RadioReason::PairwiseCipherInvalid => DisconnectReason::PairwiseCipherInvalid,
+        RadioReason::AkmpInvalid => DisconnectReason::AkmpInvalid,
+        RadioReason::UnsupportedRsnIeVersion => DisconnectReason::UnsuppRsnIeVersion,
+        RadioReason::InvalidRsnIeCapabilities => DisconnectReason::InvalidRsnIeCap,
+        RadioReason::_802_1xAuthenticationFailed => DisconnectReason::Ieee8021xAuthFailed,
+        RadioReason::CipherSuiteRejected => DisconnectReason::CipherSuiteRejected,
+        RadioReason::BeaconTimeout => DisconnectReason::BeaconTimeout,
+        RadioReason::NoAccessPointFound => DisconnectReason::NoApFound,
+        RadioReason::AuthenticationFailed => DisconnectReason::AuthFail,
+        RadioReason::AssociationFailed => DisconnectReason::AssocFail,
+        RadioReason::HandshakeTimeout => DisconnectReason::HandshakeTimeout,
+        RadioReason::ConnectionFailed => DisconnectReason::ConnectionFail,
+        RadioReason::AccessPointTsfReset => DisconnectReason::ApTsfReset,
+        RadioReason::Roaming => DisconnectReason::Roaming,
+        RadioReason::AssociationComebackTimeTooLong => DisconnectReason::AssocComebackTimeTooLong,
+        RadioReason::SaQueryTimeout => DisconnectReason::SaQueryTimeout,
+        RadioReason::NoAccessPointFoundWithCompatibleSecurity => {
+            DisconnectReason::NoApFoundWCompatibleSecurity
+        }
+        RadioReason::NoAccessPointFoundInAuthmodeThreshold => {
+            DisconnectReason::NoApFoundInAuthmodeThreshold
+        }
+        RadioReason::NoAccessPointFoundInRssiThreshold => {
+            DisconnectReason::NoApFoundInRssiThreshold
+        }
+        RadioReason::TdlsPeerUnreachable => DisconnectReason::Unmapped(25),
+        RadioReason::TdlsUnspecified => DisconnectReason::Unmapped(26),
+        RadioReason::SspRequestedDisassociation => DisconnectReason::Unmapped(27),
+        RadioReason::NoSspRoamingAgreement => DisconnectReason::Unmapped(28),
+        RadioReason::BadCipherOrAkm => DisconnectReason::Unmapped(29),
+        RadioReason::NotAuthorizedThisLocation => DisconnectReason::Unmapped(30),
+        RadioReason::ServiceChangePercludesTs => DisconnectReason::Unmapped(31),
+        RadioReason::UnspecifiedQos => DisconnectReason::Unmapped(32),
+        RadioReason::NotEnoughBandwidth => DisconnectReason::Unmapped(33),
+        RadioReason::MissingAcks => DisconnectReason::Unmapped(34),
+        RadioReason::ExceededTxOp => DisconnectReason::Unmapped(35),
+        RadioReason::StationLeaving => DisconnectReason::Unmapped(36),
+        RadioReason::EndBlockAck => DisconnectReason::Unmapped(37),
+        RadioReason::UnknownBlockAck => DisconnectReason::Unmapped(38),
+        RadioReason::Timeout => DisconnectReason::Unmapped(39),
+        RadioReason::PeerInitiated => DisconnectReason::Unmapped(46),
+        RadioReason::AccessPointInitiatedDisassociation => DisconnectReason::Unmapped(47),
+        RadioReason::InvalidFtActionFrameCount => DisconnectReason::Unmapped(48),
+        RadioReason::InvalidPmkid => DisconnectReason::Unmapped(49),
+        RadioReason::InvalidMde => DisconnectReason::Unmapped(50),
+        RadioReason::InvalidFte => DisconnectReason::Unmapped(51),
+        RadioReason::TransmissionLinkEstablishmentFailed => DisconnectReason::Unmapped(67),
+        RadioReason::AlterativeChannelOccupied => DisconnectReason::Unmapped(68),
+        RadioReason::Unspecified => DisconnectReason::Unspecified { code: None },
+        // A variant a newer esp-radio adds (the enum is `#[non_exhaustive]`).
+        _ => DisconnectReason::Unspecified { code: None },
     }
 }
 
-/// The same hint for a connect that never associated: esp-radio reports the
-/// rejection as [`ConnectionError::Failed`] carrying the reason a disconnect
-/// event would have, and a wrong password is the common cause.
-fn connect_failure_hint(error: &ConnectionError) -> &'static str {
+/// Logs a connect that never associated: esp-radio reports the rejection as
+/// [`ConnectionError::Failed`] carrying the reason a disconnect event would have,
+/// and a wrong password is the common cause, so the line names the shared kind
+/// and adds the credentials hint where it applies.
+fn log_connect_failure(error: &ConnectionError) {
     match error {
-        ConnectionError::Failed(info) => hal_disconnect_hint(&info.reason),
-        _ => "",
+        ConnectionError::Failed(info) => {
+            let reason = shared_reason(&info.reason);
+            let hint = if reason.suggests_credentials() {
+                CREDENTIALS_HINT
+            } else {
+                ""
+            };
+            log::warn!("[wifi] connect failed: {}{}", reason, hint);
+        }
+        _ => log::warn!("[wifi] connect failed: {:?}", error),
     }
 }
 

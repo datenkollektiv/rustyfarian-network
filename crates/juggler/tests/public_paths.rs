@@ -60,8 +60,8 @@ fn wifi_public_paths() {
     const TEST_WIFI_SSID: &str = "TestNet";
 
     use juggler::wifi::{
-        validate_ap_config, validate_password, validate_ssid, wifi_disconnect_reason_name,
-        ApConfig, ConnectMode, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_CHANNEL_MAX,
+        validate_ap_config, validate_password, validate_ssid, ApConfig, ConnectMode,
+        DisconnectReason, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_CHANNEL_MAX,
         AP_CHANNEL_MIN, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS,
         PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
     };
@@ -79,8 +79,25 @@ fn wifi_public_paths() {
     // Validator functions are callable.
     assert!(validate_ssid(TEST_WIFI_SSID).is_ok());
     assert!(validate_password(test_psk()).is_ok());
-    assert_eq!(wifi_disconnect_reason_name(201), Some("NO_AP_FOUND"));
-    assert_eq!(wifi_disconnect_reason_name(0), None);
+    assert_eq!(DisconnectReason::from_code(201).name(), "NO_AP_FOUND");
+    assert_eq!(DisconnectReason::from_code(201).code(), Some(201));
+    assert!(DisconnectReason::from_code(201).suggests_credentials());
+    assert_eq!(
+        DisconnectReason::from_code(0),
+        DisconnectReason::Unmapped(0)
+    );
+
+    // Join-failure classification for the portal fallback.
+    use juggler::wifi::{JoinAttempts, JoinFailure, AUTH_EXPIRE_REPEAT};
+    assert_eq!(
+        JoinFailure::of(DisconnectReason::from_code(15)),
+        JoinFailure::Credentials
+    );
+    let mut boot = JoinAttempts::new();
+    for _ in 0..AUTH_EXPIRE_REPEAT {
+        boot.record(DisconnectReason::AuthExpire);
+    }
+    assert_eq!(boot.class(), JoinFailure::Credentials);
 
     // WiFiConfig builder chain.
     let cfg = WiFiConfig::new(TEST_WIFI_SSID, test_psk())
@@ -838,6 +855,28 @@ fn provisioning_public_paths() {
     let _: usize = MQTT_HOST_MAX_LEN;
     let _: usize = MQTT_PASS_MAX_LEN;
     let _: usize = MQTT_USER_MAX_LEN;
+
+    // Portal-fallback counter policy.
+    use juggler::provisioning::{
+        FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, FallbackStep,
+        CREDENTIAL_THRESHOLD_DEFAULT, NETWORK_ABSENT_THRESHOLD_DEFAULT,
+    };
+    let policy = FallbackPolicy::new()
+        .with_credential_threshold(CREDENTIAL_THRESHOLD_DEFAULT)
+        .with_network_absent_threshold(NETWORK_ABSENT_THRESHOLD_DEFAULT);
+    let step: FallbackStep =
+        policy.record_failed_boot(FailureCounts::ZERO, juggler::wifi::JoinFailure::Transient);
+    assert_eq!(step.decision, FallbackDecision::CarryOn);
+    let _: FallbackReason = FallbackReason::NetworkAbsent;
+
+    // Restart-before-portal bookkeeping and the Wi-Fi-only fallback form.
+    use juggler::provisioning::templates::WIFI_FALLBACK_PORTAL_HTML;
+    use juggler::provisioning::{parse_wifi_form, JoinRecorder, FALLBACK_PORTAL_WINDOW_DEFAULT};
+    let mut recorder = JoinRecorder::new(policy, FailureCounts::ZERO);
+    assert_eq!(recorder.joined(), None);
+    let _: core::time::Duration = FALLBACK_PORTAL_WINDOW_DEFAULT;
+    assert!(WIFI_FALLBACK_PORTAL_HTML.contains("{{WIFI_SSID}}"));
+    let _ = parse_wifi_form;
 
     // SchemaProfile.
     let _: SchemaProfile = SchemaProfile::LorawanFieldDevice;

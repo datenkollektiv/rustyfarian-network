@@ -32,6 +32,13 @@
 //! extensions must use the `x_*` extras prefix so they never collide with a
 //! current or future canonical key.
 //!
+//! The library-owned portal-fallback counters `wifi_fail_cred` and
+//! `wifi_fail_noap` (`u8`, see [`FailureCounts`]) are reserved too. They are not
+//! part of the record: [`load`](KvProvisioningStore::load) never reads them, a
+//! record without them (0.6.x) reads as zero counts, and 0.6.x firmware ignores
+//! them. [`save`](KvProvisioningStore::save) and
+//! [`erase_all`](KvProvisioningStore::erase_all) remove them.
+//!
 //! # Profiles and the v1 → v2 migration
 //!
 //! The on-flash schema version is `2`. Two profiles share this namespace
@@ -49,7 +56,8 @@
 use anyhow::Context as _;
 
 use crate::provisioning::{
-    ExtraField, LoraFields, MqttFields, ProvisioningConfig, SchemaProfile, EXTRA_FIELDS_MAX,
+    ExtraField, FailureCounts, LoraFields, MqttFields, ProvisioningConfig, SchemaProfile,
+    EXTRA_FIELDS_MAX,
 };
 
 /// The NVS namespace holding every provisioning value.
@@ -92,11 +100,24 @@ const KEY_OTA_URL: &str = "ota_url";
 const KEY_DEV_NAME: &str = "dev_name";
 /// Comma-joined index of the extra-field names currently stored.
 const KEY_EXTRAS_IDX: &str = "extras_idx";
+/// Portal-fallback credential-failure counter (`u8`, library-owned).
+const KEY_FAIL_CRED: &str = "wifi_fail_cred";
+/// Portal-fallback network-absent counter (`u8`, library-owned).
+const KEY_FAIL_NOAP: &str = "wifi_fail_noap";
+/// Backup of the committed SSID while a Wi-Fi replacement is pending.
+const KEY_WIFI_SSID_OLD: &str = "wifi_ssid_old";
+/// Backup of the committed Wi-Fi password while a replacement is pending.
+const KEY_WIFI_PASS_OLD: &str = "wifi_pass_old";
+/// Marker (`u8`) of an unfinished Wi-Fi replacement: while set, the backups
+/// are the committed pair.
+const KEY_WIFI_PENDING: &str = "wifi_pending";
 
-/// Every canonical value key plus the `profile` discriminator, used by
+/// Every canonical value key plus the `profile` discriminator, the
+/// portal-fallback counters and the Wi-Fi replacement journal, used by
 /// [`KvProvisioningStore::erase_all`] so a reset clears both profiles' groups
-/// regardless of which one the device was provisioned under.
-const CANONICAL_KEYS: [&str; 13] = [
+/// regardless of which one the device was provisioned under, and leaves no
+/// failure count or backed-up password behind.
+const CANONICAL_KEYS: [&str; 18] = [
     KEY_PROFILE,
     KEY_WIFI_SSID,
     KEY_WIFI_PASS,
@@ -110,6 +131,11 @@ const CANONICAL_KEYS: [&str; 13] = [
     KEY_MQTT_CLIENT,
     KEY_OTA_URL,
     KEY_DEV_NAME,
+    KEY_FAIL_CRED,
+    KEY_FAIL_NOAP,
+    KEY_WIFI_SSID_OLD,
+    KEY_WIFI_PASS_OLD,
+    KEY_WIFI_PENDING,
 ];
 
 /// Maximum bytes the `extras_idx` value may occupy.
@@ -128,7 +154,8 @@ const EXTRAS_IDX_MAX: usize = 256;
 ///   (a backend may report a key of another type as `None`); a backend
 ///   failure is `Err`;
 /// - `remove` of an absent key is `Ok`;
-/// - `set_*` of an existing key replaces its value;
+/// - `set_*` of an existing key replaces its value; a failed `set_str` may
+///   leave the key absent (ESP-IDF erases a string key before rewriting it);
 /// - `get_str` returns the whole stored value; for a portal-validated config
 ///   the longest is the OTA URL (at most 128 bytes).
 ///
@@ -197,7 +224,15 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
         if schema.is_none() {
             return Ok(false);
         }
-        Ok(self.read_str(KEY_WIFI_SSID)?.is_some())
+        // ESP-IDF erases a string key before rewriting it, so a failed write
+        // of an unfinished Wi-Fi replacement can leave the primary SSID absent;
+        // the backup then holds the committed one.
+        let ssid_key = if self.wifi_replacement_pending()? {
+            KEY_WIFI_SSID_OLD
+        } else {
+            KEY_WIFI_SSID
+        };
+        Ok(self.read_str(ssid_key)?.is_some())
     }
 
     /// Experimental: API may change before 1.0.
@@ -224,7 +259,8 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
     /// The key layout (ADR 014 §4) is unchanged from 0.6.x: the same keys
     /// are read in the same order, so a record written by 0.6.x firmware loads
     /// unchanged. An empty stored `ota_url` reads as
-    /// [`ProvisioningConfig::ota_url`] `== None`.
+    /// [`ProvisioningConfig::ota_url`] `== None`. The portal-fallback counter
+    /// keys are not read; see [`load_failure_counts`](Self::load_failure_counts).
     ///
     /// # Errors
     ///
@@ -243,8 +279,15 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
             None => SchemaProfile::LorawanFieldDevice,
         };
 
-        let wifi_ssid = self.read_capped(KEY_WIFI_SSID)?;
-        let wifi_password = self.read_capped(KEY_WIFI_PASS)?;
+        // An unfinished Wi-Fi replacement left the committed pair in the
+        // backups; the primary keys may hold half of the new pair.
+        let (ssid_key, pass_key) = if self.wifi_replacement_pending()? {
+            (KEY_WIFI_SSID_OLD, KEY_WIFI_PASS_OLD)
+        } else {
+            (KEY_WIFI_SSID, KEY_WIFI_PASS)
+        };
+        let wifi_ssid = self.read_capped(ssid_key)?;
+        let wifi_password = self.read_capped(pass_key)?;
         let ota_url = self.read_capped(KEY_OTA_URL)?;
         let device_name = self.read_capped(KEY_DEV_NAME)?;
 
@@ -328,6 +371,10 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
     /// [`is_provisioned`](Self::is_provisioned) returns `false`. SSID length and
     /// the profile are logged for diagnostics; secret *values* are never logged.
     ///
+    /// A commit clears the portal-fallback counters (best-effort, before the
+    /// `profile` and `schema_ver` writes): the counts described the previous
+    /// config.
+    ///
     /// # Errors
     ///
     /// Returns `Err` on a backend write error, an extras index longer than
@@ -391,6 +438,21 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
         }
 
         self.set_str(KEY_EXTRAS_IDX, &index)?;
+
+        // A full commit replaces the Wi-Fi pair too, so an unfinished Wi-Fi
+        // replacement must not shadow it afterwards; the journal stays until
+        // the new pair is written, so a failed commit never exposes the
+        // half-written pair of the earlier replacement.
+        self.kv
+            .remove(KEY_WIFI_PENDING)
+            .with_context(|| format!("failed to remove NVS key '{KEY_WIFI_PENDING}'"))?;
+
+        // Best-effort like the stale-extras cleanup: the new record is valid
+        // either way, and a leftover count is at worst one early fallback.
+        if let Err(e) = self.clear_failure_counts() {
+            log::warn!("failed to clear the portal-fallback counters: {e:#}");
+        }
+        self.remove_wifi_backup();
 
         // The `profile` discriminator is written before the `schema_ver` guard
         // so a torn write never reads as provisioned with an unknown profile
@@ -500,6 +562,140 @@ impl<K: ProvisioningKv> KvProvisioningStore<K> {
         }
 
         Ok(())
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Replaces only the Wi-Fi SSID and password of the stored record, for the
+    /// portal fallback; every other field stays as stored.
+    ///
+    /// The replacement is journaled: the committed pair is copied to backup
+    /// keys, a single-key marker is set, the new pair is written, and removing
+    /// the marker commits it.
+    /// While the marker is set, [`load`](Self::load) returns the backed-up
+    /// pair, so a failure at any step leaves the old record readable.
+    /// A retry after a failure keeps the backups of the first attempt.
+    /// On success the backups are removed and the failure counters cleared,
+    /// both best-effort, as in [`save`](Self::save).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no record is stored, or on a backend error; the
+    /// stored record then still reads as before the call.
+    pub fn save_wifi_credentials(&mut self, ssid: &str, password: &str) -> anyhow::Result<()> {
+        if !self.is_provisioned()? {
+            anyhow::bail!("no stored record to replace the Wi-Fi credentials of");
+        }
+        log::info!(
+            "Replacing the stored Wi-Fi credentials (ssid len={})",
+            ssid.len()
+        );
+
+        if !self.wifi_replacement_pending()? {
+            let old_ssid = self.read_str(KEY_WIFI_SSID)?.unwrap_or_default();
+            let old_pass = self.read_str(KEY_WIFI_PASS)?.unwrap_or_default();
+            self.set_str(KEY_WIFI_SSID_OLD, &old_ssid)?;
+            self.set_str(KEY_WIFI_PASS_OLD, &old_pass)?;
+            self.kv
+                .set_u8(KEY_WIFI_PENDING, 1)
+                .with_context(|| format!("failed to write NVS key '{KEY_WIFI_PENDING}'"))?;
+        }
+
+        self.set_str(KEY_WIFI_SSID, ssid)?;
+        self.set_str(KEY_WIFI_PASS, password)?;
+        self.kv
+            .remove(KEY_WIFI_PENDING)
+            .with_context(|| format!("failed to remove NVS key '{KEY_WIFI_PENDING}'"))?;
+
+        self.remove_wifi_backup();
+        if let Err(e) = self.clear_failure_counts() {
+            log::warn!("failed to clear the portal-fallback counters: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// `true` while a Wi-Fi replacement is unfinished (its marker is set).
+    fn wifi_replacement_pending(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .kv
+            .get_u8(KEY_WIFI_PENDING)
+            .with_context(|| format!("failed to read NVS key '{KEY_WIFI_PENDING}'"))?
+            .is_some())
+    }
+
+    /// Removes the Wi-Fi backup pair, best-effort: a leftover backup is
+    /// ignored without the marker, and `erase_all` removes it.
+    fn remove_wifi_backup(&mut self) {
+        for key in [KEY_WIFI_SSID_OLD, KEY_WIFI_PASS_OLD] {
+            if let Err(e) = self.kv.remove(key) {
+                log::warn!("failed to remove NVS key '{key}': {e:?}");
+            }
+        }
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Reads the portal-fallback counters; an absent key reads as `0`, so a
+    /// store without them (0.6.x, or freshly cleared) is
+    /// [`FailureCounts::ZERO`].
+    ///
+    /// The counters live beside the record, not in it: they are readable on an
+    /// unprovisioned store too.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a backend read error.
+    pub fn load_failure_counts(&self) -> anyhow::Result<FailureCounts> {
+        let read = |key: &str| {
+            self.kv
+                .get_u8(key)
+                .with_context(|| format!("failed to read NVS key '{key}'"))
+                .map(Option::unwrap_or_default)
+        };
+        Ok(FailureCounts {
+            credentials: read(KEY_FAIL_CRED)?,
+            network_absent: read(KEY_FAIL_NOAP)?,
+        })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Persists the portal-fallback counters, so they survive a power cycle.
+    ///
+    /// A zero counter is stored by removing its key, so a cleared store holds
+    /// the 0.6.x key set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a backend write or remove error.
+    pub fn save_failure_counts(&mut self, counts: FailureCounts) -> anyhow::Result<()> {
+        for (key, count) in [
+            (KEY_FAIL_CRED, counts.credentials),
+            (KEY_FAIL_NOAP, counts.network_absent),
+        ] {
+            if count == 0 {
+                self.kv
+                    .remove(key)
+                    .with_context(|| format!("failed to remove NVS key '{key}'"))?;
+            } else {
+                self.kv
+                    .set_u8(key, count)
+                    .with_context(|| format!("failed to write NVS key '{key}'"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Clears the portal-fallback counters: on a successful join and when the
+    /// fallback portal opens ([`save`](Self::save) clears them on a commit).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a backend remove error.
+    pub fn clear_failure_counts(&mut self) -> anyhow::Result<()> {
+        self.save_failure_counts(FailureCounts::ZERO)
     }
 
     /// Reads one string key into an owned `String`, or `None` if absent.
@@ -833,10 +1029,332 @@ mod tests {
         for key in ["lora_dev_eui", "lora_join_eui", "lora_app_key"] {
             kv.put_str(key, "70B3D57ED0000003");
         }
+        kv.put_u8("wifi_fail_cred", 3);
+        kv.put_u8("wifi_fail_noap", 7);
+        kv.put_str("wifi_ssid_old", "OldNet");
+        kv.put_str("wifi_pass_old", test_psk());
+        kv.put_u8("wifi_pending", 1);
         let mut store = KvProvisioningStore::new(kv);
         store.erase_all().unwrap();
         assert!(!store.is_provisioned().unwrap());
         let left: Vec<&String> = store.kv().map.keys().collect();
         assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// Every key fits the 15-byte NVS key limit.
+    #[test]
+    fn reserved_keys_fit_the_nvs_key_limit() {
+        for key in CANONICAL_KEYS
+            .iter()
+            .chain(&[KEY_SCHEMA_VER, KEY_EXTRAS_IDX])
+        {
+            assert!(key.len() <= 15, "{key}");
+        }
+    }
+
+    #[test]
+    fn record_without_counters_reads_zero_counts() {
+        let store = KvProvisioningStore::new(record_0_6_wifi_mqtt());
+        assert_eq!(store.load_failure_counts().unwrap(), FailureCounts::ZERO);
+        let empty = KvProvisioningStore::new(MemKv::default());
+        assert_eq!(empty.load_failure_counts().unwrap(), FailureCounts::ZERO);
+    }
+
+    #[test]
+    fn load_ignores_the_counter_keys() {
+        let plain = KvProvisioningStore::new(record_0_6_wifi_mqtt())
+            .load()
+            .unwrap();
+        let mut kv = record_0_6_wifi_mqtt();
+        kv.put_u8("wifi_fail_cred", 4);
+        kv.put_u8("wifi_fail_noap", 19);
+        let store = KvProvisioningStore::new(kv);
+        assert_eq!(store.load().unwrap(), plain);
+        assert!(store.is_provisioned().unwrap());
+    }
+
+    /// The counts survive a power cycle: a new store over the same backend
+    /// reads what the previous boot persisted.
+    #[test]
+    fn counts_round_trip_across_a_power_cycle() {
+        let mut store = KvProvisioningStore::new(record_0_6_wifi_mqtt());
+        let counts = FailureCounts {
+            credentials: 3,
+            network_absent: 17,
+        };
+        store.save_failure_counts(counts).unwrap();
+        assert!(store.kv().map.get("wifi_fail_cred") == Some(&Value::U8(3)));
+
+        let rebooted = KvProvisioningStore::new(store.kv);
+        assert_eq!(rebooted.load_failure_counts().unwrap(), counts);
+        assert!(rebooted.load().unwrap().is_some(), "record untouched");
+    }
+
+    #[test]
+    fn zero_counts_remove_their_keys() {
+        let mut store = KvProvisioningStore::new(record_0_6_wifi_mqtt());
+        store
+            .save_failure_counts(FailureCounts {
+                credentials: 2,
+                network_absent: 0,
+            })
+            .unwrap();
+        assert!(store.kv().map.contains_key("wifi_fail_cred"));
+        assert!(!store.kv().map.contains_key("wifi_fail_noap"));
+
+        store.clear_failure_counts().unwrap();
+        assert!(
+            store.kv().map == record_0_6_wifi_mqtt().map,
+            "0.6.x key set"
+        );
+        assert_eq!(store.load_failure_counts().unwrap(), FailureCounts::ZERO);
+    }
+
+    #[test]
+    fn commit_clears_the_counts() {
+        let mut store = KvProvisioningStore::new(record_0_6_wifi_mqtt());
+        store
+            .save_failure_counts(FailureCounts {
+                credentials: 4,
+                network_absent: 9,
+            })
+            .unwrap();
+        store.save(&mqtt_config(&[])).unwrap();
+        assert_eq!(store.load_failure_counts().unwrap(), FailureCounts::ZERO);
+        assert_eq!(
+            store.kv().writes.last().map(String::as_str),
+            Some("schema_ver")
+        );
+    }
+
+    /// Five boots with a mistyped password, each a fresh store over the same
+    /// backend as after a power cycle: the fifth opens the fallback portal,
+    /// which clears the counts and keeps the record.
+    #[test]
+    fn failed_boots_open_the_fallback_portal_and_keep_the_record() {
+        use crate::provisioning::{FallbackDecision, FallbackPolicy, FallbackReason};
+        use crate::wifi::{DisconnectReason, JoinAttempts};
+
+        let policy = FallbackPolicy::new();
+        let before = KvProvisioningStore::new(record_0_6_wifi_mqtt())
+            .load()
+            .unwrap();
+        let mut kv = record_0_6_wifi_mqtt();
+        let mut decisions = Vec::new();
+        for _ in 0..5 {
+            let mut store = KvProvisioningStore::new(kv);
+            let mut boot = JoinAttempts::new();
+            for code in [15, 15, 2] {
+                boot.record(DisconnectReason::from_code(code));
+            }
+            let step =
+                policy.record_failed_boot(store.load_failure_counts().unwrap(), boot.class());
+            store.save_failure_counts(step.counts).unwrap();
+            decisions.push(step.decision);
+            kv = store.kv;
+        }
+        assert!(decisions[..4]
+            .iter()
+            .all(|d| *d == FallbackDecision::CarryOn));
+        assert_eq!(
+            decisions[4],
+            FallbackDecision::FallbackPortal {
+                reason: FallbackReason::Credentials,
+                failures: 5
+            }
+        );
+        let store = KvProvisioningStore::new(kv);
+        assert_eq!(store.load_failure_counts().unwrap(), FailureCounts::ZERO);
+        assert_eq!(store.load().unwrap(), before, "counting never erases");
+    }
+
+    /// A write fault injected by [`FlakyKv`].
+    #[derive(Debug)]
+    struct WriteFault;
+
+    impl core::fmt::Display for WriteFault {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("injected write fault")
+        }
+    }
+
+    impl std::error::Error for WriteFault {}
+
+    /// A [`MemKv`] whose write number `fail_at` fails, counting `set_*` and
+    /// `remove` calls from one; `0` never fails.
+    /// A failing `set_str` erases the key first, as ESP-IDF's string writer
+    /// does; a failing `set_u8` or `remove` changes nothing.
+    struct FlakyKv {
+        inner: MemKv,
+        writes: usize,
+        fail_at: usize,
+    }
+
+    impl FlakyKv {
+        fn new(inner: MemKv, fail_at: usize) -> Self {
+            Self {
+                inner,
+                writes: 0,
+                fail_at,
+            }
+        }
+
+        fn write(&mut self) -> Result<(), WriteFault> {
+            self.writes += 1;
+            if self.writes == self.fail_at {
+                Err(WriteFault)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ProvisioningKv for FlakyKv {
+        type Error = WriteFault;
+
+        fn get_u8(&self, key: &str) -> Result<Option<u8>, Self::Error> {
+            Ok(self.inner.get_u8(key).unwrap())
+        }
+
+        fn set_u8(&mut self, key: &str, value: u8) -> Result<(), Self::Error> {
+            self.write()?;
+            self.inner.set_u8(key, value).unwrap();
+            Ok(())
+        }
+
+        fn get_str(&self, key: &str) -> Result<Option<String>, Self::Error> {
+            Ok(self.inner.get_str(key).unwrap())
+        }
+
+        fn set_str(&mut self, key: &str, value: &str) -> Result<(), Self::Error> {
+            if let Err(fault) = self.write() {
+                self.inner.remove(key).unwrap();
+                return Err(fault);
+            }
+            self.inner.set_str(key, value).unwrap();
+            Ok(())
+        }
+
+        fn remove(&mut self, key: &str) -> Result<(), Self::Error> {
+            self.write()?;
+            self.inner.remove(key).unwrap();
+            Ok(())
+        }
+    }
+
+    /// The journaled Wi-Fi replacement makes six writes that can fail it
+    /// (two backups, the marker, the new pair, the marker removal); a fault
+    /// at any of them leaves the old record readable, a fault in the
+    /// best-effort cleanup after them does not fail the replacement.
+    #[test]
+    fn a_failed_wifi_replacement_keeps_the_old_record() {
+        let before = KvProvisioningStore::new(record_0_6_wifi_mqtt())
+            .load()
+            .unwrap()
+            .unwrap();
+        let new_pass = format!("{}-new", test_psk());
+        for fail_at in 1..=12 {
+            let mut store = KvProvisioningStore::new(FlakyKv::new(record_0_6_wifi_mqtt(), fail_at));
+            let result = store.save_wifi_credentials("NewNet", &new_pass);
+            let after = store.load().unwrap().unwrap();
+            assert_eq!(result.is_err(), fail_at <= 6, "write {fail_at}");
+            if result.is_err() {
+                assert_eq!(after, before, "write {fail_at} changed the record");
+            } else {
+                assert_eq!(after.wifi_ssid(), "NewNet", "write {fail_at}");
+                assert_eq!(after.wifi_password(), new_pass, "write {fail_at}");
+                assert_eq!(after.mqtt(), before.mqtt(), "write {fail_at}");
+                assert_eq!(after.device_name(), before.device_name(), "write {fail_at}");
+            }
+        }
+    }
+
+    /// A retry after a failed replacement keeps the first attempt's backups
+    /// and, once it succeeds, leaves no journal key behind.
+    #[test]
+    fn a_wifi_replacement_retry_commits_and_cleans_up() {
+        let before = KvProvisioningStore::new(record_0_6_wifi_mqtt())
+            .load()
+            .unwrap()
+            .unwrap();
+        let mut store = KvProvisioningStore::new(FlakyKv::new(record_0_6_wifi_mqtt(), 5));
+        let half = format!("{}-half", test_psk());
+        assert!(store.save_wifi_credentials("HalfNet", &half).is_err());
+        assert_eq!(store.load().unwrap().unwrap(), before);
+
+        let new_pass = format!("{}-new", test_psk());
+        store.save_wifi_credentials("NewNet", &new_pass).unwrap();
+        let after = store.load().unwrap().unwrap();
+        assert_eq!(after.wifi_ssid(), "NewNet");
+        assert_eq!(after.wifi_password(), new_pass);
+        for key in ["wifi_ssid_old", "wifi_pass_old", "wifi_pending"] {
+            assert!(!store.kv.inner.map.contains_key(key), "{key} left behind");
+        }
+    }
+
+    /// A full commit after a failed Wi-Fi replacement is not shadowed by the
+    /// leftover journal.
+    #[test]
+    fn a_full_save_after_a_failed_wifi_replacement_wins() {
+        let mut store = KvProvisioningStore::new(FlakyKv::new(record_0_6_wifi_mqtt(), 5));
+        let half = format!("{}-half", test_psk());
+        assert!(store.save_wifi_credentials("HalfNet", &half).is_err());
+
+        let config = mqtt_config(&[]);
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap().unwrap(), config);
+        for key in ["wifi_ssid_old", "wifi_pass_old", "wifi_pending"] {
+            assert!(!store.kv.inner.map.contains_key(key), "{key} left behind");
+        }
+    }
+
+    /// A full commit that fails keeps the journal of an earlier failed
+    /// replacement, so the half-written pair stays hidden behind the backups.
+    /// Faults at the first four writes (the Wi-Fi pair, `ota_url`,
+    /// `dev_name`) leave a loadable record.
+    #[test]
+    fn a_failed_full_save_keeps_the_wifi_journal() {
+        let before = KvProvisioningStore::new(record_0_6_wifi_mqtt())
+            .load()
+            .unwrap()
+            .unwrap();
+        let mut store = KvProvisioningStore::new(FlakyKv::new(record_0_6_wifi_mqtt(), 5));
+        let half = format!("{}-half", test_psk());
+        assert!(store.save_wifi_credentials("HalfNet", &half).is_err());
+
+        for fail_in_save in 1..=4 {
+            let mut retry = KvProvisioningStore::new(FlakyKv::new(
+                MemKv {
+                    map: store.kv.inner.map.clone(),
+                    writes: Vec::new(),
+                },
+                fail_in_save,
+            ));
+            assert!(
+                retry.save(&mqtt_config(&[])).is_err(),
+                "write {fail_in_save}"
+            );
+            let after = retry.load().unwrap().unwrap();
+            assert_eq!(
+                after.wifi_ssid(),
+                before.wifi_ssid(),
+                "write {fail_in_save}"
+            );
+            assert_eq!(
+                after.wifi_password(),
+                before.wifi_password(),
+                "write {fail_in_save}"
+            );
+        }
+    }
+
+    /// Without a stored record there is nothing to keep, so the replacement
+    /// is refused and writes nothing.
+    #[test]
+    fn a_wifi_replacement_needs_a_stored_record() {
+        let mut store = KvProvisioningStore::new(MemKv::default());
+        let pass = format!("{}-new", test_psk());
+        assert!(store.save_wifi_credentials("NewNet", &pass).is_err());
+        assert!(store.kv.writes.is_empty());
     }
 }

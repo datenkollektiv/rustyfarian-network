@@ -36,6 +36,27 @@ pub enum SessionOutcome {
     TimedOut,
 }
 
+impl SessionOutcome {
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The outcome once the portal has shut down, from the waited outcome and
+    /// the session state read after the shutdown.
+    ///
+    /// A save or factory reset accepted just before the deadline can finish
+    /// while the server stops, after the wait already returned
+    /// [`TimedOut`](Self::TimedOut); the final state then decides, so a caller
+    /// is never told "no commit" for credentials that were stored.
+    /// Read `final_state` only after the server has stopped (no handler can
+    /// still run); any other waited outcome is kept.
+    pub fn settled(self, final_state: ProvisioningState) -> Self {
+        match (self, resolve_wait(final_state)) {
+            (Self::TimedOut, WaitResolution::Committed) => Self::Committed,
+            (Self::TimedOut, WaitResolution::FactoryReset) => Self::FactoryResetRequested,
+            (outcome, _) => outcome,
+        }
+    }
+}
+
 /// Shared session state behind an `Arc<Mutex<…>>` plus a [`Condvar`].
 struct StateInner {
     machine: PortalMachine,
@@ -594,6 +615,55 @@ mod tests {
         );
         assert!(session.wait_committed(Some(Duration::ZERO)).is_some());
         assert!(matches!(session.poll(save), PortalAction::Refused(_)));
+    }
+
+    /// A save accepted before the deadline and finished during shutdown
+    /// settles a timed-out wait as committed; a failed one stays timed out.
+    #[test]
+    fn a_save_finished_after_the_deadline_settles_as_committed() {
+        let save = PortalInput::Save {
+            nonce_ok: true,
+            form_valid: true,
+        };
+        let session = SessionState::new();
+        assert_eq!(session.poll(save), PortalAction::Persist);
+        let waited = session.wait_outcome(Some(Duration::ZERO));
+        assert_eq!(waited, SessionOutcome::TimedOut);
+        assert_eq!(
+            session.persist_done(Some(test_config())),
+            PortalAction::Committed
+        );
+        assert_eq!(waited.settled(session.current()), SessionOutcome::Committed);
+
+        let failed = SessionState::new();
+        assert_eq!(failed.poll(save), PortalAction::Persist);
+        let waited = failed.wait_outcome(Some(Duration::ZERO));
+        assert_eq!(failed.persist_done(None), PortalAction::PersistFailed);
+        assert_eq!(waited.settled(failed.current()), SessionOutcome::TimedOut);
+    }
+
+    /// A factory reset accepted at the deadline settles as requested, and a
+    /// waited outcome other than a timeout is kept.
+    #[test]
+    fn settled_reads_a_late_reset_and_keeps_terminal_outcomes() {
+        let session = SessionState::new();
+        let waited = session.wait_outcome(Some(Duration::ZERO));
+        assert_eq!(
+            session.poll(PortalInput::FactoryReset { nonce_ok: true }),
+            PortalAction::ResetAccepted
+        );
+        assert_eq!(
+            waited.settled(session.current()),
+            SessionOutcome::FactoryResetRequested
+        );
+        assert_eq!(
+            SessionOutcome::Committed.settled(ProvisioningState::AwaitingSubmission),
+            SessionOutcome::Committed
+        );
+        assert_eq!(
+            SessionOutcome::TimedOut.settled(ProvisioningState::AwaitingSubmission),
+            SessionOutcome::TimedOut
+        );
     }
 
     /// A bad nonce is forbidden without touching the session.

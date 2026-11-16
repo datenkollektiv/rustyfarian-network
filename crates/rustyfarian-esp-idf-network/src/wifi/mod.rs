@@ -95,7 +95,7 @@ use esp_idf_svc::wifi::{
     WifiEvent,
 };
 use juggler::wifi::lines::{Disconnected, NetworkReady};
-use juggler::wifi::{JoinedAp, LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
+use juggler::wifi::{JoinAttempts, JoinedAp, LinkEvent, LinkRadio, LinkSupervisor, NetworkLink};
 // Only the SoftAP path uses these; gate the import so a SoftAP-disabled build
 // (where `SoftApManager` is cfg'd out) does not warn on unused imports.
 #[cfg(esp_idf_esp_wifi_softap_support)]
@@ -107,12 +107,12 @@ use rgb::RGB8;
 // `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
 #[allow(deprecated)]
 pub use juggler::wifi::{
-    credentials_hint, reason_suggests_credentials, validate_ap_config, validate_password,
-    validate_ssid, wifi_disconnect_reason_name, ApConfig, ApSelection, ChannelSet, ConnectMode,
-    Country, CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState,
-    Regulatory, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
-    AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
-    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN, STATION_TX_POWER_DEFAULT,
+    validate_ap_config, validate_password, validate_ssid, ApConfig, ApSelection, ChannelSet,
+    ConnectMode, Country, CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine,
+    LinkState, Regulatory, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
+    AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+    POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
+    STATION_TX_POWER_DEFAULT,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -536,7 +536,7 @@ impl WiFiManager {
             Ok(ip_info) if !ip_info.ip.is_unspecified() => Some(ip_info.ip),
             Ok(_) => None,
             Err(e) => {
-                log::debug!("get_ip_info transient error: {}", e);
+                log::debug!("[wifi] get_ip_info transient error: {}", e);
                 None
             }
         }
@@ -671,6 +671,21 @@ impl WiFiManager {
         Ok(())
     }
 
+    /// The reasons of the failed attempts before this manager's first join, and
+    /// whether it has joined (association plus IP) since it started.
+    ///
+    /// Feeds the provisioning fallback's classifier; recording stops at the
+    /// first join, so a later outage is not a join failure.
+    #[cfg(all(
+        feature = "provisioning",
+        feature = "mqtt",
+        esp_idf_esp_wifi_softap_support
+    ))]
+    pub(crate) fn first_join(&self) -> (bool, JoinAttempts) {
+        let join = self.link.join_log.lock().unwrap_or_else(|e| e.into_inner());
+        (join.joined, join.attempts)
+    }
+
     /// Starts the radio and connects again with a fresh back-off.
     ///
     /// A no-op unless suspended; idempotent and safe right after
@@ -700,6 +715,25 @@ struct LinkWorker {
     _subscription: EspSystemSubscription<'static>,
     _ip_subscription: EspSystemSubscription<'static>,
     supervisor: LinkSupervisor<IdfRadio>,
+    /// The failed attempts before the first join, written by both subscriptions;
+    /// read only by the provisioning boot helper (`provisioning` + `mqtt`).
+    #[cfg_attr(
+        not(all(
+            feature = "provisioning",
+            feature = "mqtt",
+            esp_idf_esp_wifi_softap_support
+        )),
+        allow(dead_code)
+    )]
+    join_log: std::sync::Arc<std::sync::Mutex<JoinLog>>,
+}
+
+/// The disconnect reasons of the attempts before the first join; recording
+/// stops once the station has its IP.
+#[derive(Default)]
+struct JoinLog {
+    attempts: JoinAttempts,
+    joined: bool,
 }
 
 impl LinkWorker {
@@ -718,7 +752,9 @@ impl LinkWorker {
                 .stack_size(LINK_WORKER_STACK_SIZE),
         )
         .context("failed to spawn the Wi-Fi link worker")?;
+        let join_log = std::sync::Arc::new(std::sync::Mutex::new(JoinLog::default()));
         let events = supervisor.events();
+        let log_sink = join_log.clone();
         let subscription = sys_loop
             .subscribe::<WifiEvent, _>(move |event: WifiEvent<'_>| match event {
                 WifiEvent::StaConnected(_) => {
@@ -731,13 +767,13 @@ impl LinkWorker {
                     // The shared line names the reason and adds the credentials
                     // hint only for reasons that point at them, so a
                     // router deauth or our own suspend no longer blames them.
-                    log::warn!(
-                        "{}",
-                        Disconnected {
-                            reason: DisconnectReason(info.reason()),
-                            hint: ""
-                        }
-                    );
+                    let reason = DisconnectReason::from_code(info.reason());
+                    log::warn!("{}", Disconnected::new(reason));
+                    let mut join = log_sink.lock().unwrap_or_else(|e| e.into_inner());
+                    if !join.joined {
+                        join.attempts.record(reason);
+                    }
+                    drop(join);
                     events.send(LinkEvent::Disconnected);
                 }
                 _ => {}
@@ -748,6 +784,7 @@ impl LinkWorker {
         // interface counts; the handle is kept as an address because raw pointers
         // are not `Send`.
         let events = supervisor.events();
+        let log_sink = join_log.clone();
         let sta_netif = sta_netif as usize;
         let ip_subscription = sys_loop
             .subscribe::<IpEvent, _>(move |event: IpEvent<'_>| {
@@ -756,6 +793,7 @@ impl LinkWorker {
                 }
                 match event {
                     IpEvent::DhcpIpAssigned(assignment) => {
+                        log_sink.lock().unwrap_or_else(|e| e.into_inner()).joined = true;
                         log::info!(
                             "{}",
                             NetworkReady {
@@ -773,6 +811,7 @@ impl LinkWorker {
             _subscription: subscription,
             _ip_subscription: ip_subscription,
             supervisor,
+            join_log,
         })
     }
 }

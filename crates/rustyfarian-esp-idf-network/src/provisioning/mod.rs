@@ -70,14 +70,18 @@ pub use store::ProvisioningStore;
 
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
 pub use boot::{
-    run_wifi_mqtt_portal, BootConfig, PortalOutcome, WifiMqttBoot, WifiMqttLoadOutcome,
+    run_wifi_mqtt_fallback_portal, run_wifi_mqtt_portal, BootConfig, JoinOutcome, PortalOutcome,
+    WifiMqttBoot, WifiMqttLoadOutcome,
 };
 
 pub use juggler::provisioning::{
-    derive_device_name, derive_softap_ssid, gate_reentry, resolve_softap_ssid, DeviceName, Field,
-    FieldError, LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState,
-    ReentryGate, ReentryRequest, SchemaProfile, ValidationError,
+    derive_device_name, derive_softap_ssid, gate_reentry, resolve_softap_ssid, DeviceName,
+    FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, Field, FieldError, LoraFields,
+    MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryGate, ReentryRequest,
+    SchemaProfile, ValidationError, CREDENTIAL_THRESHOLD_DEFAULT, FALLBACK_PORTAL_WINDOW_DEFAULT,
+    NETWORK_ABSENT_THRESHOLD_DEFAULT,
 };
+pub use juggler::wifi::JoinFailure;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -201,6 +205,7 @@ pub struct ProvisioningBuilder<'a> {
     status_entries: Vec<(String, String)>,
     on_event: Option<Arc<dyn Fn(ProvisioningEvent) + Send + Sync + 'static>>,
     country: Country,
+    form: portal::PortalForm,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
@@ -213,7 +218,16 @@ impl<'a> ProvisioningBuilder<'a> {
             status_entries: Vec::new(),
             on_event: None,
             country: Country::WORLD,
+            form: portal::PortalForm::Full,
         }
+    }
+
+    /// Serves the Wi-Fi-only fallback form instead of the profile's full form
+    /// (see `run_wifi_mqtt_fallback_portal`).
+    #[cfg(feature = "mqtt")]
+    pub(crate) fn wifi_only(mut self) -> Self {
+        self.form = portal::PortalForm::WifiOnly;
+        self
     }
 
     /// Experimental: API may change before 1.0.
@@ -336,6 +350,7 @@ impl<'a> ProvisioningBuilder<'a> {
             status_entries,
             profile,
             defaults,
+            self.form,
         )?;
 
         let subscription = subscribe_ap_events(&sys_loop, on_event.clone())?;
@@ -398,6 +413,13 @@ impl ProvisioningSession {
     /// The current provisioning state.
     pub fn state(&self) -> ProvisioningState {
         self.state.current()
+    }
+
+    /// A handle to the shared state that outlives [`shutdown`](Self::shutdown),
+    /// so a runner can read the final state once the server has stopped.
+    #[cfg(all(feature = "provisioning", feature = "mqtt"))]
+    pub(crate) fn shared_state(&self) -> SharedState {
+        self.state.clone()
     }
 
     /// Experimental: API may change before 1.0.

@@ -13,6 +13,29 @@
 //! 2. [`run_wifi_mqtt_portal`] — start the SoftAP captive portal (consumes
 //!    the modem) and return a [`PortalOutcome`] when it terminates.
 //!
+//! # Portal fallback (opt-in)
+//!
+//! [`WifiMqttBoot::load_with_fallback`] adds the portal fallback after repeated
+//! failed Wi-Fi joins (`docs/features/wifi-portal-fallback-v1.md`):
+//!
+//! 1. The load reads the two failure counters from `rf_prov` and returns
+//!    [`WifiMqttLoadOutcome::FallbackPortal`] once one reached its
+//!    [`FallbackPolicy`] threshold; otherwise `Ready`, with a non-blocking
+//!    [`wifi_config`](WifiMqttBoot::wifi_config).
+//! 2. After `WiFiManager::new_without_led`, [`WifiMqttBoot::wait_for_join`]
+//!    waits one join window, classifies the boot's failed attempts from their
+//!    disconnect reasons, and updates the counters; it never fails, so a Wi-Fi
+//!    timeout never ends the boot.
+//!    The consumer either keeps running and calls it again until it returns
+//!    `Joined` (the link worker retries; only this call clears the counters
+//!    after a late join), or restarts so the next boot retries.
+//! 3. On `FallbackPortal` the consumer runs [`run_wifi_mqtt_fallback_portal`]:
+//!    a Wi-Fi-only form that keeps the stored record until a commit, clears the
+//!    counters when it opens, and closes after its window so the stored config
+//!    is retried.
+//!
+//! The counter path never erases and never restarts.
+//!
 //! The two calls are deliberately split so the modem is only claimed in the
 //! path that needs it.  The library never calls `restart()` or `erase()`; those
 //! remain caller decisions.
@@ -22,8 +45,8 @@
 
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
 mod inner {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use anyhow::Context as _;
 
@@ -33,15 +56,17 @@ mod inner {
 
     use juggler::mqtt::resolve_client_id;
     use juggler::provisioning::{
-        classify_wifi_mqtt, gate_reentry, portal_outcome, ClassifyError, ReentryGate,
-        ReentryRequest, WifiMqttClass,
+        classify_wifi_mqtt, gate_reentry, portal_outcome, ClassifyError, FailureCounts,
+        FallbackDecision, FallbackPolicy, FallbackReason, JoinRecorder, ReentryGate,
+        ReentryRequest, WifiMqttClass, FALLBACK_PORTAL_WINDOW_DEFAULT,
     };
     use juggler::provisioning::{ProvisioningConfig, SchemaProfile};
+    use juggler::wifi::JoinFailure;
 
     use crate::mqtt::MqttConfig;
     use crate::provisioning::store::ProvisioningStore;
     use crate::provisioning::{PortalConfig, ProvisioningBuilder, ProvisioningEvent};
-    use crate::wifi::WiFiConfig;
+    use crate::wifi::{WiFiConfig, WiFiManager, POLL_INTERVAL_MS};
 
     /// Experimental: API may change before 1.0.
     ///
@@ -73,6 +98,27 @@ mod inner {
     pub struct WifiMqttBoot {
         config: Box<ProvisioningConfig>,
         mqtt_client_id: String,
+        /// Set by [`load_with_fallback`](Self::load_with_fallback) only.
+        fallback: Option<FallbackJoin>,
+    }
+
+    /// The portal-fallback bookkeeping of a bundle loaded with
+    /// [`WifiMqttBoot::load_with_fallback`].
+    struct FallbackJoin {
+        nvs: EspDefaultNvsPartition,
+        recorder: Mutex<JoinRecorder>,
+    }
+
+    impl FallbackJoin {
+        /// Persists `counts`, best-effort: a failed write is logged and the boot
+        /// goes on, at worst one boot early or late to the fallback.
+        fn persist(&self, counts: FailureCounts) {
+            if let Err(e) = ProvisioningStore::open(self.nvs.clone())
+                .and_then(|mut s| s.save_failure_counts(counts))
+            {
+                log::warn!("Portal fallback: failed to save the failure counters: {e:#}");
+            }
+        }
     }
 
     impl std::fmt::Debug for WifiMqttBoot {
@@ -180,6 +226,157 @@ mod inner {
             }
         }
 
+        /// Experimental: API may change before 1.0.
+        ///
+        /// Like [`load_with_reentry`](Self::load_with_reentry), with the portal
+        /// fallback after repeated failed Wi-Fi joins (the opt-in for the
+        /// `WifiMqttDevice` profile).
+        ///
+        /// The re-entry hook runs first, exactly once, before the store is
+        /// opened, with the same outcomes; pass `|| ReentryRequest::None`
+        /// without a hook.
+        /// Then, for a `WifiMqttDevice` record only, the failure counters are
+        /// read and decided with `policy`:
+        ///
+        /// - a counter at its threshold returns
+        ///   [`WifiMqttLoadOutcome::FallbackPortal`]; the counters are kept
+        ///   until [`run_wifi_mqtt_fallback_portal`] opens;
+        /// - otherwise `Ready`, with a bundle whose
+        ///   [`wifi_config`](Self::wifi_config) connects non-blocking and whose
+        ///   [`wait_for_join`](Self::wait_for_join) updates the counters.
+        ///
+        /// `NotProvisioned` and `OtherProfile` are unchanged, and the counters
+        /// are not read for them.
+        /// A counter read error is logged and counts from zero, so it never
+        /// ends the boot.
+        /// The library never erases and never restarts.
+        ///
+        /// # Errors
+        ///
+        /// As [`load_with`](Self::load_with).
+        pub fn load_with_fallback(
+            nvs: EspDefaultNvsPartition,
+            policy: FallbackPolicy,
+            reentry: impl FnOnce() -> ReentryRequest,
+            client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
+        ) -> anyhow::Result<WifiMqttLoadOutcome> {
+            let store = match gate_reentry(reentry, || ProvisioningStore::open(nvs.clone()))? {
+                ReentryGate::Portal => return Ok(WifiMqttLoadOutcome::PortalRequested),
+                ReentryGate::FactoryReset => return Ok(WifiMqttLoadOutcome::FactoryResetRequested),
+                ReentryGate::Proceed(store) => store,
+            };
+            let mut boot = match Self::classify(&store, client_id_fn)? {
+                WifiMqttLoadOutcome::Ready(boot) => boot,
+                other => return Ok(other),
+            };
+            let counts = store.load_failure_counts().unwrap_or_else(|e| {
+                log::warn!("Portal fallback: failed to read the failure counters, counting from zero: {e:#}");
+                FailureCounts::ZERO
+            });
+            if let FallbackDecision::FallbackPortal { reason, failures } = policy.decide(counts) {
+                log::warn!(
+                    "Portal fallback: {failures} failed Wi-Fi boots ({}), fallback portal due",
+                    reason.as_str()
+                );
+                return Ok(WifiMqttLoadOutcome::FallbackPortal { reason, failures });
+            }
+            boot.fallback = Some(FallbackJoin {
+                nvs,
+                recorder: Mutex::new(JoinRecorder::new(policy, counts)),
+            });
+            Ok(WifiMqttLoadOutcome::Ready(boot))
+        }
+
+        /// Experimental: API may change before 1.0.
+        ///
+        /// Waits up to `window` for `wifi` to join (associated, with its IP)
+        /// and, for a bundle from [`load_with_fallback`](Self::load_with_fallback),
+        /// records the result in the failure counters.
+        ///
+        /// Call it right after `WiFiManager::new_without_led` with this
+        /// bundle's non-blocking [`wifi_config`](Self::wifi_config).
+        /// A join clears the counters.
+        /// With no join, the boot's failed attempts are classified from the
+        /// disconnect reasons the link worker saw before the first join
+        /// ([`JoinFailure`]) and the matching counter grows by one; a boot
+        /// counts at most once, however often this is called.
+        ///
+        /// It never fails and never ends the boot: a counter write error is
+        /// logged.
+        /// After `NotJoined` the link worker keeps retrying with its back-off.
+        /// A consumer that keeps running must call this again, with any
+        /// window, until it returns `Joined`: only this call clears the
+        /// counters, so a station that joins later with no further call keeps
+        /// its count, and enough such boots open the fallback portal on a
+        /// healthy network.
+        /// A consumer that restarts instead lets the next boot retry; each boot
+        /// counts once, so its restart cadence sets how soon a counter reaches
+        /// its threshold.
+        /// At the threshold the consumer restarts, and the next load returns
+        /// [`WifiMqttLoadOutcome::FallbackPortal`]: the station holds the modem,
+        /// so the portal cannot open in this boot.
+        ///
+        /// A bundle from the other loads records nothing and always reports
+        /// [`FallbackDecision::CarryOn`].
+        ///
+        /// Blocks the calling task, polling every
+        /// [`POLL_INTERVAL_MS`](crate::wifi::POLL_INTERVAL_MS).
+        /// A `WiFiManager` built with an LED waits blocking in its constructor
+        /// and returns `Err` on a timeout, so use `new_without_led` here and
+        /// drive the LED from the outcome.
+        pub fn wait_for_join(&self, wifi: &WiFiManager, window: Duration) -> JoinOutcome {
+            let start = Instant::now();
+            let attempts = loop {
+                let (joined, attempts) = wifi.first_join();
+                if joined || wifi.is_ready() {
+                    if let Some(fallback) = &self.fallback {
+                        let write = fallback
+                            .recorder
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .joined();
+                        if let Some(counts) = write {
+                            log::info!("Portal fallback: Wi-Fi joined, failure counters cleared");
+                            fallback.persist(counts);
+                        }
+                    }
+                    return JoinOutcome::Joined;
+                }
+                if start.elapsed() >= window {
+                    break attempts;
+                }
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            };
+
+            let class = attempts.class();
+            let decision = match &self.fallback {
+                Some(fallback) => {
+                    let mut recorder = fallback.recorder.lock().unwrap_or_else(|e| e.into_inner());
+                    let (write, decision) = recorder.not_joined(class);
+                    let counts = recorder.stored();
+                    let policy = recorder.policy();
+                    drop(recorder);
+                    if let Some(counts) = write {
+                        fallback.persist(counts);
+                    }
+                    log::warn!(
+                        "Portal fallback: no Wi-Fi join within {} s, {} failed attempt(s), class {}; \
+                         credentials {}/{}, network absent {}/{}",
+                        window.as_secs(),
+                        attempts.attempts(),
+                        class.as_str(),
+                        counts.credentials,
+                        policy.credential_threshold(),
+                        counts.network_absent,
+                        policy.network_absent_threshold(),
+                    );
+                    decision
+                }
+                None => FallbackDecision::CarryOn,
+            };
+            JoinOutcome::NotJoined { class, decision }
+        }
+
         fn classify(
             store: &ProvisioningStore,
             client_id_fn: impl FnOnce(&ProvisioningConfig) -> anyhow::Result<String>,
@@ -200,6 +397,7 @@ mod inner {
                     Ok(WifiMqttLoadOutcome::Ready(WifiMqttBoot {
                         config: Box::new(cfg),
                         mqtt_client_id: client_id,
+                        fallback: None,
                     }))
                 }
                 (WifiMqttClass::Ready(_), None) => {
@@ -217,6 +415,7 @@ mod inner {
             Self {
                 config: Box::new(config),
                 mqtt_client_id,
+                fallback: None,
             }
         }
 
@@ -245,8 +444,18 @@ mod inner {
         /// Experimental: API may change before 1.0.
         ///
         /// Returns a borrowed [`WiFiConfig`] backed by strings owned by this struct.
+        ///
+        /// For a bundle from [`load_with_fallback`](Self::load_with_fallback)
+        /// it connects non-blocking, the profile default with the fallback, so
+        /// [`wait_for_join`](Self::wait_for_join) sees every failed attempt;
+        /// otherwise it keeps the [`WiFiConfig::new`] default.
         pub fn wifi_config(&self) -> WiFiConfig<'_> {
-            WiFiConfig::new(self.config.wifi_ssid(), self.config.wifi_password())
+            let config = WiFiConfig::new(self.config.wifi_ssid(), self.config.wifi_password());
+            if self.fallback.is_some() {
+                config.connect_nonblocking()
+            } else {
+                config
+            }
         }
 
         /// Experimental: API may change before 1.0.
@@ -293,7 +502,7 @@ mod inner {
     /// Experimental: API may change before 1.0.
     ///
     /// The outcome of [`WifiMqttBoot::load`] / [`WifiMqttBoot::load_with`] /
-    /// [`WifiMqttBoot::load_with_reentry`].
+    /// [`WifiMqttBoot::load_with_reentry`] / [`WifiMqttBoot::load_with_fallback`].
     ///
     /// `Debug` output for the `Ready` variant redacts credential fields via
     /// [`WifiMqttBoot`]'s manual `Debug` impl.
@@ -317,6 +526,49 @@ mod inner {
         /// erases.  The consumer erases (via [`ProvisioningStore::erase_all`])
         /// and then decides whether to run the portal or restart.
         FactoryResetRequested,
+        /// A failure counter reached its [`FallbackPolicy`] threshold
+        /// ([`WifiMqttBoot::load_with_fallback`] only).
+        ///
+        /// The stored record is kept and nothing was erased.  The consumer runs
+        /// [`run_wifi_mqtt_fallback_portal`], which clears the counters when it
+        /// opens, then restarts; or it carries on.
+        ///
+        /// A consumer may ignore this outcome, for example while an OTA image
+        /// is pending verification (the library cannot know the OTA state):
+        /// loading again with a policy whose thresholds are both `0` returns
+        /// `Ready` with the counters still tracked, so a join clears them and
+        /// the next boot decides afresh.
+        FallbackPortal {
+            /// The counter that reached its threshold.
+            reason: FallbackReason,
+            /// Its value, the failed boots that led here.
+            failures: u8,
+        },
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The result of [`WifiMqttBoot::wait_for_join`].
+    #[non_exhaustive]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JoinOutcome {
+        /// The station joined within the window; the failure counters are
+        /// cleared.
+        Joined,
+        /// No join within the window; the link worker keeps retrying.
+        ///
+        /// Call [`WifiMqttBoot::wait_for_join`] again until it returns
+        /// `Joined`, so a late join clears the counters, or restart.
+        NotJoined {
+            /// The class of this boot's failed attempts.
+            class: JoinFailure,
+            /// [`FallbackDecision::FallbackPortal`] once a counter reached its
+            /// threshold: restart, and the next load returns
+            /// [`WifiMqttLoadOutcome::FallbackPortal`].
+            /// [`FallbackDecision::CarryOn`] below every threshold, and always
+            /// for a bundle loaded without the fallback.
+            decision: FallbackDecision,
+        },
     }
 
     /// Experimental: API may change before 1.0.
@@ -334,6 +586,10 @@ mod inner {
         pub portal: PortalConfig<'a>,
         /// Optional wall-clock timeout for the portal.  `None` blocks until a
         /// terminal event (commit or factory-reset).
+        ///
+        /// For [`run_wifi_mqtt_fallback_portal`] this is the fallback window,
+        /// and `None` means [`FALLBACK_PORTAL_WINDOW_DEFAULT`] (10 min): the
+        /// fallback portal always closes so the stored config is retried.
         pub portal_timeout: Option<Duration>,
         /// Optional lifecycle-event callback, shared with the portal httpd task.
         ///
@@ -394,10 +650,94 @@ mod inner {
             .context("failed to start provisioning portal")?;
 
         let outcome = session.wait_outcome(config.portal_timeout);
+        // Stopping the server waits for a request still being handled, so a
+        // save or reset accepted at the deadline has finished once `shutdown`
+        // returns; the final state then settles the outcome.
+        let state = session.shared_state();
+        let shutdown = session.shutdown();
+        let outcome = outcome.settled(state.current());
         // Commit-durability rule (in `portal_outcome`): a shutdown error after
         // a commit is logged and `JustProvisioned` returned; on every other
         // outcome it is propagated.
-        portal_outcome(outcome, session.shutdown()).context("portal shutdown failed")
+        portal_outcome(outcome, shutdown).context("portal shutdown failed")
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Runs the fallback portal after [`WifiMqttLoadOutcome::FallbackPortal`]:
+    /// the SoftAP captive portal with a Wi-Fi-only form.
+    ///
+    /// - The form offers only the Wi-Fi SSID, prefilled from the stored
+    ///   record, and the password, never prefilled; the MQTT broker, OTA URL,
+    ///   device name and extras stay as stored, and no factory reset is
+    ///   offered, so an open fallback portal cannot change the broker.
+    /// - The stored record is kept until a commit replaces its Wi-Fi fields,
+    ///   so an aborted or timed-out portal changes nothing.
+    /// - The failure counters are cleared just before the portal starts, so
+    ///   after a timeout, or a portal that failed to start, the stored config
+    ///   is retried for a full streak.
+    /// - It closes after `config.portal_timeout`, or
+    ///   [`FALLBACK_PORTAL_WINDOW_DEFAULT`] when `None`, and returns
+    ///   [`PortalOutcome::PortalExitedWithoutCommit`]; restart to retry the
+    ///   stored config.
+    ///
+    /// `config.portal.profile` must be [`SchemaProfile::WifiMqttDevice`]; its
+    /// `defaults` are not used.
+    /// The library emits no LED signal of its own: the consumer knows it called
+    /// the fallback runner and can show a state distinct from first-boot
+    /// provisioning, for example from `config.on_event`.
+    ///
+    /// The shutdown rules, the library contract (no `restart()`, no erase) and
+    /// the stack budget are those of [`run_wifi_mqtt_portal`].
+    ///
+    /// # Errors
+    ///
+    /// As [`run_wifi_mqtt_portal`], and when the profile is not
+    /// `WifiMqttDevice` or no `WifiMqttDevice` record is stored.
+    pub fn run_wifi_mqtt_fallback_portal(
+        modem: Modem<'static>,
+        sys_loop: EspSystemEventLoop,
+        nvs: EspDefaultNvsPartition,
+        config: BootConfig<'_>,
+    ) -> anyhow::Result<PortalOutcome> {
+        if config.portal.profile != SchemaProfile::WifiMqttDevice {
+            anyhow::bail!("the fallback portal serves only the WifiMqttDevice profile");
+        }
+        let mut store = ProvisioningStore::open(nvs.clone())?;
+        let has_record = store
+            .load()?
+            .is_some_and(|stored| stored.profile() == SchemaProfile::WifiMqttDevice);
+        if !has_record {
+            anyhow::bail!("no stored WifiMqttDevice record for the fallback portal to keep");
+        }
+
+        // Cleared before the start: a timed-out portal retries the stored
+        // config for a full streak instead of reopening at once, and a portal
+        // that fails to start does the same instead of failing on every boot.
+        match store.clear_failure_counts() {
+            Ok(()) => log::info!("Portal fallback: opening the portal, failure counters cleared"),
+            Err(e) => log::warn!("Portal fallback: failed to clear the failure counters: {e:#}"),
+        }
+        drop(store);
+
+        let mut builder = ProvisioningBuilder::new(config.portal).wifi_only();
+        if let Some(on_event) = config.on_event {
+            builder = builder.on_event(move |e| on_event(e));
+        }
+        let session = builder
+            .start(modem, sys_loop, nvs)
+            .context("failed to start the fallback portal")?;
+
+        let window = config
+            .portal_timeout
+            .unwrap_or(FALLBACK_PORTAL_WINDOW_DEFAULT);
+        let outcome = session.wait_outcome(Some(window));
+        // As in `run_wifi_mqtt_portal`: a save accepted at the deadline has
+        // finished once `shutdown` returns, and the final state decides.
+        let state = session.shared_state();
+        let shutdown = session.shutdown();
+        let outcome = outcome.settled(state.current());
+        portal_outcome(outcome, shutdown).context("portal shutdown failed")
     }
 }
 
@@ -431,5 +771,6 @@ mod tests {
 // callers see them directly under `crate::provisioning::boot::*`.
 #[cfg(all(feature = "provisioning", feature = "mqtt"))]
 pub use inner::{
-    run_wifi_mqtt_portal, BootConfig, PortalOutcome, WifiMqttBoot, WifiMqttLoadOutcome,
+    run_wifi_mqtt_fallback_portal, run_wifi_mqtt_portal, BootConfig, JoinOutcome, PortalOutcome,
+    WifiMqttBoot, WifiMqttLoadOutcome,
 };
