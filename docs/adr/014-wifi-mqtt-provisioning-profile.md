@@ -213,6 +213,33 @@ The IDF tier now loads the stored record as `juggler::provisioning::Provisioning
 The NVS key layout in §4 is unchanged, and records written by 0.6.x firmware load unchanged.
 See `docs/features/archive/provisioning-boot-identity-v1.md`.
 
+## Amendment 2026-11-16 — reserved portal-fallback counter keys in `rf_prov`
+
+Two library-owned keys join the reserved canonical set in `rf_prov`: `wifi_fail_cred` counts credential failures and `wifi_fail_noap` counts network-absent failures.
+Each holds a `u8` written with `set_u8` and read with `get_u8`, and the count saturates at 255.
+A zero count is stored by removing its key, so a store without recorded failures has the key set of schema v2 as before.
+`load` never reads the two keys, so the layout and read order in §4 are unchanged.
+`save` (a commit) clears both keys best-effort, before the `profile` and `schema_ver` writes, so the commit-guard order from §4 is preserved.
+`erase_all` removes both keys together with the record.
+Records written by 0.6.x firmware have no counter keys and read as zero counts.
+0.6.x firmware ignores the keys, so a downgrade boots the stored record.
+The counters are advisory: they decide when the fallback portal opens and never erase or change the record (see `docs/features/wifi-portal-fallback-v1.md`).
+
+## Amendment 2026-11-17 — journal keys for the Wi-Fi replacement in `rf_prov`
+
+Three library-owned keys join the reserved canonical set in `rf_prov` for the fallback portal's Wi-Fi-only commit: `wifi_ssid_old` and `wifi_pass_old` hold the committed SSID and password backed up before a replacement, and `wifi_pending` is a `u8` marker that is set while a replacement is unfinished.
+`KvProvisioningStore::save_wifi_credentials` copies the committed pair to the backups (`set_str`), sets the marker (`set_u8`), writes the new `wifi_ssid` and `wifi_pass` pair, and then removes the marker, which is the commit point.
+The backups are removed and the counters cleared afterwards, both best-effort.
+While `wifi_pending` is set, `is_provisioned` checks `wifi_ssid_old` and `load` reads the Wi-Fi pair from the backup keys, so a failure at any step leaves the old record readable; without the marker, both read the primary keys as before and ignore leftover backups.
+ESP-IDF's `EspNvs::set_str` (esp-idf-svc 0.53) erases the key before writing it, so a failed string write leaves the key absent rather than unchanged, which is why `is_provisioned` also honours the journal.
+A retry after a failed replacement keeps the backups of the first attempt.
+`save` (a full commit) keeps `wifi_pending` until its value writes (the Wi-Fi pair, OTA URL, device name, profile group, extras and their index) have succeeded and removes it just before the `profile` and `schema_ver` writes, so a failed full commit never exposes the half-written pair of an earlier failed replacement, and a successful one is never shadowed; it removes the backups best-effort.
+`erase_all` removes all three keys.
+`save_wifi_credentials` returns `Err` and writes nothing when no record is stored.
+The primary key layout and read order in §4 are unchanged.
+0.6.x firmware ignores the three keys and reads the primary pair, so a downgrade during an unfinished replacement boots the primary pair, which may be half-written.
+A 0.6.x commit does not clear `wifi_pending`, so an upgrade back reads the backup pair until this firmware's next `save` or `save_wifi_credentials` clears the marker.
+
 ## References
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; locks the four-field schema and the extras escape hatch this ADR builds on and generalises.

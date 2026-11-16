@@ -41,8 +41,7 @@
 // `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
 #[allow(deprecated)]
 pub use juggler::wifi::{
-    credentials_hint, reason_suggests_credentials, validate_password, validate_ssid,
-    wifi_disconnect_reason_name, ApConfig, ApSelection, ChannelSet, ConnectMode, Country,
+    validate_password, validate_ssid, ApConfig, ApSelection, ChannelSet, ConnectMode, Country,
     CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine, LinkState, Regulatory,
     TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
     POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,

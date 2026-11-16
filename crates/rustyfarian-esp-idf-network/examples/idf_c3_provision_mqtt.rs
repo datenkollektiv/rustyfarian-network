@@ -2,9 +2,10 @@
 //! Wi-Fi + MQTT profile.
 //!
 //! Demonstrates the [`SchemaProfile::WifiMqttDevice`] host contract using the
-//! `WifiMqttBoot` helper and the provisioning re-entry hook:
+//! `WifiMqttBoot` helper, the provisioning re-entry hook and the opt-in portal
+//! fallback after repeated failed Wi-Fi joins:
 //!
-//! 1. [`WifiMqttBoot::load_with_reentry`] first asks the re-entry hook, which
+//! 1. [`WifiMqttBoot::load_with_fallback`] first asks the re-entry hook, which
 //!    samples the BOOT button (GPIO9, active low).
 //!    Button up: the hook answers [`ReentryRequest::None`] at once, and the
 //!    NVS store is read as with `WifiMqttBoot::load`.
@@ -24,12 +25,26 @@
 //!    [`run_wifi_mqtt_portal`] starts the SoftAP captive portal and blocks
 //!    until a submission is committed, the portal's factory-reset button is
 //!    pressed, or the portal times out.
+//!    After 5 boots whose join failed on the credentials (20 with the network
+//!    absent), the load returns [`WifiMqttLoadOutcome::FallbackPortal`] and
+//!    [`run_wifi_mqtt_fallback_portal`] runs instead: a Wi-Fi-only form that
+//!    keeps the stored broker and closes after 10 min.
 //! 3. On every portal exit the indicator thread is cancelled and joined BEFORE
 //!    calling `restart()` — this guarantees no WS2812 SPI/RMT transfer is
 //!    left mid-frame when the device reboots.
 //!    On `FactoryResetRequested` the NVS provisioning namespace is erased (via
 //!    [`ProvisioningStore::erase_all`]) after the join, then the device restarts
 //!    so it re-enters the portal on the next boot.
+//!
+//! 4. Provisioned: the station connects non-blocking and
+//!    [`WifiMqttBoot::wait_for_join`] waits one join window; a failed boot is
+//!    counted once.
+//!    A credential failure restarts at once, so a mistyped password reaches
+//!    the fallback portal in a few minutes without anyone touching the board.
+//!    Any other failure keeps the boot up while the link worker retries, for a
+//!    stay that doubles with each network-absent boot (see [`retry_stay`]), and
+//!    waits on with a second `wait_for_join`, so a late join clears the
+//!    counters and a router off overnight does not open the access point.
 //!
 //! The library never reboots or erases on its own: the hook's answer is only
 //! reported as an outcome.  Every `esp_idf_svc::hal::reset::restart()` call
@@ -68,10 +83,12 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 use rustyfarian_esp_idf_network::provisioning::{
-    run_wifi_mqtt_portal, BootConfig, DeviceName, PortalConfig, PortalDefaults, PortalOutcome,
+    run_wifi_mqtt_fallback_portal, run_wifi_mqtt_portal, BootConfig, DeviceName, FallbackDecision,
+    FallbackPolicy, JoinFailure, JoinOutcome, PortalConfig, PortalDefaults, PortalOutcome,
     ProvisioningEvent, ProvisioningStore, ReentryRequest, SchemaProfile, WifiMqttBoot,
     WifiMqttLoadOutcome,
 };
+use rustyfarian_esp_idf_network::wifi::{WiFiManager, DEFAULT_TIMEOUT_SECS};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{InputPin, PinDriver, Pull};
@@ -95,6 +112,27 @@ const BOOT_DEBOUNCE_MS: u64 = 20;
 /// C3 (bench 2026-11-08), as rgb-clock found on esp-hal; a person needs about
 /// 2 s after a visible prompt.
 const BOOT_WINDOW_MS: u64 = 2000;
+
+/// The longest a boot whose join failed stays up before it restarts.
+const RETRY_STAY_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How long a boot whose first join window failed stays up, the link worker
+/// retrying with its back-off, before it restarts: the join `window` doubled
+/// per counted network-absent boot, capped at [`RETRY_STAY_MAX`].
+///
+/// A boot counts at most once, so this cadence sets how soon the network-absent
+/// counter reaches its threshold: about 14 h to the default 20 with a 30 s
+/// window, longer than a router switched off overnight.
+/// A counter read error stays the shortest time.
+fn retry_stay(nvs: &EspDefaultNvsPartition, window: Duration) -> Duration {
+    let absent = ProvisioningStore::open(nvs.clone())
+        .and_then(|store| store.load_failure_counts())
+        .map(|counts| counts.network_absent)
+        .unwrap_or(0);
+    window
+        .saturating_mul(1u32 << absent.min(16))
+        .min(RETRY_STAY_MAX)
+}
 
 /// The re-entry hook: watches the BOOT button (GPIO9, active low) for
 /// [`BOOT_WINDOW_MS`] after boot.
@@ -177,8 +215,11 @@ fn main() -> anyhow::Result<()> {
         BOOT_WINDOW_MS,
         BOOT_HOLD_MS
     );
-    let loaded = WifiMqttBoot::load_with_reentry(
+    // The portal fallback is opt-in: the default policy opens it after 5
+    // credential failures or 20 network-absent boots.
+    let loaded = WifiMqttBoot::load_with_fallback(
         nvs.clone(),
+        FallbackPolicy::new(),
         || boot_button_reentry(gpio9),
         WifiMqttBoot::default_client_id,
     )?;
@@ -188,8 +229,18 @@ fn main() -> anyhow::Result<()> {
 
         reason @ (WifiMqttLoadOutcome::NotProvisioned
         | WifiMqttLoadOutcome::PortalRequested
-        | WifiMqttLoadOutcome::FactoryResetRequested) => {
+        | WifiMqttLoadOutcome::FactoryResetRequested
+        | WifiMqttLoadOutcome::FallbackPortal { .. }) => {
+            let fallback = matches!(reason, WifiMqttLoadOutcome::FallbackPortal { .. });
             match reason {
+                WifiMqttLoadOutcome::FallbackPortal { reason, failures } => {
+                    // A consumer with an OTA image pending verification may
+                    // skip the fallback here and load again instead.
+                    log::warn!(
+                        "Wi-Fi failed on {failures} boots ({}) — opening the Wi-Fi-only fallback portal.",
+                        reason.as_str()
+                    );
+                }
                 WifiMqttLoadOutcome::PortalRequested => {
                     log::info!("Re-entry: portal requested — keeping the stored record.");
                 }
@@ -283,7 +334,11 @@ fn main() -> anyhow::Result<()> {
             // Capture the Result WITHOUT `?` so the cleanup below runs even on
             // an operational error — an early return here would orphan the
             // indicator thread, leaving it running indefinitely.
-            let result = run_wifi_mqtt_portal(peripherals.modem, sys_loop, nvs, boot_config);
+            let result = if fallback {
+                run_wifi_mqtt_fallback_portal(peripherals.modem, sys_loop, nvs, boot_config)
+            } else {
+                run_wifi_mqtt_portal(peripherals.modem, sys_loop, nvs, boot_config)
+            };
 
             // ── Step 4: cancel + join before restart (and before propagating) ─
             //
@@ -385,8 +440,48 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
-    log::info!("A real application would now proceed to normal STA + MQTT boot.");
-    // WiFiManager::new_without_led(modem, sys_loop, Some(nvs), wifi_cfg)?;
+    // `wifi_cfg` connects non-blocking (the fallback default), so the
+    // constructor returns at once and `wait_for_join` sees every failed attempt.
+    let nvs_for_counts = nvs.clone();
+    let wifi = WiFiManager::new_without_led(peripherals.modem, sys_loop, Some(nvs), wifi_cfg)?;
+    // Never `?` a Wi-Fi timeout.  A boot counts once, however often
+    // `wait_for_join` runs, and only a call that returns `Joined` clears the
+    // counters, so a boot that stays up waits on with a second call.
+    let mut window = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+    let mut waited_on = false;
+    loop {
+        match boot.wait_for_join(&wifi, window) {
+            JoinOutcome::Joined => {
+                log::info!("Wi-Fi joined.");
+                break;
+            }
+            JoinOutcome::NotJoined {
+                class,
+                decision: FallbackDecision::CarryOn,
+            } if !waited_on && class != JoinFailure::Credentials => {
+                window = retry_stay(&nvs_for_counts, window);
+                waited_on = true;
+                log::warn!(
+                    "Wi-Fi did not join ({}) — the link keeps retrying for up to {} s before a restart.",
+                    class.as_str(),
+                    window.as_secs()
+                );
+            }
+            JoinOutcome::NotJoined { class, decision } => {
+                // A restart lets the next boot retry, or open the fallback
+                // portal once a counter reached its threshold.
+                log::warn!(
+                    "Wi-Fi did not join ({}, {decision:?}) — restarting.",
+                    class.as_str()
+                );
+                esp_idf_svc::hal::reset::restart();
+            }
+            // `#[non_exhaustive]` requires a wildcard arm.
+            _ => esp_idf_svc::hal::reset::restart(),
+        }
+    }
+
+    log::info!("A real application would now proceed to MQTT boot.");
     // MqttBuilder::new(mqtt_cfg).build()?;
 
     Ok(())

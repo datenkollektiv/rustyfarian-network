@@ -20,7 +20,9 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 
 use juggler::provisioning::kv_store::NVS_NAMESPACE;
-use juggler::provisioning::{KvProvisioningStore, ProvisioningConfig, ProvisioningKv};
+use juggler::provisioning::{
+    FailureCounts, KvProvisioningStore, ProvisioningConfig, ProvisioningKv,
+};
 
 /// Stack buffer size for a single `get_str` read.
 ///
@@ -118,9 +120,19 @@ impl ProvisioningStore {
     /// Experimental: API may change before 1.0.
     ///
     /// Writes a validated configuration to NVS in one logical commit, the
-    /// `schema_ver` guard last. See [`KvProvisioningStore::save`].
+    /// `schema_ver` guard last, and clears the portal-fallback counters.
+    /// See [`KvProvisioningStore::save`].
     pub fn save(&mut self, config: &ProvisioningConfig) -> anyhow::Result<()> {
         self.inner.save(config)
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Replaces only the Wi-Fi SSID and password, journaled so a failure
+    /// leaves the old record readable; used by the fallback portal.
+    /// See [`KvProvisioningStore::save_wifi_credentials`].
+    pub fn save_wifi_credentials(&mut self, ssid: &str, password: &str) -> anyhow::Result<()> {
+        self.inner.save_wifi_credentials(ssid, password)
     }
 
     /// Experimental: API may change before 1.0.
@@ -130,5 +142,30 @@ impl ProvisioningStore {
     /// See [`KvProvisioningStore::erase_all`].
     pub fn erase_all(&mut self) -> anyhow::Result<()> {
         self.inner.erase_all()
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Reads the portal-fallback counters from their reserved keys; absent keys
+    /// (a 0.6.x record, or a cleared store) read as zero.
+    /// See [`KvProvisioningStore::load_failure_counts`].
+    pub fn load_failure_counts(&self) -> anyhow::Result<FailureCounts> {
+        self.inner.load_failure_counts()
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Writes the portal-fallback counters; a zero counter removes its key.
+    /// See [`KvProvisioningStore::save_failure_counts`].
+    pub fn save_failure_counts(&mut self, counts: FailureCounts) -> anyhow::Result<()> {
+        self.inner.save_failure_counts(counts)
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Clears the portal-fallback counters; the stored record is untouched.
+    /// See [`KvProvisioningStore::clear_failure_counts`].
+    pub fn clear_failure_counts(&mut self) -> anyhow::Result<()> {
+        self.inner.clear_failure_counts()
     }
 }

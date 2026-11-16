@@ -10,7 +10,7 @@
 use core::fmt::{self, Debug, Display};
 use core::net::Ipv4Addr;
 
-use super::{JoinedAp, Regulatory};
+use super::{DisconnectReason, JoinedAp, Regulatory, CREDENTIALS_HINT};
 
 /// The station associated: `[wifi] link up #3` (plus ` (adopted)` for a link the
 /// supervisor found already up when it started, and ` — bssid …, ch N, rssi -NN dBm`
@@ -56,14 +56,28 @@ impl Display for NetworkReady {
 
 /// The link dropped: `[wifi] disconnected — <reason><hint>`.
 ///
-/// The reason text is the tier's own (ESP-IDF numeric `reason 8 (ASSOC_LEAVE)`,
-/// esp-radio's enum name); the hint is the shared [`CREDENTIALS_HINT`](super::CREDENTIALS_HINT)
-/// or empty.
+/// Both tiers build it from a [`DisconnectReason`] with [`Disconnected::new`]:
+/// `[wifi] disconnected — reason 8 (ASSOC_LEAVE)`, plus [`CREDENTIALS_HINT`] only
+/// where the reason points at the credentials.
+/// A driver error that carries no reason renders through [`ByDebug`] with no hint.
 pub struct Disconnected<R> {
     /// What the driver reported.
     pub reason: R,
-    /// `""` or [`CREDENTIALS_HINT`](super::CREDENTIALS_HINT).
+    /// `""` or [`CREDENTIALS_HINT`].
     pub hint: &'static str,
+}
+
+impl Disconnected<DisconnectReason> {
+    /// The line for a reason, with [`CREDENTIALS_HINT`] where
+    /// [`DisconnectReason::suggests_credentials`] holds.
+    pub fn new(reason: DisconnectReason) -> Self {
+        let hint = if reason.suggests_credentials() {
+            CREDENTIALS_HINT
+        } else {
+            ""
+        };
+        Self { reason, hint }
+    }
 }
 
 impl<R: Display> Display for Disconnected<R> {
@@ -138,7 +152,6 @@ impl Display for CountryApplied {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wifi::{credentials_hint, DisconnectReason};
 
     #[test]
     fn link_up_text_is_pinned() {
@@ -176,24 +189,38 @@ mod tests {
     #[test]
     fn disconnected_text_is_pinned() {
         assert_eq!(
+            alloc::format!("{}", Disconnected::new(DisconnectReason::from_code(8))),
+            "[wifi] disconnected — reason 8 (ASSOC_LEAVE)"
+        );
+        assert_eq!(
+            alloc::format!("{}", Disconnected::new(DisconnectReason::from_code(3))),
+            "[wifi] disconnected — reason 3 (AUTH_LEAVE)",
+            "a router deauth must not blame the credentials"
+        );
+        assert_eq!(
+            alloc::format!("{}", Disconnected::new(DisconnectReason::from_code(202))),
+            "[wifi] disconnected — reason 202 (AUTH_FAIL) — check SSID/password and network availability"
+        );
+        assert_eq!(
+            alloc::format!("{}", Disconnected::new(DisconnectReason::from_code(77))),
+            "[wifi] disconnected — reason 77 (unmapped)"
+        );
+        assert_eq!(
             alloc::format!(
                 "{}",
-                Disconnected {
-                    reason: DisconnectReason(8),
-                    hint: ""
-                }
+                Disconnected::new(DisconnectReason::Unspecified { code: None })
             ),
-            "[wifi] disconnected — reason 8 (ASSOC_LEAVE)"
+            "[wifi] disconnected — reason ? (UNSPECIFIED)"
         );
         assert_eq!(
             alloc::format!(
                 "{}",
                 Disconnected {
                     reason: ByDebug(Some(1)),
-                    hint: credentials_hint(202)
+                    hint: ""
                 }
             ),
-            "[wifi] disconnected — Some(1) — check SSID/password and network availability"
+            "[wifi] disconnected — Some(1)"
         );
     }
 

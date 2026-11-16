@@ -25,16 +25,17 @@ desk-work: available
 - ADR 021 holds: neither tier selects a console, executor or provider.
 
 ## Open Questions
-- [ ] Does `Unspecified` cover esp-radio's catch-all, or does it need a distinct `Other`?
-- [ ] Should the enum own `Display` (the whole log line, hint included) or do the tiers format?
-- [ ] Can the hal mapping be host-tested by mirroring the variants, or is review enough?
-- [ ] Do the existing `reason_suggests_credentials` / `credentials_hint` stay public after folding?
+- [x] Does `Unspecified` cover esp-radio's catch-all, or does it need a distinct `Other`? (`Unspecified` covers it, with no `Other`: `Unspecified { code: Option<u16> }` carries `Some(1)` on ESP-IDF and `None` for esp-hal's catch-all.)
+- [x] Should the enum own `Display` (the whole log line, hint included) or do the tiers format? (The enum owns the reason text, `reason 8 (ASSOC_LEAVE)`, without the hint; `lines::Disconnected::new(reason)` adds the credentials hint, and both tiers log through it.)
+- [x] Can the hal mapping be host-tested by mirroring the variants, or is review enough? (Review is enough: the esp-hal `shared_reason` table is target-gated and has no host mirror test.)
+- [x] Do the existing `reason_suggests_credentials` / `credentials_hint` stay public after folding? (No: `wifi_disconnect_reason_name`, `reason_suggests_credentials` and `credentials_hint` are removed and no longer re-exported by either tier; `CREDENTIALS_HINT` stays public.)
 
 ## State
 - [x] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Session Log
 - 2026-11-02 — Feature doc created via /feature dialog; direction set by a review nit on the disconnect-log fix
+- 2026-11-16 — Implemented: the enum replaces the `u16` newtype on both tiers, the four open questions answered by the maintainer, esp-hal logs `reason <code> (<NAME>)` like ESP-IDF

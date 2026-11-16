@@ -26,6 +26,9 @@
 //! LoRaWAN profile additional placeholders:
 //! - `{{DEV_EUI}}`, `{{JOIN_EUI}}`
 //!
+//! The Wi-Fi-only fallback template ([`WIFI_FALLBACK_PORTAL_HTML`]) carries
+//! only `{{NONCE}}`, `{{ERRORS}}`, `{{WIFI_SSID}}` and `{{DEV_NAME}}`.
+//!
 //! The module also holds the fixed response bodies and the OS probe paths both
 //! tiers serve, so the two portals cannot drift apart in wording or routing.
 
@@ -45,6 +48,17 @@ pub const WIFI_MQTT_PORTAL_HTML: &str = include_str!("assets/portal_wifi_mqtt.ht
 /// AppKey (password input — never pre-filled), OTA URL, and device name.
 /// No `{{APP_KEY}}` placeholder exists — the AppKey is never pre-filled.
 pub const LORAWAN_PORTAL_HTML: &str = include_str!("assets/portal_lorawan.html");
+
+/// Experimental: API may change before 1.0.
+///
+/// The fallback portal's Wi-Fi-only HTML template, served after repeated
+/// failed joins (see [`parse_wifi_form`](super::parse_wifi_form)).
+///
+/// Carries only the Wi-Fi SSID and password inputs, shows the device name as
+/// text, and has no factory-reset form, so an open fallback portal cannot
+/// change the MQTT broker.
+/// Placeholders: `{{NONCE}}`, `{{ERRORS}}`, `{{WIFI_SSID}}`, `{{DEV_NAME}}`.
+pub const WIFI_FALLBACK_PORTAL_HTML: &str = include_str!("assets/portal_wifi_fallback.html");
 
 /// Experimental: API may change before 1.0.
 ///
@@ -70,6 +84,38 @@ pub fn template_for(profile: SchemaProfile) -> &'static str {
         SchemaProfile::LorawanFieldDevice => LORAWAN_PORTAL_HTML,
         SchemaProfile::WifiMqttDevice => WIFI_MQTT_PORTAL_HTML,
     }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Substitutes every `{{KEY}}` token of `template` in one pass, handing each
+/// output piece to `emit`.
+///
+/// `value(key)` returns the final text for a token (already escaped where
+/// needed); `None` leaves the token as written.
+/// Substituted text is never scanned again, so a value that itself contains
+/// `{{MQTT_URI}}` (for example a submitted SSID) cannot pull another field into
+/// the page.
+pub fn fill_placeholders<'v>(
+    template: &str,
+    value: impl Fn(&str) -> Option<&'v str>,
+    mut emit: impl FnMut(&str),
+) {
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            break;
+        };
+        emit(&rest[..open]);
+        let key = &after[..close];
+        match value(key) {
+            Some(text) => emit(text),
+            None => emit(&rest[open..open + 2 + close + 2]),
+        }
+        rest = &after[close + 2..];
+    }
+    emit(rest);
 }
 
 /// Experimental: API may change before 1.0.
@@ -122,6 +168,51 @@ pub const SESSION_FINISHED_BODY: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fill(template: &str, values: &[(&str, &str)]) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        fill_placeholders(
+            template,
+            |key| values.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
+            |piece| out.push_str(piece),
+        );
+        out
+    }
+
+    #[test]
+    fn fill_placeholders_substitutes_known_and_keeps_unknown_tokens() {
+        let out = fill(
+            "<p>{{WIFI_SSID}}</p>{{FW_VER}}<i>{{DEV_NAME}}</i>",
+            &[("WIFI_SSID", "home"), ("DEV_NAME", "clock")],
+        );
+        assert_eq!(out, "<p>home</p>{{FW_VER}}<i>clock</i>");
+    }
+
+    #[test]
+    fn fill_placeholders_never_rescans_substituted_text() {
+        let out = fill(
+            "ssid={{WIFI_SSID}} broker={{MQTT_URI}}",
+            &[
+                ("WIFI_SSID", "{{MQTT_URI}}"),
+                ("MQTT_URI", "mqtt://stored:1883"),
+            ],
+        );
+        assert_eq!(out, "ssid={{MQTT_URI}} broker=mqtt://stored:1883");
+
+        let fallback = fill(
+            WIFI_FALLBACK_PORTAL_HTML,
+            &[
+                ("WIFI_SSID", "{{MQTT_URI}}{{MQTT_USER}}"),
+                ("MQTT_URI", "mqtt://stored:1883"),
+            ],
+        );
+        assert!(!fallback.contains("mqtt://stored:1883"));
+    }
+
+    #[test]
+    fn fill_placeholders_copies_an_unclosed_token_verbatim() {
+        assert_eq!(fill("a{{WIFI_SSID", &[("WIFI_SSID", "x")]), "a{{WIFI_SSID");
+    }
 
     #[test]
     fn template_for_selects_each_profile() {
@@ -223,5 +314,29 @@ mod tests {
             LORAWAN_PORTAL_HTML.contains("{{FW_VER}}"),
             "lorawan template must contain {{FW_VER}} placeholder"
         );
+    }
+
+    /// The fallback template offers only the Wi-Fi fields: no other input,
+    /// no secret pre-fill and no factory-reset form.
+    #[test]
+    fn wifi_fallback_template_offers_only_wifi_fields() {
+        for placeholder in ["{{NONCE}}", "{{ERRORS}}", "{{WIFI_SSID}}", "{{DEV_NAME}}"] {
+            assert!(
+                WIFI_FALLBACK_PORTAL_HTML.contains(placeholder),
+                "{placeholder} missing"
+            );
+        }
+        let inputs: alloc::vec::Vec<&str> = WIFI_FALLBACK_PORTAL_HTML
+            .split("<input ")
+            .skip(1)
+            .filter_map(|tag| {
+                let rest = &tag[tag.find("name=\"")? + 6..];
+                Some(&rest[..rest.find('"')?])
+            })
+            .collect();
+        assert_eq!(inputs, ["_nonce", "wifi_ssid", "wifi_pass"]);
+        assert!(!WIFI_FALLBACK_PORTAL_HTML.contains("{{WIFI_PASS}}"));
+        assert!(!WIFI_FALLBACK_PORTAL_HTML.contains("name=\"wifi_pass\" value="));
+        assert!(!WIFI_FALLBACK_PORTAL_HTML.contains("/factory-reset"));
     }
 }

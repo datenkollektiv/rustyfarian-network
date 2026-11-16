@@ -31,7 +31,7 @@ Disconnect reason 15 (`4WAY_HANDSHAKE_TIMEOUT`) on two access points of the same
 | Where | Behaviour | Evidence |
 |:--|:--|:--|
 | `WiFiManager::new` (`connect_with_led`) | Connects blocking inside the constructor and returns `Err` after the timeout | `crates/rustyfarian-esp-idf-network/src/wifi/mod.rs` ~332-365 |
-| Disconnect reasons | Mapped and logged only when non-blocking; a blocking caller gets a bare timeout | `wifi/mod.rs` ~264-275 (`wifi_disconnect_reason_name`) |
+| Disconnect reasons | Mapped and logged only when non-blocking; a blocking caller gets a bare timeout | `wifi/mod.rs` ~264-275 (`wifi_disconnect_reason_name`, since replaced by `juggler::wifi::DisconnectReason`) |
 | `WifiMqttBoot::load` | Returns `Ready` for any stored config; nothing records that it never connected | `provisioning/boot.rs` ~113 |
 | `ProvisioningStore::erase_all` | Exists, but no boot path uses it on failure | `provisioning/store.rs` ~476 |
 | Consumer | Propagates the error with `?`, `app_main` returns | rgb-clock `src/main.rs` ~148-154 |
@@ -88,8 +88,15 @@ Source: spookhouse's reply of 2026-10-28.
 | Counts clear on join, commit, and portal open | A timed-out portal retries afresh instead of reopening at once | Keep the count across a portal timeout |
 | Counts live in library-owned reserved keys in `rf_prov` | A consumer `erase_all` clears them with the record | A separate library NVS namespace |
 | Re-entry trigger: pre-load hook returning an outcome | One entry point and outcome set; the library never erases | Library erases on a `FactoryReset` answer |
-| Non-blocking connect is the `WifiMqttDevice` default | The classifier needs each attempt's reason; the blocking path ends in a bare timeout | Blocking connect with the last reason carried in the timeout error |
+| Non-blocking connect for the `WifiMqttDevice` bundle from `load_with_fallback` | The classifier needs each attempt's reason; the blocking path ends in a bare timeout | Blocking connect with the last reason carried in the timeout error |
 | Classifier builds on `juggler::wifi::DisconnectReason` | The vocabulary lands first and replaces `wifi_disconnect_reason_name(u16)` for both tiers | Classify raw `u16` reason codes |
+| `wait_for_join(&wifi, window)` reads the reasons the link worker recorded; no new `WiFiManager` API | Keeps the load modem-free and adds no tier-parity surface on `WiFiManager` | Explicit `record_join_failure` / `record_join_success` methods, which would expose reasons on the public API |
+| The fallback portal opens on the boot after the threshold, not in the failing boot | The station holds the modem in the failing boot, so the portal runs after a restart | Opening the portal in the failing boot |
+| A consumer that stays up after `NotJoined` calls `wait_for_join` again until it returns `Joined`; only that call clears the counters after a late join | No NVS write on the event-loop task, and no new `WiFiManager` API | A clear hook in the link worker's `DhcpIpAssigned` handler |
+| The network-absent threshold counts boots, so the consumer's restart cadence decides whether a router off overnight opens the AP | A restart after every 30 s window reaches 20 in about 10 min; `idf_c3_provision_mqtt` stays up longer per network-absent boot (about 14 h to 20) | A time-based network-absent threshold |
+| A repeated `AUTH_EXPIRE` counts as credential evidence from its second occurrence in one boot (`AUTH_EXPIRE_REPEAT` = 2) | A single `AUTH_EXPIRE` stays transient; a repeat within one boot is the credential signal | Every `AUTH_EXPIRE` counts as credentials |
+| The fallback commit replaces only the Wi-Fi pair through a journal (backups, `wifi_pending` marker, commit by removing the marker) | A failed write at any step keeps the old record readable, and a retry keeps the first attempt's backups | Roll back by re-saving the old record on error: a restore write can fail under the same persistent NVS fault, so the replacement is not atomic |
+| A transient window leaves the boot uncounted, and a network-absent count moves to credentials when a later window of the same boot shows credential failures | Credential evidence in a later `wait_for_join` window still counts, and a boot still counts at most once | First expired window is final: a transient first window used up the boot's count, so later credential failures never counted |
 
 ## Constraints
 
@@ -130,17 +137,20 @@ Options to weigh:
 - [x] Does the esp-hal tier need the same fallback now, or is it tracked separately? (tracked separately as a tier-parity gap (ADR 022) since rgb-clock's request of 2026-11-16, which adds esp-hal demand from its clock; the classifier and counter policy live in `juggler` and are shared by both tiers; the esp-hal boot wiring follows as its own feature when rgb-clock files that request)
 - [x] Should the non-blocking connect path become the default for this profile, so reasons are available without a second code path? (yes: the `WifiMqttDevice` profile connects non-blocking, the classifier reads each failed attempt's disconnect reason from the link worker, and part 4 follows from it without a second code path)
 - [x] Re-entry hook vs consumer-owned trigger: hook with outcomes, consumer erases (2026-10-27).
-- [ ] Acceptance: a host test or bench run shows `ProvisioningStore::load` returns the pre-fallback record after a fallback portal times out with no commit.
-- [ ] Acceptance: no `erase_all` call on the counter-driven fallback path, checkable in review.
+- [ ] Acceptance: a host test or bench run shows `ProvisioningStore::load` returns the pre-fallback record after a fallback portal times out with no commit (open: `failed_boots_open_the_fallback_portal_and_keep_the_record` in `kv_store` covers the counting path only, and no host test covers the timeout path).
+  The failed-commit path is host-tested by `a_failed_wifi_replacement_keeps_the_old_record`, but that does not close this item.
+- [x] Acceptance: no `erase_all` call on the counter-driven fallback path, checkable in review (`provisioning/boot.rs` names `erase_all` only in doc comments; the examples call it only on an explicit factory-reset answer).
 - [ ] Acceptance (rgb-clock): a mistyped password on the IDF clock opens the portal after 5 boots without anyone touching it, and the stored broker is unchanged afterwards.
 - [x] A consumer may ignore `FallbackPortal` while an OTA image is pending verification, since the library cannot know the OTA state (rgb-clock enforces this).
+- [ ] Maintainer to confirm: reasons 210, 211 and 212 (`NO_AP_FOUND` with compatible security, authmode or RSSI threshold) and `802_1X_AUTH_FAILED` (23) classify as transient, so a device that only sees them never reaches a threshold.
+- [ ] Maintainer to confirm: a credential threshold of 0 also means never, as the network-absent threshold does.
 
 ## State
 
 - [x] Design approved
-- [ ] Core implementation
-- [ ] Tests passing
-- [ ] Documentation updated
+- [x] Core implementation
+- [x] Tests passing
+- [x] Documentation updated
 
 ## Session Log
 
@@ -149,3 +159,6 @@ Options to weigh:
 - 2026-10-28 — Updated: counter phase planned — separate credential and network-absent counters, threshold 5, FallbackPortal outcome, 10 min window, counts in rf_prov.
 - 2026-11-12 — Updated: rgb-clock's reply of 2026-11-01 folded in (Wi-Fi-only fallback wanted, threshold 20, esp-hal later); it adopts the re-entry hook with 0.7.0
 - 2026-11-16 — Design approved (parts 1–4): non-blocking connect is the profile default, the classifier builds on the disconnect-reason vocabulary, esp-hal recorded as a parity gap after rgb-clock's change of demand; Ready-band roadmap row added.
+- 2026-11-16 — Core (juggler classifier, counter policy, reserved keys), IDF wiring (`load_with_fallback`, `wait_for_join`, Wi-Fi-only fallback portal) implemented; esp-hal not started (ADR 022 gap); rgb-clock hardware acceptance still open.
+- 2026-11-16 — Review: a late join clears the counters only through another `wait_for_join` call (now documented); `idf_c3_provision_mqtt` restarts at once on a credential failure and otherwise stays up, its stay doubling per network-absent boot.
+- 2026-11-17 — Review fixes: journaled Wi-Fi replacement for the fallback commit, transient windows no longer use up a boot's count.

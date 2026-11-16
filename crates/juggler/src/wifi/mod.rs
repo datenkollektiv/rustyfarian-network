@@ -7,6 +7,8 @@
 //! - [`ConnectMode`] — blocking vs. non-blocking association strategy
 //! - [`LinkMachine`] — pure reconnect policy shared by both tiers (see [`link`])
 //! - [`Country`] — the regulatory domain both tiers apply (see [`country`])
+//! - [`JoinFailure`] — the class of a failed join, for the provisioning fallback
+//!   (see [`join_failure`])
 //! - [`mock::MockWifiDriver`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
@@ -23,6 +25,7 @@ pub mod mock;
 
 pub mod country;
 pub mod handover;
+pub mod join_failure;
 pub mod lines;
 pub mod link;
 pub mod network_link;
@@ -34,6 +37,7 @@ pub use country::{
     SUPPORTED_COUNTRY_CODES,
 };
 pub use handover::{IdleWait, LinkHandover};
+pub use join_failure::{JoinAttempts, JoinFailure, AUTH_EXPIRE_REPEAT};
 pub use link::{
     LinkAction, LinkInput, LinkMachine, LinkState, RECONNECT_BACKOFF_BASE_MS,
     RECONNECT_BACKOFF_MAX_MS,
@@ -545,107 +549,282 @@ impl<'a> ApConfig<'a> {
     }
 }
 
-// ─── Disconnect reason mapping ──────────────────────────────────────────────
+// ─── Disconnect reason vocabulary ───────────────────────────────────────────
 
-/// Maps common ESP-IDF Wi-Fi disconnect reason codes to human-readable names.
+/// Why the station lost (or never got) its association, as both tiers name it.
 ///
-/// Codes and spellings follow `wifi_err_reason_t` (`esp_wifi_types_generic.h`)
-/// so a log line can be matched against the ESP-IDF documentation.
-/// The 802.11 management codes 1..=24 and the ESP-IDF band 200..=212 are
-/// covered; rarer 802.11 codes (TDLS, QoS, fast transition, 25..=68) stay
-/// unmapped and log as `(unmapped)` instead of a guess.
-pub fn wifi_disconnect_reason_name(reason: u16) -> Option<&'static str> {
-    match reason {
-        1 => Some("UNSPECIFIED"),
-        2 => Some("AUTH_EXPIRE"),
-        3 => Some("AUTH_LEAVE"),
-        4 => Some("ASSOC_EXPIRE"),
-        5 => Some("ASSOC_TOOMANY"),
-        6 => Some("NOT_AUTHED"),
-        7 => Some("NOT_ASSOCED"),
-        8 => Some("ASSOC_LEAVE"),
-        9 => Some("ASSOC_NOT_AUTHED"),
-        10 => Some("DISASSOC_PWRCAP_BAD"),
-        11 => Some("DISASSOC_SUPCHAN_BAD"),
-        12 => Some("BSS_TRANSITION_DISASSOC"),
-        13 => Some("IE_INVALID"),
-        14 => Some("MIC_FAILURE"),
-        15 => Some("4WAY_HANDSHAKE_TIMEOUT"),
-        16 => Some("GROUP_KEY_UPDATE_TIMEOUT"),
-        17 => Some("IE_IN_4WAY_DIFFERS"),
-        18 => Some("GROUP_CIPHER_INVALID"),
-        19 => Some("PAIRWISE_CIPHER_INVALID"),
-        20 => Some("AKMP_INVALID"),
-        21 => Some("UNSUPP_RSN_IE_VERSION"),
-        22 => Some("INVALID_RSN_IE_CAP"),
-        23 => Some("802_1X_AUTH_FAILED"),
-        24 => Some("CIPHER_SUITE_REJECTED"),
-        200 => Some("BEACON_TIMEOUT"),
-        201 => Some("NO_AP_FOUND"),
-        202 => Some("AUTH_FAIL"),
-        203 => Some("ASSOC_FAIL"),
-        204 => Some("HANDSHAKE_TIMEOUT"),
-        205 => Some("CONNECTION_FAIL"),
-        206 => Some("AP_TSF_RESET"),
-        207 => Some("ROAMING"),
-        208 => Some("ASSOC_COMEBACK_TIME_TOO_LONG"),
-        209 => Some("SA_QUERY_TIMEOUT"),
-        210 => Some("NO_AP_FOUND_W_COMPATIBLE_SECURITY"),
-        211 => Some("NO_AP_FOUND_IN_AUTHMODE_THRESHOLD"),
-        212 => Some("NO_AP_FOUND_IN_RSSI_THRESHOLD"),
-        _ => None,
+/// Kinds and their [`name`](Self::name) follow `wifi_err_reason_t`
+/// (`esp_wifi_types_generic.h`), so a log line can be matched against the
+/// ESP-IDF documentation.
+/// The 802.11 management codes 1..=24 and the ESP-IDF band 200..=212 are named;
+/// the rarer 802.11 codes (TDLS, QoS, fast transition, 25..=68) are not.
+///
+/// The ESP-IDF tier builds a kind from the numeric code with
+/// [`from_code`](Self::from_code).
+/// The esp-hal tier maps esp-radio's named reasons onto the same kinds, so a named
+/// kind reports its ESP-IDF [`code`](Self::code) on both tiers.
+///
+/// [`Display`](core::fmt::Display) renders `reason 8 (ASSOC_LEAVE)`,
+/// `reason 77 (unmapped)`, or `reason ? (UNSPECIFIED)` when the code is unknown;
+/// the shared [`lines::Disconnected`] line adds [`CREDENTIALS_HINT`] where
+/// [`suggests_credentials`](Self::suggests_credentials) holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DisconnectReason {
+    /// `UNSPECIFIED` (1).
+    ///
+    /// esp-radio folds code 1 and every code it does not know into one variant,
+    /// so on esp-hal this is also the catch-all and `code` is `None` there;
+    /// on ESP-IDF `code` is `Some(1)`.
+    Unspecified {
+        /// The ESP-IDF code, when the tier can tell.
+        code: Option<u16>,
+    },
+    /// `AUTH_EXPIRE` (2).
+    AuthExpire,
+    /// `AUTH_LEAVE` (3): the AP deauthenticated the station.
+    AuthLeave,
+    /// `DISASSOC_DUE_TO_INACTIVITY` (4).
+    DisassocDueToInactivity,
+    /// `ASSOC_TOOMANY` (5).
+    AssocTooMany,
+    /// `CLASS2_FRAME_FROM_NONAUTH_STA` (6).
+    Class2FrameFromNonauthSta,
+    /// `CLASS3_FRAME_FROM_NONASSOC_STA` (7).
+    Class3FrameFromNonassocSta,
+    /// `ASSOC_LEAVE` (8): the station or the AP left the association.
+    AssocLeave,
+    /// `ASSOC_NOT_AUTHED` (9).
+    AssocNotAuthed,
+    /// `DISASSOC_PWRCAP_BAD` (10).
+    DisassocPwrcapBad,
+    /// `DISASSOC_SUPCHAN_BAD` (11).
+    DisassocSupchanBad,
+    /// `BSS_TRANSITION_DISASSOC` (12).
+    BssTransitionDisassoc,
+    /// `IE_INVALID` (13).
+    IeInvalid,
+    /// `MIC_FAILURE` (14).
+    MicFailure,
+    /// `4WAY_HANDSHAKE_TIMEOUT` (15): typically a wrong password.
+    FourWayHandshakeTimeout,
+    /// `GROUP_KEY_UPDATE_TIMEOUT` (16).
+    GroupKeyUpdateTimeout,
+    /// `IE_IN_4WAY_DIFFERS` (17).
+    IeIn4wayDiffers,
+    /// `GROUP_CIPHER_INVALID` (18).
+    GroupCipherInvalid,
+    /// `PAIRWISE_CIPHER_INVALID` (19).
+    PairwiseCipherInvalid,
+    /// `AKMP_INVALID` (20).
+    AkmpInvalid,
+    /// `UNSUPP_RSN_IE_VERSION` (21).
+    UnsuppRsnIeVersion,
+    /// `INVALID_RSN_IE_CAP` (22).
+    InvalidRsnIeCap,
+    /// `802_1X_AUTH_FAILED` (23).
+    Ieee8021xAuthFailed,
+    /// `CIPHER_SUITE_REJECTED` (24).
+    CipherSuiteRejected,
+    /// `BEACON_TIMEOUT` (200): the AP's beacons stopped arriving.
+    BeaconTimeout,
+    /// `NO_AP_FOUND` (201): the SSID is not in range, or misspelt.
+    NoApFound,
+    /// `AUTH_FAIL` (202).
+    AuthFail,
+    /// `ASSOC_FAIL` (203).
+    AssocFail,
+    /// `HANDSHAKE_TIMEOUT` (204).
+    HandshakeTimeout,
+    /// `CONNECTION_FAIL` (205).
+    ConnectionFail,
+    /// `AP_TSF_RESET` (206).
+    ApTsfReset,
+    /// `ROAMING` (207).
+    Roaming,
+    /// `ASSOC_COMEBACK_TIME_TOO_LONG` (208).
+    AssocComebackTimeTooLong,
+    /// `SA_QUERY_TIMEOUT` (209).
+    SaQueryTimeout,
+    /// `NO_AP_FOUND_W_COMPATIBLE_SECURITY` (210).
+    NoApFoundWCompatibleSecurity,
+    /// `NO_AP_FOUND_IN_AUTHMODE_THRESHOLD` (211).
+    NoApFoundInAuthmodeThreshold,
+    /// `NO_AP_FOUND_IN_RSSI_THRESHOLD` (212).
+    NoApFoundInRssiThreshold,
+    /// An ESP-IDF code without a name here (the rarer 802.11 codes, or a newer one);
+    /// logged as `(unmapped)` instead of a guess.
+    Unmapped(u16),
+}
+
+impl DisconnectReason {
+    /// The kind for an ESP-IDF disconnect code (`wifi_event_sta_disconnected_t::reason`).
+    pub const fn from_code(code: u16) -> Self {
+        match code {
+            1 => Self::Unspecified { code: Some(1) },
+            2 => Self::AuthExpire,
+            3 => Self::AuthLeave,
+            4 => Self::DisassocDueToInactivity,
+            5 => Self::AssocTooMany,
+            6 => Self::Class2FrameFromNonauthSta,
+            7 => Self::Class3FrameFromNonassocSta,
+            8 => Self::AssocLeave,
+            9 => Self::AssocNotAuthed,
+            10 => Self::DisassocPwrcapBad,
+            11 => Self::DisassocSupchanBad,
+            12 => Self::BssTransitionDisassoc,
+            13 => Self::IeInvalid,
+            14 => Self::MicFailure,
+            15 => Self::FourWayHandshakeTimeout,
+            16 => Self::GroupKeyUpdateTimeout,
+            17 => Self::IeIn4wayDiffers,
+            18 => Self::GroupCipherInvalid,
+            19 => Self::PairwiseCipherInvalid,
+            20 => Self::AkmpInvalid,
+            21 => Self::UnsuppRsnIeVersion,
+            22 => Self::InvalidRsnIeCap,
+            23 => Self::Ieee8021xAuthFailed,
+            24 => Self::CipherSuiteRejected,
+            200 => Self::BeaconTimeout,
+            201 => Self::NoApFound,
+            202 => Self::AuthFail,
+            203 => Self::AssocFail,
+            204 => Self::HandshakeTimeout,
+            205 => Self::ConnectionFail,
+            206 => Self::ApTsfReset,
+            207 => Self::Roaming,
+            208 => Self::AssocComebackTimeTooLong,
+            209 => Self::SaQueryTimeout,
+            210 => Self::NoApFoundWCompatibleSecurity,
+            211 => Self::NoApFoundInAuthmodeThreshold,
+            212 => Self::NoApFoundInRssiThreshold,
+            other => Self::Unmapped(other),
+        }
+    }
+
+    /// The ESP-IDF code; `None` only for esp-hal's catch-all, whose code esp-radio
+    /// does not report.
+    pub const fn code(&self) -> Option<u16> {
+        Some(match self {
+            Self::Unspecified { code } => return *code,
+            Self::AuthExpire => 2,
+            Self::AuthLeave => 3,
+            Self::DisassocDueToInactivity => 4,
+            Self::AssocTooMany => 5,
+            Self::Class2FrameFromNonauthSta => 6,
+            Self::Class3FrameFromNonassocSta => 7,
+            Self::AssocLeave => 8,
+            Self::AssocNotAuthed => 9,
+            Self::DisassocPwrcapBad => 10,
+            Self::DisassocSupchanBad => 11,
+            Self::BssTransitionDisassoc => 12,
+            Self::IeInvalid => 13,
+            Self::MicFailure => 14,
+            Self::FourWayHandshakeTimeout => 15,
+            Self::GroupKeyUpdateTimeout => 16,
+            Self::IeIn4wayDiffers => 17,
+            Self::GroupCipherInvalid => 18,
+            Self::PairwiseCipherInvalid => 19,
+            Self::AkmpInvalid => 20,
+            Self::UnsuppRsnIeVersion => 21,
+            Self::InvalidRsnIeCap => 22,
+            Self::Ieee8021xAuthFailed => 23,
+            Self::CipherSuiteRejected => 24,
+            Self::BeaconTimeout => 200,
+            Self::NoApFound => 201,
+            Self::AuthFail => 202,
+            Self::AssocFail => 203,
+            Self::HandshakeTimeout => 204,
+            Self::ConnectionFail => 205,
+            Self::ApTsfReset => 206,
+            Self::Roaming => 207,
+            Self::AssocComebackTimeTooLong => 208,
+            Self::SaQueryTimeout => 209,
+            Self::NoApFoundWCompatibleSecurity => 210,
+            Self::NoApFoundInAuthmodeThreshold => 211,
+            Self::NoApFoundInRssiThreshold => 212,
+            Self::Unmapped(code) => *code,
+        })
+    }
+
+    /// The `wifi_err_reason_t` spelling without the `WIFI_REASON_` prefix
+    /// (`ASSOC_LEAVE`, `4WAY_HANDSHAKE_TIMEOUT`); `unmapped` for [`Unmapped`](Self::Unmapped).
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Unspecified { .. } => "UNSPECIFIED",
+            Self::AuthExpire => "AUTH_EXPIRE",
+            Self::AuthLeave => "AUTH_LEAVE",
+            Self::DisassocDueToInactivity => "DISASSOC_DUE_TO_INACTIVITY",
+            Self::AssocTooMany => "ASSOC_TOOMANY",
+            Self::Class2FrameFromNonauthSta => "CLASS2_FRAME_FROM_NONAUTH_STA",
+            Self::Class3FrameFromNonassocSta => "CLASS3_FRAME_FROM_NONASSOC_STA",
+            Self::AssocLeave => "ASSOC_LEAVE",
+            Self::AssocNotAuthed => "ASSOC_NOT_AUTHED",
+            Self::DisassocPwrcapBad => "DISASSOC_PWRCAP_BAD",
+            Self::DisassocSupchanBad => "DISASSOC_SUPCHAN_BAD",
+            Self::BssTransitionDisassoc => "BSS_TRANSITION_DISASSOC",
+            Self::IeInvalid => "IE_INVALID",
+            Self::MicFailure => "MIC_FAILURE",
+            Self::FourWayHandshakeTimeout => "4WAY_HANDSHAKE_TIMEOUT",
+            Self::GroupKeyUpdateTimeout => "GROUP_KEY_UPDATE_TIMEOUT",
+            Self::IeIn4wayDiffers => "IE_IN_4WAY_DIFFERS",
+            Self::GroupCipherInvalid => "GROUP_CIPHER_INVALID",
+            Self::PairwiseCipherInvalid => "PAIRWISE_CIPHER_INVALID",
+            Self::AkmpInvalid => "AKMP_INVALID",
+            Self::UnsuppRsnIeVersion => "UNSUPP_RSN_IE_VERSION",
+            Self::InvalidRsnIeCap => "INVALID_RSN_IE_CAP",
+            Self::Ieee8021xAuthFailed => "802_1X_AUTH_FAILED",
+            Self::CipherSuiteRejected => "CIPHER_SUITE_REJECTED",
+            Self::BeaconTimeout => "BEACON_TIMEOUT",
+            Self::NoApFound => "NO_AP_FOUND",
+            Self::AuthFail => "AUTH_FAIL",
+            Self::AssocFail => "ASSOC_FAIL",
+            Self::HandshakeTimeout => "HANDSHAKE_TIMEOUT",
+            Self::ConnectionFail => "CONNECTION_FAIL",
+            Self::ApTsfReset => "AP_TSF_RESET",
+            Self::Roaming => "ROAMING",
+            Self::AssocComebackTimeTooLong => "ASSOC_COMEBACK_TIME_TOO_LONG",
+            Self::SaQueryTimeout => "SA_QUERY_TIMEOUT",
+            Self::NoApFoundWCompatibleSecurity => "NO_AP_FOUND_W_COMPATIBLE_SECURITY",
+            Self::NoApFoundInAuthmodeThreshold => "NO_AP_FOUND_IN_AUTHMODE_THRESHOLD",
+            Self::NoApFoundInRssiThreshold => "NO_AP_FOUND_IN_RSSI_THRESHOLD",
+            Self::Unmapped(_) => "unmapped",
+        }
+    }
+
+    /// `true` for the reasons that point at the credentials or at a network that is
+    /// not there, so a log line may suggest checking them.
+    ///
+    /// The four are those a wrong SSID, a wrong password or an access point that is
+    /// out of range produce: `4WAY_HANDSHAKE_TIMEOUT` (15), `NO_AP_FOUND` (201),
+    /// `AUTH_FAIL` (202) and `HANDSHAKE_TIMEOUT` (204).
+    /// A router-initiated deauthentication (`AUTH_LEAVE`, `ASSOC_LEAVE`), a beacon
+    /// loss or the library's own suspend are deliberately not in the set: they say
+    /// nothing about the credentials, and the old unconditional hint sent users
+    /// hunting for a typo after every suspend.
+    pub const fn suggests_credentials(&self) -> bool {
+        matches!(
+            self,
+            Self::FourWayHandshakeTimeout
+                | Self::NoApFound
+                | Self::AuthFail
+                | Self::HandshakeTimeout
+        )
     }
 }
-
-/// `true` for the disconnect reasons that point at the credentials or at a
-/// network that is not there, so a log line may suggest checking them.
-///
-/// The four are those a wrong SSID, a wrong password or an access point that is
-/// out of range produce: `4WAY_HANDSHAKE_TIMEOUT` (15), `NO_AP_FOUND` (201),
-/// `AUTH_FAIL` (202) and `HANDSHAKE_TIMEOUT` (204).
-/// A router-initiated deauthentication (`AUTH_LEAVE`, `ASSOC_LEAVE`), a beacon
-/// loss or the library's own suspend are deliberately not in the set: they say
-/// nothing about the credentials, and the old unconditional hint sent users
-/// hunting for a typo after every suspend.
-pub fn reason_suggests_credentials(reason: u16) -> bool {
-    matches!(reason, 15 | 201 | 202 | 204)
-}
-
-/// The sentence appended to a disconnect log line when the reason points at the
-/// credentials; empty otherwise.
-pub const CREDENTIALS_HINT: &str = " — check SSID/password and network availability";
-
-/// The hint to append for a reason, `""` when it says nothing about credentials.
-pub fn credentials_hint(reason: u16) -> &'static str {
-    if reason_suggests_credentials(reason) {
-        CREDENTIALS_HINT
-    } else {
-        ""
-    }
-}
-
-/// One-line form of an ESP-IDF disconnect reason:
-/// `reason 8 (ASSOC_LEAVE)`, plus [`CREDENTIALS_HINT`] only where it applies.
-///
-/// The ESP-IDF tier logs this directly; the esp-hal tier shares the hint but not
-/// the code formatting, because esp-radio reports a named reason instead of the
-/// numeric code and the esp-hal `WiFiManager` logs that name followed by [`credentials_hint`]'s
-/// text.
-///
-/// ```ignore
-/// log::warn!("[wifi] disconnected — {}", DisconnectReason(info.reason()));
-/// ```
-pub struct DisconnectReason(pub u16);
 
 impl core::fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match wifi_disconnect_reason_name(self.0) {
-            Some(name) => write!(f, "reason {} ({})", self.0, name)?,
-            None => write!(f, "reason {} (unmapped)", self.0)?,
+        match self.code() {
+            Some(code) => write!(f, "reason {} ({})", code, self.name()),
+            None => write!(f, "reason ? ({})", self.name()),
         }
-        f.write_str(credentials_hint(self.0))
     }
 }
+
+/// The sentence the shared disconnect line appends when the reason points at the
+/// credentials ([`DisconnectReason::suggests_credentials`]).
+pub const CREDENTIALS_HINT: &str = " — check SSID/password and network availability";
 
 // ─── WifiDriver trait ───────────────────────────────────────────────────────
 
@@ -739,77 +918,153 @@ mod tests {
         assert!(validate_password(&pw).is_err());
     }
 
-    // ── Disconnect reason name tests ────────────────────────────────────
+    // ── Disconnect reason vocabulary tests ──────────────────────────────
+
+    /// Every named kind with its ESP-IDF code and `wifi_err_reason_t` spelling.
+    const NAMED_REASONS: [(u16, &str); 37] = [
+        (1, "UNSPECIFIED"),
+        (2, "AUTH_EXPIRE"),
+        (3, "AUTH_LEAVE"),
+        (4, "DISASSOC_DUE_TO_INACTIVITY"),
+        (5, "ASSOC_TOOMANY"),
+        (6, "CLASS2_FRAME_FROM_NONAUTH_STA"),
+        (7, "CLASS3_FRAME_FROM_NONASSOC_STA"),
+        (8, "ASSOC_LEAVE"),
+        (9, "ASSOC_NOT_AUTHED"),
+        (10, "DISASSOC_PWRCAP_BAD"),
+        (11, "DISASSOC_SUPCHAN_BAD"),
+        (12, "BSS_TRANSITION_DISASSOC"),
+        (13, "IE_INVALID"),
+        (14, "MIC_FAILURE"),
+        (15, "4WAY_HANDSHAKE_TIMEOUT"),
+        (16, "GROUP_KEY_UPDATE_TIMEOUT"),
+        (17, "IE_IN_4WAY_DIFFERS"),
+        (18, "GROUP_CIPHER_INVALID"),
+        (19, "PAIRWISE_CIPHER_INVALID"),
+        (20, "AKMP_INVALID"),
+        (21, "UNSUPP_RSN_IE_VERSION"),
+        (22, "INVALID_RSN_IE_CAP"),
+        (23, "802_1X_AUTH_FAILED"),
+        (24, "CIPHER_SUITE_REJECTED"),
+        (200, "BEACON_TIMEOUT"),
+        (201, "NO_AP_FOUND"),
+        (202, "AUTH_FAIL"),
+        (203, "ASSOC_FAIL"),
+        (204, "HANDSHAKE_TIMEOUT"),
+        (205, "CONNECTION_FAIL"),
+        (206, "AP_TSF_RESET"),
+        (207, "ROAMING"),
+        (208, "ASSOC_COMEBACK_TIME_TOO_LONG"),
+        (209, "SA_QUERY_TIMEOUT"),
+        (210, "NO_AP_FOUND_W_COMPATIBLE_SECURITY"),
+        (211, "NO_AP_FOUND_IN_AUTHMODE_THRESHOLD"),
+        (212, "NO_AP_FOUND_IN_RSSI_THRESHOLD"),
+    ];
 
     #[test]
-    fn known_disconnect_reasons_are_mapped() {
-        assert_eq!(wifi_disconnect_reason_name(2), Some("AUTH_EXPIRE"));
+    fn every_named_code_maps_to_its_kind_and_back() {
+        for (code, name) in NAMED_REASONS {
+            let reason = DisconnectReason::from_code(code);
+            assert_eq!(reason.name(), name, "code {code}");
+            assert_eq!(reason.code(), Some(code), "code {code}");
+            assert!(
+                !matches!(reason, DisconnectReason::Unmapped(_)),
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_codes_map_to_the_expected_kinds() {
         assert_eq!(
-            wifi_disconnect_reason_name(15),
-            Some("4WAY_HANDSHAKE_TIMEOUT")
+            DisconnectReason::from_code(1),
+            DisconnectReason::Unspecified { code: Some(1) }
         );
-        assert_eq!(wifi_disconnect_reason_name(200), Some("BEACON_TIMEOUT"));
-        assert_eq!(wifi_disconnect_reason_name(201), Some("NO_AP_FOUND"));
-        assert_eq!(wifi_disconnect_reason_name(202), Some("AUTH_FAIL"));
-        assert_eq!(wifi_disconnect_reason_name(203), Some("ASSOC_FAIL"));
-        assert_eq!(wifi_disconnect_reason_name(204), Some("HANDSHAKE_TIMEOUT"));
-    }
-
-    #[test]
-    fn unknown_disconnect_reason_returns_none() {
-        assert_eq!(wifi_disconnect_reason_name(0), None);
-        assert_eq!(wifi_disconnect_reason_name(999), None);
-        assert_eq!(wifi_disconnect_reason_name(25), None, "TDLS stays unmapped");
-    }
-
-    #[test]
-    fn the_common_802_11_codes_are_named() {
-        for (code, name) in [
-            (1, "UNSPECIFIED"),
-            (3, "AUTH_LEAVE"),
-            (4, "ASSOC_EXPIRE"),
-            (8, "ASSOC_LEAVE"),
-            (13, "IE_INVALID"),
-            (23, "802_1X_AUTH_FAILED"),
-            (24, "CIPHER_SUITE_REJECTED"),
-            (205, "CONNECTION_FAIL"),
-            (210, "NO_AP_FOUND_W_COMPATIBLE_SECURITY"),
-            (212, "NO_AP_FOUND_IN_RSSI_THRESHOLD"),
-        ] {
-            assert_eq!(wifi_disconnect_reason_name(code), Some(name), "code {code}");
-        }
-    }
-
-    #[test]
-    fn only_reasons_that_point_at_the_credentials_carry_the_hint() {
-        for reason in [15, 201, 202, 204] {
-            assert!(reason_suggests_credentials(reason), "reason {reason}");
-        }
-        for reason in [1, 2, 3, 8, 200, 203, 205, 207] {
-            assert!(!reason_suggests_credentials(reason), "reason {reason}");
-            assert_eq!(credentials_hint(reason), "", "reason {reason}");
-        }
-        assert_eq!(credentials_hint(202), CREDENTIALS_HINT);
-    }
-
-    #[test]
-    fn a_disconnect_line_names_the_reason_and_hints_only_when_useful() {
+        assert_eq!(DisconnectReason::from_code(2), DisconnectReason::AuthExpire);
+        assert_eq!(DisconnectReason::from_code(8), DisconnectReason::AssocLeave);
         assert_eq!(
-            alloc::format!("{}", DisconnectReason(8)),
+            DisconnectReason::from_code(15),
+            DisconnectReason::FourWayHandshakeTimeout
+        );
+        assert_eq!(
+            DisconnectReason::from_code(23),
+            DisconnectReason::Ieee8021xAuthFailed
+        );
+        assert_eq!(
+            DisconnectReason::from_code(200),
+            DisconnectReason::BeaconTimeout
+        );
+        assert_eq!(
+            DisconnectReason::from_code(201),
+            DisconnectReason::NoApFound
+        );
+        assert_eq!(DisconnectReason::from_code(202), DisconnectReason::AuthFail);
+        assert_eq!(
+            DisconnectReason::from_code(212),
+            DisconnectReason::NoApFoundInRssiThreshold
+        );
+    }
+
+    #[test]
+    fn unnamed_codes_stay_unmapped_with_their_code() {
+        for code in [0, 25, 68, 199, 213, 999, u16::MAX] {
+            let reason = DisconnectReason::from_code(code);
+            assert_eq!(reason, DisconnectReason::Unmapped(code), "code {code}");
+            assert_eq!(reason.code(), Some(code), "code {code}");
+            assert_eq!(reason.name(), "unmapped", "code {code}");
+            assert!(!reason.suggests_credentials(), "code {code}");
+        }
+    }
+
+    #[test]
+    fn the_esp_hal_catch_all_has_no_code() {
+        let catch_all = DisconnectReason::Unspecified { code: None };
+        assert_eq!(catch_all.code(), None);
+        assert_eq!(catch_all.name(), "UNSPECIFIED");
+        assert!(!catch_all.suggests_credentials());
+    }
+
+    #[test]
+    fn only_reasons_that_point_at_the_credentials_suggest_them() {
+        for code in [15, 201, 202, 204] {
+            assert!(
+                DisconnectReason::from_code(code).suggests_credentials(),
+                "code {code}"
+            );
+        }
+        for (code, _) in NAMED_REASONS {
+            if ![15, 201, 202, 204].contains(&code) {
+                assert!(
+                    !DisconnectReason::from_code(code).suggests_credentials(),
+                    "code {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reason_renders_its_code_and_name() {
+        let text = |reason: DisconnectReason| alloc::format!("{reason}");
+        assert_eq!(
+            text(DisconnectReason::from_code(8)),
             "reason 8 (ASSOC_LEAVE)"
         );
         assert_eq!(
-            alloc::format!("{}", DisconnectReason(3)),
-            "reason 3 (AUTH_LEAVE)",
-            "a router deauth must not blame the credentials"
+            text(DisconnectReason::from_code(3)),
+            "reason 3 (AUTH_LEAVE)"
         );
         assert_eq!(
-            alloc::format!("{}", DisconnectReason(202)),
-            "reason 202 (AUTH_FAIL) — check SSID/password and network availability"
+            text(DisconnectReason::from_code(202)),
+            "reason 202 (AUTH_FAIL)",
+            "the hint belongs to the line, not the reason"
         );
         assert_eq!(
-            alloc::format!("{}", DisconnectReason(77)),
+            text(DisconnectReason::from_code(77)),
             "reason 77 (unmapped)"
+        );
+        assert_eq!(
+            text(DisconnectReason::Unspecified { code: None }),
+            "reason ? (UNSPECIFIED)"
         );
     }
 

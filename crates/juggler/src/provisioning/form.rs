@@ -5,6 +5,8 @@
 //! known input names to the active profile's canonical schema fields, collects
 //! unknown pairs as opaque extras, and validates everything, accumulating
 //! per-field errors rather than failing on the first problem.
+//! [`parse_wifi_form`] parses the fallback portal's Wi-Fi-only form under the
+//! same rules and applies it to the stored record.
 //!
 //! # Reserved keys
 //!
@@ -360,6 +362,105 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
             mqtt,
             extras,
         })
+    } else {
+        Err(errors)
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Parses the Wi-Fi-only submission of the fallback portal and applies it to
+/// the `stored` record.
+///
+/// Only `wifi_ssid` and `wifi_pass` are accepted, validated exactly as in
+/// [`parse_form`]; underscore-prefixed keys (the session nonce) are ignored.
+/// Any other key, a canonical field of either profile or an extra, is rejected
+/// with a single body-level [`ValidationError::UnexpectedForProfile`], so the
+/// fallback form cannot change the MQTT broker, the OTA URL, the device name or
+/// the extras.
+///
+/// On success returns a copy of `stored` with the new SSID and password; every
+/// other field, the profile included, is the stored value.
+// The large `Err` is intentional, as on `parse_form`.
+#[allow(clippy::result_large_err)]
+pub fn parse_wifi_form(
+    body: &str,
+    stored: &ProvisioningConfig,
+) -> Result<ProvisioningConfig, FieldErrors> {
+    let mut ssid_slot = Slot::default();
+    let mut pass_slot = Slot::default();
+    let mut form_error: Option<ValidationError> = None;
+
+    for pair in body.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+
+        let key = match percent_decode::<KEY_DECODE_MAX>(raw_key) {
+            Decoded::Ok(k) => k,
+            Decoded::Malformed | Decoded::Overflow => {
+                set_form_error(&mut form_error, ValidationError::MalformedBody);
+                continue;
+            }
+        };
+
+        if key.starts_with('_') {
+            continue;
+        }
+
+        let slot = if key == Field::WifiSsid.form_name() {
+            &mut ssid_slot
+        } else if key == Field::WifiPassword.form_name() {
+            &mut pass_slot
+        } else {
+            set_form_error(&mut form_error, ValidationError::UnexpectedForProfile);
+            continue;
+        };
+
+        let value = match percent_decode::<VALUE_DECODE_MAX>(raw_value) {
+            Decoded::Ok(v) => Some(v),
+            Decoded::Malformed => {
+                set_form_error(&mut form_error, ValidationError::MalformedBody);
+                continue;
+            }
+            Decoded::Overflow => None,
+        };
+
+        if slot.seen {
+            slot.duplicate = true;
+            continue;
+        }
+        slot.seen = true;
+        match value {
+            Some(v) => {
+                let _ = slot.value.push_str(&v);
+            }
+            None => slot.overflowed = true,
+        }
+    }
+
+    let mut errors: FieldErrors = heapless::Vec::new();
+    let mut wifi_ssid: heapless::String<{ crate::wifi::SSID_MAX_LEN }> = heapless::String::new();
+    let mut wifi_password: heapless::String<{ crate::wifi::PASSWORD_MAX_LEN }> =
+        heapless::String::new();
+    validate_wifi_ssid(&ssid_slot, &mut wifi_ssid, &mut errors);
+    validate_wifi_password(&pass_slot, &mut wifi_password, &mut errors);
+    if let Some(error) = form_error {
+        let _ = errors.push(FieldError {
+            field: Field::Form,
+            error,
+        });
+    }
+
+    if errors.is_empty() {
+        let mut config = stored.clone();
+        config.wifi_ssid = wifi_ssid;
+        config.wifi_password = wifi_password;
+        Ok(config)
     } else {
         Err(errors)
     }
@@ -1745,5 +1846,111 @@ mod tests {
         assert!(!rendered.contains(test_psk()));
         assert!(rendered.contains(TEST_MQTT_USER));
         assert!(rendered.contains("broker.local"));
+    }
+
+    // ── Wi-Fi-only fallback form ────────────────────────────────────────
+
+    /// A stored `WifiMqttDevice` record with broker auth, a client ID and an
+    /// extra, so the fallback tests can check that none of it changes.
+    fn stored_wifi_mqtt() -> ProvisioningConfig {
+        let mut body = mqtt_body_with("mqtt_user", TEST_MQTT_USER);
+        body = body.replace(
+            "mqtt_pass=",
+            &alloc::format!("mqtt_pass={}", test_mqtt_psk()),
+        );
+        body = body.replace(
+            "mqtt_client=",
+            &alloc::format!("mqtt_client={TEST_MQTT_CLIENT}"),
+        );
+        body.push_str("&room=kitchen");
+        parse_form(&body, WIFI_MQTT).expect("stored record")
+    }
+
+    #[test]
+    fn wifi_form_replaces_only_the_wifi_fields() {
+        let stored = stored_wifi_mqtt();
+        let body = alloc::format!(
+            "_nonce=0a1b2c3d&wifi_ssid=new+net&wifi_pass={}",
+            test_mqtt_psk()
+        );
+        let cfg = parse_wifi_form(&body, &stored).expect("valid");
+        assert_eq!(cfg.wifi_ssid(), "new net");
+        assert_eq!(cfg.wifi_password(), test_mqtt_psk());
+        assert_eq!(cfg.profile(), WIFI_MQTT);
+        assert_eq!(cfg.mqtt(), stored.mqtt());
+        assert_eq!(cfg.ota_url(), stored.ota_url());
+        assert_eq!(cfg.device_name(), stored.device_name());
+        assert_eq!(cfg.extras(), stored.extras());
+        assert_eq!(stored.wifi_ssid(), TEST_SSID);
+        assert_eq!(stored.wifi_password(), test_psk());
+    }
+
+    #[test]
+    fn wifi_form_accepts_an_open_network() {
+        let stored = stored_wifi_mqtt();
+        let cfg = parse_wifi_form("wifi_ssid=cafe&wifi_pass=", &stored).expect("open");
+        assert_eq!(cfg.wifi_password(), "");
+    }
+
+    #[test]
+    fn wifi_form_rejects_every_other_field() {
+        let stored = stored_wifi_mqtt();
+        let psk = test_mqtt_psk();
+        for extra in [
+            "mqtt_uri=mqtt://other.local:1883",
+            "mqtt_user=other",
+            "ota_url=http://other.local/fw.bin",
+            "dev_name=other",
+            "dev_eui=0011223344556677",
+            "room=hall",
+        ] {
+            let body = alloc::format!("wifi_ssid=net&wifi_pass={psk}&{extra}");
+            let errors = parse_wifi_form(&body, &stored).expect_err(extra);
+            assert!(
+                has_error(&errors, Field::Form, ValidationError::UnexpectedForProfile),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn wifi_form_validates_like_the_full_form() {
+        let stored = stored_wifi_mqtt();
+        let psk = test_mqtt_psk();
+
+        let errors = parse_wifi_form("wifi_ssid=net", &stored).expect_err("no password");
+        assert!(has_error(
+            &errors,
+            Field::WifiPassword,
+            ValidationError::Missing
+        ));
+
+        let errors =
+            parse_wifi_form("wifi_ssid=net&wifi_pass=short", &stored).expect_err("short password");
+        assert!(has_error(
+            &errors,
+            Field::WifiPassword,
+            ValidationError::TooShort { min: 8 }
+        ));
+
+        let body = alloc::format!("wifi_ssid=&wifi_pass={psk}");
+        let errors = parse_wifi_form(&body, &stored).expect_err("empty ssid");
+        assert!(has_error(&errors, Field::WifiSsid, ValidationError::Empty));
+
+        let body = alloc::format!("wifi_ssid=a&wifi_ssid=b&wifi_pass={psk}");
+        let errors = parse_wifi_form(&body, &stored).expect_err("duplicate");
+        assert!(has_error(
+            &errors,
+            Field::WifiSsid,
+            ValidationError::Duplicate
+        ));
+
+        let body = alloc::format!("wifi_ssid=ab%zz&wifi_pass={psk}");
+        let errors = parse_wifi_form(&body, &stored).expect_err("malformed");
+        assert!(has_error(
+            &errors,
+            Field::Form,
+            ValidationError::MalformedBody
+        ));
     }
 }
