@@ -44,7 +44,7 @@
 //! the `profile` key first; a `schema_ver == 1` record (or any record with the
 //! `profile` key absent) is read as
 //! [`SchemaProfile::LorawanFieldDevice`],
-//! so beekeeper-class devices provisioned under v1 are never re-provisioned.
+//! so downstream LoRaWAN devices provisioned under v1 are never re-provisioned.
 
 use anyhow::Context as _;
 

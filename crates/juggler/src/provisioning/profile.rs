@@ -52,7 +52,7 @@ const WIFI_MQTT_FIELDS: [Field; 8] = [
 /// which curated combination it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaProfile {
-    /// Core + LoRaWAN + OTA — the beekeeper field-device schema (unchanged
+    /// Core + LoRaWAN + OTA — the downstream field-device schema (unchanged
     /// from v1).
     LorawanFieldDevice,
     /// Core + MQTT + optional OTA — Wi-Fi credentials, an MQTT broker, an

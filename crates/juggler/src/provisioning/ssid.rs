@@ -100,9 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn beekeeper_prefix() {
-        let ssid = derive_softap_ssid("Beekeeper", &TEST_MAC);
-        assert_eq!(ssid.as_str(), "Beekeeper-AB12");
+    fn downstream_prefix() {
+        let ssid = derive_softap_ssid("Downstream", &TEST_MAC);
+        assert_eq!(ssid.as_str(), "Downstream-AB12");
     }
 
     #[test]

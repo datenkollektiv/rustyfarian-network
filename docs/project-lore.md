@@ -95,6 +95,11 @@ Symptom: `cannot find 'mqtt' in 'esp_idf_svc'` and missing `sys::esp_mqtt_client
 Fix: `[env]` `ESP_IDF_SYS_ROOT_CRATE = "rustyfarian-esp-idf-network"` and `CARGO_WORKSPACE_DIR = { value = "", relative = true }` in `.cargo/config.toml`, then `just clean-idf-sys`.
 A consumer firmware is a real root package, and esp-idf-sys merges `extra_components` from its direct dependencies, so it needs neither.
 
+**ESP-IDF v6.1 defaults to picolibc, so newlib-only sdkconfig keys such as `CONFIG_NEWLIB_NANO_FORMAT` are silently ignored.**
+The generated `out/sdkconfig` has `CONFIG_LIBC_PICOLIBC=y`; a key check against the v6.1 Kconfig does not catch it, because the keys still exist (`CONFIG_NEWLIB_NANO_FORMAT` maps to `CONFIG_LIBC_NEWLIB_NANO_FORMAT` via `esp_libc/sdkconfig.rename`) but `depends on LIBC_NEWLIB`.
+The workspace `sdkconfig*.defaults` set no newlib keys, and the 2026-11-15 v6.1 hardware runs already ran on picolibc.
+Fix: a firmware that relies on newlib keys adds `CONFIG_LIBC_NEWLIB=y`, or drops them; see `docs/features/archive/esp-idf-v6-1-upgrade-v1.md`.
+
 **The Xtensa LLVM backend crashes rustc (`Cannot scavenge register without an emergency spill slot!`, SIGSEGV) on a function with many arguments.**
 Seen 2026-11-04 for `xtensa-esp32-espidf` / `xtensa-esp32s3-espidf` at opt-level 3 (eight-argument IDF MQTT `connect_work`); RISC-V built the same code, and a full clean did not help.
 The error names no function; an LLVM machine-IR dump found it.
@@ -218,6 +223,10 @@ Fix: `esp_idf_svc::sys::fsync(1)` after the last line, then a heartbeat.
 **`IP_EVENT_STA_LOST_IP` (esp-idf-svc 0.53 `IpEvent::DhcpIpDeassigned`) fires only after `CONFIG_ESP_NETIF_IP_LOST_TIMER_INTERVAL`, 120 s by default.**
 `esp_netif_down` arms `esp_netif_ip_lost_timer`; `IP_EVENT_STA_DHCP_DEASSIGNED` comes only from the DHCP client's deinit.
 Fix: gate on `WiFiManager::subscribe_ready` / `is_ready` (association + IP, milliseconds), which is why the MQTT gate uses `LinkSupervisor::subscribe_ready`.
+
+**On ESP-IDF v6.1, esp-idf-svc 0.53 logs `W esp_idf_svc::netif: IpEvent: unknown event ID 9, ignoring` on every connect (and ID 10 on disconnect).**
+v6.1 posts the new `IP_EVENT_NETIF_UP` / `IP_EVENT_NETIF_DOWN`, which 0.53 maps to `Other(i32)` with a warning; nothing else changes.
+Fix: none needed; a bench step must not reject on a bare `W (` warning prefix.
 
 ---
 

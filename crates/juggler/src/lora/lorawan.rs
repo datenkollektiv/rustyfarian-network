@@ -13,7 +13,7 @@
 //! `process()` implementation can advance the real LoRaWAN state machine.
 //!
 //! Until then, `join()`, `send()`, and `process()` compile and return sensible
-//! sentinel values so that beekeeper can boot, log the situation, and continue
+//! sentinel values so that a downstream project can boot, log the situation, and continue
 //! operating with Wi-Fi OTA while LoRa integration is completed.
 
 use super::{LoraConfig, LoraRadio};
@@ -196,7 +196,7 @@ pub struct Downlink {
 /// hardware verification (see HIGH RISK note in `docs/ROADMAP.md`).
 /// The current `process()` implementation returns [`LorawanResponse::NoUpdate`]
 /// until the `PhyRxTx` bridge is completed.
-/// All other parts of the beekeeper firmware continue to function normally.
+/// All other parts of the downstream firmware continue to function normally.
 ///
 /// Deprecated: no code drives this stub. Drive `lorawan-device`'s
 /// `nb_device::Device` with [`super::LorawanPhy`] and [`super::LorawanTimeline`].

@@ -10,9 +10,7 @@ All public APIs are explicitly marked experimental; API stabilization is owned b
 - `docs/adr/011-ota-crate-hosting-and-transport.md` (Accepted; defines four critical decisions: in-workspace hosting, hand-rolled HTTP as internal transport, 1 MiB slots, rollback enabled + 30 s health criterion)
 
 **Also see:**
-- Consumer repo plan: `../rustyfarian-ferriswheel-demo/.claude/plans/we-are-on-a-rippling-metcalfe.md`
-- Consumer repo feature doc: `../rustyfarian-ferriswheel-demo/docs/features/ota-mvp-v1.md`
-- Beekeeper reference impl: `../rustyfarian-beekeeper/src/ota/` (lift sources verified 2026-05-01)
+- Downstream reference impl: the downstream project's `src/ota/` (lift sources verified 2026-05-01)
 
 ## Decisions
 
@@ -20,10 +18,10 @@ All public APIs are explicitly marked experimental; API stabilization is owned b
 |:-------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------------------------------------|
 | Crate hosting                  | Three crates live in `rustyfarian-network` workspace (`crates/ota-pure`, `crates/rustyfarian-esp-idf-ota`, `crates/rustyfarian-esp-hal-ota`)                                                                                                                               | Avoids coupling duplication with Wi-Fi/LoRa; leverages existing `*-pure` + `rustyfarian-esp-{idf,hal}-*` naming convention; extraction later is cheap (`git mv` + `Cargo.toml` rewrite). | Sibling `rustyfarian-ota` repo (rejected: OTA's dependency graph is dominated by networking crates this workspace already pins)         |
 | HTTP transport on bare-metal   | Hand-rolled internal HTTP/1.1 GET client inside `rustyfarian-esp-hal-ota`; strict subset accepting only `HTTP/1.1 200 OK` + single valid `Content-Length`; rejects redirects, `Transfer-Encoding: chunked`, missing/duplicate headers, oversized bodies, incomplete reads. | Keeps "HTTP is out of scope" promise in workspace README; avoids premature `reqwless` adoption; small size budget for MVP demo binary.                                                   | `reqwless` or other off-the-shelf `no_std` HTTP client (rejected: contradicts README, adds dependency not justified by single use case) |
-| Streaming SHA-256 verification | In MVP: lift `StreamingVerifier` to `ota-pure`, chunk-feed from download loop without holding full image in RAM                                                                                                                                                            | Catches corruption early, reduces flash churn on bad downloads, proven in beekeeper                                                                                                      | Defer to hardened: rejected (MVP requirement per consumer lock-in)                                                                      |
+| Streaming SHA-256 verification | In MVP: lift `StreamingVerifier` to `ota-pure`, chunk-feed from download loop without holding full image in RAM                                                                                                                                                            | Catches corruption early, reduces flash churn on bad downloads, proven downstream                                                                                                        | Defer to hardened: rejected (MVP requirement per consumer lock-in)                                                                      |
 | Bare-metal flash writer        | `esp_bootloader_esp_idf::OtaUpdater` (already pinned in workspace at `=0.5.0`)                                                                                                                                                                                             | Direct partition-slot control; test-proven on bare-metal; aligns with esp-hal ecosystem                                                                                                  | Hand-rolled partition writer (rejected: redundant, breaks link to bootloader's rollback state machine)                                  |
 | Public API stability           | All three crates explicitly mark public types as experimental; semver discipline deferred to `ota-library`                                                                                                                                                                 | Unblocks consumer demo delivery; allows implementation-detail pivots until Hardened                                                                                                      | Stabilize immediately (rejected: premature, consumer still iterating on error surfaces)                                                 |
-| Lift verification strategy     | `Version`, `StreamingVerifier`, `bytes_to_hex`, `hex_to_bytes`, `OtaError` verified to exist in beekeeper `src/ota/` as of 2026-05-01; `ImageMetadata` and `OtaState` built fresh                                                                                          | Known-good codebases reduce risk; application-specific types (metadata sidecar parser, backend-neutral state machine) require custom design                                              | Rebuild everything from scratch (rejected: duplicates proven work in beekeeper)                                                         |
+| Lift verification strategy     | `Version`, `StreamingVerifier`, `bytes_to_hex`, `hex_to_bytes`, `OtaError` verified to exist in the downstream `src/ota/` as of 2026-05-01; `ImageMetadata` and `OtaState` built fresh                                                                                          | Known-good codebases reduce risk; application-specific types (metadata sidecar parser, backend-neutral state machine) require custom design                                              | Rebuild everything from scratch (rejected: duplicates proven downstream work)                                                         |
 
 ## Scope
 
@@ -44,7 +42,7 @@ All public APIs are explicitly marked experimental; API stabilization is owned b
    - `session.mark_valid() -> Result<(), OtaError>` — cancel bootloader rollback
    - `session.rollback() -> Result<(), OtaError>` — revert to previous slot
    - Internally wraps `EspOta` / `EspOtaUpdate` from `esp-idf-svc`
-   - HTTP fetched via `esp_idf_svc::http::client::EspHttpConnection` (lifted from beekeeper's `FirmwareDownloader`); HTTPS branch dropped per ADR 011 (plain HTTP only)
+   - HTTP fetched via `esp_idf_svc::http::client::EspHttpConnection` (lifted from the downstream `FirmwareDownloader`); HTTPS branch dropped per ADR 011 (plain HTTP only)
 
 3. **`rustyfarian-esp-hal-ota` (new crate)** — bare-metal no_std, async-only, ~350 LOC
    - Public surface identical to IDF crate, with `async fn fetch_and_apply` / `mark_valid` / `rollback`
@@ -55,7 +53,7 @@ All public APIs are explicitly marked experimental; API stabilization is owned b
 **Out of scope (deferred to `ota-hardened` or `ota-library`):**
 
 - TLS / HTTPS transport (plain HTTP only)
-- Ed25519 signature verification (`SignatureVerifier` from beekeeper)
+- Ed25519 signature verification (`SignatureVerifier` from the downstream project)
 - Brown-out safety / power-loss recovery
 - Automated rollback test in CI
 - Multi-device concurrency / fleet rollout
@@ -178,12 +176,12 @@ heapless = { workspace = true }
 
 ### Lift Sources
 
-- `Version` ← `../rustyfarian-beekeeper/src/ota/state.rs:7-79` (keep `core::fmt` impl, drop `String` in error paths for no_std)
+- `Version` ← downstream `src/ota/state.rs:7-79` (keep `core::fmt` impl, drop `String` in error paths for no_std)
 - `StreamingVerifier` ← `verifier.rs:66-122` (adjust `bytes_to_hex` to return fixed-buffer `heapless::String<64>` instead of `String`)
 - `bytes_to_hex` / `hex_to_bytes` ← `verifier.rs:169,199` (rework `bytes_to_hex` for fixed buffer)
 - `OtaError` (trim to 8 MVP variants) ← `error.rs` (drop Wi-Fi / signature / power variants)
-- `ImageMetadata` — **built fresh** (no equivalent in beekeeper; parses `.bin.sha256` hex string + `.bin.version` semver string)
-- `OtaState` — **built fresh** (beekeeper's manager enum too coupled to async flow; new design is backend-neutral)
+- `ImageMetadata` — **built fresh** (no downstream equivalent; parses `.bin.sha256` hex string + `.bin.version` semver string)
+- `OtaState` — **built fresh** (the downstream manager enum too coupled to async flow; new design is backend-neutral)
 
 ### Test Coverage
 
@@ -251,7 +249,7 @@ pub struct OtaSessionConfig {
 ### HTTP Client
 
 The IDF crate uses `esp_idf_svc::http::client::EspHttpConnection` directly — no hand-rolled parser is needed because `esp-idf-svc` already handles HTTP/1.1 framing, headers, and body length.
-Plain HTTP only per ADR 011 (HTTPS branch present in beekeeper's `FirmwareDownloader` is removed; future TLS support belongs to `ota-hardened`).
+Plain HTTP only per ADR 011 (HTTPS branch present in the downstream `FirmwareDownloader` is removed; future TLS support belongs to `ota-hardened`).
 Status code is checked explicitly: anything other than `200` returns `OtaError::DownloadFailed { status }`.
 
 ### Cargo.toml
@@ -274,11 +272,11 @@ log.workspace = true
 
 ### Lift Sources
 
-- `FirmwareDownloader` ← `../rustyfarian-beekeeper/src/ota/downloader.rs:18-148` (keep HTTP client abstraction, adapt to blocking `TcpStream`)
+- `FirmwareDownloader` ← downstream `src/ota/downloader.rs:18-148` (keep HTTP client abstraction, adapt to blocking `TcpStream`)
 - `FirmwareFlasher` + `OtaWriter` ← `flasher.rs` (1:1 onto `EspOta::initiate_update` / `EspOtaUpdate::write`)
 - `create_http_connection` ← `manager.rs:469-521` (blocking socket version; drop HTTPS branch per ADR 011)
 
-### Dropped from Beekeeper
+### Dropped from the downstream project
 
 - Battery guard, LoRaWAN dispatch, async flow `OtaState` enum, retry/backoff loop, Ed25519 verification
 - `MqttManager` integration for lifecycle topics (app concern)
@@ -515,10 +513,10 @@ Under `## [Unreleased]`, add to the `### Added` section:
 ## Open Questions
 
 None identified as of 2026-05-01.
-The four ADR 011 decisions fully constrain the design; consumer feature doc and beekeeper reference impl cover all ambiguities.
+The four ADR 011 decisions fully constrain the design; consumer feature doc and downstream reference impl cover all ambiguities.
 
 ## Session Log
 
-**2026-05-01** — Feature design doc created from the upstream "OTA MVP in three crates" request, locked by ADR 011, beekeeper lift inventory completed. Four crates' public surface, Cargo.toml patterns, lift sources, HTTP strictness constraint, stage gates, and workspace integration all specified. Ready for Stage 1 implementation.
+**2026-05-01** — Feature design doc created from the upstream "OTA MVP in three crates" request, locked by ADR 011, downstream lift inventory completed. Four crates' public surface, Cargo.toml patterns, lift sources, HTTP strictness constraint, stage gates, and workspace integration all specified. Ready for Stage 1 implementation.
 
 **2026-05-05** — All three stages delivered on the `ota-mvp` branch (commits `b5a2445`, `9a55c0c`, plus PR-review follow-ups). Public surface matches the design above with two additions surfaced during implementation: `EspHalOtaManager::new(config, FLASH<'d>)` takes the FLASH peripheral (`esp-storage 0.9` consumes it at construction) instead of the zero-arg shape originally sketched, and `OtaError::DownloadFailed { status: 0 }` is reserved as a sentinel for protocol-shape rejections from the bare-metal HTTP client. PR-review follow-ups also tightened error-mapping (read-error → `ServerUnreachable`, early-EOF → `DownloadFailed { status: 0 }`, rollback-failure → `FlashWriteFailed`), added an internal `log::warn!` at the `HttpError` → `OtaError` boundary, and tagged all three crates as **experimental API** in CHANGELOG and README. `just verify`, `just test-ota` (37/37), `just test-ota-hal` (33/33) all green. Archived.
