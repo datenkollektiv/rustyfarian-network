@@ -444,8 +444,8 @@ mod tests {
     #[test]
     fn broker_host_is_a_literal_or_a_name() {
         assert_eq!(
-            parse_broker_host("192.168.31.5"),
-            Ok(BrokerHost::Ipv4(core::net::Ipv4Addr::new(192, 168, 31, 5)))
+            parse_broker_host("192.168.1.5"),
+            Ok(BrokerHost::Ipv4(core::net::Ipv4Addr::new(192, 168, 1, 5)))
         );
         assert_eq!(
             parse_broker_host("broker.local"),

@@ -213,7 +213,7 @@ pub enum ApSelection {
 
 /// The AP a station associated with, as both tiers log it on every link up.
 ///
-/// `Display` gives the shared text, e.g. `bssid 72:d7:9a:ca:b9:44, ch 11, rssi -21 dBm`,
+/// `Display` gives the shared text, e.g. `bssid 02:00:00:ca:fe:01, ch 11, rssi -21 dBm`,
 /// so a weak or far AP shows in the log rather than only in the router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinedAp {
@@ -954,13 +954,13 @@ mod tests {
     #[test]
     fn joined_ap_display_is_the_shared_log_text() {
         let ap = JoinedAp {
-            bssid: [0x72, 0xd7, 0x9a, 0x0c, 0xb9, 0x04],
+            bssid: [0x02, 0x00, 0x00, 0x0c, 0xfe, 0x04],
             channel: 11,
             rssi: -21,
         };
         assert_eq!(
             alloc::format!("{ap}"),
-            "bssid 72:d7:9a:0c:b9:04, ch 11, rssi -21 dBm"
+            "bssid 02:00:00:0c:fe:04, ch 11, rssi -21 dBm"
         );
     }
 

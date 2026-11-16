@@ -211,7 +211,7 @@ Runs up to the C6 runs of 2026-11-10 used a local rustyfarian-bench checkout (`R
 4. Coordinator `idf_c6_espnow_coordinator`; the earlier runs that night failed with the scout at the driver's 20 dBm.
 5. 32 KiB main stack, 16 KB httpd stack; env defaults with an empty password on the first visit, stored values with an empty password after the re-entry; the rgb-clock 8000 B half was removed on 2026-11-11.
 6. Includes the 16 KB httpd stack and the 2 s BOOT window; a second consumer passed all 7 `WifiMqttBoot::load_with_reentry` cases on an ESP32-C3-DevKitM-1 on 2026-10-30.
-7. New check, the 0.7.0 subset on one board after a full erase; broker and image server on the Mac (192.168.40.146); statuses in `tmp/bench-ota-status.log`.
+7. New check, the 0.7.0 subset on one board after a full erase; broker and image server on the Mac; statuses in `tmp/bench-ota-status.log`.
 8. Unattended halves `-084625.log`, `-084710.log`.
 9. Coordinator: hal C6 on the shared echo app; the 15 s settle step was added after the 08:36 run, whose first finds wandered while the C6 still scanned for its AP.
 10. Coordinator `hal_c6_espnow_sta_coordinator` instead of a second ESP-IDF C3 (all flood, shutdown and txpower rows).
@@ -224,10 +224,10 @@ Runs up to the C6 runs of 2026-11-10 used a local rustyfarian-bench checkout (`R
 17. Against `idf_c6_espnow_coordinator`; the ESP-IDF peer against the same coordinator passed as an extra, `idf_c3_espnow_peer-20261111-235324.log`.
 18. Against `hal_c6_espnow_sta_coordinator`; the esp-hal peer passed as an extra, `hal_c3_espnow_peer-20261112-000025.log`.
 19. `hal_c3_ota-20261112-000839.log` (2.0.0), `-001058.log` (rollback), `-001228.log` (3.0.0).
-20. Image server `just ota-serve` on the Mac (192.168.40.146:8000) instead of a 192.168.31.x host.
+20. Image server `just ota-serve` on the Mac (port 8000) instead of a host in the board subnet.
 21. An earlier phone-form submission that night committed and reloaded too (`extras=0`, the form sends no extras).
-22. Board 192.168.31.238 to the broker 192.168.40.146:1883 through a UniFi rule for TCP 1883; T5a run as a device block; in an earlier attempt the T3 will came 43 s after the unplug.
-23. `bench-broker` is a UniFi DNS record for the local broker; the IPv4 literal is every other MQTT run.
+22. Board to the broker on the Mac through a router rule for TCP 1883; T5a run as a device block; in an earlier attempt the T3 will came 43 s after the unplug.
+23. `bench-broker` is a router DNS record for the local broker; the IPv4 literal is every other MQTT run.
 24. 2026-11-10: the v5.5.5 bump moves to the next release together with `rustyfarian-esp-idf-ws2812` (v0.9.0 still pins v5.3.3), so 0.7.0 ships on v5.3.3.
 25. The 2026-11-11 09:45 reruns of both tiers timed out waiting for the first broker session.
 26. `hal_esp32s3_mqtt_lwt-20261111-003838.log` (attended), `-20261110-235333.log` (unattended).
@@ -235,7 +235,7 @@ Runs up to the C6 runs of 2026-11-10 used a local rustyfarian-bench checkout (`R
 28. `hal_esp32s3_mqtt_lwt-20261111-001115.log` (also `-091140.log`, `-20261112-010625.log`).
 29. Open AP `bench-s3-portal` (`PORTAL_SSID_OVERRIDE`); the first `curl` timed out before the SoftAP lease.
 30. `hal_esp32s3_ota-20261111-021206.log`, `-021327.log`, `-021511.log`; manual run `hal_esp32s3_ota-manual-20261111-*.log`.
-31. Server on the Mac after a UniFi rule for TCP 8000; first failed twice (no TCP connect, then `BadStatusLine` on `HTTP/1.0`), both fixed in this run.
+31. Server on the Mac after a router rule for TCP 8000; first failed twice (no TCP connect, then `BadStatusLine` on `HTTP/1.0`), both fixed in this run.
 32. Flat with the `PendingAcks` cap, against 2136 B of drift on 2026-11-08 and 2148 B on 2026-11-03.
     The drift was `PendingAcks::early`, not the per-connect helper thread stacks, whose reconnect minimum-heap peak stays open.
     The app prints the free heap, not the minimum.

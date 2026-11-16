@@ -36,9 +36,10 @@ hal_dir := if shell('scripts/ramdisk-mounted.sh "$1"', ramdisk) == "true" { ramd
 idf_dir := if shell('scripts/ramdisk-mounted.sh "$1"', ramdisk) == "true" { ramdisk + "/targets/idf/" + file_name(justfile_directory()) } else { "target/idf" }
 
 # Guided bench runner: a local rustyfarian-bench checkout if RUSTYFARIAN_BENCH points at one,
-# otherwise the pinned release from GitHub (the scenarios need >= v0.5.0 for `probe`, `run`, `setup`/`teardown` and prompt placeholders).
+# otherwise the pinned release from GitHub (the scenarios need >= v0.5.0 for `probe`, `run`, `setup`/`teardown` and prompt placeholders,
+# `pi-submit` needs >= v0.6.0 for `submit` and the `image` command).
 bench_dir := env("RUSTYFARIAN_BENCH", "")
-bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.5.0 rustyfarian-bench" }
+bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-bench' } else { "uvx --from git+https://github.com/datenkollektiv/rustyfarian-bench@v0.6.0 rustyfarian-bench" }
 
 # act: a local rustyfarian-ci checkout if RUSTYFARIAN_CI points at one, otherwise the pushed @v1.
 ci_dir := env("RUSTYFARIAN_CI", "")
@@ -533,6 +534,26 @@ ensure-bootloader chip variant="generic":
 flash example:
     scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
+# build a named example and save its merged whole-flash image to <image>: the IDF-built bootloader at 0x0, the partition
+# table and the app, with the same chip, bootloader and partition table as `just flash`, padded to the flash size (blanks
+# NVS and otadata). It is the bench `image` command: `rustyfarian-bench submit` uploads the file and the remote bench
+# writes it with `espflash write-bin 0x0`. An image can hold Wi-Fi credentials (build-time `option_env!`), and the
+# bench keeps uploaded images in its outbox until cleared by hand
+[doc('build a named example and save its merged whole-flash image (bootloader at 0x0) to a file')]
+[group('examples')]
+save-image example image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "$(dirname "{{ image }}")"
+    # exit 1 = inside the repo and not ignored; 0 = ignored, 128 = outside the repo
+    rc=0
+    git check-ignore -q "{{ image }}" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 1 ]; then
+        printf 'save-image: %s would be tracked by git and may hold Wi-Fi credentials; save it under tmp/ or outside the repo\n' "{{ image }}" >&2
+        exit 1
+    fi
+    FLASH_SAVE_IMAGE="{{ image }}" scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
+
 # build, flash, and open the serial monitor (run without args to list examples)
 [group('examples')]
 run *example:
@@ -578,6 +599,16 @@ ports:
 [group('examples')]
 bench target *args:
     {{ bench }} --repo . run "{{ target }}" {{ args }}
+
+# submit a bench check to the remote bench, e.g. `just pi-submit c3 hal_c3_connect_async --wait`: rustyfarian-bench
+# `submit` builds the example, saves its image with `just save-image` and uploads it; the bench URL, token and optional
+# CA come from the secrets file (RUSTYFARIAN_BENCH_URL, RUSTYFARIAN_BENCH_TOKEN, RUSTYFARIAN_BENCH_CA_B64), see
+# scripts/bench-remote-env.sh
+[doc('submit a bench check to the remote bench (URL, token and CA from the secrets file)')]
+[group('examples')]
+[positional-arguments]
+pi-submit board example *args:
+    scripts/bench-remote-env.sh "{{ secrets_env }}" {{ bench }} --repo . submit "$@"
 
 # list the bench scenarios
 [group('examples')]
@@ -763,7 +794,7 @@ flash-ota-baseline example baseline target_version ota_host:
 
 # bench OTA round trip: build the served image (unhealthy when the check name contains `rollback`), export the
 # baseline's build-time variables for the runner's build step, then run the bench check, e.g.
-# `just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 192.168.40.146 --port /dev/cu.usbmodem2101`
+# `just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 <server-ip> --port /dev/cu.usbmodem2101`
 [doc('bench OTA round trip: build the served image, export the baseline build-time variables, run the bench check')]
 [group('ota')]
 bench-ota board check example baseline target_version ota_host *args:

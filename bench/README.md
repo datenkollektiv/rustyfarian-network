@@ -30,6 +30,61 @@ just bench s3 --attended
 - Logs and `results.jsonl` under `<board>/` are git-ignored (they record board MACs), so the committed record of a single check is its row in the release runbook's results table: verdict, date, git revision, board and log path.
 - A board's "Last full pass" gets the date once `--unattended` and `--attended` both passed on it, never ahead of the run; until then it reads `open`.
 
+## Remote bench
+
+`just pi-submit` runs a check on the remote bench instead of a board attached to this machine.
+
+```bash
+just pi-submit c3 hal_c3_connect_async --wait
+```
+
+- `rustyfarian-bench submit` builds the example, saves its whole-flash image through `just save-image` into a temporary directory and uploads it.
+- The image holds the build-time Wi-Fi credentials, and the remote bench keeps uploaded images until they are cleared by hand.
+- `just save-image <example> <path>` refuses a path inside the repository that git would track; use `tmp/` or a path outside the repository.
+- The bench settings come from the environment first, otherwise from the SOPS secrets file (`scripts/bench-remote-env.sh`):
+
+| Key                        | Required | Meaning                                                    |
+|:---------------------------|:---------|:-----------------------------------------------------------|
+| `RUSTYFARIAN_BENCH_URL`    | yes      | Bench host, e.g. `https://bench.example.net:8443`          |
+| `RUSTYFARIAN_BENCH_TOKEN`  | yes      | Bearer token                                               |
+| `RUSTYFARIAN_BENCH_CA_B64` | no       | Base64 of the bench's private CA certificate (PEM)         |
+
+- An exported `RUSTYFARIAN_BENCH_CA` (a PEM file path) wins over `RUSTYFARIAN_BENCH_CA_B64`.
+- The secrets file is decrypted only when the URL or the token is missing; with both exported, also export the CA if the bench needs one.
+
+## Secrets setup (SOPS + age)
+
+The remote bench and the router automation read their settings from `shared-secrets/secrets.env`, a SOPS-encrypted dotenv file.
+`shared-secrets/`, `secrets/` and `.sops.yaml` are git-ignored, because this repository is public; each contributor sets them up once.
+
+1. Install the tools with `brew install sops age jq` and create an age key with `age-keygen`.
+2. Point SOPS at the key: export `SOPS_AGE_KEY_FILE` (for example in `.envrc`).
+3. Create `.sops.yaml` in the repository root with your age public key as recipient for `shared-secrets/*.env`:
+
+```yaml
+creation_rules:
+  - path_regex: (^|/)shared-secrets/.*\.(env|json)$
+    key_groups:
+      - age:
+          - age1yourpublickey
+```
+
+4. Run `just secrets-edit`, which creates the file on first use and never writes plaintext to disk.
+5. Run `just doctor`; its router section reports the SOPS rules, the age key and whether the secrets file decrypts.
+
+- After a recipient change in `.sops.yaml`, run `just secrets-updatekeys`.
+- `just decrypt` and `just encrypt` exist for hand edits, but leave plaintext on disk in between.
+
+## Router automation (optional)
+
+`just router block|unblock|status <mac>` lets router steps run with `--unattended`; without it, run them with `--attended` and block the board by hand.
+
+- `ROUTER_BENCH_MACS` in the secrets file lists the only MACs the recipe acts on, so a typo cannot lock out this machine or the broker.
+- The router-specific code is a machine-local, executable backend script, never committed: export `ROUTER_BACKEND` (for example in `.envrc`) with its path.
+- `scripts/router.sh` calls it as `<backend> <action> <mac>` inside `sops exec-env`, so the backend reads its `ROUTER_*` values (host, credentials) from the environment.
+- `status` must print `<mac> blocked` or `<mac> not blocked`.
+- There is no fallback: with `ROUTER_BACKEND` unset, `just router` fails, and `just doctor` reports it.
+
 ## Writing a check
 
 - A step that needs a person and has no `confirm` carries `attended = true`, or `--unattended` waits on it until it times out.

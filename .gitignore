@@ -31,6 +31,9 @@ bench/*/results.jsonl
 # Tool output captures
 .output.txt
 
+# local session hand-off note
+continue-here.md
+
 # Temporary script output — use tmp/ for ad-hoc script results
 tmp/*
 !tmp/.gitkeep

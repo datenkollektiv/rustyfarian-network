@@ -8,8 +8,8 @@
 //! OTA example; this file is setup only (heap, Wi-Fi, tasks).
 //!
 //! The server must be reachable from the device: the `iot` SSID isolates clients, so the Mac
-//! cannot serve the image. Run the server on a 192.168.31.x host such as the broker host
-//! 192.168.31.185 (copy `target/ota/` there and run `just ota-serve`).
+//! cannot serve the image. Run the server on a host the board can reach, such as the broker host
+//! (copy `target/ota/` there and run `just ota-serve`).
 //!
 //! # Runbook
 //!
@@ -18,7 +18,7 @@
 //!
 //! ```sh
 //! just ota-image 2.0.0 hal_esp32s3_ota
-//! just flash-ota-baseline hal_esp32s3_ota 1.0.0 2.0.0 192.168.31.185
+//! just flash-ota-baseline hal_esp32s3_ota 1.0.0 2.0.0 <server-ip>
 //! ```
 //!
 //! Boot 1 (1.0.0) marks itself valid, sees the newer target, downloads, verifies, activates and
