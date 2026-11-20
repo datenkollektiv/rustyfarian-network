@@ -1,7 +1,8 @@
 //! OTA wire contract: the command, manifest and status JSON that an OTA
 //! consumer exchanges with its backend, plus the frozen `failed` reason codes.
 //!
-//! Enabled by the `ota-wire` feature (implies `ota`, needs `alloc`).
+//! The command, manifest and status types are enabled by the `ota-wire` feature (implies `ota`, needs `alloc`).
+//! The base `ota` feature enables only [`FailReason`], which the DDI feedback encoder (`ota::ddi::wire`) shares, and [`RollbackReason`], which the record store (`ota::persist`) shares; their serde impls need `ota-wire` or `ota-ddi`.
 //! The shapes are the first consumer's (rustyfarian-rgb-clock) and must stay byte-compatible.
 //!
 //! # Limits
@@ -21,22 +22,30 @@
 //!
 //! `Manifest::parse` validates the URL, so a manifest with a bad URL reports `manifest_invalid` even when its target is also wrong; the target is only checked afterwards.
 
+#[cfg(feature = "ota-wire")]
 mod command;
+#[cfg(feature = "ota-wire")]
 mod manifest;
 mod reason;
 mod rollback;
+#[cfg(feature = "ota-wire")]
 mod status;
+#[cfg(feature = "ota-wire")]
 mod url;
 
+#[cfg(feature = "ota-wire")]
 pub use command::{CommandError, OtaCommand, MAX_COMMAND_BYTES};
+#[cfg(feature = "ota-wire")]
 pub use manifest::{Manifest, ManifestError, MAX_MANIFEST_BYTES};
 pub use reason::FailReason;
 pub use rollback::RollbackReason;
+#[cfg(feature = "ota-wire")]
 pub use status::{OtaStatus, StatusError};
 
 /// Line and column (both 1-based) of the first byte that is not ASCII whitespace, or 1/1 when there is none.
 ///
 /// Used for the early "not a JSON object" rejection so the position matches `serde_json`'s convention without reading any payload text.
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 pub(crate) fn first_token_position(bytes: &[u8]) -> (usize, usize) {
     let (mut line, mut column) = (1, 1);
     for &b in bytes {
@@ -53,7 +62,7 @@ pub(crate) fn first_token_position(bytes: &[u8]) -> (usize, usize) {
     (1, 1)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "ota-wire", feature = "ota-ddi")))]
 mod position_tests {
     use super::first_token_position;
 

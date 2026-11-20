@@ -57,6 +57,27 @@ pub fn put_counter(kv: &FaultKv, ctr: u32) {
     kv.put_u32("att_epoch", EPOCH).put_u32("att_ctr", ctr);
 }
 
+/// Writes a DDI action record: `ddi_act`, `ddi_stage` and whichever optional keys are given.
+pub fn put_ddi(kv: &FaultKv, act: &str, stage: u8, att: Option<u32>, code: Option<u32>) {
+    kv.put_str("ddi_act", act).put_u8("ddi_stage", stage);
+    if let Some(att) = att {
+        kv.put_u32("ddi_att", att);
+    }
+    if let Some(code) = code {
+        kv.put_u32("ddi_code", code);
+    }
+}
+
+/// Every key of the DDI action record.
+pub const DDI_KEYS: [&str; 6] = [
+    "ddi_act",
+    "ddi_stage",
+    "ddi_att",
+    "ddi_code",
+    "ddi_det0",
+    "ddi_det1",
+];
+
 pub fn put_request(kv: &FaultKv, id: u32, why: &str, from: &str) {
     kv.put_u32("rq_id", id)
         .put_str("rq_why", why)

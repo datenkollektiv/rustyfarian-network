@@ -212,6 +212,9 @@ A copy outside the RAM disk keyed by chip and IDF version is unimplemented; keep
 Looks like a hang with no panic or reboot; the line appears at the start of the next boot.
 Fix: `esp_idf_svc::sys::fsync(1)` after the last line, then a heartbeat.
 
+**An ESP32-C6-DevKitC-1's USB single-serial socket can fail every espflash flash-stub `MemData` command with `Other (0x1)` while its native USB-JTAG socket works.**
+No-stub writes also needed a lower baud and left erase and runner detection unsupported; switch to the native USB-C socket and use the normal helpers instead of adding tooling workarounds.
+
 ---
 
 ## ESP-IDF Event Loop (`esp-idf-svc`)
@@ -352,6 +355,23 @@ The manager wrote the `GET` onto an unconnected socket; it also accepted only `H
 Only a pending report (`rb == 1`) is adopted; regression tests in `crates/juggler/src/ota/persist/tests/counter_loss.rs`.
 
 **Any OTA status can arrive twice (QoS 1 resend after 1 s, triggered by the ~6.5 s partition erase) — see `docs/runbooks/ota-hardware-test.md`.**
+
+**`scripts/check-library-never-reboots.sh` scans a fixed list of directories, so a module moved out of `crates/juggler/src/ota/runtime/` silently leaves the no-restart guard.**
+`just verify` stays green because the guard only reports matches, never coverage.
+Fix: add the new path to `runtime_dirs` in the same commit as the move (the loop tests `-e`, so a single file works); `juggler/src/ota/health.rs` and the IDF `src/ota/ddi/` went in this way.
+
+**A DDI verdict is written before its attempt is cleared, so a failed clear leaves stage 2 (verdict pending) with `ddi_att` still bound to a stored attempt — see rustdoc of `OtaStore::cancel_target`.**
+In that state `pending_verdict()` is `None` (the attempt exists) and `running_ddi_action()` is `None` (the stage is not running), so a lookup keyed on either misreads the action as "nothing ran" and acknowledges a cancel that must be rejected.
+
+**`BootOutcome::records_suspect()` is true for any `FailedClosed(BootFault::Store(_))`, a transient `StoreError::Kv` included; it does not mean a record is corrupt.**
+The 1005 `records_unreadable` report keys on what `repair_all` dropped or could not finish (`juggler::ota::health::repair_report_owed`), never on the boot flag alone.
+
+**`DdiResponse` and `RequestOutcome` derive `Debug` and print the whole server-supplied body.**
+Runtime logs print the status and the failure kind, never `{outcome:?}`.
+
+**ESP-IDF can omit a non-default port from the HTTP `Host` header, so hawkBit builds links on the scheme's default port and the DDI origin check rejects them.**
+The proxy sees `Host: <lab-host>` even when `DDI_BASE_URL` uses `<lab-host>:8090`; the refused first link can put once-per-boot `configData` ahead of the first successful poll and stall the baseline's ordered expectations.
+Fix: `scripts/ddi-lab-proxy.py` restores its listener port in the forwarded `Host` header.
 
 ---
 

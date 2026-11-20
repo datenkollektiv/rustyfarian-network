@@ -27,6 +27,7 @@
 //! decode buffers and reported as length errors. Every `heapless` push is
 //! handled — there are no `unwrap`s on capacity.
 
+use crate::identity::{is_device_id, is_target_token};
 use crate::mqtt::{validate_client_id, CLIENT_ID_MAX_LEN};
 
 #[cfg(test)]
@@ -37,6 +38,7 @@ use crate::provisioning::config::{
     MQTT_USER_MAX_LEN, OTA_URL_MAX_LEN,
 };
 use crate::provisioning::error::{Field, FieldError, FieldErrors, ValidationError};
+use crate::provisioning::identity::{IdentityRule, DDI_TOKEN_KEY};
 use crate::provisioning::profile::{LoraFields, MqttFields, SchemaProfile};
 
 /// Largest decoded value the parser will buffer (bytes).
@@ -193,30 +195,58 @@ fn is_cross_profile(profile: SchemaProfile, key: &str) -> bool {
 /// Experimental: API may change before 1.0.
 ///
 /// Parses an `application/x-www-form-urlencoded` provisioning submission under
-/// `profile`.
-///
-/// On success returns a fully validated [`ProvisioningConfig`] whose profile
-/// matches `profile`. On failure returns the accumulated [`FieldErrors`]: at
-/// most one error per canonical field of the active profile (up to eight for
-/// `WifiMqttDevice`) plus at most one [`Field::Form`]-level error (the first
-/// body-level problem wins), keeping the `9`-entry capacity exact.
-///
-/// A field canonical only to the *other* profile is rejected with a single
-/// body-level [`ValidationError::UnexpectedForProfile`] rather than folded into
-/// extras.
-///
-/// See the [module docs](self) for the reserved-key and never-panics
-/// guarantees.
+/// `profile` with [`IdentityRule::Open`]; see [`parse_form_with`].
 // `FieldErrors` is a heapless aggregate of per-field errors; in this `no_std`
 // crate there is no allocator to box it, so the large `Err` variant is
 // intentional (same rationale as the `clippy::large_enum_variant` allow on
 // `LorawanResponse`). Only fires on 64-bit hosts; harmless on the 32-bit target.
 #[allow(clippy::result_large_err)]
 pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConfig, FieldErrors> {
+    parse_form_with(body, profile, IdentityRule::Open)
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Parses an `application/x-www-form-urlencoded` provisioning submission under
+/// `profile` and `identity`.
+///
+/// On success returns a fully validated [`ProvisioningConfig`] whose profile
+/// matches `profile`. On failure returns the accumulated [`FieldErrors`]: at
+/// most one error per canonical field of the active profile (up to eight for
+/// `WifiMqttDevice`), one for the reserved `ddi_token` extra
+/// ([`Field::DdiToken`]) plus at most one [`Field::Form`]-level error (the
+/// first body-level problem wins), keeping the
+/// [`MAX_FIELD_ERRORS`](crate::provisioning::MAX_FIELD_ERRORS) capacity exact.
+///
+/// A field canonical only to the *other* profile is rejected with a single
+/// body-level [`ValidationError::UnexpectedForProfile`] rather than folded into
+/// extras.
+///
+/// The extra `ddi_token` ([`DDI_TOKEN_KEY`]) is reserved: when present it must
+/// be 32 to 64 lowercase hex characters ([`ValidationError::InvalidToken`],
+/// also for a value past the extra-value cap, never a form-level error).
+/// [`IdentityRule::Ddi`] binds the `WifiMqttDevice` profile only
+/// ([`IdentityRule::applies_to`]): there the token is required, the device
+/// name must be a device id ([`ValidationError::InvalidDeviceId`]),
+/// `mqtt_user` must equal it and `mqtt_client` must be blank or equal it
+/// ([`ValidationError::MustEqualDeviceName`]); a device name that already
+/// failed its own checks suppresses the equality errors. A
+/// `LorawanFieldDevice` form, which has no token input, runs as under `Open`.
+///
+/// See the [module docs](self) for the reserved-key and never-panics
+/// guarantees.
+// The large `Err` is intentional, as on `parse_form`.
+#[allow(clippy::result_large_err)]
+pub fn parse_form_with(
+    body: &str,
+    profile: SchemaProfile,
+    identity: IdentityRule,
+) -> Result<ProvisioningConfig, FieldErrors> {
     let fields = profile.fields();
     let mut slots: [Slot; MAX_CANONICAL_FIELDS] = Default::default();
     let mut extras: heapless::Vec<ExtraField, EXTRA_FIELDS_MAX> = heapless::Vec::new();
     let mut form_error: Option<ValidationError> = None;
+    let mut token_too_long = false;
 
     for pair in body.split('&') {
         if pair.is_empty() {
@@ -269,6 +299,18 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
             continue;
         }
 
+        // The reserved token extra reports its own length problem on
+        // `Field::DdiToken` instead of a misleading form-level error.
+        if key.as_str() == DDI_TOKEN_KEY {
+            match value {
+                Some(v) if v.len() <= EXTRA_VALUE_MAX_LEN => {
+                    insert_extra(&mut extras, &mut form_error, &key, &v)
+                }
+                _ => token_too_long = true,
+            }
+            continue;
+        }
+
         match value {
             Some(v) => insert_extra(&mut extras, &mut form_error, &key, &v),
             None => set_form_error(&mut form_error, ValidationError::MalformedBody),
@@ -307,8 +349,9 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
                 validate_ota_url(slot, ota_url_required(profile), &mut ota_url, &mut errors)
             }
             Field::DeviceName => validate_device_name(slot, &mut device_name, &mut errors),
-            // MqttPass is validated jointly with MqttUser below.
-            Field::MqttUser | Field::MqttPass | Field::Form => {}
+            // MqttPass is validated jointly with MqttUser below; DdiToken is an
+            // extra, checked in `validate_identity`, never a canonical slot.
+            Field::MqttUser | Field::MqttPass | Field::DdiToken | Field::Form => {}
         }
     }
 
@@ -345,6 +388,15 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
         None
     };
 
+    validate_identity(
+        identity.applies_to(profile),
+        &device_name,
+        mqtt.as_ref(),
+        &extras,
+        token_too_long,
+        &mut errors,
+    );
+
     if let Some(error) = form_error {
         let _ = errors.push(FieldError {
             field: Field::Form,
@@ -364,6 +416,65 @@ pub fn parse_form(body: &str, profile: SchemaProfile) -> Result<ProvisioningConf
         })
     } else {
         Err(errors)
+    }
+}
+
+/// `true` when `field` already carries an error.
+fn has_field_error(errors: &FieldErrors, field: Field) -> bool {
+    errors.iter().any(|e| e.field == field)
+}
+
+/// The identity checks of [`parse_form_with`]: the reserved `ddi_token` extra
+/// under every rule, and under [`IdentityRule::Ddi`] the device-id grammar and
+/// the equality of the MQTT username and client id with the device name.
+///
+/// Runs after the per-field validators, so every error here lands on a field
+/// that has none yet and the capacity proof of [`push_field_error`] holds.
+fn validate_identity(
+    ddi: bool,
+    device_name: &str,
+    mqtt: Option<&MqttFields>,
+    extras: &[ExtraField],
+    token_too_long: bool,
+    errors: &mut FieldErrors,
+) {
+    let token = super::config::find_extra(extras, DDI_TOKEN_KEY);
+    match token {
+        _ if token_too_long => {
+            push_field_error(errors, Field::DdiToken, ValidationError::InvalidToken)
+        }
+        Some("") => push_field_error(errors, Field::DdiToken, ValidationError::Empty),
+        Some(t) if !is_target_token(t) => {
+            push_field_error(errors, Field::DdiToken, ValidationError::InvalidToken)
+        }
+        Some(_) => {}
+        None if ddi => push_field_error(errors, Field::DdiToken, ValidationError::Missing),
+        None => {}
+    }
+
+    if !ddi || has_field_error(errors, Field::DeviceName) {
+        return;
+    }
+    if !is_device_id(device_name) {
+        push_field_error(errors, Field::DeviceName, ValidationError::InvalidDeviceId);
+    }
+    if let Some(mqtt) = mqtt {
+        if !has_field_error(errors, Field::MqttUser) && mqtt.username() != Some(device_name) {
+            push_field_error(
+                errors,
+                Field::MqttUser,
+                ValidationError::MustEqualDeviceName,
+            );
+        }
+        if !has_field_error(errors, Field::MqttClient)
+            && mqtt.client_id().is_some_and(|id| id != device_name)
+        {
+            push_field_error(
+                errors,
+                Field::MqttClient,
+                ValidationError::MustEqualDeviceName,
+            );
+        }
     }
 }
 
@@ -507,10 +618,11 @@ fn insert_extra(
     }
 }
 
-/// Pushes a per-field error, ignoring capacity (the `9`-entry bound is proven
+/// Pushes a per-field error, ignoring capacity (the
+/// [`MAX_FIELD_ERRORS`](crate::provisioning::MAX_FIELD_ERRORS) bound is proven
 /// sufficient by construction: at most one error per canonical field of the
-/// active profile — up to eight for `WifiMqttDevice` — plus one form-level
-/// error).
+/// active profile — up to eight for `WifiMqttDevice` — plus one for the
+/// reserved `ddi_token` extra plus one form-level error).
 fn push_field_error(errors: &mut FieldErrors, field: Field, error: ValidationError) {
     let _ = errors.push(FieldError { field, error });
 }
@@ -1952,5 +2064,250 @@ mod tests {
             Field::Form,
             ValidationError::MalformedBody
         ));
+    }
+
+    // ── Identity rule (fleet DDI profile §2) ────────────────────────────
+
+    const DDI: IdentityRule = IdentityRule::Ddi;
+    const OPEN: IdentityRule = IdentityRule::Open;
+
+    use crate::test_support::test_token;
+
+    /// A `WifiMqttDevice` body that satisfies `IdentityRule::Ddi`: the device
+    /// name is a device id, `mqtt_user` equals it, `mqtt_client` is blank and
+    /// the token is present; `field` overrides one value.
+    fn ddi_body_with(field: &str, value: &str) -> alloc::string::String {
+        let defaults = [
+            ("wifi_ssid", TEST_SSID),
+            ("wifi_pass", test_psk()),
+            ("mqtt_uri", TEST_MQTT_URI),
+            ("mqtt_user", TEST_NAME),
+            ("mqtt_pass", ""),
+            ("mqtt_client", ""),
+            ("ota_url", TEST_URL),
+            ("dev_name", TEST_NAME),
+            ("ddi_token", test_token()),
+        ];
+        build_body(&defaults, field, value)
+    }
+
+    fn ddi_errors(field: &str, value: &str) -> FieldErrors {
+        parse_form_with(&ddi_body_with(field, value), WIFI_MQTT, DDI).expect_err("refused")
+    }
+
+    #[test]
+    fn ddi_rule_accepts_the_prefilled_identity_and_keeps_the_token() {
+        let cfg = parse_form_with(&ddi_body_with("", ""), WIFI_MQTT, DDI).expect("valid");
+        assert_eq!(cfg.device_name(), TEST_NAME);
+        let mqtt = cfg.mqtt().expect("mqtt group");
+        assert_eq!(mqtt.username(), Some(TEST_NAME));
+        assert_eq!(mqtt.client_id(), None);
+        assert_eq!(cfg.extras().len(), 1);
+        assert_eq!(cfg.extras()[0].key.as_str(), DDI_TOKEN_KEY);
+        assert_eq!(cfg.ddi_token(), Ok(Some(test_token())));
+        assert!(!alloc::format!("{cfg:?}").contains(test_token()));
+    }
+
+    #[test]
+    fn ddi_rule_accepts_a_client_id_equal_to_the_device_name() {
+        let cfg =
+            parse_form_with(&ddi_body_with("mqtt_client", TEST_NAME), WIFI_MQTT, DDI).expect("ok");
+        assert_eq!(cfg.mqtt().unwrap().client_id(), Some(TEST_NAME));
+    }
+
+    #[test]
+    fn ddi_rule_requires_the_token() {
+        let body = mqtt_body_with("mqtt_user", TEST_NAME);
+        let errors = parse_form_with(&body, WIFI_MQTT, DDI).expect_err("no token");
+        assert!(has_error(
+            &errors,
+            Field::DdiToken,
+            ValidationError::Missing
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+
+        let errors = ddi_errors("ddi_token", "");
+        assert!(has_error(&errors, Field::DdiToken, ValidationError::Empty));
+    }
+
+    #[test]
+    fn a_malformed_token_is_refused_under_both_rules_and_never_echoed() {
+        let upper = test_token().to_ascii_uppercase();
+        let short = &test_token()[..31];
+        let long = "a".repeat(65);
+        for bad in [
+            upper.as_str(),
+            short,
+            long.as_str(),
+            "not hex at all, 32 characters!!",
+        ] {
+            for rule in [DDI, OPEN] {
+                let errors = parse_form_with(&ddi_body_with("ddi_token", bad), WIFI_MQTT, rule)
+                    .expect_err("refused");
+                assert!(
+                    has_error(&errors, Field::DdiToken, ValidationError::InvalidToken),
+                    "{rule:?} {bad:?}: {errors:?}"
+                );
+                assert!(
+                    !errors.iter().any(|e| e.field == Field::Form),
+                    "a token problem is never a form-level error: {errors:?}"
+                );
+                assert!(!alloc::format!("{errors:?}").contains(bad));
+            }
+        }
+    }
+
+    #[test]
+    fn open_rule_is_the_old_contract_plus_the_reserved_token_check() {
+        let body = mqtt_body_with("", "");
+        let open = parse_form_with(&body, WIFI_MQTT, OPEN).expect("free identity");
+        assert_eq!(open.ddi_token(), Ok(None));
+        assert_eq!(parse_form(&body, WIFI_MQTT), Ok(open));
+
+        let free = ddi_body_with("mqtt_user", "someone-else");
+        let cfg = parse_form_with(&free, WIFI_MQTT, OPEN).expect("open: no equality rule");
+        assert_eq!(cfg.mqtt().unwrap().username(), Some("someone-else"));
+        assert_eq!(cfg.ddi_token(), Ok(Some(test_token())));
+
+        let named = ddi_body_with("dev_name", "Any Name");
+        assert!(parse_form_with(&named, WIFI_MQTT, OPEN).is_ok());
+    }
+
+    #[test]
+    fn ddi_rule_refuses_a_device_name_that_is_not_a_device_id() {
+        for name in ["Hive_01", "ab", "-hive", "hive 01", "é-01"] {
+            let errors = ddi_errors("dev_name", name);
+            assert!(
+                has_error(&errors, Field::DeviceName, ValidationError::InvalidDeviceId),
+                "{name:?}: {errors:?}"
+            );
+        }
+        // Beyond the device-name cap the length error wins, once.
+        let errors = ddi_errors("dev_name", &"a".repeat(25));
+        assert!(has_error(
+            &errors,
+            Field::DeviceName,
+            ValidationError::TooLong {
+                max: DEVICE_NAME_MAX_LEN
+            }
+        ));
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.field == Field::DeviceName)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ddi_rule_requires_mqtt_user_to_equal_the_device_name() {
+        for user in ["", "other", "HIVE-01"] {
+            let errors = ddi_errors("mqtt_user", user);
+            assert!(
+                has_error(
+                    &errors,
+                    Field::MqttUser,
+                    ValidationError::MustEqualDeviceName
+                ),
+                "{user:?}: {errors:?}"
+            );
+            assert_eq!(errors.len(), 1, "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn ddi_rule_refuses_a_client_id_other_than_the_device_name() {
+        let errors = ddi_errors("mqtt_client", "hive-02");
+        assert!(has_error(
+            &errors,
+            Field::MqttClient,
+            ValidationError::MustEqualDeviceName
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn a_device_name_error_suppresses_the_equality_errors() {
+        let mut body = ddi_body_with("dev_name", "");
+        body.push_str("&mqtt_client=hive-02");
+        let errors = parse_form_with(&body, WIFI_MQTT, DDI).expect_err("empty name");
+        assert!(has_error(
+            &errors,
+            Field::DeviceName,
+            ValidationError::Empty
+        ));
+        assert!(!errors
+            .iter()
+            .any(|e| e.error == ValidationError::MustEqualDeviceName));
+    }
+
+    #[test]
+    fn ddi_rule_does_not_bind_a_lorawan_form() {
+        // The LoRaWAN form has no token input and its device no DDI path, so
+        // `Ddi` must not make it unsubmittable: no token, any device name.
+        let cfg = parse_form_with(&valid_body(), LORAWAN, DDI).expect("lorawan under ddi");
+        assert_eq!(cfg.ddi_token(), Ok(None));
+        parse_form_with(&body_with("dev_name", "Hive"), LORAWAN, DDI)
+            .expect("a free-form name on lorawan under ddi");
+
+        // A token that is present is still validated, as under `Open`.
+        let mut body = valid_body().to_string();
+        body.push_str("&ddi_token=");
+        body.push_str(test_token());
+        let cfg = parse_form_with(&body, LORAWAN, DDI).expect("lorawan with a token");
+        assert_eq!(cfg.ddi_token(), Ok(Some(test_token())));
+        let mut bad = valid_body().to_string();
+        bad.push_str("&ddi_token=NOT-HEX");
+        let errors = parse_form_with(&bad, LORAWAN, DDI).expect_err("bad token");
+        assert!(has_error(
+            &errors,
+            Field::DdiToken,
+            ValidationError::InvalidToken
+        ));
+    }
+
+    #[test]
+    fn ddi_identity_mismatch_is_reported_with_another_mqtt_error() {
+        let mut body = ddi_body_with("mqtt_user", "other");
+        body = body.replacen("mqtt_uri=", "mqtt_uri=nope", 1);
+        let errors = parse_form_with(&body, WIFI_MQTT, DDI).expect_err("two errors");
+        assert!(errors.iter().any(|e| e.field == Field::MqttUri));
+        assert!(has_error(
+            &errors,
+            Field::MqttUser,
+            ValidationError::MustEqualDeviceName
+        ));
+    }
+
+    #[test]
+    fn ddi_rule_errors_stay_within_the_capacity() {
+        let psk = test_psk();
+        let long = "a".repeat(65);
+        let mut body = alloc::format!(
+            "wifi_ssid=&wifi_pass=short&mqtt_uri=nope&mqtt_user=&mqtt_pass={psk}\
+             &mqtt_client=hive-02&ota_url=ftp://x&dev_name=Bad%20Name&ddi_token={long}"
+        );
+        for i in 0..(EXTRA_FIELDS_MAX + 2) {
+            body.push_str(&alloc::format!("&x{i}=v"));
+        }
+        let errors = parse_form_with(&body, WIFI_MQTT, DDI).expect_err("everything wrong");
+        assert!(errors.len() <= MAX_FIELD_ERRORS);
+        assert!(has_error(
+            &errors,
+            Field::DdiToken,
+            ValidationError::InvalidToken
+        ));
+        assert!(has_error(
+            &errors,
+            Field::DeviceName,
+            ValidationError::InvalidDeviceId
+        ));
+        assert!(has_error(
+            &errors,
+            Field::Form,
+            ValidationError::TooManyFields
+        ));
+        assert!(!alloc::format!("{errors:?}").contains(&long));
     }
 }

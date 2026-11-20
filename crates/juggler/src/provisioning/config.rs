@@ -7,6 +7,7 @@
 
 use core::fmt;
 
+use crate::provisioning::error::ValidationError;
 use crate::provisioning::form::ExtraField;
 use crate::provisioning::profile::{LoraFields, MqttFields, SchemaProfile};
 
@@ -31,8 +32,9 @@ pub const EXTRA_VALUE_MAX_LEN: usize = 64;
 /// Capacity of the [`FieldErrors`](crate::provisioning::FieldErrors) accumulator.
 ///
 /// At most one error per canonical field of the active profile (up to eight
-/// for `WifiMqttDevice`) plus one form-level error.
-pub const MAX_FIELD_ERRORS: usize = 9;
+/// for `WifiMqttDevice`), one for the reserved `ddi_token` extra and one
+/// form-level error.
+pub const MAX_FIELD_ERRORS: usize = 10;
 
 /// Maximum length of the MQTT broker host (bytes).
 ///
@@ -191,6 +193,28 @@ impl ProvisioningConfig {
 
     /// Experimental: API may change before 1.0.
     ///
+    /// The value of the extra field `key`, or `None` when the submission did not carry it.
+    pub fn extra(&self, key: &str) -> Option<&str> {
+        find_extra(&self.extras, key)
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The DDI target token, the reserved extra [`DDI_TOKEN_KEY`](crate::provisioning::DDI_TOKEN_KEY), re-validated before use.
+    ///
+    /// `Ok(None)` when the record carries no token, `Ok(Some(token))` when it carries one of 32 to 64 lowercase hex characters, and
+    /// `Err(ValidationError::InvalidToken)` when the stored value fails that rule (a record written outside the library's validation), so a runtime never sends a malformed token.
+    /// The returned text is a secret: hand it to `DdiToken::parse` and keep no other copy.
+    pub fn ddi_token(&self) -> Result<Option<&str>, ValidationError> {
+        match self.extra(crate::provisioning::identity::DDI_TOKEN_KEY) {
+            None => Ok(None),
+            Some(token) if crate::identity::is_target_token(token) => Ok(Some(token)),
+            Some(_) => Err(ValidationError::InvalidToken),
+        }
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
     /// Construct a `ProvisioningConfig` directly from validated field values.
     ///
     /// Intended for storage adapters that have just decoded a previously-stored
@@ -246,6 +270,14 @@ impl Drop for ProvisioningConfig {
     fn drop(&mut self) {
         crate::provisioning::secret::scrub(&mut self.wifi_password);
     }
+}
+
+/// The value of the extra named `key`, the one lookup [`ProvisioningConfig::extra`] and the form's identity check share.
+pub(crate) fn find_extra<'a>(extras: &'a [ExtraField], key: &str) -> Option<&'a str> {
+    extras
+        .iter()
+        .find(|e| e.key.as_str() == key)
+        .map(|e| e.value.as_str())
 }
 
 #[cfg(test)]
@@ -348,6 +380,56 @@ mod tests {
         );
         let no_ota = parse_form(&body, SchemaProfile::WifiMqttDevice).expect("valid body");
         assert_eq!(no_ota.ota_url(), None);
+    }
+
+    use crate::test_support::test_token;
+
+    #[test]
+    fn extra_looks_up_by_key() {
+        let cfg = mqtt_config_with_extra();
+        assert_eq!(cfg.extra("api_token"), Some(test_psk()));
+        assert_eq!(cfg.extra("missing"), None);
+    }
+
+    #[test]
+    fn ddi_token_is_absent_valid_or_refused() {
+        let cfg = mqtt_config_with_extra();
+        assert_eq!(cfg.ddi_token(), Ok(None), "no ddi_token extra");
+
+        let token = test_token();
+        let psk = test_psk();
+        let body = format!(
+            "wifi_ssid=home&wifi_pass={psk}&mqtt_uri=mqtt://broker.local:1883\
+             &dev_name=hive&ddi_token={token}"
+        );
+        let cfg = parse_form(&body, SchemaProfile::WifiMqttDevice).expect("valid body");
+        assert_eq!(cfg.ddi_token(), Ok(Some(token)));
+        assert!(
+            !format!("{cfg:?}").contains(token),
+            "the token must stay redacted"
+        );
+
+        let mut extras: heapless::Vec<_, { crate::provisioning::EXTRA_FIELDS_MAX }> =
+            heapless::Vec::new();
+        extras
+            .push(crate::provisioning::ExtraField {
+                key: "ddi_token".try_into().unwrap(),
+                value: "not-hex".try_into().unwrap(),
+            })
+            .unwrap();
+        let corrupt = crate::provisioning::ProvisioningConfig::from_storage_parts(
+            cfg.wifi_ssid.clone(),
+            cfg.wifi_password.clone(),
+            cfg.ota_url.clone(),
+            cfg.device_name.clone(),
+            None,
+            cfg.mqtt.clone(),
+            extras,
+        );
+        assert_eq!(
+            corrupt.ddi_token(),
+            Err(crate::provisioning::ValidationError::InvalidToken)
+        );
     }
 
     #[test]

@@ -209,11 +209,48 @@ A different backend (e.g. flash sectors) can be added later without touching the
 The clock's current layout is adopted as-is.
 The older clock layouts of commits `ef7818b..a14f555` (`rb_from` / `rb_conf`, records without ids) are not migrated: a record without an id is reported corrupt and cleared by `repair_corrupt`.
 
+**2026-11-21 — Feature split for the DDI client, and deprecation of the MQTT OTA wire:**
+
+For the IDF tier, this amendment supersedes the container column of the tier C and D rows in the decision table in section 1.
+The IDF crate feature `ota` is `["juggler/ota", "dep:embedded-svc"]` and covers download hardening (A), flashing, the record store (C: `EspNvsKv` and `juggler::ota::persist`) and the decision core.
+It no longer enables `juggler/ota-wire`.
+The new IDF crate feature `ota-wire = ["ota", "juggler/ota-wire"]` provides the MQTT wire contract (B: `OtaCommand`, `Manifest` and `OtaStatus`).
+Together with `mqtt`, it also provides the MQTT consumer runtime (D: `ota::runtime`, `OtaRuntime` and `OtaSubmitter`), gated on `all(ota-wire, mqtt)` instead of `all(ota, mqtt)`.
+The name matches the esp-hal crate's `ota-wire` feature, per ADR 022 tier parity.
+The feature `ota-ddi = ["ota", "juggler/ota-ddi"]` (ADR 027) is the DDI runtime feature.
+A build with `ota-ddi` and `mqtt` but without `ota-wire` links neither the MQTT runtime nor the MQTT wire, and `OtaSubmitter::handle` and `submit`, the MQTT command intake, are not compiled.
+`just check-ota-ddi-no-mqtt-runtime` proves this for a `wifi,mqtt,ota-ddi` build, from the feature graph and the expanded source.
+
+In `juggler`, the record store (`ota::persist`), the DDI action-id rule, `FailReason` and `RollbackReason` move from `any(ota-wire, ota-ddi)`, and the pure health policy (`ota::health`) moves from `ota::runtime`, to the base `ota` feature.
+Their serde impls stay behind `any(ota-wire, ota-ddi)`, so base `ota` stays `no_std`, alloc-free and serde-free.
+`ota::runtime` and the MQTT wire parse types stay behind `ota-wire`.
+This replaces the 2026-10-06 statement that `OtaStore` lives under the `ota-wire` feature.
+
+The DDI path paces its terminal feedback itself through `juggler::ota::ddi::VerdictSender`, at most one send per 30 s, so it does not depend on `ota::runtime::report`.
+The MQTT reporter keeps its pacing in the MQTT runtime.
+An MQTT OTA consumer that enabled `ota` with `mqtt` adds `ota-wire`.
+
+The MQTT OTA wire and runtime (`ota-wire`) are deprecated once the DDI client works over HTTPS, and the deprecation waits for TLS on the DDI transport.
+The deprecation points consumers at the DDI client.
+The MQTT OTA wire and runtime are removed in a later release after that deprecation, and no date or version is fixed here.
+
+**2026-11-22 — No MQTT OTA authority in a DDI release image:**
+
+A release image accepts no install, rollback or repair command over MQTT, and DDI is the only network path that installs an image (fleet DDI profile 0.4.0 §1).
+The IDF crate therefore refuses `ota-ddi` together with `ota-wire` at compile time (`compile_error!` in `src/lib.rs`).
+The bench-only feature `ota-ddi-bench-mqtt-wire = ["ota-ddi", "ota-wire"]` is the only way to build both.
+An image made solely for the bench may enable it, and it then takes MQTT OTA commands only from a topic that only the server principal may write.
+`--all-features` and the docs.rs feature list carry the opt-in, so neither breaks.
+`just check-ota-ddi-no-mqtt-runtime` also checks that the guard fires without the opt-in and that the opt-in builds.
+A device publishes nothing and takes no command under `rustyfarian/ota/#`, the fleet's nudge topics, so `juggler::ota::OtaSettings::validate` refuses an MQTT OTA command or status topic that filter matches (`ConfigError::ReservedTopic`).
+
 ## References
 
 - [ADR 015](015-esp-hal-provisioning.md) — esp-hal tier decision: no MQTT, no system-level resource management
 - [ADR 016](016-crate-consolidation-for-publishing.md) — three-crate consolidation (`juggler`, `rustyfarian-esp-idf-network`, `rustyfarian-esp-hal-network`)
 - [ADR 017](017-mqtt-callback-threading-contract.md) — MQTT callback threading and the channel-based handoff pattern
+- [ADR 027](027-ddi-transport-scope.md) — DDI transport scope; names the `ota-ddi` feature
+- [Feature: DDI OTA client v1](../features/ddi-client-v1.md) — DDI client decisions, including the MQTT OTA wire deprecation and removal
 - `docs/runbooks/ota-hardware-test.md` — hardware validation runbook for the OTA consumer runtime (21 physical scenarios (P1–P21) and 5 host scenarios (H1–H5))
 - `docs/features/archive/ota-decision-core-v1.md` — archived decision-core feature doc; this ADR reverses decisions from its introduction and "Decisions" section
 - `docs/features/archive/ota-consumer-runtime-v1.md` § "Sub-project B: Pure wire contract" — B design rationale, rejected alternatives, and tests

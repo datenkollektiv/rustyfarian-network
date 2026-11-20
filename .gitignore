@@ -37,3 +37,7 @@ continue-here.md
 # Temporary script output — use tmp/ for ad-hoc script results
 tmp/*
 !tmp/.gitkeep
+
+# Local critical-path map (/critical-path), kept off git
+docs/critical-path.md
+docs/critical-path.json

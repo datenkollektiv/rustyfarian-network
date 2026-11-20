@@ -10,7 +10,7 @@ hits=$(grep -rnE 'log::(debug|info|warn|error)!' \
   crates/rustyfarian-esp-hal-network/src/provisioning/ \
   | sed -E 's/"([^"\\]|\\.)*"//g' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
-  | grep -E '\b(wifi_pass|mqtt_pass|body_str|body_in_buf)\b' || true)
+  | grep -E '\b(wifi_pass|mqtt_pass|ddi_token|body_str|body_in_buf)\b' || true)
 if [ -n "$hits" ]; then
   echo "$hits"
   echo "ERROR: credential field logged in provisioning library"

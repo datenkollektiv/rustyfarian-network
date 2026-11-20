@@ -29,9 +29,38 @@ pub(crate) fn test_psk() -> &'static str {
     .as_str()
 }
 
+/// This process's DDI target token fixture, generated once on first use: 32
+/// lowercase hex digits from OS entropy, for the same CodeQL reason as
+/// [`test_psk`].
+pub(crate) fn test_token() -> &'static str {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+
+    static TOKEN: OnceLock<alloc::string::String> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            let half = |seed: u8| {
+                let mut hasher = RandomState::new().build_hasher();
+                hasher.write_u8(seed);
+                hasher.finish()
+            };
+            alloc::format!("{:016x}{:016x}", half(3), half(4))
+        })
+        .as_str()
+}
+
 // The whole module is already `cfg(test)`.
 mod tests {
-    use super::test_psk;
+    use super::{test_psk, test_token};
+
+    #[test]
+    fn test_token_is_a_stable_32_digit_lowercase_hex_target_token() {
+        let token = test_token();
+        assert!(crate::identity::is_target_token(token));
+        assert_eq!(token.len(), 32);
+        assert_eq!(test_token(), token, "generated once per process");
+    }
 
     #[test]
     fn test_psk_is_a_stable_16_digit_lowercase_hex_wpa2_passphrase() {

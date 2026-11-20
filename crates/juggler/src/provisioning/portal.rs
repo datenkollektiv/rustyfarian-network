@@ -15,7 +15,9 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use super::config::MQTT_HOST_MAX_LEN;
+use super::identity::IdentityRule;
 use super::{DeviceName, PortalDefaults, ProvisioningConfig, SchemaProfile, DEVICE_NAME_MAX_LEN};
+use crate::identity::{is_device_id, is_device_id_prefix};
 use crate::wifi::{validate_ap_config, ApConfig, Country, AP_PASSWORD_MIN_LEN};
 
 // ── Nonce ─────────────────────────────────────────────────────────────────────
@@ -171,11 +173,36 @@ impl<'a> Prefill<'a> {
     ///
     /// `mqtt_uri` is recomposed only when both host and port are set. No
     /// secret is read from either source.
+    ///
+    /// This is [`select_with`](Self::select_with) under [`IdentityRule::Open`].
     pub fn select(
         stored: Option<&'a ProvisioningConfig>,
         profile: SchemaProfile,
         defaults: &PortalDefaults<'a>,
         device_name: &'a str,
+    ) -> Self {
+        Self::select_with(stored, profile, defaults, device_name, IdentityRule::Open)
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// [`select`](Self::select) under `identity`.
+    ///
+    /// Under [`IdentityRule::Ddi`] a `WifiMqttDevice` form pre-fills
+    /// `mqtt_user` with the device name and leaves `mqtt_client` blank, so an
+    /// unchanged submission carries one id for the DDI controller id, the MQTT
+    /// username and the MQTT client id; the `mqtt_user` and `mqtt_client`
+    /// defaults are ignored. A stored record pre-fills its other fields as it
+    /// is, but its device name only when that is a device id (otherwise the
+    /// configured `device_name`), and its `mqtt_user` and `mqtt_client` follow
+    /// the same rule, so a record saved under `Open` can be re-submitted
+    /// unchanged.
+    pub fn select_with(
+        stored: Option<&'a ProvisioningConfig>,
+        profile: SchemaProfile,
+        defaults: &PortalDefaults<'a>,
+        device_name: &'a str,
+        identity: IdentityRule,
     ) -> Self {
         let mut prefill = Prefill {
             wifi_ssid: "",
@@ -187,11 +214,15 @@ impl<'a> Prefill<'a> {
             ota_url: "",
             dev_name: "",
         };
+        let ddi = identity.applies_to(profile);
         match stored {
             Some(cfg) if cfg.profile() == profile => {
                 prefill.wifi_ssid = cfg.wifi_ssid();
                 prefill.ota_url = cfg.ota_url().unwrap_or("");
                 prefill.dev_name = cfg.device_name();
+                if ddi && !is_device_id(prefill.dev_name) {
+                    prefill.dev_name = device_name;
+                }
                 if let Some(lora) = cfg.lora() {
                     prefill.dev_eui = lora.dev_eui_hex();
                     prefill.join_eui = lora.join_eui_hex();
@@ -200,8 +231,13 @@ impl<'a> Prefill<'a> {
                     let mut port = heapless::String::<5>::new();
                     let _ = write!(port, "{}", mqtt.port());
                     compose_mqtt_uri(mqtt.host(), &port, &mut prefill.mqtt_uri);
-                    prefill.mqtt_user = mqtt.username().unwrap_or("");
-                    prefill.mqtt_client = mqtt.client_id().unwrap_or("");
+                    if ddi {
+                        prefill.mqtt_user = prefill.dev_name;
+                        prefill.mqtt_client = "";
+                    } else {
+                        prefill.mqtt_user = mqtt.username().unwrap_or("");
+                        prefill.mqtt_client = mqtt.client_id().unwrap_or("");
+                    }
                 }
             }
             _ => {
@@ -219,8 +255,13 @@ impl<'a> Prefill<'a> {
                             defaults.mqtt_port,
                             &mut prefill.mqtt_uri,
                         );
-                        prefill.mqtt_user = defaults.mqtt_user;
-                        prefill.mqtt_client = defaults.mqtt_client;
+                        if ddi {
+                            prefill.mqtt_user = device_name;
+                            prefill.mqtt_client = "";
+                        } else {
+                            prefill.mqtt_user = defaults.mqtt_user;
+                            prefill.mqtt_client = defaults.mqtt_client;
+                        }
                     }
                 }
             }
@@ -251,6 +292,10 @@ pub enum PortalPlanError {
     /// The SoftAP configuration is otherwise invalid (password over the
     /// maximum length, channel out of range).
     InvalidApConfig(&'static str),
+    /// Under [`IdentityRule::Ddi`] the device-name pre-fill is not a device id:
+    /// a `MacSuffixed` prefix longer than 15 bytes or outside `[a-z0-9-]`
+    /// (refused, never truncated), or a `Fixed` name outside the grammar.
+    InvalidDeviceName(&'static str),
 }
 
 impl fmt::Display for PortalPlanError {
@@ -270,6 +315,12 @@ impl fmt::Display for PortalPlanError {
             }
             PortalPlanError::InvalidApConfig(reason) => {
                 write!(f, "invalid SoftAP configuration: {reason}")
+            }
+            PortalPlanError::InvalidDeviceName(reason) => {
+                write!(
+                    f,
+                    "invalid device name pre-fill under the DDI identity rule: {reason}"
+                )
             }
         }
     }
@@ -292,7 +343,8 @@ pub struct PortalPlan<'a> {
     pub device_name: heapless::String<DEVICE_NAME_MAX_LEN>,
     /// `true` when the device name is MAC-suffixed but a default MQTT client
     /// ID is set: that default overrides the per-device client ID unless the
-    /// user clears it in the portal. The tier logs a warning.
+    /// user clears it in the portal. The tier logs a warning. Always `false`
+    /// under [`IdentityRule::Ddi`], which ignores that default.
     pub client_id_override_warning: bool,
 }
 
@@ -332,6 +384,9 @@ pub struct PortalPlanInput<'a> {
     pub defaults: PortalDefaults<'a>,
     /// The schema profile the portal serves.
     pub profile: SchemaProfile,
+    /// The identity rule the portal runs under; `Ddi` checks the device-name
+    /// policy against the device-id grammar before the portal starts.
+    pub identity: IdentityRule,
 }
 
 /// Experimental: API may change before 1.0.
@@ -340,9 +395,12 @@ pub struct PortalPlanInput<'a> {
 /// SoftAP configuration and the device name from the AP `mac`.
 ///
 /// The order is: the profile (against the tier's `supported` predicate), then
-/// the SSID, then the AP password, then the rest of the SoftAP configuration.
-/// The first failure is returned, so an invalid profile is reported before an
-/// invalid SSID on every tier.
+/// the SSID, then the AP password, then, when [`IdentityRule::Ddi`] applies to
+/// the profile ([`IdentityRule::applies_to`]), the device-name policy ([`PortalPlanError::InvalidDeviceName`]: a `MacSuffixed`
+/// prefix longer than 15 bytes or outside `[a-z0-9-]` is refused, never
+/// truncated, and a `Fixed` name must be a device id), then the rest of the
+/// SoftAP configuration. The first failure is returned, so an invalid profile
+/// is reported before an invalid SSID on every tier.
 pub fn plan_portal<'a>(
     input: &PortalPlanInput<'a>,
     mac: &[u8; 6],
@@ -360,13 +418,29 @@ pub fn plan_portal<'a>(
             });
         }
     }
+    if input.identity.applies_to(input.profile) {
+        match input.device_name {
+            DeviceName::MacSuffixed(prefix) if !is_device_id_prefix(prefix) => {
+                return Err(PortalPlanError::InvalidDeviceName(
+                    "MAC-suffixed prefix must be at most 15 bytes of a-z, 0-9 and -, starting with a letter or digit",
+                ));
+            }
+            DeviceName::Fixed(name) if !is_device_id(name) => {
+                return Err(PortalPlanError::InvalidDeviceName(
+                    "fixed name must be 3 to 20 characters of a-z, 0-9 and -, starting with a letter or digit",
+                ));
+            }
+            _ => {}
+        }
+    }
     let plan = PortalPlan {
         ssid,
         ap_password: input.ap_password,
         channel: input.channel,
         country: input.country,
         device_name: input.device_name.resolve(mac),
-        client_id_override_warning: matches!(input.device_name, DeviceName::MacSuffixed(_))
+        client_id_override_warning: !input.identity.applies_to(input.profile)
+            && matches!(input.device_name, DeviceName::MacSuffixed(_))
             && !input.defaults.mqtt_client.is_empty(),
     };
     validate_ap_config(&plan.ap_config()).map_err(PortalPlanError::InvalidApConfig)?;
@@ -376,6 +450,92 @@ pub fn plan_portal<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ddi_prefill_of_an_open_record_can_be_submitted_unchanged() {
+        use crate::provisioning::{parse_form, parse_form_with, IdentityRule};
+        let open = parse_form(
+            &alloc::format!(
+                "wifi_ssid=net&wifi_pass={}&mqtt_uri=mqtt%3A%2F%2Fbroker%3A1883&mqtt_user=sensor\
+                 &mqtt_pass=&mqtt_client=sensor-client&ota_url=&dev_name=Any%20Name",
+                crate::test_support::test_psk()
+            ),
+            SchemaProfile::WifiMqttDevice,
+        )
+        .expect("an open record");
+        let defaults = PortalDefaults::default();
+        let prefill = Prefill::select_with(
+            Some(&open),
+            SchemaProfile::WifiMqttDevice,
+            &defaults,
+            "hive-1a2b",
+            IdentityRule::Ddi,
+        );
+        assert_eq!(
+            prefill.dev_name, "hive-1a2b",
+            "a non-id stored name gives way"
+        );
+        assert_eq!(prefill.mqtt_user, "hive-1a2b");
+        assert_eq!(prefill.mqtt_client, "");
+        assert_eq!(prefill.wifi_ssid, "net", "the other fields stay");
+
+        let id_record = parse_form(
+            &alloc::format!(
+                "wifi_ssid=net&wifi_pass={}&mqtt_uri=mqtt%3A%2F%2Fbroker%3A1883&mqtt_user=sensor\
+                 &mqtt_pass=&mqtt_client=&ota_url=&dev_name=kept-id",
+                crate::test_support::test_psk()
+            ),
+            SchemaProfile::WifiMqttDevice,
+        )
+        .expect("a record with an id name");
+        let prefill = Prefill::select_with(
+            Some(&id_record),
+            SchemaProfile::WifiMqttDevice,
+            &defaults,
+            "hive-1a2b",
+            IdentityRule::Ddi,
+        );
+        assert_eq!(prefill.dev_name, "kept-id");
+        assert_eq!(prefill.mqtt_user, "kept-id");
+
+        // The pre-filled identity passes the Ddi submit check.
+        let body = alloc::format!(
+            "wifi_ssid=net&wifi_pass={}&mqtt_uri=mqtt%3A%2F%2Fbroker%3A1883&mqtt_user={}\
+             &mqtt_pass=&mqtt_client={}&ota_url=&dev_name={}&ddi_token={}",
+            crate::test_support::test_psk(),
+            prefill.mqtt_user,
+            prefill.mqtt_client,
+            prefill.dev_name,
+            crate::test_support::test_token()
+        );
+        parse_form_with(&body, SchemaProfile::WifiMqttDevice, IdentityRule::Ddi)
+            .expect("the pre-fill submits unchanged");
+    }
+
+    #[test]
+    fn ddi_does_not_bind_the_plan_of_a_lorawan_portal() {
+        use crate::provisioning::IdentityRule;
+        let input = PortalPlanInput {
+            ssid_override: None,
+            ssid_prefix: "dev",
+            ap_password: None,
+            channel: 6,
+            country: Country::default(),
+            device_name: DeviceName::MacSuffixed("a-very-long-prefix-name"),
+            defaults: PortalDefaults::default(),
+            profile: SchemaProfile::LorawanFieldDevice,
+            identity: IdentityRule::Ddi,
+        };
+        assert!(plan_portal(&input, &[0, 1, 2, 3, 4, 5], |_| true).is_ok());
+        let wifi = PortalPlanInput {
+            profile: SchemaProfile::WifiMqttDevice,
+            ..input
+        };
+        assert!(matches!(
+            plan_portal(&wifi, &[0, 1, 2, 3, 4, 5], |_| true),
+            Err(PortalPlanError::InvalidDeviceName(_))
+        ));
+    }
     use crate::provisioning::{parse_form, MqttFields};
     use crate::test_support::test_psk;
 
@@ -654,8 +814,14 @@ mod tests {
             p.dev_name,
         ];
         for f in fields {
-            assert!(!f.contains(wifi_pass), "wifi password leaked into {f:?}");
-            assert!(!f.contains(mqtt_pass), "mqtt password leaked into {f:?}");
+            assert!(
+                !f.contains(wifi_pass),
+                "wifi password leaked into a prefill field"
+            );
+            assert!(
+                !f.contains(mqtt_pass),
+                "mqtt password leaked into a prefill field"
+            );
         }
         let debug = format!("{p:?}");
         assert!(!debug.contains(wifi_pass) && !debug.contains(mqtt_pass));
@@ -674,6 +840,63 @@ mod tests {
         assert_eq!(p.dev_name, "hive");
     }
 
+    #[test]
+    fn ddi_prefill_takes_mqtt_user_from_the_device_name_and_blanks_the_client_id() {
+        let d = defaults();
+        let p = Prefill::select_with(
+            None,
+            SchemaProfile::WifiMqttDevice,
+            &d,
+            "rgb-clock-ab12",
+            IdentityRule::Ddi,
+        );
+        assert_eq!(p.mqtt_user, "rgb-clock-ab12");
+        assert_eq!(p.mqtt_client, "");
+        assert_eq!(p.dev_name, "rgb-clock-ab12");
+        assert_eq!(p.mqtt_uri.as_str(), "mqtt://broker.local:1883");
+
+        let open = Prefill::select_with(
+            None,
+            SchemaProfile::WifiMqttDevice,
+            &d,
+            "rgb-clock-ab12",
+            IdentityRule::Open,
+        );
+        assert_eq!(open.mqtt_user, "sensor");
+        assert_eq!(open.mqtt_client, "c3-01");
+        assert_eq!(
+            open,
+            Prefill::select(None, SchemaProfile::WifiMqttDevice, &d, "rgb-clock-ab12")
+        );
+
+        let lora = Prefill::select_with(
+            None,
+            SchemaProfile::LorawanFieldDevice,
+            &d,
+            "rgb-clock-ab12",
+            IdentityRule::Ddi,
+        );
+        assert!(lora.mqtt_user.is_empty());
+    }
+
+    #[test]
+    fn ddi_prefill_derives_the_mqtt_identity_from_a_stored_device_id() {
+        // A stored device name that is a device id stays; `mqtt_user` follows it
+        // and `mqtt_client` is blank, whatever the record stored for them.
+        let stored = stored_wifi_mqtt();
+        let d = defaults();
+        let p = Prefill::select_with(
+            Some(&stored),
+            SchemaProfile::WifiMqttDevice,
+            &d,
+            "rgb-clock",
+            IdentityRule::Ddi,
+        );
+        assert_eq!(p.dev_name, "user-renamed");
+        assert_eq!(p.mqtt_user, "user-renamed");
+        assert_eq!(p.mqtt_client, "");
+    }
+
     // ── plan_portal ──────────────────────────────────────────────────────────
 
     const MAC: [u8; 6] = [0xa2, 0x00, 0x11, 0x22, 0xc4, 0xf4];
@@ -688,7 +911,109 @@ mod tests {
             device_name: DeviceName::Fixed("hive"),
             defaults: PortalDefaults::default(),
             profile: SchemaProfile::WifiMqttDevice,
+            identity: IdentityRule::Open,
         }
+    }
+
+    #[test]
+    fn ddi_plan_refuses_a_bad_device_name_policy_and_keeps_a_good_one() {
+        let sixteen = "p".repeat(16);
+        let fifteen = "p".repeat(15);
+        for prefix in [sixteen.as_str(), "RGB", "rgb_clock", "-x", " hive", "hive "] {
+            let i = PortalPlanInput {
+                device_name: DeviceName::MacSuffixed(prefix),
+                identity: IdentityRule::Ddi,
+                ..input()
+            };
+            assert!(
+                matches!(
+                    plan_portal(&i, &MAC, |_| true),
+                    Err(PortalPlanError::InvalidDeviceName(_))
+                ),
+                "{prefix:?}"
+            );
+        }
+        for prefix in [fifteen.as_str(), "hive", "c3-mqtt-demo", ""] {
+            let i = PortalPlanInput {
+                device_name: DeviceName::MacSuffixed(prefix),
+                identity: IdentityRule::Ddi,
+                ..input()
+            };
+            let plan = plan_portal(&i, &MAC, |_| true).expect("valid prefix");
+            assert!(
+                crate::identity::is_device_id(&plan.device_name),
+                "{prefix:?} -> {:?}",
+                plan.device_name
+            );
+        }
+        let plan = plan_portal(
+            &PortalPlanInput {
+                device_name: DeviceName::MacSuffixed(&fifteen),
+                identity: IdentityRule::Ddi,
+                ..input()
+            },
+            &MAC,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(plan.device_name.len(), 20, "nothing is truncated");
+
+        for name in ["Hive", "ab", "hive 01"] {
+            let i = PortalPlanInput {
+                device_name: DeviceName::Fixed(name),
+                identity: IdentityRule::Ddi,
+                ..input()
+            };
+            assert!(matches!(
+                plan_portal(&i, &MAC, |_| true),
+                Err(PortalPlanError::InvalidDeviceName(_))
+            ));
+        }
+        let i = PortalPlanInput {
+            device_name: DeviceName::Fixed("hive-01"),
+            identity: IdentityRule::Ddi,
+            ..input()
+        };
+        assert_eq!(
+            plan_portal(&i, &MAC, |_| true)
+                .unwrap()
+                .device_name
+                .as_str(),
+            "hive-01"
+        );
+    }
+
+    #[test]
+    fn open_plan_still_truncates_a_long_mac_suffixed_prefix() {
+        let sixteen = "p".repeat(16);
+        let i = PortalPlanInput {
+            device_name: DeviceName::MacSuffixed(&sixteen),
+            ..input()
+        };
+        let plan = plan_portal(&i, &MAC, |_| true).expect("open keeps the old contract");
+        assert_eq!(plan.device_name.len(), 21);
+        assert!(plan.device_name.ends_with("-c4f4"));
+    }
+
+    #[test]
+    fn ddi_plan_never_warns_about_the_client_id_default_it_ignores() {
+        let i = PortalPlanInput {
+            device_name: DeviceName::MacSuffixed("hive"),
+            defaults: PortalDefaults {
+                mqtt_client: "c3-01",
+                ..PortalDefaults::default()
+            },
+            identity: IdentityRule::Ddi,
+            ..input()
+        };
+        let plan = plan_portal(&i, &MAC, |_| true).expect("valid plan");
+        assert!(!plan.client_id_override_warning);
+    }
+
+    #[test]
+    fn device_name_plan_error_carries_static_text_only() {
+        let e = PortalPlanError::InvalidDeviceName("x");
+        assert!(format!("{e}").contains("DDI identity rule"));
     }
 
     #[test]

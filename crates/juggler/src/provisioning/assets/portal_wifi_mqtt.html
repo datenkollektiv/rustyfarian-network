@@ -48,7 +48,7 @@ hr { margin: 1.5rem 0; border: 0; border-top: 1px solid #eee; }
 <label for="mqtt_client">MQTT client ID</label>
 <input id="mqtt_client" name="mqtt_client" value="{{MQTT_CLIENT}}" maxlength="23" title="Optional, at most 23 characters. Leave blank to let the firmware derive one.">
 <p class="hint">Optional, at most 23 characters. Blank lets the firmware derive one.</p>
-
+{{DDI_TOKEN_INPUT}}
 <label for="ota_url">OTA update URL (optional)</label>
 <input id="ota_url" name="ota_url" value="{{OTA_URL}}" placeholder="optional" maxlength="128" title="Optional, plain http:// only. Leave blank if this device has no OTA.">
 <p class="hint">Optional, plain http:// only. Leave blank for no OTA.</p>

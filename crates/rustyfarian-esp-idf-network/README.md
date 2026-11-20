@@ -52,6 +52,36 @@ Add to your `Cargo.toml`:
 rustyfarian-esp-idf-network = { version = "0.7", features = ["wifi", "mqtt"] }
 ```
 
+## ESP-IDF v6.1 build setup
+
+The crate builds against ESP-IDF v6.1; set it in the `[env]` of your `.cargo/config.toml`:
+
+```toml
+[env]
+ESP_IDF_VERSION = "v6.1"
+```
+
+ESP-IDF v6 moved esp-mqtt into the managed component `espressif/mqtt`, which this crate declares in its `package.metadata.esp-idf-sys.extra_components`.
+esp-idf-sys reads that entry only from the direct dependencies of the root crate.
+A standalone firmware crate that depends on this crate directly needs nothing more.
+In a workspace with a virtual root manifest there is no root crate, the component is skipped without an error, and the build fails with `cannot find mqtt in esp_idf_svc` inside this crate.
+Name a workspace member that depends on this crate directly; add `CARGO_WORKSPACE_DIR` only if the target directory lies outside the workspace:
+
+```toml
+[env]
+ESP_IDF_SYS_ROOT_CRATE = "my-firmware"
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+```
+
+After changing these values, delete the `esp-idf-sys-*` build directories once so CMake reconfigures.
+
+The build writes `components_<chip>.lock` to the workspace root.
+Commit these files in a firmware repository, or the `^1.0.0` requirement on `espressif/mqtt` resolves to the newest 1.x on every clean build.
+
+ESP-IDF v6.1 defaults to picolibc (`CONFIG_LIBC_PICOLIBC=y`).
+Every firmware without `CONFIG_LIBC_NEWLIB=y` in its `sdkconfig.defaults` becomes a picolibc build, including one that sets no libc keys at all.
+Re-check task stack sizes tuned under ESP-IDF v5.3.3, and note that newlib-only keys such as `CONFIG_NEWLIB_NANO_FORMAT` are silently ignored under picolibc.
+
 ## Example: Wi-Fi + MQTT (OTA Runtime)
 
 For OTA-enabled firmware using the runtime loop, see [`docs/runbooks/ota-hardware-test.md`](../../docs/runbooks/ota-hardware-test.md) for the full test procedure and [`examples/idf_c3_ota_runtime.rs`](examples/idf_c3_ota_runtime.rs) for example integration (command intake, worker start, health policy, restart callback).

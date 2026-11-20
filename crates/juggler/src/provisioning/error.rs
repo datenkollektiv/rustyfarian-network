@@ -41,6 +41,9 @@ pub enum Field {
     OtaUrl,
     /// Human-readable device name (`dev_name`).
     DeviceName,
+    /// The reserved DDI target token extra (`ddi_token`): not a canonical
+    /// field, but validated by the library, so its errors name it.
+    DdiToken,
     /// Body-level problem with no single owning input (malformed body,
     /// duplicate extra key, too many extra fields, a field canonical only to
     /// the other profile).
@@ -70,6 +73,7 @@ impl Field {
             Field::MqttClient => "mqtt_client",
             Field::OtaUrl => "ota_url",
             Field::DeviceName => "dev_name",
+            Field::DdiToken => crate::provisioning::identity::DDI_TOKEN_KEY,
             Field::Form => "_form",
         }
     }
@@ -127,6 +131,15 @@ pub enum ValidationError {
     /// such field wins); the field is neither folded into extras nor reported
     /// per-field, because the active profile's form never renders it.
     UnexpectedForProfile,
+    /// Under [`IdentityRule::Ddi`](crate::provisioning::IdentityRule::Ddi) the
+    /// device name is not a device id (`^[a-z0-9][a-z0-9-]{2,19}$`).
+    InvalidDeviceId,
+    /// Under [`IdentityRule::Ddi`](crate::provisioning::IdentityRule::Ddi) the
+    /// MQTT username, or a non-blank MQTT client id, differs from the device
+    /// name.
+    MustEqualDeviceName,
+    /// The `ddi_token` extra is not 32 to 64 lowercase hexadecimal characters.
+    InvalidToken,
 }
 
 impl fmt::Display for ValidationError {
@@ -152,6 +165,13 @@ impl fmt::Display for ValidationError {
             ValidationError::TooManyFields => f.write_str("too many extra fields"),
             ValidationError::UnexpectedForProfile => {
                 f.write_str("field does not belong to the selected profile")
+            }
+            ValidationError::InvalidDeviceId => f.write_str(
+                "device id must be 3 to 20 characters of a-z, 0-9 and -, starting with a letter or digit",
+            ),
+            ValidationError::MustEqualDeviceName => f.write_str("field must equal the device name"),
+            ValidationError::InvalidToken => {
+                f.write_str("token must be 32 to 64 lowercase hexadecimal characters")
             }
         }
     }
@@ -180,8 +200,9 @@ impl fmt::Display for FieldError {
 /// [`parse_form`](crate::provisioning::parse_form).
 ///
 /// The capacity of [`MAX_FIELD_ERRORS`] is exact: at most one error per
-/// canonical field of the active profile (up to eight for `WifiMqttDevice`)
-/// plus at most one [`Field::Form`]-level error.
+/// canonical field of the active profile (up to eight for `WifiMqttDevice`),
+/// one for the reserved `ddi_token` extra ([`Field::DdiToken`]) and at most
+/// one [`Field::Form`]-level error.
 pub type FieldErrors = heapless::Vec<FieldError, MAX_FIELD_ERRORS>;
 
 #[cfg(test)]
@@ -214,6 +235,9 @@ mod tests {
             ValidationError::MalformedBody,
             ValidationError::TooManyFields,
             ValidationError::UnexpectedForProfile,
+            ValidationError::InvalidDeviceId,
+            ValidationError::MustEqualDeviceName,
+            ValidationError::InvalidToken,
         ];
 
         for err in &variants {
@@ -243,8 +267,17 @@ mod tests {
                 | ValidationError::InvalidUrl
                 | ValidationError::MalformedBody
                 | ValidationError::TooManyFields
-                | ValidationError::UnexpectedForProfile => {}
+                | ValidationError::UnexpectedForProfile
+                | ValidationError::InvalidDeviceId
+                | ValidationError::MustEqualDeviceName
+                | ValidationError::InvalidToken => {}
             }
         }
+    }
+
+    #[test]
+    fn the_token_field_names_the_reserved_extra() {
+        assert_eq!(Field::DdiToken.form_name(), "ddi_token");
+        assert_eq!(alloc::format!("{}", Field::DdiToken), "ddi_token");
     }
 }

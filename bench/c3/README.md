@@ -18,6 +18,7 @@
 | `ota` | `hal_c3_ota` | download, verify, swap, boot marked valid | `just bench-ota c3 ota …` |
 | `ota-rollback` | `hal_c3_ota` | unhealthy image rolls back, no retry | `just bench-ota c3 ota-rollback …` |
 | `ota-runtime` | `idf_c3_ota_runtime` | MQTT-triggered OTA rows P2, P7, P13, P14, P17 | local broker, six served images, see header |
+| `ddi` | `idf_c3_ddi` | DDI OTA against a lab server: forced update, `up_to_date` and chip gate (1007), cancel and reset mid-download, rollback (1004) and its sticky refusal, wrong sha256 (1002), each row probed on the server | lab DDI server (`DDI_MGMT_*`), local broker, seven bundles published with `just ddi-publish`, see header |
 
 The scenario checks and the default-scenario checks (`espnow-power-cycle`, `espnow-peer-session`, `espnow-soak`) need different `ESPNOW_SCENARIO` settings; see the headers.
 Holding BOOT through a reset enters download mode; press RST again without BOOT.

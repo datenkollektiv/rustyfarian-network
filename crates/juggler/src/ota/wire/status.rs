@@ -316,6 +316,7 @@ mod tests {
             "previously_rolled_back",
             "up_to_date",
             "downgrade",
+            "below_floor",
             "attempt_unresolved",
             "report_pending",
             "partition_not_found",
@@ -330,6 +331,10 @@ mod tests {
             "checksum_mismatch",
             "flash_write_failed",
             "insufficient_space",
+            "cancelled",
+            "foreign_origin",
+            "redirect",
+            "size_mismatch",
         ] {
             all.push(alloc::format!(r#"{{"status":"failed","reason":"{code}"}}"#));
         }
@@ -607,6 +612,7 @@ mod tests {
             (FailReason::PreviouslyRolledBack, "previously_rolled_back"),
             (FailReason::UpToDate, "up_to_date"),
             (FailReason::Downgrade, "downgrade"),
+            (FailReason::BelowFloor, "below_floor"),
             (FailReason::AttemptUnresolved, "attempt_unresolved"),
             (FailReason::ReportPending, "report_pending"),
             (FailReason::PartitionNotFound, "partition_not_found"),

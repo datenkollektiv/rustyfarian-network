@@ -21,9 +21,9 @@ use juggler::ota::{FailReason, OtaStatus, PendingReportView};
 
 use super::publish::publish_status;
 use super::shared::Shared;
-use super::stack::sample;
 use super::{OtaConfig, Records};
 use crate::mqtt::{MqttHandle, PublishAckError};
+use crate::ota::stack::sample;
 
 pub(super) struct ReporterCtx {
     pub(super) cfg: Arc<OtaConfig>,

@@ -1,4 +1,4 @@
-//! The health policy of the running image as pure decisions.
+//! The health policy of the running image as pure decisions, and the record upkeep that follows it (completion retry, repair), shared by the MQTT runtime (`ota-wire`) and the DDI runtime (`ota-ddi`).
 //!
 //! The policy decides when a freshly activated image proves itself healthy, and what happens when it does not.
 //! It never touches a slot that is not pending verification, so a normally booted image cannot restart itself because the broker happens to be down.
@@ -13,11 +13,13 @@
 
 use core::time::Duration;
 
-use crate::ota::persist::{BootDisposition, BootOutcome};
-use crate::ota::runtime::config::{DeadlineAction, OtaTimings};
-use crate::ota::{RollbackReason, SlotId};
+use crate::ota::persist::{
+    reconcile_boot, BootDisposition, BootOutcome, HardwareFacts, HardwareReadError, OtaKv,
+    OtaStore, StoreError,
+};
+use crate::ota::{FailReason, RollbackReason, SlotId, Version};
 
-/// The slice of [`OtaTimings`] the policy uses.
+/// The timings of the health policy; the MQTT runtime builds it from its `OtaTimings` (`ota-wire`), the DDI runtime carries it in its settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthConfig {
     /// Time since boot before a healthy image is marked valid.
@@ -44,20 +46,21 @@ pub struct HealthConfig {
     pub deadline_action: DeadlineAction,
 }
 
-impl From<&OtaTimings> for HealthConfig {
-    fn from(t: &OtaTimings) -> Self {
+impl Default for HealthConfig {
+    /// The documented defaults: 30 s dwell, 120 s deadline, 1 s poll, 200 ms slot retry, 5 slot reads, a warning every 25 failed reads, 3 completion attempts 1 s apart, 3 rollback attempts 5 s apart, [`DeadlineAction::Rollback`].
+    fn default() -> Self {
         Self {
-            healthy_dwell: t.healthy_dwell,
-            failure_deadline: t.failure_deadline,
-            poll_interval: t.poll_interval,
-            slot_retry: t.slot_retry,
-            slot_min_attempts: t.slot_min_attempts,
-            slot_warn_every: t.slot_warn_every,
-            complete_attempts: t.complete_attempts,
-            complete_retry: t.complete_retry,
-            rollback_attempts: t.rollback_attempts,
-            rollback_retry: t.rollback_retry,
-            deadline_action: t.deadline_action,
+            healthy_dwell: Duration::from_secs(30),
+            failure_deadline: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(1),
+            slot_retry: Duration::from_millis(200),
+            slot_min_attempts: 5,
+            slot_warn_every: 25,
+            complete_attempts: 3,
+            complete_retry: Duration::from_secs(1),
+            rollback_attempts: 3,
+            rollback_retry: Duration::from_secs(5),
+            deadline_action: DeadlineAction::Rollback,
         }
     }
 }
@@ -144,7 +147,7 @@ pub enum HealthAction {
 pub enum HealthVerdict {
     /// The image was marked valid and the attempt was recorded; `applied` is published.
     Applied,
-    /// The image was marked valid but the attempt could not be recorded within the bounded retries; `applied` is published anyway and the reporter thread keeps retrying the record in the background ([`CompletionRetry`](crate::ota::runtime::CompletionRetry)).
+    /// The image was marked valid but the attempt could not be recorded within the bounded retries; `applied` is published anyway and the runtime keeps retrying the record in the background (the MQTT runtime on its reporter thread, the DDI runtime on its worker); see [`retry_completion`].
     ///
     /// Until the record is cleared every offer answers `attempt_unresolved`.
     ApplyNotRecorded,
@@ -500,6 +503,234 @@ impl HealthMachine {
     }
 }
 
+/// What the health policy does when the failure deadline passes with the image still pending verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineAction {
+    /// Note `health_deadline`, then roll back with bounded retries (the production behaviour).
+    Rollback,
+    /// Note the given reason, then call the app's restart callback and let the bootloader abort the unverified image.
+    ///
+    /// The unhealthy demo build uses this with [`RollbackReason::Unhealthy`].
+    NoteAndRestart(RollbackReason),
+}
+
+/// The library flags at runtime start, derived from boot reconciliation.
+///
+/// The tier copies them into its flags and performs the rollback when `roll_back_now_at_boot` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFlags {
+    /// Updates, rollbacks and repairs are admitted from the start (see [`initial_admission`]).
+    pub admission_open: bool,
+    /// The health policy counts as settled from the start; the same value as `admission_open`.
+    pub health_settled: bool,
+    /// The running image must not be marked valid.
+    pub refuse_mark_valid: bool,
+    /// The boot demanded a rollback now.
+    pub roll_back_now_at_boot: bool,
+    /// The boot ended fail-closed on a store fault (see [`BootOutcome::records_suspect`]).
+    pub records_suspect: bool,
+}
+
+impl RuntimeFlags {
+    /// Derives the flags from the boot reconciliation outcome.
+    pub fn from_boot(outcome: &BootOutcome) -> Self {
+        let admit = initial_admission(outcome);
+        Self {
+            admission_open: admit,
+            health_settled: admit,
+            refuse_mark_valid: outcome.refuse_mark_valid,
+            roll_back_now_at_boot: outcome.roll_back_now,
+            records_suspect: outcome.records_suspect(),
+        }
+    }
+}
+
+/// The library flags after a repair, and what the re-run of boot reconciliation said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshedFlags {
+    /// The re-run still ends fail-closed on a store fault.
+    pub records_suspect: bool,
+    /// The running image must still not be marked valid.
+    pub refuse_mark_valid: bool,
+    /// The full outcome, for logging; a `roll_back_now` here is only logged, never acted on.
+    pub outcome: BootOutcome,
+}
+
+/// Re-runs boot reconciliation after a repair and derives the flags.
+///
+/// Reconciliation is built to be repeated after any crash, so a second run with unchanged facts changes no record.
+/// `refuse_mark_valid` stays set when the boot demanded a rollback (`roll_back_now_at_boot`: a version mismatch); otherwise it follows the new outcome, which clears a refusal that only came from the unreadable records.
+/// Returns `None` when the hardware facts could not be read: nothing is re-run and the flags stay as they are.
+pub fn refresh_after_repair<K: OtaKv>(
+    store: &mut OtaStore<K>,
+    hw: Result<HardwareFacts, HardwareReadError>,
+    running_version: Option<Version>,
+    roll_back_now_at_boot: bool,
+) -> Option<RefreshedFlags> {
+    let hw = hw.ok()?;
+    let outcome = reconcile_boot(store, Ok(hw), running_version);
+    Some(RefreshedFlags {
+        records_suspect: outcome.records_suspect(),
+        refuse_mark_valid: roll_back_now_at_boot || outcome.refuse_mark_valid,
+        outcome,
+    })
+}
+
+/// The result of one background attempt to record the completed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTry {
+    /// The attempt record was cleared; admission reopens by itself.
+    Completed,
+    /// No attempt for the running version remains (cleared by a repair, or it belongs to another version); stop retrying.
+    Gone,
+    /// The attempt is still present and could not be cleared (or read); retry later.
+    StillFailing,
+}
+
+/// One background retry of `complete_attempt(running)` after `ApplyNotRecorded`, inside ONE store lock.
+///
+/// The caller guarantees the running slot is known valid (`mark_valid` succeeded) and holds no lock across the backoff sleeps.
+/// It only completes an attempt for `running`: an attempt of another version, or one without a readable id, is left to boot reconciliation and ends the retries.
+pub fn retry_completion<K: OtaKv>(store: &mut OtaStore<K>, running: Version) -> CompletionTry {
+    match store.read_attempt() {
+        Ok(None) => CompletionTry::Gone,
+        Ok(Some(stored)) if stored.record.version == Some(running) => {
+            match store.complete_attempt(running) {
+                Ok(()) => CompletionTry::Completed,
+                Err(_) => CompletionTry::StillFailing,
+            }
+        }
+        Ok(Some(_)) => CompletionTry::Gone,
+        Err(_) => CompletionTry::StillFailing,
+    }
+}
+
+/// Why [`repair_all`] did not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairError {
+    /// The cap was reached and unreadable records remain.
+    Capped,
+    /// A transient storage error.
+    Store(StoreError),
+}
+
+impl RepairError {
+    /// Both causes are reported as `repair_failed`.
+    pub const fn reason(&self) -> FailReason {
+        FailReason::RepairFailed
+    }
+}
+
+/// Repairs record groups until none is left, at most `max_iterations` of them.
+///
+/// Returns how many groups were repaired (zero means nothing was unreadable).
+/// Reaching the cap with records still unreadable is [`RepairError::Capped`], never a success with the cap as the count.
+///
+/// # Errors
+///
+/// [`RepairError::Store`] on a transient failure (records repaired so far stay repaired), [`RepairError::Capped`] at the cap.
+pub fn repair_all<K: OtaKv>(
+    store: &mut OtaStore<K>,
+    max_iterations: u32,
+) -> Result<u32, RepairError> {
+    let mut repaired = 0;
+    while repaired < max_iterations {
+        match store.repair_corrupt() {
+            Ok(Some(_)) => repaired += 1,
+            Ok(None) => return Ok(repaired),
+            Err(e) => return Err(RepairError::Store(e)),
+        }
+    }
+    match store.corrupt_present() {
+        Ok(false) => Ok(repaired),
+        Ok(true) => Err(RepairError::Capped),
+        Err(e) => Err(RepairError::Store(e)),
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Whether the boot repair leaves a report owed: the next offered DDI action goes out `closed` + `failure` + 1005 `records_unreadable` instead of being applied.
+///
+/// A transient read error also fails the boot reconciliation closed on a store fault, yet nothing is corrupt and [`repair_all`] finds nothing; reporting it would fail a valid action for one flaky read.
+/// A report is owed when the repair dropped at least one group (`Ok` with a count above zero), could not finish (`Err`), or the re-run of the reconciliation still ends on a store fault (`still_suspect`).
+/// `still_suspect` is the flag after that re-run; when the hardware facts could not be read the re-run is skipped and the flag is the boot's, so an unconfirmed fault stays owed.
+pub const fn repair_report_owed(repaired: Result<u32, RepairError>, still_suspect: bool) -> bool {
+    match repaired {
+        Ok(0) => still_suspect,
+        Ok(_) | Err(_) => true,
+    }
+}
+
+/// What to do after a background completion attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionStep {
+    /// The attempt still failed: the retry stays armed with a longer delay.
+    Retry,
+    /// The attempt record is cleared or gone: the retry is disarmed.
+    Stop,
+    /// The retry was not armed, so no attempt was due; the machine is unchanged.
+    Ignored,
+}
+
+/// The backoff of the background completion retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionRetryConfig {
+    /// Delay before the first background attempt, and the base of the backoff.
+    pub initial: Duration,
+    /// The backoff doubles per failed attempt up to this delay.
+    pub cap: Duration,
+}
+
+/// The schedule of the background retry of `complete_attempt` after the health policy ended with `ApplyNotRecorded`.
+///
+/// The image is already valid and `applied` already published; the retry only keeps trying to clear the attempt record so admission reopens without a reset.
+/// The reporter thread owns the loop (no sleep happens under the store lock) and keeps an `Option<CompletionBackoff>`: `None` while not armed.
+/// Time is `Duration` since the reporter started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionBackoff {
+    next_due: Duration,
+    delay: Duration,
+}
+
+impl CompletionBackoff {
+    /// Arms the retry; the first attempt is due after `initial`.
+    pub fn armed(cfg: &CompletionRetryConfig, now: Duration) -> Self {
+        Self {
+            next_due: now + cfg.initial,
+            delay: cfg.initial,
+        }
+    }
+
+    /// How long the loop may wait before the next attempt.
+    pub fn wait(&self, now: Duration) -> Duration {
+        self.next_due.saturating_sub(now)
+    }
+
+    /// An attempt is due.
+    pub fn due(&self, now: Duration) -> bool {
+        now >= self.next_due
+    }
+
+    /// An attempt failed: the delay doubles up to the cap.
+    #[must_use]
+    pub fn failed(self, cfg: &CompletionRetryConfig, now: Duration) -> Self {
+        let delay = self.delay.saturating_mul(2).min(cfg.cap);
+        Self {
+            next_due: now + delay,
+            delay,
+        }
+    }
+}
+
+/// What to do after a background completion attempt: success or a vanished attempt stops the retry ([`CompletionStep::Stop`]), a failure keeps it armed ([`CompletionStep::Retry`]).
+pub fn completion_step(result: CompletionTry) -> CompletionStep {
+    match result {
+        CompletionTry::Completed | CompletionTry::Gone => CompletionStep::Stop,
+        CompletionTry::StillFailing => CompletionStep::Retry,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +742,7 @@ mod tests {
     }
 
     fn cfg() -> HealthConfig {
-        HealthConfig::from(&OtaTimings::default())
+        HealthConfig::default()
     }
 
     fn at_boot_plus(t: u64) -> Duration {
@@ -1219,13 +1450,117 @@ mod tests {
     }
 
     #[test]
-    fn the_config_follows_the_timings() {
-        let t = OtaTimings {
-            healthy_dwell: secs(5),
-            rollback_attempts: 7,
-            ..OtaTimings::default()
-        };
-        let c = HealthConfig::from(&t);
-        assert_eq!((c.healthy_dwell, c.rollback_attempts), (secs(5), 7));
+    fn runtime_flags_follow_initial_admission() {
+        use crate::ota::BootFault;
+
+        let open = RuntimeFlags::from_boot(&outcome(BootDisposition::Deferred, true));
+        assert!(open.admission_open && open.health_settled);
+        assert!(!open.records_suspect);
+
+        let pending = RuntimeFlags::from_boot(&outcome(BootDisposition::AwaitHealthCheck, false));
+        assert!(!pending.admission_open && !pending.health_settled);
+
+        let suspect = RuntimeFlags::from_boot(&outcome(
+            BootDisposition::FailedClosed(BootFault::Store(StoreError::InvalidSlot)),
+            true,
+        ));
+        assert!(suspect.records_suspect);
+        assert!(!suspect.admission_open);
+    }
+
+    #[test]
+    fn refresh_after_repair_skips_unreadable_hardware() {
+        use crate::ota::persist::fault_kv::FaultKv;
+
+        let kv = FaultKv::new();
+        let mut s = OtaStore::open(kv.clone(), || 0xC0FF_EE00);
+        assert_eq!(
+            refresh_after_repair(
+                &mut s,
+                Err(HardwareReadError::Busy),
+                Some(Version::new(1, 0, 0)),
+                false
+            ),
+            None
+        );
+        assert_eq!(kv.reads() + kv.commits(), 0);
+    }
+
+    #[test]
+    fn a_report_is_owed_when_the_repair_dropped_or_failed_or_the_records_stay_suspect() {
+        assert!(!repair_report_owed(Ok(0), false));
+        assert!(repair_report_owed(Ok(0), true));
+        assert!(repair_report_owed(Ok(1), false));
+        assert!(repair_report_owed(Ok(3), true));
+        assert!(repair_report_owed(Err(RepairError::Capped), false));
+        assert!(repair_report_owed(
+            Err(RepairError::Store(StoreError::InvalidSlot)),
+            false
+        ));
+    }
+
+    fn running_a() -> Result<HardwareFacts, HardwareReadError> {
+        use crate::ota::persist::UpdateSlot;
+        use crate::ota::SlotState;
+        Ok(HardwareFacts {
+            running_slot: SlotId(0),
+            running_state: SlotState::Valid,
+            update_slot: UpdateSlot::Absent,
+        })
+    }
+
+    #[test]
+    fn a_transient_read_error_at_boot_owes_no_report() {
+        use crate::ota::persist::fault_kv::FaultKv;
+
+        let running = Some(Version::new(1, 0, 0));
+        let kv = FaultKv::new();
+        let mut s = OtaStore::open(kv.clone(), || 0xC0FF_EE00);
+        kv.reset_counters();
+        let _ = reconcile_boot(&mut s, running_a(), running);
+        let reads = kv.reads();
+        assert!(reads > 0);
+
+        let mut failed_closed = 0;
+        for n in 1..=reads {
+            let kv = FaultKv::new();
+            let mut s = OtaStore::open(kv.clone(), || 0xC0FF_EE00);
+            kv.reset_counters();
+            kv.fail_read_at(n);
+            let boot = reconcile_boot(&mut s, running_a(), running);
+            kv.revive();
+            if !boot.records_suspect() {
+                continue;
+            }
+            failed_closed += 1;
+            let repaired = repair_all(&mut s, 32);
+            assert_eq!(repaired, Ok(0), "read {n}: nothing was corrupt");
+            let refreshed =
+                refresh_after_repair(&mut s, running_a(), running, false).expect("hardware read");
+            assert!(!refreshed.records_suspect, "read {n}");
+            assert!(
+                !repair_report_owed(repaired, refreshed.records_suspect),
+                "read {n}: a flaky read must not fail a valid action"
+            );
+        }
+        assert!(failed_closed > 0, "some read fails the boot closed");
+    }
+
+    #[test]
+    fn a_corrupt_record_at_boot_owes_a_report() {
+        use crate::ota::persist::fault_kv::FaultKv;
+
+        let running = Some(Version::new(1, 0, 0));
+        let kv = FaultKv::new();
+        kv.put_str("ddi_act", "042");
+        let mut s = OtaStore::open(kv.clone(), || 0xC0FF_EE00);
+        let boot = reconcile_boot(&mut s, running_a(), running);
+        assert!(boot.records_suspect());
+        let repaired = repair_all(&mut s, 32);
+        assert!(matches!(repaired, Ok(n) if n > 0), "{repaired:?}");
+        let refreshed =
+            refresh_after_repair(&mut s, running_a(), running, false).expect("hardware read");
+        assert!(!refreshed.records_suspect);
+        assert!(repair_report_owed(repaired, refreshed.records_suspect));
     }
 }

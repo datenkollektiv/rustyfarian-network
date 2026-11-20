@@ -4,6 +4,9 @@ mod boot_flow;
 mod corrupt_probe;
 mod counter_loss;
 mod crash_matrix;
+mod ddi_record;
+#[cfg(feature = "ota-ddi")]
+mod ddi_verdict;
 mod errors;
 mod fail_closed;
 mod failed_download;

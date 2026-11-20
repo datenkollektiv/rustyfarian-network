@@ -19,7 +19,8 @@
 //!
 //! The persisted OTA records ([`OtaStore`], [`OtaKv`], [`reconcile_boot`], [`note_boot_slot`], and their outcome and error types) are re-exported from `juggler::ota` as well; [`EspNvsKv`], [`open_store`] and [`open_store_in`] are the NVS backend, [`read_hardware_facts`] and [`note_boot_slot_idf`] read the bootloader.
 //!
-//! The OTA wire contract ([`OtaCommand`], [`Manifest`], [`OtaStatus`], [`FailReason`], [`RollbackReason`], and their error types and size limits) is re-exported from `juggler::ota` as well.
+//! The reason codes ([`FailReason`], [`RollbackReason`]) are re-exported from `juggler::ota` as well.
+//! With the `ota-wire` feature, so is the MQTT OTA wire contract (`OtaCommand`, `Manifest`, `OtaStatus`, and their error types and size limits); with `ota-wire` and `mqtt`, `runtime` holds the MQTT OTA consumer runtime; with `ota-ddi`, [`ddi`] holds the DDI transport and runtime.
 //!
 //! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
 //! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
@@ -48,20 +49,34 @@
 //! ```
 
 mod boot_facts;
+#[cfg(feature = "ota-ddi")]
+pub mod ddi;
 mod downloader;
+#[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
+mod flags;
 mod flasher;
-#[cfg(all(feature = "ota", feature = "mqtt"))]
+#[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
+mod health_driver;
+#[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
+mod records;
+#[cfg(all(feature = "ota-wire", feature = "mqtt"))]
 pub mod runtime;
+#[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
+mod stack;
 mod store;
 
 pub use boot_facts::{note_boot_slot_idf, read_hardware_facts, slot_evidence_line};
 pub use store::{open_store, open_store_in, EspNvsKv};
 
-// The runtime's configuration and verdict types, flat like the rest of the `juggler::ota` surface.
+// The health verdict types of the base `ota` feature, flat like the rest of the `juggler::ota` surface.
+// The policy itself is `juggler::ota::health`, shared by the MQTT and the DDI runtime.
+pub use juggler::ota::{DeadlineAction, HealthVerdict};
+
+// The MQTT runtime's configuration types, flat like the rest of the `juggler::ota` surface.
 // The state machines stay under `juggler::ota::runtime`; this crate's own `runtime` module is the glue.
+#[cfg(feature = "ota-wire")]
 pub use juggler::ota::{
-    ConfigError, DeadlineAction, HealthVerdict, OtaSettings, OtaStacks, OtaTimings,
-    MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
+    ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
 
 // Re-export the full public surface of `juggler::ota` for domain parity with the
@@ -73,13 +88,20 @@ pub use juggler::ota::{
     hex_to_bytes, note_boot_slot, read_with_busy_retry, reconcile, reconcile_boot,
     slot_for_partition, slot_from_label, slot_label, ActivationPermit, Admission, AttemptRecord,
     BlockedBy, BootDisposition, BootFacts, BootFault, BootOutcome, BootWarnings, BusyRetry,
-    BusyTally, CommandError, CorruptRecord, Deadline, Delivery, FailReason, FailedDownload,
-    HardwareFacts, HardwareReadError, ImageMetadata, KvError, KvStr, Manifest, ManifestError,
-    NoteBoot, NoteBootError, OfferDecision, OtaCommand, OtaError, OtaKv, OtaState, OtaStatus,
-    OtaStore, PendingReport, PendingReportView, ReasonNote, ReconcileAction, RefusalNote,
-    RepairedRecord, ReportRecord, RollbackNoted, RollbackReason, RollbackRequest, SettleOutcome,
-    SlotId, SlotState, StatusError, StoreError, StoredAttempt, StreamingVerifier, UpdateDecision,
-    UpdateSlot, Version, FACTORY_SLOT, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
+    BusyTally, CancelRequest, CorruptRecord, Deadline, Delivery, FailReason, FailedDownload,
+    HardwareFacts, HardwareReadError, ImageChip, ImageMetadata, KvError, KvStr, NoteBoot,
+    NoteBootError, OfferDecision, OtaError, OtaKv, OtaState, OtaStore, PendingReport,
+    PendingReportView, ReasonNote, ReconcileAction, RefusalNote, RepairedRecord, ReportRecord,
+    RollbackNoted, RollbackReason, RollbackRequest, SettleOutcome, SlotId, SlotState, StoreError,
+    StoredAttempt, StreamingVerifier, UpdateDecision, UpdateSlot, Version, FACTORY_SLOT,
+    NVS_NAMESPACE,
+};
+
+// The MQTT OTA wire contract (ADR 018 amendment 2026-11-21): a DDI build leaves it out.
+#[cfg(feature = "ota-wire")]
+pub use juggler::ota::{
+    CommandError, Manifest, ManifestError, OtaCommand, OtaStatus, StatusError, MAX_COMMAND_BYTES,
+    MAX_MANIFEST_BYTES,
 };
 
 macro_rules! target_chip {
@@ -117,7 +139,7 @@ target_chip! {
     esp_idf_idf_target_esp32p4 => "esp32p4",
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ota-wire"))]
 mod target_chip_guard {
     use super::{Manifest, TARGET_CHIP};
 
@@ -134,11 +156,14 @@ mod target_chip_guard {
     }
 }
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use downloader::{FirmwareDownloader, FirmwareResponse, DOWNLOAD_BUFFER_SIZE, HTTP_RX_BUFFER_SIZE};
 use flasher::{FirmwareFlasher, OtaWriter};
-use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
+use juggler::ota::download::{
+    CancelGate, DownloadAction, DownloadInput, DownloadMachine, IMAGE_HEADER_LEN,
+};
 use juggler::ota::read_bounded;
 
 pub use downloader::url_for_log;
@@ -156,6 +181,83 @@ pub struct OtaSessionConfig {
 
 /// Experimental: API may change before 1.0.
 ///
+/// The cancel switch of one [`OtaSession::fetch_and_apply_cancellable`] call, shared with the thread that cancels.
+///
+/// [`cancel`](Self::cancel) answers [`CancelRequest::Accepted`] until the download is handed the permit to select the new boot slot, and [`CancelRequest::TooLate`] once that happened or the download ended.
+/// An accepted cancel stops the download at its next step boundary (before the flash is prepared, after a read or a write, or right before the boot slot is selected): the flash session is aborted and the call returns [`OtaError::Cancelled`], with the boot slot unchanged.
+/// A blocking read or flash operation in progress is not interrupted; the cancel takes effect when it returns.
+/// One per download: a used switch answers `TooLate`.
+/// It is `Sync`, so share it as a `static` or behind an `Arc`.
+/// The esp-hal tier has the same type.
+///
+/// ```rust,no_run
+/// # use std::sync::Arc;
+/// # use rustyfarian_esp_idf_network::ota::{CancelRequest, OtaCancel, OtaSession, OtaSessionConfig};
+/// let cancel = Arc::new(OtaCancel::new());
+/// let remote = Arc::clone(&cancel);
+/// std::thread::spawn(move || {
+///     if remote.cancel() == CancelRequest::TooLate {
+///         log::warn!("the new image is already being activated");
+///     }
+/// });
+/// let mut session = OtaSession::new(OtaSessionConfig { timeout_secs: 30 }).unwrap();
+/// let result = session.fetch_and_apply_cancellable("http://192.168.1.1/fw.bin", &[0u8; 32], &cancel);
+/// ```
+#[derive(Debug, Default)]
+pub struct OtaCancel(Mutex<CancelGate>);
+
+impl OtaCancel {
+    /// Experimental: API may change before 1.0.
+    ///
+    /// A switch for a download that has not started.
+    pub const fn new() -> Self {
+        Self(Mutex::new(CancelGate::new()))
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Requests that the download stop; see the type documentation for the answer.
+    pub fn cancel(&self) -> CancelRequest {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).request()
+    }
+
+    /// Whether a cancel was accepted and the download has not yet ended on it: polled between two attempts of a retried download.
+    #[cfg(feature = "ota-ddi")]
+    pub(crate) fn is_requested(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_requested()
+    }
+
+    /// A switch for a download that is tried again after a failed attempt: it stays open across attempts (`CancelGate::for_retries`), until [`close`](Self::close).
+    #[cfg(feature = "ota-ddi")]
+    pub(crate) const fn for_retries() -> Self {
+        Self(Mutex::new(CancelGate::for_retries()))
+    }
+
+    /// Closes the switch for good, so a later cancel answers `TooLate`, and returns whether a cancel had been accepted before, in one step under the lock.
+    #[cfg(feature = "ota-ddi")]
+    pub(crate) fn close(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).close()
+    }
+
+    /// One machine step under the lock the requester takes, so a cancel cannot fall between the check and the permit.
+    fn poll(
+        &self,
+        machine: &mut DownloadMachine,
+        input: DownloadInput,
+        elapsed: Duration,
+    ) -> Result<DownloadAction, OtaError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll(machine, input, elapsed)
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
 /// Single-use OTA session that streams firmware from a plain HTTP server,
 /// verifies the SHA-256 digest, and writes to the inactive OTA partition.
 ///
@@ -169,6 +271,7 @@ pub struct OtaSessionConfig {
 pub struct OtaSession {
     config: OtaSessionConfig,
     deadline: Deadline,
+    expected_chip: Option<ImageChip>,
 }
 
 impl OtaSession {
@@ -179,6 +282,7 @@ impl OtaSession {
         Ok(Self {
             config,
             deadline: Deadline::none(),
+            expected_chip: None,
         })
     }
 
@@ -253,6 +357,29 @@ impl OtaSession {
 
     /// Experimental: API may change before 1.0.
     ///
+    /// Require the image header to name `chip` before any flash is touched.
+    ///
+    /// The first 16 body bytes are read before the inactive partition is erased and checked by `juggler::ota::download::check_image_header`: a different chip id fails with [`OtaError::TargetMismatch`], a missing `0xE9` magic byte or an image shorter than the header with `DownloadFailed { status: 0 }`, both without erasing anything.
+    /// On a match those bytes are written first, so the image and its SHA-256 are unchanged.
+    /// `esp_ota_end` still validates the whole image.
+    /// Not calling this method means no header check.
+    /// The esp-hal tier has the same method on `EspHalOtaManager`.
+    ///
+    /// ```rust,no_run
+    /// # use rustyfarian_esp_idf_network::ota::{ImageChip, OtaSession, OtaSessionConfig, TARGET_CHIP};
+    /// let chip = ImageChip::from_target(TARGET_CHIP).expect("a chip the header check knows");
+    /// let mut session = OtaSession::new(OtaSessionConfig { timeout_secs: 30 })
+    ///     .unwrap()
+    ///     .with_expected_chip(chip);
+    /// ```
+    #[must_use]
+    pub fn with_expected_chip(mut self, chip: ImageChip) -> Self {
+        self.expected_chip = Some(chip);
+        self
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
     /// Fetch firmware from `url`, verify its SHA-256 against `expected_sha256`,
     /// write it to the inactive OTA slot, and set that slot as the boot partition.
     ///
@@ -286,26 +413,68 @@ impl OtaSession {
     /// limits).
     ///
     /// Only plain `http://` URLs are supported (see ADR 011).
+    /// To cancel the download from another thread, use
+    /// [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable).
     pub fn fetch_and_apply(
         &mut self,
         url: &str,
         expected_sha256: &[u8; 32],
     ) -> Result<(), OtaError> {
+        self.fetch_and_apply_cancellable(url, expected_sha256, &OtaCancel::new())
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// [`fetch_and_apply`](Self::fetch_and_apply) that another thread can stop through `cancel`.
+    ///
+    /// Returns [`OtaError::Cancelled`] exactly when a [`OtaCancel::cancel`] was accepted; the boot slot is then unchanged.
+    pub fn fetch_and_apply_cancellable(
+        &mut self,
+        url: &str,
+        expected_sha256: &[u8; 32],
+        cancel: &OtaCancel,
+    ) -> Result<(), OtaError> {
+        self.fetch_and_apply_with(expected_sha256, None, cancel, |timeout| {
+            FirmwareDownloader::new(url).with_timeout(timeout).connect()
+        })
+    }
+
+    /// The download loop behind every public fetch: `open` connects with the given timeout and returns the `200` response.
+    ///
+    /// With `expected_size`, the declared `Content-Length` must equal it (`DownloadMachine::with_expected_size`).
+    /// Crate-private so that no public method gains a header parameter (ADR 027); the DDI transport passes an `open` that sends its `Authorization` header.
+    pub(crate) fn fetch_and_apply_with<F>(
+        &mut self,
+        expected_sha256: &[u8; 32],
+        expected_size: Option<u64>,
+        cancel: &OtaCancel,
+        mut open: F,
+    ) -> Result<(), OtaError>
+    where
+        F: FnMut(Duration) -> Result<FirmwareResponse, OtaError>,
+    {
         let start = Instant::now();
         let per_op = Duration::from_secs(self.config.timeout_secs);
         let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
+        if let Some(size) = expected_size {
+            machine = machine.with_expected_size(size);
+        }
+        if let Some(chip) = self.expected_chip {
+            machine = machine.with_expected_chip(chip);
+        }
 
         // Until `Prepare`, nothing is open that needs an abort.
         let mut connected: Option<(FirmwareResponse, FirmwareFlasher)> = None;
+        let mut header = [0u8; IMAGE_HEADER_LEN];
         let mut input = DownloadInput::Begin;
         let (len, mut response, mut flasher) = loop {
-            let action = machine
-                .poll_bounded(input, start.elapsed())
+            let action = cancel
+                .poll(&mut machine, input, start.elapsed())
                 .inspect_err(|e| log::error!("OTA download stopped: {}", e))?;
             input = match action {
                 // The connection's timeout is `min(per-read timeout, remaining deadline)`.
                 DownloadAction::Connect { budget } => {
-                    match connect(&FirmwareDownloader::new(url).with_timeout(wait_for(budget))) {
+                    match open(wait_for(budget)).and_then(size_slot) {
                         Ok((response, flasher, capacity)) => {
                             let headers = DownloadInput::Headers {
                                 content_length: response.content_length(),
@@ -318,6 +487,25 @@ impl OtaSession {
                         Err(e) => DownloadInput::ConnectFailed(e),
                     }
                 }
+                // The image header, read before the slot is erased; the machine keeps it.
+                DownloadAction::ReadHeader { max, budget } => match connected.as_mut() {
+                    Some((response, _)) => {
+                        let began = Instant::now();
+                        match read_bounded(
+                            &mut header,
+                            max,
+                            HTTP_RX_BUFFER_SIZE,
+                            budget,
+                            per_op,
+                            || began.elapsed(),
+                            |buf, wait| response.read(buf, wait_for(wait)),
+                        ) {
+                            Ok(n) => DownloadInput::header_read(&header[..n]),
+                            Err(e) => DownloadInput::ReadFailed(e),
+                        }
+                    }
+                    None => return Err(unexpected(&action)),
+                },
                 DownloadAction::Prepare { len } => match connected.take() {
                     Some((response, flasher)) => break (len, response, flasher),
                     None => return Err(unexpected(&action)),
@@ -331,8 +519,11 @@ impl OtaSession {
         let mut ota_writer = match flasher.begin(len as usize) {
             Ok(writer) => writer,
             Err(e) => {
-                return match machine.poll_bounded(DownloadInput::PrepareFailed(e), start.elapsed())
-                {
+                return match cancel.poll(
+                    &mut machine,
+                    DownloadInput::PrepareFailed(e),
+                    start.elapsed(),
+                ) {
                     Ok(DownloadAction::Done(result)) => result,
                     Ok(other) => Err(unexpected(&other)),
                     Err(e) => Err(e),
@@ -344,7 +535,7 @@ impl OtaSession {
         let mut buffer = [0u8; DOWNLOAD_BUFFER_SIZE];
         let mut input = DownloadInput::Prepared;
         loop {
-            let action = match machine.poll_bounded(input, start.elapsed()) {
+            let action = match cancel.poll(&mut machine, input, start.elapsed()) {
                 Ok(action) => action,
                 Err(e) => {
                     log::error!(
@@ -370,6 +561,13 @@ impl OtaSession {
                         Err(e) => DownloadInput::ReadFailed(e),
                     }
                 }
+                DownloadAction::WriteHeader(bytes) => {
+                    verifier.update(&bytes);
+                    match ota_writer.write_chunk(&bytes) {
+                        Ok(()) => DownloadInput::Written,
+                        Err(e) => DownloadInput::WriteFailed(e),
+                    }
+                }
                 DownloadAction::Write { n } => {
                     verifier.update(&buffer[..n]);
                     match ota_writer.write_chunk(&buffer[..n]) {
@@ -386,12 +584,17 @@ impl OtaSession {
                 DownloadAction::Abort(e) => {
                     log::error!("OTA download failed: {} — aborting, boot slot unchanged", e);
                     let _ = ota_writer.abort();
-                    return finish(&mut machine, DownloadInput::Aborted, start);
+                    return finish(cancel, &mut machine, DownloadInput::Aborted, start);
                 }
                 DownloadAction::Activate(permit) => {
                     log::info!("SHA-256 verified — completing OTA partition swap");
                     let result = ota_writer.complete(permit);
-                    return finish(&mut machine, DownloadInput::Activated(result), start);
+                    return finish(
+                        cancel,
+                        &mut machine,
+                        DownloadInput::Activated(result),
+                        start,
+                    );
                 }
                 other => return Err(abort_with(ota_writer, unexpected(&other))),
             };
@@ -472,14 +675,13 @@ fn abort_with(writer: OtaWriter<'_>, err: OtaError) -> OtaError {
     err
 }
 
-/// Connect, read the response headers, and size the inactive partition.
+/// Size the inactive partition for a response whose headers have been read.
 ///
 /// The partition is looked up only after the server answered, so nothing on
 /// flash is touched for an unreachable server.
-fn connect(
-    downloader: &FirmwareDownloader,
+fn size_slot(
+    response: FirmwareResponse,
 ) -> Result<(FirmwareResponse, FirmwareFlasher, u64), OtaError> {
-    let response = downloader.connect()?;
     let flasher = FirmwareFlasher::new()?;
     let capacity = flasher.update_partition_capacity()? as u64;
     Ok((response, flasher, capacity))
@@ -492,11 +694,12 @@ fn wait_for(budget: Duration) -> Duration {
 
 /// Feed the last outcome and return the machine's final result.
 fn finish(
+    cancel: &OtaCancel,
     machine: &mut DownloadMachine,
     input: DownloadInput,
     start: Instant,
 ) -> Result<(), OtaError> {
-    match machine.poll_bounded(input, start.elapsed())? {
+    match cancel.poll(machine, input, start.elapsed())? {
         DownloadAction::Done(result) => result,
         other => Err(unexpected(&other)),
     }

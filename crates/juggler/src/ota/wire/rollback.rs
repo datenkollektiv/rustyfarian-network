@@ -2,7 +2,9 @@
 
 use core::fmt;
 
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 use serde::de::{Deserializer, Error, Visitor};
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 use serde::{Deserialize, Serialize, Serializer};
 
 /// Experimental: API may change before 1.0.
@@ -76,6 +78,7 @@ impl RollbackReason {
     }
 }
 
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 impl Serialize for RollbackReason {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -83,6 +86,7 @@ impl Serialize for RollbackReason {
 }
 
 /// Deserializes from the wire string with [`RollbackReason::parse`]; an unknown label is an error with fixed text that never quotes the input.
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 impl<'de> Deserialize<'de> for RollbackReason {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct LabelVisitor;
@@ -134,6 +138,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
     #[test]
     fn deserialize_matches_parse() {
         for (reason, label) in ALL {
@@ -169,6 +174,7 @@ mod tests {
             RollbackReason::from_label("unhealthy_demo"),
             RollbackReason::Unknown
         );
+        #[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
         assert!(serde_json::from_str::<RollbackReason>("\"unhealthy_demo\"").is_err());
     }
 
@@ -186,9 +192,12 @@ mod tests {
             RollbackReason::from_label("secretlabel"),
             RollbackReason::Unknown
         );
-        let err = serde_json::from_str::<RollbackReason>("\"secretlabel\"").unwrap_err();
-        let text = alloc::format!("{err} {err:?}");
-        assert!(text.contains("unknown OTA rollback label"));
-        assert!(!text.contains("secret"));
+        #[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+        {
+            let err = serde_json::from_str::<RollbackReason>("\"secretlabel\"").unwrap_err();
+            let text = alloc::format!("{err} {err:?}");
+            assert!(text.contains("unknown OTA rollback label"));
+            assert!(!text.contains("secret"));
+        }
     }
 }

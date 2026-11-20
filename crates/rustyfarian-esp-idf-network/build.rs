@@ -25,6 +25,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OTA_TOPIC_PREFIX");
     println!("cargo:rerun-if-env-changed=OTA_DEMO_UNHEALTHY");
     println!("cargo:rerun-if-env-changed=OTA_FAILURE_DEADLINE_SECS");
+    // Rerun triggers for the DDI OTA examples (`idf_c3_ddi`, `idf_c6_ddi`): the server, the
+    // device identity, its token and the broker password are compiled in via `option_env!`.
+    println!("cargo:rerun-if-env-changed=DDI_BASE_URL");
+    println!("cargo:rerun-if-env-changed=DDI_CONTROLLER_ID");
+    println!("cargo:rerun-if-env-changed=DDI_TOKEN");
+    println!("cargo:rerun-if-env-changed=DDI_DEMO_UNHEALTHY");
+    println!("cargo:rerun-if-env-changed=MQTT_PASS");
     // Rerun trigger for sdkconfig (ESP-IDF config changes require a rebuild).
     // `sdkconfig.defaults` lives at the workspace root, not this crate's root;
     // `rerun-if-changed` paths are relative to the crate dir, so reach up two

@@ -1,7 +1,8 @@
 //! The firmware download order as an action machine (ADR 023 rung 3).
 //!
 //! Both tiers run `fetch_and_apply` through [`DownloadMachine`]: blocking threads on ESP-IDF, async on esp-hal, with transport and flash I/O outside `embedded-hal`.
-//! The machine owns the order of the steps (deadline, connect and headers, the Content-Length admission, preparing the slot, the read and write stream with a deadline check after each, the SHA-256 compare, the final deadline and the activation permit); the tier loop only performs the returned [`DownloadAction`] and feeds the outcome back as a [`DownloadInput`].
+//! The machine owns the order of the steps (deadline, connect and headers, the Content-Length admission, the image-header chip check when one is expected, preparing the slot, the read and write stream with a deadline check after each, the SHA-256 compare, the final deadline and the activation permit); the tier loop only performs the returned [`DownloadAction`] and feeds the outcome back as a [`DownloadInput`].
+//! A cancel enters through [`DownloadMachine::cancel`], from another thread or task through a [`CancelGate`].
 //!
 //! Pure and `no_std`: time enters as the elapsed time since the call started, and the machine never reads a clock.
 //!
@@ -56,6 +57,133 @@ pub fn check_content_length(
 
 /// Experimental: API may change before 1.0.
 ///
+/// The bytes of an ESP application image header the early chip check reads before any flash is touched.
+///
+/// The header is `esp_image_header_t` (ESP-IDF `components/bootloader_support/include/esp_app_format.h`): the magic byte at offset 0 and the `chip_id` at offset 12 are inside the first 16 bytes.
+pub const IMAGE_HEADER_LEN: usize = 16;
+
+/// The first byte of every ESP application image (`ESP_IMAGE_HEADER_MAGIC`).
+const IMAGE_MAGIC: u8 = 0xE9;
+
+/// Offset of the little-endian `u16` `chip_id` in `esp_image_header_t`: after the 8-byte common header, `wp_pin` and the three `spi_pin_drv` bytes.
+const CHIP_ID_OFFSET: usize = 12;
+
+/// Experimental: API may change before 1.0.
+///
+/// A chip as an ESP application image header names it (`esp_chip_id_t` in ESP-IDF v6.1 `esp_app_format.h`).
+///
+/// ```
+/// use juggler::ota::download::ImageChip;
+///
+/// assert_eq!(ImageChip::from_target("esp32c3"), Some(ImageChip::Esp32C3));
+/// assert_eq!(ImageChip::Esp32C3.id(), 5);
+/// assert_eq!(ImageChip::from_target("ESP32C3"), None);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageChip {
+    /// ESP32, chip id 0.
+    Esp32,
+    /// ESP32-S2, chip id 2.
+    Esp32S2,
+    /// ESP32-C3, chip id 5.
+    Esp32C3,
+    /// ESP32-S3, chip id 9.
+    Esp32S3,
+    /// ESP32-C2, chip id 12.
+    Esp32C2,
+    /// ESP32-C6, chip id 13.
+    Esp32C6,
+    /// ESP32-H2, chip id 16.
+    Esp32H2,
+    /// ESP32-P4, chip id 18.
+    Esp32P4,
+    /// ESP32-C5, chip id 23.
+    Esp32C5,
+}
+
+impl ImageChip {
+    const ALL: [ImageChip; 9] = [
+        ImageChip::Esp32,
+        ImageChip::Esp32S2,
+        ImageChip::Esp32C3,
+        ImageChip::Esp32S3,
+        ImageChip::Esp32C2,
+        ImageChip::Esp32C6,
+        ImageChip::Esp32H2,
+        ImageChip::Esp32P4,
+        ImageChip::Esp32C5,
+    ];
+
+    /// The `chip_id` an image built for this chip carries in its header.
+    pub const fn id(self) -> u16 {
+        match self {
+            ImageChip::Esp32 => 0x0000,
+            ImageChip::Esp32S2 => 0x0002,
+            ImageChip::Esp32C3 => 0x0005,
+            ImageChip::Esp32S3 => 0x0009,
+            ImageChip::Esp32C2 => 0x000C,
+            ImageChip::Esp32C6 => 0x000D,
+            ImageChip::Esp32H2 => 0x0010,
+            ImageChip::Esp32P4 => 0x0012,
+            ImageChip::Esp32C5 => 0x0017,
+        }
+    }
+
+    /// The ESP-IDF target name (`"esp32"`, `"esp32c3"`, ...), the spelling of the IDF tier's `TARGET_CHIP`.
+    pub const fn target(self) -> &'static str {
+        match self {
+            ImageChip::Esp32 => "esp32",
+            ImageChip::Esp32S2 => "esp32s2",
+            ImageChip::Esp32C3 => "esp32c3",
+            ImageChip::Esp32S3 => "esp32s3",
+            ImageChip::Esp32C2 => "esp32c2",
+            ImageChip::Esp32C6 => "esp32c6",
+            ImageChip::Esp32H2 => "esp32h2",
+            ImageChip::Esp32P4 => "esp32p4",
+            ImageChip::Esp32C5 => "esp32c5",
+        }
+    }
+
+    /// The chip for an ESP-IDF target name by exact match, `None` for any other text.
+    pub fn from_target(name: &str) -> Option<ImageChip> {
+        Self::ALL.into_iter().find(|chip| chip.target() == name)
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// Checks the first [`IMAGE_HEADER_LEN`] bytes of an image against the chip it must run on.
+///
+/// A first byte other than `0xE9` is not an ESP image: `DownloadFailed { status: 0 }`, the protocol-shape rejection.
+/// A `chip_id` other than `expected.id()`, an unknown id included, is [`OtaError::TargetMismatch`].
+///
+/// ```
+/// use juggler::ota::download::{check_image_header, ImageChip};
+/// use juggler::ota::OtaError;
+///
+/// let mut header = [0u8; 16];
+/// header[0] = 0xE9;
+/// header[12] = 5;
+/// assert_eq!(check_image_header(&header, ImageChip::Esp32C3), Ok(()));
+/// assert_eq!(check_image_header(&header, ImageChip::Esp32S3), Err(OtaError::TargetMismatch));
+/// ```
+pub fn check_image_header(
+    header: &[u8; IMAGE_HEADER_LEN],
+    expected: ImageChip,
+) -> Result<(), OtaError> {
+    if header[0] != IMAGE_MAGIC {
+        return Err(OtaError::DownloadFailed { status: 0 });
+    }
+    let chip_id = u16::from_le_bytes([header[CHIP_ID_OFFSET], header[CHIP_ID_OFFSET + 1]]);
+    if chip_id == expected.id() {
+        Ok(())
+    } else {
+        Err(OtaError::TargetMismatch)
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
 /// The outcome of the previous [`DownloadAction`], fed to [`DownloadMachine::poll`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadInput {
@@ -76,13 +204,22 @@ pub enum DownloadInput {
     Prepared,
     /// [`DownloadAction::Prepare`] failed; no write session exists.
     PrepareFailed(OtaError),
+    /// [`DownloadAction::ReadHeader`] returned `n` bytes, the first of them in `bytes`; `0` is the end of the stream.
+    ///
+    /// Build it with [`DownloadInput::header_read`].
+    HeaderRead {
+        /// The bytes read, from the start; only the first `n` (at most [`IMAGE_HEADER_LEN`]) are meaningful.
+        bytes: [u8; IMAGE_HEADER_LEN],
+        /// How many bytes the read returned.
+        n: usize,
+    },
     /// [`DownloadAction::Read`] returned `n` bytes; `0` is the end of the stream.
     Read(usize),
-    /// [`DownloadAction::Read`] failed.
+    /// [`DownloadAction::ReadHeader`] or [`DownloadAction::Read`] failed.
     ReadFailed(OtaError),
-    /// [`DownloadAction::Write`] succeeded.
+    /// [`DownloadAction::WriteHeader`] or [`DownloadAction::Write`] succeeded.
     Written,
-    /// [`DownloadAction::Write`] failed, or the tail flush of [`DownloadAction::Finalize`] did.
+    /// [`DownloadAction::WriteHeader`] or [`DownloadAction::Write`] failed, or the tail flush of [`DownloadAction::Finalize`] did.
     WriteFailed(OtaError),
     /// [`DownloadAction::Finalize`] computed this SHA-256 of the streamed bytes.
     Digest([u8; 32]),
@@ -90,6 +227,21 @@ pub enum DownloadInput {
     Aborted,
     /// [`DownloadAction::Activate`] returned.
     Activated(Result<(), OtaError>),
+}
+
+impl DownloadInput {
+    /// The answer to [`DownloadAction::ReadHeader`] for the bytes `read` returned.
+    ///
+    /// A read longer than [`IMAGE_HEADER_LEN`] keeps its length, so the machine refuses it as a read past the requested bytes.
+    pub fn header_read(read: &[u8]) -> Self {
+        let mut bytes = [0; IMAGE_HEADER_LEN];
+        let kept = read.len().min(IMAGE_HEADER_LEN);
+        bytes[..kept].copy_from_slice(&read[..kept]);
+        DownloadInput::HeaderRead {
+            bytes,
+            n: read.len(),
+        }
+    }
 }
 
 /// Experimental: API may change before 1.0.
@@ -102,11 +254,24 @@ pub enum DownloadAction {
         /// `min(per-operation timeout, remaining deadline)`.
         budget: Duration,
     },
+    /// Read at most `max` bytes of the image header within `budget`, before the slot is prepared, and answer with [`DownloadInput::HeaderRead`] or [`DownloadInput::ReadFailed`].
+    ///
+    /// Only a machine with an expected chip asks for it.
+    ReadHeader {
+        /// Header bytes still missing; never read past them.
+        max: u32,
+        /// `min(per-operation timeout, remaining deadline)`.
+        budget: Duration,
+    },
     /// Open the write session for an image of exactly `len` bytes (erasing what it needs) and answer with [`DownloadInput::Prepared`] or [`DownloadInput::PrepareFailed`].
     Prepare {
         /// The admitted image length.
         len: u32,
     },
+    /// Feed these header bytes, the first bytes of the image, to the SHA-256 and write them to the start of the slot, then answer with [`DownloadInput::Written`] or [`DownloadInput::WriteFailed`].
+    ///
+    /// Comes right after [`DownloadInput::Prepared`] when the header was read before the slot was prepared.
+    WriteHeader([u8; IMAGE_HEADER_LEN]),
     /// Read at most `max` body bytes within `budget` and answer with [`DownloadInput::Read`] or [`DownloadInput::ReadFailed`].
     Read {
         /// Bytes still expected; never read past them.
@@ -133,10 +298,23 @@ pub enum DownloadAction {
     Ignored,
 }
 
+/// Experimental: API may change before 1.0.
+///
+/// Whether a cancel request can still take effect, the answer of [`DownloadMachine::cancel`] and [`CancelGate::request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelRequest {
+    /// The download stops at its next step boundary and ends with [`OtaError::Cancelled`]; the boot slot stays unchanged.
+    Accepted,
+    /// The download is activating the new slot or is already over; the request has no effect.
+    TooLate,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
     Connecting,
+    /// Reading the image header; the chip it must name.
+    ReadingHeader(ImageChip),
     Preparing,
     Reading,
     Writing,
@@ -153,19 +331,25 @@ enum Phase {
 /// The rules:
 /// - the deadline is checked on entry, after connect, after preparation, after every read and every write, and by the activation permit;
 /// - nothing is prepared before the headers pass [`check_content_length`];
+/// - with an [expected chip](Self::with_expected_chip), nothing is prepared before the first [`IMAGE_HEADER_LEN`] bytes pass [`check_image_header`]; those bytes are written first after preparation ([`DownloadAction::WriteHeader`]), so the slot and the SHA-256 see the image unchanged;
 /// - a stream that ends before, or runs past, the admitted length is `DownloadFailed { status: 0 }`;
 /// - every error after a successful preparation yields [`DownloadAction::Abort`] first, then [`DownloadAction::Done`] with that error;
 /// - an operation's own error wins over an expired deadline at the same boundary;
+/// - an accepted [`cancel`](Self::cancel) is honoured by the next answer to the pending action: before preparation (the header reads included) it ends the download, after it the write session is aborted first; it wins over any operation error and the deadline, so the result is [`OtaError::Cancelled`] exactly when the cancel was accepted;
 /// - an input that does not answer the pending action yields [`DownloadAction::Ignored`] and changes nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadMachine {
     deadline: Deadline,
     per_op: Duration,
     expected: [u8; 32],
+    size: Option<u64>,
+    chip: Option<ImageChip>,
+    header: [u8; IMAGE_HEADER_LEN],
     phase: Phase,
     len: u32,
     received: u32,
     steps: usize,
+    cancelled: bool,
 }
 
 impl DownloadMachine {
@@ -175,16 +359,57 @@ impl DownloadMachine {
             deadline,
             per_op,
             expected,
+            size: None,
+            chip: None,
+            header: [0; IMAGE_HEADER_LEN],
             phase: Phase::Idle,
             len: 0,
             received: 0,
             steps: 0,
+            cancelled: false,
+        }
+    }
+
+    /// Also requires the declared `Content-Length` to equal `size`, as a DDI artifact's `size` does.
+    ///
+    /// A different length ends the download before any flash is touched with [`OtaError::SizeMismatch`]; the length checks of [`check_content_length`] come first.
+    /// The machine already requires the bytes received to equal the `Content-Length`, so they equal `size` too.
+    #[must_use]
+    pub const fn with_expected_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    /// Also requires the image header to name `chip`, checked before any flash is touched.
+    ///
+    /// After the headers are admitted the machine asks for the first [`IMAGE_HEADER_LEN`] body bytes ([`DownloadAction::ReadHeader`]) and checks them with [`check_image_header`]: a wrong chip ends the download with [`OtaError::TargetMismatch`], a missing magic byte or an image shorter than the header with `DownloadFailed { status: 0 }`, both without a [`DownloadAction::Prepare`].
+    /// On a match the slot is prepared and the header bytes are written first ([`DownloadAction::WriteHeader`]).
+    /// `esp_ota_end` and the bootloader still validate the whole image.
+    #[must_use]
+    pub const fn with_expected_chip(mut self, chip: ImageChip) -> Self {
+        self.chip = Some(chip);
+        self
+    }
+
+    /// Requests that the download stop, as an operator cancel does.
+    ///
+    /// Until the machine has returned [`DownloadAction::Activate`] or [`DownloadAction::Done`] the request is [`CancelRequest::Accepted`]: the next answer to the pending action (before preparation, after a read or a write, or right before the activation permit) yields [`DownloadAction::Abort`] or [`DownloadAction::Done`] with [`OtaError::Cancelled`].
+    /// After that it is [`CancelRequest::TooLate`] and changes nothing.
+    /// A second accepted request changes nothing either.
+    pub fn cancel(&mut self) -> CancelRequest {
+        match self.phase {
+            Phase::Activating | Phase::Done => CancelRequest::TooLate,
+            _ => {
+                self.cancelled = true;
+                CancelRequest::Accepted
+            }
         }
     }
 
     /// The most [`poll`](Self::poll) calls a download of `len` bytes can take when every successful read returns at least `min_read` bytes: `2 * ceil(len / min_read) + 8`.
     ///
     /// Transports may return short reads, so the tiers pass `min_read = 1`.
+    /// The header reads of an [expected chip](Self::with_expected_chip) replace the first body reads, so the bound holds for them too.
     pub const fn max_steps(len: u32, min_read: usize) -> usize {
         let min_read = if min_read == 0 { 1 } else { min_read };
         2 * (len as usize).div_ceil(min_read) + 8
@@ -217,6 +442,11 @@ impl DownloadMachine {
     pub fn poll(&mut self, input: DownloadInput, elapsed: Duration) -> DownloadAction {
         use DownloadAction as A;
         use DownloadInput as I;
+        if self.cancelled {
+            if let Some(action) = self.honour_cancel(input) {
+                return action;
+            }
+        }
         match (self.phase, input) {
             (Phase::Idle, I::Begin) => match self.deadline.check(elapsed) {
                 Err(e) => self.done(Err(e)),
@@ -238,21 +468,63 @@ impl DownloadMachine {
                 let admitted = self
                     .deadline
                     .check(elapsed)
-                    .and_then(|()| check_content_length(content_length, chunked, capacity));
+                    .and_then(|()| check_content_length(content_length, chunked, capacity))
+                    .and_then(|len| match self.size {
+                        Some(size) if size != u64::from(len) => Err(OtaError::SizeMismatch),
+                        _ => Ok(len),
+                    })
+                    .and_then(|len| {
+                        if self.chip.is_some() && (len as usize) < IMAGE_HEADER_LEN {
+                            Err(OtaError::DownloadFailed { status: 0 })
+                        } else {
+                            Ok(len)
+                        }
+                    });
                 match admitted {
                     Err(e) => self.done(Err(e)),
                     Ok(len) => {
                         self.len = len;
-                        self.phase = Phase::Preparing;
-                        A::Prepare { len }
+                        if let Some(chip) = self.chip {
+                            self.read_header(chip, elapsed)
+                        } else {
+                            self.phase = Phase::Preparing;
+                            A::Prepare { len }
+                        }
                     }
                 }
             }
-            (Phase::Connecting, I::ConnectFailed(e)) | (Phase::Preparing, I::PrepareFailed(e)) => {
-                self.done(Err(e))
+            (Phase::ReadingHeader(chip), I::HeaderRead { bytes, n }) => {
+                let have = self.received as usize;
+                if n == 0 || n > IMAGE_HEADER_LEN - have {
+                    return self.done(Err(OtaError::DownloadFailed { status: 0 }));
+                }
+                self.header[have..have + n].copy_from_slice(&bytes[..n]);
+                self.received += n as u32;
+                if have + n < IMAGE_HEADER_LEN {
+                    return match self.deadline.check(elapsed) {
+                        Err(e) => self.done(Err(e)),
+                        Ok(()) => self.read_header(chip, elapsed),
+                    };
+                }
+                match check_image_header(&self.header, chip)
+                    .and_then(|()| self.deadline.check(elapsed))
+                {
+                    Err(e) => self.done(Err(e)),
+                    Ok(()) => {
+                        self.phase = Phase::Preparing;
+                        A::Prepare { len: self.len }
+                    }
+                }
             }
+            (Phase::Connecting, I::ConnectFailed(e))
+            | (Phase::ReadingHeader(_), I::ReadFailed(e))
+            | (Phase::Preparing, I::PrepareFailed(e)) => self.done(Err(e)),
             (Phase::Preparing, I::Prepared) => match self.deadline.check(elapsed) {
                 Err(e) => self.abort(e),
+                Ok(()) if self.chip.is_some() => {
+                    self.phase = Phase::Writing;
+                    A::WriteHeader(self.header)
+                }
                 Ok(()) => self.read(elapsed),
             },
             (Phase::Reading, I::Read(n)) => {
@@ -297,8 +569,34 @@ impl DownloadMachine {
         }
     }
 
+    /// The step an accepted cancel takes when `input` answers the pending action, `None` when it does not.
+    fn honour_cancel(&mut self, input: DownloadInput) -> Option<DownloadAction> {
+        use DownloadInput as I;
+        const CANCELLED: OtaError = OtaError::Cancelled;
+        match (self.phase, input) {
+            (Phase::Idle, I::Begin)
+            | (Phase::Connecting, I::Headers { .. } | I::ConnectFailed(_))
+            | (Phase::ReadingHeader(_), I::HeaderRead { .. } | I::ReadFailed(_))
+            | (Phase::Preparing, I::PrepareFailed(_))
+            | (Phase::Aborting(_), I::Aborted) => Some(self.done(Err(CANCELLED))),
+            (Phase::Preparing, I::Prepared)
+            | (Phase::Reading, I::Read(_) | I::ReadFailed(_))
+            | (Phase::Writing, I::Written | I::WriteFailed(_))
+            | (Phase::Finalizing, I::Digest(_) | I::WriteFailed(_)) => Some(self.abort(CANCELLED)),
+            _ => None,
+        }
+    }
+
     fn budget(&self, elapsed: Duration) -> Duration {
         self.deadline.clip(self.per_op, elapsed)
+    }
+
+    fn read_header(&mut self, chip: ImageChip, elapsed: Duration) -> DownloadAction {
+        self.phase = Phase::ReadingHeader(chip);
+        DownloadAction::ReadHeader {
+            max: IMAGE_HEADER_LEN as u32 - self.received,
+            budget: self.budget(elapsed),
+        }
     }
 
     fn read(&mut self, elapsed: Duration) -> DownloadAction {
@@ -317,6 +615,124 @@ impl DownloadMachine {
     fn done(&mut self, result: Result<(), OtaError>) -> DownloadAction {
         self.phase = Phase::Done;
         DownloadAction::Done(result)
+    }
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// What a cancel requester and a download loop on another thread or task share: one per download.
+///
+/// The tier keeps it behind a lock, routes every [`DownloadMachine`] step through [`poll`](Self::poll) and every cancel through [`request`](Self::request), both under that lock.
+/// A request then either reaches the machine before it hands out the activation permit (and is [`CancelRequest::Accepted`]) or comes after it (and is [`CancelRequest::TooLate`]); no request is accepted and then ignored.
+/// Pure and `no_std`: the lock is the tier's (a `Mutex` on ESP-IDF, a critical section on esp-hal).
+///
+/// ```
+/// use core::time::Duration;
+/// use juggler::ota::download::{CancelGate, CancelRequest, DownloadAction, DownloadInput, DownloadMachine};
+/// use juggler::ota::{Deadline, OtaError};
+///
+/// let mut gate = CancelGate::new();
+/// let mut m = DownloadMachine::new(Deadline::none(), Duration::from_secs(30), [0; 32]);
+/// assert_eq!(gate.request(), CancelRequest::Accepted);
+/// let action = gate.poll(&mut m, DownloadInput::Begin, Duration::ZERO);
+/// assert!(matches!(action, Ok(DownloadAction::Done(Err(OtaError::Cancelled)))));
+/// assert_eq!(gate.request(), CancelRequest::TooLate);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CancelGate {
+    requested: bool,
+    closed: bool,
+    retrying: bool,
+}
+
+impl CancelGate {
+    /// A gate with no request, for a download that has not started.
+    pub const fn new() -> Self {
+        Self {
+            requested: false,
+            closed: false,
+            retrying: false,
+        }
+    }
+
+    /// A gate for a download that is tried again after a failed attempt: one gate spans every attempt.
+    ///
+    /// A step that ends an attempt with an error ([`DownloadAction::Done`] with `Err`, or a loop error) leaves the gate open, so a cancel that arrives between a failed attempt and the decision to retry stays accepted.
+    /// Only the activation permit and a successful end close it; the caller closes it for good with [`close`](Self::close) when it gives up.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use juggler::ota::download::{CancelGate, CancelRequest, DownloadAction, DownloadInput, DownloadMachine};
+    /// use juggler::ota::{Deadline, OtaError};
+    ///
+    /// let mut gate = CancelGate::for_retries();
+    /// let mut m = DownloadMachine::new(Deadline::none(), Duration::from_secs(30), [0; 32]);
+    /// gate.poll(&mut m, DownloadInput::Begin, Duration::ZERO).unwrap();
+    /// let failed = gate.poll(&mut m, DownloadInput::ConnectFailed(OtaError::ServerUnreachable), Duration::ZERO);
+    /// assert!(matches!(failed, Ok(DownloadAction::Done(Err(OtaError::ServerUnreachable)))));
+    /// assert_eq!(gate.request(), CancelRequest::Accepted);
+    /// assert!(gate.close());
+    /// assert_eq!(gate.request(), CancelRequest::TooLate);
+    /// ```
+    pub const fn for_retries() -> Self {
+        Self {
+            requested: false,
+            closed: false,
+            retrying: true,
+        }
+    }
+
+    /// Whether a cancel was accepted: a download that waits between two attempts polls this to end at once.
+    pub const fn is_requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Closes the gate for good, so every later request is too late, and returns whether a cancel had been accepted before.
+    ///
+    /// The caller gives up on the download with `Cancelled` when this returns `true`; the answer and the close are one step under the caller's lock.
+    pub fn close(&mut self) -> bool {
+        self.closed = true;
+        self.requested
+    }
+
+    /// A cancel request: [`CancelRequest::Accepted`] until the download has been handed the activation permit or has ended, [`CancelRequest::TooLate`] after.
+    ///
+    /// A request before the download starts is accepted, and the download then ends at its first step.
+    pub fn request(&mut self) -> CancelRequest {
+        if self.closed {
+            CancelRequest::TooLate
+        } else {
+            self.requested = true;
+            CancelRequest::Accepted
+        }
+    }
+
+    /// One [`DownloadMachine::poll_bounded`] step that first hands a requested cancel to the machine.
+    ///
+    /// Closes the gate when the step returns [`DownloadAction::Activate`], [`DownloadAction::Done`] or an error, after which every request is too late; a gate made by [`for_retries`](Self::for_retries) stays open after a failed attempt.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`DownloadMachine::poll_bounded`].
+    pub fn poll(
+        &mut self,
+        machine: &mut DownloadMachine,
+        input: DownloadInput,
+        elapsed: Duration,
+    ) -> Result<DownloadAction, OtaError> {
+        if self.requested {
+            let _ = machine.cancel();
+        }
+        let action = machine.poll_bounded(input, elapsed);
+        let ends_for_good = match action {
+            Ok(DownloadAction::Activate(_) | DownloadAction::Done(Ok(()))) => true,
+            Ok(DownloadAction::Done(Err(_))) | Err(_) => !self.retrying,
+            _ => false,
+        };
+        if ends_for_good {
+            self.closed = true;
+        }
+        action
     }
 }
 
@@ -716,7 +1132,9 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum K {
         Connect,
+        ReadHeader(u32),
         Prepare(u32),
+        WriteHeader,
         Read(u32),
         Write(usize),
         Finalize,
@@ -729,7 +1147,9 @@ mod tests {
     fn kind(a: &DownloadAction) -> K {
         match a {
             DownloadAction::Connect { .. } => K::Connect,
+            DownloadAction::ReadHeader { max, .. } => K::ReadHeader(*max),
             DownloadAction::Prepare { len } => K::Prepare(*len),
+            DownloadAction::WriteHeader(_) => K::WriteHeader,
             DownloadAction::Read { max, .. } => K::Read(*max),
             DownloadAction::Write { n } => K::Write(*n),
             DownloadAction::Finalize => K::Finalize,
@@ -759,6 +1179,49 @@ mod tests {
         assert_eq!(kind(&m.poll(headers(len), ms(0))), K::Prepare(len as u32));
         assert_eq!(kind(&m.poll(I::Prepared, ms(0))), K::Read(len as u32));
         m
+    }
+
+    #[test]
+    fn expected_size_must_equal_the_content_length() {
+        let sized = |size| machine(Deadline::none()).with_expected_size(size);
+        let mut m = sized(1024);
+        assert_eq!(kind(&m.poll(I::Begin, ms(0))), K::Connect);
+        assert_eq!(kind(&m.poll(headers(1024), ms(0))), K::Prepare(1024));
+
+        for declared in [1023, 1025] {
+            let mut m = sized(1024);
+            m.poll(I::Begin, ms(0));
+            assert_eq!(
+                kind(&m.poll(headers(declared), ms(0))),
+                K::Done(Err(OtaError::SizeMismatch))
+            );
+        }
+
+        // A chunked response is refused by the length checks, as without an expected size.
+        let mut m = sized(1024);
+        m.poll(I::Begin, ms(0));
+        let chunked = I::Headers {
+            content_length: None,
+            chunked: true,
+            capacity: 4096,
+        };
+        assert_eq!(kind(&m.poll(chunked, ms(0))), K::Done(Err(SHAPE)));
+
+        // A size above `u32::MAX` never equals an admitted length.
+        let mut m = sized(u64::from(u32::MAX) + 1);
+        m.poll(I::Begin, ms(0));
+        assert_eq!(
+            kind(&m.poll(headers(1024), ms(0))),
+            K::Done(Err(OtaError::SizeMismatch))
+        );
+
+        // The partition check comes first, so an oversized image is still `InsufficientSpace`.
+        let mut m = sized(8192);
+        m.poll(I::Begin, ms(0));
+        assert_eq!(
+            kind(&m.poll(headers(8192), ms(0))),
+            K::Done(Err(OtaError::InsufficientSpace))
+        );
     }
 
     #[test]
@@ -1051,13 +1514,23 @@ mod tests {
         Deadline(u64),
     }
 
-    /// Runs a simulated tier through the bounded loop and returns (result, steps, aborted).
-    fn run(len: u32, chunk: usize, fault: Fault) -> (Result<(), OtaError>, usize, bool) {
+    /// Runs a simulated tier through the bounded loop, with the early chip check when `chip` is set, and returns (result, steps, aborted).
+    fn run(
+        len: u32,
+        chunk: usize,
+        fault: Fault,
+        chip: bool,
+    ) -> (Result<(), OtaError>, usize, bool) {
         let deadline = match fault {
             Fault::Deadline(at) => Deadline::after(ms(at)),
             _ => Deadline::none(),
         };
         let mut m = machine(deadline);
+        if chip {
+            m = m.with_expected_chip(ImageChip::Esp32C3);
+        }
+        let header = header_for(ImageChip::Esp32C3);
+        let mut header_at = 0;
         let mut input = I::Begin;
         let mut steps = 0;
         let mut reads = 0;
@@ -1088,6 +1561,20 @@ mod tests {
                         I::Prepared
                     }
                 },
+                DownloadAction::ReadHeader { max, .. } => {
+                    reads += 1;
+                    match fault {
+                        Fault::Read(at) if reads == at => {
+                            I::ReadFailed(OtaError::ServerUnreachable)
+                        }
+                        Fault::ShortBody(at) if reads == at => I::header_read(&[]),
+                        _ => {
+                            let n = (max as usize).min(chunk);
+                            header_at += n;
+                            I::header_read(&header[header_at - n..header_at])
+                        }
+                    }
+                }
                 DownloadAction::Read { max, .. } => {
                     reads += 1;
                     match fault {
@@ -1098,7 +1585,7 @@ mod tests {
                         _ => I::Read((max as usize).min(chunk)),
                     }
                 }
-                DownloadAction::Write { .. } => {
+                DownloadAction::Write { .. } | DownloadAction::WriteHeader(_) => {
                     writes += 1;
                     match fault {
                         Fault::Write(at) if writes == at => {
@@ -1151,12 +1638,12 @@ mod tests {
             Fault::Deadline(9),
             Fault::Deadline(30),
         ];
-        for chunk in [1, 7, 64, 1_000, 4_096] {
-            for fault in faults {
-                let (result, steps, aborted) = run(len, chunk, fault);
+        for chunk in [1, 7, 16, 17, 64, 1_000, 4_096] {
+            for (fault, chip) in faults.into_iter().flat_map(|f| [(f, false), (f, true)]) {
+                let (result, steps, aborted) = run(len, chunk, fault, chip);
                 assert!(
                     steps <= DownloadMachine::max_steps(len, chunk),
-                    "{fault:?} chunk {chunk}: {steps} steps"
+                    "{fault:?} chunk {chunk} chip {chip}: {steps} steps"
                 );
                 let always_fails = matches!(
                     fault,
@@ -1177,5 +1664,640 @@ mod tests {
                 assert!(!(aborted && result.is_ok()));
             }
         }
+    }
+
+    const CANCELLED: OtaError = OtaError::Cancelled;
+
+    #[test]
+    fn a_cancel_before_connect_ends_without_any_access() {
+        let mut m = machine(Deadline::none());
+        assert_eq!(m.cancel(), CancelRequest::Accepted);
+        assert_eq!(kind(&m.poll(I::Begin, ms(0))), K::Done(Err(CANCELLED)));
+        assert_eq!(m.cancel(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn a_cancel_during_connect_never_prepares() {
+        for answer in [headers(10), I::ConnectFailed(OtaError::ServerUnreachable)] {
+            let mut m = machine(Deadline::none());
+            assert_eq!(kind(&m.poll(I::Begin, ms(0))), K::Connect);
+            assert_eq!(m.cancel(), CancelRequest::Accepted);
+            assert_eq!(
+                kind(&m.poll(answer, ms(1))),
+                K::Done(Err(CANCELLED)),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_prepare_aborts_an_open_session() {
+        let mut m = machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        m.poll(headers(10), ms(0));
+        assert_eq!(m.cancel(), CancelRequest::Accepted);
+        assert_eq!(kind(&m.poll(I::Prepared, ms(1))), K::Abort(CANCELLED));
+        assert_eq!(kind(&m.poll(I::Aborted, ms(1))), K::Done(Err(CANCELLED)));
+
+        let mut m = machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        m.poll(headers(10), ms(0));
+        m.cancel();
+        let a = m.poll(I::PrepareFailed(OtaError::FlashWriteFailed), ms(1));
+        assert_eq!(kind(&a), K::Done(Err(CANCELLED)), "nothing to abort");
+    }
+
+    #[test]
+    fn a_cancel_mid_read_aborts_after_the_read() {
+        for answer in [I::Read(4), I::ReadFailed(OtaError::ServerUnreachable)] {
+            let mut m = prepared(Deadline::none(), 10);
+            assert_eq!(m.cancel(), CancelRequest::Accepted);
+            assert_eq!(
+                kind(&m.poll(answer, ms(1))),
+                K::Abort(CANCELLED),
+                "{answer:?}"
+            );
+            assert_eq!(kind(&m.poll(I::Aborted, ms(1))), K::Done(Err(CANCELLED)));
+        }
+    }
+
+    #[test]
+    fn a_cancel_mid_write_aborts_after_the_write() {
+        for answer in [I::Written, I::WriteFailed(OtaError::FlashWriteFailed)] {
+            let mut m = prepared(Deadline::none(), 10);
+            assert_eq!(kind(&m.poll(I::Read(4), ms(1))), K::Write(4));
+            assert_eq!(m.cancel(), CancelRequest::Accepted);
+            assert_eq!(
+                kind(&m.poll(answer, ms(1))),
+                K::Abort(CANCELLED),
+                "{answer:?}"
+            );
+            assert_eq!(kind(&m.poll(I::Aborted, ms(1))), K::Done(Err(CANCELLED)));
+        }
+    }
+
+    #[test]
+    fn a_cancel_right_before_activation_withholds_the_permit() {
+        let digests = [
+            I::Digest(SHA),
+            I::Digest([0; 32]),
+            I::WriteFailed(OtaError::FlashWriteFailed),
+        ];
+        for answer in digests {
+            let mut m = prepared(Deadline::after(ms(50)), 10);
+            m.poll(I::Read(10), ms(1));
+            assert_eq!(kind(&m.poll(I::Written, ms(1))), K::Finalize);
+            assert_eq!(m.cancel(), CancelRequest::Accepted);
+            assert_eq!(
+                kind(&m.poll(answer, ms(50))),
+                K::Abort(CANCELLED),
+                "{answer:?}: wins over a mismatch, a failed tail and the deadline"
+            );
+            assert_eq!(kind(&m.poll(I::Aborted, ms(51))), K::Done(Err(CANCELLED)));
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_an_abort_still_ends_as_cancelled() {
+        let mut m = prepared(Deadline::none(), 10);
+        let a = m.poll(I::ReadFailed(OtaError::ServerUnreachable), ms(1));
+        assert_eq!(kind(&a), K::Abort(OtaError::ServerUnreachable));
+        assert_eq!(m.cancel(), CancelRequest::Accepted);
+        assert_eq!(kind(&m.poll(I::Aborted, ms(1))), K::Done(Err(CANCELLED)));
+    }
+
+    #[test]
+    fn a_cancel_during_or_after_activation_is_too_late() {
+        let mut m = prepared(Deadline::none(), 10);
+        m.poll(I::Read(10), ms(1));
+        m.poll(I::Written, ms(1));
+        assert_eq!(kind(&m.poll(I::Digest(SHA), ms(1))), K::Activate);
+        assert_eq!(m.cancel(), CancelRequest::TooLate);
+        assert_eq!(
+            kind(&m.poll(I::Activated(Ok(())), ms(1))),
+            K::Done(Ok(())),
+            "the image still activates"
+        );
+        assert_eq!(m.cancel(), CancelRequest::TooLate);
+
+        let mut failed = machine(Deadline::none());
+        failed.poll(I::Begin, ms(0));
+        failed.poll(I::ConnectFailed(OtaError::ServerUnreachable), ms(0));
+        assert_eq!(failed.cancel(), CancelRequest::TooLate, "already over");
+    }
+
+    #[test]
+    fn a_cancelled_machine_still_ignores_out_of_phase_input() {
+        let mut m = prepared(Deadline::none(), 10);
+        m.cancel();
+        assert_eq!(kind(&m.poll(I::Written, ms(1))), K::Ignored);
+        assert_eq!(kind(&m.poll(I::Aborted, ms(1))), K::Ignored);
+        assert_eq!(kind(&m.poll(I::Read(4), ms(1))), K::Abort(CANCELLED));
+    }
+
+    #[test]
+    fn the_gate_closes_with_the_permit_and_with_the_end() {
+        let mut gate = CancelGate::new();
+        let mut m = prepared(Deadline::none(), 10);
+        gate.poll(&mut m, I::Read(10), ms(1)).unwrap();
+        gate.poll(&mut m, I::Written, ms(1)).unwrap();
+        let a = gate.poll(&mut m, I::Digest(SHA), ms(1)).unwrap();
+        assert_eq!(kind(&a), K::Activate);
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+        let a = gate.poll(&mut m, I::Activated(Ok(())), ms(1)).unwrap();
+        assert_eq!(kind(&a), K::Done(Ok(())));
+
+        let mut gate = CancelGate::new();
+        let mut m = machine(Deadline::none());
+        gate.poll(&mut m, I::Begin, ms(0)).unwrap();
+        let a = gate
+            .poll(&mut m, I::ConnectFailed(OtaError::ServerUnreachable), ms(0))
+            .unwrap();
+        assert_eq!(kind(&a), K::Done(Err(OtaError::ServerUnreachable)));
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+
+        let mut gate = CancelGate::new();
+        let mut m = machine(Deadline::none());
+        assert!(gate.poll(&mut m, I::Written, ms(0)).is_err());
+        assert_eq!(
+            gate.request(),
+            CancelRequest::TooLate,
+            "a loop error ends it"
+        );
+    }
+
+    #[test]
+    fn a_retrying_gate_stays_open_after_a_failed_attempt() {
+        let mut gate = CancelGate::for_retries();
+        let mut m = machine(Deadline::none());
+        gate.poll(&mut m, I::Begin, ms(0)).unwrap();
+        let a = gate
+            .poll(&mut m, I::ConnectFailed(OtaError::ServerUnreachable), ms(0))
+            .unwrap();
+        assert_eq!(kind(&a), K::Done(Err(OtaError::ServerUnreachable)));
+        assert!(!gate.is_requested());
+        assert_eq!(gate.request(), CancelRequest::Accepted);
+
+        let mut next = machine(Deadline::none());
+        let a = gate.poll(&mut next, I::Begin, ms(0)).unwrap();
+        assert_eq!(
+            kind(&a),
+            K::Done(Err(OtaError::Cancelled)),
+            "the request carries over"
+        );
+        assert_eq!(gate.request(), CancelRequest::Accepted);
+        assert!(gate.close());
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+
+        let mut gate = CancelGate::for_retries();
+        let mut m = machine(Deadline::none());
+        assert!(gate.poll(&mut m, I::Written, ms(0)).is_err());
+        assert_eq!(gate.request(), CancelRequest::Accepted, "a loop error too");
+    }
+
+    #[test]
+    fn a_retrying_gate_closes_with_the_permit_and_the_success() {
+        let mut gate = CancelGate::for_retries();
+        let mut m = prepared(Deadline::none(), 10);
+        gate.poll(&mut m, I::Read(10), ms(1)).unwrap();
+        gate.poll(&mut m, I::Written, ms(1)).unwrap();
+        let a = gate.poll(&mut m, I::Digest(SHA), ms(1)).unwrap();
+        assert_eq!(kind(&a), K::Activate);
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn close_reports_whether_a_cancel_was_accepted_first() {
+        let mut gate = CancelGate::new();
+        assert!(!gate.close());
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+
+        let mut gate = CancelGate::new();
+        assert_eq!(gate.request(), CancelRequest::Accepted);
+        assert!(gate.close());
+        assert!(gate.close(), "closing again repeats the answer");
+    }
+
+    /// Runs a download through a gate and requests a cancel just before poll number `at`.
+    ///
+    /// Returns (answer, result, prepared, aborted).
+    fn run_cancelled(
+        len: u32,
+        chunk: usize,
+        at: usize,
+        chip: bool,
+    ) -> (CancelRequest, Result<(), OtaError>, bool, bool) {
+        let mut gate = CancelGate::new();
+        let mut m = machine(Deadline::none());
+        if chip {
+            m = m.with_expected_chip(ImageChip::Esp32C3);
+        }
+        let header = header_for(ImageChip::Esp32C3);
+        let mut header_at = 0;
+        let mut answer = None;
+        let mut input = I::Begin;
+        let mut prepared = false;
+        let mut aborted = false;
+        for step in 1.. {
+            if step == at {
+                answer = Some(gate.request());
+            }
+            input = match gate.poll(&mut m, input, ms(1)).expect("bounded") {
+                DownloadAction::Connect { .. } => headers(u64::from(len)),
+                DownloadAction::ReadHeader { max, .. } => {
+                    let n = (max as usize).min(chunk);
+                    header_at += n;
+                    I::header_read(&header[header_at - n..header_at])
+                }
+                DownloadAction::Prepare { .. } => {
+                    prepared = true;
+                    I::Prepared
+                }
+                DownloadAction::Read { max, .. } => I::Read((max as usize).min(chunk)),
+                DownloadAction::Write { .. } | DownloadAction::WriteHeader(_) => I::Written,
+                DownloadAction::Finalize => I::Digest(SHA),
+                DownloadAction::Abort(_) => {
+                    aborted = true;
+                    I::Aborted
+                }
+                DownloadAction::Activate(_) => I::Activated(Ok(())),
+                DownloadAction::Done(result) => {
+                    let answer = answer.unwrap_or_else(|| gate.request());
+                    return (answer, result, prepared, aborted);
+                }
+                DownloadAction::Ignored => panic!("ignored"),
+            };
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn a_cancel_at_any_step_is_accepted_exactly_when_the_download_ends_cancelled() {
+        for (len, chip) in [(10, false), (20, true)] {
+            for chunk in [1, 3, 10] {
+                let steps = DownloadMachine::max_steps(len, chunk);
+                for at in 1..=steps + 1 {
+                    let (answer, result, prepared, aborted) = run_cancelled(len, chunk, at, chip);
+                    let case = alloc::format!("chip {chip} chunk {chunk} at {at}");
+                    match answer {
+                        CancelRequest::Accepted => {
+                            assert_eq!(result, Err(CANCELLED), "{case}");
+                            assert_eq!(aborted, prepared, "{case}");
+                        }
+                        CancelRequest::TooLate => {
+                            assert_eq!(result, Ok(()), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A header for an image built for `chip`: the magic byte and the little-endian chip id at offset 12.
+    fn header_for(chip: ImageChip) -> [u8; IMAGE_HEADER_LEN] {
+        let mut header = [0x5A; IMAGE_HEADER_LEN];
+        header[0] = 0xE9;
+        header[12..14].copy_from_slice(&chip.id().to_le_bytes());
+        header
+    }
+
+    fn chip_machine(deadline: Deadline) -> DownloadMachine {
+        machine(deadline).with_expected_chip(ImageChip::Esp32C3)
+    }
+
+    /// A chip machine that has admitted `len` bytes and asked for the header.
+    fn reading_header(deadline: Deadline, len: u64) -> DownloadMachine {
+        let mut m = chip_machine(deadline);
+        assert_eq!(kind(&m.poll(I::Begin, ms(0))), K::Connect);
+        assert_eq!(
+            kind(&m.poll(headers(len), ms(0))),
+            K::ReadHeader(IMAGE_HEADER_LEN as u32)
+        );
+        m
+    }
+
+    #[test]
+    fn the_image_chip_ids_are_the_esp_idf_values() {
+        let table = [
+            (ImageChip::Esp32, "esp32", 0),
+            (ImageChip::Esp32S2, "esp32s2", 2),
+            (ImageChip::Esp32C3, "esp32c3", 5),
+            (ImageChip::Esp32S3, "esp32s3", 9),
+            (ImageChip::Esp32C2, "esp32c2", 12),
+            (ImageChip::Esp32C6, "esp32c6", 13),
+            (ImageChip::Esp32H2, "esp32h2", 16),
+            (ImageChip::Esp32P4, "esp32p4", 18),
+            (ImageChip::Esp32C5, "esp32c5", 23),
+        ];
+        assert_eq!(table.len(), ImageChip::ALL.len());
+        for (chip, target, id) in table {
+            assert_eq!(chip.id(), id, "{chip:?}");
+            assert_eq!(chip.target(), target, "{chip:?}");
+            assert_eq!(ImageChip::from_target(target), Some(chip), "{target}");
+        }
+        for other in ["", "ESP32C3", "esp32c3 ", "esp32c61", "esp8266"] {
+            assert_eq!(ImageChip::from_target(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn the_header_check_reads_the_magic_and_the_little_endian_chip_id() {
+        let c3 = header_for(ImageChip::Esp32C3);
+        assert_eq!(check_image_header(&c3, ImageChip::Esp32C3), Ok(()));
+        assert_eq!(
+            check_image_header(&c3, ImageChip::Esp32),
+            Err(OtaError::TargetMismatch)
+        );
+        let mut bad_magic = c3;
+        bad_magic[0] = 0xE8;
+        assert_eq!(
+            check_image_header(&bad_magic, ImageChip::Esp32C3),
+            Err(SHAPE)
+        );
+        let mut big_endian = c3;
+        big_endian[12..14].copy_from_slice(&5u16.to_be_bytes());
+        assert_eq!(
+            check_image_header(&big_endian, ImageChip::Esp32C3),
+            Err(OtaError::TargetMismatch)
+        );
+        let mut unknown = c3;
+        unknown[12..14].copy_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(
+            check_image_header(&unknown, ImageChip::Esp32C3),
+            Err(OtaError::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn a_matching_chip_prepares_then_writes_the_header_first() {
+        let header = header_for(ImageChip::Esp32C3);
+        let mut m = reading_header(Deadline::none(), 100);
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header), ms(1))),
+            K::Prepare(100)
+        );
+        match m.poll(I::Prepared, ms(1)) {
+            DownloadAction::WriteHeader(bytes) => assert_eq!(bytes, header),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(kind(&m.poll(I::Written, ms(1))), K::Read(84));
+        assert_eq!(kind(&m.poll(I::Read(84), ms(1))), K::Write(84));
+        assert_eq!(kind(&m.poll(I::Written, ms(1))), K::Finalize);
+    }
+
+    #[test]
+    fn an_image_of_exactly_the_header_finalizes_after_the_header_write() {
+        let mut m = reading_header(Deadline::none(), IMAGE_HEADER_LEN as u64);
+        let header = header_for(ImageChip::Esp32C3);
+        m.poll(I::header_read(&header), ms(1));
+        assert_eq!(kind(&m.poll(I::Prepared, ms(1))), K::WriteHeader);
+        assert_eq!(kind(&m.poll(I::Written, ms(1))), K::Finalize);
+    }
+
+    #[test]
+    fn a_wrong_chip_ends_before_any_prepare_or_write() {
+        for other in [ImageChip::Esp32S3, ImageChip::Esp32, ImageChip::Esp32C6] {
+            let mut m = reading_header(Deadline::none(), 100);
+            let a = m.poll(I::header_read(&header_for(other)), ms(1));
+            assert_eq!(
+                kind(&a),
+                K::Done(Err(OtaError::TargetMismatch)),
+                "{other:?}"
+            );
+            assert_eq!(kind(&m.poll(I::Prepared, ms(1))), K::Ignored);
+        }
+    }
+
+    #[test]
+    fn a_bad_magic_is_a_shape_error_before_any_prepare() {
+        let mut header = header_for(ImageChip::Esp32C3);
+        header[0] = 0x7F;
+        let mut m = reading_header(Deadline::none(), 100);
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header), ms(1))),
+            K::Done(Err(SHAPE))
+        );
+    }
+
+    #[test]
+    fn short_header_reads_keep_reading_until_sixteen_bytes() {
+        let header = header_for(ImageChip::Esp32C3);
+        let mut m = reading_header(Deadline::none(), 100);
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header[..5]), ms(1))),
+            K::ReadHeader(11)
+        );
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header[5..13]), ms(1))),
+            K::ReadHeader(3),
+            "the chip id is split across two reads"
+        );
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header[13..]), ms(1))),
+            K::Prepare(100)
+        );
+        match m.poll(I::Prepared, ms(1)) {
+            DownloadAction::WriteHeader(bytes) => assert_eq!(bytes, header),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_header_stream_that_ends_or_overruns_is_a_shape_error() {
+        let header = header_for(ImageChip::Esp32C3);
+        let mut m = reading_header(Deadline::none(), 100);
+        m.poll(I::header_read(&header[..4]), ms(1));
+        assert_eq!(
+            kind(&m.poll(I::header_read(&[]), ms(1))),
+            K::Done(Err(SHAPE))
+        );
+
+        let mut m = reading_header(Deadline::none(), 100);
+        m.poll(I::header_read(&header[..4]), ms(1));
+        let long = [0xE9; IMAGE_HEADER_LEN];
+        assert_eq!(
+            kind(&m.poll(I::header_read(&long[..13]), ms(1))),
+            K::Done(Err(SHAPE)),
+            "more than the missing twelve bytes"
+        );
+
+        let mut m = reading_header(Deadline::none(), 100);
+        let oversized = [0xE9; IMAGE_HEADER_LEN + 1];
+        assert_eq!(
+            kind(&m.poll(I::header_read(&oversized), ms(1))),
+            K::Done(Err(SHAPE))
+        );
+    }
+
+    #[test]
+    fn an_image_shorter_than_the_header_is_refused_at_the_headers() {
+        let mut m = chip_machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        assert_eq!(kind(&m.poll(headers(15), ms(0))), K::Done(Err(SHAPE)));
+        // The length checks still come first.
+        let mut m = chip_machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        assert_eq!(
+            kind(&m.poll(headers(8192), ms(0))),
+            K::Done(Err(OtaError::InsufficientSpace))
+        );
+    }
+
+    #[test]
+    fn a_header_read_failure_ends_without_an_abort() {
+        let mut m = reading_header(Deadline::none(), 100);
+        let a = m.poll(I::ReadFailed(OtaError::ServerUnreachable), ms(1));
+        assert_eq!(kind(&a), K::Done(Err(OtaError::ServerUnreachable)));
+    }
+
+    #[test]
+    fn without_an_expected_chip_the_header_is_never_read() {
+        let mut m = machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        assert_eq!(kind(&m.poll(headers(10), ms(0))), K::Prepare(10));
+        assert_eq!(kind(&m.poll(I::Prepared, ms(0))), K::Read(10));
+        let mut m = machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        m.poll(headers(10), ms(0));
+        let header = header_for(ImageChip::Esp32C3);
+        assert_eq!(kind(&m.poll(I::header_read(&header), ms(0))), K::Ignored);
+    }
+
+    #[test]
+    fn the_header_bytes_reach_the_slot_and_the_hash_exactly_once() {
+        let mut image = alloc::vec![0u8; 1_000];
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
+        image[..IMAGE_HEADER_LEN].copy_from_slice(&header_for(ImageChip::Esp32C3));
+        let mut expected = crate::ota::StreamingVerifier::new();
+        expected.update(&image);
+        let expected = expected.finalize();
+
+        for chunk in [1, 5, 16, 100, 4_096] {
+            let mut m = DownloadMachine::new(Deadline::none(), ms(1_000), expected)
+                .with_expected_chip(ImageChip::Esp32C3);
+            let mut verifier = crate::ota::StreamingVerifier::new();
+            let mut slot = alloc::vec::Vec::new();
+            let mut sent = 0;
+            let mut last = [0u8; 4_096];
+            let mut input = I::Begin;
+            let result = loop {
+                input = match m.poll_bounded(input, ms(1)).expect("bounded") {
+                    DownloadAction::Connect { .. } => headers(image.len() as u64),
+                    DownloadAction::ReadHeader { max, .. } => {
+                        let n = (max as usize).min(chunk);
+                        sent += n;
+                        I::header_read(&image[sent - n..sent])
+                    }
+                    DownloadAction::Prepare { .. } => {
+                        assert_eq!(
+                            sent, IMAGE_HEADER_LEN,
+                            "the header is read before the erase"
+                        );
+                        I::Prepared
+                    }
+                    DownloadAction::WriteHeader(bytes) => {
+                        verifier.update(&bytes);
+                        slot.extend_from_slice(&bytes);
+                        I::Written
+                    }
+                    DownloadAction::Read { max, .. } => {
+                        let n = (max as usize).min(chunk);
+                        last[..n].copy_from_slice(&image[sent..sent + n]);
+                        sent += n;
+                        I::Read(n)
+                    }
+                    DownloadAction::Write { n } => {
+                        verifier.update(&last[..n]);
+                        slot.extend_from_slice(&last[..n]);
+                        I::Written
+                    }
+                    DownloadAction::Finalize => {
+                        I::Digest(core::mem::take(&mut verifier).finalize())
+                    }
+                    DownloadAction::Activate(_) => I::Activated(Ok(())),
+                    DownloadAction::Done(result) => break result,
+                    other => panic!("{other:?}"),
+                };
+            };
+            assert_eq!(result, Ok(()), "chunk {chunk}");
+            assert_eq!(slot, image, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_the_header_phase_never_prepares() {
+        let header = header_for(ImageChip::Esp32C3);
+        for answer in [
+            I::header_read(&header[..4]),
+            I::header_read(&header),
+            I::header_read(&header_for(ImageChip::Esp32S3)),
+            I::ReadFailed(OtaError::ServerUnreachable),
+        ] {
+            let mut m = reading_header(Deadline::none(), 100);
+            assert_eq!(m.cancel(), CancelRequest::Accepted);
+            assert_eq!(
+                kind(&m.poll(answer, ms(1))),
+                K::Done(Err(CANCELLED)),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deadline_is_checked_during_the_header_phase() {
+        let header = header_for(ImageChip::Esp32C3);
+        let timeout = K::Done(Err(OtaError::DownloadTimeout));
+
+        let mut m = reading_header(Deadline::after(ms(10)), 100);
+        assert_eq!(kind(&m.poll(I::header_read(&header[..4]), ms(10))), timeout);
+
+        let mut m = reading_header(Deadline::after(ms(10)), 100);
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header), ms(10))),
+            timeout,
+            "a matching header does not prepare after the deadline"
+        );
+
+        let mut m = reading_header(Deadline::after(ms(10)), 100);
+        assert_eq!(
+            kind(&m.poll(I::header_read(&header_for(ImageChip::Esp32S3)), ms(10))),
+            K::Done(Err(OtaError::TargetMismatch)),
+            "the check's own result wins over the deadline"
+        );
+
+        let mut m = chip_machine(Deadline::after(ms(1_500)));
+        m.poll(I::Begin, ms(0));
+        match m.poll(headers(100), ms(900)) {
+            DownloadAction::ReadHeader { max, budget } => assert_eq!((max, budget), (16, ms(600))),
+            other => panic!("{other:?}"),
+        }
+        match m.poll(I::header_read(&header[..6]), ms(1_000)) {
+            DownloadAction::ReadHeader { max, budget } => assert_eq!((max, budget), (10, ms(500))),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_header_write_aborts_the_session() {
+        let mut m = reading_header(Deadline::none(), 100);
+        m.poll(I::header_read(&header_for(ImageChip::Esp32C3)), ms(1));
+        assert_eq!(kind(&m.poll(I::Prepared, ms(1))), K::WriteHeader);
+        let a = m.poll(I::WriteFailed(OtaError::FlashWriteFailed), ms(1));
+        assert_eq!(kind(&a), K::Abort(OtaError::FlashWriteFailed));
+        assert_eq!(
+            kind(&m.poll(I::Aborted, ms(1))),
+            K::Done(Err(OtaError::FlashWriteFailed))
+        );
+    }
+
+    #[test]
+    fn a_target_mismatch_is_reported_as_policy_1007() {
+        assert_eq!(OtaError::TargetMismatch.code(), "target_mismatch");
+        assert_eq!(
+            crate::ota::FailReason::from(OtaError::TargetMismatch).as_str(),
+            crate::ota::FailReason::TargetMismatch.as_str()
+        );
     }
 }

@@ -20,7 +20,7 @@ set -euo pipefail
 # (32 KB MMU page mismatch). The bootloader esp-idf-sys builds for the pinned ESP-IDF
 # (.cargo/config.toml) boots both.
 #
-# c6 and esp32 build idf_c6_mqtt and idf_esp32_mqtt. A missing RISC-V bootloader (c3, c6) is
+# c6 builds idf_c6_mqtt (idf_c6_ddi for --ota) and esp32 builds idf_esp32_mqtt. A missing RISC-V bootloader (c3, c6) is
 # non-fatal for the generic variant: flash.sh then falls back to the espflash bundled one.
 # A missing Xtensa bootloader and any missing --ota bootloader are fatal, because the
 # bundled bootloader is not a safe fallback there (and not rollback-enabled).
@@ -73,7 +73,9 @@ case "$chip" in
     c6)
         idf_target="riscv32imac-esp-espidf"
         mcu="esp32c6"
-        example="idf_c6_mqtt"
+        # The OTA bootloader needs only a build with the OTA sdkconfig overlay; idf_c6_ddi is the one C6 example
+        # with an `ota` feature today. It is a lab plain-HTTP image: switch to its TLS successor when that lands.
+        if [ "$variant" = "ota" ]; then example="idf_c6_ddi"; else example="idf_c6_mqtt"; fi
         ;;
     esp32)
         idf_target="xtensa-esp32-espidf"
@@ -93,9 +95,9 @@ esac
 
 if [ "$variant" = "ota" ]; then
     case "$chip" in
-        c3|esp32s3) ;;
+        c3|c6|esp32s3) ;;
         *)
-            printf 'Error: no --ota bootloader variant for %s (OTA is validated on c3 and esp32s3 only).\n' "$chip" >&2
+            printf 'Error: no --ota bootloader variant for %s (the OTA bootloader exists for c3, c6 and esp32s3; the c6 one is unvalidated on hardware until the DDI bench run).\n' "$chip" >&2
             exit 1
             ;;
     esac

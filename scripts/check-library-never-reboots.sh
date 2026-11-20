@@ -53,8 +53,8 @@ if find crates/rustyfarian-esp-idf-network/src/ota crates/juggler/src/ota/persis
 fi
 
 runtime_dirs=""
-for dir in crates/juggler/src/ota/runtime crates/rustyfarian-esp-idf-network/src/ota/runtime; do
-  if [ -d "$dir" ]; then runtime_dirs="$runtime_dirs $dir"; fi
+for dir in crates/juggler/src/ota/runtime crates/juggler/src/ota/health.rs crates/rustyfarian-esp-idf-network/src/ota/runtime crates/rustyfarian-esp-idf-network/src/ota/ddi crates/rustyfarian-esp-idf-network/src/ota/health_driver.rs; do
+  if [ -e "$dir" ]; then runtime_dirs="$runtime_dirs $dir"; fi
 done
 if [ -n "$runtime_dirs" ]; then
   grep -rHnE 'esp_restart|reset::restart|\brestart\(|esp_ota_|mark_running_slot|set_boot_slot|initiate_update' $runtime_dirs > tmp/ota-runtime-reboots.txt 2>&1 || true

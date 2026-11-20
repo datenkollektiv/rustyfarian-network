@@ -104,7 +104,7 @@ impl OtaKv for EspNvsKv {
     }
 }
 
-fn random_u32() -> u32 {
+pub(crate) fn random_u32() -> u32 {
     // SAFETY: `esp_random` has no preconditions; it reads the hardware RNG and may be called from any task.
     unsafe { esp_idf_svc::sys::esp_random() }
 }

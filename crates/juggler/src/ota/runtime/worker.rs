@@ -1,16 +1,14 @@
 //! Worker decisions: the gates of update, rollback and repair, the offer plan, and the retained blocked offer.
 //!
-//! The worker thread (ESP-IDF tier) executes these in order; every function here is pure or touches the store only through the generic [`OtaStore`].
+//! The worker thread (ESP-IDF tier) executes these in order; every function here is pure or touches the store only through the generic [`OtaStore`](crate::ota::OtaStore).
 
-use crate::ota::persist::{
-    reconcile_boot, BootOutcome, HardwareFacts, HardwareReadError, OtaKv, OtaStore, StoreError,
-    UpdateSlot, FACTORY_SLOT,
-};
-use crate::ota::runtime::health::initial_admission;
+use crate::ota::persist::{HardwareFacts, HardwareReadError, StoreError, UpdateSlot, FACTORY_SLOT};
 use crate::ota::{
     decide_offer, Admission, FailReason, ImageMetadata, Manifest, OfferDecision, OtaCommand,
     SlotId, SlotState, Version,
 };
+
+pub use crate::ota::health::{refresh_after_repair, RefreshedFlags, RuntimeFlags};
 
 /// How a hardware read failure is reported: a handle that stayed busy is `busy`, anything else `partition_not_found`.
 fn hardware_reason(e: HardwareReadError) -> FailReason {
@@ -326,73 +324,13 @@ pub const fn repair_status(repaired: u32) -> Result<u32, FailReason> {
     }
 }
 
-/// The library flags at runtime start, derived from boot reconciliation.
-///
-/// The tier copies them into its flags and performs the rollback when `roll_back_now_at_boot` is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeFlags {
-    /// Updates, rollbacks and repairs are admitted from the start (see [`initial_admission`]).
-    pub admission_open: bool,
-    /// The health policy counts as settled from the start; the same value as `admission_open`.
-    pub health_settled: bool,
-    /// The running image must not be marked valid.
-    pub refuse_mark_valid: bool,
-    /// The boot demanded a rollback now.
-    pub roll_back_now_at_boot: bool,
-    /// The boot ended fail-closed on a store fault (see [`BootOutcome::records_suspect`]).
-    pub records_suspect: bool,
-}
-
-impl RuntimeFlags {
-    /// Derives the flags from the boot reconciliation outcome.
-    pub fn from_boot(outcome: &BootOutcome) -> Self {
-        let admit = initial_admission(outcome);
-        Self {
-            admission_open: admit,
-            health_settled: admit,
-            refuse_mark_valid: outcome.refuse_mark_valid,
-            roll_back_now_at_boot: outcome.roll_back_now,
-            records_suspect: outcome.records_suspect(),
-        }
-    }
-}
-
-/// The library flags after a repair, and what the re-run of boot reconciliation said.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefreshedFlags {
-    /// The re-run still ends fail-closed on a store fault.
-    pub records_suspect: bool,
-    /// The running image must still not be marked valid.
-    pub refuse_mark_valid: bool,
-    /// The full outcome, for logging; a `roll_back_now` here is only logged, never acted on.
-    pub outcome: BootOutcome,
-}
-
-/// Re-runs boot reconciliation after a repair and derives the flags.
-///
-/// Reconciliation is built to be repeated after any crash, so a second run with unchanged facts changes no record.
-/// `refuse_mark_valid` stays set when the boot demanded a rollback (`roll_back_now_at_boot`: a version mismatch); otherwise it follows the new outcome, which clears a refusal that only came from the unreadable records.
-/// Returns `None` when the hardware facts could not be read: nothing is re-run and the flags stay as they are.
-pub fn refresh_after_repair<K: OtaKv>(
-    store: &mut OtaStore<K>,
-    hw: Result<HardwareFacts, HardwareReadError>,
-    running_version: Option<Version>,
-    roll_back_now_at_boot: bool,
-) -> Option<RefreshedFlags> {
-    let hw = hw.ok()?;
-    let outcome = reconcile_boot(store, Ok(hw), running_version);
-    Some(RefreshedFlags {
-        records_suspect: outcome.records_suspect(),
-        refuse_mark_valid: roll_back_now_at_boot || outcome.refuse_mark_valid,
-        outcome,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ota::persist::fault_kv::FaultKv;
-    use crate::ota::persist::{BootDisposition, BootFault, BootWarnings, KvError};
+    use crate::ota::persist::{
+        reconcile_boot, BootDisposition, BootFault, BootOutcome, BootWarnings, KvError, OtaStore,
+    };
     use crate::ota::{BlockedBy, SettleOutcome};
     use alloc::format;
     use alloc::string::String;

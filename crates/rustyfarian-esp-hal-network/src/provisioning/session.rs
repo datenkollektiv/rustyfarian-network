@@ -27,7 +27,7 @@ use juggler::provisioning::{DeviceName, PortalDefaults, ProvisioningConfig, Sche
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
 use juggler::provisioning::{format_nonce, plan_portal, PortalPlanError, PortalPlanInput};
-use juggler::provisioning::{PortalAction, PortalInput, PortalMachine};
+use juggler::provisioning::{IdentityRule, PortalAction, PortalInput, PortalMachine};
 
 #[cfg(all(
     feature = "embassy",
@@ -240,6 +240,13 @@ pub enum ProvisioningError {
         /// The profile that was requested but is not implemented in v1.
         profile: SchemaProfile,
     },
+    /// Under [`IdentityRule::Ddi`] the device-name pre-fill is not a device id:
+    /// a `MacSuffixed` prefix longer than 15 bytes or outside `[a-z0-9-]`
+    /// (refused, never truncated), or a `Fixed` name outside the grammar.
+    InvalidDeviceName {
+        /// The static reason; never the name itself.
+        reason: &'static str,
+    },
 }
 
 impl core::fmt::Display for ProvisioningError {
@@ -267,6 +274,12 @@ impl core::fmt::Display for ProvisioningError {
                     "provisioning profile {:?} is not supported in v1 \
                      (only WifiMqttDevice is implemented; LoRaWAN portal logic is a v2 expansion)",
                     profile
+                )
+            }
+            ProvisioningError::InvalidDeviceName { reason } => {
+                write!(
+                    f,
+                    "invalid device name pre-fill under the DDI identity rule: {reason}"
                 )
             }
         }
@@ -493,16 +506,38 @@ pub struct ProvisioningBuilder<'a> {
     config: PortalConfig<'a>,
     on_event: Option<fn(ProvisioningEvent)>,
     country: juggler::wifi::Country,
+    identity: IdentityRule,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
+    /// The identity rule a portal of this crate runs under unless
+    /// [`with_identity`](Self::with_identity) says otherwise:
+    /// [`IdentityRule::Open`], because this tier has no DDI client yet (ADR 022
+    /// gap); the ESP-IDF tier defaults to `Ddi` when its `ota-ddi` feature is on.
+    pub const DEFAULT_IDENTITY: IdentityRule = IdentityRule::Open;
+
     /// Creates a builder from a [`PortalConfig`].
     pub fn new(config: PortalConfig<'a>) -> Self {
         Self {
             config,
             on_event: None,
             country: juggler::wifi::Country::WORLD,
+            identity: Self::DEFAULT_IDENTITY,
         }
+    }
+
+    /// Sets the identity rule (default [`DEFAULT_IDENTITY`](Self::DEFAULT_IDENTITY)).
+    ///
+    /// Under [`IdentityRule::Ddi`] the portal renders the `ddi_token` input,
+    /// pre-fills `mqtt_user` from the device name with `mqtt_client` blank,
+    /// requires the device name to be a device id that equals the MQTT username
+    /// (and the client id, when set) and refuses a `MacSuffixed` prefix that is
+    /// not a device-id prefix when `start` plans the portal
+    /// ([`ProvisioningError::InvalidDeviceName`]).
+    /// Same name and shape as the ESP-IDF tier's builder (ADR 022).
+    pub fn with_identity(mut self, identity: IdentityRule) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Sets the Wi-Fi country the SoftAP runs under (default
@@ -658,12 +693,16 @@ impl<'a> ProvisioningBuilder<'a> {
                 device_name: self.config.device_name,
                 defaults: self.config.defaults,
                 profile: self.config.profile,
+                identity: self.identity,
             },
             &ap_mac,
             |p| validate_profile(p).is_ok(),
         )
         .map_err(plan_error)?;
         log::info!("Provisioning SSID resolved (len={})", plan.ssid.len());
+        if self.identity.applies_to(self.config.profile) {
+            log::info!("Provisioning identity rule: DDI (the device name is the MQTT username and client id; ddi_token required)");
+        }
         // An open AP (no password) is warned about once, inside
         // `WiFiManager::init_softap_async` (security-checklist item 8).
 
@@ -731,6 +770,7 @@ impl<'a> ProvisioningBuilder<'a> {
             device_name: dev_name,
             profile: self.config.profile,
             defaults: portal::PortalDefaultsOwned::from_borrowed(&self.config.defaults),
+            identity: self.identity,
         };
 
         // ── Step 6: spawn tasks ─────────────────────────────────────────────
@@ -798,6 +838,9 @@ fn plan_error(e: PortalPlanError) -> ProvisioningError {
         PortalPlanError::InvalidSsid(reason) => ProvisioningError::InvalidSsid { reason },
         PortalPlanError::PasswordTooShort { min } => ProvisioningError::PasswordTooShort { min },
         PortalPlanError::InvalidApConfig(reason) => ProvisioningError::SoftApInit { reason },
+        PortalPlanError::InvalidDeviceName(reason) => {
+            ProvisioningError::InvalidDeviceName { reason }
+        }
     }
 }
 
@@ -857,7 +900,7 @@ where
 ))]
 pub(crate) mod portal {
     use heapless::String as HS;
-    use juggler::provisioning::{PortalDefaults, SchemaProfile};
+    use juggler::provisioning::{IdentityRule, PortalDefaults, SchemaProfile};
 
     /// Maximum length for `firmware_version` in the render config.
     pub(crate) const RENDER_FW_VERSION_MAX: usize = 32;
@@ -955,6 +998,9 @@ pub(crate) mod portal {
             allow(dead_code)
         )]
         pub defaults: PortalDefaultsOwned,
+        /// The identity rule: `Ddi` renders the `ddi_token` input and selects
+        /// the identity pre-fill, and the parser enforces the rule on submit.
+        pub identity: IdentityRule,
     }
 }
 

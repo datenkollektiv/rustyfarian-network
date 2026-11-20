@@ -12,8 +12,9 @@
 //! | `std` | `mqtt` (full, incl. `CallbackScope`, `SubscribeClient`, `Outbox`, `PendingAcks`) | `anyhow` |
 //! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device`, `sx126x`, `embedded-hal` |
 //! | `espnow` | `espnow` | none (implies wifi, for the country channel set) |
-//! | `ota` | `ota` | `heapless`, `sha2` |
-//! | `ota-wire` | `ota::wire` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
+//! | `ota` | `ota` (incl. `ota::persist`, `ota::health`, `FailReason`, `RollbackReason`) | `heapless`, `sha2` |
+//! | `ota-wire` | `ota::wire` (command, manifest, status), `ota::runtime` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
+//! | `ota-ddi` | `ota::ddi` | `serde`, `serde_json`, `zeroize` (implies `ota`, needs `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless`, `zeroize` (implies wifi+mqtt) |
 //! | `flash-store` | `provisioning::flash_store` | `embedded-storage` (implies `provisioning`) |
 //! | `embassy` | `espnow::EmbassyClock` | `embassy-time` (no time driver, ADR 021) |
@@ -38,12 +39,24 @@
 //!   detection. Zero external dependencies.
 //!
 //! - **`ota`** — OTA metadata parsing, streaming SHA-256 verification, version
-//!   comparison. Requires `heapless` and `sha2`.
+//!   comparison, decisions, the persisted record store (`ota::persist`), the
+//!   pure health policy (`ota::health`) and the frozen `failed` and rollback
+//!   reason codes. Requires `heapless` and `sha2`.
 //!
-//! - **`ota-wire`** — OTA wire contract: command and manifest parsing, status
-//!   JSON, and the frozen `failed` reason codes. Requires `serde` and
+//! - **`ota-wire`** — MQTT OTA wire contract: command and manifest parsing,
+//!   status JSON, the serde forms of the reason codes, and the consumer
+//!   runtime's pure state machines (`ota::runtime`). Requires `serde` and
 //!   `serde_json` (no default features, `alloc`); implies `ota`. The base `ota`
 //!   feature stays free of both.
+//!
+//! - **`ota-ddi`** — the sans-IO DDI client (`ota::ddi`: `PollMachine`,
+//!   deployment admission, `VerdictSender`, `CancelMachine`, `DdiSettings`, the
+//!   nudge topic) and its JSON codec (`ota::ddi::wire`): the poll, deployment
+//!   and cancel documents of the hawkBit DDI v1 profile, the bounded feedback
+//!   encoder and the profile codes, and the zeroizing target token
+//!   `ota::ddi::DdiToken`. Requires `serde`, `serde_json` (no default
+//!   features, `alloc`) and `zeroize`; implies `ota`. Independent of
+//!   `ota-wire`; the two share only `ota::wire::FailReason`.
 //!
 //! - **`provisioning`** — SoftAP captive-portal form parsing, field validation,
 //!   and provisioning state machine. **This is a meta-feature that enables
@@ -86,10 +99,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 // alloc is needed in tests (provisioning + espnow mocks use alloc::format! etc.)
-// and by the `ota-wire` JSON types (String, serde_json).
+// and by the `ota-wire` and `ota-ddi` JSON types (String, serde_json).
 #[cfg(any(
     test,
     feature = "ota-wire",
+    feature = "ota-ddi",
     feature = "std",
     all(feature = "mock", feature = "mqtt")
 ))]
@@ -102,6 +116,8 @@ pub(crate) mod test_support;
 // ── Always-available (no feature gate) ──────────────────────────────────────
 // backoff and status_colors are used across wifi+mqtt and have zero external deps.
 pub mod backoff;
+// The device identity grammar of the fleet DDI profile, shared by `ota::ddi` and `provisioning`.
+pub mod identity;
 pub mod status_colors;
 #[cfg(feature = "std")]
 pub mod wait_list;
