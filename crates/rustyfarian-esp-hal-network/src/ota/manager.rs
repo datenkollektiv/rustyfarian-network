@@ -17,13 +17,16 @@ use esp_bootloader_esp_idf::partitions::{
     PartitionType, PARTITION_TABLE_MAX_LEN,
 };
 use esp_storage::FlashStorage;
-use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine};
+use juggler::ota::download::{
+    DownloadAction, DownloadInput, DownloadMachine, ImageChip, IMAGE_HEADER_LEN,
+};
 use juggler::ota::{
     classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, OtaError, SlotId,
     StreamingVerifier,
 };
 
 use super::activation::{self, Entry, OtadataSectors};
+use super::cancel::OtaCancel;
 use super::http::async_client::fetch_get;
 use super::http::parse_url;
 
@@ -42,6 +45,9 @@ fn to_embassy(d: CoreDuration) -> Duration {
 
 /// Bytes requested per socket read.
 const CHUNK_LEN: usize = 512;
+
+/// How long a failed download waits for the RST of the aborted socket to leave before it returns.
+const ABORT_FLUSH_WAIT: Duration = Duration::from_millis(500);
 
 /// A socket read buffer whose start is word-aligned, so a NOR driver writes
 /// from it without copying through a sector-sized temporary.
@@ -229,11 +235,12 @@ fn flush_tail(
 
 /// Feeds the last outcome and returns the machine's final result.
 fn finish(
+    cancel: &OtaCancel,
     machine: &mut DownloadMachine,
     input: DownloadInput,
     elapsed: CoreDuration,
 ) -> Result<(), OtaError> {
-    match machine.poll_bounded(input, elapsed)? {
+    match cancel.poll(machine, input, elapsed)? {
         DownloadAction::Done(result) => result,
         other => Err(unexpected(&other)),
     }
@@ -313,6 +320,7 @@ pub struct EspHalOtaManager<'d> {
     config: OtaManagerConfig,
     flash: FlashStorage<'d>,
     deadline: Deadline,
+    expected_chip: Option<ImageChip>,
 }
 
 impl<'d> EspHalOtaManager<'d> {
@@ -330,6 +338,7 @@ impl<'d> EspHalOtaManager<'d> {
             config,
             flash: FlashStorage::new(flash),
             deadline: Deadline::none(),
+            expected_chip: None,
         })
     }
 
@@ -385,6 +394,28 @@ impl<'d> EspHalOtaManager<'d> {
 
     /// Experimental: API may change before 1.0.
     ///
+    /// Require the image header to name `chip` before the partition is prepared.
+    ///
+    /// The first 16 body bytes are read before the erase and checked by `juggler::ota::download::check_image_header`: a different chip id fails with [`OtaError::TargetMismatch`], a missing `0xE9` magic byte or an image shorter than the header with `DownloadFailed { status: 0 }`, both without touching the partition.
+    /// On a match those bytes are written first, so the image and its SHA-256 are unchanged.
+    /// Not calling this method means no header check.
+    /// The ESP-IDF tier has the same method on `OtaSession`.
+    ///
+    /// ```ignore
+    /// let mut manager = EspHalOtaManager::new(
+    ///     OtaManagerConfig { timeout_secs: 30 },
+    ///     peripherals.FLASH,
+    /// )?
+    /// .with_expected_chip(ImageChip::Esp32C3);
+    /// ```
+    #[must_use]
+    pub fn with_expected_chip(mut self, chip: ImageChip) -> Self {
+        self.expected_chip = Some(chip);
+        self
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
     /// Fetch firmware from `url`, verify its SHA-256 against `expected_sha256`,
     /// write it to the inactive OTA slot, and activate that slot for next boot.
     ///
@@ -421,6 +452,9 @@ impl<'d> EspHalOtaManager<'d> {
     ///
     /// With [`with_deadline`](Self::with_deadline) set, the whole call is bounded by that total.
     ///
+    /// To cancel the download from another task, use
+    /// [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable).
+    ///
     /// [`mark_valid`]: EspHalOtaManager::mark_valid
     pub async fn fetch_and_apply(
         &mut self,
@@ -428,20 +462,78 @@ impl<'d> EspHalOtaManager<'d> {
         url: &str,
         expected_sha256: &[u8; 32],
     ) -> Result<(), OtaError> {
+        self.fetch_and_apply_cancellable(socket, url, expected_sha256, &OtaCancel::new())
+            .await
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// [`fetch_and_apply`](Self::fetch_and_apply) that another task can stop through `cancel`.
+    ///
+    /// Returns [`OtaError::Cancelled`] exactly when an [`OtaCancel::cancel`] was accepted; the boot slot is then unchanged.
+    ///
+    /// On any error the socket is aborted (a TCP RST), so a server that is still sending the image (after a refused header, say) stops; the call waits up to 500 ms for the RST to leave.
+    pub async fn fetch_and_apply_cancellable(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        url: &str,
+        expected_sha256: &[u8; 32],
+        cancel: &OtaCancel,
+    ) -> Result<(), OtaError> {
+        let result = self.stream(socket, url, expected_sha256, cancel).await;
+        if result.is_err() {
+            socket.abort();
+            let _ = with_timeout(ABORT_FLUSH_WAIT, socket.flush()).await;
+        }
+        result
+    }
+
+    /// The body of [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable), without the socket abort on error.
+    async fn stream(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        url: &str,
+        expected_sha256: &[u8; 32],
+        cancel: &OtaCancel,
+    ) -> Result<(), OtaError> {
         let start = Instant::now();
         let elapsed = || to_core(start.elapsed());
         let per_op = CoreDuration::from_secs(self.config.timeout_secs);
         let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
+        if let Some(chip) = self.expected_chip {
+            machine = machine.with_expected_chip(chip);
+        }
 
         // 1. Connect, read the headers and size the partition; nothing is
         //    prepared yet, so an error returns without an abort.
         let mut input = DownloadInput::Begin;
+        let mut header = [0u8; IMAGE_HEADER_LEN];
         let len = loop {
-            let action = machine
-                .poll_bounded(input, elapsed())
+            let action = cancel
+                .poll(&mut machine, input, elapsed())
                 .inspect_err(|e| log::error!("OTA: download stopped: {}", e))?;
             input = match action {
                 DownloadAction::Connect { budget } => self.connect(socket, url, budget).await,
+                // The image header, read before the partition is erased; the machine keeps it.
+                DownloadAction::ReadHeader { max, budget } => {
+                    let to_read = (max as usize).min(IMAGE_HEADER_LEN);
+                    match with_timeout(to_embassy(budget), socket.read(&mut header[..to_read]))
+                        .await
+                    {
+                        Err(_) => {
+                            log::error!(
+                                "OTA: image header read timed out (per-read {}s or deadline)",
+                                self.config.timeout_secs
+                            );
+                            DownloadInput::ReadFailed(classify_read_error(true))
+                        }
+                        Ok(Err(e)) => {
+                            log::error!("OTA: image header read failed: {:?}", e);
+                            DownloadInput::ReadFailed(classify_read_error(false))
+                        }
+                        Ok(Ok(n)) => DownloadInput::header_read(&header[..n]),
+                    }
+                }
                 DownloadAction::Prepare { len } => break len,
                 DownloadAction::Done(result) => return result,
                 other => return Err(unexpected(&other)),
@@ -457,6 +549,7 @@ impl<'d> EspHalOtaManager<'d> {
             Err(e) => {
                 log::error!("OtaUpdater::new failed: {:?}", e);
                 return finish(
+                    cancel,
                     &mut machine,
                     DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
                     elapsed(),
@@ -480,6 +573,7 @@ impl<'d> EspHalOtaManager<'d> {
                 Err(e) => {
                     log::error!("next_partition failed: {:?}", e);
                     return finish(
+                        cancel,
                         &mut machine,
                         DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
                         elapsed(),
@@ -525,7 +619,12 @@ impl<'d> EspHalOtaManager<'d> {
             let mut sink = match prepared {
                 Ok(sink) => sink,
                 Err(e) => {
-                    return finish(&mut machine, DownloadInput::PrepareFailed(e), elapsed());
+                    return finish(
+                        cancel,
+                        &mut machine,
+                        DownloadInput::PrepareFailed(e),
+                        elapsed(),
+                    );
                 }
             };
 
@@ -541,7 +640,7 @@ impl<'d> EspHalOtaManager<'d> {
             let mut written: u32 = 0;
             let mut input = DownloadInput::Prepared;
             loop {
-                let action = match machine.poll_bounded(input, elapsed()) {
+                let action = match cancel.poll(&mut machine, input, elapsed()) {
                     Ok(action) => action,
                     // Nothing on this tier needs undoing: the slot is simply
                     // never activated.
@@ -571,6 +670,17 @@ impl<'d> EspHalOtaManager<'d> {
                                 DownloadInput::ReadFailed(classify_read_error(false))
                             }
                             Ok(Ok(n)) => DownloadInput::Read(n),
+                        }
+                    }
+                    // The header the machine read before the erase goes first.
+                    DownloadAction::WriteHeader(bytes) => {
+                        verifier.update(&bytes);
+                        match write_chunk(&mut sink, &mut aligner, written, &bytes) {
+                            Ok(()) => {
+                                written += IMAGE_HEADER_LEN as u32;
+                                DownloadInput::Written
+                            }
+                            Err(e) => DownloadInput::WriteFailed(e),
                         }
                     }
                     DownloadAction::Write { n } => {
@@ -625,7 +735,12 @@ impl<'d> EspHalOtaManager<'d> {
                 if result.is_ok() {
                     log::info!("OTA: partition swap complete — reboot to apply");
                 }
-                finish(&mut machine, DownloadInput::Activated(result), elapsed())
+                finish(
+                    cancel,
+                    &mut machine,
+                    DownloadInput::Activated(result),
+                    elapsed(),
+                )
             }
             Err(e) => Err(e),
         }

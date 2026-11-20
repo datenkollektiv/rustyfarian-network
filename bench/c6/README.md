@@ -12,3 +12,4 @@ Connect the USB port wired to the chip's USB-Serial-JTAG (the DevKitC has two).
 | `dns-subscribe` | `hal_c6_mqtt_lwt` | broker by hostname, runtime subscribe, delivery across a broker restart | `MQTT_HOST=bench-broker` |
 | `dns-unresolvable` | `hal_c6_mqtt_lwt` | unresolvable broker name retries every 10 s | |
 | `provision` | `hal_c6_provision_mqtt` | portal record with two extras survives a power cut | a person joins the SoftAP and replugs |
+| `ddi` | `idf_c6_ddi` | DDI OTA against a lab server: forced update, `up_to_date` and chip gate (1007), cancel and reset mid-download, rollback (1004) and its sticky refusal, wrong sha256 (1002), each row probed on the server | lab DDI server (`DDI_MGMT_*`), local broker, seven bundles published with `just ddi-publish`, see header |

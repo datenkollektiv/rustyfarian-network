@@ -9,6 +9,8 @@ use crate::ota::persist::{
 };
 use crate::ota::{Admission, BlockedBy, FailReason, RollbackReason, SlotId, Version};
 
+pub use crate::ota::health::{repair_all, retry_completion, CompletionTry, RepairError};
+
 fn blocked_reason(by: BlockedBy) -> FailReason {
     match by {
         BlockedBy::AttemptUnresolved => FailReason::AttemptUnresolved,
@@ -117,78 +119,6 @@ pub fn ack_delivered<K: OtaKv>(
     attempt_id: u32,
 ) -> Result<Delivery, StoreError> {
     store.mark_report_delivered(attempt_id)
-}
-
-/// The result of one background attempt to record the completed attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionTry {
-    /// The attempt record was cleared; admission reopens by itself.
-    Completed,
-    /// No attempt for the running version remains (cleared by a repair, or it belongs to another version); stop retrying.
-    Gone,
-    /// The attempt is still present and could not be cleared (or read); retry later.
-    StillFailing,
-}
-
-/// One background retry of `complete_attempt(running)` after `ApplyNotRecorded`, inside ONE store lock.
-///
-/// The caller guarantees the running slot is known valid (`mark_valid` succeeded) and holds no lock across the backoff sleeps.
-/// It only completes an attempt for `running`: an attempt of another version, or one without a readable id, is left to boot reconciliation and ends the retries.
-pub fn retry_completion<K: OtaKv>(store: &mut OtaStore<K>, running: Version) -> CompletionTry {
-    match store.read_attempt() {
-        Ok(None) => CompletionTry::Gone,
-        Ok(Some(stored)) if stored.record.version == Some(running) => {
-            match store.complete_attempt(running) {
-                Ok(()) => CompletionTry::Completed,
-                Err(_) => CompletionTry::StillFailing,
-            }
-        }
-        Ok(Some(_)) => CompletionTry::Gone,
-        Err(_) => CompletionTry::StillFailing,
-    }
-}
-
-/// Why [`repair_all`] did not finish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairError {
-    /// The cap was reached and unreadable records remain.
-    Capped,
-    /// A transient storage error.
-    Store(StoreError),
-}
-
-impl RepairError {
-    /// Both causes are reported as `repair_failed`.
-    pub const fn reason(&self) -> FailReason {
-        FailReason::RepairFailed
-    }
-}
-
-/// Repairs record groups until none is left, at most `max_iterations` of them.
-///
-/// Returns how many groups were repaired (zero means nothing was unreadable).
-/// Reaching the cap with records still unreadable is [`RepairError::Capped`], never a success with the cap as the count.
-///
-/// # Errors
-///
-/// [`RepairError::Store`] on a transient failure (records repaired so far stay repaired), [`RepairError::Capped`] at the cap.
-pub fn repair_all<K: OtaKv>(
-    store: &mut OtaStore<K>,
-    max_iterations: u32,
-) -> Result<u32, RepairError> {
-    let mut repaired = 0;
-    while repaired < max_iterations {
-        match store.repair_corrupt() {
-            Ok(Some(_)) => repaired += 1,
-            Ok(None) => return Ok(repaired),
-            Err(e) => return Err(RepairError::Store(e)),
-        }
-    }
-    match store.corrupt_present() {
-        Ok(false) => Ok(repaired),
-        Ok(true) => Err(RepairError::Capped),
-        Err(e) => Err(RepairError::Store(e)),
-    }
 }
 
 /// The result of [`failed_download`].

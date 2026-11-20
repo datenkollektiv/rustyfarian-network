@@ -34,12 +34,34 @@ pub const RQ_WHY: &str = "rq_why";
 pub const RQ_FROM: &str = "rq_from";
 /// `str`: version last left by a rollback, refused until a different one is offered.
 pub const REJ_VER: &str = "rej_ver";
+/// `str`: DDI action id of the action record, canonical `i64` digits ([`is_canonical_action_id`]).
+pub const DDI_ACT: &str = "ddi_act";
+/// `u8`: stage of the DDI action record; the commit marker, written last and removed first.
+pub const DDI_STAGE: &str = "ddi_stage";
+/// `u32`: attempt id bound to the DDI action, absent for an action that never started an attempt.
+pub const DDI_ATT: &str = "ddi_att";
+/// `u32`: verdict code of the DDI action, 0 for success or a profile code 1001 to 1007.
+pub const DDI_CODE: &str = "ddi_code";
+/// `str`: first feedback detail of the verdict.
+pub const DDI_DET0: &str = "ddi_det0";
+/// `str`: second feedback detail of the verdict.
+pub const DDI_DET1: &str = "ddi_det1";
 /// Every key of the namespace.
 #[cfg(test)]
-pub(crate) const KEYS: [&str; 16] = [
+pub(crate) const KEYS: [&str; 22] = [
     RB, RB_WHY, RB_ID, ATT_CTR, ATT_EPOCH, ATT_ID, ATT_BOOT, ATT_VER, ATT_SLOT, ATT_ACT, ATT_INV,
-    ATT_WHY, RQ_ID, RQ_WHY, RQ_FROM, REJ_VER,
+    ATT_WHY, RQ_ID, RQ_WHY, RQ_FROM, REJ_VER, DDI_ACT, DDI_STAGE, DDI_ATT, DDI_CODE, DDI_DET0,
+    DDI_DET1,
 ];
+
+/// `ddi_stage`: the action was admitted and its attempt (if `ddi_att` matches `att_id`) is running.
+pub const STAGE_RUNNING: u8 = 1;
+/// `ddi_stage`: the terminal verdict awaits delivery.
+pub const STAGE_VERDICT_PENDING: u8 = 2;
+/// `ddi_stage`: the verdict was delivered (or the server no longer knows the action); never re-applied.
+pub const STAGE_CLOSED: u8 = 3;
+
+pub use crate::ota::action_id::is_canonical_action_id;
 
 /// Slot used for a running partition that is not `ota_0` or `ota_1`.
 ///
@@ -115,9 +137,38 @@ mod tests {
                 "rq_id",
                 "rq_why",
                 "rq_from",
-                "rej_ver"
+                "rej_ver",
+                "ddi_act",
+                "ddi_stage",
+                "ddi_att",
+                "ddi_code",
+                "ddi_det0",
+                "ddi_det1"
             ]
         );
+    }
+
+    #[test]
+    fn canonical_action_ids_are_i64_digits_without_leading_zeros() {
+        for id in ["0", "1", "42", "1234567890123456789", "9223372036854775807"] {
+            assert!(is_canonical_action_id(id), "{id}");
+        }
+        for id in [
+            "",
+            "00",
+            "012",
+            "9223372036854775808",
+            "9999999999999999999",
+            "12345678901234567890",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1a",
+            "\u{661}",
+        ] {
+            assert!(!is_canonical_action_id(id), "{id:?}");
+        }
     }
 
     #[test]

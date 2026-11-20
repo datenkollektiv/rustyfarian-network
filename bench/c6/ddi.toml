@@ -1,0 +1,206 @@
+# ESP-IDF DDI OTA client on the C6-DevKitC-1 against a lab DDI server (docs/features/ddi-client-v1.md), the B2
+# scenario chain on one board in one run, the twin of c3/ddi: forced update, up_to_date and chip gate (1007),
+# cancel mid-download, reboot mid-download, unhealthy image rolled back (1004) and refused again (1007), wrong
+# sha256 (1002). Every operator row pairs the device log with a probe of the action on the server (`just ddi-watch`:
+# state and last code through the Management API, scripts/ddi-lab.sh). The device reaches the server through the
+# lab proxy (`just ddi-proxy`, scripts/ddi-lab-proxy.py), which throttles artifacts to 20 KiB/s (the cancel and the
+# reset need a window) and corrupts the `-tampered` copy for the 1002 row.
+# Connect the USB port wired to the chip's USB-Serial-JTAG. `just flash` uses the rollback-enabled OTA bootloader
+# (`scripts/ensure-bootloader.sh --ota c6`), unvalidated on C6 hardware until this run.
+# Prerequisites, all in the shell that starts the run (the shell beats the dotenv file):
+#   in .env: DDI_CONTROLLER_ID and DDI_TOKEN of this board, DDI_BASE_URL=http://<this machine's LAN IPv4>:8090/DEFAULT,
+#            DDI_MGMT_URL=http://<lab-host>:<port>, DDI_MGMT_USER, DDI_MGMT_PASS, MQTT_HOST=<this machine's LAN IPv4>
+#   export FIRMWARE_VERSION=1.0.0 ESPFLASH_PORT=<c6 port>
+#   just mosquitto up; just ddi-tenant-init; just ddi-ensure-target      (a fleet-seeded target needs neither ddi-*)
+#   just ddi-bundle idf_c6_ddi 1.0.0; just ddi-bundle idf_c6_ddi 1.1.0; just ddi-bundle idf_c6_ddi 1.2.0
+#   just ddi-bundle idf_c6_ddi 1.3.0; DDI_DEMO_UNHEALTHY=1 just ddi-bundle idf_c6_ddi 1.4.0; just ddi-bundle idf_c6_ddi 1.5.0
+#   just ddi-bundle idf_c3_ddi 9.9.9                      (the other chip's image under this board's id: the chip gate)
+#   for v in 1.0.0 1.1.0 1.2.0 1.3.0 1.4.0; do just ddi-publish idf_c6_ddi $v; done
+#   just ddi-publish idf_c6_ddi 1.5.0 --tampered; just ddi-publish idf_c3_ddi 9.9.9
+#   just bench c6 ddi --port <c6 port>
+# The setup erases the whole flash (the runtime keeps its records in NVS), recreates the target on the server so it
+# forgets the sets of the last run (hawkBit never offers an installed set again; on a fleet-owned target replace
+# ddi-target-reset by ddi-quiesce and bump the versions) and starts the proxy (log: tmp/bench-ddi-proxy.log).
+# The router must pass TCP 8090 and 1883 from the IoT subnet to this machine. No person needed: the runner flashes
+# and resets over USB. Each operator row captures its action id from the device log for the probe that follows it.
+examples = ["idf_c6_ddi"]
+setup = [
+  ["sh", "-c", "scripts/espflash.sh erase-flash"],
+  ["just", "ddi-target-reset"],
+  ["sh", "-c", "mkdir -p tmp; pkill -f '[s]cripts/ddi-lab-proxy.py' || true; (nohup just ddi-proxy > tmp/bench-ddi-proxy.log 2>&1 &); scripts/ddi-lab.sh proxy-wait"],
+]
+teardown = [["sh", "-c", "pkill -f '[s]cripts/ddi-lab-proxy.py' || true"]]
+
+# ── baseline ───────────────────────────────────────────────────────────────────
+
+[[step]]
+say = "Baseline 1.0.0 boots, polls the lab server through the proxy and sends its configData"
+arm = false       # printed during the reset
+expect = ['DDI example 1\.0\.0 starting on c6-devkitc1 \(esp32c6\)', '\[ota\] DDI poll answered: Ok', '\[ota\] DDI configData sent']
+reject = '\[app\] refusing to start|DDI base URL refused|DDI poll answered: (Unauthorized|NotFound|Gone)|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 120
+
+# ── version gate: up_to_date (1007) ────────────────────────────────────────────
+
+[[step]]
+say = "The running version offered again (1.0.0): refused 1007 up_to_date before any download, feedback delivered"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.0.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_up>\d+) refused: Policy up_to_date', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'admitted: version|attempt \d+ begun|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 120
+
+[[step]]
+say = "The server shows that action closed with code 1007 up_to_date"
+probe = ["just", "ddi-watch", "{a_up}"]
+arm = false
+expect = 'action=(?P=a_up) type=update status=error code=1007 detail=up_to_date'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── chip gate: a C3 image offered to the C6 (1007) ─────────────────────────────
+
+[[step]]
+say = "An esp32c3 image (9.9.9) offered to the C6: refused 1007 target_mismatch before any download, although newer"
+run = ["just", "ddi-assign", "idf_c3_ddi", "9.9.9", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_chip>\d+) refused: Policy target_mismatch', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'admitted: version|attempt \d+ begun|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+[[step]]
+say = "The server shows that action closed with code 1007 target_mismatch"
+probe = ["just", "ddi-watch", "{a_chip}"]
+arm = false
+expect = 'action=(?P=a_chip) type=update status=error code=1007 detail=target_mismatch'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── forced update ──────────────────────────────────────────────────────────────
+
+[[step]]
+say = "Forced update to 1.1.0: downloaded through the proxy, booted, healthy, slot marked valid, success delivered"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.1.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_fwd>\d+) admitted: version 1\.1\.0', '\[ota\] attempt \d+ begun for action \d+', '\[ota\] proceeding sent for action \d+', 'DDI download from http://', '\[ota\] action \d+: boot slot selected; restarting in \d+ ms', 'DDI example 1\.1\.0 starting', '\[ota\] the new image booted for action \d+', '\[ota\] image 1\.1\.0 is healthy; the slot is marked valid', '\[ota\] health policy finished: Applied', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'download of action \d+ failed|refused: |rolling back|\[app\] refusing to start|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 240
+
+[[step]]
+say = "The server shows that action finished with no code"
+probe = ["just", "ddi-watch", "{a_fwd}"]
+arm = false
+expect = 'action=(?P=a_fwd) type=update status=finished code=none detail=none'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── cancel during the download ─────────────────────────────────────────────────
+
+[[step]]
+say = "Offer 1.2.0; the download starts (about 23 s at the proxy's rate)"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.2.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_can>\d+) admitted: version 1\.2\.0', '\[ota\] attempt \d+ begun for action \d+', 'DDI download from http://']
+reject = 'refused: |PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+[[step]]
+say = "Cancel it at once: the next poll (the nudge, 10 s after the last) finds the download running, stops it and acknowledges"
+run = ["just", "ddi-cancel", "{a_can}", "--nudge"]
+arm = false
+expect = ['\[ota\] cancel of action (?P=a_can): Downloading', '\[ota\] cancel of the download: Accepted', '\[ota\] download of action (?P=a_can) failed: cancelled', '\[ota\] cancel ended: Some\(Acknowledged\)']
+reject = 'boot slot selected|DDI example 1\.2\.0 starting|cancel of action \d+: (Activated|VerdictPending|NotRunning)|cancel ended: Some\(Rejected\)|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "The server shows that action canceled"
+probe = ["just", "ddi-watch", "{a_can}"]
+arm = false
+expect = 'action=(?P=a_can) type=cancel status=canceled'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── reboot during the download ─────────────────────────────────────────────────
+
+[[step]]
+say = "Offer 1.3.0; the download starts and runs for 10 s more (about 200 KB written) before the reset"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.3.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_rst>\d+) admitted: version 1\.3\.0', '\[ota\] attempt \d+ begun for action \d+', 'DDI download from http://']
+reject = 'refused: |boot slot selected|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+settle = 10       # keeps the step open while the transfer runs, so the next step resets mid-download
+
+[[step]]
+say = "Reset mid-download: the old image boots, clears the interrupted attempt, is offered the same action again and completes it"
+reset = true      # the runbook's reset-button press, done over USB
+arm = false
+expect = ['DDI example 1\.1\.0 starting', '\[ota\] boot reconciliation: ', '\[ota\] deployment (?P=a_rst) admitted: version 1\.3\.0', '\[ota\] attempt \d+ begun for action (?P=a_rst)', '\[ota\] action (?P=a_rst): boot slot selected; restarting in \d+ ms', 'DDI example 1\.3\.0 starting', '\[ota\] the new image booted for action (?P=a_rst)', '\[ota\] image 1\.3\.0 is healthy; the slot is marked valid', '\[ota\] verdict for action (?P=a_rst) delivered; the action is closed']
+reject = 'refused: |rolling back|\[app\] refusing to start|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 240
+
+[[step]]
+say = "The server shows that action finished with no code"
+probe = ["just", "ddi-watch", "{a_rst}"]
+arm = false
+expect = 'action=(?P=a_rst) type=update status=finished code=none detail=none'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── unhealthy image: rollback (1004), then refused again (1007) ────────────────
+
+[[step]]
+say = "Offer the unhealthy 1.4.0: it boots, never turns healthy, is rolled back at the 120 s deadline, and 1.3.0 reports 1004"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.4.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_bad>\d+) admitted: version 1\.4\.0', '\[ota\] action \d+: boot slot selected; restarting in \d+ ms', 'DDI example 1\.4\.0 starting', 'DDI_DEMO_UNHEALTHY=1', '\[ota\] health deadline reached with the slot still pending; rolling back', 'DDI example 1\.3\.0 starting', '\[ota\] boot reconciliation: ReportedRollback', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'image 1\.4\.0 is healthy|refused: |download of action \d+ failed|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 360
+
+[[step]]
+say = "The server shows that action closed with code 1004 rolled_back"
+probe = ["just", "ddi-watch", "{a_bad}"]
+arm = false
+expect = 'action=(?P=a_bad) type=update status=error code=1004 detail=rolled_back'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "1.4.0 offered again: refused 1007 previously_rolled_back before any download"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.4.0", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_prev>\d+) refused: Policy previously_rolled_back', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'admitted: version|attempt \d+ begun|PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 90
+
+[[step]]
+say = "The server shows that action closed with code 1007 previously_rolled_back"
+probe = ["just", "ddi-watch", "{a_prev}"]
+arm = false
+expect = 'action=(?P=a_prev) type=update status=error code=1007 detail=previously_rolled_back'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+# ── wrong sha256 (1002) ────────────────────────────────────────────────────────
+
+[[step]]
+say = "Offer the tampered 1.5.0 (one byte flipped by the proxy): downloaded, refused by the digest check, 1002 delivered, no reboot"
+run = ["just", "ddi-assign", "idf_c6_ddi", "1.5.0", "--tampered", "--nudge"]
+arm = false
+expect = ['\[ota\] deployment (?P<a_sha>\d+) admitted: version 1\.5\.0', '\[ota\] attempt \d+ begun for action \d+', '\[ota\] download of action \d+ failed: checksum_mismatch', '\[ota\] the failed attempt was cleared; its verdict awaits delivery', '\[ota\] verdict for action \d+ delivered; the action is closed']
+reject = 'boot slot selected|DDI example 1\.5\.0 starting|refused: |PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 180
+
+[[step]]
+say = "The server shows that action closed with code 1002 checksum_mismatch"
+probe = ["just", "ddi-watch", "{a_sha}"]
+arm = false
+expect = 'action=(?P=a_sha) type=update status=error code=1002 detail=checksum_mismatch'
+serial_reject = 'PANIC|panicked|Guru Meditation|abort\(\)'
+timeout = 60
+
+[[step]]
+say = "1.3.0 keeps running and polling for 30 s: no reboot, no new attempt"
+duration = 30
+arm = false
+reject = 'admitted: version|attempt \d+ begun|rst:0x[0-9a-f]+ \(|ESP-ROM:|PANIC|panicked|Guru Meditation|abort\(\)'

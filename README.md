@@ -33,8 +33,8 @@ Wi-Fi, MQTT, LoRa, ESP-NOW, and OTA support libraries for ESP32 projects.
 - Minimal friction: a few lines of `Cargo.toml` and no surprises
 
 **Out of scope:** General-purpose application-layer clients (HTTP, CoAP, WebSocket) and BLE provisioning flows.
-The OTA feature (in both `rustyfarian-esp-idf-network` and `rustyfarian-esp-hal-network`) carries its own internal HTTP/1.1 GET client for firmware download.
-This is an implementation detail and is not published as a reusable workspace HTTP API.
+The OTA feature carries its own internal HTTP/1.1 GET client for firmware download, and the DDI OTA client (`ota-ddi`, ESP-IDF tier first) carries a credential-bound transport that speaks only the DDI endpoints of one configured server ([ADR 027](docs/adr/027-ddi-transport-scope.md)).
+Neither is published as a reusable HTTP API.
 SoftAP captive-portal provisioning ships with two `SchemaProfile`s — `LorawanFieldDevice` and `WifiMqttDevice`.
 They are specified under [ADR 013](docs/adr/013-softap-provisioning-acceptance.md) (acceptance, 2026-06-11)
 and [ADR 014](docs/adr/014-wifi-mqtt-provisioning-profile.md) (Wi-Fi + MQTT generalisation, 2026-06-12).

@@ -239,6 +239,113 @@ pub fn decide_offer(
     }
 }
 
+/// Experimental: API may change before 1.0.
+///
+/// What the device knows about its versions when [`decide_version_gate`] judges an offer.
+///
+/// Named fields, so the two optional versions cannot be swapped at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionFacts {
+    /// The running firmware version.
+    pub running: Version,
+    /// The version the device last rolled back from, kept until a different version passes its health check.
+    pub rolled_back: Option<Version>,
+    /// The device's minimum version, inclusive.
+    pub floor: Option<Version>,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// A rule of [`decide_version_gate`]: why an offer is refused, or why a marked offer passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateReason {
+    /// The offered version is below the device's minimum version.
+    BelowFloor,
+    /// The offered version is the one the device last rolled back from.
+    PreviouslyRolledBack,
+    /// The offered version is older than the running one.
+    Downgrade,
+    /// The offered version equals the running one.
+    UpToDate,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// The outcome of [`decide_version_gate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionGate {
+    /// The offer passes.
+    Apply {
+        /// Why it passed only because of the downgrade marker, reported with the success: [`GateReason::PreviouslyRolledBack`] or [`GateReason::Downgrade`] (also for an equal version); `None` for a plain upgrade.
+        marked: Option<GateReason>,
+    },
+    /// The offer is refused for this reason.
+    Refuse(GateReason),
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// The version gate of a DDI offer: [`decide_update`] plus a minimum-version floor, the remembered rolled-back version and the downgrade marker.
+///
+/// The first rule that applies decides:
+///
+/// 1. `offered < floor` refuses with [`GateReason::BelowFloor`], marker or not.
+/// 2. `offered == rolled_back` refuses with [`GateReason::PreviouslyRolledBack`] without the marker, whether the offer is newer or not.
+/// 3. Without the marker, [`decide_update`]'s `Reject` refuses with [`GateReason::Downgrade`] and its `Skip` with [`GateReason::UpToDate`].
+/// 4. Otherwise the offer passes, `marked` with [`GateReason::PreviouslyRolledBack`] for the remembered version, with [`GateReason::Downgrade`] for a version that is not newer, and `None` for a plain upgrade.
+///
+/// The floor is inclusive: an offer equal to it passes rule 1.
+/// The rolled-back version keeps the lifetime documented on [`decide_offer`].
+///
+/// # Example
+///
+/// ```
+/// use juggler::ota::{decide_version_gate, GateReason, Version, VersionFacts, VersionGate};
+///
+/// let running = Version::new(1, 2, 0);
+/// let older = Version::new(1, 1, 0);
+/// let facts = VersionFacts { running, rolled_back: None, floor: None };
+///
+/// assert_eq!(
+///     decide_version_gate(older, &facts, false),
+///     VersionGate::Refuse(GateReason::Downgrade)
+/// );
+/// assert_eq!(
+///     decide_version_gate(older, &facts, true),
+///     VersionGate::Apply { marked: Some(GateReason::Downgrade) }
+/// );
+/// let floored = VersionFacts { floor: Some(running), ..facts };
+/// assert_eq!(
+///     decide_version_gate(older, &floored, true),
+///     VersionGate::Refuse(GateReason::BelowFloor)
+/// );
+/// ```
+pub fn decide_version_gate(
+    offered: Version,
+    facts: &VersionFacts,
+    downgrade_allowed: bool,
+) -> VersionGate {
+    if facts.floor.is_some_and(|floor| offered < floor) {
+        return VersionGate::Refuse(GateReason::BelowFloor);
+    }
+    let remembered = facts.rolled_back == Some(offered);
+    let reason = match (remembered, decide_update(facts.running, offered)) {
+        (true, _) => GateReason::PreviouslyRolledBack,
+        (false, UpdateDecision::Apply) => return VersionGate::Apply { marked: None },
+        (false, UpdateDecision::Reject) => GateReason::Downgrade,
+        (false, UpdateDecision::Skip) => GateReason::UpToDate,
+    };
+    match (downgrade_allowed, reason) {
+        (true, GateReason::UpToDate) => VersionGate::Apply {
+            marked: Some(GateReason::Downgrade),
+        },
+        (true, reason) => VersionGate::Apply {
+            marked: Some(reason),
+        },
+        (false, reason) => VersionGate::Refuse(reason),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +526,105 @@ mod tests {
                 decide_offer(running, offered, refused, admission),
                 expected,
                 "running={running:?} offered={offered:?} refused={refused:?} admission={admission:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_version_gate_table() {
+        use GateReason as R;
+        use VersionGate as G;
+        const APPLY: G = G::Apply { marked: None };
+        const MARKED_DOWNGRADE: G = G::Apply {
+            marked: Some(R::Downgrade),
+        };
+        const MARKED_ROLLED_BACK: G = G::Apply {
+            marked: Some(R::PreviouslyRolledBack),
+        };
+        let v = Version::new;
+        let running = v(2, 0, 0);
+        let cases = [
+            // (offered, rolled_back, floor, marker, expected)
+            (v(3, 0, 0), None, None, false, APPLY),
+            (v(3, 0, 0), None, None, true, APPLY),
+            (v(2, 0, 0), None, None, false, G::Refuse(R::UpToDate)),
+            (v(2, 0, 0), None, None, true, MARKED_DOWNGRADE),
+            (v(1, 0, 0), None, None, false, G::Refuse(R::Downgrade)),
+            (v(1, 0, 0), None, None, true, MARKED_DOWNGRADE),
+            // The remembered version, newer, equal or older.
+            (
+                v(3, 0, 0),
+                Some(v(3, 0, 0)),
+                None,
+                false,
+                G::Refuse(R::PreviouslyRolledBack),
+            ),
+            (
+                v(2, 0, 0),
+                Some(v(2, 0, 0)),
+                None,
+                false,
+                G::Refuse(R::PreviouslyRolledBack),
+            ),
+            (
+                v(1, 0, 0),
+                Some(v(1, 0, 0)),
+                None,
+                false,
+                G::Refuse(R::PreviouslyRolledBack),
+            ),
+            (v(3, 0, 0), Some(v(3, 0, 0)), None, true, MARKED_ROLLED_BACK),
+            (v(1, 0, 0), Some(v(1, 0, 0)), None, true, MARKED_ROLLED_BACK),
+            // Another remembered version changes nothing.
+            (v(3, 0, 0), Some(v(4, 0, 0)), None, false, APPLY),
+            (
+                v(1, 0, 0),
+                Some(v(4, 0, 0)),
+                None,
+                false,
+                G::Refuse(R::Downgrade),
+            ),
+            // The floor is inclusive and beats everything, the marker included.
+            (
+                v(1, 5, 0),
+                None,
+                Some(v(1, 5, 0)),
+                false,
+                G::Refuse(R::Downgrade),
+            ),
+            (
+                v(1, 4, 9),
+                None,
+                Some(v(1, 5, 0)),
+                true,
+                G::Refuse(R::BelowFloor),
+            ),
+            (
+                v(1, 4, 9),
+                Some(v(1, 4, 9)),
+                Some(v(1, 5, 0)),
+                true,
+                G::Refuse(R::BelowFloor),
+            ),
+            (
+                v(3, 0, 0),
+                None,
+                Some(v(4, 0, 0)),
+                false,
+                G::Refuse(R::BelowFloor),
+            ),
+            (v(3, 0, 0), None, Some(v(3, 0, 0)), false, APPLY),
+        ];
+        for (offered, rolled_back, floor, marker, expected) in cases {
+            let facts = VersionFacts {
+                running,
+                rolled_back,
+                floor,
+            };
+            assert_eq!(
+                decide_version_gate(offered, &facts, marker),
+                expected,
+                "offered={offered:?} rolled_back={rolled_back:?} floor={floor:?} marker={marker}"
             );
         }
     }

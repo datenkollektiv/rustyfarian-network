@@ -19,10 +19,10 @@ use juggler::ota::{
 
 use super::manifest::{fetch_manifest, ManifestLimits};
 use super::publish::publish_status;
-use super::shared::{OtaFlags, Shared};
-use super::stack::sample;
-use super::{OtaConfig, Records};
+use super::shared::Shared;
+use super::{OtaConfig, OtaFlags, Records};
 use crate::mqtt::MqttHandle;
+use crate::ota::stack::sample;
 use crate::ota::{
     read_hardware_facts, url_for_log, BusyRetry, OtaSession, OtaSessionConfig, TARGET_CHIP,
 };

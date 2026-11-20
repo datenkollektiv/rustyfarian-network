@@ -45,6 +45,9 @@ bench := if bench_dir != "" { 'uv run --project "' + bench_dir + '" rustyfarian-
 ci_dir := env("RUSTYFARIAN_CI", "")
 ci_repo_flag := if ci_dir != "" { '--local-repository "datenkollektiv/rustyfarian-ci@v1=' + absolute_path(ci_dir) + '"' } else { "" }
 
+# critical-path map: an agents-toolbox checkout that holds skills/critical-path/critical_path.py (no public fallback).
+toolbox_dir := env("AGENTS_TOOLBOX", "")
+
 # SOPS-encrypted dotenv secrets (git-ignored, see .sops.yaml); the age key comes from .envrc
 secrets_env := justfile_directory() / "shared-secrets/secrets.env"
 
@@ -172,40 +175,73 @@ check-ota-pure:
 check-ota-wire-pure:
     cargo check -p juggler --no-default-features --features ota-wire --target {{ hal_c3_target }} -Zbuild-std=core,alloc
 
+# check the DDI JSON codec is no_std + alloc clean without the MQTT wire (no ESP-IDF required)
+[group('build')]
+check-ota-ddi-pure:
+    cargo check -p juggler --no-default-features --features ota-ddi --target {{ hal_c3_target }} -Zbuild-std=core,alloc
+
 # check the pure provisioning feature (no ESP-IDF required)
 [group('build')]
 check-provisioning-pure:
     cargo check -p juggler --features provisioning
 
-# check the esp-idf ota domain of the consolidated ESP-IDF network crate
+# check the esp-idf ota domain (download, flash, record store) and the MQTT wire contract without the runtime
 [group('build')]
 check-ota-idf:
     cargo check -p rustyfarian-esp-idf-network --features ota --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features ota-wire --target-dir {{ idf_dir }}
 
 # type-check (clippy) the esp-idf ota unit tests; they cannot run on the host (esp-idf-sys)
 [group('build')]
 clippy-ota-tests:
     cargo clippy -p rustyfarian-esp-idf-network --features ota --tests --target-dir {{ idf_dir }} -- -D warnings
+    cargo clippy -p rustyfarian-esp-idf-network --features ota-wire --tests --target-dir {{ idf_dir }} -- -D warnings
 
-# lint the pure ota-wire code and its host tests (the workspace clippy never enables `ota-wire`)
+# lint the pure ota, ota-wire and ota-ddi code and their host tests (the workspace clippy never enables them)
 [group('build')]
 clippy-ota-pure:
+    cargo clippy -p juggler --features ota --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-wire --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features ota-ddi --all-targets --target {{ host_target }} -- -D warnings
 
 # lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
 [group('build')]
 clippy-pure:
-    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,ota-ddi,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
 
-# check the esp-idf ota runtime (features wifi,mqtt,ota) and its hardware example
+# check the esp-idf ota runtime (features wifi,mqtt,ota-wire) and its hardware example
 [group('build')]
 check-ota-mqtt-idf:
-    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota --example idf_c3_ota_runtime --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-wire --example idf_c3_ota_runtime --target-dir {{ idf_dir }}
 
 # lint the esp-idf ota runtime and its hardware example (they cannot run on the host)
 [group('build')]
 clippy-ota-mqtt-idf:
-    cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota --lib --tests --example idf_c3_ota_runtime --target-dir {{ idf_dir }} -- -D warnings
+    cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-wire --lib --tests --example idf_c3_ota_runtime --target-dir {{ idf_dir }} -- -D warnings
+
+# check the esp-idf DDI transport, without and with the plain-HTTP lab opt-in
+[group('build')]
+check-ota-ddi-idf:
+    cargo check -p rustyfarian-esp-idf-network --features ota-ddi --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features ota-ddi-insecure-http --target-dir {{ idf_dir }}
+
+# lint the esp-idf DDI transport, without and with the plain-HTTP lab opt-in (it cannot run on the host)
+[group('build')]
+clippy-ota-ddi-idf:
+    cargo clippy -p rustyfarian-esp-idf-network --features ota-ddi --lib --tests --target-dir {{ idf_dir }} -- -D warnings
+    cargo clippy -p rustyfarian-esp-idf-network --features ota-ddi-insecure-http --lib --tests --target-dir {{ idf_dir }} -- -D warnings
+
+# lint the esp-idf DDI runtime next to wifi and mqtt (the nudge build), without and with the plain-HTTP lab opt-in, the latter also linting the idf_c3_ddi and idf_c6_ddi examples (it cannot run on the host)
+[group('build')]
+clippy-ota-ddi-mqtt-idf:
+    cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi --lib --tests --target-dir {{ idf_dir }} -- -D warnings
+    cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi-insecure-http --lib --tests --example idf_c3_ddi --example idf_c6_ddi --target-dir {{ idf_dir }} -- -D warnings
+
+# prove a DDI build leaves the MQTT OTA runtime out: check wifi,mqtt,ota-ddi without ota-wire, assert the feature graph and the expanded source, then that ota-ddi,ota-wire fails without the bench-only ota-ddi-bench-mqtt-wire opt-in
+[group('build')]
+check-ota-ddi-no-mqtt-runtime:
+    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi --target-dir {{ idf_dir }}
+    scripts/check-ota-ddi-no-mqtt-runtime.sh {{ idf_target }} {{ idf_dir }}
 
 # check the esp-idf provisioning domain of the consolidated ESP-IDF network crate
 [group('build')]
@@ -250,7 +286,7 @@ check-idf-all:
 
 # check all ESP-IDF domains (per-domain isolation gaps that --all-features masks)
 [group('build')]
-check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-ota-mqtt-idf check-provisioning check-idf-all
+check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-ota-mqtt-idf check-ota-ddi-idf check-ota-ddi-no-mqtt-runtime check-provisioning check-idf-all
 
 # check the consolidated HAL network crate stub (no-default-features, host)
 [group('build')]
@@ -444,7 +480,9 @@ test-espnow: test-wifi
 # run platform-independent OTA unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
 test-ota:
+    cargo test --target {{ host_target }} -p juggler --features ota
     cargo test --target {{ host_target }} -p juggler --features ota-wire
+    cargo test --target {{ host_target }} -p juggler --features ota-ddi
 
 # run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
@@ -696,12 +734,99 @@ check-no-credential-logging:
 check-library-never-reboots:
     scripts/check-library-never-reboots.sh
 
+# local critical-path map (git-ignored docs/critical-path.json): just critical-path check | compute | render [--max-nodes N]; needs AGENTS_TOOLBOX
+[group('maintenance')]
+critical-path action="render" *args:
+    @test -n "{{ toolbox_dir }}" || { echo "error: set AGENTS_TOOLBOX to an agents-toolbox checkout" >&2; exit 1; }
+    python3 -I "{{ toolbox_dir }}/skills/critical-path/critical_path.py" {{ action }} docs/critical-path.json {{ args }}
+
 # ── ota ───────────────────────────────────────────────────────────────────
 
 # build an OTA example and produce app binary, SHA-256, manifest, and command (version first)
 [group('ota')]
 ota-image version example="idf_c3_ota_runtime":
     scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
+
+# build a DDI example with FIRMWARE_VERSION=version and write the fleet's release bundle (<name>.bin, .bin.sha256, .bin.version, .bin.chip) to tmp/ddi-bundle/
+[group('ota')]
+ddi-bundle example version:
+    scripts/ddi-bundle.sh "{{ example }}" "{{ version }}" "{{ hal_dir }}" "{{ idf_dir }}"
+
+# The ddi-* recipes below are the operator side of the DDI lab (scripts/ddi-lab.sh): the hawkBit Management API
+# subset the fleet DDI profile 0.4.0 §7 names as its reference binding. DDI_MGMT_URL, DDI_MGMT_USER, DDI_MGMT_PASS
+# and DDI_CONTROLLER_ID come from the dotenv file or the shell; the credentials have no default and are never printed.
+
+# enable target-token auth and the 30 s polling interval on the lab server (tenant keys; a server without them answers 400 and is left as is)
+[group('ota')]
+ddi-tenant-init:
+    scripts/ddi-lab.sh tenant-init
+
+# create the device's target (DDI_CONTROLLER_ID) on the lab server with the token in DDI_TOKEN, or set that token on the existing target
+[group('ota')]
+ddi-ensure-target:
+    scripts/ddi-lab.sh ensure-target
+
+# delete and recreate the device's target with DDI_TOKEN, so the lab server forgets the installed set of the last bench run (a fleet-owned target: use ddi-quiesce and new versions instead)
+[group('ota')]
+ddi-target-reset:
+    scripts/ddi-lab.sh target-reset
+
+# upload a bundle from tmp/ddi-bundle/ as a software module with its artifact and target-visible chip metadata, then create its distribution set, e.g. `just ddi-publish idf_c3_ddi 1.1.0 [--tampered] [--downgrade-allowed]`
+[group('ota')]
+[positional-arguments]
+ddi-publish example version *flags:
+    scripts/ddi-lab.sh publish "$@"
+
+# the upload half of ddi-publish (module, artifact, chip metadata); prints module=<id>
+[group('ota')]
+[positional-arguments]
+ddi-upload example version *flags:
+    scripts/ddi-lab.sh upload "$@"
+
+# the set half of ddi-publish (a distribution set from the uploaded module); prints set=<id>
+[group('ota')]
+[positional-arguments]
+ddi-set example version *flags:
+    scripts/ddi-lab.sh set "$@"
+
+# assign a published set to the device's target, forced; prints action=<id>; `--nudge` publishes the MQTT poll-now nudge, e.g. `just ddi-assign idf_c3_ddi 1.1.0 --nudge`
+[group('ota')]
+[positional-arguments]
+ddi-assign example version *flags:
+    scripts/ddi-lab.sh assign "$@"
+
+# cancel an action of the device's target (default: the newest open one); `--force` also force-quits it, `--nudge` wakes the device, e.g. `just ddi-cancel --nudge`
+[group('ota')]
+[positional-arguments]
+ddi-cancel *args:
+    scripts/ddi-lab.sh cancel "$@"
+
+# cancel and force-quit every open action of the device's target
+[group('ota')]
+ddi-quiesce:
+    scripts/ddi-lab.sh quiesce
+
+# one line with an action's state and last reported code, `action=<id> type=<type> status=<status> code=<n|none> detail=<text|none>` (default: the newest action)
+[group('ota')]
+[positional-arguments]
+ddi-action *action:
+    scripts/ddi-lab.sh action "$@"
+
+# print that line whenever it changes, polled every 2 s, until killed: the probe of the bench DDI checks
+[group('ota')]
+[positional-arguments]
+ddi-watch *action:
+    scripts/ddi-lab.sh watch "$@"
+
+# publish the MQTT poll-now nudge on rustyfarian/ota/<DDI_CONTROLLER_ID>/nudge (MQTT_* from the dotenv file)
+[group('ota')]
+ddi-nudge:
+    scripts/ddi-lab.sh nudge
+
+# run the lab proxy the device's DDI_BASE_URL points at (http://<this machine>:DDI_LAB_PROXY_PORT/DEFAULT, default port 8090): forwards to DDI_LAB_UPSTREAM (default DDI_MGMT_URL), throttles artifacts to DDI_LAB_PROXY_RATE B/s (default 20480) and corrupts `-tampered` ones
+[group('ota')]
+ddi-proxy:
+    scripts/ddi-lab.sh proxy
 
 # baseline flash of idf_c3_ota_runtime with FIRMWARE_VERSION=version
 [group('ota')]
@@ -840,6 +965,13 @@ ota-serve rate="0" stall="0":
 mosquitto action:
     @scripts/mosquitto.sh "{{ action }}"
 
+# Port: LOCAL_HAWKBIT_PORT (default 18090), loopback only; the in-memory state is lost on `down`.
+# `up` prints the DDI_MGMT_* values to export for the `ddi-*` recipes.
+[doc('manage the local hawkBit 1.2.0 DDI server in Docker: just hawkbit up | down | status | restart')]
+[group('ota')]
+hawkbit action:
+    @scripts/hawkbit.sh "{{ action }}"
+
 # ── ci ────────────────────────────────────────────────────────────────────
 
 # local pre-commit gate: format (modifies files), then verify
@@ -852,11 +984,11 @@ verify: fmt-check clippy-pure clippy-ota-pure check-no-credential-logging check-
 
 # ESP-IDF device checks and lints on the workspace default RISC-V target (needs the ESP toolchain)
 [group('ci')]
-verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clippy-provisioning-mqtt-tests clippy-ota-mqtt-idf clippy-espnow
+verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clippy-provisioning-mqtt-tests clippy-ota-mqtt-idf clippy-ota-ddi-idf clippy-ota-ddi-mqtt-idf clippy-espnow
 
 # bare-metal esp-hal device checks (needs the ESP toolchain for -Zbuild-std)
 [group('ci')]
-verify-hal: check-hal check-ota-wire-pure
+verify-hal: check-hal check-ota-wire-pure check-ota-ddi-pure
 
 # CI-equivalent: verify, deny, then the device gates
 [group('ci')]
@@ -880,7 +1012,7 @@ ci-clippy: clippy-pure clippy-ota-pure
 
 # CI job (rust.yml): workspace check and the pure OTA checks on the ESP-IDF default target
 [group('ci')]
-ci-check: check check-ota-pure check-ota-wire-pure
+ci-check: check check-ota-pure check-ota-wire-pure check-ota-ddi-pure check-ota-ddi-no-mqtt-runtime
 
 # CI job (rust.yml): check the Wi-Fi STA-only build with SoftAP disabled (ESP-IDF)
 [group('ci')]

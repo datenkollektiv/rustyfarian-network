@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted.
+Superseded in part by [ADR 027](027-ddi-transport-scope.md): decision 2, for the DDI transport only.
 
 ## Context
 

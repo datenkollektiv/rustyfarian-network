@@ -51,7 +51,7 @@ app_bin="$ota_dir/${example}-v${version}.bin"
 espflash save-image --chip "$mcu" --flash-size 4mb --partition-table partitions.ota.csv "$elf" "$app_bin"
 
 size=$(wc -c < "$app_bin" | tr -d ' ')
-slot=$((0x1E0000))
+slot=$("$(dirname "$0")/ota-slot-size.sh" partitions.ota.csv)
 if [ "$size" -gt "$slot" ]; then
     echo "App image is $size bytes, larger than the $slot-byte OTA slot in partitions.ota.csv" >&2
     exit 1

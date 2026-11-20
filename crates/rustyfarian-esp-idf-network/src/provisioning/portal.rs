@@ -32,12 +32,13 @@ use esp_idf_svc::http::Method;
 
 use juggler::provisioning::html_json_escape::{html_escape_to, json_escape_to};
 use juggler::provisioning::templates::{
-    template_for, COMMITTED_HTML, FACTORY_RESET_HTML, PROBE_PATHS, RESUBMIT_HINT,
-    SESSION_FINISHED_BODY, WIFI_FALLBACK_PORTAL_HTML,
+    template_for, COMMITTED_HTML, DDI_TOKEN_INPUT_HTML, FACTORY_RESET_HTML, PROBE_PATHS,
+    RESUBMIT_HINT, SESSION_FINISHED_BODY, WIFI_FALLBACK_PORTAL_HTML,
 };
 use juggler::provisioning::{
-    body_nonce_matches, parse_form, parse_wifi_form, Field, FieldError, FieldErrors, PortalAction,
-    PortalDefaults, PortalInput, Prefill, ProvisioningConfig, SchemaProfile, ValidationError,
+    body_nonce_matches, parse_form_with, parse_wifi_form, Field, FieldError, FieldErrors,
+    IdentityRule, PortalAction, PortalDefaults, PortalInput, Prefill, ProvisioningConfig,
+    SchemaProfile, ValidationError,
 };
 
 use crate::provisioning::store::ProvisioningStore;
@@ -91,8 +92,8 @@ impl PortalForm {
 ///
 /// `ap_ip` backs the probe-route redirects; `nonce` is the per-session token
 /// embedded in the form and required on every mutating POST; `state` and
-/// `store` are shared with the session; `on_event` and `status_entries` come
-/// from the builder.
+/// `store` are shared with the session; `on_event`, `status_entries` and
+/// `identity` come from the builder.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     ap_ip: std::net::Ipv4Addr,
@@ -106,6 +107,7 @@ pub(crate) fn start(
     profile: SchemaProfile,
     defaults: Arc<PortalDefaultsOwned>,
     form: PortalForm,
+    identity: IdentityRule,
 ) -> anyhow::Result<EspHttpServer<'static>> {
     let template = form.template(profile);
     let config = Configuration {
@@ -126,8 +128,9 @@ pub(crate) fn start(
         server.fn_handler("/", Method::Get, move |request| {
             let stored = load_stored(&store_for_load);
             let defaults = defaults_for_load.as_borrowed();
-            let prefill = Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
-            let html = render_form(template, &nonce, &prefill, &FieldErrors::new());
+            let prefill =
+                Prefill::select_with(stored.as_ref(), profile, &defaults, &device_name, identity);
+            let html = render_form(template, &nonce, &prefill, &FieldErrors::new(), identity);
             let cur = state.current();
             log::debug!("GET / (state={})", cur.as_str());
             let headers = [
@@ -153,13 +156,19 @@ pub(crate) fn start(
                 BodyRead::TooLarge => {
                     let stored = load_stored(&store);
                     let defaults = defaults.as_borrowed();
-                    let prefill =
-                        Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
+                    let prefill = Prefill::select_with(
+                        stored.as_ref(),
+                        profile,
+                        &defaults,
+                        &device_name,
+                        identity,
+                    );
                     let html = render_form_with_banner(
                         template,
                         &nonce,
                         &prefill,
                         "Request body too large — please try again.",
+                        identity,
                     );
                     let mut response = request.into_status_response(413)?;
                     response.write_all(html.as_bytes())?;
@@ -177,7 +186,7 @@ pub(crate) fn start(
             // sequences the rest (nonce → gate → persist → commit).
             let nonce_ok = body_nonce_matches(body.as_bytes(), &nonce);
             let parsed = nonce_ok.then(|| match form {
-                PortalForm::Full => parse_form(&body, profile),
+                PortalForm::Full => parse_form_with(&body, profile, identity),
                 PortalForm::WifiOnly => parse_wifi_form_against_store(&body, &store),
             });
             let form_valid = matches!(parsed, Some(Ok(_)));
@@ -198,9 +207,14 @@ pub(crate) fn start(
                     log::info!("POST /save rejected: {} field error(s)", errors.len());
                     let stored = load_stored(&store);
                     let defaults = defaults.as_borrowed();
-                    let prefill =
-                        Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
-                    let html = render_form(template, &nonce, &prefill, &errors);
+                    let prefill = Prefill::select_with(
+                        stored.as_ref(),
+                        profile,
+                        &defaults,
+                        &device_name,
+                        identity,
+                    );
+                    let html = render_form(template, &nonce, &prefill, &errors, identity);
                     let mut response = request.into_status_response(400)?;
                     response.write_all(html.as_bytes())?;
                 }
@@ -233,13 +247,19 @@ pub(crate) fn start(
                         PortalAction::PersistFailed => {
                             let stored = load_stored(&store);
                             let defaults = defaults.as_borrowed();
-                            let prefill =
-                                Prefill::select(stored.as_ref(), profile, &defaults, &device_name);
+                            let prefill = Prefill::select_with(
+                                stored.as_ref(),
+                                profile,
+                                &defaults,
+                                &device_name,
+                                identity,
+                            );
                             let html = render_form_with_banner(
                                 template,
                                 &nonce,
                                 &prefill,
                                 "Could not save credentials to flash. Please try again.",
+                                identity,
                             );
                             let mut response = request.into_status_response(500)?;
                             response.write_all(html.as_bytes())?;
@@ -499,10 +519,16 @@ fn parse_wifi_form_against_store(
 /// Substitutes pre-fill values and rendered errors into the active profile's
 /// template.
 ///
-/// Secret inputs (`wifi_pass`, `app_key`, `mqtt_pass`) carry no placeholder
-/// substitution and are always emitted empty.
-fn render_form(template: &str, nonce: &str, prefill: &Prefill<'_>, errors: &FieldErrors) -> String {
-    render_template(template, nonce, prefill, &render_errors(errors))
+/// Secret inputs (`wifi_pass`, `app_key`, `mqtt_pass`, `ddi_token`) carry no
+/// placeholder substitution and are always emitted empty.
+fn render_form(
+    template: &str,
+    nonce: &str,
+    prefill: &Prefill<'_>,
+    errors: &FieldErrors,
+    identity: IdentityRule,
+) -> String {
+    render_template(template, nonce, prefill, &render_errors(errors), identity)
 }
 
 /// Renders the form with a non-field-specific banner instead of per-field
@@ -514,8 +540,9 @@ fn render_form_with_banner(
     nonce: &str,
     prefill: &Prefill<'_>,
     message: &str,
+    identity: IdentityRule,
 ) -> String {
-    render_template(template, nonce, prefill, &render_banner(message))
+    render_template(template, nonce, prefill, &render_banner(message), identity)
 }
 
 fn render_template(
@@ -523,7 +550,15 @@ fn render_template(
     nonce: &str,
     prefill: &Prefill<'_>,
     errors_html: &str,
+    identity: IdentityRule,
 ) -> String {
+    // The token input is a static block with no value: rendered under the DDI
+    // identity rule, left out otherwise.
+    let token_input = if identity.is_ddi() {
+        DDI_TOKEN_INPUT_HTML
+    } else {
+        ""
+    };
     // Every profile shares the Core/OTA placeholders; the profile-specific
     // ones (`{{DEV_EUI}}` / `{{JOIN_EUI}}` for LoRaWAN, `{{MQTT_*}}` for
     // Wi-Fi+MQTT) simply do not appear in the other profile's template (nor in
@@ -555,6 +590,7 @@ fn render_template(
             "MQTT_CLIENT" => Some(mqtt_client.as_str()),
             "OTA_URL" => Some(ota_url.as_str()),
             "DEV_NAME" => Some(dev_name.as_str()),
+            "DDI_TOKEN_INPUT" => Some(token_input),
             _ => None,
         },
         |piece| out.push_str(piece),
@@ -619,6 +655,7 @@ fn field_label(field: Field) -> &'static str {
         Field::MqttClient => "MQTT client ID",
         Field::OtaUrl => "OTA URL",
         Field::DeviceName => "Device name",
+        Field::DdiToken => "DDI target token",
         Field::Form => "Submission",
     }
 }
@@ -817,9 +854,49 @@ pub(super) mod tests {
                 &test_nonce(),
                 &p,
                 &FieldErrors::new(),
+                IdentityRule::Open,
             );
             assert!(html.contains("value=\"rgb-clock\""));
+            assert!(!html.contains("ddi_token"), "no token input under Open");
         }
+    }
+
+    /// Under the DDI identity rule the form carries the token input (a password
+    /// input with no value), pre-fills `mqtt_user` from the device name and
+    /// leaves `mqtt_client` blank; the error list labels the token field.
+    #[test]
+    fn ddi_identity_renders_the_token_input_and_the_identity_prefill() {
+        let owned = PortalDefaultsOwned::from_borrowed(&PortalDefaults {
+            mqtt_user: "sensor",
+            mqtt_client: "c3-01",
+            ..PortalDefaults::default()
+        });
+        let defaults = owned.as_borrowed();
+        let p = Prefill::select_with(
+            None,
+            SchemaProfile::WifiMqttDevice,
+            &defaults,
+            "rgb-clock-ab12",
+            IdentityRule::Ddi,
+        );
+        let mut errors = FieldErrors::new();
+        let _ = errors.push(FieldError {
+            field: Field::DdiToken,
+            error: ValidationError::Missing,
+        });
+        let html = render_form(
+            template_for(SchemaProfile::WifiMqttDevice),
+            &test_nonce(),
+            &p,
+            &errors,
+            IdentityRule::Ddi,
+        );
+        assert!(html.contains("name=\"ddi_token\" type=\"password\""));
+        assert!(!html.contains("name=\"ddi_token\" value="));
+        assert!(html.contains("name=\"mqtt_user\" value=\"rgb-clock-ab12\""));
+        assert!(html.contains("name=\"mqtt_client\" value=\"\""));
+        assert!(html.contains("DDI target token"));
+        assert!(!html.contains("{{DDI_TOKEN_INPUT}}"));
     }
 
     #[test]
@@ -844,6 +921,7 @@ pub(super) mod tests {
             &test_nonce(),
             &p,
             &FieldErrors::new(),
+            IdentityRule::Ddi,
         );
         assert!(!html.contains(&wifi_password));
         assert!(!html.contains(&mqtt_pass));
@@ -854,6 +932,11 @@ pub(super) mod tests {
             &test_nonce(),
             &p,
             &FieldErrors::new(),
+            IdentityRule::Ddi,
+        );
+        assert!(
+            !html.contains("ddi_token"),
+            "the fallback form has no token slot"
         );
         assert!(!html.contains(&wifi_password));
         assert!(!html.contains(&mqtt_pass));

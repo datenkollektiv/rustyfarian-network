@@ -76,10 +76,10 @@ pub use boot::{
 
 pub use juggler::provisioning::{
     derive_device_name, derive_softap_ssid, gate_reentry, resolve_softap_ssid, DeviceName,
-    FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, Field, FieldError, LoraFields,
-    MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState, ReentryGate, ReentryRequest,
-    SchemaProfile, ValidationError, CREDENTIAL_THRESHOLD_DEFAULT, FALLBACK_PORTAL_WINDOW_DEFAULT,
-    NETWORK_ABSENT_THRESHOLD_DEFAULT,
+    FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, Field, FieldError,
+    IdentityRule, LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState,
+    ReentryGate, ReentryRequest, SchemaProfile, ValidationError, CREDENTIAL_THRESHOLD_DEFAULT,
+    DDI_TOKEN_KEY, FALLBACK_PORTAL_WINDOW_DEFAULT, NETWORK_ABSENT_THRESHOLD_DEFAULT,
 };
 pub use juggler::wifi::JoinFailure;
 
@@ -206,9 +206,23 @@ pub struct ProvisioningBuilder<'a> {
     on_event: Option<Arc<dyn Fn(ProvisioningEvent) + Send + Sync + 'static>>,
     country: Country,
     form: portal::PortalForm,
+    identity: IdentityRule,
 }
 
 impl<'a> ProvisioningBuilder<'a> {
+    /// Experimental: API may change before 1.0.
+    ///
+    /// The identity rule a portal of this crate runs under unless
+    /// [`with_identity`](Self::with_identity) says otherwise:
+    /// [`IdentityRule::Ddi`] when the `ota-ddi` feature is on (the device
+    /// provisions for the DDI client, so its id and token follow the fleet DDI
+    /// profile §2), [`IdentityRule::Open`] otherwise.
+    pub const DEFAULT_IDENTITY: IdentityRule = if cfg!(feature = "ota-ddi") {
+        IdentityRule::Ddi
+    } else {
+        IdentityRule::Open
+    };
+
     /// Experimental: API may change before 1.0.
     ///
     /// Creates a builder from a [`PortalConfig`].
@@ -219,7 +233,23 @@ impl<'a> ProvisioningBuilder<'a> {
             on_event: None,
             country: Country::WORLD,
             form: portal::PortalForm::Full,
+            identity: Self::DEFAULT_IDENTITY,
         }
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Sets the identity rule (default [`DEFAULT_IDENTITY`](Self::DEFAULT_IDENTITY)).
+    ///
+    /// Under [`IdentityRule::Ddi`] the portal renders the `ddi_token` input,
+    /// pre-fills `mqtt_user` from the device name with `mqtt_client` blank,
+    /// requires the device name to be a device id that equals the MQTT username
+    /// (and the client id, when set) and refuses a `MacSuffixed` prefix that is
+    /// not a device-id prefix when [`start`](Self::start) plans the portal.
+    /// Same name and shape as the esp-hal tier's builder (ADR 022).
+    pub fn with_identity(mut self, identity: IdentityRule) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Serves the Wi-Fi-only fallback form instead of the profile's full form
@@ -300,12 +330,24 @@ impl<'a> ProvisioningBuilder<'a> {
                 device_name: self.config.device_name,
                 defaults: self.config.defaults,
                 profile: self.config.profile,
+                // The Wi-Fi-only fallback form carries no device name and no
+                // token, so a device-name policy must never block credential
+                // recovery.
+                identity: match self.form {
+                    portal::PortalForm::WifiOnly => IdentityRule::Open,
+                    _ => self.identity,
+                },
             },
             &mac,
             |_| true,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         log::info!("Provisioning SSID resolved (len={})", plan.ssid.len());
+        if self.identity.applies_to(self.config.profile)
+            && !matches!(self.form, portal::PortalForm::WifiOnly)
+        {
+            log::info!("Provisioning identity rule: DDI (the device name is the MQTT username and client id; ddi_token required)");
+        }
         let ap_config = plan
             .ap_config()
             .with_max_connections(DEFAULT_MAX_CONNECTIONS);
@@ -351,6 +393,7 @@ impl<'a> ProvisioningBuilder<'a> {
             profile,
             defaults,
             self.form,
+            self.identity,
         )?;
 
         let subscription = subscribe_ap_events(&sys_loop, on_event.clone())?;

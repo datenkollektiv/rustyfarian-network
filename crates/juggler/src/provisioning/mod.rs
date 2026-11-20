@@ -35,6 +35,7 @@ pub mod fallback;
 pub mod flash_store;
 pub mod form;
 pub mod html_json_escape;
+pub mod identity;
 #[cfg(feature = "std")]
 pub mod kv_store;
 pub mod portal;
@@ -64,7 +65,8 @@ pub use fallback::{
     FailureCounts, FallbackDecision, FallbackPolicy, FallbackReason, FallbackStep, JoinRecorder,
     CREDENTIAL_THRESHOLD_DEFAULT, FALLBACK_PORTAL_WINDOW_DEFAULT, NETWORK_ABSENT_THRESHOLD_DEFAULT,
 };
-pub use form::{parse_form, parse_wifi_form, ExtraField};
+pub use form::{parse_form, parse_form_with, parse_wifi_form, ExtraField};
+pub use identity::{IdentityRule, DDI_TOKEN_KEY};
 #[cfg(feature = "std")]
 pub use kv_store::{KvProvisioningStore, ProvisioningKv};
 pub use portal::{

@@ -47,6 +47,6 @@ pub use session::{
 
 pub use juggler::provisioning::{
     derive_device_name, derive_softap_ssid, gate_reentry, resolve_softap_ssid, DeviceName, Field,
-    FieldError, LoraFields, MqttFields, PortalDefaults, ProvisioningConfig, ProvisioningState,
-    ReentryGate, ReentryRequest, SchemaProfile, ValidationError,
+    FieldError, IdentityRule, LoraFields, MqttFields, PortalDefaults, ProvisioningConfig,
+    ProvisioningState, ReentryGate, ReentryRequest, SchemaProfile, ValidationError, DDI_TOKEN_KEY,
 };

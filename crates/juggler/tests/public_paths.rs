@@ -598,7 +598,7 @@ fn espnow_mock_public_paths() {
 
 // ── ota ───────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "ota-wire")]
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 #[test]
 fn ota_persist_public_paths() {
     use juggler::ota::{
@@ -679,6 +679,54 @@ fn ota_persist_public_paths() {
     let failed = reconcile_boot(&mut store, Err(HardwareReadError::Busy), None);
     assert!(failed.refuse_mark_valid && !failed.slot_released);
     assert_eq!(BusyTally::new().into_error(), HardwareReadError::Busy);
+}
+
+#[cfg(feature = "ota-ddi")]
+#[test]
+fn ota_ddi_persist_public_paths() {
+    use juggler::ota::ddi::wire::ActionId;
+    use juggler::ota::ddi::OfferGate;
+    use juggler::ota::persist::{
+        DdiVerdict, KvError, KvStr, OtaKv, OtaStore, VerdictDelivery, VerdictNote, VerdictResult,
+    };
+
+    struct EmptyKv;
+    impl OtaKv for EmptyKv {
+        fn get_u8(&self, _: &str) -> Result<Option<u8>, KvError> {
+            Ok(None)
+        }
+        fn get_u32(&self, _: &str) -> Result<Option<u32>, KvError> {
+            Ok(None)
+        }
+        fn get_str(&self, _: &str) -> Result<Option<KvStr>, KvError> {
+            Ok(None)
+        }
+        fn set_u8(&mut self, _: &str, _: u8) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn set_u32(&mut self, _: &str, _: u32) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn set_str(&mut self, _: &str, _: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+        fn remove(&mut self, _: &str) -> Result<(), KvError> {
+            Ok(())
+        }
+    }
+
+    let action = ActionId::parse("42").unwrap();
+    let verdict = DdiVerdict::records_unreadable(action.clone());
+    assert!(matches!(verdict.result, VerdictResult::Failure(_)));
+    let mut store = OtaStore::open(EmptyKv, || 1);
+    assert_eq!(store.offer_gate(), OfferGate::Open);
+    assert_eq!(store.is_action_closed(&action), Ok(false));
+    assert_eq!(store.pending_verdict(), Ok(None));
+    assert_eq!(store.persist_verdict(&verdict), Ok(VerdictNote::Written));
+    assert_eq!(
+        store.mark_verdict_delivered(&action),
+        Ok(VerdictDelivery::NotPending)
+    );
 }
 
 #[cfg(feature = "ota-wire")]
@@ -809,6 +857,11 @@ fn ota_public_paths() {
     let _: OtaError = OtaError::FlashWriteFailed;
     let _: OtaError = OtaError::PartitionNotFound;
     let _: OtaError = OtaError::InsufficientSpace;
+    let _: OtaError = OtaError::Cancelled;
+    let _: OtaError = OtaError::ForeignOrigin;
+    let _: OtaError = OtaError::Redirect { status: 302 };
+    let _: OtaError = OtaError::SizeMismatch;
+    let _: OtaError = OtaError::TargetMismatch;
 
     // OtaState linear progression.
     let s = OtaState::Idle;
@@ -830,6 +883,35 @@ fn ota_public_paths() {
     // ImageMetadata is reachable (construction requires heapless types; just
     // confirm the import resolves — the name alone is the path test).
     fn _uses_metadata(_: &ImageMetadata) {}
+
+    // The health policy is part of the base feature, with or without `ota-wire`.
+    use core::time::Duration;
+    use juggler::ota::health::{
+        initial_admission, poll_decision, HealthConfig, PollStep, RuntimeFlags,
+    };
+    use juggler::ota::{BootDisposition, BootOutcome, BootWarnings, DeadlineAction, HealthVerdict};
+
+    assert_eq!(
+        HealthConfig::default().deadline_action,
+        DeadlineAction::Rollback
+    );
+    assert_eq!(
+        poll_decision(&HealthConfig::default(), Duration::ZERO, false),
+        PollStep::Wait(Duration::from_secs(1))
+    );
+    assert!(HealthVerdict::Applied.opens_admission());
+    let outcome = BootOutcome {
+        disposition: BootDisposition::Deferred,
+        action: None,
+        slot_released: true,
+        admission_open_at_boot: false,
+        refuse_mark_valid: false,
+        roll_back_now: false,
+        report_pending: false,
+        warnings: BootWarnings::default(),
+    };
+    assert!(initial_admission(&outcome));
+    assert!(RuntimeFlags::from_boot(&outcome).admission_open);
 }
 
 // ── provisioning ─────────────────────────────────────────────────────────────

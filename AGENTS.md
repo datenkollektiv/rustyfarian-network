@@ -73,8 +73,11 @@ just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests
 just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
 just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify-idf)
 just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify-idf)
+just check-ota-ddi-no-mqtt-runtime  # prove a wifi,mqtt,ota-ddi build excludes the MQTT OTA runtime (check, feature graph, expanded source; in verify-idf and ci-check)
+just clippy-ota-ddi-mqtt-idf  # lint the ESP-IDF DDI runtime with wifi and mqtt (the nudge build); its glue cannot run host tests (in verify-idf)
 just test                  # all platform-independent unit tests (no ESP toolchain needed; in verify)
 just build-example <name>  # build a hardware example with auto-detected chip + target
+just ddi-bundle <example> <version>  # build a DDI example with that FIRMWARE_VERSION and write the fleet release bundle (.bin, .bin.sha256, .bin.version, .bin.chip) to tmp/ddi-bundle/
 just build-all-examples [prefix]  # build every tier example (optional name prefix); stops at the first failure unless KEEP_GOING=1
 just flash <name>          # build + flash to a connected board
 just run <name>            # flash + serial monitor

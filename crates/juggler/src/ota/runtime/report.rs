@@ -17,6 +17,10 @@ use crate::ota::persist::Delivery;
 use crate::ota::runtime::config::OtaTimings;
 use crate::ota::runtime::store_ops::CompletionTry;
 
+pub use crate::ota::health::{
+    completion_step, CompletionBackoff, CompletionRetryConfig, CompletionStep,
+};
+
 /// The reporter's intervals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReporterConfig {
@@ -296,81 +300,12 @@ impl ReporterMachine {
     }
 }
 
-/// What to do after a background completion attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionStep {
-    /// The attempt still failed: the retry stays armed with a longer delay.
-    Retry,
-    /// The attempt record is cleared or gone: the retry is disarmed.
-    Stop,
-    /// The retry was not armed, so no attempt was due; the machine is unchanged.
-    Ignored,
-}
-
-/// The backoff of the background completion retry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompletionRetryConfig {
-    /// Delay before the first background attempt, and the base of the backoff.
-    pub initial: Duration,
-    /// The backoff doubles per failed attempt up to this delay.
-    pub cap: Duration,
-}
-
 impl From<&OtaTimings> for CompletionRetryConfig {
     fn from(t: &OtaTimings) -> Self {
         Self {
             initial: t.complete_retry,
             cap: t.report_retry.max(t.complete_retry),
         }
-    }
-}
-
-/// The schedule of the background retry of `complete_attempt` after the health policy ended with `ApplyNotRecorded`.
-///
-/// The image is already valid and `applied` already published; the retry only keeps trying to clear the attempt record so admission reopens without a reset.
-/// The reporter thread owns the loop (no sleep happens under the store lock) and keeps an `Option<CompletionBackoff>`: `None` while not armed.
-/// Time is `Duration` since the reporter started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompletionBackoff {
-    next_due: Duration,
-    delay: Duration,
-}
-
-impl CompletionBackoff {
-    /// Arms the retry; the first attempt is due after `initial`.
-    pub fn armed(cfg: &CompletionRetryConfig, now: Duration) -> Self {
-        Self {
-            next_due: now + cfg.initial,
-            delay: cfg.initial,
-        }
-    }
-
-    /// How long the loop may wait before the next attempt.
-    pub fn wait(&self, now: Duration) -> Duration {
-        self.next_due.saturating_sub(now)
-    }
-
-    /// An attempt is due.
-    pub fn due(&self, now: Duration) -> bool {
-        now >= self.next_due
-    }
-
-    /// An attempt failed: the delay doubles up to the cap.
-    #[must_use]
-    pub fn failed(self, cfg: &CompletionRetryConfig, now: Duration) -> Self {
-        let delay = self.delay.saturating_mul(2).min(cfg.cap);
-        Self {
-            next_due: now + delay,
-            delay,
-        }
-    }
-}
-
-/// What to do after a background completion attempt: success or a vanished attempt stops the retry ([`CompletionStep::Stop`]), a failure keeps it armed ([`CompletionStep::Retry`]).
-pub fn completion_step(result: CompletionTry) -> CompletionStep {
-    match result {
-        CompletionTry::Completed | CompletionTry::Gone => CompletionStep::Stop,
-        CompletionTry::StillFailing => CompletionStep::Retry,
     }
 }
 

@@ -336,6 +336,30 @@ fn settle<K: OtaKv>(
     })
 }
 
+/// Before [`ReconcileAction::ClearAttempt`]: the attempted image itself runs with its promised version in a slot the bootloader never marks pending ([`SlotState::Unknown`], app rollback disabled), so no health check will run and the update succeeded; a DDI action bound to the attempt gets its success verdict first, as [`OtaStore::complete_attempt`] writes it.
+///
+/// Any other cleared attempt (an interrupted download, a slot marked invalid, another version running) writes no verdict: the action stays open and the server offers it again.
+fn note_unverified_success<K: OtaKv>(
+    store: &mut OtaStore<K>,
+    hw: &HardwareFacts,
+    running_version: Option<Version>,
+) -> Result<(), StoreError> {
+    if hw.running_state != SlotState::Unknown {
+        return Ok(());
+    }
+    let Some(attempt) = store.read_attempt()? else {
+        return Ok(());
+    };
+    let attempt = attempt.record;
+    let booted = attempt.slot == hw.running_slot
+        && attempt.version.is_some()
+        && attempt.version == running_version;
+    if booted && store.ddi_bound_to(attempt.attempt_id)? {
+        store.write_ddi_success()?;
+    }
+    Ok(())
+}
+
 fn note_activation<K: OtaKv>(store: &mut OtaStore<K>, warnings: &mut BootWarnings) {
     if let Err(e) = store.mark_activated() {
         warnings.activation_not_recorded = Some(e);
@@ -353,6 +377,7 @@ fn sequence<K: OtaKv>(
         ReconcileAction::NoAttempt => settle(store, hw.running_slot),
         ReconcileAction::Defer => Ok(BootDisposition::Deferred),
         ReconcileAction::ClearAttempt => {
+            note_unverified_success(store, hw, running_version)?;
             store.clear_attempt()?;
             settle(store, hw.running_slot)
         }

@@ -22,6 +22,10 @@
 //!
 //! Wi-Fi + MQTT profile additional placeholders:
 //! - `{{MQTT_URI}}`, `{{MQTT_USER}}`, `{{MQTT_CLIENT}}`
+//! - `{{DDI_TOKEN_INPUT}}` — the whole DDI target token input block: the tier
+//!   substitutes [`DDI_TOKEN_INPUT_HTML`] under
+//!   [`IdentityRule::Ddi`](super::IdentityRule::Ddi) and `""` otherwise. The
+//!   block is static and has no `value=`, so the token is never pre-filled.
 //!
 //! LoRaWAN profile additional placeholders:
 //! - `{{DEV_EUI}}`, `{{JOIN_EUI}}`
@@ -37,10 +41,24 @@ use super::SchemaProfile;
 /// The Wi-Fi + MQTT profile portal HTML template.
 ///
 /// Includes fields for Wi-Fi credentials, MQTT broker URI, optional MQTT
-/// username / password / client ID, OTA URL, and device name.  No
-/// `{{MQTT_PASS}}` or `{{WIFI_PASS}}` placeholder exists — secrets are
-/// never pre-filled.
+/// username / password / client ID, the `{{DDI_TOKEN_INPUT}}` slot, OTA URL,
+/// and device name.  No `{{MQTT_PASS}}` or `{{WIFI_PASS}}` placeholder
+/// exists — secrets are never pre-filled.
 pub const WIFI_MQTT_PORTAL_HTML: &str = include_str!("assets/portal_wifi_mqtt.html");
+
+/// Experimental: API may change before 1.0.
+///
+/// The DDI target token input block a tier substitutes for `{{DDI_TOKEN_INPUT}}`
+/// under [`IdentityRule::Ddi`](super::IdentityRule::Ddi); under
+/// [`IdentityRule::Open`](super::IdentityRule::Open) the slot renders as `""`.
+///
+/// A password input named [`DDI_TOKEN_KEY`](super::DDI_TOKEN_KEY) with no
+/// `value=`: the token is typed on every full submission and never shown back.
+/// The hint states the identity rule the submit enforces, because the
+/// `mqtt_user` and `mqtt_client` hints above it describe the open form.
+pub const DDI_TOKEN_INPUT_HTML: &str = "<label for=\"ddi_token\">DDI target token</label>\n\
+<input id=\"ddi_token\" name=\"ddi_token\" type=\"password\" autocomplete=\"off\" placeholder=\"required, 32\u{2013}64 lowercase hex\" minlength=\"32\" maxlength=\"64\" pattern=\"[0-9a-f]{32,64}\" required>\n\
+<p class=\"hint\">Never pre-filled, re-enter each time. The device name is the device id (3\u{2013}20 of a\u{2013}z, 0\u{2013}9, dash) and the MQTT username; leave the client ID blank.</p>\n";
 
 /// The LoRaWAN profile portal HTML template.
 ///
@@ -292,6 +310,33 @@ mod tests {
             !WIFI_MQTT_PORTAL_HTML.contains("name=\"wifi_pass\" value="),
             "wifi_pass input must not carry a value= attribute"
         );
+    }
+
+    /// The token slot sits in the Wi-Fi + MQTT form only, and the block that
+    /// fills it is a password input with no pre-fill and no placeholder of its
+    /// own, so no token value can ever reach the page.
+    #[test]
+    fn ddi_token_slot_renders_a_password_input_or_nothing() {
+        assert!(WIFI_MQTT_PORTAL_HTML.contains("{{DDI_TOKEN_INPUT}}"));
+        assert!(!LORAWAN_PORTAL_HTML.contains("{{DDI_TOKEN_INPUT}}"));
+        assert!(!WIFI_FALLBACK_PORTAL_HTML.contains("{{DDI_TOKEN_INPUT}}"));
+        assert!(!WIFI_MQTT_PORTAL_HTML.contains("name=\"ddi_token\""));
+
+        assert!(DDI_TOKEN_INPUT_HTML.contains("name=\"ddi_token\""));
+        assert!(DDI_TOKEN_INPUT_HTML.contains("type=\"password\""));
+        assert!(!DDI_TOKEN_INPUT_HTML.contains("value="));
+        assert!(!DDI_TOKEN_INPUT_HTML.contains("{{"));
+
+        let ddi = fill(
+            WIFI_MQTT_PORTAL_HTML,
+            &[("DDI_TOKEN_INPUT", DDI_TOKEN_INPUT_HTML)],
+        );
+        assert!(ddi.contains("name=\"ddi_token\" type=\"password\""));
+        assert!(!ddi.contains("{{DDI_TOKEN_INPUT}}"));
+
+        let open = fill(WIFI_MQTT_PORTAL_HTML, &[("DDI_TOKEN_INPUT", "")]);
+        assert!(!open.contains("ddi_token"));
+        assert!(!open.contains("{{DDI_TOKEN_INPUT}}"));
     }
 
     /// The LoRaWAN template must contain the CSRF nonce and LoRaWAN-specific

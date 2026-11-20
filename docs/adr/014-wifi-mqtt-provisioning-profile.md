@@ -240,6 +240,14 @@ The primary key layout and read order in §4 are unchanged.
 0.6.x firmware ignores the three keys and reads the primary pair, so a downgrade during an unfinished replacement boots the primary pair, which may be half-written.
 A 0.6.x commit does not clear `wifi_pending`, so an upgrade back reads the backup pair until this firmware's next `save` or `save_wifi_credentials` clears the marker.
 
+## Amendment 2026-11-22 — the reserved `ddi_token` extra and the identity rule
+
+The library reserves the extra key `ddi_token` (`juggler::provisioning::DDI_TOKEN_KEY`), stored under the `x_` prefix as `x_ddi_token`, for the fleet DDI profile's target token.
+Unlike every other extra it is validated by the library whenever it is present (32 to 64 lowercase hex, reported on `Field::DdiToken`), so it is no longer opaque, and it stays redacted and scrubbed like every extra value.
+`parse_form_with(body, profile, identity)` adds the `IdentityRule`, which binds the `WifiMqttDevice` profile only (a LoRaWAN form has no token input and its device no DDI path): under `Ddi` the token is required, the device name must be a device id (`^[a-z0-9][a-z0-9-]{2,19}$`, `juggler::identity`), `mqtt_user` must equal it and `mqtt_client` must be blank or equal it, so one device id serves the DDI controller id, the MQTT username and the MQTT client id (profile 0.4.0 §2).
+`parse_form` keeps the open rule, and the NVS key layout of §4 does not change.
+The Wi-Fi+MQTT template gains the `{{DDI_TOKEN_INPUT}}` slot, filled by the tiers with a password input that has no value under `Ddi` and with nothing otherwise, which keeps the rule that secrets are never pre-filled.
+
 ## References
 
 - [ADR 013](013-softap-provisioning-acceptance.md) — SoftAP provisioning acceptance; locks the four-field schema and the extras escape hatch this ADR builds on and generalises.

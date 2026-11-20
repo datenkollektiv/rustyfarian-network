@@ -24,6 +24,12 @@ pub enum CorruptRecord {
     AttemptWithoutId,
     /// `rq_from` exists but `rq_id` does not; the id is stored before the request is armed, so no write sequence leaves this.
     RequestWithoutId,
+    /// `ddi_act` is not a canonical action id, or `ddi_stage` exists without it (the id is stored before the stage, so no write sequence leaves that).
+    DdiActionInvalid,
+    /// `ddi_stage` holds a value that is not a known stage.
+    DdiStageInvalid,
+    /// `ddi_code` is not 0 or a profile code 1001 to 1007, or a pending verdict has none (the code is stored before the stage).
+    DdiVerdictInvalid,
 }
 
 /// Why a store operation failed.
@@ -39,6 +45,10 @@ pub enum StoreError {
     ReportPending,
     /// The slot has no stored label or cannot be an attempt target.
     InvalidSlot,
+    /// The verdict of another DDI action is still undelivered.
+    VerdictPending,
+    /// The DDI action is closed (its verdict was persisted) and is never applied again.
+    ActionClosed,
 }
 
 impl core::fmt::Display for CorruptRecord {
@@ -52,6 +62,9 @@ impl core::fmt::Display for CorruptRecord {
             }
             CorruptRecord::AttemptWithoutId => f.write_str("attempt record has no id"),
             CorruptRecord::RequestWithoutId => f.write_str("rollback request has no id"),
+            CorruptRecord::DdiActionInvalid => f.write_str("DDI action record has no valid id"),
+            CorruptRecord::DdiStageInvalid => f.write_str("DDI action record has an unknown stage"),
+            CorruptRecord::DdiVerdictInvalid => f.write_str("DDI verdict has no valid code"),
         }
     }
 }
@@ -69,6 +82,10 @@ impl core::fmt::Display for StoreError {
             }
             StoreError::ReportPending => f.write_str("another OTA report is still undelivered"),
             StoreError::InvalidSlot => f.write_str("slot cannot be stored as an OTA target"),
+            StoreError::VerdictPending => {
+                f.write_str("the verdict of another DDI action is still undelivered")
+            }
+            StoreError::ActionClosed => f.write_str("the DDI action is closed"),
         }
     }
 }
@@ -80,9 +97,11 @@ impl core::error::Error for StoreError {
         match self {
             StoreError::Kv(e) => Some(e),
             StoreError::Corrupt(c) => Some(c),
-            StoreError::NotAdmitted(_) | StoreError::ReportPending | StoreError::InvalidSlot => {
-                None
-            }
+            StoreError::NotAdmitted(_)
+            | StoreError::ReportPending
+            | StoreError::InvalidSlot
+            | StoreError::VerdictPending
+            | StoreError::ActionClosed => None,
         }
     }
 }
@@ -264,11 +283,13 @@ pub enum RepairedRecord {
     Counter,
     /// `rej_ver` was unreadable and was removed.
     Refusal,
+    /// The DDI action record was unreadable and was removed, stage first: the loop guard and an undelivered verdict are lost.
+    DdiAction,
 }
 
 /// The stored type of a key, for corruption probes.
 #[derive(Debug, Clone, Copy)]
-enum KeyType {
+pub(super) enum KeyType {
     U8,
     U32,
     Str,
@@ -306,7 +327,7 @@ pub(crate) struct BootRecords {
 ///
 /// All state is in the backend; the store holds only the entropy source for the install epoch.
 pub struct OtaStore<K: OtaKv> {
-    kv: K,
+    pub(super) kv: K,
     entropy: fn() -> u32,
 }
 
@@ -318,7 +339,7 @@ impl<K: OtaKv + core::fmt::Debug> core::fmt::Debug for OtaStore<K> {
     }
 }
 
-fn label_str(text: &str) -> KvStr {
+pub(super) fn label_str(text: &str) -> KvStr {
     KvStr::try_from(text).unwrap_or_default()
 }
 
@@ -344,7 +365,7 @@ impl<K: OtaKv> OtaStore<K> {
     /// Reads a reason key; a mistyped, over-long or non-ASCII value reads as the label `"unknown"` (never a fault).
     ///
     /// Other errors (a transient flash failure) still fail.
-    fn reason(&self, key: &str) -> Result<Option<KvStr>, KvError> {
+    pub(super) fn reason(&self, key: &str) -> Result<Option<KvStr>, KvError> {
         match self.kv.get_str(key) {
             Err(e) if is_corrupt_code(&e) => Ok(Some(label_str("unknown"))),
             other => other,
@@ -365,7 +386,7 @@ impl<K: OtaKv> OtaStore<K> {
         }
     }
 
-    fn any_corrupt(&self, keys: &[(&str, KeyType)]) -> Result<bool, StoreError> {
+    pub(super) fn any_corrupt(&self, keys: &[(&str, KeyType)]) -> Result<bool, StoreError> {
         for &(key, ty) in keys {
             if self.corrupt_read(key, ty)? {
                 return Ok(true);
@@ -375,18 +396,18 @@ impl<K: OtaKv> OtaStore<K> {
     }
 
     /// Removes `key` when its stored value is bad, so a following `set` cannot hit a type mismatch; no commit otherwise.
-    fn scrub(&mut self, key: &str, ty: KeyType) -> Result<(), StoreError> {
+    pub(super) fn scrub(&mut self, key: &str, ty: KeyType) -> Result<(), StoreError> {
         if self.corrupt_read(key, ty)? {
             self.kv.remove(key)?;
         }
         Ok(())
     }
 
-    fn flag(&self, key: &str) -> Result<bool, StoreError> {
+    pub(super) fn flag(&self, key: &str) -> Result<bool, StoreError> {
         Ok(self.kv.get_u8(key)? == Some(1))
     }
 
-    fn attempt_exists(&self) -> Result<bool, StoreError> {
+    pub(super) fn attempt_exists(&self) -> Result<bool, StoreError> {
         Ok(self.kv.get_str(k::ATT_VER)?.is_some() && self.kv.get_str(k::ATT_SLOT)?.is_some())
     }
 
@@ -511,12 +532,12 @@ impl<K: OtaKv> OtaStore<K> {
 
     /// reserves the next attempt id (never 0), creating the install epoch first.
     ///
-    /// The id is one above the highest of `att_ctr`, `att_id`, `rb_id` and `rq_id`, so a lost or lowered counter never reissues an id that a record (for example a delivered report) still carries.
+    /// The id is one above the highest of `att_ctr`, `att_id`, `rb_id`, `rq_id` and `ddi_att`, so a lost or lowered counter never reissues an id that a record (for example a delivered report or a closed DDI action) still carries.
     /// A read error of any of them fails the call before anything is written.
     /// After a `u32` wrap ids repeat; that is about four billion attempts away.
     pub fn next_attempt_id(&mut self) -> Result<u32, StoreError> {
         self.epoch()?;
-        let floor = self.highest_id(&[k::ATT_CTR, k::ATT_ID, k::RB_ID, k::RQ_ID])?;
+        let floor = self.highest_id(&[k::ATT_CTR, k::ATT_ID, k::RB_ID, k::RQ_ID, k::DDI_ATT])?;
         let mut next = floor.wrapping_add(1);
         if next == 0 {
             next = 1;
@@ -599,18 +620,28 @@ impl<K: OtaKv> OtaStore<K> {
         Ok(())
     }
 
-    /// the attempted image is running and was marked valid; drops a different or corrupt refusal, clears the attempt.
+    /// the attempted image is running and was marked valid; persists the success verdict of a DDI action bound to the attempt, drops a different or corrupt refusal, clears the attempt.
     ///
-    /// A transient read error of the refusal returns the error without any write and keeps the attempt (fail closed); the next boot repeats the sequence.
+    /// A read error (a transient refusal read, an unreadable DDI action record) returns the error without any write and keeps the attempt (fail closed); the next boot repeats the sequence.
+    /// The verdict is written before the attempt is cleared, so a power loss never loses it: the next boot completes the attempt again and finds the verdict already pending.
     ///
     /// The caller must mark the image valid BEFORE calling this.
     pub fn complete_attempt(&mut self, running: Version) -> Result<(), StoreError> {
-        match self.kv.get_str(k::REJ_VER) {
-            Ok(Some(refused)) if Version::parse(&refused).ok() == Some(running) => {}
-            Ok(Some(_)) => self.kv.remove(k::REJ_VER)?,
-            Err(e) if is_corrupt_code(&e) => self.kv.remove(k::REJ_VER)?,
+        let drop_refusal = match self.kv.get_str(k::REJ_VER) {
+            Ok(Some(refused)) => Version::parse(&refused).ok() != Some(running),
+            Err(e) if is_corrupt_code(&e) => true,
             Err(e) => return Err(e.into()),
-            Ok(None) => {}
+            Ok(None) => false,
+        };
+        let bound = match self.kv.get_u32(k::ATT_ID)? {
+            Some(id) => self.ddi_bound_to(id)?,
+            None => false,
+        };
+        if bound {
+            self.write_ddi_success()?;
+        }
+        if drop_refusal {
+            self.kv.remove(k::REJ_VER)?;
         }
         self.clear_attempt()?;
         Ok(())
@@ -635,9 +666,10 @@ impl<K: OtaKv> OtaStore<K> {
         Ok(())
     }
 
-    /// persists the report, then the refusal, then clears the attempt.
+    /// persists the report, then the rolled-back verdict of a DDI action bound to the attempt, then the refusal, then clears the attempt.
     ///
     /// `already` means the report for this attempt is persisted.
+    /// The DDI verdict is `closed` + `failure` + 1004 with the details `rolled_back` and the report's reason.
     /// Any error keeps the attempt; the next boot repeats the sequence.
     pub fn report_rollback(
         &mut self,
@@ -645,11 +677,17 @@ impl<K: OtaKv> OtaStore<K> {
         left: Option<Version>,
         already: bool,
     ) -> Result<(), StoreError> {
-        if !already {
+        let bound = self.ddi_bound_to(attempt_id)?;
+        if !already || bound {
             let why = self
                 .reason(k::ATT_WHY)?
                 .unwrap_or_else(|| label_str("bootloader"));
-            self.persist_report(attempt_id, &why)?;
+            if !already {
+                self.persist_report(attempt_id, &why)?;
+            }
+            if bound {
+                self.write_ddi_rolled_back(&why)?;
+            }
         }
         if let Some(left) = left {
             self.scrub(k::REJ_VER, KeyType::Str)?;
@@ -842,6 +880,16 @@ impl<K: OtaKv> OtaStore<K> {
         hw: HardwareFacts,
         running_version: Option<Version>,
     ) -> Result<FailedDownload, StoreError> {
+        self.settle_failed(hw, running_version, None)
+    }
+
+    /// [`OtaStore::settle_failed_download`], and with `verdict` (code and `details[0]`) the failure verdict of a DDI action bound to the attempt, written before the clear.
+    pub(super) fn settle_failed(
+        &mut self,
+        hw: HardwareFacts,
+        running_version: Option<Version>,
+        verdict: Option<(u32, &str)>,
+    ) -> Result<FailedDownload, StoreError> {
         let attempt = match self.read_attempt()? {
             None => return Ok(FailedDownload::NoAttempt),
             Some(attempt) => attempt,
@@ -855,6 +903,11 @@ impl<K: OtaKv> OtaStore<K> {
         };
         match reconcile(Some(&attempt.record), &facts) {
             ReconcileAction::ClearAttempt => {
+                if let Some((code, detail)) = verdict {
+                    if self.ddi_bound_to(attempt.record.attempt_id)? {
+                        self.write_ddi_failure(code, detail)?;
+                    }
+                }
                 self.clear_attempt()?;
                 Ok(FailedDownload::Cleared)
             }
@@ -902,10 +955,11 @@ impl<K: OtaKv> OtaStore<K> {
     /// | `rq_from` (also an unknown label) or `rq_id` | the request is removed; its reason (`rq_why`) goes with it |
     /// | `rb` | re-armed as pending (`rb = 1`, one overwrite): an unreadable flag is treated as an undelivered report, which is delivered again (deduplicated downstream) rather than dropped; the reason and id are kept |
     /// | `rb_id` | removed; a pending report is re-adopted with a fresh id, so downstream may see it once more |
-    /// | `att_ctr` / `att_epoch` | the epoch is removed first (a new one is drawn with the next id) and an unreadable counter is reset to the highest readable `att_id` / `rq_id` / `rb_id` |
+    /// | `ddi_act` (also a non-canonical id), `ddi_stage` (also an unknown stage), `ddi_att` or `ddi_code` (also an unknown code) | the whole DDI action record is removed, `ddi_stage` first: its loop guard and an undelivered verdict are lost, and the runtime reports `records_unreadable` instead |
+    /// | `att_ctr` / `att_epoch` | the epoch is removed first (a new one is drawn with the next id) and an unreadable counter is reset to the highest readable `att_id` / `rq_id` / `rb_id` / `ddi_att` |
     /// | `rej_ver` | removed (the loop guard is lost, which is what an unreadable refusal already meant) |
     ///
-    /// Reason keys (`att_why`, `rq_why`, `rb_why`) are never a fault: an unreadable one reads as the label `"unknown"` and is replaced the next time it is written.
+    /// Reason keys (`att_why`, `rq_why`, `rb_why`) and DDI detail keys (`ddi_det0`, `ddi_det1`) are never a fault: an unreadable one reads as the label `"unknown"` and is replaced the next time it is written.
     ///
     /// Crash behaviour: every repair is a sequence of single-key removes in an order that stays detectable, so a power loss mid-repair is finished by the next call.
     /// `rb` is re-armed with ONE `set_u8` that replaces the mistyped entry (see [`OtaKv`]'s contract), so a power loss leaves either the unreadable `rb` (the next call repairs it again) or `rb = 1`; the report is never dropped.
@@ -932,6 +986,10 @@ impl<K: OtaKv> OtaStore<K> {
             }
             return Ok(Some(RepairedRecord::Report));
         }
+        if self.ddi_corrupt()? {
+            self.remove_ddi_record()?;
+            return Ok(Some(RepairedRecord::DdiAction));
+        }
         if self.any_corrupt(&COUNTER_KEYS)? {
             self.repair_counter()?;
             return Ok(Some(RepairedRecord::Counter));
@@ -945,7 +1003,7 @@ impl<K: OtaKv> OtaStore<K> {
 
     /// Whether [`OtaStore::repair_corrupt`] would repair something, without writing anything.
     ///
-    /// Checks the same groups in the same order (attempt keys and label, request keys and label, report keys, counter keys, refusal).
+    /// Checks the same groups in the same order (attempt keys and label, request keys and label, report keys, DDI action record, counter keys, refusal).
     /// A transient read error is returned as an error, never as "nothing corrupt": the caller cannot tell the two apart otherwise.
     ///
     /// The runtime uses it to tell "an operator repair is needed" from "nothing to do" before a repair command may write.
@@ -959,6 +1017,7 @@ impl<K: OtaKv> OtaStore<K> {
             || self.any_corrupt(&REQUEST_KEYS)?
             || self.request_label_corrupt()?
             || self.any_corrupt(&REPORT_KEYS)?
+            || self.ddi_corrupt()?
             || self.any_corrupt(&COUNTER_KEYS)?
             || self.corrupt_read(k::REJ_VER, KeyType::Str)?)
     }
@@ -988,7 +1047,7 @@ impl<K: OtaKv> OtaStore<K> {
             self.kv.remove(k::ATT_EPOCH)?;
         }
         if self.corrupt_read(k::ATT_CTR, KeyType::U32)? {
-            let highest = self.highest_id(&[k::ATT_ID, k::RB_ID, k::RQ_ID])?;
+            let highest = self.highest_id(&[k::ATT_ID, k::RB_ID, k::RQ_ID, k::DDI_ATT])?;
             self.kv.remove(k::ATT_CTR)?;
             if highest > 0 {
                 self.kv.set_u32(k::ATT_CTR, highest)?;
@@ -1004,6 +1063,7 @@ impl<K: OtaKv> OtaStore<K> {
         let attempt = self.read_attempt()?;
         self.request()?;
         self.report()?;
+        self.ddi_record()?;
         // The refusal is only a loop guard: an unreadable value must not block boot.
         let _ = self.refused();
         let report_persisted = match &attempt {

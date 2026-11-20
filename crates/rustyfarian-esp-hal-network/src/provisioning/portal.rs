@@ -27,9 +27,9 @@
 //!
 //! # Stack usage
 //!
-//! The HTTP task steady-state frame peaks at roughly **8.3 KiB**:
+//! The HTTP task steady-state frame peaks at roughly **10.3 KiB**:
 //! - `req_buf` of `DEFAULT_REQUEST_SIZE_CAP` (2048 B) on the stack
-//! - `resp_buf` of `DEFAULT_TX_BUF` (6144 B) on the stack
+//! - `resp_buf` of `DEFAULT_TX_BUF` (8192 B) on the stack
 //! - small locals and async executor overhead
 //!
 //! Both buffers are stack-allocated for the lifetime of the accept-loop.
@@ -79,10 +79,14 @@
 )]
 
 // The bare-metal embassy builds have a global allocator (required by esp-radio);
-// bring `alloc` into scope for the validation-error string formatting path.
-#[cfg(all(
-    feature = "embassy",
-    any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+// bring `alloc` into scope for the validation-error string formatting path,
+// which the host tests exercise too (`errors_html`).
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
 ))]
 extern crate alloc;
 
@@ -98,7 +102,7 @@ use juggler::provisioning::html_json_escape::html_escape_to;
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
 ))]
-use juggler::provisioning::parse_form;
+use juggler::provisioning::parse_form_with;
 #[cfg(all(
     feature = "embassy",
     any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
@@ -116,6 +120,17 @@ use juggler::provisioning::{
     )
 ))]
 use juggler::provisioning::{templates::template_for, Prefill};
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
+))]
+use juggler::provisioning::{
+    templates::{DDI_TOKEN_INPUT_HTML, RESUBMIT_HINT},
+    FieldErrors,
+};
 
 #[cfg(any(
     test,
@@ -152,11 +167,26 @@ const DEFAULT_RX_BUF: usize = 1024;
 
 /// Default socket transmit buffer size.
 ///
-/// 6 KiB is the Phase 2B–locked value (see `docs/features/archive/esp-hal-provisioning-v1.md`
-/// Decisions "Locked at Phase 2B implementation").  Real portal HTML for the
-/// `WifiMqttDevice` profile is 4–6 KiB rendered with placeholders substituted;
-/// a smaller buffer would trip the [`MINIMAL_500`] fallback on every portal GET.
-const DEFAULT_TX_BUF: usize = 6144;
+/// 6 KiB was the Phase 2B–locked value (see `docs/features/archive/esp-hal-provisioning-v1.md`
+/// Decisions "Locked at Phase 2B implementation"): real portal HTML for the
+/// `WifiMqttDevice` profile is 4–6 KiB rendered with placeholders substituted,
+/// and a smaller buffer would trip the [`MINIMAL_500`] fallback on every portal
+/// GET.  8 KiB since the DDI identity rule: its token block plus a re-render
+/// with every pre-fill at its cap, every character `"` (the longest HTML
+/// escape, `&quot;`), and ten errors needs about 7.7 KiB with the header
+/// reserve (`worst_case_ddi_render_fits_the_response_buffer` keeps the proof).
+const DEFAULT_TX_BUF: usize = 8192;
+
+/// Bytes of `resp_buf` kept for the status line and headers in front of a
+/// rendered form.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
+))]
+const RESPONSE_HEADER_RESERVE: usize = 200;
 
 /// The budget of one connection phase as an embassy duration.
 ///
@@ -785,6 +815,19 @@ fn render_portal_template(
                     b"FW_VER" => {
                         write_html_escaped(out_buf, &mut pos, config.firmware_version.as_str())?;
                     }
+                    b"DDI_TOKEN_INPUT" => {
+                        // The token block is static HTML with no value, so it
+                        // is written raw; under the open rule the slot is empty.
+                        if config.identity.is_ddi() {
+                            let block = DDI_TOKEN_INPUT_HTML.as_bytes();
+                            let end_pos = pos + block.len();
+                            if end_pos > out_buf.len() {
+                                return Err(());
+                            }
+                            out_buf[pos..end_pos].copy_from_slice(block);
+                            pos = end_pos;
+                        }
+                    }
                     b"ERRORS" => {
                         if let Some(err) = error_text {
                             // Errors are pre-escaped HTML; write raw.
@@ -935,7 +978,8 @@ pub(crate) fn dispatch_request(
                 // check); `PortalMachine` sequences the rest (nonce → gate →
                 // persist → commit).
                 let nonce_ok = body_nonce_matches(body_after_headers, shared.nonce.as_str());
-                let parsed = nonce_ok.then(|| parse_form(body_str, config.profile));
+                let parsed =
+                    nonce_ok.then(|| parse_form_with(body_str, config.profile, config.identity));
                 let form_valid = matches!(parsed, Some(Ok(_)));
                 return match (
                     shared.poll(PortalInput::Save {
@@ -959,29 +1003,7 @@ pub(crate) fn dispatch_request(
                         }
                         log::info!("POST /save rejected: {} field error(s)", errors.len());
 
-                        // Heap-allocated: nine field errors plus the resubmit
-                        // hint outgrow any small fixed buffer, and a silently
-                        // truncated block would leave unclosed tags.
-                        let mut errors_html = alloc::string::String::new();
-                        if !errors.is_empty() {
-                            errors_html
-                                .push_str("<div class=\"errors\"><strong>Please fix:</strong><ul>");
-                            for err in &errors {
-                                errors_html.push_str("<li>");
-                                html_escape_to(err.field.form_name(), |s| {
-                                    errors_html.push_str(s);
-                                });
-                                errors_html.push_str(": ");
-                                let err_str = alloc::format!("{}", err.error);
-                                html_escape_to(err_str.as_str(), |s| {
-                                    errors_html.push_str(s);
-                                });
-                                errors_html.push_str("</li>");
-                            }
-                            errors_html.push_str("</ul><p>");
-                            errors_html.push_str(juggler::provisioning::templates::RESUBMIT_HINT);
-                            errors_html.push_str("</p></div>");
-                        }
+                        let errors_html = errors_html(&errors);
 
                         // Stored / default values, never the rejected
                         // submission (and never a secret).
@@ -1119,6 +1141,44 @@ fn session_finished(resp_buf: &mut [u8]) -> Result<usize, ()> {
     )
 }
 
+/// The `{{ERRORS}}` block of a rejected `POST /save`: one list item per field
+/// error (the input name and the error's `Display`, both HTML-escaped) and the
+/// resubmit hint; empty for no errors.
+///
+/// Heap-allocated: ten field errors plus the hint outgrow any small fixed
+/// buffer, and a silently truncated block would leave unclosed tags. No value
+/// of the submission is rendered.
+#[cfg(any(
+    test,
+    all(
+        feature = "embassy",
+        any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3")
+    )
+))]
+fn errors_html(errors: &FieldErrors) -> alloc::string::String {
+    let mut errors_html = alloc::string::String::new();
+    if errors.is_empty() {
+        return errors_html;
+    }
+    errors_html.push_str("<div class=\"errors\"><strong>Please fix:</strong><ul>");
+    for err in errors {
+        errors_html.push_str("<li>");
+        html_escape_to(err.field.form_name(), |s| {
+            errors_html.push_str(s);
+        });
+        errors_html.push_str(": ");
+        let err_str = alloc::format!("{}", err.error);
+        html_escape_to(err_str.as_str(), |s| {
+            errors_html.push_str(s);
+        });
+        errors_html.push_str("</li>");
+    }
+    errors_html.push_str("</ul><p>");
+    errors_html.push_str(RESUBMIT_HINT);
+    errors_html.push_str("</p></div>");
+    errors_html
+}
+
 /// Renders the portal form, pre-filled from the store or the defaults, as a
 /// complete response with `status_line` (no trailing CRLF) into `resp_buf`.
 ///
@@ -1136,27 +1196,27 @@ fn form_response(
     config: &PortalRenderConfig,
     error_text: Option<&str>,
 ) -> Result<usize, ()> {
-    const HEADER_RESERVE: usize = 200;
-    if resp_buf.len() < HEADER_RESERVE {
+    if resp_buf.len() < RESPONSE_HEADER_RESERVE {
         return Err(());
     }
     let stored = load_stored(store);
     let defaults = config.defaults.as_borrowed();
-    let prefill = Prefill::select(
+    let prefill = Prefill::select_with(
         stored.as_ref(),
         config.profile,
         &defaults,
         config.device_name.as_str(),
+        config.identity,
     );
     let body_len = render_portal_template(
         config,
         shared.nonce.as_str(),
         &prefill,
         error_text,
-        &mut resp_buf[HEADER_RESERVE..],
+        &mut resp_buf[RESPONSE_HEADER_RESERVE..],
     )?;
 
-    let mut hdr_buf = [0u8; HEADER_RESERVE];
+    let mut hdr_buf = [0u8; RESPONSE_HEADER_RESERVE];
     let mut hdr_pos = 0usize;
     write_bytes(&mut hdr_buf, &mut hdr_pos, status_line)?;
     write_bytes(
@@ -1175,7 +1235,10 @@ fn form_response(
     if total > resp_buf.len() {
         return Err(());
     }
-    resp_buf.copy_within(HEADER_RESERVE..HEADER_RESERVE + body_len, hdr_len);
+    resp_buf.copy_within(
+        RESPONSE_HEADER_RESERVE..RESPONSE_HEADER_RESERVE + body_len,
+        hdr_len,
+    );
     resp_buf[..hdr_len].copy_from_slice(&hdr_buf[..hdr_len]);
     Ok(total)
 }
@@ -2087,6 +2150,7 @@ mod tests {
                     "DEV_NAME",
                     "FW_VER",
                     "ERRORS",
+                    "DDI_TOKEN_INPUT",
                 ];
                 assert!(
                     allowed.contains(&marker),
@@ -2427,23 +2491,144 @@ mod tests {
 
     // ── Device-name pre-fill in the render ────────────────────────────────────
 
-    /// Renders the full Wi-Fi+MQTT form into a host buffer from a pre-fill.
-    fn render(prefill: &Prefill<'_>) -> std::string::String {
+    /// A Wi-Fi+MQTT render config with empty version and name under `identity`.
+    fn render_config(
+        identity: juggler::provisioning::IdentityRule,
+    ) -> super::super::session::portal::PortalRenderConfig {
         use super::super::session::portal::{
             PortalDefaultsOwned, PortalRenderConfig, RENDER_DEVICE_NAME_MAX, RENDER_FW_VERSION_MAX,
         };
         use juggler::provisioning::{PortalDefaults, SchemaProfile};
 
-        let config = PortalRenderConfig {
+        PortalRenderConfig {
             firmware_version: heapless::String::<RENDER_FW_VERSION_MAX>::new(),
             device_name: heapless::String::<RENDER_DEVICE_NAME_MAX>::new(),
             profile: SchemaProfile::WifiMqttDevice,
             defaults: PortalDefaultsOwned::from_borrowed(&PortalDefaults::default()),
-        };
+            identity,
+        }
+    }
+
+    /// Renders the full Wi-Fi+MQTT form into a host buffer from a pre-fill
+    /// under the open identity rule.
+    fn render(prefill: &Prefill<'_>) -> std::string::String {
+        render_with(prefill, juggler::provisioning::IdentityRule::Open)
+    }
+
+    fn render_with(
+        prefill: &Prefill<'_>,
+        identity: juggler::provisioning::IdentityRule,
+    ) -> std::string::String {
+        let config = render_config(identity);
         let mut buf = std::vec![0u8; 16 * 1024];
         let len = render_portal_template(&config, test_nonce(), prefill, None, &mut buf)
             .expect("render must fit a 16 KiB buffer");
         std::string::String::from_utf8(buf[..len].to_vec()).expect("rendered HTML is UTF-8")
+    }
+
+    /// Under the DDI identity rule the form carries the token input (a password
+    /// input with no value) and the identity pre-fill; under the open rule the
+    /// slot renders as nothing.
+    #[test]
+    fn ddi_identity_renders_the_token_input_and_the_identity_prefill() {
+        use juggler::provisioning::{IdentityRule, PortalDefaults, SchemaProfile};
+
+        let defaults = PortalDefaults {
+            mqtt_user: "sensor",
+            mqtt_client: "c3-01",
+            ..PortalDefaults::default()
+        };
+        let prefill = Prefill::select_with(
+            None,
+            SchemaProfile::WifiMqttDevice,
+            &defaults,
+            "rgb-clock-ab12",
+            IdentityRule::Ddi,
+        );
+        let html = render_with(&prefill, IdentityRule::Ddi);
+        assert!(html.contains("name=\"ddi_token\" type=\"password\""));
+        assert!(!html.contains("name=\"ddi_token\" value="));
+        assert!(html.contains("name=\"mqtt_user\" value=\"rgb-clock-ab12\""));
+        assert!(html.contains("name=\"mqtt_client\" value=\"\""));
+        assert!(!html.contains("{{DDI_TOKEN_INPUT}}"));
+
+        let open = Prefill::select(
+            None,
+            SchemaProfile::WifiMqttDevice,
+            &defaults,
+            "rgb-clock-ab12",
+        );
+        let html = render(&open);
+        assert!(!html.contains("ddi_token"));
+        assert!(!html.contains("{{DDI_TOKEN_INPUT}}"));
+        assert!(html.contains("name=\"mqtt_user\" value=\"sensor\""));
+    }
+
+    /// The largest page the portal can produce under the DDI identity rule
+    /// (every pre-fill at its cap and made of `"`, the character with the
+    /// longest HTML escape, ten errors with the longest message, the token
+    /// block) fits `DEFAULT_TX_BUF` behind the header reserve, so a
+    /// rejected submission never falls back to `MINIMAL_500`.
+    #[test]
+    fn worst_case_ddi_render_fits_the_response_buffer() {
+        use super::super::session::portal::RENDER_FW_VERSION_MAX;
+        use juggler::provisioning::{
+            Field, FieldError, IdentityRule, PortalDefaults, SchemaProfile, ValidationError,
+            DEVICE_NAME_MAX_LEN, MQTT_HOST_MAX_LEN, MQTT_USER_MAX_LEN, OTA_URL_MAX_LEN,
+        };
+
+        let mut config = render_config(IdentityRule::Ddi);
+        // Every value is `"`, the character with the longest HTML escape
+        // (`&quot;`, six bytes), so the page is as large as any stored record
+        // or default can make it.
+        let _ = config
+            .firmware_version
+            .push_str(&"\"".repeat(RENDER_FW_VERSION_MAX));
+        let ssid = "\"".repeat(juggler::wifi::SSID_MAX_LEN);
+        let host = "\"".repeat(MQTT_HOST_MAX_LEN);
+        let user = "\"".repeat(MQTT_USER_MAX_LEN);
+        let client = "\"".repeat(juggler::mqtt::CLIENT_ID_MAX_LEN);
+        let ota = "\"".repeat(OTA_URL_MAX_LEN);
+        let name = "\"".repeat(DEVICE_NAME_MAX_LEN);
+        let defaults = PortalDefaults {
+            wifi_ssid: &ssid,
+            mqtt_host: &host,
+            mqtt_port: "65535",
+            mqtt_user: &user,
+            mqtt_client: &client,
+            ota_url: &ota,
+            ..PortalDefaults::default()
+        };
+        // The open selection keeps the 64-byte username and the client id,
+        // the longest values the fields can show.
+        let prefill = Prefill::select(None, SchemaProfile::WifiMqttDevice, &defaults, &name);
+
+        let mut errors = FieldErrors::new();
+        for field in [
+            Field::WifiSsid,
+            Field::WifiPassword,
+            Field::MqttUri,
+            Field::MqttUser,
+            Field::MqttPass,
+            Field::MqttClient,
+            Field::OtaUrl,
+            Field::DeviceName,
+            Field::DdiToken,
+            Field::Form,
+        ] {
+            errors
+                .push(FieldError {
+                    field,
+                    error: ValidationError::InvalidDeviceId,
+                })
+                .expect("ten errors fit");
+        }
+        let html = errors_html(&errors);
+
+        let mut buf = std::vec![0u8; DEFAULT_TX_BUF - RESPONSE_HEADER_RESERVE];
+        let len = render_portal_template(&config, test_nonce(), &prefill, Some(&html), &mut buf)
+            .expect("the worst case fits DEFAULT_TX_BUF");
+        assert!(len <= buf.len());
     }
 
     /// Fresh device: the shared pre-fill puts the configured device name into
@@ -2505,6 +2690,7 @@ mod tests {
             device_name: dev_name,
             profile: SchemaProfile::WifiMqttDevice,
             defaults: PortalDefaultsOwned::from_borrowed(&PortalDefaults::default()),
+            identity: juggler::provisioning::IdentityRule::Open,
         };
 
         // Build a Prefill whose wifi_ssid is at maximum capacity (32 chars).

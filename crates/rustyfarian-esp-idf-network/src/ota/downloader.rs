@@ -3,15 +3,16 @@
 //! HTTPS is explicitly rejected at the ADR 011 MVP scope.
 //! TLS support belongs to `ota-hardened`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use embedded_svc::http::Headers;
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
-use esp_idf_svc::sys::{esp, esp_http_client_set_timeout_ms};
+use esp_idf_svc::sys::{esp, esp_http_client_set_timeout_ms, EspError};
 
-use juggler::ota::{capped_read_len, classify_read_error, OtaError};
+use juggler::ota::{capped_read_len, classify_read_error, OtaError, UrlForLog};
 
 /// Buffer size for downloading firmware chunks.
 pub(super) const DOWNLOAD_BUFFER_SIZE: usize = 4096;
@@ -28,48 +29,62 @@ pub(super) const DOWNLOAD_BUFFER_SIZE: usize = 4096;
 /// It also bounds one response header line.
 pub(super) const HTTP_RX_BUFFER_SIZE: usize = 1024;
 
-/// `true` when an `esp_http_client_read` failure code means "the read timed out".
+/// `true` when an `esp_http_client` failure code means "a wait timed out": a read, a header fetch or a connect.
 ///
 /// `esp_http_client_read` returns `-ESP_ERR_HTTP_EAGAIN` when its wait elapses
 /// before data arrives, and `EspHttpConnection::read` wraps any negative return
 /// as-is, so `EspError::code()` is negative.
 /// The positive constant is also accepted because the ESP-IDF v4 workaround in
 /// `esp-idf-svc` builds the error from it.
+/// `ESP_ERR_HTTP_CONNECTING` is what the ESP-IDF v6.1 API documents for
+/// `esp_http_client_open` timing out before the connection is made, so it is a
+/// timeout too, in either sign.
 pub(super) fn is_read_timeout(code: esp_idf_svc::sys::esp_err_t) -> bool {
-    use esp_idf_svc::sys::ESP_ERR_HTTP_EAGAIN;
-    code == -ESP_ERR_HTTP_EAGAIN || code == ESP_ERR_HTTP_EAGAIN
+    use esp_idf_svc::sys::{ESP_ERR_HTTP_CONNECTING, ESP_ERR_HTTP_EAGAIN};
+    [ESP_ERR_HTTP_EAGAIN, ESP_ERR_HTTP_CONNECTING]
+        .iter()
+        .any(|&timeout| code == timeout || code == -timeout)
 }
 
-/// Strip RFC 3986 `userinfo` (`user:password@`) from a URL before logging it.
+/// Make a URL safe to log: strip the RFC 3986 `userinfo` (`user:password@`), the query and the fragment, and escape control characters.
 ///
 /// HTTPS is rejected by [`create_http_connection`], but plain HTTP URLs may
-/// still legally embed credentials per RFC 3986 section 3.2.1.
-/// Logging the URL verbatim would leak those credentials into the console and
-/// `espflash monitor` output.
-/// This helper splits at `://`, drops anything up to the last `@` in the
-/// authority, and rejoins.
-/// If the input has no scheme it is returned unchanged (the caller is logging
-/// arbitrary text, not a URL).
+/// still legally embed credentials per RFC 3986 section 3.2.1, and a query can
+/// carry a token.
+/// Logging the URL verbatim would leak those into the console and
+/// `espflash monitor` output, and a control character could break or forge a
+/// log line.
+/// The authority ends at the first `/`, `?` or `#`; only the scheme, host,
+/// port and path are kept.
+/// If the input has no scheme it is returned whole with control characters
+/// escaped (the caller is logging arbitrary text, not a URL).
+/// This is [`juggler::ota::UrlForLog`] as a `String`; log any other
+/// server-supplied string (a link, a file name) through
+/// [`juggler::ota::TextForLog`].
 ///
 /// ```
 /// use rustyfarian_esp_idf_network::ota::url_for_log;
 ///
 /// assert_eq!(
-///     url_for_log("http://user:pass@192.168.1.1/fw.bin"),
+///     url_for_log("http://user:pass@192.168.1.1/fw.bin?c=secret#frag"),
 ///     "http://192.168.1.1/fw.bin"
 /// );
 /// assert_eq!(url_for_log("not a url"), "not a url");
 /// ```
 pub fn url_for_log(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    let authority_no_userinfo = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if path.is_empty() {
-        format!("{scheme}://{authority_no_userinfo}")
-    } else {
-        format!("{scheme}://{authority_no_userinfo}/{path}")
+    UrlForLog(url).to_string()
+}
+
+/// Set once the insecure-HTTP WARN has been logged; statics reset on every boot.
+static INSECURE_HTTP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Logs the insecure-HTTP WARN for the first plain-HTTP OTA connection of the boot only.
+pub(crate) fn warn_insecure_http_once(url: &str) {
+    if !INSECURE_HTTP_WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "Using insecure HTTP for OTA: {} (logged once per boot)",
+            url_for_log(url)
+        );
     }
 }
 
@@ -111,13 +126,7 @@ impl FirmwareDownloader {
         );
 
         let client = create_http_connection(&self.url, self.timeout, "application/octet-stream")?;
-        let content_length = client.content_len();
-        let chunked = client.header("Transfer-Encoding").is_some();
-        Ok(FirmwareResponse {
-            client,
-            content_length,
-            chunked,
-        })
+        Ok(FirmwareResponse::from_connection(client))
     }
 }
 
@@ -131,6 +140,17 @@ pub struct FirmwareResponse {
 }
 
 impl FirmwareResponse {
+    /// Wraps a connection whose response headers have been read.
+    pub(super) fn from_connection(client: EspHttpConnection) -> Self {
+        let content_length = client.content_len();
+        let chunked = client.header("Transfer-Encoding").is_some();
+        Self {
+            client,
+            content_length,
+            chunked,
+        }
+    }
+
     /// The declared `Content-Length`, or `None` when the response carries none
     /// (including `Transfer-Encoding: chunked`).
     pub fn content_length(&self) -> Option<u64> {
@@ -159,27 +179,30 @@ impl FirmwareResponse {
     /// `DownloadTimeout`; any other read failure is `ServerUnreachable`
     /// (see [`classify_read_error`]).
     pub fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, OtaError> {
-        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let want = capped_read_len(
             u32::try_from(buf.len()).unwrap_or(u32::MAX),
             buf.len(),
             HTTP_RX_BUFFER_SIZE,
         );
         let buf = &mut buf[..want];
-        // SAFETY: the handle is the live `esp_http_client` owned by `self.client`,
-        // which outlives the call; `esp_http_client_set_timeout_ms` only stores
-        // the value in it.
-        esp!(unsafe { esp_http_client_set_timeout_ms(self.client.handle(), timeout_ms) }).map_err(
-            |e| {
-                log::error!("Could not set the read timeout: {:?}", e);
-                OtaError::ServerUnreachable
-            },
-        )?;
+        set_wait(&mut self.client, timeout).map_err(|e| {
+            log::error!("Could not set the read timeout: {:?}", e);
+            OtaError::ServerUnreachable
+        })?;
         self.client.read(buf).map_err(|e| {
             log::error!("Read error during firmware download: {:?}", e);
             classify_read_error(is_read_timeout(e.code()))
         })
     }
+}
+
+/// Sets the wait of the next transport operations of `client` (a header fetch or a body read), clamped to the C `int` milliseconds.
+pub(super) fn set_wait(client: &mut EspHttpConnection, wait: Duration) -> Result<(), EspError> {
+    let wait_ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: the handle is the live `esp_http_client` owned by `client`,
+    // which outlives the call; `esp_http_client_set_timeout_ms` only stores
+    // the value in it.
+    esp!(unsafe { esp_http_client_set_timeout_ms(client.handle(), wait_ms) })
 }
 
 /// Create an `EspHttpConnection`, initiate a GET request, read the response headers,
@@ -204,7 +227,7 @@ pub fn create_http_connection(
         return Err(OtaError::ServerUnreachable);
     }
 
-    log::warn!("Using insecure HTTP for OTA: {}", url_for_log(url));
+    warn_insecure_http_once(url);
 
     let config = Configuration {
         timeout: Some(timeout),
@@ -287,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn url_query_and_fragment_are_stripped() {
+        assert_eq!(url_for_log("http://h/fw.bin?c=0123abcd"), "http://h/fw.bin");
+        assert_eq!(url_for_log("http://h/fw.bin#frag"), "http://h/fw.bin");
+        assert_eq!(url_for_log("http://user@host?x"), "http://host");
+    }
+
+    #[test]
+    fn url_control_characters_are_escaped() {
+        assert_eq!(url_for_log("http://h/a\r\nb"), r"http://h/a\r\nb");
+    }
+
+    #[test]
     fn non_url_input_passes_through() {
         // No `://` separator → not a URL, return as-is.
         assert_eq!(url_for_log("not a url"), "not a url");
@@ -297,6 +332,17 @@ mod tests {
         use esp_idf_svc::sys::ESP_ERR_HTTP_EAGAIN;
         assert!(is_read_timeout(-ESP_ERR_HTTP_EAGAIN));
         assert!(is_read_timeout(ESP_ERR_HTTP_EAGAIN));
+    }
+
+    #[test]
+    fn a_connect_timeout_is_a_timeout_in_either_sign() {
+        use esp_idf_svc::sys::ESP_ERR_HTTP_CONNECTING;
+        assert!(is_read_timeout(ESP_ERR_HTTP_CONNECTING));
+        assert!(is_read_timeout(-ESP_ERR_HTTP_CONNECTING));
+        assert_eq!(
+            juggler::ota::classify_read_error(is_read_timeout(ESP_ERR_HTTP_CONNECTING)),
+            juggler::ota::OtaError::DownloadTimeout
+        );
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 use core::fmt;
 
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 use serde::de::{Deserializer, Error, Visitor};
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::ota::{Admission, BlockedBy, OfferDecision, OtaError};
@@ -46,6 +48,8 @@ pub enum FailReason {
     UpToDate,
     /// Admission: the offered version is older than the running one.
     Downgrade,
+    /// Admission: the offered version is below the device's minimum version.
+    BelowFloor,
     /// Admission: an update attempt is unresolved.
     AttemptUnresolved,
     /// Admission: a rollback report is undelivered.
@@ -81,6 +85,7 @@ impl FailReason {
             FailReason::PreviouslyRolledBack => "previously_rolled_back",
             FailReason::UpToDate => "up_to_date",
             FailReason::Downgrade => "downgrade",
+            FailReason::BelowFloor => "below_floor",
             FailReason::AttemptUnresolved => "attempt_unresolved",
             FailReason::ReportPending => "report_pending",
             FailReason::PartitionNotFound => "partition_not_found",
@@ -95,9 +100,9 @@ impl FailReason {
 
     /// Parses a wire code by exact match; the inverse of [`as_str`](FailReason::as_str).
     ///
-    /// Covers the 19 fixed codes and every [`OtaError::code`].
-    /// `partition_not_found` and `version_invalid` are both fixed codes and `OtaError` codes; they map to [`FailReason::PartitionNotFound`] and [`FailReason::VersionInvalid`], which serialize back to the same code.
-    /// `download_failed` maps to `Ota(DownloadFailed { status: 0 })`, because the HTTP status is not on the wire; the code still round-trips.
+    /// Covers the 20 fixed codes and every [`OtaError::code`].
+    /// `partition_not_found`, `version_invalid` and `target_mismatch` are both fixed codes and `OtaError` codes; they map to [`FailReason::PartitionNotFound`], [`FailReason::VersionInvalid`] and [`FailReason::TargetMismatch`], which serialize back to the same code.
+    /// `download_failed` maps to `Ota(DownloadFailed { status: 0 })` and `redirect` to `Ota(Redirect { status: 0 })`, because the HTTP status is not on the wire; the code still round-trips.
     /// Anything else, including a different case or surrounding whitespace, is `None`.
     ///
     /// # Examples
@@ -125,6 +130,7 @@ impl FailReason {
             "previously_rolled_back" => FailReason::PreviouslyRolledBack,
             "up_to_date" => FailReason::UpToDate,
             "downgrade" => FailReason::Downgrade,
+            "below_floor" => FailReason::BelowFloor,
             "attempt_unresolved" => FailReason::AttemptUnresolved,
             "report_pending" => FailReason::ReportPending,
             "partition_not_found" => FailReason::PartitionNotFound,
@@ -139,6 +145,10 @@ impl FailReason {
             "checksum_mismatch" => FailReason::Ota(OtaError::ChecksumMismatch),
             "flash_write_failed" => FailReason::Ota(OtaError::FlashWriteFailed),
             "insufficient_space" => FailReason::Ota(OtaError::InsufficientSpace),
+            "cancelled" => FailReason::Ota(OtaError::Cancelled),
+            "foreign_origin" => FailReason::Ota(OtaError::ForeignOrigin),
+            "redirect" => FailReason::Ota(OtaError::Redirect { status: 0 }),
+            "size_mismatch" => FailReason::Ota(OtaError::SizeMismatch),
             _ => return None,
         })
     }
@@ -166,12 +176,25 @@ impl FailReason {
     }
 }
 
+impl From<crate::ota::GateReason> for FailReason {
+    fn from(reason: crate::ota::GateReason) -> Self {
+        use crate::ota::GateReason;
+        match reason {
+            GateReason::BelowFloor => FailReason::BelowFloor,
+            GateReason::PreviouslyRolledBack => FailReason::PreviouslyRolledBack,
+            GateReason::Downgrade => FailReason::Downgrade,
+            GateReason::UpToDate => FailReason::UpToDate,
+        }
+    }
+}
+
 impl From<OtaError> for FailReason {
     fn from(e: OtaError) -> Self {
         FailReason::Ota(e)
     }
 }
 
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 impl Serialize for FailReason {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -179,6 +202,7 @@ impl Serialize for FailReason {
 }
 
 /// Deserializes from the wire string with [`FailReason::from_code`]; an unknown code is an error that does not echo it.
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
 impl<'de> Deserialize<'de> for FailReason {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct CodeVisitor;
@@ -227,6 +251,11 @@ mod tests {
             OtaError::FlashWriteFailed,
             OtaError::PartitionNotFound,
             OtaError::InsufficientSpace,
+            OtaError::Cancelled,
+            OtaError::ForeignOrigin,
+            OtaError::Redirect { status: 301 },
+            OtaError::SizeMismatch,
+            OtaError::TargetMismatch,
         ];
         for e in errors {
             let parsed = FailReason::from_code(e.code()).unwrap();
@@ -257,6 +286,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
     #[test]
     fn deserialize_uses_from_code_and_rejects_unknown_without_echo() {
         let ok: FailReason = serde_json::from_str("\"busy\"").unwrap();
@@ -268,7 +298,7 @@ mod tests {
 
     /// The frozen wire vocabulary.
     /// Changing a string here is a breaking change for every consumer.
-    const TABLE: [(FailReason, &str); 19] = [
+    const TABLE: [(FailReason, &str); 20] = [
         (FailReason::CommandInvalid, "command_invalid"),
         (FailReason::Busy, "busy"),
         (FailReason::WorkerUnavailable, "worker_unavailable"),
@@ -280,6 +310,7 @@ mod tests {
         (FailReason::PreviouslyRolledBack, "previously_rolled_back"),
         (FailReason::UpToDate, "up_to_date"),
         (FailReason::Downgrade, "downgrade"),
+        (FailReason::BelowFloor, "below_floor"),
         (FailReason::AttemptUnresolved, "attempt_unresolved"),
         (FailReason::ReportPending, "report_pending"),
         (FailReason::PartitionNotFound, "partition_not_found"),
@@ -308,6 +339,11 @@ mod tests {
             OtaError::FlashWriteFailed,
             OtaError::PartitionNotFound,
             OtaError::InsufficientSpace,
+            OtaError::Cancelled,
+            OtaError::ForeignOrigin,
+            OtaError::Redirect { status: 301 },
+            OtaError::SizeMismatch,
+            OtaError::TargetMismatch,
         ];
         for err in all {
             let code = err.code();

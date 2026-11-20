@@ -23,9 +23,15 @@ mqtt = []
 lora = ["dep:heapless", "dep:nb", "dep:lorawan-device", "dep:sx126x", "dep:embedded-hal"]
 # ESP-NOW scans honour the Wi-Fi country (`wifi::ChannelSet`).
 espnow = ["wifi"]
+# `ota` includes the record store (`ota::persist`), the reason codes, without their serde impls, and the pure health policy (`ota::health`).
 ota = ["dep:heapless", "dep:sha2"]
-# OTA wire contract (command, manifest, status JSON, reason codes). Needs alloc; the base `ota` feature stays alloc-free.
+# MQTT OTA wire contract (command, manifest, status JSON) and the consumer runtime machines. Needs alloc; the base `ota` feature stays alloc-free.
 ota-wire = ["ota", "dep:serde", "dep:serde_json"]
+# The sans-IO DDI client (`ota::ddi`: poll, admission, feedback, cancel, settings) and its JSON codec
+# (`ota::ddi::wire`): poll, deployment and cancel documents, the feedback encoder and the profile codes.
+# Needs alloc. Separate from `ota-wire` (the MQTT wire); both share `ota::wire::FailReason`.
+# `zeroize` scrubs the target token (`ota::ddi::DdiToken`) on drop.
+ota-ddi = ["ota", "dep:serde", "dep:serde_json", "dep:zeroize"]
 # `lora` is not implied: a Wi-Fi + MQTT device must not pull lorawan-device.
 # Enable `lora` alongside for `LoraFields::to_lora_config`.
 provisioning = ["wifi", "mqtt", "dep:heapless", "dep:zeroize"]

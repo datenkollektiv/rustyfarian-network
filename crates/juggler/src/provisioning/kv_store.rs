@@ -996,6 +996,30 @@ mod tests {
         assert!(store.kv().map.get("schema_ver") == Some(&Value::U8(2)));
     }
 
+    /// The DDI target token is an ordinary extra on the wire and in NVS: the
+    /// form key `ddi_token` lands under `x_ddi_token`, reads back through the
+    /// re-validating accessor, and the value never reaches a log line.
+    #[test]
+    fn ddi_token_extra_is_stored_as_x_ddi_token_and_reads_back_validated() {
+        let token = alloc::string::String::from(crate::test_support::test_token());
+
+        let mut store = KvProvisioningStore::new(MemKv::default());
+        let config = mqtt_config(&[(crate::provisioning::DDI_TOKEN_KEY, token.as_str())]);
+        store.save(&config).unwrap();
+        assert!(
+            matches!(store.kv().map.get("x_ddi_token"), Some(Value::Str(v)) if *v == token),
+            "the token is stored under x_ddi_token"
+        );
+        assert!(
+            matches!(store.kv().map.get("extras_idx"), Some(Value::Str(v)) if v == "ddi_token"),
+            "the extras index names ddi_token"
+        );
+
+        let loaded = store.load().unwrap().expect("record");
+        assert_eq!(loaded.ddi_token(), Ok(Some(token.as_str())));
+        assert!(!format!("{loaded:?}").contains(token.as_str()));
+    }
+
     /// The torn-write guard (ADR 014 §4): every value, then `extras_idx`,
     /// then `profile`, and `schema_ver` strictly last, so a commit that loses
     /// power mid-way never reads as provisioned with partial data.

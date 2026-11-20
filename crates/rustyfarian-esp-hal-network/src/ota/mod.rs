@@ -29,6 +29,9 @@
 // Module is private; no item in this module is part of the public API.
 mod http;
 
+mod cancel;
+pub use cancel::OtaCancel;
+
 // Activation order (host-tested); used by the manager.
 #[cfg(any(
     test,
@@ -50,8 +53,8 @@ mod activation;
 pub use juggler::ota::{
     bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
     hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy, BootFacts,
-    Deadline, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction, SlotId, SlotState,
-    StreamingVerifier, UpdateDecision, Version,
+    CancelRequest, Deadline, ImageChip, ImageMetadata, OfferDecision, OtaError, OtaState,
+    ReconcileAction, SlotId, SlotState, StreamingVerifier, UpdateDecision, Version,
 };
 
 // The wire contract needs `alloc` + serde, so on this tier it is opt-in via `ota-wire`.
@@ -67,13 +70,15 @@ pub use juggler::ota::{
     MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
 };
 
+// The health verdict types of the base `ota` feature (the policy is `juggler::ota::health`).
+pub use juggler::ota::{DeadlineAction, HealthVerdict};
+
 // The consumer runtime's pure state machines and configuration (feature `ota-wire`).
 #[cfg(any(feature = "ota-wire", test))]
 pub use juggler::ota::runtime;
 #[cfg(any(feature = "ota-wire", test))]
 pub use juggler::ota::{
-    ConfigError, DeadlineAction, HealthVerdict, OtaSettings, OtaStacks, OtaTimings,
-    MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
+    ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
 
 // One const per supported chip feature. The bare-metal OTA tier supports `esp32`, `esp32c3`,
@@ -128,8 +133,9 @@ mod reexport_parity_guard {
         use crate::ota::{
             bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
             hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy,
-            BootFacts, Deadline, ImageMetadata, OfferDecision, OtaError, OtaState, ReconcileAction,
-            SlotId, SlotState, StreamingVerifier, UpdateDecision, Version,
+            BootFacts, CancelRequest, Deadline, ImageChip, ImageMetadata, OfferDecision, OtaError,
+            OtaState, ReconcileAction, SlotId, SlotState, StreamingVerifier, UpdateDecision,
+            Version,
         };
         use crate::ota::{
             note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition,
@@ -181,6 +187,8 @@ mod reexport_parity_guard {
         assert_exported::<ReconcileAction>();
         assert_exported::<SlotId>();
         assert_exported::<SlotState>();
+        assert_exported::<CancelRequest>();
+        assert_exported::<ImageChip>();
         // Reference the hex helpers as function items (no call → no alloc needed).
         let _hex_helpers = (bytes_to_hex, hex_to_bytes);
 

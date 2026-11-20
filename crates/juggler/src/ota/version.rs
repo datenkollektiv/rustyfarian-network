@@ -34,37 +34,22 @@ impl Version {
     /// Experimental: API may change before 1.0.
     ///
     /// Parse a version string of the form `"MAJOR.MINOR.PATCH"`.
-    /// Leading/trailing whitespace is trimmed before parsing.
+    ///
+    /// Each component is plain decimal, at most 65535, with no sign and no leading zero (a lone `0` is valid).
+    /// Whitespace is not trimmed: `" 1.2.3"` is invalid.
     ///
     /// Returns `Err(OtaError::VersionInvalid)` for any malformed input.
     pub fn parse(s: &str) -> Result<Self, OtaError> {
-        let s = s.trim();
-
         // Split into at most 4 parts so we can reject "1.2.3.4" cheaply.
         let mut parts = s.splitn(4, '.');
-        let major_str = parts.next().unwrap_or("");
-        let minor_str = parts.next().ok_or(OtaError::VersionInvalid)?;
-        let patch_str = parts.next().ok_or(OtaError::VersionInvalid)?;
+        let major = parse_component(parts.next())?;
+        let minor = parse_component(parts.next())?;
+        let patch = parse_component(parts.next())?;
 
         // A fourth segment means too many dots.
         if parts.next().is_some() {
             return Err(OtaError::VersionInvalid);
         }
-
-        // Empty string edge case: major_str is "" after trim.
-        if major_str.is_empty() {
-            return Err(OtaError::VersionInvalid);
-        }
-
-        let major = major_str
-            .parse::<u16>()
-            .map_err(|_| OtaError::VersionInvalid)?;
-        let minor = minor_str
-            .parse::<u16>()
-            .map_err(|_| OtaError::VersionInvalid)?;
-        let patch = patch_str
-            .parse::<u16>()
-            .map_err(|_| OtaError::VersionInvalid)?;
 
         Ok(Self {
             major,
@@ -72,6 +57,18 @@ impl Version {
             patch,
         })
     }
+}
+
+/// One version component: 1 to 5 ASCII digits, no leading zero unless it is `0`, at most 65535.
+///
+/// `u16::from_str` alone would accept a `+` sign and leading zeros.
+fn parse_component(part: Option<&str>) -> Result<u16, OtaError> {
+    let part = part.ok_or(OtaError::VersionInvalid)?;
+    let digits_only = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits_only || (part.len() > 1 && part.starts_with('0')) {
+        return Err(OtaError::VersionInvalid);
+    }
+    part.parse::<u16>().map_err(|_| OtaError::VersionInvalid)
 }
 
 impl PartialOrd for Version {
@@ -111,9 +108,94 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_with_whitespace() {
-        let v = Version::parse("  0.1.8\n").unwrap();
-        assert_eq!(v, Version::new(0, 1, 8));
+    fn parse_rejects_surrounding_whitespace() {
+        for s in [
+            "  0.1.8\n",
+            " 1.2.3",
+            "1.2.3 ",
+            "1.2.3\n",
+            "\t1.2.3",
+            "1. 2.3",
+            "1.2 .3",
+        ] {
+            assert_eq!(Version::parse(s), Err(OtaError::VersionInvalid), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_a_sign() {
+        for s in ["+1.2.3", "1.+2.3", "1.2.+3", "-1.2.3", "1.2.-3", "+0.0.0"] {
+            assert_eq!(Version::parse(s), Err(OtaError::VersionInvalid), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_leading_zeros() {
+        for s in [
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "00.0.0",
+            "0.00.0",
+            "0.0.00",
+            "065535.0.0",
+        ] {
+            assert_eq!(Version::parse(s), Err(OtaError::VersionInvalid), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_a_lone_zero_and_ten() {
+        assert_eq!(Version::parse("0.10.0"), Ok(Version::new(0, 10, 0)));
+        assert_eq!(Version::parse("10.0.100"), Ok(Version::new(10, 0, 100)));
+    }
+
+    #[test]
+    fn parse_component_boundaries() {
+        assert_eq!(Version::parse("0.0.65535"), Ok(Version::new(0, 0, 65535)));
+        assert_eq!(Version::parse("0.65535.0"), Ok(Version::new(0, 65535, 0)));
+        for s in [
+            "0.65536.0",
+            "0.0.65536",
+            "99999.0.0",
+            "100000.0.0",
+            "1.2.18446744073709551616",
+        ] {
+            assert_eq!(Version::parse(s), Err(OtaError::VersionInvalid), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_empty_components_and_other_forms() {
+        for s in [
+            ".1.2",
+            "1..2",
+            "1.2.",
+            "...",
+            "1.2.3.",
+            "1.2.3-rc.1",
+            "1.2.3+build",
+            "v1.2.3",
+            "1_0.2.3",
+            "1.2.3\u{0}",
+            "\u{661}.2.3",
+            "1,2,3",
+        ] {
+            assert_eq!(Version::parse(s), Err(OtaError::VersionInvalid), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_display_round_trips() {
+        for v in [
+            Version::new(0, 0, 0),
+            Version::new(1, 20, 300),
+            Version::new(65535, 0, 65535),
+        ] {
+            let mut buf = heapless::String::<24>::new();
+            core::fmt::Write::write_fmt(&mut buf, format_args!("{v}")).unwrap();
+            assert_eq!(Version::parse(&buf), Ok(v));
+        }
     }
 
     #[test]

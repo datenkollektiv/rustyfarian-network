@@ -1,4 +1,4 @@
-//! Persisted OTA records: the attempt, the rollback report, the operator-rollback request and the refused version.
+//! Persisted OTA records: the attempt, the rollback report, the operator-rollback request, the refused version and the DDI action record.
 //!
 //! All record semantics, write ordering and boot orchestration live here as pure generic code over the key-level [`OtaKv`] trait, so the crash-consistency rules are host-tested with fault injection.
 //! A platform crate supplies only the key-value backend (on ESP-IDF, NVS).
@@ -24,8 +24,15 @@
 //! | `rq_why` | str | reason of that rollback |
 //! | `rq_from` | str | slot label the rollback leaves; written last (arm marker), removed first |
 //! | `rej_ver` | str | version last left by a rollback, refused until a different one is offered |
+//! | `ddi_act` | str | DDI action id, canonical `i64` digits (1 to 19, no leading zero); the loop guard |
+//! | `ddi_stage` | u8 | 1 running, 2 verdict pending, 3 closed; written last (commit marker), removed first |
+//! | `ddi_att` | u32 | attempt id bound to the DDI action; absent for an action without an attempt |
+//! | `ddi_code` | u32 | verdict code: 0 success, or a profile code 1001 to 1007; kept after delivery |
+//! | `ddi_det0` | str | first feedback detail (the reason, or the success detail); kept after delivery |
+//! | `ddi_det1` | str | second feedback detail (the rollback reason of a 1004 verdict) |
 //!
-//! An attempt exists iff `att_ver` and `att_slot` exist, a request iff `rq_from` exists, a report iff `rb` exists.
+//! An attempt exists iff `att_ver` and `att_slot` exist, a request iff `rq_from` exists, a report iff `rb` exists, a DDI action record iff `ddi_stage` exists.
+//! The DDI action record and its write orders are described in `ddi.rs`; its typed API (`DdiVerdict`, `OtaStore::offer_gate`, `OtaStore::persist_verdict` and the rest) needs the `ota-ddi` feature.
 //!
 //! # Layout rule
 //!
@@ -36,12 +43,16 @@
 //!
 //! A read error or a corrupt record (unknown slot label) means: no write of any kind, admission closed, never mark valid.
 //! [`OtaStore::repair_corrupt`] is the explicit, caller-triggered exit from a corrupt record.
-//! Unreadable reason keys (`att_why`, `rq_why`, `rb_why`) are the exception: they read as the label `"unknown"` and never fail a boot.
+//! Unreadable reason keys (`att_why`, `rq_why`, `rb_why`) and DDI detail keys (`ddi_det0`, `ddi_det1`) are the exception: they read as the label `"unknown"` and never fail a boot.
 
 pub mod boot;
+mod ddi;
 pub mod keys;
 pub mod kv;
 pub mod store;
+
+#[cfg(feature = "ota-ddi")]
+pub use ddi::{DdiVerdict, VerdictDelivery, VerdictNote, VerdictResult};
 
 pub use boot::{
     note_boot_slot, read_with_busy_retry, reconcile_boot, BootDisposition, BootFault, BootOutcome,

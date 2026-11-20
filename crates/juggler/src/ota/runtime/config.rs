@@ -4,7 +4,10 @@ use alloc::string::String;
 use core::fmt;
 use core::time::Duration;
 
-use crate::ota::{RollbackReason, Version};
+use crate::ota::health::HealthConfig;
+use crate::ota::Version;
+
+pub use crate::ota::health::DeadlineAction;
 
 /// The smallest accepted stack in bytes for the reporter thread.
 ///
@@ -30,16 +33,10 @@ pub const MAX_REPAIR_ITERATIONS: u32 = 256;
 /// The longest accepted topic in bytes.
 const MAX_TOPIC_BYTES: usize = 256;
 
-/// What the health policy does when the failure deadline passes with the image still pending verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeadlineAction {
-    /// Note `health_deadline`, then roll back with bounded retries (the production behaviour).
-    Rollback,
-    /// Note the given reason, then call the app's restart callback and let the bootloader abort the unverified image.
-    ///
-    /// The unhealthy demo build uses this with [`RollbackReason::Unhealthy`].
-    NoteAndRestart(RollbackReason),
-}
+/// The root of the fleet's DDI nudge topics, `rustyfarian/ota/<controller-id>/nudge`.
+///
+/// A device publishes nothing and takes no command under `rustyfarian/ota/#` (fleet DDI profile 0.4.0 §1), so neither OTA topic may lie there.
+const FLEET_OTA_ROOT: &str = "rustyfarian/ota";
 
 /// Stack sizes of the runtime threads, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +147,24 @@ impl Default for OtaTimings {
     }
 }
 
+impl From<&OtaTimings> for HealthConfig {
+    fn from(t: &OtaTimings) -> Self {
+        Self {
+            healthy_dwell: t.healthy_dwell,
+            failure_deadline: t.failure_deadline,
+            poll_interval: t.poll_interval,
+            slot_retry: t.slot_retry,
+            slot_min_attempts: t.slot_min_attempts,
+            slot_warn_every: t.slot_warn_every,
+            complete_attempts: t.complete_attempts,
+            complete_retry: t.complete_retry,
+            rollback_attempts: t.rollback_attempts,
+            rollback_retry: t.rollback_retry,
+            deadline_action: t.deadline_action,
+        }
+    }
+}
+
 /// Why a configuration was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
@@ -166,6 +181,8 @@ pub enum ConfigError {
     },
     /// A topic is empty, too long, contains a NUL byte or a wildcard; carries which topic.
     BadTopic(&'static str),
+    /// A topic lies under the fleet's DDI nudge filter `rustyfarian/ota/#` (`rustyfarian/ota` itself included), where a device publishes nothing and takes no command (fleet DDI profile 0.4.0 §1); carries which topic.
+    ReservedTopic(&'static str),
     /// A count exceeds its documented maximum ([`MAX_REJECT_QUEUE_DEPTH`], [`MAX_REPAIR_ITERATIONS`]); carries the field name.
     TooLarge(&'static str),
     /// The command and status topics are the same (the status would be taken for a command).
@@ -184,6 +201,10 @@ impl fmt::Display for ConfigError {
             ),
             ConfigError::TooLarge(name) => write!(f, "OTA setting `{name}` exceeds its maximum"),
             ConfigError::BadTopic(which) => write!(f, "OTA {which} topic is invalid"),
+            ConfigError::ReservedTopic(which) => write!(
+                f,
+                "OTA {which} topic lies under the fleet's reserved `rustyfarian/ota/#`"
+            ),
             ConfigError::SameTopic => f.write_str("OTA command and status topics must differ"),
         }
     }
@@ -203,14 +224,21 @@ fn topic_ok(topic: &str) -> bool {
     !topic.is_empty() && topic.len() <= MAX_TOPIC_BYTES && !topic.contains(['+', '#', '\0'])
 }
 
+/// Whether the filter `rustyfarian/ota/#` matches `topic`: the root itself or any topic below it.
+fn topic_reserved(topic: &str) -> bool {
+    topic
+        .strip_prefix(FLEET_OTA_ROOT)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// The platform-neutral part of the runtime configuration.
 ///
 /// The ESP-IDF tier wraps it with the restart callback in `OtaConfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtaSettings {
-    /// The topic the runtime subscribes to for commands; no wildcard.
+    /// The topic the runtime subscribes to for commands; no wildcard, never under `rustyfarian/ota/#`.
     pub command_topic: String,
-    /// The topic statuses are published to; no wildcard.
+    /// The topic statuses are published to; no wildcard, never under `rustyfarian/ota/#`.
     pub status_topic: String,
     /// The version of the running firmware.
     pub running_version: Version,
@@ -249,13 +277,19 @@ impl OtaSettings {
     ///
     /// # Errors
     ///
-    /// The first [`ConfigError`] found: topics, then stacks, then durations, then counts, then maxima.
+    /// The first [`ConfigError`] found: topics (their form, then the reserved `rustyfarian/ota/#`), then stacks, then durations, then counts, then maxima.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !topic_ok(&self.command_topic) {
             return Err(ConfigError::BadTopic("command"));
         }
         if !topic_ok(&self.status_topic) {
             return Err(ConfigError::BadTopic("status"));
+        }
+        if topic_reserved(&self.command_topic) {
+            return Err(ConfigError::ReservedTopic("command"));
+        }
+        if topic_reserved(&self.status_topic) {
+            return Err(ConfigError::ReservedTopic("status"));
         }
         if self.command_topic == self.status_topic {
             return Err(ConfigError::SameTopic);
@@ -318,6 +352,7 @@ impl OtaSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ota::RollbackReason;
 
     fn ok() -> OtaSettings {
         OtaSettings::new("dev/ota/command", "dev/ota/status", Version::new(1, 0, 0)).unwrap()
@@ -379,6 +414,43 @@ mod tests {
         );
         assert_eq!(OtaSettings::new("t", "t", v), Err(ConfigError::SameTopic));
         assert!(OtaSettings::new("rustyfarian/watchtower/dev-1/ota/command", "s", v).is_ok());
+    }
+
+    #[test]
+    fn topics_the_fleet_nudge_filter_matches_are_refused() {
+        let v = Version::new(1, 0, 0);
+        for reserved in [
+            "rustyfarian/ota/dev-1/nudge",
+            "rustyfarian/ota/dev-1/command",
+            "rustyfarian/ota/",
+            "rustyfarian/ota",
+        ] {
+            assert_eq!(
+                OtaSettings::new(reserved, "s", v),
+                Err(ConfigError::ReservedTopic("command")),
+                "{reserved:?}"
+            );
+            assert_eq!(
+                OtaSettings::new("c", reserved, v),
+                Err(ConfigError::ReservedTopic("status")),
+                "{reserved:?}"
+            );
+        }
+        for allowed in [
+            "rustyfarian/otas/dev-1",
+            "rustyfarian/ota-bench/dev-1/command",
+            "bench/rustyfarian/ota/dev-1",
+            "Rustyfarian/ota/dev-1",
+        ] {
+            assert!(OtaSettings::new(allowed, "s", v).is_ok(), "{allowed:?}");
+        }
+        assert_eq!(
+            OtaSettings::new("rustyfarian/ota/#", "s", v),
+            Err(ConfigError::BadTopic("command")),
+            "a wildcard is refused before the prefix is looked at"
+        );
+        let shown = alloc::format!("{}", ConfigError::ReservedTopic("status"));
+        assert!(shown.contains("status") && shown.contains("rustyfarian/ota/#"));
     }
 
     #[test]
@@ -479,6 +551,28 @@ mod tests {
         s.timings.failure_deadline = Duration::from_secs(15);
         s.timings.deadline_action = DeadlineAction::NoteAndRestart(RollbackReason::Unhealthy);
         assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_config_follows_the_timings() {
+        let t = OtaTimings {
+            healthy_dwell: Duration::from_secs(5),
+            rollback_attempts: 7,
+            ..OtaTimings::default()
+        };
+        let c = HealthConfig::from(&t);
+        assert_eq!(
+            (c.healthy_dwell, c.rollback_attempts),
+            (Duration::from_secs(5), 7)
+        );
+    }
+
+    #[test]
+    fn health_defaults_match_the_timing_defaults() {
+        assert_eq!(
+            HealthConfig::from(&OtaTimings::default()),
+            HealthConfig::default()
+        );
     }
 
     #[test]

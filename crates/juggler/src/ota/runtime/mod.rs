@@ -10,18 +10,18 @@
 //! | [`intake`] | what the MQTT callback does with one payload (reject, or queue it) |
 //! | [`worker`] | admission gates for update, rollback and repair, and offer retention |
 //! | [`store_ops`] | the multi-call record sequences (rollback arm and undo, repair, delivery) |
-//! | [`health`] | the health policy of the running image as a function of time and step outcomes |
+//! | [`health`] | the health policy, re-exported from [`crate::ota::health`] (base `ota`) |
 //! | [`report`] | when and how the `rolled_back` report is published and marked delivered, and the background completion retry |
 //! | [`fetch`] | the size and total-time limits of the manifest body |
 
 pub mod config;
 pub mod fetch;
-pub mod health;
 pub mod intake;
 pub mod report;
 pub mod store_ops;
 pub mod worker;
 
+pub use crate::ota::health;
 pub use config::{
     ConfigError, DeadlineAction, OtaSettings, OtaStacks, OtaTimings, MAX_REJECT_QUEUE_DEPTH,
     MAX_REPAIR_ITERATIONS, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
