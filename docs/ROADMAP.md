@@ -45,6 +45,7 @@ timeline
               : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)
               : Provisioning tier parity — async wait_committed on IDF, one on_event shape, esp-hal boot helpers load_with_reentry and run_wifi_mqtt_portal (ADR 022)
               : OTA tier parity — one manager name across tiers (OtaSession, EspHalOtaManager), MQTT OTA runtime on esp-hal (ADR 022)
+              : DDI OTA client — hawkBit DDI polling on ESP-IDF first, HTTPS by default, plain HTTP lab opt-in in 0.8.0, MQTT OTA wire retired after (feature-doc ddi-client-v1)
               : Ladder closure code leftovers — TxCore Ignored action, hal connect timeout, OtaState next_state deprecation, DeferredRestore removal (archived ladder-closure gaps)
 
     Mid term  : LoRa TTN OTAA validation — first downlink (FPort 10) and session persistence remain (runbook)
