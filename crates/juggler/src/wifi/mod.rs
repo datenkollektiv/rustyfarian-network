@@ -2,21 +2,20 @@
 //!
 //! # Architecture
 //!
-//! - [`WifiDriver`] — hardware-agnostic Wi-Fi driver interface
 //! - [`WiFiConfig`] — connection configuration (SSID, password, connect mode)
 //! - [`ConnectMode`] — blocking vs. non-blocking association strategy
 //! - [`LinkMachine`] — pure reconnect policy shared by both tiers (see [`link`])
 //! - [`Country`] — the regulatory domain both tiers apply (see [`country`])
 //! - [`JoinFailure`] — the class of a failed join, for the provisioning fallback
 //!   (see [`join_failure`])
-//! - [`mock::MockWifiDriver`] — test double for host-side unit tests
+//! - [`mock::MockLink`] — test double for host-side unit tests
 //!   (requires the `mock` feature or `#[cfg(test)]`)
 //!
 //! # Feature flags
 //!
 //! | Feature | What it enables                                              |
 //! |:--------|:-------------------------------------------------------------|
-//! | `mock`  | `MockWifiDriver` and `MockLink` for downstream host tests    |
+//! | `mock`  | `MockLink` for downstream host tests                         |
 
 #[cfg(any(test, feature = "mock"))]
 mod link_mock;
@@ -142,7 +141,7 @@ pub enum ConnectMode {
     /// Initiate association and return immediately.
     ///
     /// The platform event loop drives the connection in the background.
-    /// Use `WifiDriver::is_connected()` to check readiness.
+    /// Use the tier's `WiFiManager::is_connected()` to check readiness.
     ///
     /// **Note:** If an LED driver is provided to the Wi-Fi manager, this mode
     /// may fall back to blocking behaviour to drive the LED status indicator.
@@ -826,40 +825,6 @@ impl core::fmt::Display for DisconnectReason {
 /// credentials ([`DisconnectReason::suggests_credentials`]).
 pub const CREDENTIALS_HINT: &str = " — check SSID/password and network availability";
 
-// ─── WifiDriver trait ───────────────────────────────────────────────────────
-
-/// Hardware-agnostic Wi-Fi driver interface.
-///
-/// Deprecated: no tier implements it; ADR 022 replaces it with shared link
-/// traits that both tiers implement.
-///
-/// # Implementors
-///
-/// - [`mock::MockWifiDriver`] — test double (behind `mock` feature / `#[cfg(test)]`)
-#[deprecated(
-    since = "0.7.0",
-    note = "no tier implements WifiDriver; ADR 022 replaces it with shared link traits"
-)]
-pub trait WifiDriver {
-    /// Driver-specific error type.
-    type Error: core::fmt::Debug;
-
-    /// Configure the driver with the given SSID and password.
-    fn configure(&mut self, ssid: &str, password: &str) -> Result<(), Self::Error>;
-
-    /// Start the Wi-Fi hardware.
-    fn start(&mut self) -> Result<(), Self::Error>;
-
-    /// Initiate association with the configured AP.
-    fn connect(&mut self) -> Result<(), Self::Error>;
-
-    /// Disconnect from the current AP.
-    fn disconnect(&mut self) -> Result<(), Self::Error>;
-
-    /// Returns `true` if the station is associated and authenticated.
-    fn is_connected(&self) -> Result<bool, Self::Error>;
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1120,28 +1085,6 @@ mod tests {
         assert!(matches!(config.connect_mode, ConnectMode::NonBlocking));
     }
 
-    // ── MockWifiDriver tests ────────────────────────────────────────────
-
-    #[test]
-    #[allow(deprecated)] // exercises the deprecated `WifiDriver` through its mock
-    fn mock_driver_connect_disconnect_cycle() {
-        let mut driver = mock::MockWifiDriver::new();
-        assert!(!driver.is_connected().unwrap());
-
-        driver.configure(TEST_SSID, test_psk()).unwrap();
-        assert!(driver.configured);
-
-        driver.start().unwrap();
-        assert!(driver.started);
-
-        driver.connect().unwrap();
-        assert!(driver.is_connected().unwrap());
-        assert_eq!(driver.connect_count, 1);
-
-        driver.disconnect().unwrap();
-        assert!(!driver.is_connected().unwrap());
-    }
-
     // ── WifiPowerSave tests ──────────────────────────────────────────────
 
     #[test]
@@ -1256,20 +1199,6 @@ mod tests {
                 v
             );
         }
-    }
-
-    // ── MockWifiDriver tests ────────────────────────────────────────────
-
-    #[test]
-    #[allow(deprecated)] // exercises the deprecated `WifiDriver` through its mock
-    fn mock_driver_fail_connect() {
-        let mut driver = mock::MockWifiDriver::new();
-        driver.fail_connect = true;
-
-        driver.configure(TEST_SSID, test_psk()).unwrap();
-        driver.start().unwrap();
-        assert!(driver.connect().is_err());
-        assert!(!driver.is_connected().unwrap());
     }
 
     // ── ApConfig tests ────────────────────────────────────────────────────

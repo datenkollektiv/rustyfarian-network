@@ -80,7 +80,7 @@ default = []
 # wifi: Wi-Fi STA connection manager + SoftAP lifecycle manager.
 wifi = ["juggler/wifi", "juggler/std", "dep:pennant", "dep:rgb"]
 
-# mqtt: MQTT builder + handle, MqttManager (deprecated), background event loop.
+# mqtt: MQTT builder + handle, background event loop.
 mqtt = ["juggler/mqtt", "juggler/std", "dep:pennant", "dep:rgb"]
 
 # lora: SX1262 radio driver + LoRaWAN adapter for lorawan-device 0.12.

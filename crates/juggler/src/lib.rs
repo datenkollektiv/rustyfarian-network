@@ -80,7 +80,7 @@
 //!   domains. Pure MQTT validation and state machines compile under `mqtt` alone.
 //!
 //! - **`mock`** — Exposes test-double implementations for unit testing:
-//!   [`wifi::mock::MockWifiDriver`], [`lora::mock::MockLoraRadio`], and
+//!   [`wifi::mock::MockLink`], [`lora::mock::MockLoraRadio`], and
 //!   [`espnow::mock::MockEspNowDriver`]. These mocks implement the driver traits
 //!   so your application code can be tested against a deterministic, hardware-free
 //!   environment on the host. **Implies `wifi`, `lora`, and `espnow` features.**
@@ -89,7 +89,7 @@
 //! ## Re-export patterns
 //!
 //! Each domain module re-exports its primary types at the crate root for ergonomic imports:
-//! - `wifi::*` exports [`WiFiConfig`](wifi::WiFiConfig), [`WifiDriver`](wifi::WifiDriver), etc.
+//! - `wifi::*` exports [`WiFiConfig`](wifi::WiFiConfig), [`LinkMachine`](wifi::LinkMachine), etc.
 //! - `mqtt::*` exports [`MqttConnectionState`](mqtt::MqttConnectionState), validation functions, etc.
 //! - `lora::*` exports [`LoraRadio`](lora::LoraRadio), [`LorawanPhy`](lora::LorawanPhy), [`LorawanTimeline`](lora::LorawanTimeline), etc.
 //! - `espnow::*` exports [`EspNowDriver`](espnow::EspNowDriver), [`PeerTracker`](espnow::PeerTracker), etc.

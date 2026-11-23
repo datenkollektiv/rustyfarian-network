@@ -274,7 +274,7 @@ RX1 opens ≈1 s, RX2 ≈2 s after TX end; start with `RX_WINDOW_OFFSET_MS = -20
 Common upstream causes: DIO1 interrupt not delivered, BUSY pin not handled (below).
 
 **DIO1 interrupt not delivered → radio events never reach the state machine.**
-Without a working DIO1 path `nb_device::Event::RadioEvent` never fires and downlinks are never processed; on ESP-IDF poll `get_irq_status()` instead — see rustdoc of `EspIdfLoraRadio::irq_pending`.
+Without a working DIO1 path `nb_device::Event::RadioEvent` never fires and downlinks are never processed; on ESP-IDF poll `get_irq_status()` instead — see rustdoc of the `LoraRadio::irq_pending` impl on `EspIdfLoraRadio`.
 
 **BUSY pin not handled → SX1262 SPI commands issued while BUSY is high are ignored or corrupt; wait for BUSY low (bounded) before every command.**
 

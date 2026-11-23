@@ -343,29 +343,6 @@ where
             tx_start: None,
         })
     }
-
-    /// Return the radio to RC-oscillator standby, aborting any in-progress RX or TX.
-    ///
-    /// Best effort: errors are ignored.
-    #[deprecated(
-        since = "0.7.0",
-        note = "use the LoraRadio trait method, `LoraRadio::cancel_rx(&mut radio)`, which \
-                reports the error"
-    )]
-    pub fn cancel_rx(&mut self) {
-        let _ = LoraRadio::cancel_rx(self);
-    }
-
-    /// Return `true` if a TxDone, RxDone, Timeout or CrcErr IRQ is latched in the
-    /// radio's IRQ register, WITHOUT clearing it; `false` when the read fails.
-    #[deprecated(
-        since = "0.7.0",
-        note = "use LorawanPhy::irq_pending on the LoraRadioAdapter, or the LoraRadio trait \
-                method `LoraRadio::irq_pending(&mut radio)`, which reports the error"
-    )]
-    pub fn irq_pending(&mut self) -> bool {
-        LoraRadio::irq_pending(self).unwrap_or(false)
-    }
 }
 
 // ─── Hardware reset ──────────────────────────────────────────────────────────

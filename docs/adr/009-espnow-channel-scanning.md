@@ -70,7 +70,7 @@ Add `ScanConfig`, `ScanResult`, and `DEFAULT_SCAN_CHANNELS` to `espnow-pure`.
 
 ```rust
 let espnow = EspIdfEspNow::init_with_radio(modem, sys_loop, nvs)?;
-let result = espnow.scan_for_peer(&brain_mac, &ScanConfig::new(b"probe"))?;
+let result = espnow.scan_for_peer(&brain_mac, &ScanConfig::for_peer())?;
 log::info!("Found peer on channel {}", result.channel);
 ```
 
@@ -78,7 +78,7 @@ Or the convenience constructor:
 
 ```rust
 let (espnow, result) = EspIdfEspNow::init_with_radio_scanning(
-    modem, sys_loop, nvs, &brain_mac, &ScanConfig::new(b"probe"),
+    modem, sys_loop, nvs, &brain_mac, &ScanConfig::for_peer(),
 )?;
 ```
 

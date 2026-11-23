@@ -73,8 +73,6 @@ pub use scan_job::{CancelOutcome, Cancelled, GateRefusal, JobEpoch, ScanGate, Sc
 pub use session::EmbassyClock;
 pub use session::{Clock, PeerSendError, PeerSession};
 pub use tracker::PeerTracker;
-#[allow(deprecated)]
-pub use tx::DeferredRestore;
 pub use tx::{
     Abandon, Completed, Completion, Next, Refusal, ScanRefusal, SendKind, TxCore, TxId,
     PROBE_RESERVED_SLOTS,
@@ -355,14 +353,6 @@ impl PeerConfig {
 pub struct ScanConfig<'a> {
     /// Channels to scan, in order (default: [`DEFAULT_SCAN_CHANNELS`]).
     pub channels: &'a [u8],
-    /// Ignored: the scan sends the [`ProbeFrame`] it builds itself.
-    ///
-    /// Kept for one release; build the config with [`ScanConfig::for_peer`].
-    #[deprecated(
-        since = "0.7.0",
-        note = "the scan sends the 0xF3 probe frame itself; build the config with `ScanConfig::for_peer()`"
-    )]
-    pub probe_data: &'a [u8],
     /// Per-channel probe timeout (default: [`DEFAULT_PROBE_TIMEOUT`] = 100 ms).
     ///
     /// On both tiers it bounds queueing and the start of a probe: a probe that did not start in
@@ -410,32 +400,13 @@ impl<'a> ScanConfig<'a> {
     /// [`Country::WORLD`](crate::wifi::Country::WORLD): 12 and 13); set the country of
     /// the peer's network to reach a peer on 12 or 13.
     pub fn for_peer() -> Self {
-        #[allow(deprecated)]
         Self {
             channels: &DEFAULT_SCAN_CHANNELS,
-            probe_data: &[],
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             burst_timeout: DEFAULT_BURST_TIMEOUT,
             probe_confirmations: DEFAULT_PROBE_CONFIRMATIONS,
             confirmation_gap: DEFAULT_CONFIRMATION_GAP,
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
-        }
-    }
-
-    /// Create a scan config with default channels (1-13), the given probe
-    /// payload, and the default timeouts and confirmation settings.
-    ///
-    /// `probe_data` is ignored: the scan sends the [`ProbeFrame`] it builds
-    /// itself.
-    #[deprecated(
-        since = "0.7.0",
-        note = "the scan sends the 0xF3 probe frame itself; use `ScanConfig::for_peer()`"
-    )]
-    pub fn new(probe_data: &'a [u8]) -> Self {
-        #[allow(deprecated)]
-        Self {
-            probe_data,
-            ..Self::for_peer()
         }
     }
 
@@ -710,15 +681,6 @@ mod tests {
         let timeout = core::time::Duration::from_millis(20);
         let config = ScanConfig::for_peer().with_reply_timeout(timeout);
         assert_eq!(config.reply_timeout, timeout);
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_scan_config_new_still_builds_the_default_config() {
-        let config = ScanConfig::new(b"probe");
-        assert_eq!(config.probe_data, b"probe");
-        assert_eq!(config.channels, &DEFAULT_SCAN_CHANNELS);
-        assert_eq!(config.reply_timeout, DEFAULT_REPLY_TIMEOUT);
     }
 
     #[test]
