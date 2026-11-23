@@ -48,7 +48,7 @@ The reply carries no RSSI, because the ESP-IDF receive callback of `esp-idf-svc 
 
 ### Scan rule: reply wins, ACK is the fallback
 
-1. The scan sends the `0xF3` probe on each channel of `ScanConfig::channels`; `ScanConfig::probe_data` is deprecated and ignored, `ScanConfig::for_peer()` builds the config.
+1. The scan sends the `0xF3` probe on each channel of `ScanConfig::channels`; `ScanConfig::probe_data` was removed in 0.8.0 on 2026-11-24, and `ScanConfig::for_peer()` builds the config.
 2. After the MAC-layer ACK the scan machine issues `ScanAction::AwaitReply { until }` with `until` = ACK time + `ScanConfig::reply_timeout` (default 50 ms); the driver feeds `ScanInput::Reply(ProbeReply)` or `Completed` on timeout.
 3. A matching reply ends the scan with `found = home_channel`; the coordinator has stated its channel, so no further probe is sent.
 4. An ACK without a reply nominates the first such channel as the candidate and the sweep continues; a later reply still wins over the candidate.

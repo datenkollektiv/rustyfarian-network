@@ -124,18 +124,6 @@ pub fn plan_offer(
     }
 }
 
-/// What a failing `begin_attempt` means: a store that refuses admission blocks (the offer is retained), any other failure is `attempt_not_persisted`.
-#[deprecated(
-    since = "0.7.0",
-    note = "use `begin_failure_outcome`, which cannot answer `Proceed`"
-)]
-pub fn begin_failure(e: &StoreError) -> OfferPlan {
-    match begin_failure_outcome(e) {
-        BeginFailure::Blocked(reason) => OfferPlan::Blocked(reason),
-        BeginFailure::Fail(reason) => OfferPlan::Fail(reason),
-    }
-}
-
 /// What a failing `begin_attempt` means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeginFailure {
@@ -656,19 +644,6 @@ mod tests {
                 BeginFailure::Fail(FailReason::AttemptNotPersisted)
             );
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn the_deprecated_begin_failure_agrees() {
-        assert_eq!(
-            begin_failure(&StoreError::NotAdmitted(BlockedBy::ReportPending)),
-            OfferPlan::Blocked(FailReason::ReportPending)
-        );
-        assert_eq!(
-            begin_failure(&StoreError::InvalidSlot),
-            OfferPlan::Fail(FailReason::AttemptNotPersisted)
-        );
     }
 
     #[test]

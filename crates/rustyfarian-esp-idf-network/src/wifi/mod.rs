@@ -104,15 +104,12 @@ use pennant::PulseEffect;
 use rgb::RGB8;
 
 // Re-export all pure types from juggler::wifi
-// `WifiDriver` is deprecated (ADR 022) but stays re-exported until it is removed.
-#[allow(deprecated)]
 pub use juggler::wifi::{
     validate_ap_config, validate_password, validate_ssid, ApConfig, ApSelection, ChannelSet,
     ConnectMode, Country, CountryError, DisconnectReason, LinkAction, LinkInput, LinkMachine,
-    LinkState, Regulatory, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave,
-    AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
-    POLL_INTERVAL_MS, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN,
-    STATION_TX_POWER_DEFAULT,
+    LinkState, Regulatory, TxPowerLevel, WiFiConfig, WifiPowerSave, AP_MAX_CONNECTIONS_DEFAULT,
+    AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN, POLL_INTERVAL_MS,
+    RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_MAX_MS, SSID_MAX_LEN, STATION_TX_POWER_DEFAULT,
 };
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
@@ -552,15 +549,6 @@ impl WiFiManager {
     /// [`LinkState::Suspended`]; infallible, for rendering a status.
     pub fn state(&self) -> LinkState {
         self.link.supervisor.state()
-    }
-
-    /// Former name of [`state`](Self::state).
-    #[deprecated(
-        since = "0.7.0",
-        note = "use `state()`, the name both tiers share (ADR 022)"
-    )]
-    pub fn link_state(&self) -> LinkState {
-        self.state()
     }
 
     /// `true` while the station is associated and has its IP address.

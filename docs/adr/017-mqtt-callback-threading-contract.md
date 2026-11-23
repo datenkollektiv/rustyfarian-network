@@ -64,7 +64,7 @@ Contract §1 and §3 are unchanged.
 
 ### Positive
 
-- Deadlock is impossible via `MqttHandle`: callbacks that violate the contract fail fast instead of hanging forever (the deprecated legacy `MqttManager` is excluded — see Negative).
+- Deadlock is impossible via `MqttHandle`: callbacks that violate the contract fail fast instead of hanging forever (the legacy `MqttManager` was excluded from this guard before it was removed in 0.8.0 on 2026-11-24 — see Negative).
 - Backward-compatible: no signature changes, no new enum variants; `on_connect` signature unchanged.
 - Ordering preserved: startup message precedes any `on_connect` publish.
 - Running the connect work on one library thread (the `mqtt-net` runner since 2026-11-11) isolates unsafe-to-call code to a single point.
@@ -75,7 +75,7 @@ Contract §1 and §3 are unchanged.
 - The MQTT thread memory change (2026-11-11) adds three `unsafe` blocks, all FFI: the `esp_pthread_get_cfg` and `esp_pthread_set_cfg` calls that name a library thread, the restore of the caller's pthread configuration, and the `uxTaskGetStackHighWaterMark` self-measurement.
 - Known limit: `is_connected()` confirms before subscriptions are sent (ROADMAP row notes this).
 - A running `on_connect` cannot be cancelled by a disconnect.
-- The deprecated legacy `MqttManager` has no guard (out of scope).
+- The legacy `MqttManager` had no guard (out of scope) and was removed in 0.8.0 on 2026-11-24.
 - Guard cost: every `MqttHandle` publish/subscribe call first reads the thread-local `CallbackScope` depth counter (`juggler::mqtt::in_callback`) — one thread-local `Cell<u32>` read, no lock, no allocation; negligible next to the `enqueue` it precedes.
 - A blocked `on_connect` holds the client lock AND defers the runner's Close, Shutdown and retry handling until it returns; a warning is logged past 1 s, and `is_connected()` stays false meanwhile, which is why `on_connect` must be short-lived.
 - The connect plan no longer runs under one continuous client-lock hold, so an app publish may enqueue between two steps, before the startup message; readiness (`try_publish*`, `is_connected()`, `wait_connected`) is still gated on `WorkDone`.

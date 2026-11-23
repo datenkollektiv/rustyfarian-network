@@ -268,7 +268,6 @@ struct ScanJob {
 
 impl ScanJob {
     fn new(mac: MacAddress, config: &ScanConfig<'_>) -> Self {
-        // `..` skips the deprecated `probe_data`: the machine builds its own probe frames.
         let ScanConfig {
             channels,
             probe_timeout,
@@ -276,7 +275,6 @@ impl ScanJob {
             probe_confirmations,
             confirmation_gap,
             reply_timeout,
-            ..
         } = *config;
         Self {
             mac,
@@ -298,7 +296,6 @@ impl ScanJob {
             probe_confirmations: self.probe_confirmations,
             confirmation_gap: self.confirmation_gap,
             reply_timeout: self.reply_timeout,
-            ..ScanConfig::for_peer()
         }
     }
 }

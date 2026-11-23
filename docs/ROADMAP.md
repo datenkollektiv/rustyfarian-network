@@ -47,7 +47,7 @@ timeline
               : OTA tier parity — one manager name across tiers (OtaSession, EspHalOtaManager), MQTT OTA runtime on esp-hal (ADR 022)
               : DDI OTA client — hawkBit DDI polling on ESP-IDF first, HTTPS by default, plain HTTP lab opt-in in 0.8.0, MQTT OTA wire retired after (feature-doc ddi-client-v1)
               : Remote DDI bench checks — replace local-only setup, teardown, host run and probe steps so rustyfarian-bench v0.6.0 accepts c3/ddi and c6/ddi remotely
-              : Ladder closure code leftovers — TxCore Ignored action, hal connect timeout, OtaState next_state deprecation, DeferredRestore removal (archived ladder-closure gaps)
+              : Ladder closure code leftovers — TxCore Ignored action, hal connect timeout, OtaState next_state deprecation (archived ladder-closure gaps)
 
     Mid term  : LoRa TTN OTAA validation — first downlink (FPort 10) and session persistence remain (runbook)
               : OTA security model doc — threat model and signed-manifest question

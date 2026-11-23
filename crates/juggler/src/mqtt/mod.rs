@@ -35,8 +35,8 @@ pub use subscriptions::{
 /// 100 ms is always fully respected — e.g. 5050 ms yields 51 iterations
 /// (5100 ms of polling) rather than 50 (5000 ms).
 #[deprecated(
-    note = "its only user is the deprecated ESP-IDF `MqttManager`: both tiers' builders wait \
-            on `MqttClient::wait_connected`; slated for removal in 1.0"
+    note = "unused since the ESP-IDF `MqttManager` was removed in 0.8.0: both tiers' builders \
+            wait on `MqttClient::wait_connected`; slated for removal in 1.0"
 )]
 pub fn connection_wait_iterations(timeout_ms: u64) -> u64 {
     timeout_ms.div_ceil(100)

@@ -68,7 +68,7 @@
 //! Each domain module in this crate re-exports the corresponding types from
 //! [`juggler`] (the platform-agnostic core) for consumer convenience:
 //!
-//! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::WifiDriver`], etc. from `juggler::wifi`
+//! - `wifi::*` exports [`wifi::WiFiConfig`], [`wifi::LinkMachine`], etc. from `juggler::wifi`
 //! - `mqtt::*` exports [`mqtt::MqttConnectionState`], validation functions, etc. from `juggler::mqtt`
 //!   and the config types shared with the bare-metal tier — [`mqtt::QoS`],
 //!   [`mqtt::MqttConfig`], [`mqtt::LwtConfig`], [`mqtt::TryPublishError`]; raw

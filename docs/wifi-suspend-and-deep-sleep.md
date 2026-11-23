@@ -12,13 +12,13 @@ Design and decisions: `docs/features/archive/wifi-reconnect-and-suspend-v1.md`; 
 
 | Tier    | Suspend                       | Resume                       | Radio while suspended       | State                        |
 |:--------|:------------------------------|:-----------------------------|:----------------------------|:-----------------------------|
-| ESP-IDF | `WiFiManager::suspend(&self)` | `WiFiManager::resume(&self)` | stopped                     | `link_state()` → `LinkState` |
+| ESP-IDF | `WiFiManager::suspend(&self)` | `WiFiManager::resume(&self)` | stopped                     | `state()` → `LinkState`      |
 | esp-hal | `WiFiManager::suspend(&self)` | `WiFiManager::resume(&self)` | on, station disconnected    | `state()`, `is_suspended()`  |
 
 - Both calls are idempotent; resume is a no-op unless suspended.
 - ESP-IDF runs `esp_wifi_disconnect` + `esp_wifi_stop` (resume: `esp_wifi_start` + `esp_wifi_connect`) on the caller's thread; the radio is stopped when `suspend()` returns, within a few milliseconds, and `resume()` never waits; driver events queued before the stop are dropped by the link worker, however late they arrive.
 - esp-hal only signals the supervisor task and never blocks; the task disconnects within `SUSPEND_DISCONNECT_TIMEOUT_MS` (500 ms) and `is_suspended()` turns `true` when that disconnect finished or gave up.
-- `state()` / `link_state()` report `LinkState::Suspended` from the moment `suspend()` is called.
+- `state()` reports `LinkState::Suspended` from the moment `suspend()` is called.
 - A `resume()` right after `suspend()` (even within 50 ms) leaves one connect in flight, never two, and uses a fresh back-off.
 
 ## Deep sleep on ESP-IDF

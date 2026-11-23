@@ -606,8 +606,6 @@ pub struct ScanMachine<'a> {
     candidate: Option<usize>,
     /// Sequence number of the last probe issued (`0` before the first).
     seq: u8,
-    /// The last encoded probe, for the deprecated [`probe_data`](Self::probe_data).
-    last_probe: [u8; PROBE_FRAME_LEN],
     /// The channels the Wi-Fi country allows; others are skipped.
     allowed: ChannelSet,
     /// Entries of the channel list `allowed` excludes.
@@ -635,11 +633,6 @@ impl<'a> ScanMachine<'a> {
             phase: Phase::Sweep,
             candidate: None,
             seq: 0,
-            last_probe: ProbeFrame {
-                seq: 0,
-                tx_channel: 0,
-            }
-            .encode(),
             allowed: ChannelSet::ALL,
             not_allowed: 0,
         }
@@ -687,7 +680,6 @@ impl<'a> ScanMachine<'a> {
     /// repeats until the counter wraps.
     pub fn with_first_seq(mut self, seq: u8) -> Self {
         self.seq = seq;
-        self.last_probe = ProbeFrame { seq, tx_channel: 0 }.encode();
         self
     }
 
@@ -807,21 +799,6 @@ impl<'a> ScanMachine<'a> {
             tx_channel: channel,
         }
         .encode()
-    }
-
-    /// The last probe frame the machine issued (the start-sequence frame for channel 0 before
-    /// the first probe).
-    ///
-    /// Kept for one release for drivers written against the payload of
-    /// [`ScanConfig::probe_data`]; the scan now sends the `0xF3` frame.
-    /// Unlike that payload, the slice borrows the machine, so read it after each `SendProbe`
-    /// instead of holding it across `poll`.
-    #[deprecated(
-        since = "0.7.0",
-        note = "the scan sends the 0xF3 probe frame; use `probe_frame(channel)` for the channel `SendProbe` names"
-    )]
-    pub fn probe_data(&self) -> &[u8] {
-        &self.last_probe
     }
 
     /// [`poll`](Self::poll) under the poll budget of ADR 023 decision 6.
@@ -1033,7 +1010,6 @@ impl<'a> ScanMachine<'a> {
     fn send_probe(&mut self, idx: usize, confirmation: u8) -> ScanAction {
         let channel = self.config.channels[idx];
         self.seq = self.seq.wrapping_add(1);
-        self.last_probe = self.probe_frame(channel);
         ScanAction::SendProbe {
             channel,
             confirmation,
@@ -1992,23 +1968,6 @@ mod tests {
             m.poll(D::ZERO, ScanInput::Reply(stale)),
             ScanAction::AwaitReply { until }
         );
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn probe_data_returns_the_last_encoded_frame() {
-        let mut m = machine(ScanConfig::for_peer().with_channels(&[6]), None);
-        assert_eq!(m.probe_data(), &[super::super::TAG_PROBE, 0, 0]);
-        m.poll(D::ZERO, ScanInput::Start);
-        m.poll(D::ZERO, ScanInput::Completed);
-        m.poll(D::ZERO, ScanInput::Completed);
-        m.poll(D::ZERO, ScanInput::Completed);
-        assert!(matches!(
-            m.poll(D::ZERO, ScanInput::Completed),
-            ScanAction::SendProbe { .. }
-        ));
-        assert_eq!(m.probe_data(), &m.probe_frame(6));
-        assert_eq!(m.probe_data(), &[super::super::TAG_PROBE, 1, 6]);
     }
 
     #[test]

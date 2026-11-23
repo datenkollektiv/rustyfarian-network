@@ -135,22 +135,16 @@
 //!   an IP again, without waiting for a retry timer; builder subscriptions are
 //!   re-issued and [`MqttHandle::connect_count`] bumps once `is_connected()` is
 //!   `true` again.
-//!
-//! [`MqttManager`] is still available but deprecated — use [`MqttBuilder`] for
-//! new code.
 
 use anyhow::Context as _;
 use pennant::PulseEffect;
 use rgb::RGB8;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 // Re-export StatusLed and SimpleLed from pennant for convenience
 pub use pennant::{SimpleLed, StatusLed};
 
-#[allow(deprecated)]
-use juggler::mqtt::connection_wait_iterations;
 use juggler::mqtt::{
     format_broker_url, in_callback, next_state, validate_broker_host, AckOutcome, CallbackScope,
     MqttClient, MqttEvent, NetworkGate, PendingAcks, PendingPublish, SessionInput, SubscribeClient,
@@ -199,24 +193,11 @@ pub use juggler::mqtt::{
 /// `e.downcast_ref::<PublishAckError>()` on the inner `anyhow::Error`.
 pub type TryPublishError = juggler::mqtt::TryPublishError<anyhow::Error>;
 
-/// Poll interval used while waiting for the MQTT broker connection to be confirmed.
-///
-/// Must stay consistent with the 100 ms interval hard-coded in
-/// [`connection_wait_iterations`] — both express the same physical interval.
-const POLL_INTERVAL_MS: u64 = 100;
-
 /// Pause between attempts while the network is up, when
 /// [`MqttConfig::reconnect_timeout_ms`] is unset.
 ///
 /// The same default as the esp-hal tier, so both pace reconnects alike (ADR 022).
 pub const DEFAULT_RECONNECT_TIMEOUT_MS: u64 = 10_000;
-
-/// Stack size for the `MqttManager` (legacy) event loop thread.
-///
-/// The default ESP-IDF pthread stack (3 KiB) is too small for
-/// `EspLogger::should_log`, which walks a `BTreeMap` and overflows the stack.
-/// 8 KiB provides sufficient headroom for the event loop and message callbacks.
-const EVENT_LOOP_STACK_SIZE: usize = 8192;
 
 /// Stack size for the `MqttBuilder` event loop thread (`mqtt-events`).
 ///
@@ -299,8 +280,7 @@ pub const LED_POLL_INTERVAL_MS: u64 = 50;
 pub const ERROR_PULSE_FRAMES: u32 = 20;
 
 use esp_idf_svc::mqtt::client::{
-    Details, EspMqttClient, EspMqttConnection, EventPayload, LwtConfiguration,
-    MqttClientConfiguration, QoS as EspQoS,
+    Details, EspMqttClient, EspMqttConnection, EventPayload, QoS as EspQoS,
 };
 
 /// Error returned by [`MqttHandle::publish_acked`].
@@ -356,289 +336,6 @@ impl std::fmt::Display for PublishAckError {
 }
 
 impl std::error::Error for PublishAckError {}
-
-/// MQTT client manager with automatic connection and event handling.
-///
-/// The manager spawns a background thread to process MQTT events,
-/// which is required for the ESP-IDF MQTT client to function.
-///
-/// When dropped, the manager signals the background thread to shut down.
-/// Use [`publish`](Self::publish) or [`publish_with`](Self::publish_with)
-/// for lifecycle messages instead of the deprecated startup/shutdown helpers.
-#[deprecated(
-    since = "0.7.0",
-    note = "use MqttBuilder (via MqttBuilder::new) instead; MqttManager has no esp-hal \
-            counterpart (ADR 022) and is slated for removal in 1.0"
-)]
-pub struct MqttManager<'a, F>
-where
-    F: Fn(&str, &[u8]) + Send + 'static,
-{
-    client: EspMqttClient<'a>,
-    client_id: String,
-    shutdown: Arc<AtomicBool>,
-    _phantom: std::marker::PhantomData<F>,
-}
-
-#[allow(deprecated)]
-impl<'a, F> MqttManager<'a, F>
-where
-    F: Fn(&str, &[u8]) + Send + 'static,
-{
-    /// Creates a new MQTT manager and connects to the broker.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Connection configuration
-    /// * `incoming_topics` - Topics to subscribe to for incoming messages
-    /// * `on_message` - Callback invoked with `(topic, payload)` when a message
-    ///   is received on any subscribed topic
-    ///
-    /// # Returns
-    ///
-    /// A connected MQTT manager, or an error if the connection fails.
-    ///
-    /// # Deprecation
-    ///
-    /// This constructor does not expose reconnect lifecycle callbacks, making it
-    /// impossible to re-subscribe after an automatic broker reconnect.
-    /// Use [`MqttBuilder`] instead: it handles reconnection transparently and
-    /// avoids the heap-corruption risk that existed in earlier versions of this
-    /// method.
-    #[deprecated(
-        since = "0.2.0",
-        note = "use MqttBuilder (via MqttBuilder::new) instead; \
-                MqttManager::new does not re-subscribe after auto-reconnect"
-    )]
-    pub fn new(
-        config: MqttConfig<'_>,
-        incoming_topics: &[&str],
-        on_message: F,
-    ) -> anyhow::Result<Self> {
-        let topics: Vec<String> = incoming_topics.iter().map(|t| t.to_string()).collect();
-        let client_id = config.client_id.to_string();
-
-        log::info!(
-            "Connecting to MQTT broker at {}:{}",
-            config.host,
-            config.port
-        );
-
-        let lwt_cfg = config.lwt().map(|lwt| LwtConfiguration {
-            topic: lwt.topic(),
-            payload: lwt.payload(),
-            qos: to_esp_qos(lwt.qos()),
-            retain: lwt.retain(),
-        });
-
-        let mqtt_cfg = MqttClientConfiguration {
-            client_id: Some(config.client_id),
-            keep_alive_interval: Some(Duration::from_secs(config.keep_alive_secs.unwrap_or(30))),
-            // esp-idf-svc reads `None` as "auto-reconnect disabled"; `Some(ZERO)` keeps
-            // it on with esp-mqtt's 10 s default.
-            reconnect_timeout: Some(
-                config
-                    .reconnect_timeout_ms
-                    .map_or(Duration::ZERO, Duration::from_millis),
-            ),
-            task_stack: config.task_stack_size,
-            lwt: lwt_cfg,
-            username: config.username(),
-            password: config.password(),
-            ..Default::default()
-        };
-
-        let mqtt_url = format!("mqtt://{}:{}", config.host, config.port);
-        let (client, mut connection) = EspMqttClient::new(&mqtt_url, &mqtt_cfg)?;
-
-        let connected = Arc::new(AtomicBool::new(false));
-        let connected_clone = Arc::clone(&connected);
-        let connection_error = Arc::new(AtomicBool::new(false));
-        let connection_error_clone = Arc::clone(&connection_error);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-
-        // Spawn a background thread for MQTT event processing.
-        std::thread::Builder::new()
-            .stack_size(EVENT_LOOP_STACK_SIZE)
-            .spawn(move || {
-                log::info!("MQTT event loop started");
-                while let Ok(event) = connection.next() {
-                    if shutdown_clone.load(Ordering::Acquire) {
-                        log::info!("MQTT shutdown signal received");
-                        break;
-                    }
-                    match event.payload() {
-                        EventPayload::Connected(_) => {
-                            log::info!("MQTT connected");
-                            connected_clone.store(true, Ordering::Release);
-                        }
-                        EventPayload::Subscribed(id) => {
-                            log::info!("Subscription confirmed (id: {})", id);
-                        }
-                        EventPayload::Received {
-                            data,
-                            topic: Some(topic_str),
-                            ..
-                        } => {
-                            log::debug!("Received on '{}': {:?}", topic_str, data);
-                            on_message(topic_str, data);
-                        }
-                        EventPayload::Error(e) => {
-                            log::error!("MQTT error: {:?}", e);
-                            connection_error_clone.store(true, Ordering::Release);
-                        }
-                        EventPayload::Disconnected => {
-                            log::info!("MQTT disconnected");
-                            connected_clone.store(false, Ordering::Release);
-                            if shutdown_clone.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                log::info!("MQTT event loop exited");
-            })
-            .context("failed to spawn MQTT event loop thread")?;
-
-        let shutdown_for_err = Arc::clone(&shutdown);
-        let mut manager = Self {
-            client,
-            client_id,
-            shutdown,
-            _phantom: std::marker::PhantomData,
-        };
-
-        // Wait for connection
-        let timeout_ms = config.connection_timeout_ms.unwrap_or(5000);
-        let iterations = connection_wait_iterations(timeout_ms);
-        log::info!("Waiting for MQTT connection...");
-
-        let mut connected_within_timeout = false;
-        for _ in 0..iterations {
-            if connected.load(Ordering::Acquire) {
-                log::info!("MQTT connection confirmed");
-                connected_within_timeout = true;
-                break;
-            }
-            if connection_error.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-        }
-
-        if connected_within_timeout {
-            // Subscribe to all topics only when connected — calling subscribe() on an
-            // unconnected EspMqttClient corrupts the ESP-IDF heap.
-            for topic in &topics {
-                validate_subscribe_filter(topic.as_str())
-                    .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
-                manager
-                    .client
-                    .subscribe(topic.as_str(), EspQoS::AtLeastOnce)?;
-                log::info!("Subscribed to '{}'", topic);
-            }
-        } else {
-            log::warn!(
-                "[mqtt] connection failed — skipping subscribe to avoid heap corruption; \
-                 caller should retry after a delay"
-            );
-            shutdown_for_err.store(true, Ordering::Release);
-            return Err(anyhow::anyhow!("MQTT broker unreachable within timeout"));
-        }
-
-        Ok(manager)
-    }
-
-    /// Publishes a message to a topic with QoS 1 and no retain flag.
-    ///
-    /// For full control over QoS and retain, use [`publish_with`](Self::publish_with).
-    pub fn publish(&mut self, topic: &str, payload: &str) -> anyhow::Result<()> {
-        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, false)
-    }
-
-    /// Publishes a retained message with QoS 1.
-    ///
-    /// Convenience wrapper around [`publish_with`](Self::publish_with) for
-    /// messages that should be retained by the broker (e.g. state, online status).
-    pub fn publish_retained(&mut self, topic: &str, payload: &str) -> anyhow::Result<()> {
-        self.publish_with(topic, payload.as_bytes(), QoS::AtLeastOnce, true)
-    }
-
-    /// Publishes a message with explicit QoS and retain control.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The message payload
-    /// * `qos` - Quality of Service level
-    /// * `retain` - Whether the broker should retain this message
-    pub fn publish_with(
-        &mut self,
-        topic: &str,
-        payload: &[u8],
-        qos: QoS,
-        retain: bool,
-    ) -> anyhow::Result<()> {
-        validate_publish_topic(topic)
-            .map_err(|e| anyhow::anyhow!("invalid publish topic: {}", e))?;
-        log::debug!("Publishing to '{}': {:?}", topic, payload);
-        self.client
-            .enqueue(topic, to_esp_qos(qos), retain, payload)?;
-        Ok(())
-    }
-
-    /// Sends a startup notification message.
-    ///
-    /// Publishes "1" to `iot/{client_id}/startup`.
-    #[deprecated(
-        note = "use MqttBuilder::with_startup_message(topic, payload, qos, retain) for automatic startup notifications on every (re)connect, or publish() / publish_with() for custom lifecycle messages"
-    )]
-    pub fn send_startup_message(&mut self) -> anyhow::Result<()> {
-        let topic = format!("iot/{}/startup", self.client_id);
-        self.publish(&topic, "1")
-    }
-
-    /// Returns the client ID.
-    pub fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
-    /// Sends a shutdown notification message.
-    ///
-    /// Publishes "1" to `iot/{client_id}/shutdown`.
-    #[deprecated(note = "use publish() or publish_with() for custom lifecycle messages")]
-    pub fn send_shutdown_message(&mut self) -> anyhow::Result<()> {
-        let topic = format!("iot/{}/shutdown", self.client_id);
-        self.publish(&topic, "1")
-    }
-
-    /// Signals the background thread to shut down.
-    ///
-    /// This is called automatically when the manager is dropped.
-    /// Sends a shutdown notification while still connected, then signals
-    /// the background thread to exit.
-    #[allow(deprecated)]
-    pub fn shutdown(&mut self) {
-        log::info!("Initiating MQTT shutdown");
-        if let Err(e) = self.send_shutdown_message() {
-            log::warn!("Failed to send shutdown message: {:?}", e);
-        }
-        // Then signal the background thread to stop
-        self.shutdown.store(true, Ordering::Release);
-    }
-}
-
-#[allow(deprecated)]
-impl<'a, F> Drop for MqttManager<'a, F>
-where
-    F: Fn(&str, &[u8]) + Send + 'static,
-{
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
 
 // ── Builder API ───────────────────────────────────────────────────────────────
 
@@ -759,7 +456,7 @@ pub struct MqttBuilder<'a> {
     on_disconnect: Option<Box<dyn Fn() + Send + 'static>>,
     on_message: Option<OnMessageCallback>,
     subscribe_topics: Vec<(String, QoS)>,
-    startup: Option<StartupSpec>,
+    startup: Option<StartupMessage>,
 }
 
 impl<'a> MqttBuilder<'a> {
@@ -962,26 +659,12 @@ impl<'a> MqttBuilder<'a> {
         qos: QoS,
         retain: bool,
     ) -> Self {
-        self.startup = Some(StartupSpec::Custom(StartupMessage {
+        self.startup = Some(StartupMessage {
             topic: topic.to_string(),
             payload: payload.to_vec(),
             qos,
             retain,
-        }));
-        self
-    }
-
-    /// Publishes `"1"` to `iot/{client_id}/startup` (QoS 1, not retained) on
-    /// every (re)connect; the behaviour the no-argument
-    /// `with_startup_message()` had before 0.7.0.
-    ///
-    /// Replaces any message set by [`with_startup_message`](Self::with_startup_message).
-    #[deprecated(
-        since = "0.7.0",
-        note = "use with_startup_message(topic, payload, qos, retain), which the esp-hal tier shares"
-    )]
-    pub fn with_default_startup_message(mut self) -> Self {
-        self.startup = Some(StartupSpec::Default);
+        });
         self
     }
 
@@ -1016,7 +699,7 @@ impl<'a> MqttBuilder<'a> {
             validate_subscribe_filter(topic.as_str())
                 .map_err(|e| anyhow::anyhow!("invalid subscribe filter '{}': {}", topic, e))?;
         }
-        if let Some(StartupSpec::Custom(message)) = &self.startup {
+        if let Some(message) = &self.startup {
             validate_publish_topic(&message.topic)
                 .map_err(|e| anyhow::anyhow!("invalid startup-message topic: {}", e))?;
         }
@@ -1096,15 +779,7 @@ impl<'a> MqttBuilder<'a> {
         let on_message = self.on_message;
         let subscription_count = self.subscribe_topics.len();
         let subs = Arc::new(Subscriptions::new(self.subscribe_topics));
-        let startup: Option<StartupMessage> = self.startup.map(|spec| match spec {
-            StartupSpec::Default => StartupMessage {
-                topic: format!("iot/{}/startup", client_id),
-                payload: b"1".to_vec(),
-                qos: QoS::AtLeastOnce,
-                retain: false,
-            },
-            StartupSpec::Custom(message) => message,
-        });
+        let startup: Option<StartupMessage> = self.startup;
 
         // The runner creates the client and hands its event connection over here,
         // so this thread does nothing until the station has an IP.
@@ -1967,12 +1642,4 @@ pub(super) struct StartupMessage {
     pub(super) payload: Vec<u8>,
     pub(super) qos: QoS,
     pub(super) retain: bool,
-}
-
-/// What the builder was asked to publish on connect; the default form needs
-/// the client id, so it is resolved in `build`.
-#[derive(Debug, Clone)]
-enum StartupSpec {
-    Default,
-    Custom(StartupMessage),
 }

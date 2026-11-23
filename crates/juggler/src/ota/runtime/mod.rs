@@ -31,21 +31,15 @@ pub use health::{
     after_unhealthy, deadline_plan, initial_admission, poll_decision, DeadlinePlan, HealthConfig,
     HealthVerdict, PollStep, SlotReading, SlotReads, SlotRetry,
 };
-#[allow(deprecated)]
-pub use health::{HealthAction, HealthEvent, HealthMachine};
 pub use intake::{decide_intake, IntakeDecision, SendResult};
 pub use report::{
     after_publish, completion_step, rejects_delta, CompletionBackoff, CompletionRetryConfig,
     CompletionStep, DeliveryStep, PublishOutcome, PublishStep, ReportPace, ReporterConfig,
 };
-#[allow(deprecated)]
-pub use report::{CompletionRetry, ReporterMachine, ViewStep};
 pub use store_ops::{
     ack_delivered, failed_download, repair_all, retry_completion, rollback_arm, rollback_undo,
     ArmedRollback, CompletionTry, FailedSettle, RepairError, Undone,
 };
-#[allow(deprecated)]
-pub use worker::begin_failure;
 pub use worker::{
     begin_failure_outcome, blocked_report, early_update_block, plan_offer, plan_repair,
     plan_rollback, plan_update_gate, refresh_after_repair, refused_or_absent, repair_status,

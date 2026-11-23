@@ -55,15 +55,14 @@ fn test_psk() -> &'static str {
 
 #[cfg(feature = "wifi")]
 #[test]
-#[allow(deprecated)] // `WifiDriver` stays a public path until it is removed
 fn wifi_public_paths() {
     const TEST_WIFI_SSID: &str = "TestNet";
 
     use juggler::wifi::{
         validate_ap_config, validate_password, validate_ssid, ApConfig, ConnectMode,
-        DisconnectReason, TxPowerLevel, WiFiConfig, WifiDriver, WifiPowerSave, AP_CHANNEL_MAX,
-        AP_CHANNEL_MIN, AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS,
-        PASSWORD_MAX_LEN, POLL_INTERVAL_MS, SSID_MAX_LEN,
+        DisconnectReason, TxPowerLevel, WiFiConfig, WifiPowerSave, AP_CHANNEL_MAX, AP_CHANNEL_MIN,
+        AP_MAX_CONNECTIONS_DEFAULT, AP_PASSWORD_MIN_LEN, DEFAULT_TIMEOUT_SECS, PASSWORD_MAX_LEN,
+        POLL_INTERVAL_MS, SSID_MAX_LEN,
     };
 
     // Constants are reachable.
@@ -125,33 +124,6 @@ fn wifi_public_paths() {
 
     let ap_open = ApConfig::open("OpenNet");
     assert!(validate_ap_config(&ap_open).is_ok());
-
-    // WifiDriver trait is in scope (turbofish would require a concrete type;
-    // just confirm it names a trait by using it as a bound in a local fn).
-    fn _accepts_driver<D: WifiDriver>(_: &D) {}
-}
-
-// ── wifi::mock ────────────────────────────────────────────────────────────────
-
-#[cfg(all(feature = "wifi", feature = "mock"))]
-#[test]
-#[allow(deprecated)] // `WifiDriver` stays a public path until it is removed
-fn wifi_mock_public_paths() {
-    const TEST_WIFI_SSID: &str = "ssid";
-
-    use juggler::wifi::mock::{MockWifiDriver, MockWifiError};
-    use juggler::wifi::WifiDriver;
-
-    let mut drv = MockWifiDriver::new();
-    drv.configure(TEST_WIFI_SSID, test_psk()).unwrap();
-    drv.start().unwrap();
-    drv.connect().unwrap();
-    assert!(drv.is_connected().unwrap());
-    drv.disconnect().unwrap();
-    assert!(!drv.is_connected().unwrap());
-
-    // MockWifiError is reachable.
-    let _: MockWifiError = MockWifiError::ConnectFailed;
 }
 
 // ── mqtt ──────────────────────────────────────────────────────────────────────
@@ -552,11 +524,6 @@ fn espnow_public_paths() {
         juggler::espnow::DEFAULT_REPLY_TIMEOUT,
         core::time::Duration::from_millis(50)
     );
-    // Deprecated for one release, still a public path.
-    #[allow(deprecated)]
-    let legacy = ScanConfig::new(b"probe");
-    #[allow(deprecated)]
-    let _: &[u8] = legacy.probe_data;
 
     // ScanResult.
     let _: ScanResult = ScanResult { channel: 6 };
@@ -802,21 +769,6 @@ fn ota_runtime_public_paths() {
         CompletionStep::Stop
     );
 
-    // The deprecated action machines stay reachable for one release.
-    #[allow(deprecated)]
-    {
-        use juggler::ota::runtime::{
-            HealthAction, HealthEvent, HealthMachine, ReporterMachine, ViewStep,
-        };
-        let mut machine = HealthMachine::new(health);
-        assert_eq!(
-            machine.step(Duration::ZERO, false, HealthEvent::Begin),
-            HealthAction::ReadSlot
-        );
-        let mut machine = ReporterMachine::new(reporter);
-        assert!(machine.report_due(Duration::ZERO));
-        assert_eq!(machine.on_view(Duration::ZERO, true), ViewStep::Publish);
-    }
     assert_eq!(rejects_delta(3, 1), 2);
 
     let mut body = ManifestBody::new(Duration::from_secs(10));
@@ -1072,9 +1024,6 @@ fn espnow_scan_public_paths() {
         tx_channel: 6,
         home_channel: 6,
     });
-    // Deprecated for one release, still a public path.
-    #[allow(deprecated)]
-    let _: &[u8] = machine.probe_data();
 
     let t = Duration::ZERO;
     assert_eq!(machine.poll(t, ScanInput::Start), ScanAction::RemovePeer);
