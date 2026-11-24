@@ -103,7 +103,7 @@ espnow = ["juggler/wifi", "juggler/espnow", "juggler/std", "juggler/embassy"]
 # ota: Streaming download + SHA-256 verify + partition swap, the NVS record store and the decisions.
 ota = ["juggler/ota", "dep:embedded-svc"]
 
-# ota-wire: the MQTT OTA wire contract (command, manifest, status JSON); with `mqtt`, also the
+# ota-wire: deprecated since 0.8.0, use the DDI client (`ota-ddi`). The MQTT OTA wire contract (command, manifest, status JSON); with `mqtt`, also the
 # MQTT OTA consumer runtime (`ota::runtime`, `OtaSubmitter`). Same name as the esp-hal tier's feature.
 ota-wire = ["ota", "juggler/ota-wire"]
 

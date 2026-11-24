@@ -173,7 +173,8 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 - [x] IDF DDI transport
 - [x] IDF DDI runtime (`ota::ddi` worker, download thread, health hook, nudge)
 - [ ] TLS round (S1 to S4): HTTPS with the compiled-in CA, the clock gate, `mqtts://` for the nudge, stack and heap measured on C3 and C6; accepted per the HTTPS acceptance row
-- [ ] MQTT OTA wire and runtime deprecated when the DDI client ships, then removed
+- [x] MQTT OTA wire and runtime deprecated in 0.8.0 (2026-11-24 maintainer decision, ahead of TLS; ADR 018 amendment 2026-11-24)
+- [ ] MQTT OTA wire and runtime removed in a later release (no version fixed)
 - [x] Host tests and the conformance scenario list (T12): one host test per §7 device row in `crates/juggler/src/ota/ddi/scenarios.rs`, run by `just test-ota`; the rows that cannot run on the host (S-TLS-02 among them) and seven harness expectations this client meets differently are tabled in its header
 - [ ] Bench reject pattern for the DDI token in the serial capture of `c3/ddi` and `c6/ddi` (FR-B acceptance: the token never appears in serial logs; no bench step checks it yet)
 - [x] Hardware tests on C3 and C6 against a lab DDI server
@@ -199,3 +200,4 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 - 2026-11-22 — Host-test record (T12) tables S-TLS-02 (untrusted CA, wrong name, expired certificate) as covered by the TLS round S1 to S4, and records harness difference F7: the fleet harness refuses a nudge host without the build-time opt-in at start (`mqtt_without_opt_in`), but this client's nudge rides on the app's MQTT session, which the IDF tier always opens as `mqtt://` with no opt-in, so `mqtts://` for the nudge is the TLS round.
 - 2026-11-23 — Local lab hardware passed on both boards: C3 Super Mini `idf_c3_ddi` 20/20 and C6 DevKitC-1 `idf_c6_ddi` 20/20, with the proxy `Host` listener-port fix and a 180 s tampered-step timeout on both boards.
 - 2026-11-23 — FR-B follow-up timing review: the post-boot `proceeding` is sent once and lost on any failure (bug 023); open questions added for the download-deadline bound against T and the RAM-only 1005 marker; a State item added for the bench token reject pattern.
+- 2026-11-24 — MQTT OTA wire and runtime deprecated in 0.8.0 ahead of TLS (maintainer decision, ADR 018 amendment 2026-11-24); removal version left open.

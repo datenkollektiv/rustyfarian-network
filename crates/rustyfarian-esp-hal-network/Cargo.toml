@@ -83,7 +83,7 @@ ota = [
     "embassy",
 ]
 
-# ota-wire: opt-in OTA wire contract (command/manifest/status JSON). Pulls serde, serde_json and `alloc`;
+# ota-wire: deprecated since 0.8.0 (the MQTT OTA wire; use the DDI client, ADR 022 gap on this tier). Opt-in OTA wire contract (command/manifest/status JSON). Pulls serde, serde_json and `alloc`;
 # the consumer must provide a global allocator (`wifi` brings `esp-alloc`).
 ota-wire = ["ota", "juggler/ota-wire"]
 

@@ -25,7 +25,7 @@ lora = ["dep:heapless", "dep:nb", "dep:lorawan-device", "dep:sx126x", "dep:embed
 espnow = ["wifi"]
 # `ota` includes the record store (`ota::persist`), the reason codes, without their serde impls, and the pure health policy (`ota::health`).
 ota = ["dep:heapless", "dep:sha2"]
-# MQTT OTA wire contract (command, manifest, status JSON) and the consumer runtime machines. Needs alloc; the base `ota` feature stays alloc-free.
+# Deprecated since 0.8.0, use the DDI client (`ota-ddi`): MQTT OTA wire contract (command, manifest, status JSON) and the consumer runtime machines. Needs alloc; the base `ota` feature stays alloc-free.
 ota-wire = ["ota", "dep:serde", "dep:serde_json"]
 # The sans-IO DDI client (`ota::ddi`: poll, admission, feedback, cancel, settings) and its JSON codec
 # (`ota::ddi::wire`): poll, deployment and cancel documents, the feedback encoder and the profile codes.

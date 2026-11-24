@@ -59,6 +59,7 @@ pub use juggler::ota::{
 
 // The wire contract needs `alloc` + serde, so on this tier it is opt-in via `ota-wire`.
 #[cfg(any(feature = "ota-wire", test))]
+#[allow(deprecated)]
 pub use juggler::ota::{
     note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition, slot_from_label,
     slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings, BusyRetry, BusyTally,
@@ -75,8 +76,10 @@ pub use juggler::ota::{DeadlineAction, HealthVerdict};
 
 // The consumer runtime's pure state machines and configuration (feature `ota-wire`).
 #[cfg(any(feature = "ota-wire", test))]
+#[allow(deprecated)]
 pub use juggler::ota::runtime;
 #[cfg(any(feature = "ota-wire", test))]
+#[allow(deprecated)]
 pub use juggler::ota::{
     ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
@@ -127,6 +130,7 @@ pub const TARGET_CHIP: &str = "esp32s3";
 // Runs on the host via `just test-ota-hal` (`cargo test --no-default-features`,
 // which sets `cfg(test)` and so pulls this module in without the ESP deps).
 #[cfg(test)]
+#[allow(deprecated)]
 mod reexport_parity_guard {
     #[test]
     fn ota_public_surface_is_reexported_from_this_crate() {

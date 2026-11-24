@@ -21,6 +21,7 @@ use crate::ota::Version;
 pub const DDI_MIN_STACK_BYTES: usize = 12288;
 
 #[cfg(all(feature = "ota-wire", feature = "ota-ddi"))]
+#[allow(deprecated)]
 const _: () = assert!(DDI_MIN_STACK_BYTES == crate::ota::runtime::MIN_WORKER_STACK_BYTES);
 
 /// Experimental: API may change before 1.0.

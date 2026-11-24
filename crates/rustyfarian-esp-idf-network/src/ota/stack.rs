@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// The health policy runs on the app's own thread and is not tracked here.
 /// The DDI runtime reports its own threads in `ota::ddi::DdiStackMarks`.
 #[cfg(all(feature = "ota-wire", feature = "mqtt"))]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StackMarks {
     /// Least free bytes of the `ota-worker` thread.

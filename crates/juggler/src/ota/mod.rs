@@ -27,6 +27,10 @@ pub mod metadata;
 pub mod persist;
 pub mod reconcile;
 #[cfg(feature = "ota-wire")]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub mod runtime;
 pub mod state;
 pub mod verifier;
@@ -57,6 +61,7 @@ pub use persist::{
 };
 pub use reconcile::{reconcile, AttemptRecord, BootFacts, ReconcileAction, SlotId, SlotState};
 #[cfg(feature = "ota-wire")]
+#[allow(deprecated)]
 pub use runtime::{
     ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
@@ -64,6 +69,7 @@ pub use state::OtaState;
 pub use verifier::{bytes_to_hex, hex_to_bytes, StreamingVerifier};
 pub use version::Version;
 #[cfg(feature = "ota-wire")]
+#[allow(deprecated)]
 pub use wire::{
     CommandError, Manifest, ManifestError, OtaCommand, OtaStatus, StatusError, MAX_COMMAND_BYTES,
     MAX_MANIFEST_BYTES,

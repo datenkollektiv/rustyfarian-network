@@ -37,6 +37,8 @@
 //!
 //! The record store sits behind one mutex that is only taken through short closures that contain store calls and nothing else; never across HTTP, `OtaSession`, hardware reads, sleeps, publishes or channel operations.
 
+#![allow(deprecated)]
+
 mod health;
 mod intake;
 mod manifest;

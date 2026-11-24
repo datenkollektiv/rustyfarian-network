@@ -14,6 +14,10 @@ use crate::ota::{ImageMetadata, OtaError};
 ///
 /// Largest accepted manifest body in bytes.
 /// A larger body is rejected before any parsing.
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub const MAX_MANIFEST_BYTES: usize = 1024;
 
 /// Experimental: API may change before 1.0.
@@ -37,6 +41,10 @@ pub const MAX_MANIFEST_BYTES: usize = 1024;
 /// assert!(manifest.image_metadata().is_ok());
 /// ```
 #[derive(Clone, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub struct Manifest {
     /// Firmware version, `major.minor.patch`.
     pub version: String,
@@ -74,6 +82,10 @@ impl fmt::Debug for Manifest {
 /// Why a manifest was rejected.
 /// Carries no payload text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub enum ManifestError {
     /// The body exceeds [`MAX_MANIFEST_BYTES`].
     TooLarge,

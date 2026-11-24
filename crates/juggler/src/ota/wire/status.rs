@@ -39,6 +39,10 @@ use super::rollback::RollbackReason;
 /// An unknown `failed` reason code is an error, an unknown `rolled_back` label is an error as well, and `download_failed` comes back as `DownloadFailed { status: 0 }` because the status is not on the wire (the bytes still round-trip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub enum OtaStatus<'a> {
     /// The download has started.
     Downloading,
@@ -246,6 +250,10 @@ impl<'de> Deserialize<'de> for OtaStatus<'de> {
 /// It cannot occur for [`OtaStatus`]: every field is a string, an integer or a unit variant, which `serde_json` writes to a `String` without any fallible step, so the error path is unreachable in practice.
 /// Even if it did occur, the underlying error could echo content, so it is dropped rather than exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub struct StatusError;
 
 impl fmt::Display for StatusError {

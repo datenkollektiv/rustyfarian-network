@@ -13,11 +13,19 @@ pub use crate::ota::health::DeadlineAction;
 ///
 /// The ESP-IDF pthread default (3 KiB) overflows with the default logger, so anything below this is refused.
 /// The worker needs more: see [`MIN_WORKER_STACK_BYTES`].
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub const MIN_STACK_BYTES: usize = 4096;
 
 /// The smallest accepted worker stack in bytes.
 ///
 /// Covers the 4 KiB download buffer, the 1 KiB manifest buffer and the HTTP client, SHA-256 and logging frames.
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub const MIN_WORKER_STACK_BYTES: usize = 12288;
 
 /// The largest accepted `reject_queue_depth`.
@@ -40,6 +48,10 @@ const FLEET_OTA_ROOT: &str = "rustyfarian/ota";
 
 /// Stack sizes of the runtime threads, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub struct OtaStacks {
     /// The worker thread: manifest fetch, download, flash.
     pub worker_bytes: usize,
@@ -59,6 +71,10 @@ impl Default for OtaStacks {
 
 /// Every time and count the runtime uses; all fields are public so an app (or a demo build) can override single values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub struct OtaTimings {
     /// Per network operation timeout of the manifest fetch (`esp_http_client`).
     pub manifest_per_op: Duration,
@@ -167,6 +183,10 @@ impl From<&OtaTimings> for HealthConfig {
 
 /// Why a configuration was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub enum ConfigError {
     /// A duration that must not be zero is zero; carries the field name.
     ZeroDuration(&'static str),
@@ -235,6 +255,10 @@ fn topic_reserved(topic: &str) -> bool {
 ///
 /// The ESP-IDF tier wraps it with the restart callback in `OtaConfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub struct OtaSettings {
     /// The topic the runtime subscribes to for commands; no wildcard, never under `rustyfarian/ota/#`.
     pub command_topic: String,
