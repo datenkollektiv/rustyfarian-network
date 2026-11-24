@@ -24,7 +24,15 @@ set -euo pipefail
 #   watch [action-id]                        that line whenever it changes, polled every 2 s, until killed (a bench probe)
 #   nudge                                    publish the MQTT poll-now nudge on rustyfarian/ota/<id>/nudge
 #   proxy                                    run the lab proxy the device's DDI_BASE_URL points at (scripts/ddi-lab-proxy.py)
-#   proxy-wait                               wait up to 10 s until the proxy answers on loopback (a bench setup step)
+#   proxy-wait                               wait up to 10 s until the proxy answers on loopback
+#   proxy-acquire <user>                     register <user> (a bench run, e.g. c3) and start the proxy unless it answers already
+#   proxy-release <user>                     drop <user>; the proxy is stopped once no user is left
+#
+# Bench checks share one proxy: runs on two boards at once each acquire it in their setup and release it in their
+# teardown, so the run that ends first leaves it up for the other. A run that died without its teardown leaves its
+# user file in tmp/bench-ddi-proxy.users/; delete that directory to let the next release stop the proxy.
+# A release stops only the proxy a bench run started (its PIDs are in tmp/bench-ddi-proxy.pid); a proxy that was
+# already answering at the first acquire, e.g. one started by hand with `just ddi-proxy`, is borrowed and left running.
 #
 # `--tampered` names the module, the set and the artifact `<bundle>-tampered`; the lab proxy flips one byte of such an
 # artifact, so the device reports 1002 checksum_mismatch (the server itself verifies every upload). `--downgrade-allowed`
@@ -598,17 +606,92 @@ cmd_proxy() {
     exec python3 -u "$workspace_root/scripts/ddi-lab-proxy.py" "$port" "$upstream" "$rate"
 }
 
+# Whether the DDI lab proxy itself listens on the port: its health path answers with a fixed body no other server sends.
+proxy_healthy() {
+    [ "$(curl -s --max-time 2 "http://127.0.0.1:$1/ddi-lab-proxy/health" || true)" = "ddi-lab-proxy" ]
+}
+
 cmd_proxy_wait() {
-    local port="${DDI_LAB_PROXY_PORT:-8090}" code
+    local port="${DDI_LAB_PROXY_PORT:-8090}"
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        code="$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
-        if [ "$code" != "000" ] && [ -n "$code" ]; then
-            echo "proxy answers on 127.0.0.1:$port (HTTP $code)"
+        if proxy_healthy "$port"; then
+            echo "proxy answers on 127.0.0.1:$port"
             return 0
         fi
         sleep 1
     done
-    die "the proxy does not answer on 127.0.0.1:$port after 10 s (see tmp/bench-ddi-proxy.log)"
+    die "the DDI lab proxy does not answer on 127.0.0.1:$port after 10 s (see tmp/bench-ddi-proxy.log)"
+}
+
+proxy_users="$workspace_root/tmp/bench-ddi-proxy.users"
+proxy_lock="$workspace_root/tmp/bench-ddi-proxy.lock"
+# PIDs of the proxy a bench run started; absent while the runs borrow a proxy somebody else started.
+proxy_pids="$workspace_root/tmp/bench-ddi-proxy.pid"
+
+proxy_running_pids() {
+    pgrep -f '[s]cripts/ddi-lab-proxy.py' || true
+}
+
+# Serialises acquire and release, so a release never stops the proxy another run has just found alive.
+proxy_locked() {
+    local user="${2:-}" tries=0
+    [[ "$user" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "usage: ddi-lab.sh proxy-acquire|proxy-release <user> (lower-case letters, digits, dashes)"
+    mkdir -p "$workspace_root/tmp"
+    until mkdir "$proxy_lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 30 ] || die "tmp/bench-ddi-proxy.lock is held for 30 s; remove it if no bench run is starting or ending"
+        sleep 1
+    done
+    trap 'rmdir "$proxy_lock" 2>/dev/null || true' EXIT
+    "$1" "$user"
+}
+
+proxy_acquire() {
+    local port="${DDI_LAB_PROXY_PORT:-8090}" code
+    mkdir -p "$proxy_users"
+    : > "$proxy_users/$1"
+    if proxy_healthy "$port"; then
+        echo "proxy already answers on 127.0.0.1:$port, shared with: $(ls "$proxy_users" | tr '\n' ' ')"
+        return 0
+    fi
+    code="$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
+    if [ "$code" != "000" ] && [ -n "$code" ]; then
+        rm -f "$proxy_users/$1"
+        die "127.0.0.1:$port answers HTTP $code but is not the DDI lab proxy (or one started before it had a health path): stop that listener or set DDI_LAB_PROXY_PORT"
+    fi
+    local before pid
+    before="$(proxy_running_pids)"
+    rm -f "$proxy_pids"
+    (cd "$workspace_root" && nohup just ddi-proxy > tmp/bench-ddi-proxy.log 2>&1 &)
+    if ! (cmd_proxy_wait); then
+        rm -f "$proxy_users/$1"
+        exit 1
+    fi
+    # Only the processes this start added are ours to stop.
+    for pid in $(proxy_running_pids); do
+        grep -qx "$pid" <<<"$before" || echo "$pid" >> "$proxy_pids"
+    done
+}
+
+proxy_release() {
+    rm -f "$proxy_users/$1"
+    if [ -n "$(ls -A "$proxy_users" 2>/dev/null)" ]; then
+        echo "proxy left running for: $(ls "$proxy_users" | tr '\n' ' ')"
+        return 0
+    fi
+    if [ ! -f "$proxy_pids" ]; then
+        echo "proxy was not started by a bench run, left running"
+        return 0
+    fi
+    local pid
+    while read -r pid; do
+        # The PID may have been reused since: stop it only while it still is the proxy.
+        if [[ "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" -o command= 2>/dev/null | grep -q 'scripts/ddi-lab-proxy.py'; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done < "$proxy_pids"
+    rm -f "$proxy_pids"
+    echo "proxy stopped"
 }
 
 case "$command" in
@@ -626,6 +709,8 @@ case "$command" in
     nudge) require_controller; publish_nudge ;;
     proxy) cmd_proxy "$@" ;;
     proxy-wait) cmd_proxy_wait "$@" ;;
+    proxy-acquire) proxy_locked proxy_acquire "${1:-}" ;;
+    proxy-release) proxy_locked proxy_release "${1:-}" ;;
     -h|--help|help) usage ;;
     *)
         printf 'Error: unknown command "%s"\n' "$command" >&2

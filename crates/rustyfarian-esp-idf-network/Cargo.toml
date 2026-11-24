@@ -16,7 +16,7 @@ exclude = ["examples/idf_esp32s3_mqtt_lwt.rs", "examples/idf_c3_espnow_coordinat
 
 [package.metadata.docs.rs]
 default-target = "riscv32imc-esp-espidf"
-features = ["wifi", "mqtt", "lora", "espnow", "ota", "ota-wire", "ota-ddi", "ota-ddi-bench-mqtt-wire", "provisioning"]
+features = ["wifi", "mqtt", "lora", "espnow", "ota", "ota-ddi", "provisioning"]
 # Note: docs.rs will use its own esp-idf build environment; the esp-idf-sys
 # crate is pre-built by docs.rs when the target is recognized.
 
@@ -100,12 +100,8 @@ lora = [
 # `juggler/embassy` brings `espnow::EmbassyClock` for `PeerSession` (no time driver is selected).
 espnow = ["juggler/wifi", "juggler/espnow", "juggler/std", "juggler/embassy"]
 
-# ota: Streaming download + SHA-256 verify + partition swap, the NVS record store and the decisions.
+# ota: boot-slot control (mark valid, roll back), the NVS record store and the decisions; downloads need `ota-ddi`.
 ota = ["juggler/ota", "dep:embedded-svc"]
-
-# ota-wire: deprecated since 0.8.0, use the DDI client (`ota-ddi`). The MQTT OTA wire contract (command, manifest, status JSON); with `mqtt`, also the
-# MQTT OTA consumer runtime (`ota::runtime`, `OtaSubmitter`). Same name as the esp-hal tier's feature.
-ota-wire = ["ota", "juggler/ota-wire"]
 
 # ota-ddi: the credential-bound DDI transport and runtime (ADR 027), blocking on this tier.
 ota-ddi = ["ota", "juggler/ota-ddi"]
@@ -113,14 +109,6 @@ ota-ddi = ["ota", "juggler/ota-ddi"]
 # ota-ddi-insecure-http: lab opt-in that lets the DDI transport use an `http://` base URL.
 # Release images leave it out; the transport logs a WARN once per boot when it is used.
 ota-ddi-insecure-http = ["ota-ddi"]
-
-# ota-ddi-bench-mqtt-wire: bench-only opt-in that lets `ota-wire` (the MQTT OTA wire and, with `mqtt`,
-# its runtime) build next to `ota-ddi`. Without it the pair is a compile error (`src/lib.rs`): a release
-# image accepts no install, rollback or repair command over MQTT, and DDI is the only network path that
-# installs an image (fleet DDI profile 0.4.0 §1, ADR 018 amendment 2026-11-22). An image made solely for
-# the bench may enable it; it then takes MQTT OTA commands only from a topic that only the server
-# principal may write, never under `rustyfarian/ota/#`.
-ota-ddi-bench-mqtt-wire = ["ota-ddi", "ota-wire"]
 
 # provisioning: SoftAP captive portal.
 provisioning = ["wifi", "juggler/provisioning", "juggler/std", "dep:embedded-svc"]
@@ -231,10 +219,6 @@ required-features = ["provisioning"]
 [[example]]
 name = "idf_c3_provision_mqtt"
 required-features = ["wifi", "mqtt", "provisioning"]
-
-[[example]]
-name = "idf_c3_ota_runtime"
-required-features = ["wifi", "mqtt", "ota-wire"]
 
 [[example]]
 name = "idf_c3_ddi"

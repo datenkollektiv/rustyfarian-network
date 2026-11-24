@@ -9,7 +9,7 @@ use juggler::ota::{CancelRequest, OtaError};
 
 /// Experimental: API may change before 1.0.
 ///
-/// The cancel switch of one `EspHalOtaManager::fetch_and_apply_cancellable` call, shared with the task that cancels.
+/// The cancel switch of one download, shared with the task that cancels.
 ///
 /// [`cancel`](Self::cancel) answers [`CancelRequest::Accepted`] until the download is handed the permit to activate the new slot, and [`CancelRequest::TooLate`] once that happened or the download ended.
 /// An accepted cancel stops the download at its next step boundary (before the partition is prepared, after a read or a write, or right before the otadata activation write): the call returns `OtaError::Cancelled` and the boot slot is unchanged.
@@ -90,6 +90,7 @@ impl OtaCancel {
     #[cfg_attr(
         not(all(
             feature = "embassy",
+            feature = "ota-ddi",
             any(
                 feature = "esp32c3",
                 feature = "esp32c6",
@@ -97,7 +98,10 @@ impl OtaCancel {
                 feature = "esp32s3"
             )
         )),
-        allow(dead_code, reason = "only the chip build's manager drives a download")
+        allow(
+            dead_code,
+            reason = "only the chip build's manager drives a download, for the DDI client"
+        )
     )]
     pub(crate) fn poll(
         &self,
@@ -106,6 +110,33 @@ impl OtaCancel {
         elapsed: Duration,
     ) -> Result<DownloadAction, OtaError> {
         self.with(|gate| gate.poll(machine, input, elapsed))
+    }
+
+    /// Whether the download has to stop between two steps of the slot preparation (the sector-wise erase): an accepted cancel or an expired deadline.
+    ///
+    /// `Err` is the end of the download, with the error a cancel or deadline during the body gives (`Cancelled`, `DownloadTimeout`); see `DownloadMachine::check_preparing`.
+    #[cfg_attr(
+        not(all(
+            feature = "embassy",
+            feature = "ota-ddi",
+            any(
+                feature = "esp32c3",
+                feature = "esp32c6",
+                feature = "esp32",
+                feature = "esp32s3"
+            )
+        )),
+        allow(
+            dead_code,
+            reason = "only the chip build's manager erases sector by sector"
+        )
+    )]
+    pub(crate) fn check_preparing(
+        &self,
+        machine: &mut DownloadMachine,
+        elapsed: Duration,
+    ) -> Result<(), OtaError> {
+        self.with(|gate| gate.check_preparing(machine, elapsed))
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut CancelGate) -> R) -> R {
@@ -183,5 +214,54 @@ mod tests {
         let cancel = OtaCancel::for_retries();
         assert!(!cancel.close());
         assert_eq!(cancel.cancel(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn a_cancel_between_erase_steps_ends_with_the_cancel_error() {
+        let cancel = OtaCancel::new();
+        let mut machine = DownloadMachine::new(Deadline::none(), Duration::from_secs(1), [0; 32]);
+        cancel
+            .poll(&mut machine, DownloadInput::Begin, Duration::ZERO)
+            .unwrap();
+        let headers = DownloadInput::Headers {
+            content_length: Some(10),
+            chunked: false,
+            capacity: 4096,
+        };
+        assert!(matches!(
+            cancel.poll(&mut machine, headers, Duration::ZERO),
+            Ok(DownloadAction::Prepare { len: 10 })
+        ));
+        assert_eq!(cancel.check_preparing(&mut machine, Duration::ZERO), Ok(()));
+        assert_eq!(cancel.cancel(), CancelRequest::Accepted);
+        assert_eq!(
+            cancel.check_preparing(&mut machine, Duration::ZERO),
+            Err(OtaError::Cancelled)
+        );
+        assert_eq!(cancel.cancel(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn the_deadline_between_erase_steps_ends_with_the_timeout_error() {
+        let cancel = OtaCancel::new();
+        let deadline = Deadline::after(Duration::from_secs(5));
+        let mut machine = DownloadMachine::new(deadline, Duration::from_secs(1), [0; 32]);
+        cancel
+            .poll(&mut machine, DownloadInput::Begin, Duration::ZERO)
+            .unwrap();
+        let headers = DownloadInput::Headers {
+            content_length: Some(10),
+            chunked: false,
+            capacity: 4096,
+        };
+        cancel.poll(&mut machine, headers, Duration::ZERO).unwrap();
+        assert_eq!(
+            cancel.check_preparing(&mut machine, Duration::from_secs(4)),
+            Ok(())
+        );
+        assert_eq!(
+            cancel.check_preparing(&mut machine, Duration::from_secs(5)),
+            Err(OtaError::DownloadTimeout)
+        );
     }
 }

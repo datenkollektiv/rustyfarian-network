@@ -20,7 +20,7 @@ set -euo pipefail
 # (32 KB MMU page mismatch). The bootloader esp-idf-sys builds for the pinned ESP-IDF
 # (.cargo/config.toml) boots both.
 #
-# c6 builds idf_c6_mqtt (idf_c6_ddi for --ota) and esp32 builds idf_esp32_mqtt. A missing RISC-V bootloader (c3, c6) is
+# c3 builds idf_c3_connect (idf_c3_ddi for --ota), c6 builds idf_c6_mqtt (idf_c6_ddi for --ota) and esp32 builds idf_esp32_mqtt. A missing RISC-V bootloader (c3, c6) is
 # non-fatal for the generic variant: flash.sh then falls back to the espflash bundled one.
 # A missing Xtensa bootloader and any missing --ota bootloader are fatal, because the
 # bundled bootloader is not a safe fallback there (and not rollback-enabled).
@@ -68,7 +68,7 @@ case "$chip" in
     c3)
         idf_target="riscv32imc-esp-espidf"
         mcu="esp32c3"
-        if [ "$variant" = "ota" ]; then example="idf_c3_ota_runtime"; else example="idf_c3_connect"; fi
+        if [ "$variant" = "ota" ]; then example="idf_c3_ddi"; else example="idf_c3_connect"; fi
         ;;
     c6)
         idf_target="riscv32imac-esp-espidf"

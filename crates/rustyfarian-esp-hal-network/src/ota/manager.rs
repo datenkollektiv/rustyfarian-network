@@ -3,29 +3,36 @@
 //!
 //! This module is compiled only when both a chip feature (`esp32c3`,
 //! `esp32c6`, `esp32`, or `esp32s3`) **and** the `embassy` feature are active.
+//! Boot-slot control needs nothing more; the download machinery is the DDI client's and is compiled with `ota-ddi`.
 
+#[cfg(feature = "ota-ddi")]
 use core::time::Duration as CoreDuration;
 
-use core::net::Ipv4Addr;
+#[cfg(feature = "ota-ddi")]
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{IpAddress, IpEndpoint};
+#[cfg(feature = "ota-ddi")]
+use embassy_net::IpEndpoint;
+#[cfg(feature = "ota-ddi")]
 use embassy_time::{with_timeout, Duration, Instant};
+#[cfg(feature = "ota-ddi")]
 use embedded_storage::nor_flash::NorFlash;
-use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
 use esp_bootloader_esp_idf::partitions::{
-    read_partition_table, AppPartitionSubType, DataPartitionSubType, FlashRegion, NorFlashRegion,
-    PartitionType, PARTITION_TABLE_MAX_LEN,
+    read_partition_table, AppPartitionSubType, DataPartitionSubType, FlashRegion, PartitionType,
+    PARTITION_TABLE_MAX_LEN,
 };
+#[cfg(feature = "ota-ddi")]
+use esp_bootloader_esp_idf::partitions::{NorFlashRegion, PartitionEntry, PartitionTable};
 use esp_storage::FlashStorage;
-use juggler::ota::download::{
-    DownloadAction, DownloadInput, DownloadMachine, ImageChip, IMAGE_HEADER_LEN,
-};
+#[cfg(feature = "ota-ddi")]
+use juggler::ota::download::{DownloadAction, DownloadInput, DownloadMachine, IMAGE_HEADER_LEN};
+#[cfg(feature = "ota-ddi")]
 use juggler::ota::{
-    classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, OtaError, SlotId,
-    StreamingVerifier,
+    classify_read_error, round_up, ActivationPermit, ChunkAligner, Deadline, StreamingVerifier,
 };
+use juggler::ota::{OtaError, SlotId};
 
 use super::activation::{self, Entry, OtadataSectors};
+#[cfg(feature = "ota-ddi")]
 use super::cancel::OtaCancel;
 #[cfg(feature = "ota-ddi")]
 use super::ddi::plan::DdiGate;
@@ -33,21 +40,23 @@ use super::ddi::plan::DdiGate;
 use super::ddi::resolve::{resolve, ResolveError};
 #[cfg(feature = "ota-ddi")]
 use super::flash::SharedFlash;
-use super::http::async_client::fetch_get;
 #[cfg(feature = "ota-ddi")]
 use super::http::async_client::send_and_read_head;
 #[cfg(feature = "ota-ddi")]
 use super::http::ddi::{download_headers, request_head, Method, ACCEPT_FIRMWARE};
+#[cfg(feature = "ota-ddi")]
 use super::http::parse_url;
 #[cfg(feature = "ota-ddi")]
 use juggler::ota::ddi::{CheckedUrl, RetryAfter};
 
 /// Converts an `embassy_time` duration (microsecond-exact) to `core`.
+#[cfg(feature = "ota-ddi")]
 pub(crate) fn to_core(d: Duration) -> CoreDuration {
     CoreDuration::from_micros(d.as_micros())
 }
 
 /// Converts a `core` duration to `embassy_time`, saturating at the maximum.
+#[cfg(feature = "ota-ddi")]
 pub(crate) fn to_embassy(d: CoreDuration) -> Duration {
     // Capped well below `u64::MAX` so `Instant::now() + d` in `with_timeout`
     // cannot overflow.
@@ -56,14 +65,17 @@ pub(crate) fn to_embassy(d: CoreDuration) -> Duration {
 }
 
 /// Bytes requested per socket read.
+#[cfg(feature = "ota-ddi")]
 const CHUNK_LEN: usize = 512;
 
 /// How long a failed download waits for the RST of the aborted socket to leave before it returns.
+#[cfg(feature = "ota-ddi")]
 const ABORT_FLUSH_WAIT: Duration = Duration::from_millis(500);
 
 /// A socket read buffer whose start is word-aligned, so a NOR driver writes
 /// from it without copying through a sector-sized temporary.
 #[repr(align(4))]
+#[cfg(feature = "ota-ddi")]
 struct ChunkBuf([u8; CHUNK_LEN]);
 
 /// Where downloaded bytes go.
@@ -75,6 +87,7 @@ struct ChunkBuf([u8; CHUNK_LEN]);
 /// is written through the non-erasing `NorFlash` view.
 /// An encrypted partition keeps the read-modify-write path, because the ROM
 /// encrypts whole sectors and the plain view is not available for it.
+#[cfg(feature = "ota-ddi")]
 enum Sink<'r, 'a, 'd> {
     /// Read-modify-erase-write; accepts any offset and length.
     ReadModifyWrite(&'r mut FlashRegion<'a, 'd>),
@@ -82,7 +95,6 @@ enum Sink<'r, 'a, 'd> {
     Nor(NorFlashRegion<'r, 'a, 'd>),
     /// The firmware's [`SharedFlash`], borrowed for one write at a time; erased once by the
     /// caller, written at `base` plus the image offset (absolute flash offsets).
-    #[cfg(feature = "ota-ddi")]
     Shared {
         flash: &'static SharedFlash,
         base: u32,
@@ -97,15 +109,6 @@ enum FlashHandle<'d> {
     /// operation at a time and never across an `.await`.
     #[cfg(feature = "ota-ddi")]
     Shared(&'static SharedFlash),
-}
-
-/// What a download fetches.
-enum Source<'s> {
-    /// The URL of a public `fetch_and_apply*` call: a plain GET to an IPv4 literal.
-    Plain(&'s str),
-    /// A DDI artifact ([`EspHalOtaManager::fetch_ddi`]).
-    #[cfg(feature = "ota-ddi")]
-    Ddi(DdiFetch<'s>),
 }
 
 /// One DDI artifact fetch, the crate-private seam of the DDI transport's `download`.
@@ -145,7 +148,8 @@ pub(super) fn ota_app_count(
 ///
 /// The only place that changes the boot selection; the permit parameter makes
 /// a timed-out download unable to reach it.
-/// `pt_buf` is free again once the `OtaUpdater` that borrowed it is dropped.
+/// `pt_buf` is free again once the table read from it is no longer used.
+#[cfg(feature = "ota-ddi")]
 fn activate(
     flash: &mut FlashStorage<'_>,
     pt_buf: &mut [u8; PARTITION_TABLE_MAX_LEN],
@@ -248,6 +252,7 @@ impl OtadataSectors for Otadata<'_, '_, '_> {
 }
 
 /// Writes one chunk at `offset` through the selected path.
+#[cfg(feature = "ota-ddi")]
 fn write_chunk(
     sink: &mut Sink<'_, '_, '_>,
     aligner: &mut ChunkAligner,
@@ -270,7 +275,6 @@ fn write_chunk(
                 log::error!("Flash write failed: {:?}", e);
                 OtaError::FlashWriteFailed
             }),
-        #[cfg(feature = "ota-ddi")]
         Sink::Shared { flash, base } => {
             let mut nor: &SharedFlash = flash;
             aligner
@@ -284,6 +288,7 @@ fn write_chunk(
 }
 
 /// Writes the tail the aligner held back (the `NorFlash` path only).
+#[cfg(feature = "ota-ddi")]
 fn flush_tail(
     sink: &mut Sink<'_, '_, '_>,
     aligner: &mut ChunkAligner,
@@ -296,7 +301,6 @@ fn flush_tail(
                 log::error!("OTA: final flash write failed: {:?}", e);
                 OtaError::FlashWriteFailed
             }),
-        #[cfg(feature = "ota-ddi")]
         Sink::Shared { flash, base } => {
             let mut nor: &SharedFlash = flash;
             aligner
@@ -311,6 +315,7 @@ fn flush_tail(
 }
 
 /// Feeds the last outcome and returns the machine's final result.
+#[cfg(feature = "ota-ddi")]
 fn finish(
     cancel: &OtaCancel,
     machine: &mut DownloadMachine,
@@ -324,6 +329,7 @@ fn finish(
 }
 
 /// An action the loop's current phase cannot perform: an internal error.
+#[cfg(feature = "ota-ddi")]
 fn unexpected(action: &DownloadAction) -> OtaError {
     log::error!("OTA: unexpected download step {:?}", action);
     OtaError::DownloadFailed { status: 0 }
@@ -333,6 +339,7 @@ fn unexpected(action: &DownloadAction) -> OtaError {
 ///
 /// Bundled so the streaming helpers take few arguments (the Xtensa LLVM backend has failed on
 /// functions with many, see `docs/project-lore.md` "Toolchain & Build").
+#[cfg(feature = "ota-ddi")]
 struct Run<'r, E: Fn() -> CoreDuration> {
     machine: &'r mut DownloadMachine,
     cancel: &'r OtaCancel,
@@ -346,6 +353,7 @@ struct Run<'r, E: Fn() -> CoreDuration> {
 /// Each chunk feeds both the flash and the verifier. Each socket read waits at most `min(per-read
 /// timeout, remaining deadline)`; a timed-out wait is `DownloadTimeout`, a socket read error is
 /// `ServerUnreachable`.
+#[cfg(feature = "ota-ddi")]
 async fn stream_body<E: Fn() -> CoreDuration>(
     run: &mut Run<'_, E>,
     sink: &mut Sink<'_, '_, '_>,
@@ -436,6 +444,85 @@ async fn stream_body<E: Fn() -> CoreDuration>(
     }
 }
 
+/// The OTA app number of a partition: `Ota0 + n` gives `n`; factory, test and anything else are not OTA apps.
+#[cfg(feature = "ota-ddi")]
+pub(super) fn booted_entry_app(entry: &PartitionEntry) -> Option<u8> {
+    match entry.partition_type() {
+        PartitionType::App(sub) => (sub as u8)
+            .checked_sub(AppPartitionSubType::Ota0 as u8)
+            .filter(|n| *n < 16),
+        _ => None,
+    }
+}
+
+/// The partition a download writes and its OTA app number.
+#[cfg(feature = "ota-ddi")]
+struct UpdateTarget {
+    entry: PartitionEntry,
+    app: u8,
+}
+
+/// Whether an otadata partition of `len` bytes (`None`: there is none) holds both otadata entries, which the activation needs.
+#[cfg(feature = "ota-ddi")]
+fn otadata_fits(len: Option<u32>) -> bool {
+    len.is_some_and(|len| {
+        len as usize >= OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN
+    })
+}
+
+/// Chooses the slot a download writes: the OTA app after the partition the MMU maps, never the running one.
+///
+/// Not `OtaUpdater::next_partition`: it starts from the otadata selection, and with blank otadata (selected `Factory`) and `ota_0` running its fallback `(Factory.ota_app_number() + 2) % count` underflows and lands on `ota_0` again, so the running image would be erased.
+/// Fails closed with [`OtaError::PartitionNotFound`], before anything is erased or written, when the running partition cannot be read, the table has fewer than two OTA slots, or it has no otadata partition large enough for the activation.
+#[cfg(feature = "ota-ddi")]
+fn update_target(table: &PartitionTable<'_>) -> Result<UpdateTarget, OtaError> {
+    let booted = match table.booted_partition() {
+        Ok(Some(booted)) => booted,
+        Ok(None) => {
+            log::error!("OTA: refusing the download: no partition maps to the running image");
+            return Err(OtaError::PartitionNotFound);
+        }
+        Err(e) => {
+            log::error!(
+                "OTA: refusing the download: could not read the running partition: {:?}",
+                e
+            );
+            return Err(OtaError::PartitionNotFound);
+        }
+    };
+    let app = activation::next_update_app(booted_entry_app(&booted), ota_app_count(table))
+        .ok_or_else(|| {
+            log::error!("OTA: refusing the download: the partition table needs two OTA slots");
+            OtaError::PartitionNotFound
+        })?;
+    let entry = (AppPartitionSubType::Ota0 as u8)
+        .checked_add(app)
+        .and_then(|raw| AppPartitionSubType::try_from(raw).ok())
+        .and_then(|sub| table.find_partition(PartitionType::App(sub)).ok().flatten())
+        .ok_or_else(|| {
+            log::error!("OTA: the target partition is missing from the table");
+            OtaError::PartitionNotFound
+        })?;
+    if entry.offset() == booted.offset() {
+        log::error!("OTA: refusing the download: the target is the running partition");
+        return Err(OtaError::PartitionNotFound);
+    }
+    // The activation writes the otadata; without a usable one the image could never be selected.
+    let otadata_len = table
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()
+        .flatten()
+        .map(|otadata| otadata.len());
+    if !otadata_fits(otadata_len) {
+        log::error!(
+            "OTA: refusing the download: no usable otadata partition ({:?} bytes)",
+            otadata_len
+        );
+        return Err(OtaError::PartitionNotFound);
+    }
+    Ok(UpdateTarget { entry, app })
+}
+
 /// Where a shared-flash download writes: the target slot, resolved once.
 #[cfg(feature = "ota-ddi")]
 struct Target {
@@ -449,45 +536,27 @@ struct Target {
     encrypted: bool,
 }
 
-/// Resolves the slot `OtaUpdater::next_partition` names, under one short flash borrow.
+/// Resolves the slot after the running one (see [`update_target`]), under one short flash borrow.
 #[cfg(feature = "ota-ddi")]
 fn resolve_target(flash: &mut FlashStorage<'_>) -> Result<Target, OtaError> {
     let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-    let (capacity, slot, encrypted) = {
-        let mut updater = OtaUpdater::new(&mut *flash, &mut pt_buf).map_err(|e| {
-            log::error!("OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        let (mut region, slot) = updater.next_partition().map_err(|e| {
-            log::error!("next_partition failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        let encrypted = region.as_nor_flash().is_err();
-        (region.capacity() as u32, slot, encrypted)
-    };
-    let table = read_partition_table(flash, &mut pt_buf).map_err(|e| {
+    let table = read_partition_table(&mut *flash, &mut pt_buf).map_err(|e| {
         log::error!("OTA: could not read the partition table: {:?}", e);
         OtaError::PartitionNotFound
     })?;
-    let entry = table
-        .find_partition(PartitionType::App(slot))
-        .ok()
-        .flatten()
-        .ok_or_else(|| {
-            log::error!("OTA: the target partition is missing from the table");
-            OtaError::PartitionNotFound
-        })?;
+    let UpdateTarget { entry, app } = update_target(&table)?;
+    let encrypted = entry.as_flash_region(flash).as_nor_flash().is_err();
     Ok(Target {
         offset: entry.offset(),
-        capacity,
-        // As in the owned path: `Ota0 + n`, anything else wraps out of range for the plan.
-        next_app: (slot as u8).wrapping_sub(AppPartitionSubType::Ota0 as u8),
+        capacity: entry.len(),
+        next_app: app,
         encrypted,
     })
 }
 
-/// Steps 2 to 4 of a download on the [`SharedFlash`]: resolve the target, erase it sector by
-/// sector with a yield after each, stream the body, activate.
+/// Steps 2 to 4 of a download on the [`SharedFlash`]: take the OTA lease, resolve the target,
+/// erase it sector by sector (a cancel and the deadline are checked, and the executor gets a
+/// yield, before each), stream the body, activate.
 ///
 /// Every flash operation borrows the shared flash on its own; no borrow lives across an `.await`.
 #[cfg(feature = "ota-ddi")]
@@ -496,6 +565,18 @@ async fn stream_shared<E: Fn() -> CoreDuration>(
     socket: &mut TcpSocket<'_>,
     mut run: Run<'_, E>,
 ) -> Result<(), OtaError> {
+    // Held until this function ends, on every path, and by a dropped future: two downloads
+    // never erase and write the same slot between their awaits. Kept for the rest of the boot
+    // once the slot is selected.
+    let Some(lease) = shared.lease_ota() else {
+        log::warn!("OTA: another download holds the flash lease, or one selected its slot in this boot; this one touches nothing");
+        return finish(
+            run.cancel,
+            run.machine,
+            DownloadInput::PrepareFailed(OtaError::FlashBusy),
+            (run.elapsed)(),
+        );
+    };
     let target = shared.with(resolve_target).unwrap_or_else(|| {
         log::error!("OTA: the shared flash is busy");
         Err(OtaError::PartitionNotFound)
@@ -528,6 +609,15 @@ async fn stream_shared<E: Fn() -> CoreDuration>(
     log::info!("OTA: erasing {} bytes of the target partition", erased_span);
     let mut at = 0;
     while at < erased_span {
+        // A cancel or the deadline stops the erase here, so at most the sector in progress
+        // remains after it; the end is the one a cancel or deadline during the body gives.
+        if let Err(e) = run.cancel.check_preparing(run.machine, (run.elapsed)()) {
+            log::error!(
+                "OTA: download stopped during the erase: {} — boot slot unchanged",
+                e
+            );
+            return Err(e);
+        }
         let from = target.offset + at;
         let mut nor: &SharedFlash = shared;
         if let Err(e) = nor.erase(from, from + sector) {
@@ -564,6 +654,8 @@ async fn stream_shared<E: Fn() -> CoreDuration>(
         });
     if result.is_ok() {
         log::info!("OTA: partition swap complete — reboot to apply");
+        // The slot is selected for the next boot: no later download of this boot may erase it.
+        lease.keep();
     }
     finish(
         run.cancel,
@@ -573,21 +665,15 @@ async fn stream_shared<E: Fn() -> CoreDuration>(
     )
 }
 
-/// Size in bytes of the inactive OTA partition, from a short-lived
-/// `OtaUpdater` (it only reads the partition table).
+/// Size in bytes of the OTA partition a download would write (the one after the running app).
+#[cfg(feature = "ota-ddi")]
 pub(crate) fn update_capacity(flash: &mut FlashStorage<'_>) -> Result<u64, OtaError> {
     let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-    let mut updater = OtaUpdater::new(flash, &mut pt_buf).map_err(|e| {
-        log::error!("OtaUpdater::new failed: {:?}", e);
+    let table = read_partition_table(flash, &mut pt_buf).map_err(|e| {
+        log::error!("OTA: could not read the partition table: {:?}", e);
         OtaError::PartitionNotFound
     })?;
-    let (region, _slot) = updater.next_partition().map_err(|e| {
-        log::error!("next_partition failed: {:?}", e);
-        OtaError::PartitionNotFound
-    })?;
-    // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
-    // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
-    Ok(region.capacity() as u64)
+    Ok(u64::from(update_target(&table)?.entry.len()))
 }
 
 /// Reads both otadata entries and the OTA app slot count; `what` names the caller in logs.
@@ -628,35 +714,26 @@ pub(super) fn read_otadata(
 /// Configuration for [`EspHalOtaManager`].
 #[derive(Debug, Clone, Copy)]
 pub struct OtaManagerConfig {
-    /// Per-operation timeout (in seconds) applied to the HTTP header read and
-    /// to each individual body-chunk socket read.
+    /// Per-operation timeout (in seconds) of a download through this manager (the DDI transport's
+    /// `download`, feature `ota-ddi`): applied to the connect and HTTP header phase and to each
+    /// individual body-chunk socket read.
+    /// Boot-slot control does not use it.
     ///
     /// A value of `0` is permitted but probably not useful — `embassy_time`
     /// will return `TimeoutError` on the first poll yield, mapped to
     /// [`OtaError::DownloadTimeout`].
-    /// Without [`with_deadline`], the total wall-clock duration of [`fetch_and_apply`] is unbounded and
-    /// scales with the firmware size; the timeout caps individual stalls.
-    ///
-    /// [`fetch_and_apply`]: EspHalOtaManager::fetch_and_apply
-    /// [`with_deadline`]: EspHalOtaManager::with_deadline
+    /// Without `EspHalOtaManager::with_deadline`, the total wall-clock duration of a download is
+    /// unbounded and scales with the firmware size; the timeout caps individual stalls.
     pub timeout_secs: u64,
 }
 
 /// Experimental: API may change before 1.0.
 ///
-/// Async bare-metal OTA manager.
+/// Bare-metal OTA manager: boot-slot control, and the flash side of the DDI client's download.
 ///
-/// Streams firmware from a plain `http://` URL over an
-/// `embassy_net::TcpSocket`, verifies the SHA-256 digest, writes to the
-/// inactive OTA partition via `esp_bootloader_esp_idf::OtaUpdater`, and
-/// swaps slots by activating the next partition.
-///
-/// # URL format
-///
-/// Only `http://` URLs with IP-literal hosts are supported for the MVP.
-/// DNS resolution is the caller's responsibility; pass an IP address in
-/// the URL (e.g. `http://192.168.1.100/firmware.bin`).
-/// `https://` is rejected per ADR 011 §2.
+/// [`mark_valid`](Self::mark_valid), [`rollback`](Self::rollback), [`selected_slot`](Self::selected_slot) and [`previous_update_rolled_back`](Self::previous_update_rolled_back) read and write the otadata partition.
+/// With the `ota-ddi` feature the DDI transport's `download` streams an artifact through this manager: it writes the inactive OTA partition (the OTA app after the running one, never the running one), verifies the SHA-256 digest and activates that slot.
+/// This type has no URL entry point of its own.
 ///
 /// # Flash peripheral
 ///
@@ -677,21 +754,28 @@ pub struct OtaManagerConfig {
 ///
 /// # Usage
 ///
+/// Call `mark_valid()` once the health check of a freshly booted image passes.
+///
 /// ```ignore
 /// let peripherals = esp_hal::init(esp_hal::Config::default());
 /// let mut manager = EspHalOtaManager::new(
 ///     OtaManagerConfig { timeout_secs: 60 },
 ///     peripherals.FLASH,
 /// )?;
-/// manager.fetch_and_apply(&mut socket, url, &expected_sha256).await?;
-/// esp_hal::system::software_reset();
-/// // After reboot, call mark_valid() once the health check passes.
+/// manager.mark_valid()?;
 /// ```
 pub struct EspHalOtaManager<'d> {
+    #[cfg_attr(
+        not(feature = "ota-ddi"),
+        allow(dead_code, reason = "only a download reads the timeout")
+    )]
     config: OtaManagerConfig,
     flash: FlashHandle<'d>,
+    #[cfg(feature = "ota-ddi")]
     deadline: Deadline,
-    expected_chip: Option<ImageChip>,
+    /// A download through this manager selected its slot for the next boot; no further download until the reset.
+    #[cfg(feature = "ota-ddi")]
+    slot_selected: bool,
 }
 
 impl<'d> EspHalOtaManager<'d> {
@@ -708,8 +792,10 @@ impl<'d> EspHalOtaManager<'d> {
         Ok(Self {
             config,
             flash: FlashHandle::Owned(FlashStorage::new(flash)),
+            #[cfg(feature = "ota-ddi")]
             deadline: Deadline::none(),
-            expected_chip: None,
+            #[cfg(feature = "ota-ddi")]
+            slot_selected: false,
         })
     }
 
@@ -719,6 +805,8 @@ impl<'d> EspHalOtaManager<'d> {
     ///
     /// The manager borrows the flash for one operation at a time and never across an `.await`, so the store can commit between two chunks of a download.
     /// The download erases the target sectors one by one and yields to the executor after each, so a long erase does not starve Wi-Fi and MQTT.
+    /// Only one download at a time holds the flash: a second one fails with [`OtaError::FlashBusy`] before it touches the flash, which the DDI retry policy tries again inside the download deadline.
+    /// Once a download has selected its slot for the next boot, every later download of this boot fails the same way on both constructors, so the selected image is never erased; reset to apply it.
     /// An encrypted target partition is refused with [`OtaError::FlashWriteFailed`] before anything is erased: this path writes plain sectors only.
     /// Everything else behaves as with [`new`](Self::new).
     ///
@@ -735,7 +823,8 @@ impl<'d> EspHalOtaManager<'d> {
             config,
             flash: FlashHandle::Shared(flash),
             deadline: Deadline::none(),
-            expected_chip: None,
+            #[cfg(feature = "ota-ddi")]
+            slot_selected: false,
         })
     }
 
@@ -763,19 +852,19 @@ impl<'d> EspHalOtaManager<'d> {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// Limit the whole [`fetch_and_apply`](Self::fetch_and_apply) call to `total`.
+    /// Limit a whole download through this manager (the DDI transport's `download`) to `total`.
     ///
     /// The deadline is **cooperative**: the clock starts on entry to
-    /// `fetch_and_apply` and is checked at operation boundaries, namely on
+    /// the download and is checked at operation boundaries, namely on
     /// entry, after connect and headers, after partition preparation (the
-    /// erase), after every chunk read and every flash write, and immediately
+    /// erase, which on the shared flash also checks between its sectors), after every chunk read and every flash write, and immediately
     /// before the otadata activation write.
     /// A failed check returns [`OtaError::DownloadTimeout`] and the new slot is
     /// not activated.
     ///
     /// Each network wait uses `min(per-read timeout, remaining deadline)`, so
     /// network waits never overrun the deadline; blocking flash operations
-    /// (erase, write) cannot be interrupted and may overrun, with expiry
+    /// (a sector erase, a write) cannot be interrupted and may overrun, with expiry
     /// detected when they return.
     /// Finalization is different: once the permit is granted and activation
     /// starts, its result is returned even if it finishes after the deadline.
@@ -805,128 +894,49 @@ impl<'d> EspHalOtaManager<'d> {
     /// )?
     /// .with_deadline(embassy_time::Duration::from_secs(300));
     /// ```
+    #[cfg(feature = "ota-ddi")]
     #[must_use]
     pub fn with_deadline(mut self, total: Duration) -> Self {
         self.deadline = Deadline::after(to_core(total));
         self
     }
 
-    /// Experimental: API may change before 1.0.
-    ///
-    /// Require the image header to name `chip` before the partition is prepared.
-    ///
-    /// The first 16 body bytes are read before the erase and checked by `juggler::ota::download::check_image_header`: a different chip id fails with [`OtaError::TargetMismatch`], a missing `0xE9` magic byte or an image shorter than the header with `DownloadFailed { status: 0 }`, both without touching the partition.
-    /// On a match those bytes are written first, so the image and its SHA-256 are unchanged.
-    /// Not calling this method means no header check.
-    /// The ESP-IDF tier has the same method on `OtaSession`.
-    ///
-    /// ```ignore
-    /// let mut manager = EspHalOtaManager::new(
-    ///     OtaManagerConfig { timeout_secs: 30 },
-    ///     peripherals.FLASH,
-    /// )?
-    /// .with_expected_chip(ImageChip::Esp32C3);
-    /// ```
-    #[must_use]
-    pub fn with_expected_chip(mut self, chip: ImageChip) -> Self {
-        self.expected_chip = Some(chip);
-        self
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// Fetch firmware from `url`, verify its SHA-256 against `expected_sha256`,
-    /// write it to the inactive OTA slot, and activate that slot for next boot.
-    ///
-    /// The server is contacted before the partition is prepared: a connection
-    /// or HTTP-status failure, a response without a `Content-Length` or with a
-    /// `Transfer-Encoding` (`DownloadFailed { status: 0 }`), and an image larger
-    /// than the inactive partition ([`OtaError::InsufficientSpace`]) all fail
-    /// without erasing anything; the rule is
-    /// [`check_content_length`](juggler::ota::check_content_length), and the
-    /// order of the steps is `juggler::ota::download::DownloadMachine`, shared
-    /// with the ESP-IDF tier.
-    ///
-    /// The operation is streaming: the full image is never held in RAM.
-    /// Bytes are written to the inactive partition as they arrive — flash
-    /// **is** modified during the download, even on the failure path.
-    /// On checksum mismatch (or any download / flash error), the new slot is
-    /// **not** activated and the boot slot is left unchanged, so the device
-    /// continues to boot the running image; the inactive partition is left in
-    /// an undefined state and will be overwritten on the next OTA attempt.
-    /// Power loss between mid-download and the activation likewise leaves the
-    /// boot slot unchanged.
-    ///
-    /// Activation is a single 32-byte write of the new `ota_seq`, the `New`
-    /// state and their CRC into the otadata sector that is *not* selected, so
-    /// the boot selection changes only together with the armed rollback; a
-    /// failed or interrupted write leaves the previous selection in place.
-    /// After a write error or a read-back mismatch the previous bytes of that
-    /// sector are written back, the original error is returned as
-    /// [`OtaError::FlashWriteFailed`], and whether the restore worked is
-    /// logged.
-    ///
-    /// After this function returns `Ok(())` the caller must reboot the device.
-    /// Once the new image has passed its health check, call [`mark_valid`].
-    ///
-    /// With [`with_deadline`](Self::with_deadline) set, the whole call is bounded by that total.
-    ///
-    /// To cancel the download from another task, use
-    /// [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable).
-    ///
-    /// [`mark_valid`]: EspHalOtaManager::mark_valid
-    pub async fn fetch_and_apply(
-        &mut self,
-        socket: &mut TcpSocket<'_>,
-        url: &str,
-        expected_sha256: &[u8; 32],
-    ) -> Result<(), OtaError> {
-        self.fetch_and_apply_cancellable(socket, url, expected_sha256, &OtaCancel::new())
-            .await
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// [`fetch_and_apply`](Self::fetch_and_apply) that another task can stop through `cancel`.
-    ///
-    /// Returns [`OtaError::Cancelled`] exactly when an [`OtaCancel::cancel`] was accepted; the boot slot is then unchanged.
-    ///
-    /// On any error the socket is aborted (a TCP RST), so a server that is still sending the image (after a refused header, say) stops; the call waits up to 500 ms for the RST to leave.
-    pub async fn fetch_and_apply_cancellable(
-        &mut self,
-        socket: &mut TcpSocket<'_>,
-        url: &str,
-        expected_sha256: &[u8; 32],
-        cancel: &OtaCancel,
-    ) -> Result<(), OtaError> {
-        self.run(socket, &mut Source::Plain(url), expected_sha256, cancel)
-            .await
-    }
-
-    /// The DDI artifact fetch behind the DDI transport's `download`: the same streaming download, verification and slot swap as [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable), with the token sent, the server name resolved, and redirects refused ([`OtaError::Redirect`]).
+    /// The DDI artifact fetch behind the DDI transport's `download`: fetches the artifact, verifies its SHA-256 against `expected_sha256`, writes it to the inactive OTA slot and activates that slot for the next boot, with the token sent, the server name resolved, and redirects refused ([`OtaError::Redirect`]).
     ///
     /// The declared `Content-Length` must equal the gate's size ([`OtaError::SizeMismatch`]) and the image header must name its chip ([`OtaError::TargetMismatch`]), both before any flash is touched; a non-200 answer hands its `Retry-After` back.
+    ///
+    /// The server is contacted before the partition is prepared: a connection or HTTP-status failure, a response without a `Content-Length` or with a `Transfer-Encoding` (`DownloadFailed { status: 0 }`), and an image larger than the inactive partition ([`OtaError::InsufficientSpace`]) all fail without erasing anything.
+    /// The rule is [`check_content_length`](juggler::ota::check_content_length), and the order of the steps is `juggler::ota::download::DownloadMachine`, shared with the ESP-IDF tier.
+    ///
+    /// The operation is streaming: the full image is never held in RAM, and flash **is** modified during the download, even on the failure path.
+    /// On a checksum mismatch, any download or flash error, or a power loss before the activation, the new slot is **not** activated and the boot slot is left unchanged; the inactive partition is left in an undefined state and is overwritten by the next attempt.
+    ///
+    /// Activation is a single 32-byte write of the new `ota_seq`, the `New` state and their CRC into the otadata sector that is *not* selected, so the boot selection changes only together with the armed rollback; a failed or interrupted write leaves the previous selection in place.
+    /// After a write error or a read-back mismatch the previous bytes of that sector are written back, the original error is returned as [`OtaError::FlashWriteFailed`], and whether the restore worked is logged.
+    ///
+    /// [`OtaError::Cancelled`] is returned exactly when an [`OtaCancel::cancel`] was accepted; the boot slot is then unchanged.
+    /// On any error the socket is aborted (a TCP RST), so a server that is still sending the image stops; the call waits up to 500 ms for the RST to leave.
     #[cfg(feature = "ota-ddi")]
     pub(crate) async fn fetch_ddi(
         &mut self,
         socket: &mut TcpSocket<'_>,
-        fetch: DdiFetch<'_>,
+        mut fetch: DdiFetch<'_>,
         expected_sha256: &[u8; 32],
         cancel: &OtaCancel,
     ) -> Result<(), OtaError> {
-        self.run(socket, &mut Source::Ddi(fetch), expected_sha256, cancel)
-            .await
+        self.run(socket, &mut fetch, expected_sha256, cancel).await
     }
 
     /// [`stream`](Self::stream), with the socket aborted on error.
+    #[cfg(feature = "ota-ddi")]
     async fn run(
         &mut self,
         socket: &mut TcpSocket<'_>,
-        source: &mut Source<'_>,
+        fetch: &mut DdiFetch<'_>,
         expected_sha256: &[u8; 32],
         cancel: &OtaCancel,
     ) -> Result<(), OtaError> {
-        let result = self.stream(socket, source, expected_sha256, cancel).await;
+        let result = self.stream(socket, fetch, expected_sha256, cancel).await;
         if result.is_err() {
             socket.abort();
             let _ = with_timeout(ABORT_FLUSH_WAIT, socket.flush()).await;
@@ -934,29 +944,20 @@ impl<'d> EspHalOtaManager<'d> {
         result
     }
 
-    /// The body of [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable), without the socket abort on error.
+    /// The body of [`fetch_ddi`](Self::fetch_ddi), without the socket abort on error.
+    #[cfg(feature = "ota-ddi")]
     async fn stream(
         &mut self,
         socket: &mut TcpSocket<'_>,
-        source: &mut Source<'_>,
+        fetch: &mut DdiFetch<'_>,
         expected_sha256: &[u8; 32],
         cancel: &OtaCancel,
     ) -> Result<(), OtaError> {
         let start = Instant::now();
         let elapsed = || to_core(start.elapsed());
         let per_op = CoreDuration::from_secs(self.config.timeout_secs);
-        let mut machine = match source {
-            Source::Plain(_) => {
-                let machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
-                match self.expected_chip {
-                    Some(chip) => machine.with_expected_chip(chip),
-                    None => machine,
-                }
-            }
-            // The DDI gates replace the manager's own chip setting: the chip check is never off.
-            #[cfg(feature = "ota-ddi")]
-            Source::Ddi(fetch) => fetch.gate.machine(self.deadline, per_op, *expected_sha256),
-        };
+        // The machine comes from the DDI gates, so the size and chip checks are never off.
+        let mut machine = fetch.gate.machine(self.deadline, per_op, *expected_sha256);
 
         // 1. Connect, read the headers and size the partition; nothing is
         //    prepared yet, so an error returns without an abort.
@@ -967,11 +968,7 @@ impl<'d> EspHalOtaManager<'d> {
                 .poll(&mut machine, input, elapsed())
                 .inspect_err(|e| log::error!("OTA: download stopped: {}", e))?;
             input = match action {
-                DownloadAction::Connect { budget } => match source {
-                    Source::Plain(url) => self.connect(socket, url, budget).await,
-                    #[cfg(feature = "ota-ddi")]
-                    Source::Ddi(fetch) => self.connect_ddi(socket, fetch, budget).await,
-                },
+                DownloadAction::Connect { budget } => self.connect_ddi(socket, fetch, budget).await,
                 // The image header, read before the partition is erased; the machine keeps it.
                 DownloadAction::ReadHeader { max, budget } => {
                     let to_read = (max as usize).min(IMAGE_HEADER_LEN);
@@ -1006,58 +1003,49 @@ impl<'d> EspHalOtaManager<'d> {
             timeout_secs: self.config.timeout_secs,
             elapsed: &elapsed,
         };
-        #[cfg_attr(
-            not(feature = "ota-ddi"),
-            allow(
-                clippy::infallible_destructuring_match,
-                reason = "the shared-flash arm exists only with `ota-ddi`"
-            )
-        )]
         let flash = match &mut self.flash {
             FlashHandle::Owned(flash) => flash,
-            #[cfg(feature = "ota-ddi")]
             FlashHandle::Shared(shared) => return stream_shared(shared, socket, run).await,
         };
+        if self.slot_selected {
+            log::warn!("OTA: a download selected its slot in this boot; this one touches nothing");
+            return finish(
+                run.cancel,
+                run.machine,
+                DownloadInput::PrepareFailed(OtaError::FlashBusy),
+                (run.elapsed)(),
+            );
+        }
 
-        // 2. Only now is the partition table read for writing.
-        //    `OtaUpdater::new` reads it to locate ota_0/ota_1.
+        // 2. Only now is the partition table read for writing; the target is the slot after
+        //    the running one (see `update_target`), refused before any erase when it cannot
+        //    be told.
         let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = match OtaUpdater::new(flash, &mut pt_buf) {
-            Ok(updater) => updater,
+        let chosen = read_partition_table(&mut *flash, &mut pt_buf)
+            .map_err(|e| {
+                log::error!("OTA: could not read the partition table: {:?}", e);
+                OtaError::PartitionNotFound
+            })
+            .and_then(|table| update_target(&table));
+        let UpdateTarget {
+            entry,
+            app: next_app,
+        } = match chosen {
+            Ok(chosen) => chosen,
             Err(e) => {
-                log::error!("OtaUpdater::new failed: {:?}", e);
                 return finish(
                     run.cancel,
                     run.machine,
-                    DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
+                    DownloadInput::PrepareFailed(e),
                     (run.elapsed)(),
                 );
             }
         };
 
-        // The region borrows `updater`, which activation needs back, so the
-        // stream runs in its own scope and hands out either the permit or the
-        // final result.
-        let next_app: u8;
+        // The region borrows the flash, which activation needs back, so the stream runs in
+        // its own scope and hands out either the permit or the final result.
         let streamed = {
-            let mut region = match updater.next_partition() {
-                Ok((region, slot)) => {
-                    // `ota_app_number` is crate-private; the discriminants are
-                    // `Ota0 + n`, and anything else wraps out of range, which
-                    // the activation plan refuses.
-                    next_app = (slot as u8).wrapping_sub(AppPartitionSubType::Ota0 as u8);
-                    region
-                }
-                Err(e) => {
-                    log::error!("next_partition failed: {:?}", e);
-                    return finish(
-                        run.cancel,
-                        run.machine,
-                        DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
-                        (run.elapsed)(),
-                    );
-                }
-            };
+            let mut region = entry.as_flash_region(&mut *flash);
 
             // 2a. Pick the write path, erasing an unencrypted partition's
             //     sectors once here instead of once per chunk (bug 004). The
@@ -1118,12 +1106,12 @@ impl<'d> EspHalOtaManager<'d> {
         match streamed {
             Ok(permit) => {
                 log::info!("OTA: SHA-256 verified — activating next partition");
-                // The updater only located the slots and has no `Drop`; its
-                // borrow of the flash and the table buffer ended with its
-                // last use above.
+                // The region's borrow of the flash and the table buffer ended with
+                // the scope above; `next_app` is the slot that was written.
                 let result = activate(flash, &mut pt_buf, next_app, permit);
                 if result.is_ok() {
                     log::info!("OTA: partition swap complete — reboot to apply");
+                    self.slot_selected = true;
                 }
                 finish(
                     run.cancel,
@@ -1133,73 +1121,6 @@ impl<'d> EspHalOtaManager<'d> {
                 )
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Performs [`DownloadAction::Connect`]: the GET, the headers, and the
-    /// size of the inactive partition, read only after the server answered.
-    async fn connect(
-        &mut self,
-        socket: &mut TcpSocket<'_>,
-        url: &str,
-        budget: CoreDuration,
-    ) -> DownloadInput {
-        let parsed = match parse_url(url) {
-            Ok(parsed) => parsed,
-            Err(e) => return DownloadInput::ConnectFailed(OtaError::from(e)),
-        };
-        // Open the TCP connection here: the caller hands over an unconnected
-        // socket, and this tier resolves no names, so the host must be an
-        // IPv4 literal. The connect shares the budget with the header phase.
-        let ip: Ipv4Addr = match parsed.host.parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                log::error!(
-                    "OTA: host {:?} is not an IPv4 literal (no DNS on this tier)",
-                    parsed.host
-                );
-                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
-            }
-        };
-        let endpoint = IpEndpoint::new(IpAddress::Ipv4(ip), parsed.port);
-        let connect_started = Instant::now();
-        match with_timeout(to_embassy(budget), socket.connect(endpoint)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log::warn!("OTA: tcp connect to {}:{} failed: {:?}", ip, parsed.port, e);
-                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
-            }
-            Err(_) => {
-                log::error!(
-                    "OTA: tcp connect to {}:{} timed out (per-op {}s or deadline)",
-                    ip,
-                    parsed.port,
-                    self.config.timeout_secs
-                );
-                return DownloadInput::ConnectFailed(classify_read_error(true));
-            }
-        }
-        let budget = budget.saturating_sub(to_core(connect_started.elapsed()));
-        // The wait is `min(per-read timeout, remaining deadline)` so a stalled
-        // server cannot hang the OTA path or outlast the deadline.
-        let headers = match with_timeout(to_embassy(budget), fetch_get(socket, &parsed)).await {
-            Err(_) => {
-                log::error!(
-                    "OTA: HTTP header phase timed out (per-read {}s or deadline)",
-                    self.config.timeout_secs
-                );
-                return DownloadInput::ConnectFailed(classify_read_error(true));
-            }
-            Ok(Err(e)) => return DownloadInput::ConnectFailed(e),
-            Ok(Ok(headers)) => headers,
-        };
-        match self.partition_capacity() {
-            Ok(capacity) => DownloadInput::Headers {
-                content_length: headers.content_length,
-                chunked: headers.chunked,
-                capacity,
-            },
-            Err(e) => DownloadInput::ConnectFailed(e),
         }
     }
 
@@ -1284,8 +1205,8 @@ impl<'d> EspHalOtaManager<'d> {
         }
     }
 
-    /// Size in bytes of the inactive OTA partition, from a short-lived
-    /// `OtaUpdater` (it only reads the partition table).
+    /// Size in bytes of the OTA partition a download would write, from the partition table.
+    #[cfg(feature = "ota-ddi")]
     fn partition_capacity(&mut self) -> Result<u64, OtaError> {
         self.with_flash(OtaError::PartitionNotFound, update_capacity)
     }
@@ -1308,12 +1229,12 @@ impl<'d> EspHalOtaManager<'d> {
     /// Experimental: API may change before 1.0.
     ///
     /// The slot the bootloader selected for this boot: `ota_0` is `SlotId(0)`,
-    /// `ota_1` is `SlotId(1)`, anything else (factory) is `SlotId(0xFF)`, the `FACTORY_SLOT` of the `ota-wire` feature.
+    /// `ota_1` is `SlotId(1)`, anything else (factory) is `SlotId(0xFF)`, the `FACTORY_SLOT` of the `ota-ddi` feature.
     ///
     /// It is the slot of the otadata entry the bootloader selects (an `Aborted`
     /// or `Invalid` entry is skipped, as after a rollback), which is the
-    /// running slot on every normal boot; right after [`fetch_and_apply`](Self::fetch_and_apply) it is
-    /// already the new slot, before the reboot.
+    /// running slot on every normal boot; right after a download activated the new slot it is
+    /// already that slot, before the reboot.
     pub fn selected_slot(&mut self) -> Result<SlotId, OtaError> {
         let (entries, ota_count) = self.read_otadata("selected_slot")?;
         Ok(match activation::selected_app(&entries, ota_count) {

@@ -3,7 +3,7 @@ set -euo pipefail
 # hawkbit.sh — run a local Eclipse hawkBit 1.2.0 update server in Docker as the lab DDI server
 # Usage: scripts/hawkbit.sh <up|down|status|restart>
 #
-# This is the lab DDI server behind the `c3/ddi` and `c6/ddi` bench checks. hawkBit 1.2.0 is the fleet DDI profile's
+# This is the lab DDI server behind the `c3/ddi-idf`, `c3/ddi-hal` and `c6/ddi-idf` bench checks. hawkBit 1.2.0 is the fleet DDI profile's
 # oracle version (see scripts/ddi-lab.sh). The server runs with hawkBit's built-in default admin account (see the
 # hawkBit documentation for the default credentials); that password is not in this file and `up` does not print it.
 # The port is bound to 127.0.0.1 on purpose and is not configurable to another address: the device never talks to

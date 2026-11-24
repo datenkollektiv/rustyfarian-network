@@ -56,6 +56,10 @@ pub enum OtaError {
     ///
     /// Its code is `target_mismatch`, the same string as the fixed `FailReason::TargetMismatch`.
     TargetMismatch,
+    /// Another download holds the flash: this one erased and wrote nothing, and the boot slot is unchanged.
+    ///
+    /// It goes away when the other download ends, so the DDI retry policy treats it as transient.
+    FlashBusy,
 }
 
 impl OtaError {
@@ -92,6 +96,7 @@ impl OtaError {
             OtaError::Redirect { .. } => "redirect",
             OtaError::SizeMismatch => "size_mismatch",
             OtaError::TargetMismatch => "target_mismatch",
+            OtaError::FlashBusy => "flash_busy",
         }
     }
 }
@@ -114,6 +119,7 @@ impl fmt::Display for OtaError {
             OtaError::Redirect { status } => write!(f, "Download redirected with status {status}"),
             OtaError::SizeMismatch => write!(f, "Download length differs from the artifact size"),
             OtaError::TargetMismatch => write!(f, "Image header targets a different chip"),
+            OtaError::FlashBusy => write!(f, "Flash held by another download"),
         }
     }
 }
@@ -149,7 +155,7 @@ mod tests {
     /// The published wire contract as fixed strings, independent of `code()`.
     /// Changing a string here is a breaking change for every backend.
     /// `DownloadFailed` and `Redirect` appear twice: the status never changes the code.
-    const GOLDEN: [(OtaError, &str); 15] = [
+    const GOLDEN: [(OtaError, &str); 16] = [
         (OtaError::ServerUnreachable, "server_unreachable"),
         (OtaError::DownloadFailed { status: 404 }, "download_failed"),
         (OtaError::DownloadFailed { status: 0 }, "download_failed"),
@@ -165,6 +171,7 @@ mod tests {
         (OtaError::Redirect { status: 0 }, "redirect"),
         (OtaError::SizeMismatch, "size_mismatch"),
         (OtaError::TargetMismatch, "target_mismatch"),
+        (OtaError::FlashBusy, "flash_busy"),
     ];
 
     /// Marks the variant of `err` as covered.
@@ -174,7 +181,7 @@ mod tests {
     /// arm, the arm's new index overflows `covered` (rejected at build time by
     /// the deny-by-default `unconditional_panic` lint) until the array grows,
     /// and `golden_covers_every_variant` fails until `GOLDEN` gets a row.
-    fn mark(err: &OtaError, covered: &mut [bool; 13]) {
+    fn mark(err: &OtaError, covered: &mut [bool; 14]) {
         match err {
             OtaError::ServerUnreachable => covered[0] = true,
             OtaError::DownloadFailed { .. } => covered[1] = true,
@@ -189,12 +196,13 @@ mod tests {
             OtaError::Redirect { .. } => covered[10] = true,
             OtaError::SizeMismatch => covered[11] = true,
             OtaError::TargetMismatch => covered[12] = true,
+            OtaError::FlashBusy => covered[13] = true,
         }
     }
 
     #[test]
     fn golden_covers_every_variant() {
-        let mut covered = [false; 13];
+        let mut covered = [false; 14];
         for (err, _) in &GOLDEN {
             mark(err, &mut covered);
         }

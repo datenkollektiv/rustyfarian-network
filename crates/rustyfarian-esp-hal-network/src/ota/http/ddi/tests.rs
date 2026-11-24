@@ -250,8 +250,15 @@ fn malformed_heads_are_refused() {
         b"HTTP/1.1 200 OK\r\nContent-Length : 1\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nX: a\r\n folded\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length\t: 1\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n",
@@ -296,6 +303,46 @@ fn content_length_body() {
         b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"a\":\"bcdef\"}",
     ));
     assert_eq!(body.unwrap(), b"{\"a\":\"bcdef\"}");
+}
+
+#[test]
+fn framing_header_names_are_case_insensitive() {
+    for name in ["content-length", "CONTENT-LENGTH", "Content-Length"] {
+        let stream = alloc::format!("HTTP/1.1 200 OK\r\n{name}: 2\r\n\r\n{{}}");
+        let (_, _, body) = body_of(read_all_splits(stream.as_bytes()));
+        assert_eq!(body.unwrap(), b"{}", "{name}");
+    }
+    let (_, _, body) = body_of(read_all_splits(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    ));
+    assert_eq!(body.unwrap(), b"{}");
+}
+
+#[test]
+fn download_admission_refuses_missing_zero_chunked_and_oversized_lengths() {
+    use juggler::ota::check_content_length;
+
+    let facts = |framing| download_headers(head(200, framing, None), &mut None).unwrap();
+    let missing = facts(Framing::Close);
+    assert_eq!(
+        check_content_length(missing.content_length, missing.chunked, u64::MAX),
+        Err(OtaError::DownloadFailed { status: 0 })
+    );
+    let zero = facts(Framing::Length(0));
+    assert_eq!(
+        check_content_length(zero.content_length, zero.chunked, u64::MAX),
+        Err(OtaError::DownloadFailed { status: 0 })
+    );
+    let chunked = facts(Framing::Chunked);
+    assert_eq!(
+        check_content_length(chunked.content_length, chunked.chunked, u64::MAX),
+        Err(OtaError::DownloadFailed { status: 0 })
+    );
+    let oversized = facts(Framing::Length(200));
+    assert_eq!(
+        check_content_length(oversized.content_length, oversized.chunked, 100),
+        Err(OtaError::InsufficientSpace)
+    );
 }
 
 #[test]

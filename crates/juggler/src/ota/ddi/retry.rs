@@ -34,9 +34,9 @@ pub enum DownloadRetry {
 
 /// Experimental: API may change before 1.0.
 ///
-/// Whether `error` may go away on its own: an unreachable server, a read or header timeout, a body cut short, HTTP 408, 413, 429, 5xx, or the status 0 of a rejected response shape.
+/// Whether `error` may go away on its own: an unreachable server, a read or header timeout, a body cut short, the flash held by another download, HTTP 408, 413, 429, 5xx, or the status 0 of a rejected response shape.
 ///
-/// Every other error is final at once: any other 4xx (including a 404 or 410 artifact), a checksum or target mismatch, a flash error, a redirect, a foreign origin and a cancel.
+/// Every other error is final at once: any other 4xx (including a 404 or 410 artifact), a checksum or target mismatch, a flash write or partition error, a redirect, a foreign origin and a cancel.
 ///
 /// ```
 /// use juggler::ota::ddi::is_transient_download_error;
@@ -48,7 +48,10 @@ pub enum DownloadRetry {
 /// ```
 pub const fn is_transient_download_error(error: &OtaError) -> bool {
     match error {
-        OtaError::ServerUnreachable | OtaError::DownloadTimeout | OtaError::SizeMismatch => true,
+        OtaError::ServerUnreachable
+        | OtaError::DownloadTimeout
+        | OtaError::SizeMismatch
+        | OtaError::FlashBusy => true,
         OtaError::DownloadFailed { status } => {
             matches!(*status, 0 | 408 | 413 | 429) || (*status >= 500 && *status <= 599)
         }
@@ -134,6 +137,7 @@ mod tests {
             OtaError::ServerUnreachable,
             OtaError::DownloadTimeout,
             OtaError::SizeMismatch,
+            OtaError::FlashBusy,
             OtaError::DownloadFailed { status: 0 },
             OtaError::DownloadFailed { status: 408 },
             OtaError::DownloadFailed { status: 429 },

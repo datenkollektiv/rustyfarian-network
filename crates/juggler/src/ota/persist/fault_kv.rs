@@ -52,6 +52,7 @@ struct Inner {
     fail_read_at: Option<usize>,
     corrupt: BTreeMap<String, i32>,
     crashed: bool,
+    record_lost: bool,
 }
 
 fn err(code: i32) -> KvError {
@@ -255,6 +256,12 @@ impl FaultKv {
             .insert(key.to_string(), code);
     }
 
+    /// Makes [`OtaKv::newer_record_lost`] read `true` until it is acknowledged.
+    #[cfg(feature = "ota-ddi")]
+    pub fn set_record_lost(&self) {
+        self.inner.borrow_mut().record_lost = true;
+    }
+
     /// Clears every fault and the dead flag; the map survives ("reboot").
     pub fn revive(&self) {
         let mut i = self.inner.borrow_mut();
@@ -272,6 +279,15 @@ impl FaultKv {
 }
 
 impl OtaKv for FaultKv {
+    fn newer_record_lost(&self) -> bool {
+        self.inner.borrow().record_lost
+    }
+
+    fn acknowledge_record_loss(&mut self) -> Result<(), KvError> {
+        self.inner.borrow_mut().record_lost = false;
+        Ok(())
+    }
+
     fn get_u8(&self, key: &str) -> Result<Option<u8>, KvError> {
         self.get(key, |v| if let Val::U8(x) = v { Some(*x) } else { None })
     }

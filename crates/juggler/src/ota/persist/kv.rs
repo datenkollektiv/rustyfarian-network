@@ -55,6 +55,20 @@ pub trait OtaKv {
     fn set_str(&mut self, key: &str, value: &str) -> Result<(), KvError>;
     /// Removes a key; an absent key is `Ok`.
     fn remove(&mut self, key: &str) -> Result<(), KvError>;
+    /// Whether the backend found, when it was opened, that a record newer than the state it serves may have been lost to corruption.
+    ///
+    /// `false` unless the backend can tell (`FlashKv` can, and it keeps the finding across reboots until [`acknowledge_record_loss`](Self::acknowledge_record_loss)); the runtime then owes the server a `records_unreadable` report for the next offered action, as after a repair.
+    fn newer_record_lost(&self) -> bool {
+        false
+    }
+    /// Clears [`newer_record_lost`](Self::newer_record_lost) for this boot and the following ones, once the report it owes is stored.
+    ///
+    /// # Errors
+    ///
+    /// The backend's write error; the finding then stays.
+    fn acknowledge_record_loss(&mut self) -> Result<(), KvError> {
+        Ok(())
+    }
 }
 
 impl core::fmt::Display for KvError {

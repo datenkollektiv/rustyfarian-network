@@ -101,7 +101,7 @@ pub fn after_repair<K: OtaKv>(
 ///
 /// Step 3: a `rolled_back` report of the MQTT OTA runtime that no DDI verdict binds blocks every DDI offer.
 ///
-/// Nothing is written; the tier warns the operator, because only an MQTT OTA image delivers that report.
+/// Nothing is written; the tier warns the operator, because only an MQTT OTA image delivers that report; the last release that builds one is 0.8, and the recovery is recorded in `docs/features/ddi-client-v1.md`.
 pub fn unbound_report_blocks<K: OtaKv>(store: &OtaStore<K>) -> bool {
     store.admission() == Admission::Blocked(BlockedBy::ReportPending)
         && matches!(store.pending_verdict(), Ok(None))

@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The DDI transport types (`DdiTransportConfig`, `DdiTransportError`, `DdiStackMarks`) live in `juggler::ota::ddi` and stay re-exported at their `rustyfarian-esp-idf-network` paths.
 - `rustyfarian-esp-hal-network` `ota-ddi` turns on `embassy-net` DNS and raises `STA_SOCKET_COUNT`, so firmware that sizes `StackResources` by hand must use the constant.
 
+### Removed
+
+- **Breaking:** the MQTT OTA wire and runtime deprecated in 0.8.0 are removed, with the `ota-wire` and `ota-ddi-bench-mqtt-wire` features, `juggler::ota::runtime`, the ESP-IDF `ota::runtime` and the `idf_c3_ota_runtime` example ([ADR 018](docs/adr/018-ota-consumer-runtime-in-library.md)).
+- **Breaking:** both tiers drop the URL pull API, `OtaSession::fetch_and_apply*` on ESP-IDF and `EspHalOtaManager::fetch_and_apply*` with `with_expected_chip`, `hal_c3_ota` and `hal_esp32s3_ota` on esp-hal, where `with_deadline` now needs `ota-ddi`.
+- Migrate to the DDI client (`ota-ddi`), the only download path on both tiers ([ddi-client-v1](docs/features/ddi-client-v1.md)).
+
 ## [0.8.0] - 2026-11-24
 
 ### Added

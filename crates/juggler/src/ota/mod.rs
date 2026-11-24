@@ -5,11 +5,10 @@
 //! ([`download::DownloadMachine`], with the shared Content-Length admission rule
 //! [`check_content_length`]).
 //!
-//! The MQTT wire contract (command, manifest, status JSON) lives in [`wire`] behind the `ota-wire` feature; its reason codes ([`FailReason`], [`RollbackReason`]) are part of the base feature.
-//! The health policy of the running image and the record upkeep that follows it live in [`health`] (base feature), shared by the MQTT and the DDI runtime.
-//! The rest of the consumer runtime's pure state machines (command intake, worker gates, report delivery, manifest limits, configuration) live in [`runtime`] behind `ota-wire`; only its configuration types are re-exported flat.
-//! The sans-IO DDI client lives in [`ddi`] behind the `ota-ddi` feature: the poll, admission, feedback and cancel machines, the runtime settings ([`ddi::DdiSettings`]) and the JSON codec (poll, deployment and cancel documents, the feedback encoder, the profile codes); the two wires share [`FailReason`](wire::FailReason).
-//! The persisted record store ([`persist`]) is part of the base feature, so the MQTT and the DDI runtime keep their records in the same `ota` namespace.
+//! The reason codes ([`FailReason`], [`RollbackReason`]) live in [`wire`] and are part of the base feature.
+//! The health policy of the running image and the record upkeep that follows it live in [`health`] (base feature).
+//! The sans-IO DDI client lives in [`ddi`] behind the `ota-ddi` feature: the poll, admission, feedback and cancel machines, the runtime settings ([`ddi::DdiSettings`]) and the JSON codec (poll, deployment and cancel documents, the feedback encoder, the profile codes); its feedback carries [`FailReason`](wire::FailReason).
+//! The persisted record store ([`persist`]) is part of the base feature; the DDI runtime keeps its records in the `ota` namespace.
 //! [`UrlForLog`] and [`TextForLog`] make a URL or a server-supplied string safe to log.
 //!
 //! All public APIs are experimental.
@@ -26,12 +25,6 @@ mod log_text;
 pub mod metadata;
 pub mod persist;
 pub mod reconcile;
-#[cfg(feature = "ota-wire")]
-#[deprecated(
-    since = "0.8.0",
-    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
-)]
-pub mod runtime;
 pub mod state;
 pub mod verifier;
 pub mod version;
@@ -62,19 +55,8 @@ pub use persist::{
     StoreError, StoredAttempt, UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
 };
 pub use reconcile::{reconcile, AttemptRecord, BootFacts, ReconcileAction, SlotId, SlotState};
-#[cfg(feature = "ota-wire")]
-#[allow(deprecated)]
-pub use runtime::{
-    ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
-};
 pub use state::OtaState;
 pub use verifier::{bytes_to_hex, hex_to_bytes, StreamingVerifier};
 pub use version::Version;
-#[cfg(feature = "ota-wire")]
-#[allow(deprecated)]
-pub use wire::{
-    CommandError, Manifest, ManifestError, OtaCommand, OtaStatus, StatusError, MAX_COMMAND_BYTES,
-    MAX_MANIFEST_BYTES,
-};
 pub use wire::{FailReason, RollbackReason};
 pub use write_align::{round_up, AlignError, ChunkAligner, MAX_WRITE_SIZE};

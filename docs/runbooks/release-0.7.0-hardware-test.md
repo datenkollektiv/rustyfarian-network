@@ -1,5 +1,7 @@
 # Runbook: Release 0.7.0 Hardware Test
 
+> **2026-11-24:** the OTA recipes and examples named in this runbook were removed after 0.8.0, so run its OTA rows from the `v0.7.0` tag.
+
 This is the one hardware run before the release 0.7.0 tag, and each feature doc points here.
 The bench is the source of truth: the header of `bench/<board>/<check>.toml` holds the procedure, `bench/<board>/results.jsonl` the verdict of every run, and `bench/<board>/logs/` the serial log.
 This file lists the checks, the manual checks the bench has no file for, the results, and the flows each check covers.

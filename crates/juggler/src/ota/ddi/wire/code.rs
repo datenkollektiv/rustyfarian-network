@@ -16,7 +16,7 @@ use crate::ota::OtaError;
 /// |:-----|:--------|
 /// | `Transfer` 1001 | `ManifestFetch`; `Ota(ServerUnreachable)`, `Ota(DownloadFailed)` for any status including 0, `Ota(DownloadTimeout)`, `Ota(SizeMismatch)` (a wrong body length is a transfer failure, fleet DDI profile §4) |
 /// | `Checksum` 1002 | `Ota(ChecksumMismatch)` |
-/// | `Flash` 1003 | `Ota(FlashWriteFailed)`, `PartitionNotFound`, `Ota(PartitionNotFound)`, `Ota(InsufficientSpace)` |
+/// | `Flash` 1003 | `Ota(FlashWriteFailed)`, `PartitionNotFound`, `Ota(PartitionNotFound)`, `Ota(InsufficientSpace)`, `Ota(FlashBusy)` (still busy when the download deadline passed) |
 /// | `RolledBack` 1004 | none: the machine uses it directly for a rollback report |
 /// | `Device` 1005 | `WorkerUnavailable`, `AttemptNotPersisted`, `RepairFailed`, `VersionInvalid`, `Ota(VersionInvalid)` (the RUNNING version does not parse) |
 /// | `Deployment` 1006 | `ManifestInvalid`, `Ota(ForeignOrigin)`, `Ota(Redirect)` for any status (the profile allows only `manifest_invalid`, `foreign_origin` or `redirect` as its `details[0]`) |
@@ -112,7 +112,8 @@ impl ProfileCode {
                 OtaError::VersionInvalid => Some(ProfileCode::Device),
                 OtaError::FlashWriteFailed
                 | OtaError::PartitionNotFound
-                | OtaError::InsufficientSpace => Some(ProfileCode::Flash),
+                | OtaError::InsufficientSpace
+                | OtaError::FlashBusy => Some(ProfileCode::Flash),
                 OtaError::ForeignOrigin | OtaError::Redirect { .. } => {
                     Some(ProfileCode::Deployment)
                 }
@@ -135,7 +136,7 @@ mod tests {
     use ProfileCode::{Checksum, Deployment, Device, Flash, Policy, Transfer};
 
     /// Every `FailReason` variant and every `OtaError` inside `Ota`, with the exact code.
-    const TABLE: [(FailReason, Option<ProfileCode>); 36] = [
+    const TABLE: [(FailReason, Option<ProfileCode>); 37] = [
         (FailReason::CommandInvalid, None),
         (FailReason::Busy, None),
         (FailReason::WorkerUnavailable, Some(Device)),
@@ -187,6 +188,7 @@ mod tests {
         ),
         (FailReason::Ota(OtaError::SizeMismatch), Some(Transfer)),
         (FailReason::Ota(OtaError::TargetMismatch), Some(Policy)),
+        (FailReason::Ota(OtaError::FlashBusy), Some(Flash)),
     ];
 
     #[test]

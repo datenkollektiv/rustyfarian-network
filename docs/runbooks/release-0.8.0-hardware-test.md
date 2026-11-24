@@ -1,5 +1,7 @@
 # Runbook: Release 0.8.0 Hardware Test
 
+> **2026-11-24:** the `bench-ota` recipe and the `hal_c3_ota` and `hal_esp32s3_ota` examples named in the MQTT OTA rows are removed, so run those rows from the `v0.8.0` tag.
+
 This is the hardware run for release 0.8.0; the C3 and C6 rows run after the tag on the remote bench (see Decisions).
 0.8.0 is the first release on ESP-IDF v6.1 and the first with the DDI OTA client ([ddi-client-v1](../features/ddi-client-v1.md)).
 The bench is the source of truth: the header of `bench/<board>/<check>.toml` holds the procedure, `bench/<board>/results.jsonl` the verdict of every run, and `bench/<board>/logs/` the serial log.
@@ -38,7 +40,7 @@ Use only the `just` recipes named here or in the check headers.
 - The router must pass TCP 8090 and 1883 from the IoT subnet to the bench machine.
 - Each DDI board needs its own `DDI_CONTROLLER_ID` and `DDI_TOKEN`, plus `DDI_BASE_URL=http://<this machine's LAN IPv4>:8090/DEFAULT`, `DDI_MGMT_URL`, `DDI_MGMT_USER`, `DDI_MGMT_PASS` and `MQTT_HOST=<this machine's LAN IPv4>` in the dotenv file.
 - In the shell that starts the DDI run, export `FIRMWARE_VERSION` and `ESPFLASH_PORT`, because the shell beats the dotenv file.
-- The bundle and publish sequence for each DDI board is in the header of `bench/c3/ddi.toml` and `bench/c6/ddi.toml`, and it uses only `just ddi-tenant-init`, `just ddi-ensure-target`, `just ddi-bundle` and `just ddi-publish`.
+- The bundle and publish sequence for each DDI board is in the header of `bench/c3/ddi-idf.toml` and `bench/c6/ddi-idf.toml` (renamed from `ddi.toml` on 2026-11-24), and it uses only `just ddi-tenant-init`, `just ddi-ensure-target`, `just ddi-bundle` and `just ddi-publish`.
 - The check's own setup erases the whole flash, resets the device's target with `just ddi-target-reset` and starts the proxy, so a fleet-owned target needs `just ddi-quiesce` and new versions instead, as the header says.
 
 ## Chip matrix

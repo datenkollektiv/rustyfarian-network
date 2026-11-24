@@ -19,7 +19,9 @@ verifies every upload, so a wrong digest cannot be declared through its API).
 Only DDI paths (/<tenant>/controller/v1/...) without a `.` or `..` segment (percent-encoded ones included) are
 forwarded, so a path cannot climb out of the DDI tree on an upstream that normalises it; everything else, the Management API and
 a UI included, is answered 403, so the port the router opens to the IoT subnet exposes nothing
-beyond what the device needs. The Authorization header passes through untouched and is never
+beyond what the device needs. The one exception is GET /ddi-lab-proxy/health, answered 200 with the
+fixed body "ddi-lab-proxy": the bench asks it before it shares a listener, so another HTTP server on
+the port is never taken for this proxy. The Authorization header passes through untouched and is never
 logged; log lines carry only the method, the path, the status and the byte count. Runs with
 python3 -u, so each line is flushed.
 """
@@ -34,6 +36,8 @@ from urllib.parse import unquote, urlsplit
 CHUNK = 4096
 TAMPER_OFFSET = 65536
 TAMPER_SUFFIX = "-tampered.bin"
+HEALTH_PATH = "/ddi-lab-proxy/health"
+HEALTH_BODY = b"ddi-lab-proxy\n"
 DDI_PATH = re.compile(r"^/[^/]+/controller/v1/")
 HOP_BY_HOP = {
     "connection",
@@ -89,6 +93,14 @@ def main():
         def forward(self):
             # Logged without the query or fragment: either may carry a secret.
             log_path = self.path.split("?", 1)[0].split("#", 1)[0]
+            if self.command == "GET" and self.path == HEALTH_PATH:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(HEALTH_BODY)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(HEALTH_BODY)
+                return
             if not DDI_PATH.match(self.path) or has_dot_segment(self.path):
                 self.log_message("%s %s -> 403 not a DDI path", self.command, log_path)
                 self.send_error(403, "only DDI paths are proxied")

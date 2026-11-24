@@ -205,11 +205,11 @@ impl DdiTransport {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// Fetches the artifact at `href` into the slot `manager` writes, the same streaming download, verification and slot swap as [`EspHalOtaManager::fetch_and_apply_cancellable`], with the token sent, the server name resolved and redirects refused.
+    /// Fetches the artifact at `href` into the slot `manager` writes: a streaming download whose SHA-256 is verified before that slot is activated for the next boot, with the token sent, the server name resolved and redirects refused.
     ///
     /// A link that fails the origin check fails with [`OtaError::ForeignOrigin`] before any request, and an accepted one is fetched at the rebuilt URL, never at the link text; a 3xx fails with [`OtaError::Redirect`].
     /// The declared `Content-Length` must equal `size`, or the download fails with [`OtaError::SizeMismatch`] before any flash is touched.
-    /// The image header must name this firmware's chip (`TARGET_CHIP`), always: this tier's activation does not read it, so the chip is checked here ([`OtaError::TargetMismatch`]), whatever `with_expected_chip` the manager has.
+    /// The image header must name this firmware's chip (`TARGET_CHIP`), always: this tier's activation does not read it, so the chip is checked here ([`OtaError::TargetMismatch`]).
     /// The manager's timeout and deadline apply.
     pub async fn download(
         &self,
@@ -302,6 +302,7 @@ impl DdiTransport {
         };
 
         let mut buffers = self.requests.lock().await;
+        log::info!("[ota] DDI request: socket buffers taken, connecting");
         let SocketBuffers { rx, tx } = &mut *buffers;
         let mut socket = TcpSocket::new(self.stack, rx, tx);
         let result = self.exchange(&mut socket, &exchange).await;
@@ -332,6 +333,7 @@ impl DdiTransport {
                 return Err(DdiTransportError::Timeout);
             }
         }
+        log::info!("[ota] DDI request: connected, sending");
         let head = match with_timeout(
             to_embassy(self.wait(x.start)?),
             send_and_read_head(socket, &[x.head, x.body]),

@@ -565,7 +565,7 @@ fn espnow_mock_public_paths() {
 
 // ── ota ───────────────────────────────────────────────────────────────────────
 
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 #[test]
 fn ota_persist_public_paths() {
     use juggler::ota::{
@@ -696,96 +696,6 @@ fn ota_ddi_persist_public_paths() {
     );
 }
 
-#[cfg(feature = "ota-wire")]
-#[test]
-fn ota_runtime_public_paths() {
-    use core::time::Duration;
-    use juggler::ota::runtime::CompletionTry;
-    use juggler::ota::runtime::{
-        after_publish, after_unhealthy, completion_step, deadline_plan, decide_intake,
-        plan_rollback, poll_decision, rejects_delta, CompletionBackoff, CompletionRetryConfig,
-        CompletionStep, DeliveryStep, Feed, HealthConfig, IntakeDecision, ManifestBody, OfferPlan,
-        PollStep, PublishOutcome, PublishStep, ReportPace, ReporterConfig, Retention, SendResult,
-        SlotReads, SlotRetry,
-    };
-    use juggler::ota::{
-        ConfigError, DeadlineAction, FailReason, HealthVerdict, OtaCommand, OtaSettings, OtaStacks,
-        OtaTimings, Version, MIN_STACK_BYTES,
-    };
-
-    let settings = OtaSettings::new("dev/ota/command", "dev/ota/status", Version::new(1, 0, 0))
-        .expect("valid topics");
-    assert_eq!(settings.stacks, OtaStacks::default());
-    assert_eq!(settings.timings.deadline_action, DeadlineAction::Rollback);
-    assert_eq!(MIN_STACK_BYTES, 4096);
-    assert_eq!(
-        OtaSettings::new("a", "a", Version::new(1, 0, 0)),
-        Err(ConfigError::SameTopic)
-    );
-
-    let decision = decide_intake(
-        OtaCommand::parse(br#"{"action":"repair"}"#),
-        false,
-        || true,
-        |_| SendResult::Sent,
-    );
-    assert_eq!(decision, IntakeDecision::Queued);
-
-    let timings = OtaTimings::default();
-    let health = HealthConfig::from(&timings);
-    assert_eq!(
-        poll_decision(&health, Duration::ZERO, false),
-        PollStep::Wait(health.poll_interval)
-    );
-    assert_eq!(
-        poll_decision(&health, health.healthy_dwell, false),
-        PollStep::Evaluate
-    );
-    assert_eq!(
-        after_unhealthy(&health, health.failure_deadline),
-        PollStep::Deadline
-    );
-    assert!(matches!(
-        SlotReads::default().busy(&health, Duration::ZERO),
-        SlotRetry::Sleep { .. }
-    ));
-    assert!(!deadline_plan(&health).restart);
-    assert!(HealthVerdict::Applied.publishes_applied());
-
-    let reporter = ReporterConfig::from(&timings);
-    let pace = ReportPace::new();
-    assert!(pace.due(Duration::ZERO));
-    assert_eq!(
-        after_publish(PublishOutcome::Acked),
-        PublishStep::MarkDelivered
-    );
-    let (step, _) = pace.delivered(&reporter, Duration::ZERO, juggler::ota::Delivery::Marked);
-    assert_eq!(step, DeliveryStep::Done);
-    let completion = CompletionRetryConfig::from(&timings);
-    let backoff = CompletionBackoff::armed(&completion, Duration::ZERO);
-    assert!(backoff.wait(Duration::ZERO) > Duration::ZERO);
-    assert_eq!(
-        completion_step(CompletionTry::Completed),
-        CompletionStep::Stop
-    );
-
-    assert_eq!(rejects_delta(3, 1), 2);
-
-    let mut body = ManifestBody::new(Duration::from_secs(10));
-    assert_eq!(body.feed(10, Duration::ZERO), Feed::Continue);
-
-    let mut retention = Retention::new();
-    retention.on_command(&OtaCommand::Repair);
-    assert!(!retention.has_offer());
-    let _: Option<OfferPlan> = None;
-    assert_eq!(
-        plan_rollback(Version::new(2, 0, 0), Version::new(1, 0, 0), true, || Err(
-            juggler::ota::HardwareReadError::Busy
-        )),
-        Err(FailReason::VersionMismatch)
-    );
-}
-
 #[cfg(feature = "ota")]
 #[test]
 fn ota_public_paths() {
@@ -814,6 +724,7 @@ fn ota_public_paths() {
     let _: OtaError = OtaError::Redirect { status: 302 };
     let _: OtaError = OtaError::SizeMismatch;
     let _: OtaError = OtaError::TargetMismatch;
+    let _: OtaError = OtaError::FlashBusy;
 
     // OtaState linear progression.
     let s = OtaState::Idle;
@@ -836,7 +747,7 @@ fn ota_public_paths() {
     // confirm the import resolves — the name alone is the path test).
     fn _uses_metadata(_: &ImageMetadata) {}
 
-    // The health policy is part of the base feature, with or without `ota-wire`.
+    // The health policy is part of the base feature.
     use core::time::Duration;
     use juggler::ota::health::{
         initial_admission, poll_decision, HealthConfig, PollStep, RuntimeFlags,

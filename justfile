@@ -170,12 +170,7 @@ check-espnow-pure:
 check-ota-pure:
     cargo check -p juggler --no-default-features --features ota
 
-# check the OTA wire contract is no_std + alloc clean (no ESP-IDF required)
-[group('build')]
-check-ota-wire-pure:
-    cargo check -p juggler --no-default-features --features ota-wire --target {{ hal_c3_target }} -Zbuild-std=core,alloc
-
-# check the DDI JSON codec is no_std + alloc clean without the MQTT wire (no ESP-IDF required)
+# check the DDI JSON codec is no_std + alloc clean (no ESP-IDF required)
 [group('build')]
 check-ota-ddi-pure:
     cargo check -p juggler --no-default-features --features ota-ddi --target {{ hal_c3_target }} -Zbuild-std=core,alloc
@@ -191,23 +186,20 @@ check-ota-flash-kv-pure:
 check-provisioning-pure:
     cargo check -p juggler --features provisioning
 
-# check the esp-idf ota domain (download, flash, record store) and the MQTT wire contract without the runtime
+# check the esp-idf ota domain (boot-slot control, record store)
 [group('build')]
 check-ota-idf:
     cargo check -p rustyfarian-esp-idf-network --features ota --target-dir {{ idf_dir }}
-    cargo check -p rustyfarian-esp-idf-network --features ota-wire --target-dir {{ idf_dir }}
 
 # type-check (clippy) the esp-idf ota unit tests; they cannot run on the host (esp-idf-sys)
 [group('build')]
 clippy-ota-tests:
     cargo clippy -p rustyfarian-esp-idf-network --features ota --tests --target-dir {{ idf_dir }} -- -D warnings
-    cargo clippy -p rustyfarian-esp-idf-network --features ota-wire --tests --target-dir {{ idf_dir }} -- -D warnings
 
-# lint the pure ota, ota-wire and ota-ddi code and their host tests (the workspace clippy never enables them)
+# lint the pure ota and ota-ddi code and their host tests (the workspace clippy never enables them)
 [group('build')]
 clippy-ota-pure:
     cargo clippy -p juggler --features ota --all-targets --target {{ host_target }} -- -D warnings
-    cargo clippy -p juggler --features ota-wire --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-ddi --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-flash-kv --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-ddi,ota-flash-kv --all-targets --target {{ host_target }} -- -D warnings
@@ -215,23 +207,14 @@ clippy-ota-pure:
 # lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
 [group('build')]
 clippy-pure:
-    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,ota-ddi,ota-flash-kv,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-ddi,ota-flash-kv,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
 
-# check the esp-idf ota runtime (features wifi,mqtt,ota-wire) and its hardware example
-[group('build')]
-check-ota-mqtt-idf:
-    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-wire --example idf_c3_ota_runtime --target-dir {{ idf_dir }}
-
-# lint the esp-idf ota runtime and its hardware example (they cannot run on the host)
-[group('build')]
-clippy-ota-mqtt-idf:
-    cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-wire --lib --tests --example idf_c3_ota_runtime --target-dir {{ idf_dir }} -- -D warnings
-
-# check the esp-idf DDI transport, without and with the plain-HTTP lab opt-in
+# check the esp-idf DDI transport, without and with the plain-HTTP lab opt-in, and the DDI runtime next to wifi and mqtt (the nudge build)
 [group('build')]
 check-ota-ddi-idf:
     cargo check -p rustyfarian-esp-idf-network --features ota-ddi --target-dir {{ idf_dir }}
     cargo check -p rustyfarian-esp-idf-network --features ota-ddi-insecure-http --target-dir {{ idf_dir }}
+    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi --target-dir {{ idf_dir }}
 
 # lint the esp-idf DDI transport, without and with the plain-HTTP lab opt-in (it cannot run on the host)
 [group('build')]
@@ -244,12 +227,6 @@ clippy-ota-ddi-idf:
 clippy-ota-ddi-mqtt-idf:
     cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi --lib --tests --target-dir {{ idf_dir }} -- -D warnings
     cargo clippy -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi-insecure-http --lib --tests --example idf_c3_ddi --example idf_c6_ddi --target-dir {{ idf_dir }} -- -D warnings
-
-# prove a DDI build leaves the MQTT OTA runtime out: check wifi,mqtt,ota-ddi without ota-wire, assert the feature graph and the expanded source, then that ota-ddi,ota-wire fails without the bench-only ota-ddi-bench-mqtt-wire opt-in
-[group('build')]
-check-ota-ddi-no-mqtt-runtime:
-    cargo check -p rustyfarian-esp-idf-network --features wifi,mqtt,ota-ddi --target-dir {{ idf_dir }}
-    scripts/check-ota-ddi-no-mqtt-runtime.sh {{ idf_target }} {{ idf_dir }}
 
 # check the esp-idf provisioning domain of the consolidated ESP-IDF network crate
 [group('build')]
@@ -294,7 +271,7 @@ check-idf-all:
 
 # check all ESP-IDF domains (per-domain isolation gaps that --all-features masks)
 [group('build')]
-check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-ota-mqtt-idf check-ota-ddi-idf check-ota-ddi-no-mqtt-runtime check-provisioning check-idf-all
+check-idf: check-wifi check-mqtt check-lora check-espnow check-ota-idf check-ota-ddi-idf check-provisioning check-idf-all
 
 # check the consolidated HAL network crate stub (no-default-features, host)
 [group('build')]
@@ -315,9 +292,8 @@ check-provisioning-hal-embassy:
 check-ota-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
-    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32c3,unstable,rt,embassy --example hal_c3_ota --target-dir {{ hal_dir }}
 
-# check the esp-hal DDI client (ota-ddi, ota-ddi-insecure-http; with wifi+mqtt also on ESP32-S3) and the hal_c3_ddi / hal_c6_ddi examples on ESP32-C6 and ESP32-C3, and that ota-ddi + ota-wire fails without the bench opt-in
+# check the esp-hal DDI client (ota-ddi, ota-ddi-insecure-http; with wifi+mqtt also on ESP32-S3) and the hal_c3_ddi / hal_c6_ddi examples on ESP32-C6 and ESP32-C3
 [group('build')]
 check-ota-ddi-hal:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
@@ -329,7 +305,6 @@ check-ota-ddi-hal:
     cargo check -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32s3,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c3,unstable,rt,embassy --example hal_c3_ddi --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c6,unstable,rt,embassy --example hal_c6_ddi --target-dir {{ hal_dir }}
-    scripts/check-ota-ddi-hal-guard.sh {{ hal_c3_target }} {{ hal_dir }}
 
 # lint the esp-hal DDI client on ESP32-C6, ESP32-C3 (no atomic read-modify-write) and ESP32-S3 (Xtensa)
 [group('build')]
@@ -416,8 +391,6 @@ clippy-hal: clippy-ota-ddi-hal
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --example hal_c3_espnow_peer -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32s3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features provisioning,esp32s3,unstable,rt,embassy --example hal_esp32s3_provision_mqtt -- -D warnings
-    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32c3,unstable,rt,embassy --example hal_c3_ota -- -D warnings
-    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32s3,unstable,rt,embassy --example hal_esp32s3_ota -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target xtensa-esp32-none-elf -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target xtensa-esp32-none-elf -p rustyfarian-esp-hal-network --no-default-features --features mqtt,esp32,unstable,rt,embassy -- -D warnings
 
@@ -517,7 +490,6 @@ test-espnow: test-wifi
 [group('test & lint')]
 test-ota:
     cargo test --target {{ host_target }} -p juggler --features ota
-    cargo test --target {{ host_target }} -p juggler --features ota-wire
     cargo test --target {{ host_target }} -p juggler --features ota-ddi
     cargo test --target {{ host_target }} -p juggler --features ota-ddi,ota-flash-kv ota::persist::
 
@@ -779,11 +751,6 @@ critical-path action="render" *args:
 
 # ── ota ───────────────────────────────────────────────────────────────────
 
-# build an OTA example and produce app binary, SHA-256, manifest, and command (version first)
-[group('ota')]
-ota-image version example="idf_c3_ota_runtime":
-    scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
-
 # build a DDI example (idf_* or hal_{c3,c6}_*) with FIRMWARE_VERSION=version and write the fleet's release bundle (<name>.bin, .bin.sha256, .bin.version, .bin.chip) to tmp/ddi-bundle/
 [group('ota')]
 ddi-bundle example version:
@@ -865,137 +832,6 @@ ddi-nudge:
 ddi-proxy:
     scripts/ddi-lab.sh proxy
 
-# baseline flash of idf_c3_ota_runtime with FIRMWARE_VERSION=version
-[group('ota')]
-ota-flash version:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! printf '%s' "{{ version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "Error: version must be MAJOR.MINOR.PATCH, got '{{ version }}'" >&2
-        exit 1
-    fi
-    FIRMWARE_VERSION="{{ version }}" scripts/flash.sh "idf_c3_ota_runtime" "{{ hal_dir }}" "{{ idf_dir }}"
-
-# build an unhealthy OTA image (OTA_DEMO_UNHEALTHY=1, optional failure deadline in s)
-[group('ota')]
-ota-image-unhealthy version deadline="" example="idf_c3_ota_runtime":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! printf '%s' "{{ version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "Error: version must be MAJOR.MINOR.PATCH, got '{{ version }}'" >&2
-        exit 1
-    fi
-    if [ -n "{{ deadline }}" ] && ! printf '%s' "{{ deadline }}" | grep -Eq '^[0-9]+$'; then
-        echo "Error: deadline must be a whole number of seconds, got '{{ deadline }}'" >&2
-        exit 1
-    fi
-    export FIRMWARE_VERSION="{{ version }}" OTA_DEMO_UNHEALTHY=1
-    if [ -n "{{ deadline }}" ]; then
-        export OTA_FAILURE_DEADLINE_SECS="{{ deadline }}"
-    fi
-    scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
-
-# publish OTA manifest command for version (fails if not built)
-[group('ota')]
-ota-push version:
-    scripts/ota-mqtt.sh cmd "{{ version }}"
-
-# publish tampered manifest command (kind: target|checksum)
-[group('ota')]
-ota-cmd-tampered version kind:
-    scripts/ota-mqtt.sh cmd-tampered "{{ version }}" "{{ kind }}"
-
-# publish raw payload to OTA command topic
-[group('ota')]
-ota-pub payload:
-    scripts/ota-mqtt.sh pub {{ quote(payload) }}
-
-# publish rollback action
-[group('ota')]
-ota-rollback from:
-    scripts/ota-mqtt.sh rollback "{{ from }}"
-
-# publish repair action
-[group('ota')]
-ota-repair:
-    scripts/ota-mqtt.sh repair
-
-# burst publish count commands (kind: repair|invalid)
-[group('ota')]
-ota-burst count kind:
-    scripts/ota-mqtt.sh burst "{{ count }}" "{{ kind }}"
-
-# subscribe to OTA status topic with ISO timestamps (topic: default status)
-[group('ota')]
-ota-status topic="status":
-    scripts/ota-mqtt.sh sub "{{ topic }}"
-
-# flash the baseline of a bare-metal OTA example: it fetches target_version's image (built by ota-image) from ota_host
-[group('ota')]
-flash-ota-baseline example baseline target_version ota_host:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for v in "{{ baseline }}" "{{ target_version }}"; do
-        if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Error: versions must be MAJOR.MINOR.PATCH, got '$v'" >&2
-            exit 1
-        fi
-    done
-    image="target/ota/{{ example }}-v{{ target_version }}.bin"
-    if [ ! -f "$image" ]; then
-        echo "$image does not exist; run 'just ota-image {{ target_version }} {{ example }}' first" >&2
-        exit 1
-    fi
-    export FIRMWARE_VERSION="{{ baseline }}"
-    export OTA_HOST="{{ ota_host }}"
-    export OTA_PORT="${OTA_PORT:-8000}"
-    export OTA_PATH="$(basename "$image")"
-    export OTA_SHA256="$(shasum -a 256 "$image" | cut -d' ' -f1)"
-    export OTA_TARGET_VERSION="{{ target_version }}"
-    scripts/flash.sh "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
-
-# bench OTA round trip: build the served image (unhealthy when the check name contains `rollback`), export the
-# baseline's build-time variables for the runner's build step, then run the bench check, e.g.
-# `just bench-ota s3 ota hal_esp32s3_ota 1.0.0 2.0.0 <server-ip> --port /dev/cu.usbmodem2101`
-[doc('bench OTA round trip: build the served image, export the baseline build-time variables, run the bench check')]
-[group('ota')]
-bench-ota board check example baseline target_version ota_host *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for v in "{{ baseline }}" "{{ target_version }}"; do
-        if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Error: versions must be MAJOR.MINOR.PATCH, got '$v'" >&2
-            exit 1
-        fi
-    done
-    case "{{ check }}" in
-        *rollback*) just ota-image-unhealthy "{{ target_version }}" "" "{{ example }}" ;;
-        *) just ota-image "{{ target_version }}" "{{ example }}" ;;
-    esac
-    image="target/ota/{{ example }}-v{{ target_version }}.bin"
-    export FIRMWARE_VERSION="{{ baseline }}"
-    export OTA_HOST="{{ ota_host }}"
-    export OTA_PORT="${OTA_PORT:-8000}"
-    export OTA_PATH="$(basename "$image")"
-    export OTA_SHA256="$(shasum -a 256 "$image" | cut -d' ' -f1)"
-    export OTA_TARGET_VERSION="{{ target_version }}"
-    just bench "{{ board }}" "{{ check }}" {{ args }}
-
-# Usage: just ota-serve              (serve at full speed)
-#        just ota-serve 10240        (throttle to 10 KB/s)
-#        just ota-serve 0 102400     (full speed, then stall after 100 KiB: download_timeout test)
-# Port: OTA_PORT (default 8000), the same variable `ota-image` writes into the URLs.
-[doc('serve OTA images from target/ota/ over HTTP with optional throttle')]
-[group('ota')]
-ota-serve rate="0" stall="0":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ ! -d target/ota ]; then
-        echo "target/ota does not exist; run 'just ota-image <version>' first" >&2
-        exit 1
-    fi
-    exec python3 scripts/ota-server.py target/ota "${OTA_PORT:-8000}" "{{ rate }}" "{{ stall }}"
-
 # Port: LOCAL_MQTT_PORT (default 1883); `up` prints the MQTT_HOST and MQTT_PORT to use.
 [doc('manage a local test MQTT broker: just mosquitto up | down | status | restart')]
 [group('ota')]
@@ -1021,11 +857,11 @@ verify: fmt-check clippy-pure clippy-ota-pure check-no-credential-logging check-
 
 # ESP-IDF device checks and lints on the workspace default RISC-V target (needs the ESP toolchain)
 [group('ci')]
-verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clippy-provisioning-mqtt-tests clippy-ota-mqtt-idf clippy-ota-ddi-idf clippy-ota-ddi-mqtt-idf clippy-espnow
+verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clippy-provisioning-mqtt-tests clippy-ota-ddi-idf clippy-ota-ddi-mqtt-idf clippy-espnow
 
 # bare-metal esp-hal device checks (needs the ESP toolchain for -Zbuild-std)
 [group('ci')]
-verify-hal: check-hal check-ota-wire-pure check-ota-ddi-pure check-ota-flash-kv-pure
+verify-hal: check-hal check-ota-ddi-pure check-ota-flash-kv-pure
 
 # CI-equivalent: verify, deny, then the device gates
 [group('ci')]
@@ -1049,7 +885,7 @@ ci-clippy: clippy-pure clippy-ota-pure
 
 # CI job (rust.yml): workspace check and the pure OTA checks on the ESP-IDF default target
 [group('ci')]
-ci-check: check check-ota-pure check-ota-wire-pure check-ota-ddi-pure check-ota-ddi-no-mqtt-runtime
+ci-check: check check-ota-pure check-ota-ddi-pure check-ota-ddi-idf
 
 # CI job (rust.yml): check the Wi-Fi STA-only build with SoftAP disabled (ESP-IDF)
 [group('ci')]

@@ -5,9 +5,8 @@
 //! (no features) succeeds on the host.
 //!
 //! The stub mirrors the *type names* of the real implementation but does not
-//! mirror their signatures — the real `new` requires the `FLASH` peripheral
-//! and `fetch_and_apply` requires `embassy_net::tcp::TcpSocket`, neither of
-//! which are available without the chip + embassy features. Any code that
+//! mirror their signatures — the real `new` requires the `FLASH` peripheral,
+//! which is not available without the chip + embassy features. Any code that
 //! calls the real surface without those features fails to compile, which is
 //! the desired behaviour: the stub is a typecheck convenience, not a runtime
 //! substitute. Mirrors the pattern used by `rustyfarian-esp-hal-network`.
@@ -26,7 +25,7 @@ pub struct OtaManagerConfig {
 /// Bare-metal OTA manager placeholder.
 ///
 /// Compiled when chip + `embassy` features are not active. The real type
-/// (with `new`, `fetch_and_apply`, `mark_valid`, `rollback`) lives in
+/// (with `new`, `mark_valid`, `rollback`) lives in
 /// `manager.rs` and is gated on those features.
 #[derive(Debug, Default)]
 pub struct EspHalOtaManager;

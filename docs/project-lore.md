@@ -201,7 +201,7 @@ A variant-switching harvest must delete `release/build/esp-idf-sys-*` (`just cle
 
 **Bare-metal OTA rollback depends on the bootloader, built from the sdkconfig overlay, not the example's features.**
 Only `sdkconfig.ota.defaults` sets `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`; cache files are `<chip>.bin` and `<chip>-ota.bin`.
-`flash.sh` picks `-ota` when the features include `ota`; `ensure-bootloader.sh --ota` builds it (c3 via `idf_c3_ota_runtime`, esp32s3 via `idf_esp32s3_mqtt_lwt` + `ota`).
+`flash.sh` picks `-ota` when the features include `ota`; `ensure-bootloader.sh --ota` builds it (c3 via `idf_c3_ota_runtime`, esp32s3 via `idf_esp32s3_mqtt_lwt` + `ota`; 2026-11-24: `idf_c3_ota_runtime` is removed and the c3 case builds `idf_c3_ddi`).
 
 **The IDF-built v5.3.3 bootloader boots bare-metal esp-hal images on RISC-V (C3) and Xtensa (Heltec V3 S3), verified 2026-09-26** with `--bootloader <path> --ignore-app-descriptor`.
 
@@ -334,10 +334,10 @@ A library log line can turn tainted the day an example first calls `with_auth` /
 
 **`esp-storage 0.9.0` `FlashStorage::new` takes `FLASH<'d>`; a second call per boot panics** — hence `EspHalOtaManager::new(config, FLASH<'d>)`.
 
-**Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon** (request smuggling) — see rustdoc of `parse_header` and `HeaderState::feed` in `ota/http.rs`.
+**Hand-rolled HTTP/1.1 parsers must reject `Content-Length: +N` and whitespace before the colon** (request smuggling) — see rustdoc of `parse_header` and `HeaderState::feed` in `ota/http.rs` (2026-11-24: `HeaderState` is removed, and the DDI `HeadParser` in `ota/http/ddi` carries the same rules).
 
 **A same-second `[ota] update failed … Update server unreachable` with nothing in the server log means no TCP connect happened; a blocked route times out after `timeout_secs`.**
-The manager wrote the `GET` onto an unconnected socket; it also accepted only `HTTP/1.1 ` while `just ota-serve` answers `HTTP/1.0` (`BadStatusLine`); a hal OTA run needs a router rule for the image port.
+The manager wrote the `GET` onto an unconnected socket; it also accepted only `HTTP/1.1 ` while `just ota-serve` answers `HTTP/1.0` (`BadStatusLine`); a hal OTA run needs a router rule for the image port (2026-11-24: the hal pull path and `just ota-serve` are removed, and the DDI `HeadParser` carries the same rules).
 
 **Logging a URL with RFC 3986 userinfo leaks credentials** — see rustdoc of `url_for_log`.
 

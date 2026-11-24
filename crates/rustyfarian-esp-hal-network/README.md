@@ -19,7 +19,7 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 | `mqtt`         | Async MQTT 5 client via `minimq 0.13.5` (ADR 019)         | Yes                | Implies `wifi` + `embassy`; IPv4 broker literal.      |
 | `espnow`       | ESP-NOW driver `EspHalEspNow` (ADR 020)                   | Yes                | Implies `wifi` + `embassy`; `esp32c3`/`esp32c6` only. |
 | `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.           |
-| `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.      |
+| `ota`          | OTA boot-slot control (mark valid, roll back)             | Yes                | Downloads need `ota-ddi`.                             |
 | `ota-ddi`      | DDI (hawkBit DDI v1) OTA client (ADR 027)                 | Yes                | No TLS yet: `http://` needs `ota-ddi-insecure-http`.  |
 | `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V).    |
 
@@ -80,8 +80,8 @@ rustyfarian-esp-hal-network = { version = "0.8", features = ["wifi", "esp32s3", 
 # MQTT (with Wi-Fi) on ESP32-S3
 rustyfarian-esp-hal-network = { version = "0.8", features = ["mqtt", "esp32s3", "embassy", "rt"] }
 
-# Wi-Fi + OTA on ESP32-C6
-rustyfarian-esp-hal-network = { version = "0.8", features = ["wifi", "ota", "esp32c6", "embassy", "rt"] }
+# Wi-Fi + MQTT + DDI OTA client on ESP32-C6 (`ota-ddi` is not in 0.8.0: take the repository until the next release)
+rustyfarian-esp-hal-network = { git = "https://github.com/datenkollektiv/rustyfarian-network", features = ["wifi", "mqtt", "ota-ddi", "esp32c6", "embassy", "rt", "unstable"] }
 
 # SoftAP provisioning on ESP32-C3
 rustyfarian-esp-hal-network = { version = "0.8", features = ["provisioning", "esp32c3", "embassy", "rt"] }

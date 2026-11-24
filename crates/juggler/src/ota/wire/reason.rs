@@ -2,9 +2,9 @@
 
 use core::fmt;
 
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 use serde::de::{Deserializer, Error, Visitor};
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::ota::{Admission, BlockedBy, OfferDecision, OtaError};
@@ -149,6 +149,7 @@ impl FailReason {
             "foreign_origin" => FailReason::Ota(OtaError::ForeignOrigin),
             "redirect" => FailReason::Ota(OtaError::Redirect { status: 0 }),
             "size_mismatch" => FailReason::Ota(OtaError::SizeMismatch),
+            "flash_busy" => FailReason::Ota(OtaError::FlashBusy),
             _ => return None,
         })
     }
@@ -194,7 +195,7 @@ impl From<OtaError> for FailReason {
     }
 }
 
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 impl Serialize for FailReason {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -202,7 +203,7 @@ impl Serialize for FailReason {
 }
 
 /// Deserializes from the wire string with [`FailReason::from_code`]; an unknown code is an error that does not echo it.
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 impl<'de> Deserialize<'de> for FailReason {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct CodeVisitor;
@@ -256,6 +257,7 @@ mod tests {
             OtaError::Redirect { status: 301 },
             OtaError::SizeMismatch,
             OtaError::TargetMismatch,
+            OtaError::FlashBusy,
         ];
         for e in errors {
             let parsed = FailReason::from_code(e.code()).unwrap();
@@ -286,7 +288,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+    #[cfg(feature = "ota-ddi")]
     #[test]
     fn deserialize_uses_from_code_and_rejects_unknown_without_echo() {
         let ok: FailReason = serde_json::from_str("\"busy\"").unwrap();
@@ -344,6 +346,7 @@ mod tests {
             OtaError::Redirect { status: 301 },
             OtaError::SizeMismatch,
             OtaError::TargetMismatch,
+            OtaError::FlashBusy,
         ];
         for err in all {
             let code = err.code();

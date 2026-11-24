@@ -1,4 +1,4 @@
-//! The library-owned flags of an OTA runtime, shared by the MQTT and the DDI runtime.
+//! The library-owned flags of the DDI runtime.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

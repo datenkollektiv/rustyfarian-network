@@ -9,11 +9,11 @@
 //!
 //! The consumer writes the [`AttemptRecord`] before the download starts, with
 //! `activated = false` and `boot_selected = false`.
-//! `boot_selected` is persisted right after `fetch_and_apply` returns `Ok`
+//! `boot_selected` is persisted right after the download returns `Ok`
 //! (it switches the boot slot internally) and before rebooting.
 //! Never persist it before the call: an interrupted download would then be
 //! mistaken for a rollback and a good version refused.
-//! If `fetch_and_apply` returns `Err`, call [`reconcile`] with refreshed facts
+//! If the download returns `Err`, call [`reconcile`] with refreshed facts
 //! right away instead of waiting for a reboot: the previous image still runs
 //! and the boot slot was not switched, so it returns
 //! [`ReconcileAction::ClearAttempt`] and admission reopens.
@@ -237,7 +237,7 @@ pub struct AttemptRecord {
     pub slot: SlotId,
     /// The target slot was selected as the boot slot.
     ///
-    /// Persist it right after `fetch_and_apply` returns `Ok` (which switches
+    /// Persist it right after the download returns `Ok` (which switches
     /// the boot slot internally) and before rebooting.
     /// Never persist it before that call: an interrupted download would then
     /// be mistaken for a rollback and a good version refused.

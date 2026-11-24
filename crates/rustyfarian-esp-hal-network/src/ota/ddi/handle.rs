@@ -189,11 +189,13 @@ impl DdiRuntime {
             log::warn!("[ota] boot bookkeeping warnings: {:?}", outcome.warnings);
         }
         let mut boot = plan.flags;
-        let report_owed = if plan.needs_repair() {
+        let repair_owed = if plan.needs_repair() {
             repair(records, running, &mut boot)?
         } else {
             false
         };
+        // The records read cleanly but may be stale (a damaged newer record): owed like a repair that dropped records.
+        let report_owed = repair_owed || with_store(records, |store| store.newer_record_lost())?;
 
         let flags = OtaFlags::new(&shared.flags);
         flags.set_admission_open(boot.admission_open);

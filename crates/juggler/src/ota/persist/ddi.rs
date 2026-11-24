@@ -467,11 +467,24 @@ mod typed {
         /// A verdict that already awaits delivery wins: one for the same action is kept ([`VerdictNote::KeptPending`]), one for another action refuses this one with [`StoreError::VerdictPending`], and the server offers the refused action again once the first verdict is delivered.
         ///
         /// A [`DdiVerdict::records_unreadable`] verdict first repairs every corrupt record ([`OtaStore::repair_corrupt`] until none is left, a corrupt attempt or DDI record included), so it can be stored at all; the 1005 report stands for what the repair dropped.
+        /// Once it is stored it also acknowledges the backend's lost-record finding ([`OtaKv::acknowledge_record_loss`]), which until then survives every reboot.
         ///
         /// # Errors
         ///
         /// Nothing is written on [`StoreError::NotAdmitted`] (an attempt exists: its verdict comes from its own sequence), [`StoreError::VerdictPending`], or a read error, except the repairs of a `records_unreadable` verdict.
         pub fn persist_verdict(&mut self, verdict: &DdiVerdict) -> Result<VerdictNote, StoreError> {
+            let note = self.persist_verdict_records(verdict)?;
+            if verdict.is_records_unreadable() {
+                // The report is stored (or its action already answered): the backend's lost-record finding is discharged with it.
+                self.kv.acknowledge_record_loss()?;
+            }
+            Ok(note)
+        }
+
+        fn persist_verdict_records(
+            &mut self,
+            verdict: &DdiVerdict,
+        ) -> Result<VerdictNote, StoreError> {
             if verdict.is_records_unreadable() {
                 // One group per call; the store has six groups, so this ends with none left or an error.
                 for _ in 0..REPAIR_PASSES {
@@ -568,6 +581,7 @@ mod typed {
         /// Write order: the rollback report of the bound attempt (`rb_id` equal to `ddi_att`, or a 1004 verdict's report whose `rb_id` a repair removed) is marked delivered first, then `ddi_stage` = closed.
         /// A power loss between the two sends the verdict once more, which the server deduplicates; the other order could leave the report pending and admission blocked for good.
         /// Code and details are kept after delivery.
+        /// A delivered `records_unreadable` verdict also acknowledges the backend's lost-record finding, in case a power loss kept [`OtaStore::persist_verdict`] from doing so.
         /// [`VerdictDelivery::NotPending`] while an attempt still exists (see [`OtaStore::pending_verdict`]).
         pub fn mark_verdict_delivered(
             &mut self,
@@ -590,6 +604,13 @@ mod typed {
                 if report_of_this_attempt && self.flag(k::RB)? {
                     self.kv.set_u8(k::RB, 0)?;
                 }
+            }
+            // A power loss between the 1005 verdict's write and its acknowledgement left the backend's lost-record finding set: this delivery answers it.
+            if r.code == Some(u32::from(ProfileCode::Device.as_u16()))
+                && self.ddi_details()?.first().map(|d| d.as_str())
+                    == Some(DETAIL_RECORDS_UNREADABLE)
+            {
+                self.kv.acknowledge_record_loss()?;
             }
             self.kv.set_u8(k::DDI_STAGE, k::STAGE_CLOSED)?;
             Ok(VerdictDelivery::Marked)

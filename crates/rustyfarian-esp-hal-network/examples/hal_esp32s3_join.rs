@@ -76,7 +76,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-/// The dev-dependency `juggler` (host-test features such as `ota-wire`) links
+/// The dev-dependency `juggler` (host-test features such as `ota-ddi`) links
 /// `alloc` into every example, which then needs a global allocator. This
 /// bring-up never allocates, so an allocator that always fails is enough.
 struct NoHeap;

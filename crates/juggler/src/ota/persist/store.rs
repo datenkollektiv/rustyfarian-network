@@ -360,6 +360,14 @@ impl<K: OtaKv> OtaStore<K> {
         self.kv
     }
 
+    /// Whether the backend may have lost a record newer than the state it serves ([`OtaKv::newer_record_lost`]).
+    ///
+    /// The records then read cleanly but may be stale: a closed action or a rolled-back version may be forgotten.
+    /// A tier treats it like a repair that dropped records and owes the server a 1005 `records_unreadable` report for the next offered action.
+    pub fn newer_record_lost(&self) -> bool {
+        self.kv.newer_record_lost()
+    }
+
     // ---- reads ---------------------------------------------------------
 
     /// Reads a reason key; a mistyped, over-long or non-ASCII value reads as the label `"unknown"` (never a fault).
@@ -863,7 +871,7 @@ impl<K: OtaKv> OtaStore<K> {
         Ok(self.kv.get_u32(k::RB_ID)? == Some(attempt_id) && rb == 1)
     }
 
-    /// After a failed `fetch_and_apply`: clears the attempt only when the decision core says [`ReconcileAction::ClearAttempt`].
+    /// After a failed download: clears the attempt only when the decision core says [`ReconcileAction::ClearAttempt`].
     ///
     /// Builds the same `BootFacts` as boot reconciliation (`hw`, `running_version`, and the report fact from the store), runs [`reconcile()`], and performs only the clear.
     /// A boot-time action (health check, refusal, rollback report, defer) is left to the next boot and returned as [`FailedDownload::Kept`].

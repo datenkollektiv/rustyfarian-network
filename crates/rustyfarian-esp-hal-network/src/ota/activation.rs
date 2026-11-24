@@ -29,6 +29,7 @@ pub(super) type Entry = [u8; ENTRY_LEN];
 const ERASED: u32 = 0xFFFF_FFFF;
 
 /// `esp_ota_img_states_t` `ESP_OTA_IMG_NEW`.
+#[cfg(any(feature = "ota-ddi", test))]
 const STATE_NEW: u32 = 0x0;
 
 /// `esp_ota_img_states_t` `ESP_OTA_IMG_PENDING_VERIFY`.
@@ -62,6 +63,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 /// Builds the entry the bootloader expects for `seq` in `state`.
+#[cfg(any(feature = "ota-ddi", test))]
 pub(super) fn encode_entry(seq: u32, state: u32) -> Entry {
     let mut entry = [0xFF; ENTRY_LEN];
     entry[0..4].copy_from_slice(&seq.to_le_bytes());
@@ -144,6 +146,7 @@ pub(super) fn selected_app(sectors: &[Entry; 2], ota_count: usize) -> Option<u8>
 }
 
 /// Why an activation cannot be planned.
+#[cfg(any(feature = "ota-ddi", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanError {
     /// The partition table has no OTA app slots, or more than the 16 the format allows.
@@ -157,6 +160,7 @@ pub(super) enum PlanError {
 }
 
 /// Where and what to write.
+#[cfg(any(feature = "ota-ddi", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Plan {
     /// Index (0 or 1) of the otadata sector to write: the non-selected one.
@@ -172,6 +176,7 @@ pub(super) struct Plan {
 /// The sequence rule is the crate's: the selected slot is `(seq - 1) % ota_count`
 /// of the highest valid sequence, and the new sequence is the smallest one above
 /// it that selects `next_app`.
+#[cfg(any(feature = "ota-ddi", test))]
 pub(super) fn plan_activation(
     sectors: &[Entry; 2],
     ota_count: usize,
@@ -272,10 +277,14 @@ fn app_state(sectors: &[Entry; 2], ota_count: usize, app: u8) -> juggler::ota::S
 }
 
 /// The OTA app ESP-IDF's `esp_ota_get_next_update_partition(NULL)` names: the one after the
-/// running OTA app, `ota_0` from a factory image, none without OTA apps or when the only one runs.
+/// running OTA app, `ota_0` from a factory image; none with fewer than two OTA apps.
+///
+/// One OTA app next to a factory image is refused although the factory image could write it: the image installed there has no slot to update into, so the DDI runtime could not start to confirm it and the bootloader would roll it back at the next reset.
+///
+/// The slot a download writes: never the running one, whatever the otadata selects (blank otadata selects `Factory` even when `ota_0` runs, which made `OtaUpdater::next_partition` name the running `ota_0`).
 #[cfg(any(feature = "ota-ddi", test))]
-fn next_update_app(running_app: Option<u8>, ota_count: usize) -> Option<u8> {
-    if ota_count == 0 || ota_count > 16 {
+pub(super) fn next_update_app(running_app: Option<u8>, ota_count: usize) -> Option<u8> {
+    if !(2..=16).contains(&ota_count) {
         return None;
     }
     let next = match running_app {
@@ -427,6 +436,7 @@ pub(super) enum RestoreOutcome {
 }
 
 /// The first thing that went wrong.
+#[cfg(any(feature = "ota-ddi", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Cause<E> {
     /// Reading the otadata failed; nothing was written.
@@ -440,6 +450,7 @@ pub(super) enum Cause<E> {
 }
 
 /// A failed activation: the original cause and the restore outcome.
+#[cfg(any(feature = "ota-ddi", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ActivationFailure<E> {
     /// The original error.
@@ -454,6 +465,7 @@ pub(super) struct ActivationFailure<E> {
 /// On a write error or a read-back mismatch it tries to put the previous bytes
 /// of the written sector back and reports the original error together with the
 /// restore outcome.
+#[cfg(any(feature = "ota-ddi", test))]
 pub(super) fn activate_as_new<S: OtadataSectors>(
     sectors: &mut S,
     ota_count: usize,
@@ -1126,5 +1138,56 @@ mod tests {
         assert_eq!(failure.cause, Cause::Plan(PlanError::AlreadySelected));
         assert_eq!(failure.restore, RestoreOutcome::NotNeeded);
         assert_eq!(flash.writes, 0);
+    }
+
+    mod update_app {
+        use super::super::next_update_app;
+
+        #[test]
+        fn the_slot_after_the_running_one_modulo_the_count() {
+            assert_eq!(next_update_app(Some(0), 2), Some(1));
+            assert_eq!(next_update_app(Some(1), 2), Some(0));
+            assert_eq!(next_update_app(Some(2), 3), Some(0));
+            assert_eq!(next_update_app(Some(0), 3), Some(1));
+        }
+
+        #[test]
+        fn a_factory_image_updates_ota_0() {
+            assert_eq!(next_update_app(None, 2), Some(0));
+        }
+
+        #[test]
+        fn a_factory_image_with_one_ota_slot_has_no_target() {
+            assert_eq!(next_update_app(None, 1), None);
+        }
+
+        #[test]
+        fn blank_otadata_with_ota_0_running_never_names_ota_0() {
+            assert_eq!(next_update_app(Some(0), 2), Some(1));
+        }
+
+        #[test]
+        fn a_lone_running_slot_has_no_target() {
+            assert_eq!(next_update_app(Some(0), 1), None);
+        }
+
+        #[test]
+        fn no_ota_slots_or_too_many_have_no_target() {
+            assert_eq!(next_update_app(None, 0), None);
+            assert_eq!(next_update_app(Some(0), 0), None);
+            assert_eq!(next_update_app(None, 17), None);
+        }
+
+        #[test]
+        fn the_target_is_never_the_running_slot() {
+            for count in 0..=17 {
+                for running in core::iter::once(None).chain((0..16).map(Some)) {
+                    if let Some(target) = next_update_app(running, count) {
+                        assert_ne!(Some(target), running, "{running:?} of {count}");
+                        assert!(usize::from(target) < count);
+                    }
+                }
+            }
+        }
     }
 }

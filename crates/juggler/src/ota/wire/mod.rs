@@ -1,53 +1,22 @@
-//! OTA wire contract: the command, manifest and status JSON that an OTA
-//! consumer exchanges with its backend, plus the frozen `failed` reason codes.
+//! OTA reason codes: the frozen `failed` reason codes ([`FailReason`]) and the `rolled_back` reason codes ([`RollbackReason`]).
 //!
-//! The command, manifest and status types are enabled by the `ota-wire` feature (implies `ota`, needs `alloc`).
-//! The base `ota` feature enables only [`FailReason`], which the DDI feedback encoder (`ota::ddi::wire`) shares, and [`RollbackReason`], which the record store (`ota::persist`) shares; their serde impls need `ota-wire` or `ota-ddi`.
-//! The shapes are the first consumer's (rustyfarian-rgb-clock) and must stay byte-compatible.
-//!
-//! # Limits
-//!
-//! - A command payload larger than [`MAX_COMMAND_BYTES`] (512) is rejected before any parsing.
-//! - A manifest body larger than [`MAX_MANIFEST_BYTES`] (1024) is rejected before any parsing.
+//! Both are part of the base `ota` feature: the DDI feedback encoder (`ota::ddi::wire`) uses [`FailReason`] and the record store (`ota::persist`) uses [`RollbackReason`]; their serde impls need `ota-ddi`.
+//! The code strings were first published on the MQTT OTA wire (removed after 0.8.0) and are stored in device records, so they must stay byte-compatible.
 //!
 //! # Privacy
 //!
 //! Nothing in this module logs, and no error value carries payload text.
-//! URLs may contain `user:password@`; a consumer logs only the fixed reason strings.
-//! A `Malformed { line, column }` position reveals lengths, never content: an error just after a URL hints at the URL's length.
-//!
-//! # Consumer order
-//!
-//! `OtaCommand::parse`, fetch the manifest, `Manifest::parse`, `Manifest::check_target`, `Manifest::image_metadata`, then `decide_offer`; map each failure with `reason()` or `FailReason::from_offer`.
-//!
-//! `Manifest::parse` validates the URL, so a manifest with a bad URL reports `manifest_invalid` even when its target is also wrong; the target is only checked afterwards.
 
-#![allow(deprecated)]
-
-#[cfg(feature = "ota-wire")]
-mod command;
-#[cfg(feature = "ota-wire")]
-mod manifest;
 mod reason;
 mod rollback;
-#[cfg(feature = "ota-wire")]
-mod status;
-#[cfg(feature = "ota-wire")]
-mod url;
 
-#[cfg(feature = "ota-wire")]
-pub use command::{CommandError, OtaCommand, MAX_COMMAND_BYTES};
-#[cfg(feature = "ota-wire")]
-pub use manifest::{Manifest, ManifestError, MAX_MANIFEST_BYTES};
 pub use reason::FailReason;
 pub use rollback::RollbackReason;
-#[cfg(feature = "ota-wire")]
-pub use status::{OtaStatus, StatusError};
 
 /// Line and column (both 1-based) of the first byte that is not ASCII whitespace, or 1/1 when there is none.
 ///
 /// Used for the early "not a JSON object" rejection so the position matches `serde_json`'s convention without reading any payload text.
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi"))]
+#[cfg(feature = "ota-ddi")]
 pub(crate) fn first_token_position(bytes: &[u8]) -> (usize, usize) {
     let (mut line, mut column) = (1, 1);
     for &b in bytes {
@@ -64,7 +33,7 @@ pub(crate) fn first_token_position(bytes: &[u8]) -> (usize, usize) {
     (1, 1)
 }
 
-#[cfg(all(test, any(feature = "ota-wire", feature = "ota-ddi")))]
+#[cfg(all(test, feature = "ota-ddi"))]
 mod position_tests {
     use super::first_token_position;
 

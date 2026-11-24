@@ -1,6 +1,6 @@
 //! The firmware download order as an action machine (ADR 023 rung 3).
 //!
-//! Both tiers run `fetch_and_apply` through [`DownloadMachine`]: blocking threads on ESP-IDF, async on esp-hal, with transport and flash I/O outside `embedded-hal`.
+//! Both tiers run a firmware download through [`DownloadMachine`]: blocking threads on ESP-IDF, async on esp-hal, with transport and flash I/O outside `embedded-hal`.
 //! The machine owns the order of the steps (deadline, connect and headers, the Content-Length admission, the image-header chip check when one is expected, preparing the slot, the read and write stream with a deadline check after each, the SHA-256 compare, the final deadline and the activation permit); the tier loop only performs the returned [`DownloadAction`] and feeds the outcome back as a [`DownloadInput`].
 //! A cancel enters through [`DownloadMachine::cancel`], from another thread or task through a [`CancelGate`].
 //!
@@ -336,6 +336,7 @@ enum Phase {
 /// - every error after a successful preparation yields [`DownloadAction::Abort`] first, then [`DownloadAction::Done`] with that error;
 /// - an operation's own error wins over an expired deadline at the same boundary;
 /// - an accepted [`cancel`](Self::cancel) is honoured by the next answer to the pending action: before preparation (the header reads included) it ends the download, after it the write session is aborted first; it wins over any operation error and the deadline, so the result is [`OtaError::Cancelled`] exactly when the cancel was accepted;
+/// - [`check_preparing`](Self::check_preparing) lets a tier whose preparation yields ask for an accepted cancel or an expired deadline between its steps; it ends the machine like a failed preparation;
 /// - an input that does not answer the pending action yields [`DownloadAction::Ignored`] and changes nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadMachine {
@@ -404,6 +405,31 @@ impl DownloadMachine {
                 CancelRequest::Accepted
             }
         }
+    }
+
+    /// Asks between two steps of a slot preparation whether the download has to stop: an accepted [`cancel`](Self::cancel) or an expired deadline.
+    ///
+    /// For a tier whose [`DownloadAction::Prepare`] takes long (the esp-hal erase runs sector by sector and yields in between) and so cannot wait for the answer to learn of a cancel or a deadline.
+    /// `Err(e)` ends the machine exactly as the answer [`DownloadInput::PrepareFailed`] would: [`OtaError::Cancelled`] when a cancel was accepted (it wins over the deadline), else [`OtaError::DownloadTimeout`] once the deadline has expired; nothing was opened, so there is nothing to abort, and the tier returns `e`.
+    /// `Ok(())` changes nothing: the machine still waits for the answer to [`DownloadAction::Prepare`].
+    /// Outside the preparation it always answers `Ok(())` and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// `Cancelled` or `DownloadTimeout`, as above.
+    pub fn check_preparing(&mut self, elapsed: Duration) -> Result<(), OtaError> {
+        if self.phase != Phase::Preparing {
+            return Ok(());
+        }
+        let stop = if self.cancelled {
+            Err(OtaError::Cancelled)
+        } else {
+            self.deadline.check(elapsed)
+        };
+        if let Err(e) = stop {
+            self.done(Err(e));
+        }
+        stop
     }
 
     /// The most [`poll`](Self::poll) calls a download of `len` bytes can take when every successful read returns at least `min_read` bytes: `2 * ceil(len / min_read) + 8`.
@@ -705,6 +731,29 @@ impl CancelGate {
             self.requested = true;
             CancelRequest::Accepted
         }
+    }
+
+    /// One [`DownloadMachine::check_preparing`] that first hands a requested cancel to the machine.
+    ///
+    /// Closes the gate when it returns an error, like a [`poll`](Self::poll) that ends the download (a gate made by [`for_retries`](Self::for_retries) stays open).
+    /// Does not count as a [`poll_bounded`](DownloadMachine::poll_bounded) step.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`DownloadMachine::check_preparing`].
+    pub fn check_preparing(
+        &mut self,
+        machine: &mut DownloadMachine,
+        elapsed: Duration,
+    ) -> Result<(), OtaError> {
+        if self.requested {
+            let _ = machine.cancel();
+        }
+        let checked = machine.check_preparing(elapsed);
+        if checked.is_err() && !self.retrying {
+            self.closed = true;
+        }
+        checked
     }
 
     /// One [`DownloadMachine::poll_bounded`] step that first hands a requested cancel to the machine.
@@ -1688,6 +1737,92 @@ mod tests {
                 "{answer:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cancel_between_erase_steps_ends_like_a_failed_prepare() {
+        let mut m = machine(Deadline::none());
+        m.poll(I::Begin, ms(0));
+        assert_eq!(kind(&m.poll(headers(10), ms(0))), K::Prepare(10));
+        assert_eq!(m.check_preparing(ms(1)), Ok(()));
+        assert_eq!(m.cancel(), CancelRequest::Accepted);
+        assert_eq!(m.check_preparing(ms(2)), Err(CANCELLED));
+        assert_eq!(m.cancel(), CancelRequest::TooLate, "the machine is over");
+        assert_eq!(kind(&m.poll(I::Prepared, ms(2))), K::Ignored);
+    }
+
+    #[test]
+    fn the_deadline_between_erase_steps_ends_like_a_failed_prepare() {
+        let mut m = machine(Deadline::after(ms(100)));
+        m.poll(I::Begin, ms(0));
+        m.poll(headers(10), ms(0));
+        assert_eq!(m.check_preparing(ms(99)), Ok(()));
+        assert_eq!(m.check_preparing(ms(100)), Err(OtaError::DownloadTimeout));
+        assert_eq!(m.cancel(), CancelRequest::TooLate);
+        assert_eq!(kind(&m.poll(I::Prepared, ms(100))), K::Ignored);
+    }
+
+    #[test]
+    fn a_cancel_wins_over_the_deadline_between_erase_steps() {
+        let mut m = machine(Deadline::after(ms(100)));
+        m.poll(I::Begin, ms(0));
+        m.poll(headers(10), ms(0));
+        m.cancel();
+        assert_eq!(m.check_preparing(ms(500)), Err(CANCELLED));
+    }
+
+    #[test]
+    fn check_preparing_outside_the_preparation_changes_nothing() {
+        let mut m = machine(Deadline::after(ms(100)));
+        assert_eq!(m.check_preparing(ms(500)), Ok(()), "before the first poll");
+        assert_eq!(kind(&m.poll(I::Begin, ms(0))), K::Connect);
+        m.cancel();
+        assert_eq!(m.check_preparing(ms(500)), Ok(()), "while connecting");
+        assert_eq!(
+            kind(&m.poll(I::ConnectFailed(OtaError::ServerUnreachable), ms(1))),
+            K::Done(Err(CANCELLED))
+        );
+
+        let mut m = prepared(Deadline::after(ms(100)), 10);
+        assert_eq!(m.check_preparing(ms(500)), Ok(()), "while reading");
+        assert_eq!(
+            kind(&m.poll(I::Read(10), ms(1))),
+            K::Write(10),
+            "the machine carries on"
+        );
+    }
+
+    #[test]
+    fn the_gate_hands_the_request_over_and_closes_between_erase_steps() {
+        let mut gate = CancelGate::new();
+        let mut m = machine(Deadline::none());
+        gate.poll(&mut m, I::Begin, ms(0)).unwrap();
+        gate.poll(&mut m, headers(10), ms(0)).unwrap();
+        assert_eq!(gate.check_preparing(&mut m, ms(1)), Ok(()));
+        assert_eq!(gate.request(), CancelRequest::Accepted);
+        assert_eq!(gate.check_preparing(&mut m, ms(2)), Err(CANCELLED));
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+
+        let mut gate = CancelGate::new();
+        let mut m = machine(Deadline::after(ms(10)));
+        gate.poll(&mut m, I::Begin, ms(0)).unwrap();
+        gate.poll(&mut m, headers(10), ms(0)).unwrap();
+        assert_eq!(
+            gate.check_preparing(&mut m, ms(10)),
+            Err(OtaError::DownloadTimeout)
+        );
+        assert_eq!(gate.request(), CancelRequest::TooLate);
+
+        let mut gate = CancelGate::for_retries();
+        let mut m = machine(Deadline::after(ms(10)));
+        gate.poll(&mut m, I::Begin, ms(0)).unwrap();
+        gate.poll(&mut m, headers(10), ms(0)).unwrap();
+        assert!(gate.check_preparing(&mut m, ms(10)).is_err());
+        assert_eq!(
+            gate.request(),
+            CancelRequest::Accepted,
+            "a retry gate stays open"
+        );
     }
 
     #[test]
