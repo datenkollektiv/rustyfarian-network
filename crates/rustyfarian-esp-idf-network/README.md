@@ -49,7 +49,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustyfarian-esp-idf-network = { version = "0.7", features = ["wifi", "mqtt"] }
+rustyfarian-esp-idf-network = { version = "0.8", features = ["wifi", "mqtt"] }
 ```
 
 ## ESP-IDF v6.1 build setup
