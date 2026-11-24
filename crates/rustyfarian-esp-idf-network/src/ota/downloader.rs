@@ -1,20 +1,23 @@
-//! Firmware downloader over plain HTTP using `EspHttpConnection`.
-//!
-//! HTTPS is explicitly rejected at the ADR 011 MVP scope.
-//! TLS support belongs to `ota-hardened`.
+//! The firmware response of the DDI download (`ota-ddi`) over `EspHttpConnection`, and the log-safe URL helper.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "ota-ddi")]
 use std::time::Duration;
 
+#[cfg(feature = "ota-ddi")]
 use embedded_svc::http::Headers;
+#[cfg(feature = "ota-ddi")]
 use esp_idf_svc::handle::RawHandle;
-use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
-use esp_idf_svc::http::Method;
+#[cfg(feature = "ota-ddi")]
+use esp_idf_svc::http::client::EspHttpConnection;
+#[cfg(feature = "ota-ddi")]
 use esp_idf_svc::sys::{esp, esp_http_client_set_timeout_ms, EspError};
 
-use juggler::ota::{capped_read_len, classify_read_error, OtaError, UrlForLog};
+use juggler::ota::UrlForLog;
+#[cfg(feature = "ota-ddi")]
+use juggler::ota::{capped_read_len, classify_read_error, OtaError};
 
 /// Buffer size for downloading firmware chunks.
+#[cfg(feature = "ota-ddi")]
 pub(super) const DOWNLOAD_BUFFER_SIZE: usize = 4096;
 
 /// Receive buffer of the HTTP client, in bytes.
@@ -27,6 +30,7 @@ pub(super) const DOWNLOAD_BUFFER_SIZE: usize = 4096;
 /// [`FirmwareResponse::read`] requests no more than this per call, which limits
 /// that worst case but does not make a call one wait.
 /// It also bounds one response header line.
+#[cfg(feature = "ota-ddi")]
 pub(super) const HTTP_RX_BUFFER_SIZE: usize = 1024;
 
 /// `true` when an `esp_http_client` failure code means "a wait timed out": a read, a header fetch or a connect.
@@ -39,6 +43,7 @@ pub(super) const HTTP_RX_BUFFER_SIZE: usize = 1024;
 /// `ESP_ERR_HTTP_CONNECTING` is what the ESP-IDF v6.1 API documents for
 /// `esp_http_client_open` timing out before the connection is made, so it is a
 /// timeout too, in either sign.
+#[cfg(any(feature = "ota-ddi", test))]
 pub(super) fn is_read_timeout(code: esp_idf_svc::sys::esp_err_t) -> bool {
     use esp_idf_svc::sys::{ESP_ERR_HTTP_CONNECTING, ESP_ERR_HTTP_EAGAIN};
     [ESP_ERR_HTTP_EAGAIN, ESP_ERR_HTTP_CONNECTING]
@@ -48,9 +53,8 @@ pub(super) fn is_read_timeout(code: esp_idf_svc::sys::esp_err_t) -> bool {
 
 /// Make a URL safe to log: strip the RFC 3986 `userinfo` (`user:password@`), the query and the fragment, and escape control characters.
 ///
-/// HTTPS is rejected by [`create_http_connection`], but plain HTTP URLs may
-/// still legally embed credentials per RFC 3986 section 3.2.1, and a query can
-/// carry a token.
+/// A URL may legally embed credentials per RFC 3986 section 3.2.1, and a
+/// query can carry a token.
 /// Logging the URL verbatim would leak those into the console and
 /// `espflash monitor` output, and a control character could break or forge a
 /// log line.
@@ -75,62 +79,8 @@ pub fn url_for_log(url: &str) -> String {
     UrlForLog(url).to_string()
 }
 
-/// Set once the insecure-HTTP WARN has been logged; statics reset on every boot.
-static INSECURE_HTTP_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Logs the insecure-HTTP WARN for the first plain-HTTP OTA connection of the boot only.
-pub(crate) fn warn_insecure_http_once(url: &str) {
-    if !INSECURE_HTTP_WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!(
-            "Using insecure HTTP for OTA: {} (logged once per boot)",
-            url_for_log(url)
-        );
-    }
-}
-
-/// Downloads firmware over plain HTTP.
-///
-/// [`connect`](Self::connect) opens the connection and reads the response
-/// headers; [`FirmwareResponse::read`] then reads the body. The order of the
-/// steps, and the Content-Length admission, belong to
-/// `juggler::ota::download::DownloadMachine`.
-pub struct FirmwareDownloader {
-    url: String,
-    timeout: Duration,
-}
-
-impl FirmwareDownloader {
-    /// Create a new downloader targeting `url`.
-    ///
-    /// Default timeout is 30 seconds.
-    pub fn new(url: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            timeout: Duration::from_secs(30),
-        }
-    }
-
-    /// Override the connection timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Open the connection and read the `200` response headers.
-    ///
-    /// HTTPS URLs are rejected; only plain `http://` is accepted at MVP scope.
-    pub fn connect(&self) -> Result<FirmwareResponse, OtaError> {
-        log::info!(
-            "Starting firmware download from: {}",
-            url_for_log(&self.url)
-        );
-
-        let client = create_http_connection(&self.url, self.timeout, "application/octet-stream")?;
-        Ok(FirmwareResponse::from_connection(client))
-    }
-}
-
 /// A `200` response whose body has not been read yet.
+#[cfg(feature = "ota-ddi")]
 pub struct FirmwareResponse {
     client: EspHttpConnection,
     /// The declared `Content-Length`; `None` when absent or chunked.
@@ -139,6 +89,7 @@ pub struct FirmwareResponse {
     chunked: bool,
 }
 
+#[cfg(feature = "ota-ddi")]
 impl FirmwareResponse {
     /// Wraps a connection whose response headers have been read.
     pub(super) fn from_connection(client: EspHttpConnection) -> Self {
@@ -197,77 +148,13 @@ impl FirmwareResponse {
 }
 
 /// Sets the wait of the next transport operations of `client` (a header fetch or a body read), clamped to the C `int` milliseconds.
+#[cfg(feature = "ota-ddi")]
 pub(super) fn set_wait(client: &mut EspHttpConnection, wait: Duration) -> Result<(), EspError> {
     let wait_ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: the handle is the live `esp_http_client` owned by `client`,
     // which outlives the call; `esp_http_client_set_timeout_ms` only stores
     // the value in it.
     esp!(unsafe { esp_http_client_set_timeout_ms(client.handle(), wait_ms) })
-}
-
-/// Create an `EspHttpConnection`, initiate a GET request, read the response headers,
-/// and return the connection ready for reading the response body.
-///
-/// Only plain `http://` is supported.
-/// Returns `Err(OtaError::ServerUnreachable)` for `https://` URLs —
-/// TLS is deferred to the `ota-hardened` scope (ADR 011).
-///
-/// `accept` is sent as the `Accept` header (`application/octet-stream` for firmware, `application/json` for a manifest).
-pub fn create_http_connection(
-    url: &str,
-    timeout: Duration,
-    accept: &str,
-) -> Result<EspHttpConnection, OtaError> {
-    if url.starts_with("https://") {
-        log::error!(
-            "HTTPS firmware download is not supported in this build (ota-hardened scope). \
-             URL: {}",
-            url_for_log(url)
-        );
-        return Err(OtaError::ServerUnreachable);
-    }
-
-    warn_insecure_http_once(url);
-
-    let config = Configuration {
-        timeout: Some(timeout),
-        buffer_size: Some(HTTP_RX_BUFFER_SIZE),
-        ..Default::default()
-    };
-
-    let mut client = EspHttpConnection::new(&config).map_err(|e| {
-        log::error!("Failed to create HTTP client: {:?}", e);
-        OtaError::ServerUnreachable
-    })?;
-
-    let headers = [("Accept", accept)];
-    client
-        .initiate_request(Method::Get, url, &headers)
-        .map_err(|e| {
-            log::error!(
-                "Failed to initiate HTTP GET request to {}: {:?}",
-                url_for_log(url),
-                e
-            );
-            OtaError::ServerUnreachable
-        })?;
-
-    client.initiate_response().map_err(|e| {
-        log::error!(
-            "Failed to read HTTP response from {}: {:?}",
-            url_for_log(url),
-            e
-        );
-        OtaError::ServerUnreachable
-    })?;
-
-    let status = client.status();
-    if status != 200 {
-        log::error!("HTTP GET {} returned status {}", url_for_log(url), status);
-        return Err(OtaError::DownloadFailed { status });
-    }
-
-    Ok(client)
 }
 
 #[cfg(test)]

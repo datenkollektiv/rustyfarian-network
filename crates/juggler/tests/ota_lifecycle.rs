@@ -464,7 +464,7 @@ impl Device {
             return Ok(Offer::Aborted);
         }
 
-        // fetch_and_apply: write the image, then switch the boot slot.
+        // The download: write the image, then switch the boot slot.
         self.downloads += 1;
         self.switched_since_offer = false;
         let reported = if behaviour == Behaviour::Mislabelled {
@@ -484,7 +484,7 @@ impl Device {
         self.switched_ever = true;
         self.tick()?;
 
-        // Only after fetch_and_apply returned Ok; a failed write is logged.
+        // Only after the download returned Ok; a failed write is logged.
         self.update_attempt(|a| a.boot_selected = true)?;
         Ok(Offer::Rebooting)
     }

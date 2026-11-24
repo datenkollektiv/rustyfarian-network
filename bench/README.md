@@ -22,7 +22,7 @@ just bench s3 --attended
 
 - Needs the workspace dotenv file with `WIFI_SSID`, `WIFI_PASS` and `MQTT_HOST` (an IPv4); `just doctor` checks the setup.
 - `--unattended` runs the steps the log can judge, `--attended` only those that need a person; a board passes only when both pass.
-- Per-check build variables (`ESPNOW_SCENARIO`, `COORDINATOR_MAC`, `ESPNOW_PEER_MAC`) and the OTA recipe `just bench-ota` are described in the check headers.
+- Per-check build variables (`ESPNOW_SCENARIO`, `COORDINATOR_MAC`, `ESPNOW_PEER_MAC`) are described in the check headers.
 - Pin `--port` while another board is attached: detection probes every candidate port with espflash, which resets whatever is on it.
 - A check with two examples runs the hal one first, then its idf twin.
 - Every Wi-Fi check starts with a signal step that warns when the joined AP is below -75 dBm (a far mesh node).

@@ -32,14 +32,14 @@ A generic client that carried these would contradict the README and open a path 
 
 - There is one credential-bound DDI transport per tier.
 - The ESP-IDF transport ships in this round.
-- The esp-hal transport follows in a later round, and its gaps are listed in the Scope table of the feature doc: no TLS stack, IPv4 literals only on the OTA path, a 256 B request buffer, no OTA runtime and none of the `ota::ddi` runtime types of this round (`DdiNudge` included).
+- The esp-hal transport follows in a later round, and its gaps are listed in the Scope table of the feature doc: no TLS stack, IPv4 literals only on the OTA path, a 256 B request buffer, no OTA runtime and none of the `ota::ddi` runtime types of this round (`DdiNudge` included). 2026-11-24: the esp-hal DDI client is implemented, and the URL pull API is removed on both tiers (`EspHalOtaManager::fetch_and_apply*` and `OtaSession::fetch_and_apply*`), so the gaps listed here for the pull path no longer apply.
 - No generic or exported HTTP client is added.
 - The transport is DDI-only: no public method takes a URL string, headers or a method, and the requests it can make are fixed.
 - The sans-IO DDI machine lives in `juggler::ota::ddi` (ADR 023 rung 3), next to the codec in `juggler::ota::ddi::wire`.
 - The transport only performs I/O and maps errors.
 - Parsing (documents, status handling and the `Retry-After` value) and every decision stay in `juggler`, as the ADR 023 decision 7 review rule requires.
 - This ADR supersedes ADR 011 decision 2 for the DDI transport only.
-- The hand-rolled esp-hal GET client and the MQTT wire's manifest and firmware fetch (`FirmwareDownloader`, `create_http_connection`) keep ADR 011, plain HTTP, unchanged.
+- The hand-rolled esp-hal GET client and the MQTT wire's manifest and firmware fetch (`FirmwareDownloader`, `create_http_connection`) keep ADR 011, plain HTTP, unchanged (2026-11-24: both were removed with the MQTT wire and the URL pull API).
 - ADR 011 deferred TLS to a "Hardened ADR"; this ADR is that decision for the DDI transport only.
 
 ### Names and features
@@ -82,7 +82,7 @@ ADR 023 decision 10 applies: each method is one endpoint with no decisions.
 - Redirects are never followed: every ESP-IDF request sets `FollowRedirectsPolicy::FollowNone`, and a 3xx is a failure.
 - esp-idf-svc's default `FollowGetHead` would follow a GET redirect and keep every header set on the handle, so the token would reach the redirected host.
 - `download` reuses `OtaSession` and the existing `DownloadMachine` loop through a crate-private request path that carries the `Authorization: TargetToken` header and `FollowNone`.
-- The public `OtaSession::fetch_and_apply*` methods keep their URL-only signature, and no public method gains a header parameter.
+- The public `OtaSession::fetch_and_apply*` methods keep their URL-only signature, and no public method gains a header parameter (2026-11-24: those public methods were removed, and the crate-private path stays).
 - The size is compared with `Content-Length` and with the bytes written.
 - Each request uses its own HTTP client, so the copies of the token made by esp-idf-svc (the `CString` and the `esp_http_client` header list) stay short-lived.
 - Zeroing on drop covers the library's own copies only.
@@ -146,9 +146,9 @@ The ADR 011 reasons for keeping the MQTT wire's HTTP internal and plain still ho
 
 ### Negative
 
-- Until the MQTT wire is removed, there are two download paths with different security: plain HTTP on the MQTT wire and HTTPS on the DDI client.
+- Until the MQTT wire was removed on 2026-11-24, there were two download paths with different security: plain HTTP on the MQTT wire and HTTPS on the DDI client.
 - The sync and async parity gap is recorded here, and it departs from ADR 022 decisions 2 and 3 for the DDI transport.
-- The esp-hal `download` must also settle how the TCP socket is supplied, because the esp-hal precedent `EspHalOtaManager::fetch_and_apply_cancellable` takes a `TcpSocket`.
+- The esp-hal `download` must also settle how the TCP socket is supplied, because the esp-hal precedent `EspHalOtaManager::fetch_and_apply_cancellable` takes a `TcpSocket` (2026-11-24: that precedent was removed with the esp-hal pull updater).
 - The heap headroom for one HTTPS session and one MQTTS session on C3 and C6 is not measured yet (open question in the feature doc).
 - The token copies made inside esp-idf-svc are freed but not zeroed.
 - Unauthenticated SNTP can still move the clock back after the build-time floor, so the floor is not a hard guarantee.
@@ -165,6 +165,6 @@ The ADR 011 reasons for keeping the MQTT wire's HTTP internal and plain still ho
 - [ADR 023 — Shared Tier Logic Follows a Three-Rung Ladder](023-shared-logic-ladder.md)
 - [Feature: DDI OTA client v1](../features/ddi-client-v1.md)
 - `crates/juggler/src/ota/ddi/wire/mod.rs` (the DDI codec and its size limits)
-- `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs` (`FirmwareDownloader`, `create_http_connection`)
-- `crates/rustyfarian-esp-idf-network/src/ota/mod.rs` (`OtaSession::fetch_and_apply_cancellable`, `OtaCancel`)
-- `crates/rustyfarian-esp-hal-network/src/ota/manager.rs` (`EspHalOtaManager::fetch_and_apply_cancellable`)
+- `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs` (`FirmwareDownloader`, `create_http_connection`, removed 2026-11-24)
+- `crates/rustyfarian-esp-idf-network/src/ota/mod.rs` (`OtaSession::fetch_and_apply_cancellable`, removed 2026-11-24; `OtaCancel`)
+- `crates/rustyfarian-esp-hal-network/src/ota/manager.rs` (`EspHalOtaManager::fetch_and_apply_cancellable`, removed 2026-11-24)

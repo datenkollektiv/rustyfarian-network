@@ -53,7 +53,7 @@ if find crates/rustyfarian-esp-idf-network/src/ota crates/juggler/src/ota/persis
 fi
 
 runtime_dirs=""
-for dir in crates/juggler/src/ota/runtime crates/juggler/src/ota/health.rs crates/juggler/src/ota/ddi/worker.rs crates/juggler/src/ota/ddi/download_flow.rs crates/juggler/src/ota/ddi/boot.rs crates/rustyfarian-esp-idf-network/src/ota/runtime crates/rustyfarian-esp-idf-network/src/ota/ddi crates/rustyfarian-esp-idf-network/src/ota/health_driver.rs crates/rustyfarian-esp-hal-network/src/ota/ddi crates/rustyfarian-esp-hal-network/src/ota/ddi.rs crates/rustyfarian-esp-hal-network/src/ota/flags.rs; do
+for dir in crates/juggler/src/ota/health.rs crates/juggler/src/ota/ddi/worker.rs crates/juggler/src/ota/ddi/download_flow.rs crates/juggler/src/ota/ddi/boot.rs crates/rustyfarian-esp-idf-network/src/ota/ddi crates/rustyfarian-esp-idf-network/src/ota/health_driver.rs crates/rustyfarian-esp-hal-network/src/ota/ddi crates/rustyfarian-esp-hal-network/src/ota/ddi.rs crates/rustyfarian-esp-hal-network/src/ota/flags.rs; do
   if [ -e "$dir" ]; then runtime_dirs="$runtime_dirs $dir"; fi
 done
 if [ -n "$runtime_dirs" ]; then

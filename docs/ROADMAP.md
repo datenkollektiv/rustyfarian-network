@@ -44,9 +44,9 @@ timeline
               : OTA download progress callback — user-facing progress for the OTA session
               : Upstream asks — esp-radio WifiController stop and start, esp-idf-svc inbound retain and QoS (from tier capability closure)
               : Provisioning tier parity — async wait_committed on IDF, one on_event shape, esp-hal boot helpers load_with_reentry and run_wifi_mqtt_portal (ADR 022)
-              : OTA tier parity — one manager name across tiers (OtaSession, EspHalOtaManager), MQTT OTA runtime on esp-hal (ADR 022)
-              : DDI OTA client — hawkBit DDI polling on ESP-IDF first, HTTPS by default, plain HTTP lab opt-in in 0.8.0, MQTT OTA wire retired after (feature-doc ddi-client-v1)
-              : Remote DDI bench checks — replace local-only setup, teardown, host run and probe steps so rustyfarian-bench v0.6.0 accepts c3/ddi and c6/ddi remotely
+              : OTA tier parity — URL pull updater dropped on both tiers, DDI is the only download path, one manager name and remaining method differences left (OtaSession, EspHalOtaManager) (ADR 022)
+              : DDI OTA client — hawkBit DDI polling on ESP-IDF first, HTTPS by default, plain HTTP lab opt-in in 0.8.0, MQTT OTA wire removed in the next minor (feature-doc ddi-client-v1)
+              : Remote DDI bench checks — replace local-only setup, teardown, host run and probe steps so rustyfarian-bench v0.6.0 accepts c3/ddi-idf, c3/ddi-hal and c6/ddi-idf remotely
               : Ladder closure code leftovers — TxCore Ignored action, hal connect timeout, OtaState next_state deprecation (archived ladder-closure gaps)
 
     Mid term  : LoRa TTN OTAA validation — first downlink (FPort 10) and session persistence remain (runbook)
@@ -75,7 +75,7 @@ The rows were re-checked against the code on 2026-11-11 with the resolved ones r
 
 Positive findings worth keeping in mind (no action):
 
-- `rustyfarian-esp-hal-network` OTA module's hand-rolled HTTP/1.1 parser is the security high-water mark (33 tests covering RFC 7230 smuggling vectors).
+- `rustyfarian-esp-hal-network` OTA module's hand-rolled HTTP/1.1 parser is the security high-water mark (host tests covering RFC 7230 smuggling vectors).
 - MQTT's SUBACK-deadlock avoidance (resolved via `MqttBuilder::subscribe`) and its `Weak`-based event-loop shutdown are solid.
 - ESP-NOW's failed-scan recovery keeps the last known channel by design; since ADR 025 a stale pin is corrected by the coordinator's probe reply on the next scan, and PeerLink rescans after 20 unacknowledged sends.
 

@@ -13,7 +13,6 @@
 //! | `lora` | `lora` | `heapless`, `nb`, `lorawan-device`, `sx126x`, `embedded-hal` |
 //! | `espnow` | `espnow` | none (implies wifi, for the country channel set) |
 //! | `ota` | `ota` (incl. `ota::persist`, `ota::health`, `FailReason`, `RollbackReason`) | `heapless`, `sha2` |
-//! | `ota-wire` | `ota::wire` (command, manifest, status), `ota::runtime` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `ota-ddi` | `ota::ddi` | `serde`, `serde_json`, `zeroize` (implies `ota`, needs `alloc`) |
 //! | `ota-flash-kv` | `ota::persist::FlashKv` | `embedded-storage` (implies `ota`, no `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless`, `zeroize` (implies wifi+mqtt) |
@@ -44,20 +43,14 @@
 //!   pure health policy (`ota::health`) and the frozen `failed` and rollback
 //!   reason codes. Requires `heapless` and `sha2`.
 //!
-//! - **`ota-wire`** — MQTT OTA wire contract: command and manifest parsing,
-//!   status JSON, the serde forms of the reason codes, and the consumer
-//!   runtime's pure state machines (`ota::runtime`). Requires `serde` and
-//!   `serde_json` (no default features, `alloc`); implies `ota`. The base `ota`
-//!   feature stays free of both.
-//!
 //! - **`ota-ddi`** — the sans-IO DDI client (`ota::ddi`: `PollMachine`,
 //!   deployment admission, `VerdictSender`, `CancelMachine`, `DdiSettings`, the
 //!   nudge topic) and its JSON codec (`ota::ddi::wire`): the poll, deployment
 //!   and cancel documents of the hawkBit DDI v1 profile, the bounded feedback
 //!   encoder and the profile codes, and the zeroizing target token
-//!   `ota::ddi::DdiToken`. Requires `serde`, `serde_json` (no default
-//!   features, `alloc`) and `zeroize`; implies `ota`. Independent of
-//!   `ota-wire`; the two share only `ota::wire::FailReason`.
+//!   `ota::ddi::DdiToken`, plus the serde forms of the reason codes. Requires
+//!   `serde`, `serde_json` (no default features, `alloc`) and `zeroize`;
+//!   implies `ota`. The base `ota` feature stays free of all three.
 //!
 //! - **`ota-flash-kv`** — `ota::persist::FlashKv`, the record store's backend
 //!   over raw NOR flash (`embedded-storage`): an append-only, CRC-checked
@@ -103,14 +96,11 @@
 //! - `provisioning::*` exports [`ProvisioningState`](provisioning::ProvisioningState), [`SchemaProfile`](provisioning::SchemaProfile), etc.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// The libtest harness is generated at the crate root, so it reads the tests of the deprecated MQTT OTA runtime (0.8.0) from outside the deprecated module.
-#![cfg_attr(test, allow(deprecated))]
 
 // alloc is needed in tests (provisioning + espnow mocks use alloc::format! etc.)
-// and by the `ota-wire` and `ota-ddi` JSON types (String, serde_json).
+// and by the `ota-ddi` JSON types (String, serde_json).
 #[cfg(any(
     test,
-    feature = "ota-wire",
     feature = "ota-ddi",
     feature = "std",
     all(feature = "mock", feature = "mqtt")

@@ -60,6 +60,8 @@ response body to the partition writer. The client is not exported, not
 re-exported, and not advertised as a reusable HTTP transport. It is an
 implementation detail of `rustyfarian-esp-hal-ota`.
 
+**2026-11-24 note:** neither tier offers this client as a URL pull updater any more (`OtaSession::fetch_and_apply*` and `EspHalOtaManager::fetch_and_apply*` are removed); the internal HTTP transports serve the DDI client only (ADR 027).
+
 The MVP client is deliberately strict. It accepts only `HTTP/1.1 200 OK`
 responses with exactly one valid `Content-Length` header. It rejects
 redirects, `Transfer-Encoding: chunked`, missing or duplicate

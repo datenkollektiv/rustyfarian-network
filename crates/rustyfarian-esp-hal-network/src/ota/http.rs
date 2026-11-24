@@ -1,17 +1,17 @@
-//! Strict HTTP/1.1 GET client — internal transport for `rustyfarian-esp-hal-network`.
+//! HTTP/1.1 client parts of the DDI client — internal transport for `rustyfarian-esp-hal-network`.
 //!
 //! This HTTP client is an implementation detail of `rustyfarian-esp-hal-network`
 //! and not part of the crate's public API.
 //! It may be removed if a workspace HTTP dependency arrives later.
 //!
-//! The client accepts **only** `HTTP/1.1 200 OK` responses with at most one
-//! valid `Content-Length` header and hands the length and any
-//! `Transfer-Encoding` on as raw facts; the admission rule (missing, chunked,
+//! The URL parser and the status-line and header-line parsers are here; the DDI exchange built on them is [`ddi`].
+//! An artifact download hands the declared `Content-Length` and any
+//! `Transfer-Encoding` on as raw facts ([`ResponseHeaders`]); the admission rule (missing, chunked,
 //! zero, too large) is `juggler::ota::check_content_length`, applied by
 //! `juggler::ota::download::DownloadMachine` before any flash partition is touched.
 
 // When building without the embassy + chip features, the parsing types and
-// functions defined here are only used in the `#[cfg(test)]` block below.
+// functions defined here are only used in the `#[cfg(test)]` blocks below.
 // Suppress the resulting dead_code warnings so `cargo clippy -D warnings`
 // does not fail on stub/host builds.
 #![cfg_attr(
@@ -39,14 +39,6 @@ pub(crate) enum HttpError {
     BadStatusLine,
     /// Status code was present and valid but not 200.
     NonSuccess { status: u16 },
-    /// `Content-Length` header appeared more than once.
-    DuplicateContentLength,
-    /// `Content-Length` value could not be parsed as a decimal `u64`.
-    InvalidContentLength,
-    /// I/O error reading from the socket.
-    Io,
-    /// Connection closed before the full response header was received.
-    EarlyEof,
     /// URL could not be parsed as `http://<host>/<path>`.
     BadUrl,
 }
@@ -54,7 +46,7 @@ pub(crate) enum HttpError {
 impl From<HttpError> for OtaError {
     fn from(e: HttpError) -> OtaError {
         // The public `OtaError` surface collapses several internal variants
-        // (BadStatusLine, Io, BadUrl, …) into
+        // (BadStatusLine, BadUrl) into
         // `ServerUnreachable`. Log the original variant before collapsing so
         // root cause survives in `espflash monitor` output.
         log::warn!("OTA HTTP error: {:?}", e);
@@ -65,12 +57,7 @@ impl From<HttpError> for OtaError {
 
             // Structural parse failures: the TCP endpoint answered but did not
             // speak recognisable HTTP/1.1 — treat as server unreachable.
-            HttpError::BadStatusLine
-            | HttpError::DuplicateContentLength
-            | HttpError::InvalidContentLength
-            | HttpError::EarlyEof
-            | HttpError::Io
-            | HttpError::BadUrl => OtaError::ServerUnreachable,
+            HttpError::BadStatusLine | HttpError::BadUrl => OtaError::ServerUnreachable,
         }
     }
 }
@@ -93,9 +80,8 @@ pub(crate) struct ResponseHeaders {
 
 /// Parsed `http://host[:port]/path` URL.
 ///
-/// DNS is the caller's responsibility for the MVP; only IP-literal hosts are
-/// expected.  If the caller passes a hostname, it is forwarded verbatim in the
-/// `Host` header — connect/resolve is the application's concern.
+/// The host is forwarded verbatim in the `Host` header; resolving it is the caller's concern
+/// (the DDI client looks a server name up through the station stack's DNS).
 pub(crate) struct ParsedUrl<'a> {
     pub host: &'a str,
     /// TCP port — used both to connect the socket and to populate the `Host`
@@ -184,9 +170,8 @@ pub(crate) fn parse_url(url: &str) -> Result<ParsedUrl<'_>, HttpError> {
 /// - `HTTP/1.1 NNN reason\r\n`
 /// - `HTTP/1.1 NNN\r\n`  (reason phrase is optional per RFC 7230 §3.1.2)
 /// - the same with `HTTP/1.0`: an HTTP/1.1 client processes a 1.0 response
-///   (RFC 7230 §2.6), and Python's `http.server` (`just ota-serve`) answers
-///   with `HTTP/1.0`; a 1.0 response without `Content-Length` still fails
-///   `check_content_length` as before.
+///   (RFC 7230 §2.6), and Python's `http.server` answers with `HTTP/1.0`; a 1.0
+///   artifact response without `Content-Length` still fails `check_content_length`.
 ///
 /// Rejects anything that does not start with exactly `HTTP/1.1 ` or `HTTP/1.0 `.
 pub(crate) fn parse_status_line(line: &[u8]) -> Result<u16, HttpError> {
@@ -281,174 +266,16 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
         .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-/// Accumulator that scans header lines and enforces ADR 011 §2 constraints.
-///
-/// Call [`HeaderState::feed`] for each `Name: value\r\n` line (excluding the
-/// status line and the blank separator line).  Call [`HeaderState::finish`]
-/// after the blank line to retrieve the [`ResponseHeaders`].
-pub(crate) struct HeaderState {
-    content_length: Option<u64>,
-    has_transfer_encoding: bool,
-}
+// ── Async exchange (embassy + `ota-ddi`) ─────────────────────────────────────
 
-impl HeaderState {
-    pub(crate) fn new() -> Self {
-        Self {
-            content_length: None,
-            has_transfer_encoding: false,
-        }
-    }
-
-    /// Feed one header line.  Returns `Err` on the first violation.
-    pub(crate) fn feed(&mut self, line: &[u8]) -> Result<(), HttpError> {
-        // Skip empty / whitespace-only lines (blank line signals end of headers;
-        // callers should not pass it here, but be defensive).
-        if trim_ows(line).is_empty() {
-            return Ok(());
-        }
-
-        let (name, value) = parse_header(line)?;
-
-        if eq_ignore_case(name, b"content-length") {
-            if self.content_length.is_some() {
-                return Err(HttpError::DuplicateContentLength);
-            }
-            // RFC 7230 §3.3.2: Content-Length is `1*DIGIT` — no sign, no whitespace,
-            // no leading `+` (which `u64::from_str` would otherwise accept). Enforce
-            // strict ASCII-digit-only input before delegating to from_str for the
-            // overflow check. Leading zeros are tolerated (RFC permits them).
-            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-                return Err(HttpError::InvalidContentLength);
-            }
-            let s = core::str::from_utf8(value).map_err(|_| HttpError::InvalidContentLength)?;
-            let n: u64 = s.parse().map_err(|_| HttpError::InvalidContentLength)?;
-            self.content_length = Some(n);
-        } else if eq_ignore_case(name, b"transfer-encoding") {
-            self.has_transfer_encoding = true;
-        }
-
-        Ok(())
-    }
-
-    /// The header facts after all headers have been fed; the download machine
-    /// applies the admission rule to them.
-    pub(crate) fn finish(self) -> ResponseHeaders {
-        ResponseHeaders {
-            content_length: self.content_length,
-            chunked: self.has_transfer_encoding,
-        }
-    }
-}
-
-// ── Async fetch helper (embassy feature only) ────────────────────────────────
-
-#[cfg(feature = "embassy")]
+#[cfg(all(feature = "embassy", feature = "ota-ddi"))]
 pub(crate) mod async_client {
-    use super::{parse_status_line, HeaderState, HttpError, ParsedUrl, ResponseHeaders};
     use embassy_net::tcp::TcpSocket;
-
-    /// Read the HTTP response headers line by line into `header_buf`.
-    ///
-    /// Returns the number of bytes consumed (including the blank separator
-    /// line) and the raw lines parsed so far.  The header section is expected
-    /// to fit within `header_buf`; oversized headers are treated as a protocol
-    /// error.
-    ///
-    /// Line endings accepted: `\r\n` only (strict HTTP/1.1).
-    async fn read_headers(
-        socket: &mut TcpSocket<'_>,
-        header_buf: &mut [u8],
-    ) -> Result<usize, HttpError> {
-        let mut filled = 0usize;
-        loop {
-            if filled >= header_buf.len() {
-                return Err(HttpError::Io); // header too large
-            }
-            let n = socket
-                .read(&mut header_buf[filled..filled + 1])
-                .await
-                .map_err(|_| HttpError::Io)?;
-            if n == 0 {
-                return Err(HttpError::EarlyEof);
-            }
-            filled += 1;
-
-            // Check if we just completed the blank separator line "\r\n\r\n".
-            if filled >= 4 && &header_buf[filled - 4..filled] == b"\r\n\r\n" {
-                return Ok(filled);
-            }
-        }
-    }
-
-    /// Send a strict `GET` request and parse the response headers.
-    ///
-    /// On success, the socket's read cursor is positioned immediately after
-    /// the blank header separator — the caller can stream the body directly.
-    ///
-    /// The returned facts are not yet admitted: the caller passes them to the
-    /// download machine, which applies `check_content_length`.
-    pub(crate) async fn fetch_get(
-        socket: &mut TcpSocket<'_>,
-        parsed: &ParsedUrl<'_>,
-    ) -> Result<ResponseHeaders, super::super::OtaError> {
-        // 1. Send the request.
-        let mut req_buf = [0u8; 256];
-        // Format: GET /path HTTP/1.1\r\nHost: host[:port]\r\nConnection: close\r\n\r\n
-        let req_len = super::format_get_request(
-            &mut req_buf,
-            parsed.host,
-            parsed.port,
-            parsed.path,
-            parsed.query,
-        )
-        .map_err(|_| super::super::OtaError::ServerUnreachable)?;
-
-        // Write the full request, handling partial writes (embassy-net TcpSocket::write
-        // does not impl embedded_io_async::Write, so we use its native write() directly).
-        let mut written = 0;
-        while written < req_len {
-            let n = socket
-                .write(&req_buf[written..req_len])
-                .await
-                .map_err(|_| super::super::OtaError::ServerUnreachable)?;
-            if n == 0 {
-                return Err(super::super::OtaError::ServerUnreachable);
-            }
-            written += n;
-        }
-
-        // 2. Read headers byte-by-byte until "\r\n\r\n".
-        let mut header_buf = [0u8; 1024];
-        let header_len = read_headers(socket, &mut header_buf)
-            .await
-            .map_err(super::super::OtaError::from)?;
-        let _ = header_len; // consumed by read_headers
-
-        // 3. Parse status line + headers from header_buf.
-        let header_data = &header_buf[..header_len];
-        let (status, headers_block) = split_status_line(header_data)?;
-
-        // Validate status: must be exactly 200.
-        if status != 200 {
-            return Err(super::super::OtaError::DownloadFailed { status });
-        }
-
-        // 4. Parse each header line.
-        let mut state = HeaderState::new();
-        for line in HeaderLineIter::new(headers_block) {
-            state.feed(line).map_err(super::super::OtaError::from)?;
-        }
-
-        // 5. Hand the Content-Length and Transfer-Encoding facts on; duplicate
-        //    and malformed lengths were already rejected by `feed`.
-        Ok(state.finish())
-    }
 
     /// Sends `parts` (a DDI request head, then its body) and reads the response head ([`super::ddi::HeadParser`]).
     ///
     /// The socket's read cursor ends right after the head, so the caller reads the body next.
     /// The caller bounds the whole exchange with one timeout.
-    #[cfg(feature = "ota-ddi")]
     pub(crate) async fn send_and_read_head(
         socket: &mut TcpSocket<'_>,
         parts: &[&[u8]],
@@ -474,139 +301,13 @@ pub(crate) mod async_client {
             }
         }
     }
-
-    /// Split the raw header block into the first line and the remainder.
-    fn split_status_line(data: &[u8]) -> Result<(u16, &[u8]), super::super::OtaError> {
-        let crlf = data
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or(super::super::OtaError::ServerUnreachable)?;
-        let first_line = &data[..crlf];
-        let rest = &data[crlf + 2..];
-        let status = parse_status_line(first_line).map_err(super::super::OtaError::from)?;
-        Ok((status, rest))
-    }
-
-    /// Iterator over header lines separated by `\r\n` in a byte slice.
-    struct HeaderLineIter<'a> {
-        data: &'a [u8],
-    }
-
-    impl<'a> HeaderLineIter<'a> {
-        fn new(data: &'a [u8]) -> Self {
-            Self { data }
-        }
-    }
-
-    impl<'a> Iterator for HeaderLineIter<'a> {
-        type Item = &'a [u8];
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.data.is_empty() {
-                return None;
-            }
-            match self.data.windows(2).position(|w| w == b"\r\n") {
-                Some(0) => {
-                    // Blank line — end of headers.
-                    self.data = &[];
-                    None
-                }
-                Some(pos) => {
-                    let line = &self.data[..pos];
-                    self.data = &self.data[pos + 2..];
-                    Some(line)
-                }
-                None => {
-                    // Last fragment without trailing CRLF — shouldn't happen with
-                    // well-formed HTTP, but yield it anyway.
-                    let line = self.data;
-                    self.data = &[];
-                    if line.is_empty() {
-                        None
-                    } else {
-                        Some(line)
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── Request formatting (always compiles — host-testable) ─────────────────────
-
-/// Format `GET /path HTTP/1.1\r\nHost: host[:port]\r\nConnection: close\r\n\r\n`
-/// into `buf`.  Returns the number of bytes written, or `Err(())` if the
-/// buffer is too small.
-///
-/// Per RFC 7230 §5.4, the `Host` field-value must mirror the URL authority
-/// component.  The port is included whenever it is not the HTTP/1.1
-/// default of 80; servers behind reverse proxies / virtual-host routers
-/// will otherwise route the request incorrectly or reject it outright.
-pub(crate) fn format_get_request(
-    buf: &mut [u8],
-    host: &str,
-    port: u16,
-    path: &str,
-    query: &str,
-) -> Result<usize, ()> {
-    let mut pos = 0;
-    write_bytes(buf, &mut pos, b"GET ")?;
-    write_bytes(buf, &mut pos, path.as_bytes())?;
-    write_bytes(buf, &mut pos, query.as_bytes())?;
-    write_bytes(buf, &mut pos, b" HTTP/1.1\r\nHost: ")?;
-    write_bytes(buf, &mut pos, host.as_bytes())?;
-    if port != 80 {
-        write_bytes(buf, &mut pos, b":")?;
-        write_u16_decimal(buf, &mut pos, port)?;
-    }
-    write_bytes(buf, &mut pos, b"\r\nConnection: close\r\n\r\n")?;
-    Ok(pos)
-}
-
-/// Append `src` at `*pos` in `buf`, advancing `*pos`. Errors if `buf` is too small.
-fn write_bytes(buf: &mut [u8], pos: &mut usize, src: &[u8]) -> Result<(), ()> {
-    let end = *pos + src.len();
-    if end > buf.len() {
-        return Err(());
-    }
-    buf[*pos..end].copy_from_slice(src);
-    *pos = end;
-    Ok(())
-}
-
-/// Append `n` as ASCII decimal at `*pos` in `buf`, advancing `*pos`.
-/// At most 5 bytes (`u16::MAX = 65535`).
-fn write_u16_decimal(buf: &mut [u8], pos: &mut usize, n: u16) -> Result<(), ()> {
-    // Build the digits LSB-first into a fixed scratch buffer, then copy
-    // them out in MSB-first order.
-    let mut tmp = [0u8; 5];
-    let mut len = 0;
-    let mut n = n;
-    if n == 0 {
-        tmp[0] = b'0';
-        len = 1;
-    } else {
-        while n > 0 {
-            tmp[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-    }
-    if *pos + len > buf.len() {
-        return Err(());
-    }
-    for i in 0..len {
-        buf[*pos + i] = tmp[len - 1 - i];
-    }
-    *pos += len;
-    Ok(())
 }
 
 // ── DDI extension (feature `ota-ddi`) ───────────────────────────────────────
 
 /// The DDI transport's HTTP/1.1 exchange, sans-IO: the request head writer, the response head parser and the body decoder.
 ///
-/// Unlike the strict firmware GET above, a DDI request may be a `GET`, `POST` or `PUT` with an `Authorization` header, and the transport must see any status, the `Retry-After` value and a JSON body that may come chunked (ADR 027).
+/// A DDI request may be a `GET`, `POST` or `PUT` with an `Authorization` header, and the transport must see any status, the `Retry-After` value and a JSON body that may come chunked (ADR 027).
 /// Redirects are never followed: the transport reports a 3xx other than 304 as its own error ([`juggler::ota::ddi::is_redirect`]).
 #[cfg(any(feature = "ota-ddi", test))]
 pub(crate) mod ddi {
@@ -672,7 +373,7 @@ pub(crate) mod ddi {
     /// The request head of a DDI request, in a heap buffer of exactly its size.
     ///
     /// `POST` and `PUT` always carry `Content-Type: application/json` and a `Content-Length` of `body_len` (0 included); a `GET` carries neither.
-    /// `Host` names the port unless it is 80, as the firmware GET does.
+    /// `Host` names the port unless it is 80 (RFC 7230 §5.4: the field mirrors the URL authority, and a server that routes by `Host` needs a non-default port).
     /// Every request asks the server to close the connection after the response.
     /// The head holds the `Authorization` value, the token included; it is freed, not zeroed, when the caller drops it, like the copies the ESP-IDF tier's HTTP client makes.
     pub(crate) fn request_head(
@@ -1154,7 +855,6 @@ pub(crate) mod ddi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use juggler::ota::check_content_length;
 
     // ── Status line ──────────────────────────────────────────────────────────
 
@@ -1182,7 +882,7 @@ mod tests {
 
     #[test]
     fn status_line_http10_is_accepted() {
-        // `just ota-serve` (Python's `http.server`) answers `HTTP/1.0`.
+        // Python's `http.server` answers `HTTP/1.0`.
         assert_eq!(parse_status_line(b"HTTP/1.0 200 OK"), Ok(200));
         assert_eq!(parse_status_line(b"HTTP/1.0 404 Not Found\r\n"), Ok(404));
     }
@@ -1231,170 +931,6 @@ mod tests {
         assert_eq!(
             parse_status_line(b"GET / HTTP/1.1"),
             Err(HttpError::BadStatusLine)
-        );
-    }
-
-    // ── Header parsing ───────────────────────────────────────────────────────
-
-    #[test]
-    fn header_content_length_present() {
-        let mut state = HeaderState::new();
-        state.feed(b"Content-Length: 1024").unwrap();
-        let resp = state.finish();
-        assert_eq!(resp.content_length, Some(1024));
-        assert!(!resp.chunked);
-    }
-
-    #[test]
-    fn header_content_length_missing() {
-        let resp = HeaderState::new().finish();
-        assert_eq!(resp.content_length, None);
-        // The shared admission rule maps it like the ESP-IDF tier does.
-        assert_eq!(
-            check_content_length(resp.content_length, resp.chunked, u64::MAX),
-            Err(OtaError::DownloadFailed { status: 0 })
-        );
-    }
-
-    #[test]
-    fn header_content_length_duplicate() {
-        let mut state = HeaderState::new();
-        state.feed(b"Content-Length: 100").unwrap();
-        assert_eq!(
-            state.feed(b"Content-Length: 200"),
-            Err(HttpError::DuplicateContentLength)
-        );
-    }
-
-    #[test]
-    fn header_content_length_zero_rejected() {
-        let mut state = HeaderState::new();
-        state.feed(b"Content-Length: 0").unwrap();
-        let resp = state.finish();
-        assert_eq!(resp.content_length, Some(0));
-        assert_eq!(
-            check_content_length(resp.content_length, resp.chunked, u64::MAX),
-            Err(OtaError::DownloadFailed { status: 0 })
-        );
-    }
-
-    #[test]
-    fn header_content_length_overflow() {
-        // 2^64 = 18446744073709551616 — exceeds u64::MAX
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length: 18446744073709551616"),
-            Err(HttpError::InvalidContentLength)
-        );
-    }
-
-    #[test]
-    fn header_content_length_non_numeric() {
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length: abc"),
-            Err(HttpError::InvalidContentLength)
-        );
-    }
-
-    #[test]
-    fn header_content_length_case_insensitive() {
-        // RFC 7230: header field names are case-insensitive.
-        let mut state = HeaderState::new();
-        state.feed(b"content-length: 1024").unwrap();
-        let resp = state.finish();
-        assert_eq!(resp.content_length, Some(1024));
-    }
-
-    #[test]
-    fn header_content_length_mixed_case() {
-        let mut state = HeaderState::new();
-        state.feed(b"CONTENT-LENGTH: 512").unwrap();
-        let resp = state.finish();
-        assert_eq!(resp.content_length, Some(512));
-    }
-
-    #[test]
-    fn header_transfer_encoding_chunked() {
-        // Transfer-Encoding: chunked must cause rejection even when CL is present.
-        let mut state = HeaderState::new();
-        state.feed(b"Transfer-Encoding: chunked").unwrap();
-        state.feed(b"Content-Length: 1024").unwrap();
-        let resp = state.finish();
-        assert!(resp.chunked);
-        assert_eq!(
-            check_content_length(resp.content_length, resp.chunked, u64::MAX),
-            Err(OtaError::DownloadFailed { status: 0 })
-        );
-    }
-
-    #[test]
-    fn header_transfer_encoding_identity() {
-        // Any Transfer-Encoding header is rejected — identity included.
-        let mut state = HeaderState::new();
-        state.feed(b"Transfer-Encoding: identity").unwrap();
-        state.feed(b"Content-Length: 100").unwrap();
-        assert!(state.finish().chunked);
-    }
-
-    #[test]
-    fn header_content_length_rejects_leading_plus() {
-        // RFC 7230 §3.3.2 requires Content-Length to be `1*DIGIT` — no sign.
-        // `u64::from_str` would otherwise accept `+1024`, opening a request-
-        // smuggling primitive when paired with a strict upstream proxy.
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length: +1024"),
-            Err(HttpError::InvalidContentLength)
-        );
-    }
-
-    #[test]
-    fn header_content_length_rejects_leading_minus() {
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length: -1"),
-            Err(HttpError::InvalidContentLength)
-        );
-    }
-
-    #[test]
-    fn header_content_length_rejects_empty_value() {
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length: "),
-            Err(HttpError::InvalidContentLength)
-        );
-    }
-
-    #[test]
-    fn header_rejects_whitespace_before_colon() {
-        // RFC 7230 §3.2.4 forbids whitespace between header name and colon.
-        // Accepting it would silently disable header recognition (the name
-        // `Content-Length\t` does not match `content-length`), enabling a
-        // duplicate-CL bypass and Transfer-Encoding smuggling.
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Content-Length\t: 1024"),
-            Err(HttpError::BadStatusLine)
-        );
-
-        let mut state = HeaderState::new();
-        assert_eq!(
-            state.feed(b"Transfer-Encoding : chunked"),
-            Err(HttpError::BadStatusLine)
-        );
-    }
-
-    #[test]
-    fn oversized_body_rejected() {
-        // Capacity 100 but Content-Length = 200 → InsufficientSpace.
-        let mut state = HeaderState::new();
-        state.feed(b"Content-Length: 200").unwrap();
-        let resp = state.finish();
-        assert_eq!(
-            check_content_length(resp.content_length, resp.chunked, 100),
-            Err(OtaError::InsufficientSpace)
         );
     }
 
@@ -1481,59 +1017,5 @@ mod tests {
         }
         let p = parse_url("http://[::1]:8080/x").unwrap();
         assert_eq!((p.host, p.port), ("[::1]", 8080));
-    }
-
-    #[test]
-    fn get_request_appends_query() {
-        let mut buf = [0u8; 128];
-        let n = format_get_request(&mut buf, "h", 80, "/", "?x=1").unwrap();
-        assert!(buf[..n].starts_with(b"GET /?x=1 HTTP/1.1\r\n"));
-    }
-
-    // ── GET request formatting (Host header port handling) ───────────────────
-
-    #[test]
-    fn host_header_omits_default_port() {
-        // RFC 7230 §5.4: when the authority's port is the default (80 for HTTP),
-        // the Host field-value MAY omit it. We omit it for compactness.
-        let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "192.168.1.1", 80, "/fw.bin", "").unwrap();
-        let req = core::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(
-            req,
-            "GET /fw.bin HTTP/1.1\r\nHost: 192.168.1.1\r\nConnection: close\r\n\r\n"
-        );
-    }
-
-    #[test]
-    fn host_header_includes_non_default_port() {
-        // Servers that route by Host (vhost / reverse proxy) require the port
-        // when it is not the HTTP/1.1 default. Omitting it on :8080 caused the
-        // P2 review finding.
-        let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "192.168.1.1", 8080, "/fw.bin", "").unwrap();
-        let req = core::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(
-            req,
-            "GET /fw.bin HTTP/1.1\r\nHost: 192.168.1.1:8080\r\nConnection: close\r\n\r\n"
-        );
-    }
-
-    #[test]
-    fn host_header_includes_low_non_default_port() {
-        // Boundary: any port other than 80 is "non-default" — including 81.
-        let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "host", 81, "/", "").unwrap();
-        let req = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(req.contains("Host: host:81\r\n"));
-    }
-
-    #[test]
-    fn host_header_includes_max_port() {
-        // u16::MAX boundary: 5 ASCII digits must fit.
-        let mut buf = [0u8; 256];
-        let n = format_get_request(&mut buf, "h", 65535, "/", "").unwrap();
-        let req = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(req.contains("Host: h:65535\r\n"));
     }
 }

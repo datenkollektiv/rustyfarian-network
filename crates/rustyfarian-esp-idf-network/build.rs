@@ -20,11 +20,8 @@ fn main() {
     // Enables the measurement `on_connect` in `idf_esp32s3_mqtt_lwt`.
     println!("cargo:rerun-if-env-changed=MQTT_ON_CONNECT_DEMO");
     println!("cargo:rerun-if-env-changed=OTA_URL");
-    // Rerun triggers for the OTA runtime example (firmware version, topic prefix).
+    // Rerun trigger for the firmware version the DDI OTA examples report.
     println!("cargo:rerun-if-env-changed=FIRMWARE_VERSION");
-    println!("cargo:rerun-if-env-changed=OTA_TOPIC_PREFIX");
-    println!("cargo:rerun-if-env-changed=OTA_DEMO_UNHEALTHY");
-    println!("cargo:rerun-if-env-changed=OTA_FAILURE_DEADLINE_SECS");
     // Rerun triggers for the DDI OTA examples (`idf_c3_ddi`, `idf_c6_ddi`): the server, the
     // device identity, its token and the broker password are compiled in via `option_env!`.
     println!("cargo:rerun-if-env-changed=DDI_BASE_URL");

@@ -1,5 +1,7 @@
 # Runbook: OTA Hardware Test (Library Runtime)
 
+> **2026-11-24:** this runbook is history: the MQTT OTA runtime, `idf_c3_ota_runtime` and the `just ota-*` recipes it names are removed, so run it from the `v0.8.0` tag.
+
 Run this after any change to the OTA download path, wire contract, record store or runtime, and before every release.
 It pushes real firmware updates over MQTT to a device and records one result per scenario.
 

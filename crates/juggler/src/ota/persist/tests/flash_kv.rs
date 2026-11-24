@@ -473,6 +473,7 @@ fn a_torn_tail_falls_back_and_the_next_commit_goes_to_an_erased_sector() {
     flash.fill(second + 8, second + 24, 0xFF);
     let mut kv = open(&flash);
     assert_eq!(kv.get_u32("att_ctr"), Ok(Some(1)));
+    assert!(!kv.recovered_from_corruption());
     flash.reset_counters();
     kv.set_u32("att_ctr", 3).expect("set");
     assert_eq!(flash.erases(), 1);
@@ -521,9 +522,340 @@ fn foreign_data_opens_as_an_empty_store() {
     flash.fill(0, 4, 0xFE);
     let mut kv = open(&flash);
     assert_eq!(state(&kv), vec![None; KEYS.len()]);
+    assert!(!kv.recovered_from_corruption());
     kv.set_u8("rb", 1).expect("set");
     assert_eq!(flash.overwrites(), 0);
     assert_eq!(open(&flash).get_u8("rb"), Ok(Some(1)));
+}
+
+#[test]
+fn a_blank_region_and_plausible_looking_foreign_data_open_empty_without_the_flag() {
+    let blank = MockNor::new(3);
+    let kv = open(&blank);
+    assert_eq!(state(&kv), vec![None; KEYS.len()]);
+    assert!(!kv.recovered_from_corruption());
+
+    // Every position looks like a header (format byte, in-range length) but nothing passes its CRC.
+    let foreign = MockNor::new(6);
+    foreign.fill(0, 6 * SECTOR, 0x01);
+    let mut kv = open(&foreign);
+    assert_eq!(state(&kv), vec![None; KEYS.len()]);
+    assert!(!kv.recovered_from_corruption());
+    kv.set_u8("rb", 1).expect("set");
+    assert_eq!(foreign.overwrites(), 0);
+    assert_eq!(open(&foreign).get_u8("rb"), Ok(Some(1)));
+}
+
+/// Three snapshots in sector 0 (`att_ctr` 1, 2, 3); returns the flash and the padded snapshot size.
+fn three_snapshots() -> (MockNor, usize) {
+    let flash = MockNor::new(2);
+    let mut kv = open(&flash);
+    kv.set_u32("att_ctr", 1).expect("set");
+    let snapshot = flash.bytes_written();
+    kv.set_u32("att_ctr", 2).expect("set");
+    kv.set_u32("att_ctr", 3).expect("set");
+    (flash, snapshot)
+}
+
+/// Opens, checks the newest value and the flag, then commits on: the commits survive a reopen and never program over written bits.
+fn assert_recovered(flash: &MockNor) {
+    let mut kv = open(flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(3)));
+    assert!(kv.recovered_from_corruption());
+    for value in 4..300u32 {
+        kv.set_u32("att_ctr", value).expect("set");
+        if value % 37 == 0 {
+            let reopened = open(flash);
+            assert_eq!(reopened.get_u32("att_ctr"), Ok(Some(value)));
+        }
+    }
+    assert_eq!(open(flash).get_u32("att_ctr"), Ok(Some(299)));
+    assert_eq!(flash.overwrites(), 0);
+}
+
+#[test]
+fn a_corrupt_first_snapshot_does_not_hide_the_later_ones() {
+    let (flash, _) = three_snapshots();
+    flash.clear_bits(12, 0x01);
+    assert_recovered(&flash);
+}
+
+#[test]
+fn a_corrupt_length_of_the_first_snapshot_does_not_hide_the_later_ones() {
+    // Out of range, in range but short, and in range but spanning the next snapshots.
+    for (at, byte) in [(3, 0xFF), (2, 0x10), (2, 0x40), (2, 0x00)] {
+        let (flash, _) = three_snapshots();
+        flash.fill(at, at + 1, byte);
+        assert_recovered(&flash);
+    }
+}
+
+#[test]
+fn a_corrupt_middle_snapshot_keeps_the_newest_and_the_flag() {
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(snapshot + 12, 0x01);
+    assert_recovered(&flash);
+}
+
+#[test]
+fn a_torn_tail_after_a_corrupt_snapshot_falls_back_to_the_last_valid_one() {
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(12, 0x01);
+    // Tear the third snapshot.
+    flash.fill(2 * snapshot + 8, 2 * snapshot + 24, 0xFF);
+    let mut kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(2)));
+    assert!(kv.recovered_from_corruption());
+    kv.set_u32("att_ctr", 9).expect("set");
+    assert_eq!(open(&flash).get_u32("att_ctr"), Ok(Some(9)));
+    assert_eq!(flash.overwrites(), 0);
+}
+
+#[test]
+fn a_valid_snapshot_after_garbage_keeps_its_sector_until_a_newer_one_lands() {
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(12, 0x01);
+    // The rest of sector 0 is dirty, so the next commit rotates to sector 1.
+    flash.fill(3 * snapshot, SECTOR, 0x00);
+    let mut kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(3)));
+    assert!(kv.recovered_from_corruption());
+    // A power cut during that rotation leaves the newest snapshot in sector 0 intact.
+    flash.reset_counters();
+    flash.cut_at(1);
+    assert!(kv.set_u32("att_ctr", 4).is_err());
+    flash.revive();
+    assert_eq!(open(&flash).get_u32("att_ctr"), Ok(Some(3)));
+    assert_eq!(flash.erases(), 1);
+    kv.set_u32("att_ctr", 5).expect("set");
+    assert_eq!(open(&flash).get_u32("att_ctr"), Ok(Some(5)));
+    assert_eq!(flash.overwrites(), 0);
+}
+
+/// The finding is stored by now: it reads `true` on a reopen, and `false` on the one after the acknowledgement.
+fn assert_lost_until_acknowledged(flash: &MockNor) {
+    let mut kv = open(flash);
+    assert!(kv.newer_record_lost(), "the finding survives the reboot");
+    kv.acknowledge_record_loss().expect("acknowledge");
+    assert!(!kv.newer_record_lost());
+    assert!(!open(flash).newer_record_lost());
+}
+
+#[test]
+fn a_damaged_newest_snapshot_is_reported_until_it_is_acknowledged() {
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(2 * snapshot + 12, 0x01);
+    let mut kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(2)), "the older state");
+    assert!(kv.newer_record_lost());
+    assert!(OtaKv::newer_record_lost(&kv));
+    // The commit that removes the damage (the boot-slot note of a real boot) stores the finding with it.
+    kv.set_u32("att_ctr", 9).expect("set");
+    assert!(kv.newer_record_lost(), "this boot keeps the finding");
+    // Reboots and further commits, a sector rotation included, keep it.
+    let mut kv = open(&flash);
+    assert!(kv.newer_record_lost());
+    flash.reset_counters();
+    let mut value = 9;
+    while flash.erases() < 2 {
+        value += 1;
+        kv.set_u32("att_ctr", value).expect("set");
+    }
+    let mut kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(value)));
+    assert!(kv.newer_record_lost());
+    let before = state(&kv);
+    OtaKv::acknowledge_record_loss(&mut kv).expect("acknowledge");
+    assert!(!kv.newer_record_lost());
+    let reopened = open(&flash);
+    assert!(!reopened.newer_record_lost());
+    assert_eq!(state(&reopened), before, "no key changed");
+    assert_eq!(flash.overwrites(), 0);
+}
+
+#[test]
+fn the_stored_finding_is_no_key_of_the_store() {
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(2 * snapshot + 12, 0x01);
+    let mut kv = open(&flash);
+    let marker = "\u{1}lost";
+    assert_eq!(kv.get_u8(marker), Ok(None));
+    assert_eq!(
+        kv.set_u8(marker, 0).map_err(|e| e.code),
+        Err(KvError::CODE_INVALID_VALUE)
+    );
+    kv.remove(marker).expect("an absent key");
+    assert!(kv.newer_record_lost());
+    kv.set_u32("att_ctr", 9).expect("set");
+    assert_lost_until_acknowledged(&flash);
+    // Without a finding the acknowledgement commits nothing.
+    let mut kv = open(&flash);
+    flash.reset_counters();
+    kv.acknowledge_record_loss().expect("acknowledge");
+    assert_eq!(flash.bytes_written(), 0);
+}
+
+#[test]
+fn a_retry_after_a_failed_write_in_a_fresh_sector_never_skips_a_sector() {
+    let flash = MockNor::new(3);
+    let mut kv = open(&flash);
+    let mut value = 0;
+    while flash.erases() < 1 {
+        value += 1;
+        kv.set_u32("att_ctr", value).expect("set");
+    }
+    // The newest snapshot is the first of sector 1; a failed append sends the next commit to sector 2, whose write fails too.
+    flash.fail_next_write();
+    assert!(kv.set_u32("att_ctr", 100).is_err());
+    flash.fail_next_write();
+    assert!(kv.set_u32("att_ctr", 101).is_err());
+    // The retry lands in sector 2 again, not two sectors on in sector 0.
+    kv.set_u32("att_ctr", 102).expect("set");
+    assert_ne!(flash.byte(2 * SECTOR), 0xFF);
+    assert_eq!(open(&flash).get_u32("att_ctr"), Ok(Some(102)));
+    // So its later damage is found where `open` looks for a lost snapshot.
+    flash.clear_bits(2 * SECTOR + 12, 0x01);
+    let kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(value)), "the stale state");
+    assert!(kv.newer_record_lost());
+    assert_eq!(flash.overwrites(), 0);
+}
+
+#[test]
+fn a_damaged_only_snapshot_opens_empty_and_is_reported() {
+    let flash = MockNor::new(2);
+    open(&flash).set_u32("att_ctr", 1).expect("set");
+    flash.clear_bits(12, 0x01);
+    let mut kv = open(&flash);
+    assert_eq!(state(&kv), vec![None; KEYS.len()]);
+    assert!(kv.newer_record_lost());
+    kv.set_u8("rb", 1).expect("set");
+    assert_lost_until_acknowledged(&flash);
+    assert_eq!(flash.overwrites(), 0);
+}
+
+#[test]
+fn a_damaged_first_snapshot_of_a_fresh_sector_is_reported() {
+    let flash = MockNor::new(2);
+    let mut kv = open(&flash);
+    let mut value = 0;
+    while flash.erases() < 1 {
+        value += 1;
+        kv.set_u32("att_ctr", value).expect("set");
+    }
+    // The newest snapshot is the only one of sector 1.
+    flash.clear_bits(SECTOR + 12, 0x01);
+    let mut kv = open(&flash);
+    assert_eq!(kv.get_u32("att_ctr"), Ok(Some(value - 1)));
+    assert!(kv.newer_record_lost());
+    kv.set_u32("att_ctr", 7).expect("set");
+    assert_lost_until_acknowledged(&flash);
+}
+
+#[test]
+fn damage_anywhere_in_the_newest_committed_snapshot_is_reported() {
+    let (probe, snapshot) = three_snapshots();
+    let len = usize::from(u16::from_le_bytes([
+        probe.byte(2 * snapshot + 2),
+        probe.byte(2 * snapshot + 3),
+    ]));
+    // Format byte, entry count, both length bytes, the sequence number, the body, the CRC.
+    let damage: [(usize, u8); 8] = [
+        (0, 0x00),
+        (1, 0xFE),
+        (2, 0x00),
+        (3, 0xFF),
+        (4, 0x00),
+        (7, 0x7F),
+        (12, 0x00),
+        (len - 1, 0x00),
+    ];
+    for (offset, byte) in damage {
+        let (flash, snapshot) = three_snapshots();
+        let at = 2 * snapshot + offset;
+        assert_ne!(flash.byte(at), byte, "offset {offset} is not damaged");
+        flash.fill(at, at + 1, byte);
+        let mut kv = open(&flash);
+        assert_eq!(kv.get_u32("att_ctr"), Ok(Some(2)), "offset {offset}");
+        assert!(kv.newer_record_lost(), "offset {offset}");
+        kv.set_u32("att_ctr", 9).expect("set");
+        let reopened = open(&flash);
+        assert_eq!(reopened.get_u32("att_ctr"), Ok(Some(9)));
+        assert!(reopened.newer_record_lost(), "offset {offset}");
+        assert_lost_until_acknowledged(&flash);
+        assert_eq!(flash.overwrites(), 0);
+    }
+}
+
+#[test]
+fn a_write_cut_short_is_not_reported_before_its_last_word() {
+    let (probe, _) = two_snapshots();
+    probe.reset_counters();
+    open(&probe).set_u32("att_ctr", 3).expect("set");
+    let steps = probe.steps();
+    assert!(steps > 2);
+    for step in 1..=steps {
+        let (flash, _) = two_snapshots();
+        let mut kv = open(&flash);
+        flash.reset_counters();
+        flash.cut_at(step);
+        let committed = kv.set_u32("att_ctr", 3).is_ok();
+        flash.revive();
+        let mut kv = open(&flash);
+        let value = kv.get_u32("att_ctr").expect("reads");
+        assert!(value == Some(2) || value == Some(3), "step {step}");
+        if committed {
+            assert_eq!(value, Some(3), "step {step}");
+        }
+        if step < steps {
+            assert_eq!(
+                value,
+                Some(2),
+                "step {step}: the first word is written last"
+            );
+            assert!(!kv.newer_record_lost(), "step {step}");
+        }
+        kv.set_u32("att_ctr", 9).expect("set");
+        let reopened = open(&flash);
+        assert_eq!(reopened.get_u32("att_ctr"), Ok(Some(9)));
+        // Only a cut inside the last word may read as a loss, and that finding is then kept like any other.
+        if step < steps {
+            assert!(!reopened.newer_record_lost(), "step {step}");
+        }
+        assert_eq!(flash.overwrites(), 0);
+    }
+}
+
+#[test]
+fn older_damage_and_a_blank_region_are_not_reported() {
+    // Damage in front of the adopted snapshot lost nothing newer.
+    for at in [0, 12] {
+        let (flash, snapshot) = three_snapshots();
+        for at in [at, snapshot + at] {
+            flash.clear_bits(at, 0x01);
+        }
+        let kv = open(&flash);
+        assert_eq!(kv.get_u32("att_ctr"), Ok(Some(3)));
+        assert!(!kv.newer_record_lost());
+    }
+    let blank = MockNor::new(3);
+    assert!(!open(&blank).newer_record_lost());
+}
+
+#[test]
+fn foreign_data_is_reported_and_erased_by_the_first_commit() {
+    let flash = MockNor::new(4);
+    flash.fill(SECTOR, 4 * SECTOR, 0x5A);
+    let mut kv = open(&flash);
+    assert_eq!(state(&kv), vec![None; KEYS.len()]);
+    assert!(kv.newer_record_lost());
+    flash.reset_counters();
+    kv.set_u8("rb", 1).expect("set");
+    assert_eq!(flash.erases(), 3, "every sector that was not blank");
+    let reopened = open(&flash);
+    assert_eq!(reopened.get_u8("rb"), Ok(Some(1)));
+    assert_lost_until_acknowledged(&flash);
+    assert_eq!(flash.overwrites(), 0);
 }
 
 #[test]
@@ -820,6 +1152,62 @@ fn a_power_cut_at_any_step_of_an_operator_rollback_keeps_one_side_of_the_write()
         out.extend(operator_rollback(s));
         out
     });
+}
+
+#[cfg(feature = "ota-ddi")]
+#[test]
+fn a_stored_records_unreadable_verdict_acknowledges_the_lost_record() {
+    use crate::ota::ddi::wire::ActionId;
+    use crate::ota::persist::DdiVerdict;
+    let (flash, snapshot) = three_snapshots();
+    flash.clear_bits(2 * snapshot + 12, 0x01);
+    // Boot one: the boot-slot note replaces the damaged snapshot, then the device resets before any report.
+    let mut kv = open(&flash);
+    assert!(kv.newer_record_lost());
+    kv.set_u32("att_ctr", 9).expect("set");
+    // Boot two still owes the report; storing the 1005 verdict discharges it.
+    let mut store = OtaStore::open(open(&flash), || 7);
+    assert!(store.newer_record_lost());
+    let verdict = DdiVerdict::records_unreadable(ActionId::parse("7").expect("id"));
+    store.persist_verdict(&verdict).expect("verdict");
+    assert!(!store.newer_record_lost());
+    assert!(!open(&flash).newer_record_lost());
+}
+
+#[cfg(feature = "ota-ddi")]
+#[test]
+fn a_delivered_records_unreadable_verdict_acknowledges_a_finding_left_by_a_power_cut() {
+    use crate::ota::ddi::wire::ActionId;
+    use crate::ota::persist::DdiVerdict;
+    let damaged = || {
+        let (flash, snapshot) = three_snapshots();
+        flash.clear_bits(2 * snapshot + 12, 0x01);
+        flash.reset_counters();
+        flash
+    };
+    let verdict = DdiVerdict::records_unreadable(ActionId::parse("7").expect("id"));
+    let probe = damaged();
+    OtaStore::open(open(&probe), || 7)
+        .persist_verdict(&verdict)
+        .expect("verdict");
+    // The acknowledgement is the last commit: cut its last step, after the verdict is stored.
+    let flash = damaged();
+    let mut store = OtaStore::open(open(&flash), || 7);
+    flash.cut_at(probe.steps());
+    assert!(store.persist_verdict(&verdict).is_err());
+    flash.revive();
+    let mut store = OtaStore::open(open(&flash), || 7);
+    assert!(store.newer_record_lost(), "verdict and finding both stored");
+    assert_eq!(
+        store.pending_verdict().expect("reads").map(|v| v.action),
+        Some(verdict.action.clone())
+    );
+    // The rebooted worker delivers the queued verdict on its normal path.
+    store
+        .mark_verdict_delivered(&verdict.action)
+        .expect("delivered");
+    assert!(!store.newer_record_lost());
+    assert!(!open(&flash).newer_record_lost());
 }
 
 #[cfg(feature = "ota-ddi")]

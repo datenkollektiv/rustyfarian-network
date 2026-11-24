@@ -1,6 +1,6 @@
 //! The settings the ESP-IDF DDI runtime is built from: stack sizes, timings and the identity of the firmware, validated before any thread starts.
 //!
-//! It is the DDI twin of the MQTT runtime's `OtaSettings`, without anything MQTT-shaped: the server, the controller id and the token belong to the tier's transport configuration, and the restart callback is the tier's.
+//! The server, the controller id and the token belong to the tier's transport configuration, and the restart callback is the tier's.
 //! The wall-clock rule of the runtime ([`WALL_CLOCK_FLOOR_SECS`], [`clock_is_set`]) lives here so the host tests pin it.
 
 use alloc::format;
@@ -15,14 +15,10 @@ use crate::ota::Version;
 
 /// Experimental: API may change before 1.0.
 ///
-/// The smallest accepted stack of either DDI runtime thread, in bytes; the same floor as the MQTT runtime's worker (`MIN_WORKER_STACK_BYTES`).
+/// The smallest accepted stack of either DDI runtime thread, in bytes.
 ///
 /// It covers the 4 KiB download buffer, the HTTP client, SHA-256 and logging frames.
 pub const DDI_MIN_STACK_BYTES: usize = 12288;
-
-#[cfg(all(feature = "ota-wire", feature = "ota-ddi"))]
-#[allow(deprecated)]
-const _: () = assert!(DDI_MIN_STACK_BYTES == crate::ota::runtime::MIN_WORKER_STACK_BYTES);
 
 /// Experimental: API may change before 1.0.
 ///

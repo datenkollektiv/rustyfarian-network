@@ -1,5 +1,5 @@
 # esp-hal (bare-metal) DDI OTA client on the C3 Super Mini against a lab DDI server (docs/features/ddi-client-v1.md),
-# step for step the same B2 chain and patterns as `c3/ddi` (ESP-IDF), only the example names differ, so the two tiers
+# step for step the same B2 chain and patterns as `c3/ddi-idf` (ESP-IDF), only the example names differ, so the two tiers
 # compare row by row: forced update, up_to_date and chip gate (1007), cancel mid-download,
 # reboot mid-download, unhealthy image rolled back (1004) and refused again (1007), wrong sha256 (1002).
 # Every operator row pairs the device log with a probe of the action on the server (`just ddi-watch`: state and
@@ -16,19 +16,19 @@
 #   just ddi-bundle hal_c6_ddi 9.9.9                      (the other chip's image under this board's id: the chip gate)
 #   for v in 1.0.0 1.1.0 1.2.0 1.3.0 1.4.0; do just ddi-publish hal_c3_ddi $v; done
 #   just ddi-publish hal_c3_ddi 1.5.0 --tampered; just ddi-publish hal_c6_ddi 9.9.9
-#   just bench c3 ddi --port <c3 port>
+#   just bench c3 ddi-hal --port <c3 port>
 # The setup erases the whole flash (the runtime keeps its records in the `nvs` partition), recreates the target on the server so it
 # forgets the sets of the last run (hawkBit never offers an installed set again; on a fleet-owned target replace
-# ddi-target-reset by ddi-quiesce and bump the versions) and starts the proxy (log: tmp/bench-ddi-proxy.log).
+# ddi-target-reset by ddi-quiesce and bump the versions) and starts the proxy, or shares the one a run on another board started (log: tmp/bench-ddi-proxy.log).
 # The router must pass TCP 8090 and 1883 from the IoT subnet to this machine. No person needed: the runner flashes
 # and resets over USB. Each operator row captures its action id from the device log for the probe that follows it.
 examples = ["hal_c3_ddi"]
 setup = [
   ["sh", "-c", "scripts/espflash.sh erase-flash"],
   ["just", "ddi-target-reset"],
-  ["sh", "-c", "mkdir -p tmp; pkill -f '[s]cripts/ddi-lab-proxy.py' || true; (nohup just ddi-proxy > tmp/bench-ddi-proxy.log 2>&1 &); scripts/ddi-lab.sh proxy-wait"],
+  ["scripts/ddi-lab.sh", "proxy-acquire", "c3"],
 ]
-teardown = [["sh", "-c", "pkill -f '[s]cripts/ddi-lab-proxy.py' || true"]]
+teardown = [["scripts/ddi-lab.sh", "proxy-release", "c3"]]
 
 # ── baseline ───────────────────────────────────────────────────────────────────
 

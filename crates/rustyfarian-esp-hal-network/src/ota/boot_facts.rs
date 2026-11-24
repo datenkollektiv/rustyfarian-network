@@ -98,9 +98,7 @@ fn format_slot_evidence(
 mod chip {
     use alloc::string::String;
 
-    use esp_bootloader_esp_idf::partitions::{
-        read_partition_table, AppPartitionSubType, PartitionType, PARTITION_TABLE_MAX_LEN,
-    };
+    use esp_bootloader_esp_idf::partitions::{read_partition_table, PARTITION_TABLE_MAX_LEN};
     use esp_storage::FlashStorage;
     use juggler::ota::persist::{
         note_boot_slot, BusyRetry, FlashKv, HardwareFacts, HardwareReadError, NoteBoot,
@@ -110,7 +108,7 @@ mod chip {
 
     use super::super::activation::{self, hardware_facts, OtadataRead};
     use super::super::flash::SharedFlash;
-    use super::super::manager::{read_otadata, update_capacity};
+    use super::super::manager::{booted_entry_app, read_otadata, update_capacity};
     use super::{format_slot_evidence, FLASH_BUSY, NO_SHARED_FLASH, OTADATA, PARTITION_TABLE};
 
     /// The OTA app number of the partition the MMU maps, `None` for a factory or any other app.
@@ -130,13 +128,7 @@ mod chip {
             );
             PARTITION_TABLE
         })?;
-        Ok(booted.and_then(|entry| match entry.partition_type() {
-            // `Ota0 + n`; factory, test and anything else are not OTA apps.
-            PartitionType::App(sub) => (sub as u8)
-                .checked_sub(AppPartitionSubType::Ota0 as u8)
-                .filter(|n| *n < 16),
-            _ => None,
-        }))
+        Ok(booted.and_then(|entry| booted_entry_app(&entry)))
     }
 
     /// Runs `f` on the shared flash, mapping a missing or lent-out handle to its code.

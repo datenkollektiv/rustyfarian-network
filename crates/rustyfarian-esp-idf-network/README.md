@@ -17,7 +17,7 @@ Domain features are opt-in; `default = []` means you explicitly declare which do
 | `mqtt`         | MQTT client with builder and automatic reconnection            | `mqtt`, `std`           | All          | Requires `wifi` for bootstrap (compile-checked).           |
 | `lora`         | SX1262 radio driver, LoRaWAN OTAA/ADR support                  | `lora`                  | All          | Firmware selects one `critical-section` provider (below).  |
 | `espnow`       | ESP-NOW peer-to-peer messaging, broadcast mode                 | `espnow`                | All          | No Wi-Fi required; works in AP or isolation.               |
-| `ota`          | Over-the-air firmware update (streaming, SHA-256 verified)     | `ota`                   | All          | Blocking API; downloads firmware from HTTP only (ADR 011). |
+| `ota`          | OTA boot-slot control (mark valid, roll back), record store    | `ota`                   | All          | Blocking API; downloads need `ota-ddi` (ADR 027).          |
 | `provisioning` | SoftAP captive-portal Wi-Fi and device credential provisioning | `provisioning`          | All          | Requires `wifi` feature; NVS credential store.             |
 
 **Special notes:**
@@ -81,10 +81,6 @@ Commit these files in a firmware repository, or the `^1.0.0` requirement on `esp
 ESP-IDF v6.1 defaults to picolibc (`CONFIG_LIBC_PICOLIBC=y`).
 Every firmware without `CONFIG_LIBC_NEWLIB=y` in its `sdkconfig.defaults` becomes a picolibc build, including one that sets no libc keys at all.
 Re-check task stack sizes tuned under ESP-IDF v5.3.3, and note that newlib-only keys such as `CONFIG_NEWLIB_NANO_FORMAT` are silently ignored under picolibc.
-
-## Example: Wi-Fi + MQTT (OTA Runtime)
-
-For OTA-enabled firmware using the runtime loop, see [`docs/runbooks/ota-hardware-test.md`](../../docs/runbooks/ota-hardware-test.md) for the full test procedure and [`examples/idf_c3_ota_runtime.rs`](examples/idf_c3_ota_runtime.rs) for example integration (command intake, worker start, health policy, restart callback).
 
 ## Example: Wi-Fi + MQTT
 

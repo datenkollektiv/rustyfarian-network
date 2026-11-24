@@ -20,12 +20,14 @@
 //! # Power-loss safety
 //!
 //! [`FlashKv::open`] scans every sector and adopts the valid snapshot with the highest sequence number; a torn snapshot fails its CRC and the previous one wins.
+//! A commit writes the first flash word of its snapshot last, so a write cut short leaves that word erased; a programmed first word without a valid snapshot is therefore a committed snapshot that was damaged later ([`FlashKv::newer_record_lost`]).
+//! That finding is stored as a reserved entry in every snapshot from the next commit on, until [`FlashKv::acknowledge_record_loss`] removes it.
 //! A sector is erased only to receive the next snapshot, and never while it holds the newest valid snapshot, so a cut during an erase or a write leaves either the state before or the state after that one commit.
 //! After a failed or interrupted write the rest of that sector is never written again; the next commit goes to an erased sector.
 //!
 //! # Wear
 //!
-//! A commit erases at most one sector.
+//! A commit erases at most one sector; the first commit of an empty store also erases every sector that is not blank.
 //! A sector holds `ERASE_SIZE / s` snapshots of `s` bytes (padded), so `n` commits erase at most `n / (ERASE_SIZE / s) + 1` sectors, spread over every sector of the region.
 //! A write that leaves the store unchanged (the same value again, or the removal of an absent key) commits nothing.
 //!
@@ -49,11 +51,14 @@ const CRC_LEN: usize = 4;
 /// Longest key, in bytes (the NVS limit, so both tiers accept the same keys).
 pub const MAX_KEY_LEN: usize = 15;
 
-/// Most keys one store holds; the `ota` namespace uses 22.
+/// Most keys one store holds; the `ota` namespace uses 22, and the loss marker takes one while it is set.
 pub const MAX_ENTRIES: usize = 24;
 
 /// Longest string value, in bytes.
 const MAX_STR_LEN: usize = 32;
+
+/// Reserved key of the loss marker ([`FlashKv::newer_record_lost`]); it starts with a control byte and is refused on every write.
+const LOSS_KEY: &str = "\u{1}lost";
 
 /// Largest encoded entry: key length, key, type tag, string length, string.
 const MAX_ENTRY_LEN: usize = 1 + MAX_KEY_LEN + 1 + 1 + MAX_STR_LEN;
@@ -338,6 +343,10 @@ pub struct FlashKv<F: NorFlash> {
     latest_sector: Option<u32>,
     /// Sequence number of the next snapshot; `None` once exhausted.
     next_seq: Option<u32>,
+    /// Whether the newest snapshot's sector held an invalid record before a valid one.
+    recovered_from_corruption: bool,
+    /// Whether a complete record that fails its CRC may have been newer than the adopted snapshot.
+    newer_record_lost: bool,
 }
 
 impl<F: NorFlash> core::fmt::Debug for FlashKv<F> {
@@ -362,7 +371,15 @@ impl<F: NorFlash> FlashKv<F> {
 
     /// Opens the store on `total_bytes` of `flash` from `base_offset` and loads the newest valid snapshot.
     ///
+    /// Every sector is scanned for valid snapshots and the one with the highest sequence number wins.
+    /// An invalid snapshot does not end the scan of its sector: the scan moves on by one flash word at a time until it finds the next valid snapshot or the sector ends, so intact snapshots behind a corrupt one are still adopted.
     /// A blank region, or one holding no valid snapshot (foreign data, a torn first write), opens as an empty store; its sectors are erased as the log reaches them.
+    /// A torn last snapshot falls back to the newest earlier valid one.
+    /// The next commit never writes into a sector that is not erased from the write position on, so garbage is never programmed over.
+    /// Worst case on foreign data the scan reads two chunks per flash word of every sector (header, then the candidate snapshot), plus one pass over the blank parts.
+    ///
+    /// [`FlashKv::recovered_from_corruption`] reports whether a valid snapshot was found after an invalid one in the sector of the adopted snapshot.
+    /// [`FlashKv::newer_record_lost`] reports whether a record newer than the adopted snapshot may have been lost.
     ///
     /// # Errors
     ///
@@ -397,32 +414,100 @@ impl<F: NorFlash> FlashKv<F> {
         let mut mirror = Mirror::new();
         let mut best: Option<(u32, u32, u32)> = None;
         let header_len = round_up(HEADER_LEN, Self::ALIGN);
+        let mut best_corrupt = false;
+        // Sectors without a valid snapshot whose first word is programmed: bit `n` for sector `n`, one flag for those beyond the mask.
+        let mut orphans: u64 = 0;
+        let mut far_orphan = false;
         for sector in 0..sectors {
             let start = base_offset + sector * Self::SECTOR;
             let mut pos = 0usize;
+            let mut invalid_seen = false;
+            let mut valid_after_invalid = false;
+            let mut any_valid = false;
+            let mut head_programmed = false;
             while pos + header_len <= erase {
                 let at = start + pos as u32;
                 flash.read(at, &mut buf[..header_len]).map_err(flash_err)?;
-                if buf[0] != FORMAT_V1 {
-                    break;
+                if pos == 0 {
+                    head_programmed = buf[..Self::ALIGN].iter().any(|b| *b != 0xFF);
+                }
+                if buf[..header_len].iter().all(|b| *b == 0xFF) {
+                    // Erased here: jump to the next programmed word, or end the sector.
+                    match Self::next_programmed(&mut flash, start, pos + header_len)? {
+                        Some(next) => {
+                            pos = next;
+                            continue;
+                        }
+                        None => break,
+                    }
                 }
                 let len = usize::from(u16::from_le_bytes([buf[2], buf[3]]));
-                if !(HEADER_LEN + CRC_LEN..=MAX_SNAPSHOT_BYTES).contains(&len) {
-                    break;
-                }
                 let padded = round_up(len, Self::ALIGN);
-                if pos + padded > erase {
-                    break;
+                let plausible = buf[0] == FORMAT_V1
+                    && usize::from(buf[1]) <= MAX_ENTRIES
+                    && (HEADER_LEN + CRC_LEN..=MAX_SNAPSHOT_BYTES).contains(&len)
+                    && pos + padded <= erase;
+                if plausible {
+                    flash.read(at, &mut buf[..padded]).map_err(flash_err)?;
+                    if let Some(seq) = decode(&buf[..len], &mut scratch) {
+                        pos += padded;
+                        valid_after_invalid |= invalid_seen;
+                        any_valid = true;
+                        if best.is_none_or(|(newest, _, _)| seq > newest) {
+                            best = Some((seq, sector, pos as u32));
+                            core::mem::swap(&mut mirror, &mut scratch);
+                        }
+                        continue;
+                    }
                 }
-                flash.read(at, &mut buf[..padded]).map_err(flash_err)?;
-                let Some(seq) = decode(&buf[..len], &mut scratch) else {
-                    break;
-                };
-                pos += padded;
-                if best.is_none_or(|(newest, _, _)| seq > newest) {
-                    best = Some((seq, sector, pos as u32));
-                    core::mem::swap(&mut mirror, &mut scratch);
+                // Not a snapshot here, whatever its header claims (a wrong length would skip real ones): resynchronise one word on.
+                invalid_seen = true;
+                pos += Self::ALIGN;
+            }
+            if best.is_some_and(|(_, newest_sector, _)| newest_sector == sector) {
+                best_corrupt = valid_after_invalid;
+            }
+            if !any_valid && head_programmed {
+                match 1u64.checked_shl(sector) {
+                    Some(bit) => orphans |= bit,
+                    None => far_orphan = true,
                 }
+            }
+        }
+        let orphan = |sector: u32| {
+            1u64.checked_shl(sector)
+                .map_or(far_orphan, |bit| orphans & bit != 0)
+        };
+        // A snapshot's first word is written last, so a programmed first word where the next snapshot would begin is a snapshot that was committed and no longer reads valid, not a write cut short.
+        // A newer snapshot than the adopted one lives right behind it or at the start of the sector the log rotates into; without an adopted one, anywhere.
+        let (lost_behind, lost_in_target) = match best {
+            Some((_, sector, end)) => {
+                let mut head = [0xFFu8; MAX_ALIGN];
+                if end as usize + Self::ALIGN <= erase {
+                    flash
+                        .read(
+                            base_offset + sector * Self::SECTOR + end,
+                            &mut head[..Self::ALIGN],
+                        )
+                        .map_err(flash_err)?;
+                }
+                (
+                    head[..Self::ALIGN].iter().any(|b| *b != 0xFF),
+                    orphan((sector + 1) % sectors),
+                )
+            }
+            None => (false, orphans != 0 || far_orphan),
+        };
+
+        // The finding outlives the damage: it rides as a reserved entry in every snapshot from the next commit on, until it is acknowledged.
+        let marked = mirror.iter().any(|e| e.key.as_str() == LOSS_KEY);
+        if (lost_behind || lost_in_target) && !marked {
+            if let Ok(key) = Key::try_from(LOSS_KEY) {
+                // A full store keeps the finding for this boot only.
+                let _ = mirror.push(Entry {
+                    key,
+                    value: Value::U8(1),
+                });
             }
         }
 
@@ -437,9 +522,67 @@ impl<F: NorFlash> FlashKv<F> {
             cursor_clean: false,
             latest_sector: best.map(|(_, sector, _)| sector),
             next_seq: best.map_or(Some(1), |(seq, _, _)| seq.checked_add(1)),
+            recovered_from_corruption: best_corrupt,
+            newer_record_lost: lost_behind || lost_in_target || marked,
         };
-        kv.cursor_clean = kv.is_erased(cursor_sector, cursor_pos)?;
+        // The damaged start of the rotation target is erased by the next commit: the log rotates into it at once.
+        kv.cursor_clean = !lost_in_target && kv.is_erased(cursor_sector, cursor_pos)?;
         Ok(kv)
+    }
+
+    /// Whether the newest snapshot's sector held an invalid record that is not a torn tail: a valid snapshot lies behind it.
+    ///
+    /// A blank region, foreign data and a torn last snapshot leave it `false`.
+    /// Experimental: API may change before 1.0.
+    #[must_use]
+    pub fn recovered_from_corruption(&self) -> bool {
+        self.recovered_from_corruption
+    }
+
+    /// Whether a record newer than the adopted snapshot may have been lost: the store may have fallen back to an older state, or opened empty over an established log.
+    ///
+    /// A commit writes the first flash word of its snapshot last, so a write cut short by a power loss leaves that word erased, and a programmed first word marks a snapshot that was committed.
+    /// True when such a word stands where a newer snapshot than the adopted one would begin and no valid snapshot is there: right behind the adopted snapshot, or at the start of the sector the log rotates into when that sector holds no valid snapshot.
+    /// Without an adopted snapshot it is true when any sector without a valid snapshot starts with a programmed word: a lost log, or foreign data.
+    /// Whatever damaged the snapshot (its header, its body or its CRC), the finding holds; only a cut during the write of that one last word reads `true` without a loss.
+    /// The next commit erases or leaves behind the damaged place and stores the finding with its snapshot, so every later [`open`](Self::open) still reads `true` until [`acknowledge_record_loss`](Self::acknowledge_record_loss).
+    /// Experimental: API may change before 1.0.
+    #[must_use]
+    pub fn newer_record_lost(&self) -> bool {
+        self.newer_record_lost
+    }
+
+    /// Clears [`newer_record_lost`](Self::newer_record_lost), in this boot and for every later [`open`](Self::open): one commit when the finding was stored.
+    ///
+    /// Experimental: API may change before 1.0.
+    ///
+    /// # Errors
+    ///
+    /// The commit's error; the finding then stays.
+    pub fn acknowledge_record_loss(&mut self) -> Result<(), KvError> {
+        if self.mirror.iter().any(|e| e.key.as_str() == LOSS_KEY) {
+            self.commit(Change::Remove(LOSS_KEY))?;
+        }
+        self.newer_record_lost = false;
+        Ok(())
+    }
+
+    /// Offset in the sector (rounded down to `ALIGN`) of the first word at or after `from` that is not erased; `None` when the rest reads erased.
+    fn next_programmed(flash: &mut F, start: u32, from: usize) -> Result<Option<usize>, KvError> {
+        let mut chunk = [0u8; MAX_ALIGN];
+        let mut pos = from;
+        while pos < F::ERASE_SIZE {
+            // `pos` and the sector size are multiples of `ALIGN`, and `ALIGN` divides 64.
+            let n = (F::ERASE_SIZE - pos).min(MAX_ALIGN);
+            flash
+                .read(start + pos as u32, &mut chunk[..n])
+                .map_err(flash_err)?;
+            if let Some(i) = chunk[..n].iter().position(|b| *b != 0xFF) {
+                return Ok(Some(pos + i / Self::ALIGN * Self::ALIGN));
+            }
+            pos += n;
+        }
+        Ok(None)
     }
 
     fn sector_offset(&self, sector: u32) -> u32 {
@@ -465,6 +608,15 @@ impl<F: NorFlash> FlashKv<F> {
         Ok(true)
     }
 
+    /// Writes `bytes` at `at` and reads them back; nothing for an empty slice.
+    fn write_verified(&mut self, at: u32, bytes: &[u8]) -> Result<(), KvError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.flash.write(at, bytes).map_err(flash_err)?;
+        self.verify(at, bytes)
+    }
+
     /// Whether `bytes` read back at `at`.
     fn verify(&mut self, at: u32, bytes: &[u8]) -> Result<(), KvError> {
         let mut chunk = [0u8; MAX_ALIGN];
@@ -488,13 +640,27 @@ impl<F: NorFlash> FlashKv<F> {
         // `MAX_SNAPSHOT_BYTES` is a multiple of 64, and `ALIGN` divides 64.
         let padded = round_up(len, Self::ALIGN);
         let fits = self.cursor_pos as usize + padded <= F::ERASE_SIZE;
-        if !(self.cursor_clean && fits) {
-            // Never the sector of the newest valid snapshot: with two sectors after a failed write
-            // in the fresh one, that fresh sector is erased again.
-            let mut target = (self.cursor_sector + 1) % self.sectors;
-            if Some(target) == self.latest_sector {
-                target = self.cursor_sector;
+        if self.latest_sector.is_none() {
+            // The first snapshot of the store: nothing here is worth keeping, so every sector that is not blank (foreign data, a lost log, a write cut short) is erased, and the log starts in a region that holds nothing but its own snapshots.
+            for sector in 0..self.sectors {
+                if !self.is_erased(sector, 0)? {
+                    let from = self.sector_offset(sector);
+                    self.flash
+                        .erase(from, from + Self::SECTOR)
+                        .map_err(flash_err)?;
+                }
             }
+            self.cursor_sector = 0;
+            self.cursor_pos = 0;
+            self.cursor_clean = true;
+        } else if !(self.cursor_clean && fits) {
+            // The sector after the newest valid snapshot's; after a failed write in that fresh sector, the same one again.
+            // The log never skips a sector, so a snapshot newer than the newest valid one is only ever right behind it or at the start of the next sector, the two places `open` checks for a lost one.
+            let target = if Some(self.cursor_sector) == self.latest_sector {
+                (self.cursor_sector + 1) % self.sectors
+            } else {
+                self.cursor_sector
+            };
             let from = self.sector_offset(target);
             self.flash
                 .erase(from, from + Self::SECTOR)
@@ -507,12 +673,11 @@ impl<F: NorFlash> FlashKv<F> {
         // never ties with the next snapshot.
         self.next_seq = seq.checked_add(1);
         let at = self.sector_offset(self.cursor_sector) + self.cursor_pos;
-        let bytes = &buf[..padded];
+        // The first word last: until it is programmed the snapshot does not exist, so a cut anywhere before leaves a place `open` knows as never committed.
+        let (head, body) = buf[..padded].split_at(Self::ALIGN);
         let written = self
-            .flash
-            .write(at, bytes)
-            .map_err(flash_err)
-            .and_then(|()| self.verify(at, bytes));
+            .write_verified(at + Self::ALIGN as u32, body)
+            .and_then(|()| self.write_verified(at, head));
         if let Err(e) = written {
             self.cursor_clean = false;
             return Err(e);
@@ -526,12 +691,13 @@ impl<F: NorFlash> FlashKv<F> {
     fn find(&self, key: &str) -> Option<&Value> {
         self.mirror
             .iter()
+            .filter(|_| key != LOSS_KEY)
             .find(|e| e.key.as_str() == key)
             .map(|e| &e.value)
     }
 
     fn set(&mut self, key: &str, value: Value) -> Result<(), KvError> {
-        if !valid_key(key) {
+        if !valid_key(key) || key == LOSS_KEY {
             return Err(invalid_value());
         }
         if self.find(key) == Some(&value) {
@@ -542,6 +708,14 @@ impl<F: NorFlash> FlashKv<F> {
 }
 
 impl<F: NorFlash> OtaKv for FlashKv<F> {
+    fn newer_record_lost(&self) -> bool {
+        self.newer_record_lost
+    }
+
+    fn acknowledge_record_loss(&mut self) -> Result<(), KvError> {
+        FlashKv::acknowledge_record_loss(self)
+    }
+
     fn get_u8(&self, key: &str) -> Result<Option<u8>, KvError> {
         match self.find(key) {
             None => Ok(None),

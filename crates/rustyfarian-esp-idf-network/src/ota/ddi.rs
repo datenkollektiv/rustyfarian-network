@@ -246,7 +246,7 @@ impl DdiTransport {
 
     /// Experimental: API may change before 1.0.
     ///
-    /// Fetches the artifact at `href` into `session`, the same streaming download, verification and slot swap as [`OtaSession::fetch_and_apply_cancellable`], with the token sent and redirects refused.
+    /// Fetches the artifact at `href` into `session`, a streaming download, SHA-256 verification and slot swap, with the token sent and redirects refused.
     ///
     /// A link that fails the origin check ([`DdiEndpoint::check_href`]) fails with [`OtaError::ForeignOrigin`] before any request, and an accepted one is fetched at the rebuilt [`CheckedUrl`], never at the link text; a 3xx fails with [`OtaError::Redirect`].
     /// The declared `Content-Length` must equal `size`, or the download fails with [`OtaError::SizeMismatch`] before any flash is touched; the bytes written then equal it as well.

@@ -318,6 +318,8 @@ fn repair_at_boot(records: &Records, running: Version, boot: &mut RuntimeFlags) 
 }
 
 /// A `rolled_back` report of the MQTT OTA runtime that no DDI verdict binds blocks every DDI offer; nothing is written, the operator is told.
+///
+/// The MQTT OTA runtime was removed after release 0.8; the recovery is recorded in `docs/features/ddi-client-v1.md`.
 fn warn_about_unbound_report(records: &Records) {
     let (admission, pending) = records.with(|store| (store.admission(), store.pending_verdict()));
     if admission == Admission::Blocked(BlockedBy::ReportPending) && matches!(pending, Ok(None)) {

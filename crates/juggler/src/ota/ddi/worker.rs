@@ -1013,7 +1013,12 @@ impl DdiWorker {
     ) -> Step {
         match self.sender.answered(work(outcome, at)) {
             SendOutcome::Delivered(delivered) => {
+                let lost = store.newer_record_lost();
                 let marked = store.mark_verdict_delivered(&delivered);
+                if lost && !store.newer_record_lost() {
+                    // A queued 1005 verdict of an earlier boot was delivered and discharged the store's finding: nothing is owed for the next action.
+                    self.unreported_corruption = false;
+                }
                 self.events.push(WorkerEvent::VerdictDelivered {
                     action: delivered,
                     marked,
@@ -1555,6 +1560,74 @@ mod tests {
         let events = w.drain_events();
         assert!(events.contains(&WorkerEvent::Nudge(Nudge::TooSoon)));
         assert!(events.contains(&WorkerEvent::Nudge(Nudge::Moved)));
+    }
+
+    #[test]
+    fn a_nudge_during_the_verdict_delivery_polls_10_s_after_the_last_poll() {
+        let (_kv, mut s) = store();
+        let mut w = worker(false);
+        first_poll(&mut w, &mut s, POLL_EMPTY);
+        let verdict = DdiVerdict::records_unreadable(ActionId::parse("7").expect("id"));
+        assert_eq!(s.persist_verdict(&verdict), Ok(VerdictNote::Written));
+        let health = Wake {
+            health: Some(HealthVerdict::Applied),
+            ..Wake::default()
+        };
+        assert_eq!(
+            w.poll(&mut s, WorkerInput::Woken(health), at(12)),
+            WorkerAction::Send(DdiRequest::Poll)
+        );
+        let send = w.poll(
+            &mut s,
+            WorkerInput::PollAnswered {
+                outcome: status(200, POLL_EMPTY),
+                admission_open: true,
+            },
+            at(12),
+        );
+        assert!(
+            matches!(send, WorkerAction::Send(DdiRequest::Verdict { .. })),
+            "{send:?}"
+        );
+        assert_eq!(
+            w.poll(&mut s, WorkerInput::Answered(status(200, "")), at(13)),
+            WorkerAction::Sleep {
+                until: Some(secs(43))
+            }
+        );
+        let nudge = Wake {
+            nudge: true,
+            ..Wake::default()
+        };
+        assert_eq!(
+            w.poll(&mut s, WorkerInput::Woken(nudge), at(13)),
+            WorkerAction::Sleep {
+                until: Some(secs(22))
+            }
+        );
+        assert_eq!(
+            w.poll(&mut s, WorkerInput::Woken(Wake::default()), at(22)),
+            WorkerAction::Send(DdiRequest::Poll)
+        );
+    }
+
+    #[test]
+    fn a_delivered_queued_1005_verdict_clears_the_owed_report() {
+        let (kv, mut s) = store();
+        // An earlier boot stored the 1005 verdict and lost power before the finding was acknowledged.
+        let verdict = DdiVerdict::records_unreadable(ActionId::parse("7").expect("id"));
+        assert_eq!(s.persist_verdict(&verdict), Ok(VerdictNote::Written));
+        kv.set_record_lost();
+        let mut w = worker(true);
+        let send = first_poll(&mut w, &mut s, POLL_EMPTY);
+        assert!(
+            matches!(send, WorkerAction::Send(DdiRequest::Verdict { .. })),
+            "{send:?}"
+        );
+        assert!(w.unreported_corruption);
+        w.poll(&mut s, WorkerInput::Answered(status(200, "")), at(1));
+        assert!(!s.newer_record_lost());
+        assert!(!w.unreported_corruption, "the next action is not gated");
     }
 
     #[test]

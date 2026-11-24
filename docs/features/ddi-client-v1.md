@@ -1,172 +1,402 @@
 # Feature: DDI OTA client v1
 
 The fleet backend chose a profile of the Eclipse hawkBit DDI API v1 as its device-facing OTA wire.
-The device polls over HTTP with a per-device `Authorization: TargetToken <token>` header, and an optional MQTT "poll now" nudge wakes it early.
-The profile is the fleet DDI profile 0.4.0, frozen on 2026-11-21.
-A change to its hashed region (§1–§6, the §7 pass criteria and the declared divergences) is a MINOR bump, and the fleet relays every bump here.
-The maintainer reviewed it on 2026-11-20 and decided the items in this document.
-This is the single feature doc for the work, and it is transient: it is archived when the feature closes.
+The device polls over HTTP with a per-device `Authorization: TargetToken <token>` header, and an optional MQTT nudge wakes it early.
+The profile is fleet DDI profile 0.4.0, frozen on 2026-11-21.
+A change to its hashed region (§1 to §6, the §7 pass criteria and the declared divergences) is a MINOR bump, and the fleet relays every bump here.
+Status: the ESP-IDF and esp-hal clients are done over plain HTTP behind a lab opt-in, the TLS round is open, and this transient doc is archived when the feature closes.
 
 ## Problem
 
-Today the library's OTA consumer runtime speaks the MQTT wire (ADR 018), and both tiers download with internal HTTP GET clients that are not a public API (the hand-rolled esp-hal client of ADR 011 decision 2, `EspHttpConnection` on ESP-IDF).
+Until 2026-11-24 the OTA runtime spoke the MQTT wire (ADR 018), and both tiers downloaded with internal HTTP GET clients that are not a public API.
 The fleet needs a device-facing HTTP polling client with TLS, origin-bound credentials and fail-closed update rules.
-Neither tier has that today: the ESP-IDF tier has a downloader but no DDI transport, and the esp-hal tier has no TLS, no DNS on the OTA path and no OTA runtime.
-The first round targeted the ESP-IDF tier; the esp-hal round followed on 2026-11-24, with its tier gaps listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022).
+Neither tier had that: the ESP-IDF tier had a downloader but no DDI transport, and the esp-hal tier had no TLS, no DNS on the OTA path and no OTA runtime.
+The ESP-IDF tier came first; the esp-hal round followed on 2026-11-24.
+
+## How it works
+
+### Update sequence
+
+```mermaid
+sequenceDiagram
+    participant D as Device
+    participant S as Server
+    participant B as Broker
+    B->>D: MQTT nudge on the device topic
+    D->>S: GET poll with TargetToken header
+    S-->>D: 200 poll links
+    D->>S: PUT configData once per boot
+    D->>S: GET deploymentBase
+    S-->>D: 200 document one chunk one artifact
+    D->>S: feedback proceeding before download
+    D->>S: GET artifact
+    S-->>D: image bytes checked by sha256
+    D->>S: feedback proceeding before reboot
+    Note over D: write image and reboot
+    D->>S: feedback proceeding after boot
+    Note over D: health check and mark image valid
+    alt image passes health check
+        D->>S: feedback closed success
+    else image rolled back
+        Note over D: old image boots and polls
+        D->>S: feedback closed failure 1004 rolled_back
+    end
+```
+
+- The diagram shows one update; the `configData` PUT happens at the first poll of each boot that returns 200, whether or not that poll carried a link.
+- A poll without a `deploymentBase` link sends no GET.
+- The post-boot `proceeding` is a profile SHOULD that resets the server's silent timeout during the longest gap.
+- A nudge polls no sooner than 10 s after the last poll started, and never during a poll in flight.
+
+### Offer evaluation order
+
+```mermaid
+graph TB
+    A["Poll link origin check"] --> B["cancelAction precedence"]
+    A -->|"foreign or refused link"| A1["No request no feedback keep polling"]
+    B --> C["Blocked offer check"]
+    C -->|"blocked"| C1["Not retrieved no deploymentBase GET"]
+    C --> D["Document validity"]
+    D -->|"invalid"| D1["1006 manifest_invalid"]
+    D --> E["Skip deferral valid documents only"]
+    E -->|"skip"| E1["Poll again no feedback"]
+    E --> F["Chip gate"]
+    F -->|"differs"| F1["1007 target_mismatch"]
+    F -->|"malformed or missing entry"| F2["1006 manifest_invalid"]
+    F --> G["Version gate"]
+    G -->|"below floor"| G1["1007 below_floor"]
+    G --> H["Remembered rollback check"]
+    H -->|"remembered version"| H1["1007 previously_rolled_back"]
+    H --> I["Downgrade or equal version check"]
+    I -->|"refused"| I1["1007 downgrade or up_to_date"]
+    I --> J["Download"]
+```
+
+- The early image-header chip check is not in this chart; it reads the first bytes received and refuses a mismatch as 1007 before any flash write.
+- The fixed order means an invalid, mislabelled document gets 1006 on both sides.
+- The downgrade marker and refusal precedence are under Update behaviour.
 
 ## Decisions
 
-Decisions are grouped into themed tables, and each one was decided by the maintainer on 2026-11-20; rows that cite profile 0.4.0 were aligned on 2026-11-22.
+The maintainer decided each decision on 2026-11-20, and rows that cite profile 0.4.0 were aligned on 2026-11-22.
 
 ### Scope and ownership
 
 | Decision | Reason | Rejected Alternative |
 |:--|:--|:--|
-| A sans-IO DDI state machine in `juggler`, plus a credential-bound DDI transport per tier (ESP-IDF in this round) | Host-tested logic, with time and random values as inputs as `DownloadMachine` does (`crates/juggler/src/ota/download.rs:1-6`) | Generic GET, POST and PUT primitives with caller-supplied headers |
-| No generic HTTP API is exported | `README.md:35-37` keeps general-purpose HTTP clients out of scope, and binding the token to the configured origin removes the leak path | Exporting a reusable HTTP client |
-| ESP-IDF first; the esp-hal DDI client was implemented on 2026-11-24 (`ota-ddi`, `hal_c3_ddi`, `hal_c6_ddi`) and its named gaps are recorded here (ADR 022): no TLS (`https://` is refused with `TlsUnavailable`, and `http://` works only under `ota-ddi-insecure-http`), no wall clock, no IPv6 (a bracketed host is `ServerUnreachable`), A-record DNS on the DDI path only (the public `fetch_and_apply*` path still takes IPv4 literals and keeps its 256 B request buffer, `crates/rustyfarian-esp-hal-network/src/ota/manager.rs:1153-1158` and `crates/rustyfarian-esp-hal-network/src/ota/http.rs:395`), `stack_high_water` always None, and records in the `nvs` data partition through juggler `FlashKv`; the API differences are listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022); no esp-hal hardware run has happened yet | The fleet devices run ESP-IDF, and the esp-hal gap was a separate body of work; the juggler machines are tier-neutral, so esp-hal reuses them (done 2026-11-24) | Both tiers in the first release (decided first, revised the same day) |
-| The MQTT OTA wire and runtime (ADR 018) move behind their own feature, are deprecated once the DDI client ships, and are then removed | DDI replaces it; two device-facing OTA wires would otherwise stay supported in parallel | Keep the MQTT wire long term |
-| Feature split: `ota` keeps download, flash, record store and decisions; the MQTT runtime (`ota-wire`) and the DDI runtime (`ota-ddi`) each get a feature; the DDI path paces its terminal feedback itself (`VerdictSender`), and the MQTT reporter keeps its pacing in the MQTT runtime (ADR 018 amendment 2026-11-21) | A DDI build must not link the MQTT command intake (`OtaSubmitter::handle` and `submit` are public today) | Keep one runtime feature |
-| No MQTT OTA authority in a DDI release image: on the IDF tier `ota-ddi` with `ota-wire` is a compile error unless the bench-only `ota-ddi-bench-mqtt-wire` opt-in is enabled, and `OtaSettings` refuses an MQTT OTA command or status topic that `rustyfarian/ota/#` matches (profile 0.4.0 §1, ADR 018 amendment 2026-11-22) | A release image must not accept an install, rollback or repair command over MQTT, and a device never publishes under the fleet's nudge topics | Trust the firmware's feature list |
-| DDI client in 0.8.0 under the plain-HTTP lab opt-in; TLS in 0.8.0 or the next minor; not documented as ready outside a lab before TLS | Lets the fleet start on the wire while TLS lands | 0.8.0 waits for TLS; DDI in 0.9.0 |
-| New ADR 027 for the DDI transport scope, superseding ADR 011 decision 2 for this purpose; ADR 018 amendment for the feature split and deprecation | Records the decisions where the project keeps architecture rules | Leave the scope in this feature doc only |
+| Sans-IO DDI state machine in `juggler`, plus a credential-bound transport per tier | Host-tested; time and random values are inputs, as in `DownloadMachine` | Generic GET, POST, PUT primitives |
+| No generic HTTP API is exported | `README.md:35-37` keeps general HTTP clients out of scope | Exporting a reusable HTTP client |
+| ESP-IDF first; esp-hal followed 2026-11-24, gaps in [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022) | Fleet devices run ESP-IDF; juggler machines are tier-neutral | Both tiers in the first release |
+| MQTT OTA wire and runtime (ADR 018) removed, unreleased | Deprecated 0.8.0, removed 2026-11-24; no build accepts an MQTT OTA command | Keep the MQTT wire long term |
+| DDI client in 0.8.0 under the plain-HTTP lab opt-in; TLS later | Lets the fleet start while TLS lands; not documented as ready outside a lab before TLS | 0.8.0 waits for TLS |
 
 ### esp-hal tier gaps (ADR 022)
 
-The esp-hal round keeps the ESP-IDF names as `async fn`; these differences go beyond the error type, and consumer code that targets both tiers must allow for them.
+The esp-hal round keeps the ESP-IDF names as `async fn`, but these differences go beyond the error type.
+Consumer code that targets both tiers must allow for them.
 
-- `DdiRuntime::start(records, stack)` also takes the station `Stack` and returns `(DdiHandle, DdiRunner)`; the firmware spawns `DdiRunner::run`, where the ESP-IDF `start(records)` returns `DdiHandle` and starts its own threads.
-- `RestartFn` is a plain `fn()`, where the ESP-IDF tier takes `Arc<dyn Fn() + Send + Sync>`, so a capturing closure does not compile on esp-hal (the ESP32-C3 has no `Arc` there).
-- `open_records` takes the `&'static SharedFlash` from `SharedFlash::new(peripherals.FLASH)`, where the ESP-IDF tier takes an `EspDefaultNvsPartition`.
-- The DDI download always checks the image header's chip against `TARGET_CHIP`, whatever `with_expected_chip` says, because the bare-metal slot activation does not read the header.
+- `DdiRuntime::start(records, stack)` also takes the station `Stack` and returns `(DdiHandle, DdiRunner)`; the firmware spawns `DdiRunner::run`.
+- ESP-IDF `start(records)` returns `DdiHandle` and starts its own threads.
+- `RestartFn` is a plain `fn()`, where ESP-IDF takes `Arc<dyn Fn() + Send + Sync>`, so a capturing closure does not compile on esp-hal.
+- `open_records` takes the `&'static SharedFlash` from `SharedFlash::new(peripherals.FLASH)`, where ESP-IDF takes an `EspDefaultNvsPartition`.
+- Records are a `FlashKv` log in the `nvs` data partition; the ESP-IDF tier keeps them in NVS and is unchanged.
+- A lost record makes the next offered action report `closed` + `failure` + 1005 `records_unreadable` instead of being applied.
+- The store keeps that finding across reboots until the 1005 verdict is stored.
+- The DDI download always checks the image header chip against `TARGET_CHIP`, because bare-metal slot activation does not read the header.
+- `EspHalOtaManager` has no `with_expected_chip`; the ESP-IDF `OtaSession` keeps it as an opt-in.
+- After a download selected its slot for the next boot, every later download of that boot fails with `FlashBusy` until the reset.
+- The partition table needs two OTA slots: a factory image with one OTA slot is refused at `start` with `PartitionNotFound`, before any update.
 - No IPv6 server address: a bracketed host is `ServerUnreachable`.
+- DNS is A-record only on the DDI path, through `Stack::dns_query`; IPv4 literals are used as is.
 - No wall clock: feedback carries no timestamp, and a `Retry-After` date is ignored (a delay in seconds still applies).
-- `DdiHandle::stack_high_water` always returns `None` for both marks, since the worker and the download share the firmware's one task.
+- No TLS, as on ESP-IDF: `https://` is refused with `TlsUnavailable`, and `http://` works only under `ota-ddi-insecure-http`.
+- `DdiHandle::stack_high_water` always returns `None` for both marks, since the worker and the download share one task.
 - `ota-ddi` turns on `embassy-net` DNS and raises `wifi::STA_SOCKET_COUNT`, so firmware that sizes `StackResources` by hand must use the constant.
-- No TLS, as on the ESP-IDF tier: `https://` is refused with `TlsUnavailable`, and `http://` works only under `ota-ddi-insecure-http`.
+- `with_deadline` needs `ota-ddi` on `EspHalOtaManager`; on `OtaSession` it is ungated, and it and `with_expected_chip` have no effect without `ota-ddi`.
+
+### Undelivered `rolled_back` report
+
+- A `rolled_back` report that the removed MQTT OTA runtime left undelivered keeps every DDI offer blocked (`unbound_report_blocks`), and the boot warning says so.
+- Only `OtaStore::mark_report_delivered` clears it, and its last caller was the MQTT OTA runtime of release 0.8.x, which ran on ESP-IDF only.
+- Recovery on ESP-IDF: flash a release 0.8.x MQTT OTA image once so that it delivers the report, or erase the OTA records (the `ota` NVS namespace).
+- Recovery on esp-hal: the records are a `FlashKv` log that no released MQTT OTA image reads, so erasing is the only option.
+- `just erase-flash` erases the records on both tiers, together with everything else in flash.
 
 ### Transport and security
 
 | Decision | Reason | Rejected Alternative |
 |:--|:--|:--|
-| HTTPS is the default and only release-image transport | Release devices must not accept plain HTTP | A runtime config flag |
-| Plain `http://` only behind a cargo feature that release images leave out, with a WARN once per boot | The IDF downloader warns on every connection today (`crates/rustyfarian-esp-idf-network/src/ota/downloader.rs:207`) | A provisioned extra; anyone who reaches the portal could flip it |
-| Exactly one trust anchor, fixed at image build as one CA certificate or one pinned server key; the compiled-in CA is that choice, and no provisioning or runtime input can change it; hostname verification, TLS 1.2 or later, a clock check before every TLS connect, never a fallback to plain HTTP (profile 0.4.0 §1) | The CA must not be writable from the portal | CA provisioned into NVS (plaintext, portal-writable); a public CA bundle |
-| Wall clock (the TLS round, S2): before every TLS connect, reconnects included (the client does no `Range` resumes), the clock must be set and at or after a build-time floor, else the connect fails closed with the library's own error; that error has no wire code: before an offer is retrieved nothing is sent and the device polls again once the clock passes, inside an action it is a connection failure that becomes 1001 once the download deadline passes, and one WARN names the case at most once per boot until the check passes (profile 0.4.0 §1, §4); the app starts SNTP; until S2 lands `https://` is refused with `TlsUnavailable` and `WALL_CLOCK_FLOOR_SECS` (2024-01-01) gates timestamps only | Certificate validity needs a sane clock, and unauthenticated SNTP can push it back after the first connect | The library starts SNTP; the clock left entirely to the app; a wire code of its own |
-| Origin binding: the transport takes base URL and token once and builds every request itself | No caller-supplied URL can carry the token elsewhere | Following server URLs unchecked |
-| Before following any `_links` href or artifact URL: exact scheme, host and port match with the base, per the profile 0.4.0 §2 URL grammar plus two stricter rules (a last host label that is a number in any base is no DNS name; a `.` or `..` path segment is refused), and the request goes to the `CheckedUrl` rebuilt from the checked parts; a refusal is logged as a WARN that names the `UrlRefusal` case, never the URL | Stops a hostile or mistaken link from moving the token | Accepting any URL the server sends |
-| A foreign artifact URL in the deployment document, or a 3xx on the deployment or download request, aborts with 1006 (`details[0]` `foreign_origin` or `redirect`) | Gives the fleet a stable code for a rejected link | Silent skip |
-| A foreign or refused href of a poll link (`deploymentBase`, `cancelAction`, `configData`) gets no request and no feedback; the device acts on no link of that poll and keeps polling | Only the link is refused; the poll and the rollout stay live (profile §2) | Abort the poll on a foreign link |
-| Redirects are never followed; a 3xx is a failure; the ESP-IDF transport sets `FollowRedirectsPolicy::FollowNone` | esp-idf-svc's default `FollowGetHead` follows a GET redirect and keeps every header set on the handle, so a token header would reach the redirected host | Follow redirects |
-| POST and PUT always send `Content-Length` | Without it esp-idf-svc sends a chunked POST | Chunked bodies |
-| JSON bodies bounded (4 KiB request, 8 KiB response) and buffered on the heap | Keeps worker stack use predictable | Stack buffers |
-| `mqtts://` with the same compiled-in CA for the nudge connection | One trust anchor for both connections | Plain MQTT for the nudge |
-| HTTPS acceptance for the TLS round (S1 to S4), checked on the image a device runs, on that chip's hardware (profile 0.4.0 §7 HTTPS): over `https://` a poll, a deployment, its feedback and the image download succeed; the image contains no `http://` opt-in; the release-image settings are checked on the image; a failed clock check, a wrong CA, a wrong hostname, an expired certificate and a foreign-origin link each fail closed with no `http://` connection; a trust anchor or `http` opt-in supplied through provisioning is ignored; `mqtts://` with CA verification for the nudge | The fleet cites this list informatively, so a change to it is told to the fleet and the two cannot drift apart silently | Keep the acceptance list in the fleet's request only |
-| Token and `Authorization` value live in a `Secret` newtype with a redacting `Debug` | Keeps the token out of logs and debug output, following the library's existing redaction pattern | Plain `String` fields |
-| `url_for_log` strips userinfo, query and fragment | The query can carry secrets; this is a public behaviour change | Strip userinfo only |
-| Server-supplied strings that are logged have control characters escaped | Stops log injection | Log as received |
-| Release images keep `CONFIG_LOG_MAXIMUM_LEVEL` at INFO or below, leave `CONFIG_MBEDTLS_DEBUG` off, write no core dump to UART (`CONFIG_ESP_COREDUMP_ENABLE_TO_UART` off) and have no panic GDB stub (`CONFIG_ESP_SYSTEM_PANIC_GDBSTUB` off); a release image is any build not made solely for the bench, lab-fleet builds included (profile 0.4.0 §2) | ESP-IDF v6.1 `esp_http_client` prints the whole request header block, `Authorization` included, at DEBUG, and a memory dump holds the token; profile 0.4.0 §2 supersedes the fleet's FR-A and FR-B debug-log promises, which are closed against this row and the zeroing row | Trust the default log level |
+| HTTPS only in release images; `http://` only behind `ota-ddi-insecure-http` | Release devices must not accept plain HTTP; the opt-in WARNs once per boot | A runtime config flag |
+| One trust anchor fixed at image build; clock gate before every TLS connect | The CA must not be writable from the portal; certificate validity needs a sane clock | CA in NVS; a public CA bundle |
+| Origin binding: the transport builds every request and checks each link against the base origin | A foreign artifact URL or 3xx gives 1006 `foreign_origin` or `redirect`; a foreign poll link is ignored | Following server URLs unchecked |
+| Redirects are never followed; `FollowRedirectsPolicy::FollowNone` is set | esp-idf-svc's default follows GET redirects and keeps the token header | Follow redirects |
+| Token lives in a redacting `Secret`; release-image settings keep it out of logs and dumps | `esp_http_client` logs the `Authorization` header at DEBUG | Plain `String` fields |
+
+<details><summary>Transport and security details</summary>
+
+**Trust anchor (profile 0.4.0 §1).**
+
+- Exactly one trust anchor is fixed at image build, as one CA certificate or one pinned server key; the compiled-in CA is that choice.
+- No provisioning or runtime input can change it.
+- Hostname verification and TLS 1.2 or later are required.
+- There is never a fallback to plain HTTP.
+
+**Wall-clock gate (S2).**
+
+- The clock must be set and at or after `WALL_CLOCK_FLOOR_SECS` (2024-01-01) before every TLS connect.
+- Reconnects are included, because the client does no `Range` resumes.
+- A failed check fails closed with the library's own error, and that error has no wire code.
+- Before an offer is retrieved nothing is sent, and the device polls again once the clock passes.
+- Inside an action it is a connection failure that becomes 1001 once the download deadline passes.
+- One WARN names the case, at most once per boot until the check passes (profile 0.4.0 §1, §4).
+- The app starts SNTP.
+- Until S2 lands, `https://` is refused with `TlsUnavailable`, and `WALL_CLOCK_FLOOR_SECS` gates timestamps only.
+
+**URL grammar (profile 0.4.0 §2, plus two stricter rules).**
+
+- The accepted form is `scheme://host[:port]` followed by `/`, `?` or the end.
+- The host is a DNS name of `[A-Za-z0-9-]` labels with a letter in the last label, a canonical IPv4, or a bracketed IPv6.
+- `@`, `\`, `%`, whitespace, control characters and non-ASCII are refused anywhere.
+- Scheme and host are lower-cased, and the default port is made explicit.
+- A last host label that is a number in any base is no DNS name, and a `.` or `..` path segment is refused.
+- Requests go only to the `CheckedUrl` rebuilt from the checked parts.
+- A refusal is logged as a WARN naming the `UrlRefusal` case (`forbidden_char`, `syntax`, `scheme`, `host`, `port`, `origin`, `length`, `path`), never the URL.
+- `DdiEndpoint::check_base_url` is the exposed validator.
+
+**HTTPS acceptance (S1 to S4, profile 0.4.0 §7 HTTPS).**
+
+- The list is checked on the image a device runs, on that chip's hardware.
+- Over `https://`, a poll, a deployment, its feedback and the image download succeed.
+- The image contains no `http://` opt-in, and the release-image settings are checked on the image.
+- A failed clock check, a wrong CA, a wrong hostname, an expired certificate and a foreign-origin link each fail closed with no `http://` connection.
+- A trust anchor or `http` opt-in supplied through provisioning is ignored.
+- `mqtts://` with CA verification is used for the nudge.
+- A change to this list is relayed to the fleet.
+
+**Release-image settings (profile 0.4.0 §2).**
+
+- `CONFIG_LOG_MAXIMUM_LEVEL` stays at INFO or below.
+- `CONFIG_MBEDTLS_DEBUG` stays off.
+- `CONFIG_ESP_COREDUMP_ENABLE_TO_UART` stays off, so no core dump goes to UART.
+- `CONFIG_ESP_SYSTEM_PANIC_GDBSTUB` stays off, so there is no panic GDB stub.
+- A release image is any build not made solely for the bench, lab-fleet builds included.
+- Profile 0.4.0 §2 supersedes the fleet's FR-A and FR-B debug-log promises, which are closed by these settings.
+
+**Limits, nudge and logging.**
+
+- JSON bodies are bounded at 4 KiB request and 8 KiB response, and buffered on the heap.
+- `url_for_log` strips userinfo, query and fragment, since the query can carry secrets.
+- `mqtts://` with the compiled-in CA is used for the nudge.
+
+</details>
 
 ### Provisioning and identity
 
 | Decision | Reason | Rejected Alternative |
 |:--|:--|:--|
-| Device id rule `^[a-z0-9][a-z0-9-]{2,19}$`, equal to the DDI controller id, MQTT username and MQTT client id | One identity for all three uses | Separate names per service |
-| Portal identity rule as a runtime option: `IdentityRule::{Open, Ddi}` on both tiers, binding the Wi-Fi+MQTT profile only (a LoRaWAN portal and the Wi-Fi-only fallback run as `Open`), `Ddi` by default on ESP-IDF when `ota-ddi` is on and `Open` otherwise (esp-hal defaults to `Open`); under `Ddi` the device name must be a device id, `mqtt_user` must equal it and `mqtt_client` must be blank or equal it at submit, and a fresh form pre-fills `mqtt_user` from the device name with `mqtt_client` blank | One id for the DDI controller id, the MQTT username and the MQTT client id (profile 0.4.0 §2), enforced where the operator types it; existing consumers keep the open rule | Compile-time only via `ota-ddi` (esp-hal could not enable it); always on for `WifiMqttDevice` (breaks free-form names) |
-| Under `Ddi` a `MacSuffixed` prefix longer than 15 bytes or outside `[a-z0-9-]`, and a `Fixed` name outside the grammar, are refused when the portal is planned (`PortalPlanError::InvalidDeviceName`), not truncated; under `Open` the truncation stays | Silent truncation changes the identity; the open rule keeps today's consumers working | Keep truncating; refuse unconditionally |
-| Token is the provisioning extra with form key `ddi_token`, stored in NVS as `x_ddi_token` | The 13-byte extra-name limit excludes the `x_` prefix (`crates/juggler/src/provisioning/config.rs:22-26`) | A dedicated portal field |
-| Token validated as `[0-9a-f]{32,64}` whenever the `ddi_token` extra is present, required under `Ddi` and re-entered on every full submission like the passwords (the Wi-Fi-only fallback form keeps the stored one), and re-validated by `ProvisioningConfig::ddi_token()` before use; one grammar in `juggler::identity`, shared with `DdiToken::parse` | CR or LF can never reach a header, the bound matches the storage limit, and the two features cannot drift apart | Validate only at provisioning; a blank token keeps the stored one |
-| Library-rendered secret token input: the `{{DDI_TOKEN_INPUT}}` slot of the Wi-Fi+MQTT form, filled with a password input that has no value under `Ddi` and with nothing under `Open`; never pre-filled, never echoed into HTML, the status JSON or logs | The token is not shown back to the operator | Prefilled input; an app-rendered field |
-| `EXTRA_VALUE_MAX_LEN` (64) never lowered below 64 within 0.x | The token must fit | Lower the limit |
-| Token storage: a release image keeps the token in encrypted storage; an image built for lab boards (a build-time choice that no runtime input can enable) may keep it in plaintext NVS as a recorded lab-only risk, closed by the hardened round (profile 0.4.0 §2) | The library's store is plaintext NVS (`crates/juggler/src/provisioning/kv_store.rs:11-14`), and NVS encryption is a partition concern of the device repo's image | Encrypt in this library |
-| Zeroing on drop covers the library's own copies only | The esp-idf-svc `CString` and the `esp_http_client` header list are freed unzeroed; one client per request keeps them short-lived | Promise zeroing of every copy |
-| No provisioned DDI base URL in this round: the examples keep the compile-time `DDI_BASE_URL` and `DdiEndpoint::check_base_url` stays the exposed validator; a `ddi_base_url` extra comes with the follow-up that moves the examples to provisioning | `check_base_url` needs alloc and the `ota-ddi` feature, which the no-alloc esp-hal flash store cannot carry (ADR 022) | A `ddi_base_url` extra validated on ESP-IDF only |
+| Device id grammar `^[a-z0-9][a-z0-9-]{2,19}$`, equal to controller id, MQTT username and client id | One identity for all three uses | Separate names per service |
+| `IdentityRule::{Open, Ddi}` as a runtime option on both tiers, Wi-Fi+MQTT only | One id, enforced at the portal; the open rule keeps old consumers | Compile-time only |
+| Token is the extra `ddi_token` (`x_ddi_token` in NVS), grammar `[0-9a-f]{32,64}` | CR and LF never reach a header; the grammar is shared with `DdiToken::parse` | A dedicated portal field |
+| Token storage encrypted in a release image; plaintext NVS only in a lab-board build | The library store is plaintext NVS; encryption is the device image's concern | Encrypt in this library |
+| No provisioned DDI base URL this round; examples keep `DDI_BASE_URL` | `check_base_url` needs alloc, which the no-alloc esp-hal store lacks | A `ddi_base_url` extra, ESP-IDF only |
+
+**Identity rule.**
+
+- Defaults: `Ddi` on ESP-IDF when `ota-ddi` is on, `Open` otherwise; esp-hal defaults to `Open`.
+- The rule binds the Wi-Fi+MQTT profile only; a LoRaWAN portal and the Wi-Fi-only fallback run as `Open`.
+- Under `Ddi`, the device name must be a device id, `mqtt_user` must equal it, and `mqtt_client` must be blank or equal it, checked at submit.
+- Under `Ddi`, a bad `MacSuffixed` prefix or `Fixed` name is refused when the portal is planned (`PortalPlanError::InvalidDeviceName`).
+- Under `Open`, truncation stays.
+- A fresh form pre-fills `mqtt_user` from the device name, with `mqtt_client` blank.
+
+**Token handling.**
+
+- The token is validated whenever the `ddi_token` extra is present, and it is required under `Ddi`.
+- It is re-entered on every full submission like the passwords; the Wi-Fi-only fallback form keeps the stored one.
+- `ProvisioningConfig::ddi_token()` validates it again before use.
+- `EXTRA_VALUE_MAX_LEN` is 64 and is never lowered below 64 within 0.x, so the token fits.
+- The input has no value under `Ddi` and nothing under `Open`, and the token is never echoed into HTML, the status JSON or logs.
 
 ### Update behaviour
 
 | Decision | Reason | Rejected Alternative |
 |:--|:--|:--|
-| `config.polling.sleep` clamped to [30 s, 24 h] as fixed library constants; same bounds for `Retry-After` and back-off; the profile sets only the 30 s floor, the 24 h ceiling is library policy | Bounded polling load and bounded waits | Caller-chosen bounds |
-| `skip` in `update` or `download` means "not now": no download, action stays open, poll again, no feedback; it applies only to an otherwise valid document (an invalid one is 1006 regardless), a value outside `skip`, `attempt` or `forced` is 1006 `manifest_invalid`, and a `skip` retrieval does not start the server's silent timeout; a server MUST NOT send it (profile §3a, §6) | The server decides the action; the device defers | Report skip as a failure |
-| Document rules (profile §3a), refused before any download with 1006 `manifest_invalid`: anything but exactly one chunk with exactly one artifact; a chunk with `encrypted: true`; a missing or malformed `size` or `hashes.sha256`; no `download-http` link | sha256 is the only corruption check, and the device installs only the one image the profile describes | Pick the first chunk or artifact; accept unhashed artifacts |
-| Artifact `size` compared with `Content-Length` and the bytes written, and a mismatch is 1001 (`SizeMismatch`: a wrong body length is a transfer failure, profile 0.4.0 §4); a `size` above the update partition is refused with 1006 before download | Catches truncation and oversize before any flash write | Check only the hash |
-| Software-module metadata key `chip`, value `[a-z0-9]{1,32}`, must equal `TARGET_CHIP` exactly; a well-formed differing value is refused 1007 `target_mismatch` before any download; a missing, duplicate, empty or malformed entry is 1006 `manifest_invalid`; no metadata entry, the downgrade marker included, overrides this gate (profile §3b) | Stops a wrong-chip image; the entry is unsigned, so it guards against operator error only | Trust the module name |
-| Evaluation order of a retrieved offer, after the poll-link origin check, `cancelAction` precedence and the blocked-offer rule: document validity (1006, the 8 KiB response cap included), then skip deferral (valid documents only), then the chip gate (1007), then the version gate (1007) | Both sides report the same code for a document that is invalid and mislabelled | Check the chip before document validity |
-| Early image-header chip check: the chip id in the image header is compared in the first bytes received, before any flash write, and a mismatch is refused 1007 `target_mismatch`; a profile SHOULD that may be cut in 0.8.0 because `esp_ota_end` stays the backstop (1003) | Saves a full download and a slot erase per operator mistake | Rely on `esp_ota_end` only |
-| `Version::parse` tightened to plain decimal `MAJOR.MINOR.PATCH`, no sign, no leading zeros, no surrounding whitespace, each at most 65535 | `u16::from_str` accepted `+1.02.3`, and the parser trimmed whitespace | Keep the lenient parser |
-| An offer older than the running version needs metadata `downgrade=allowed`; without it refused 1007 with details `downgrade`, and an equal version without it is refused 1007 `up_to_date` (profile §4) | Keeps a device-side default against an accidental downgrade; the marker is unsigned metadata, so it is no defence against a hostile server | The server decides any version other than the running one |
-| The remembered version that last rolled back stays refused 1007 `previously_rolled_back` until a different version passes its health check, unless the marker is present; this check runs before the downgrade branch | Keeps a refusal sticky | Forget refusals |
-| With the marker, `closed` + `success` carries `details[0]` `downgrade` when the offer is not newer, or `previously_rolled_back` when it is the remembered version (also when that offer is newer); `previously_rolled_back` wins when both apply | The fleet sees why an allowed downgrade or a remembered version was applied | Report a plain success |
-| A device minimum-version floor refuses an offer below it with 1007 `below_floor`, marker or not | A floor is a hard lower bound that the marker cannot lower | The marker overrides the floor |
-| Refusal precedence when several apply: `below_floor`, then `previously_rolled_back`, then `downgrade` or `up_to_date`; the marker must be key `downgrade` with value `allowed` exactly (case-sensitive), and any other value or a second `downgrade` entry is 1006 `manifest_invalid` | One refusal code per offer, in a fixed order on both sides | Accept any marker value |
-| Blocked offers (image pending verification, unresolved attempt, undelivered report) are not retrieved yet | No deploymentBase GET, so the server's silent timeout never starts and nothing counts against the rollout | Retrieve and queue |
-| Polling and error statuses: 410 stop; 404 re-poll; 401 backs off like a transient failure (profile 0.4.0 §4), never with another credential, and still feeds the consecutive-401 rule of the feedback table; 413 and 429 honour `Retry-After`; 429 without it, 5xx and timeouts back off exponentially from the poll interval up to 24 h with jitter | Matches the fleet profile's status contract without guessing | Retry every status the same way |
-| A transient error becomes terminal 1001 only inside an action once the download deadline passes, never on the poll path; inside an action an unreachable server, a timeout, a body cut short or a status 0, 408, 413, 429 or 5xx is retried after a 5 s back-off doubling to 60 s or the answer's `Retry-After` if longer, the last wait clamped to the deadline, and each attempt starts a new session (`decide_download_retry`) | A poll failure must not end an action, and one 503 or reset must not end a download | Fail on the first error |
-| Cancel: the download machine checks a cancel flag after each read and at `Deadline::permit_activation` (`crates/juggler/src/ota/deadline.rs:56`); acknowledged until activation, rejected after it | Gives the operator an emergency stop for the whole download | Reject every cancel while an attempt is open |
+| Offer evaluation order per the flowchart: document rules, skip, chip gate | Both sides report the same code for an invalid, mislabelled document | Check the chip before document validity |
+| Version rules: downgrade marker, device floor, remembered rollback, refusal precedence | One refusal code per offer, in a fixed order | The server decides any version |
+| Blocked offers (pending verification, open attempt, undelivered report) are not retrieved | No `deploymentBase` GET, so the silent timeout never starts | Retrieve and queue |
+| Poll statuses and download retry: transient errors retry, terminal 1001 only after the deadline | A poll failure must not end an action, nor one 503 a download | Fail on the first error |
+| Cancel is acknowledged until activation, rejected after | An operator emergency stop for the whole download | Reject every cancel while an attempt is open |
+
+<details><summary>Update behaviour details</summary>
+
+**Document rules (profile §3a).**
+
+- A document must have exactly one chunk with exactly one artifact.
+- A chunk with `encrypted: true` is refused.
+- A missing or malformed `size` or `hashes.sha256` is refused, and so is a missing `download-http` link.
+- A `size` above the update partition is refused with 1006 before download.
+- The 8 KiB response cap is part of document validity.
+
+**Chip gate (profile §3b).**
+
+- A missing, duplicate, empty or malformed `chip` entry is 1006 `manifest_invalid`.
+- No metadata entry, the downgrade marker included, overrides this gate.
+- The `chip` entry matches `[a-z0-9]{1,32}` and must equal `TARGET_CHIP`; differing is 1007 `target_mismatch`.
+- The early image-header check refuses a mismatch as 1007 before any flash write; `esp_ota_end` is the backstop, reported as 1003.
+
+**Skip.**
+
+- Skip applies only to an otherwise valid document; an invalid one is 1006 regardless.
+- A value outside `skip`, `attempt` or `forced` is 1006 `manifest_invalid`.
+- A `skip` retrieval does not start the server's silent timeout.
+- The profile says a server MUST NOT send `skip` (§3a, §6).
+
+**Downgrade marker.**
+
+- The marker must be key `downgrade` with value `allowed`, exactly and case-sensitive.
+- Any other value, or a second `downgrade` entry, is 1006 `manifest_invalid`.
+- The `previously_rolled_back` refusal runs before the downgrade branch, and it lifts when a different version passes its health check, unless the marker is present.
+- When both apply, `previously_rolled_back` wins in `details[0]`, including when the offer is newer than the remembered version.
+- With the marker, `closed` + `success` carries `downgrade` or `previously_rolled_back` in `details[0]`.
+
+**Version rules.**
+
+- `Version::parse` accepts only plain decimal `MAJOR.MINOR.PATCH`, with no sign, leading zeros or whitespace, and each part at most 65535.
+- An older offer needs `downgrade=allowed`, and an equal one without it is 1007 `up_to_date`.
+- The device minimum-version floor refuses below it with 1007 `below_floor`, marker or not.
+- Refusal precedence is `below_floor`, then `previously_rolled_back`, then `downgrade` or `up_to_date`.
+
+**Poll status handling (profile 0.4.0 §4).**
+
+- `config.polling.sleep` is clamped to [30 s, 24 h], with the same bounds for `Retry-After` and back-off; 24 h is library policy, and the profile sets the 30 s floor.
+- 410 stops polling, and 404 re-polls.
+- 401 backs off like a transient failure, never with another credential, and still feeds the consecutive-401 rule.
+- 413 and 429 honour `Retry-After`.
+- 429 without `Retry-After`, 5xx and timeouts back off exponentially from the poll interval up to 24 h, with jitter.
+
+**Download retry.**
+
+- Inside an action, an unreachable server, a timeout, a body cut short, or a status 0, 408, 413, 429 or 5xx is retried.
+- The wait is 5 s, doubling to 60 s, or the answer's `Retry-After` if longer; the last wait is clamped to the deadline.
+- Each attempt starts a new session (`decide_download_retry`).
+- The download deadline default is 300 s (see Open Questions).
+- On the esp-hal shared flash a cancel and the deadline are also checked before each erased sector.
+- An artifact `size` that differs from `Content-Length` or the bytes written is 1001 `size_mismatch`.
+- `OtaError::FlashBusy` (`flash_busy`) retries until the deadline, and still busy then gives `Flash` 1003.
+
+</details>
 
 ### Feedback, nudge and conformance
 
 | Decision | Reason | Rejected Alternative |
 |:--|:--|:--|
-| Loop guard: DDI action id and stage persisted in the existing `ota` NVS namespace as `ddi_act` (str, the action id in canonical `i64` form: 1 to 19 ASCII digits, no leading zero unless the id is `0`, at most `i64::MAX`) and `ddi_stage` (u8); a closed action id is never re-applied | Stops a closed action from running again after reboot | Keep the action in RAM |
-| A pending verdict wins: a second verdict for the same action is kept as the first, one for another action is refused (`StoreError::VerdictPending`) until the first is delivered; every verdict of an attempt is written inside the store's own sequence before the attempt is cleared, and is sent only once the attempt is gone; an attempt cleared without its version having booted (an interrupted download, a slot marked invalid) writes no verdict and the action is offered again, while one that booted with app rollback disabled reports success; a `records_unreadable` verdict repairs the corrupt records first | One verdict record, and no power loss can clear an attempt without its verdict; the server offers a refused action again | Newest verdict replaces the pending one |
-| Corruption fails closed; the DDI runtime calls `OtaStore::repair_corrupt` at boot when corruption closes admission, and reports `closed` + `failure` + 1005 + details `records_unreadable` when the repair dropped records or could not finish (a transient read error repairs nothing and reports nothing) | Corruption cannot wedge the device silently | Stay closed without a report |
-| Terminal feedback (success and failure) persisted and retried until the server answers 200, 404 or 410 (profile 0.4.0 §4; another 2xx is retried), no faster than 30 s; after a 404 the action is gone | Today only `rolled_back` is persisted; `applied` is best-effort | Best-effort feedback |
-| After 3 consecutive 401 answers to its feedback the device stops retrying on that action, keeps the verdict, logs once, resumes after the next poll that is not a 401 | A bad token must not hammer the server | Retry forever |
-| Health policy persists the success verdict and signals `ota-worker`, which sends the POST | Keeps the report off the health path | Send from the health check |
-| Thread stack defaults chosen after measuring an mbedTLS handshake with the runtime's `StackMarks` on C3 and C6 | Measured, not guessed | Fixed guess |
-| Feedback sequence: `proceeding` before the download, before the reboot and once after the new image boots, before the health check; the post-boot one is a profile SHOULD that resets the server's silent timeout during the longest gap; `closed` + `success` only after the image is marked valid | Matches the fleet's status points | Single final report |
-| Rollback reported as `closed` + `failure` + 1004 + details `rolled_back` and the rollback reason; the old image polls at boot | The report beats the server's silent timeout | Report on the next normal boot |
-| `details[0]` carries the `FailReason` string; code corrections `version_invalid` to 1005, `download_failed` with status 0 to 1001, `insufficient_space` to 1003 | Stable codes for the fleet | Keep the old mapping |
-| Bounded feedback encoder: at most 10 details of 256 characters | Bounded heap and wire size | Unbounded details |
-| Nudge: exact topic `rustyfarian/ota/<device-id>/nudge` registered with `.subscribe()` (re-sent on every connect) on the app's single MQTT connection | Survives reconnects | Subscribe once |
-| Nudge polls no sooner than 10 s after the start of the last poll and never while a poll is in flight, enforced in the juggler machine | Bounds the poll rate | Trust the server |
-| `configData` is sent once per boot: one PUT at the first poll of the boot that returns 200, whether or not that poll carried the link, with the URL built from the configured base; `mode: merge`; keys only `chip` (grammar above), `board` (`[a-z0-9._-]{1,32}`, fixed when the image is built, never provisioned) and `version` (strict version format); no other key (profile §3b) | Gives the fleet the hardware facts it asks for; a reused device id cannot keep a stale `chip` | Skip the call |
-| Conformance: until a device-conformance tier exists, the profile's §7 device-scenario list is the contract, and this repo's host-test copy of it anchors that contract; the host-binary interface stays open (Open Questions) | The shared list is the contract, and this repo catches drift against it | Fleet-only tests |
+| Persisted loop guard (`ddi_act`, `ddi_stage`) and verdicts; a pending verdict wins | Closed actions never rerun after reboot; no power loss clears an attempt without its verdict | Keep the action in RAM; newest verdict replaces pending |
+| Terminal feedback retried until the server answers 200, 404 or 410, no faster than 30 s | Only `rolled_back` was persisted before; `applied` is best-effort | Best-effort feedback |
+| Feedback sequence per the sequence diagram; rollback reported as 1004 `rolled_back` at boot | The old image sends it, which beats the server's silent timeout | A single final report |
+| Nudge topic `rustyfarian/ota/<device-id>/nudge`, re-subscribed on every connect | Survives reconnects; no poll sooner than 10 s after the last poll started, never mid-poll | Subscribe once; trust the server's rate |
+| Conformance: the profile §7 device-scenario list is the contract | The shared list is the contract, and this repo catches drift | Fleet-only tests |
+
+The harness differences F1 to F7 and the rows that do not run on the host are tabled in the header of `crates/juggler/src/ota/ddi/scenarios.rs`.
+
+<details><summary>Feedback, nudge and conformance details</summary>
+
+**Verdict persistence.**
+
+- Every verdict of an attempt is written inside the store's own sequence before the attempt is cleared, and is sent only once the attempt is gone.
+- An attempt cleared without its version having booted (an interrupted download, or a slot marked invalid) writes no verdict, and the action is offered again.
+- An attempt that booted with app rollback disabled reports success.
+- A `records_unreadable` verdict repairs the corrupt records first.
+- Boot repair runs when corruption closes admission, and it reports 1005 only when it dropped records or could not finish.
+- A transient read error repairs nothing and reports nothing.
+- `ddi_act` holds the action id in canonical `i64` form: 1 to 19 ASCII digits, no leading zero unless the id is `0`, and at most `i64::MAX`.
+- A verdict counts as delivered on 200, 404 or 410 only, and another 2xx is retried.
+- After a 404 the action is gone.
+- Corruption fails closed, and boot repair reports `closed` + `failure` + 1005 `records_unreadable`.
+- A pending verdict wins; a verdict for another action gets `StoreError::VerdictPending`.
+
+**Feedback limits.**
+
+- After 3 consecutive 401 answers to feedback, retries stop for that action until a poll is not a 401; the verdict is kept and it logs once.
+- The bounded feedback encoder sends at most 10 details of 256 characters.
+- `details[0]` carries the `FailReason` string; `version_invalid` is 1005, `download_failed` status 0 is 1001, and `insufficient_space` is 1003.
+- Thread stack defaults were chosen after measuring an mbedTLS handshake (`StackMarks`), and `DdiStacks` is 16 KiB each, provisional until S4.
+
+**configData.**
+
+- One PUT is sent at the first poll of the boot that returns 200, whether or not that poll carried a link.
+- The URL is built from the configured base, with `mode: merge`.
+- The keys are only `chip` (grammar in the chip gate bullets), `board` (`[a-z0-9._-]{1,32}`, fixed when the image is built, never provisioned) and `version` (strict version format).
+- No other key is sent (profile §3b).
+
+</details>
 
 ## Constraints
 
-- The fleet DDI profile is frozen at 0.4.0 (2026-11-21); the fleet relays every MINOR bump here, and decisions here follow it.
-- The profile version bumps MINOR whenever its §1–§6, its §7 pass criteria or its declared divergences change; the freeze keeps the number.
+- The fleet DDI profile is frozen at 0.4.0 (2026-11-21), the fleet relays every MINOR bump here, and decisions here follow it.
+- The profile version bumps MINOR whenever its §1 to §6, its §7 pass criteria or its declared divergences change, and the freeze keeps the number.
 - Rollout evidence may claim HTTPS only after every token and MQTT password used over plaintext has been rotated.
-- Tier parity (ADR 022): the same API names and arguments on both tiers, with only the error type differing; the esp-hal gaps are recorded in the Scope table and under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022).
-- The first round's DDI transport is blocking on ESP-IDF; the esp-hal round lands the same names and arguments as `async fn` and revisits the blocking choice (ADR 027).
+- Tier parity (ADR 022): the same API names and arguments on both tiers, with only the error type differing; the esp-hal gaps are under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022).
+- The first round's DDI transport is blocking on ESP-IDF, and the esp-hal round lands the same names as `async fn` and revisits the blocking choice (ADR 027).
 - No reusable, exported HTTP client (`README.md:35-37`).
-- Image signature verification is out of scope (device-repo work); sha256 detects corruption only.
+- Image signature verification is out of scope (device-repo work), so sha256 detects corruption only.
 - Residual clock risk: unauthenticated SNTP can still be pushed back to any time after the build date, so the build-time floor is not a hard guarantee.
-- Plaintext NVS for the token is a lab-board build only; a release image keeps it in encrypted storage, which the device repo's image provides (profile 0.4.0 §2).
+- Plaintext NVS for the token is a lab-board build only, and a release image keeps it in encrypted storage that the device repo's image provides (profile 0.4.0 §2).
 - Release images must not raise `CONFIG_LOG_MAXIMUM_LEVEL` above INFO, enable `CONFIG_MBEDTLS_DEBUG`, write a core dump to UART or run a panic GDB stub.
 
 ## Open Questions
 
-- [ ] esp-hal round: TLS stack choice and when it starts; DNS is answered for the DDI path (A-record lookup through `Stack::dns_query`, IPv4 literals used as is, IPv6 refused), while the public `fetch_and_apply*` path still takes IPv4 literals only.
-- [x] esp-hal round: the bare-metal slot activation does not check the image header's chip id, so the DDI download always forces the chip check (`ImageChip::from_target(TARGET_CHIP)`, a mismatch is refused before any flash write), which meets the early header check on that tier.
-- [ ] Heap headroom with one HTTPS and one MQTTS session on C3 and C6 (hardware measurement).
+- [ ] esp-hal TLS stack choice and when it starts.
+- [ ] Heap headroom with one HTTPS and one MQTTS session on C3 and C6 (hardware measurement); over plain HTTP the esp-hal C3 kept about 17 KB of its 72 KiB heap free during downloads.
 - [ ] Worker and reporter stack defaults under TLS (after measurement).
-- [x] Name and wire code of the clock-not-set error: no wire code of its own (profile 0.4.0 §1, §4: nothing is sent before retrieval, 1001 inside an action); the name is the library's choice when S2 lands, after T14 makes `OtaError` `#[non_exhaustive]`.
-- [x] Fleet operator's confirmation of the downgrade marker rule (`downgrade=allowed`), confirmed by profile draft 0.3.0.
-- [ ] Host-binary interface for the conformance harness (stdio or local HTTP); open on both sides, and no device-conformance tier runs one yet.
-- [ ] The download deadline against the fleet's silent timeout T (profile 0.4.0 §6, default 600 s): `DdiSettings::validate` refuses a zero `firmware_deadline` but sets no upper bound, so a firmware can set it above T; open whether the library caps it or the device repos must keep it below T (the default is 300 s).
-- [ ] The boot-repair 1005 report is owed in RAM only (`unreported_corruption` in the IDF worker) and goes to the first action offered during that boot, so a corruption repaired while no rollout is open is never reported; asked the fleet on 2026-11-23 whether the profile requires a marker that survives the restart (F5).
+- [x] esp-hal chip check: slot activation does not check the image header chip, so the DDI download forces `ImageChip::from_target(TARGET_CHIP)` before any flash write.
+- [x] Name and wire code of the clock-not-set error: no wire code (profile §1, §4); the name is the library's choice when S2 lands, after T14 makes `OtaError` `#[non_exhaustive]`.
+- [x] The fleet operator confirmed the downgrade marker rule (`downgrade=allowed`) in profile draft 0.3.0.
+- [ ] Host-binary interface for the conformance harness (stdio or local HTTP) is open on both sides, and no device-conformance tier runs one yet.
+- [ ] The download deadline against the fleet's silent timeout T (profile 0.4.0 §6, default 600 s): does the library cap it, or do device repos keep it below T?
+  - `DdiSettings::validate` refuses a zero `firmware_deadline` but sets no upper bound; the default is 300 s.
+- [ ] Does the profile require a boot-repair marker that survives a restart (harness difference F5)? Asked the fleet on 2026-11-23, no answer recorded.
+  - The 1005 report is held in RAM only (`unreported_corruption`, IDF worker) and goes to the first action offered in that boot.
+  - Corruption repaired while no rollout is open is therefore never reported.
+- [ ] Bug 023: the post-boot `proceeding` is sent once and lost on any failure.
+- [ ] Cause of the one-off esp-hal C3 poll stall (2026-11-24, `c3/ddi-hal` step 8).
+  - The device logged `[ota] nudge: polling now` and sent no request for over four minutes, with Wi-Fi and MQTT up, then resumed by itself.
+  - Log: `bench/c3/logs/hal_c3_ddi-20261124-143202.log`; it did not recur in five further C3 and four C6 runs.
+  - A lost timer wake in the embassy/esp-rtos timer queue is the leading, unproven suspicion.
+  - The worker machines, runner wake path, record-store lock and transport deadlines were ruled out by code reading only.
+  - Four Info diagnostics stay so that a recurrence shows where the request stopped.
+- [ ] Does esp-radio touch the `nvs` partition? No corruption was observed in the 2026-11-24 runs.
+- [ ] The `hal_c6_ddi` bundle check, named as owed on 2026-11-24, is not recorded as done.
+- [ ] The esp-hal runtime logs `[ota] nudge: polling now` for internal wakes without a nudge (cosmetic, no decision recorded).
+- [ ] Known limits of the lost-record detection (2026-11-25): accept or close?
+  - A commit writes the first word of its snapshot last, so damage anywhere in a committed record is reported; a write cut short is not.
+  - A power cut during the write of that one last word is reported without a loss.
+  - Foreign data in the region is reported like a lost record, and the first commit erases it.
+  - A sector that fails every write blocks all commits, because a retry stays in the same sector so a lost record is always found.
+  - The obligation of a boot repair (records dropped, not lost) is still held in RAM only, on both tiers.
+  - A power cut between the erase of a damaged next sector and the first recovery commit loses the finding (fourth review, not fixed).
+- [ ] After a failed boot of the selected slot the bootloader may keep running the old image while `otadata` still selects the other slot.
+  - A download in that state still erases that slot, on purpose: refusing it would block every later update.
+  - Only the handoff inside one boot is guarded (a download that selected its slot keeps the flash until the reset).
 
 <details><summary>Code references</summary>
 
 - `crates/juggler/src/ota/download.rs:1-6`: sans-IO pattern the DDI machine follows.
 - `crates/juggler/src/ota/download.rs:258-279`: Content-Length enforcement against bytes received.
-- `crates/juggler/src/ota/error.rs:14`: `OtaError`, `#[non_exhaustive]` since 0.8.0, so the new clock variant is additive.
+- `crates/juggler/src/ota/error.rs:14`: `OtaError`, `#[non_exhaustive]` since 0.8.0, so the clock variant is additive.
+- `crates/juggler/src/ota/deadline.rs:56`: `Deadline::permit_activation`, where cancel is rejected after activation.
 - `crates/juggler/src/ota/persist/store.rs:971`: `OtaStore::repair_corrupt`.
 - `crates/juggler/src/mqtt/mod.rs:54`: `format_broker_url`, where the scheme is chosen.
-- `crates/juggler/src/provisioning/form.rs:87-94`: `ExtraField`'s redacting `Debug`, the pattern `Secret` follows.
-- `crates/juggler/src/ota/ddi/feedback.rs`: `VerdictSender`, the DDI path's own feedback pacing; the MQTT reporter's pacing stays in `crates/juggler/src/ota/runtime/report.rs`.
-- `crates/juggler/src/ota/health.rs`: the pure health policy and the record upkeep, shared by the MQTT and the DDI runtime.
+- `crates/juggler/src/provisioning/form.rs:87-94`: `ExtraField` redacting `Debug`, the pattern `Secret` follows.
+- `crates/juggler/src/provisioning/config.rs:22-26`: the 13-byte extra-name limit.
+- `crates/juggler/src/provisioning/kv_store.rs:11-14`: the plaintext NVS store.
+- `crates/juggler/src/ota/ddi/feedback.rs`: `VerdictSender`, the DDI path's own feedback pacing.
+- `crates/juggler/src/ota/health.rs`: the pure health policy and record upkeep used by the DDI runtime.
 - `crates/juggler/src/ota/ddi/settings.rs`: `DdiSettings`, `DdiStacks`, the wall-clock floor and the nudge topic.
-- `crates/juggler/src/ota/ddi/endpoint.rs`: `DdiEndpoint`, `CheckedUrl`, `UrlRefusal` and `check_base_url`, the profile 0.4.0 §2 origin check.
+- `crates/juggler/src/ota/ddi/endpoint.rs`: `DdiEndpoint`, `CheckedUrl`, `UrlRefusal` and `check_base_url`.
 - `crates/juggler/src/ota/ddi/wire/code.rs`: `ProfileCode::for_reason`, the reason-to-code table.
-- `crates/juggler/src/ota/runtime/config.rs`: `ConfigError::ReservedTopic`, the `rustyfarian/ota/#` refusal.
+- `crates/juggler/src/ota/persist/tests/flash_kv.rs`: the lost-record host tests.
 - `crates/rustyfarian-esp-idf-network/src/ota/ddi/`: the DDI runtime (`worker`, `download`, `handle`, `nudge`).
-- `crates/rustyfarian-esp-idf-network/src/ota/runtime/intake.rs`: `OtaSubmitter`, which lives in the IDF crate.
 - `crates/rustyfarian-esp-idf-network/src/ota/downloader.rs:63`: `url_for_log`.
-- `crates/rustyfarian-esp-hal-network/src/ota/http.rs:395`: the 256 B request buffer.
 - `crates/rustyfarian-esp-hal-network/src/ota/mod.rs`: `TARGET_CHIP` per chip.
 
 </details>
@@ -175,48 +405,57 @@ The esp-hal round keeps the ESP-IDF names as `async fn`; these differences go be
 
 - [x] ADR 027 written
 - [x] ADR 018 amendment (feature split and deprecation)
-- [x] Feature split (`ota`, MQTT runtime feature `ota-wire`, DDI runtime feature `ota-ddi`; the DDI path paces its own feedback)
+- [x] Feature split: `ota`, and `ota-ddi` for the DDI runtime, which paces its own feedback
 - [x] `juggler` DDI state machine
 - [x] `Version::parse` tightening
 - [x] `url_for_log` change and once-per-boot WARN on the IDF tier
-- [x] Provisioning validator for the device id and `ddi_token` input (T10): `IdentityRule::Ddi` enforces the device-id grammar and the equality with the MQTT username and client id, requires and validates `ddi_token`, pre-fills `mqtt_user` and refuses an invalid `MacSuffixed` prefix (profile 0.4.0 §2); host tests on juggler, both tiers' check, clippy and host-test recipes green
-- [ ] Provisioned DDI base URL (`ddi_base_url` extra passing `DdiEndpoint::check_base_url` at provisioning) and the examples reading controller id, token and base URL from provisioning
+- [x] Portal identity and token provisioning (T10) on both tiers, host tests and checks green
+- [ ] Hardware run for portal identity and token provisioning (none recorded)
+- [ ] Provisioned DDI base URL (`ddi_base_url` extra checked by `check_base_url`) and examples reading controller id, token and base URL from provisioning
 - [x] Cancel input on the download machine
 - [x] Persisted terminal verdicts and loop guard
-- [x] Early image-header chip check on the download machine (both tiers, `with_expected_chip`)
+- [x] Early image-header chip check on both tiers (`with_expected_chip`)
 - [x] IDF DDI transport
 - [x] IDF DDI runtime (`ota::ddi` worker, download thread, health hook, nudge)
-- [x] esp-hal DDI client (`ota-ddi`, `hal_c3_ddi`, `hal_c6_ddi`), implemented 2026-11-24 with the gaps listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022)
-- [ ] esp-hal hardware runs: `hal_c6_ddi` on the bench (`c3/ddi-hal` passed 20/20 on 2026-11-24), and a `hal_c3_ota` rerun for the shared-flash write path
-- [ ] TLS round (S1 to S4): HTTPS with the compiled-in CA, the clock gate, `mqtts://` for the nudge, stack and heap measured on C3 and C6; accepted per the HTTPS acceptance row
-- [x] MQTT OTA wire and runtime deprecated in 0.8.0 (2026-11-24 maintainer decision, ahead of TLS; ADR 018 amendment 2026-11-24)
-- [ ] MQTT OTA wire and runtime removed in a later release (no version fixed)
-- [x] Host tests and the conformance scenario list (T12): one host test per §7 device row in `crates/juggler/src/ota/ddi/scenarios.rs`, run by `just test-ota`; the rows that cannot run on the host (S-TLS-02 among them) and seven harness expectations this client meets differently are tabled in its header
-- [ ] Bench reject pattern for the DDI token in the serial capture of `c3/ddi` and `c6/ddi` (FR-B acceptance: the token never appears in serial logs; no bench step checks it yet)
-- [x] Hardware tests on C3 and C6 against a lab DDI server
-- [ ] CHANGELOG entries (including the `url_for_log` and `OtaError` breaking changes)
+- [x] esp-hal DDI client (`ota-ddi`, `hal_c3_ddi`, `hal_c6_ddi`), with the gaps under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022)
+- [x] Post-removal bench 2026-11-24: `c3/ddi-idf`, `c6/ddi-idf`, `c3/ddi-hal` and `c6/ddi-hal` each 20/20 against hawkBit 1.2.0 behind the lab proxy
+- [x] Review-fix bench 2026-11-24: `c3/ddi-hal` and `c6/ddi-hal` each 20/20 in two rounds
+- [x] Lab DDI server runs: `idf_c3_ddi` and `idf_c6_ddi` each 20/20 on 2026-11-23
+- [x] esp-hal DDI poll stall seen once on C3 (2026-11-24): treated as a one-off by maintainer decision, no bug filed, worker sleep unbounded
+- [ ] TLS round (S1 to S4): HTTPS with the compiled-in CA, clock gate, `mqtts://` nudge, stack and heap measured on C3 and C6
+- [x] MQTT OTA wire and runtime deprecated in 0.8.0 and removed 2026-11-24, unreleased
+- [x] Host tests and the conformance scenario list (T12) in `crates/juggler/src/ota/ddi/scenarios.rs`, run by `just test-ota`
+- [ ] Bench reject pattern for the DDI token in the serial capture of `c3/ddi-idf`, `c3/ddi-hal` and `c6/ddi-idf`; no bench step checks it yet
+- [ ] esp-hal owned-flash path and ESP-IDF tier erase the image span in one blocking call, so a cancel or deadline is seen only after the erase
+- [ ] Hardware row for the blank-`otadata` target choice (`ota_0` running) on esp-hal
+- [ ] Hardware for the 2026-11-24 review fixes not yet run: two concurrent downloads, a corrupt record, and a cancel during the erase
+- [ ] Hardware for the 2026-11-25 lost-record, busy-lease, second-review and third-review changes (none yet)
+- [ ] CHANGELOG entries, including the `url_for_log` and `OtaError` breaking changes and the new `OtaError::FlashBusy` variant
 - [ ] Documentation updated
 
 ## Session Log
 
-- 2026-11-20 — Feature doc created from the maintainer's review of the fleet DDI profile draft 0.1.0.
-- 2026-11-20 — Scope revised: ESP-IDF only in the first round (esp-hal gap recorded); the MQTT OTA wire is removed after its deprecation.
-- 2026-11-20 — Aligned with the fleet DDI profile draft 0.3.0 (skip deferral, chip rule, evaluation order, marker details, feedback retry and sequence, configData timing).
-- 2026-11-20 — Codec and version parser tightened to profile 0.3.0 (T15, T2): chunk `encrypted`, metadata reduced to `downgrade` and `chip`, configData encoder, strict `Version::parse` without trimming.
-- 2026-11-21 — IDF DDI transport (T8): `ota::ddi` behind `ota-ddi`, `http://` only with `ota-ddi-insecure-http`, `https://` refused until TLS; `OtaError` gains `ForeignOrigin`, `Redirect` and `SizeMismatch` (all 1006).
-- 2026-11-21 — Persisted verdicts and loop guard (T5): DDI action record `ddi_act`, `ddi_stage`, `ddi_att`, `ddi_code`, `ddi_det0`, `ddi_det1` in the `ota` namespace, verdicts written before the attempt clears, `ActionId` tightened to canonical `i64`, a pending verdict wins over a second one; esp-hal has no `OtaKv` backend (gap recorded).
-- 2026-11-21 — Feature split (T1) and ADR 018 amendment (A2): IDF `ota` no longer enables `juggler/ota-wire`, the new `ota-wire` carries the MQTT wire and runtime, a `wifi,mqtt,ota-ddi` build links no `OtaSubmitter` (`just check-ota-ddi-no-mqtt-runtime`); the transport-neutral reporter seam was dropped, the DDI path paces its own feedback.
-- 2026-11-22 — IDF DDI runtime (T9): `ota::ddi` runtime behind `ota-ddi` (the `ota-worker` thread owns `PollMachine`, `CancelMachine`, `VerdictSender` and every feedback; one `ota-download` thread per admitted attempt with its own `OtaSession` and `OtaCancel`; the health verdict is persisted by the store and sent by the worker; `DdiNudge::on_message` from the app's `on_message` on topic `rustyfarian/ota/<controller-id>/nudge`, subscribed by the app); the pure health policy moved to `juggler::ota::health` (base `ota`, every `ota::runtime` path kept); `DdiStacks` 16 KiB + 16 KiB provisional until S4; `WALL_CLOCK_FLOOR_SECS` (2024-01-01) stands in for the S2 clock gate; `just clippy-ota-ddi-mqtt-idf` added (in `verify-idf`).
-- 2026-11-22 — Origin check to the fleet DDI profile 0.4.0 §2 (T17): `DdiEndpoint` accepts only `scheme://host[:port]` followed by `/`, `?` or the end (DNS name of `[A-Za-z0-9-]` labels with a letter in the last one, canonical IPv4 or bracketed IPv6; `@`, `\`, `%`, whitespace, control and non-ASCII refused anywhere; scheme and host lower-cased, default port explicit); `check_href`/`check_url` return a `CheckedUrl` rebuilt from the checked parts, which is the only URL the IDF transport hands its HTTP client (E2, E4, E8), or a `UrlRefusal` naming the case (`forbidden_char`, `syntax`, `scheme`, `host`, `port`, `origin`, `length`, `path`) that is logged as a WARN without the URL; `DdiEndpoint::check_base_url` is the validator the provisioning step (T10) calls and `DdiEndpoint::new` runs at every boot; the error type `ota::ddi::ForeignOrigin` removed, `PollVerdict::LinksRefused` carries the case.
-- 2026-11-22 — Feedback codes and HTTP handling to profile 0.4.0 §4 (T18): `OtaError::SizeMismatch` maps to 1001 (`Transfer`), a verdict counts as delivered on 200, 404 or 410 only (another 2xx is retried with nothing handed back), and a 401 on the poll or on a request handed back through `PollInput::Performed` backs off exponentially like a transient failure while `PollVerdict::Unauthorized` stays for the consecutive-401 rule. No MQTT OTA authority in a DDI release image (T20): `ota-ddi` with `ota-wire` is a compile error on the IDF tier without the bench-only `ota-ddi-bench-mqtt-wire` opt-in (`just check-ota-ddi-no-mqtt-runtime` checks the guard), `OtaSettings::validate` refuses an MQTT OTA command or status topic that `rustyfarian/ota/#` matches (`ConfigError::ReservedTopic`), ADR 018 amendment 2026-11-22.
-- 2026-11-22 — Synced to the frozen fleet DDI profile 0.4.0 (T19): freeze and MINOR-bump rule, the clock error's answer (no wire code, the S2 rule before every TLS connect), release-image settings (no core dump to UART, no panic GDB stub), token storage (encrypted in a release image, plaintext NVS for lab boards only), the §7 HTTPS acceptance list, T10's base-URL check, and the T17, T18 and T20 alignment in the decision rows (`CheckedUrl` and the two stricter URL rules, `SizeMismatch` at 1001).
-- 2026-11-22 — Portal identity and token provisioning (T10): `juggler::identity` grammar shared by `ControllerId::parse`, `DdiToken::parse` and the portal, `IdentityRule::{Open, Ddi}` with `parse_form_with`, `Prefill::select_with` and `PortalPlanInput::identity`, the reserved `ddi_token` extra (`x_ddi_token`, `Field::DdiToken`, required under `Ddi`), the `{{DDI_TOKEN_INPUT}}` slot and `ProvisioningBuilder::with_identity` on both tiers (ESP-IDF defaults to `Ddi` with `ota-ddi`); the esp-hal portal buffer grew to 7 KiB; no base-URL extra this round; no hardware run yet.
-- 2026-11-22 — Bench checks `c3/ddi` and `c6/ddi` and the operator recipes (critical-path B1): `scripts/ddi-lab.sh` behind `just ddi-tenant-init`, `ddi-ensure-target`, `ddi-target-reset`, `ddi-publish` (`ddi-upload`, `ddi-set`), `ddi-assign`, `ddi-cancel`, `ddi-quiesce`, `ddi-action`, `ddi-watch`, `ddi-nudge` and `ddi-proxy` drives the hawkBit Management API subset of profile §7 (tenant keys, target with token, module with artifact and target-visible `chip`, set, forced assignment, cancel and force-quit, action state and last code) with `DDI_MGMT_URL`, `DDI_MGMT_USER` and `DDI_MGMT_PASS` from the environment (no default, never printed); `scripts/ddi-lab-proxy.py` sits between the device and the server (links kept on its origin, artifacts throttled to 20 KiB/s so the cancel and the reset mid-download have a window, a `-tampered` copy corrupted for 1002, because hawkBit verifies every upload and never re-offers an installed set); each check chains up_to_date and chip gate (1007), forced update, cancel and reset mid-download, 1004 rollback and its sticky refusal, 1002, every row probed on the server; dry-run against hawkBit 1.2.0 on loopback, the device run is B2 behind the fleet's tokens (G6).
-- 2026-11-22 — Device-conformance host tests (T12): `ota::ddi::scenarios` in `juggler` mirrors the fleet DDI profile 0.4.0 §7 device rows against the real sans-IO machines (`PollMachine`, `admit_retrieved`, `VerdictSender`, `CancelMachine`, `DownloadMachine`, the `ota::health` policy and `OtaStore` over the fault-injecting KV), driving a scripted server with time as an input and simulating reboots and power cuts by reopening the store; one test per row (S01, S02, S09, S10, S11, S13, S15 with SEC-24, SEC-25, S17b, S-DEV-01 to 15, S-ORIG-01 to 05, S-HYG-02, 04, 05), all green; rows needing a real server, TLS, a process start or log output are tabled with their coverage (bench B2, TLS round S1 to S4, the `ota-ddi-insecure-http` feature, `token.rs` redaction tests); six harness expectations this client meets differently are recorded for the T21 reply: F1 empty `details` on `proceeding`, cancel answers and a plain success, where the harness wants 1 to 10 details, `boot_ok`, `cancel_acknowledged` and `cancel_rejected`; F2 the resend differs in its `timestamp`; F3 a closed or interrupted action's document is retrieved again (the guard holds at application); F4 a stored report goes out after the first accepted poll rather than before it; F5 unreadable records are repaired at boot and reported 1005 once rather than for every offer; F6 the harness's short-body fixture (a `Content-Length` 64 bytes above a 100-byte body under a 4096-byte declared size) is `1001 size_mismatch`, refused before any byte is read, where the harness expects `download_failed` (a body that does end early is `download_failed`), and a non-numeric `stopId` is an invalid document rather than acknowledged.
-- 2026-11-22 — Host-test record (T12) tables S-TLS-02 (untrusted CA, wrong name, expired certificate) as covered by the TLS round S1 to S4, and records harness difference F7: the fleet harness refuses a nudge host without the build-time opt-in at start (`mqtt_without_opt_in`), but this client's nudge rides on the app's MQTT session, which the IDF tier always opens as `mqtt://` with no opt-in, so `mqtts://` for the nudge is the TLS round.
-- 2026-11-23 — Local lab hardware passed on both boards: C3 Super Mini `idf_c3_ddi` 20/20 and C6 DevKitC-1 `idf_c6_ddi` 20/20, with the proxy `Host` listener-port fix and a 180 s tampered-step timeout on both boards.
-- 2026-11-23 — FR-B follow-up timing review: the post-boot `proceeding` is sent once and lost on any failure (bug 023); open questions added for the download-deadline bound against T and the RAM-only 1005 marker; a State item added for the bench token reject pattern.
-- 2026-11-24 — MQTT OTA wire and runtime deprecated in 0.8.0 ahead of TLS (maintainer decision, ADR 018 amendment 2026-11-24); removal version left open.
-- 2026-11-24 — esp-hal DDI client implemented, uncommitted (slices S1 to S5 of the esp-hal round): juggler `FlashKv` record store in the `nvs` partition, a shared flash handle for the OTA manager and the record store, a hand-rolled DDI HTTP transport with A-record DNS, juggler `DdiWorker`, `DownloadFlow` and `HealthFlow` machines checked against every scenario row, and the hal runtime under the IDF names; `https://` is still refused until the TLS round, and the `hal_c3_ddi` bench run has since passed (see the hardware entry below), so the `hal_c6_ddi` bench run and its bundle check, and a `hal_c3_ota` rerun for the shared-flash write path, are owed.
-- 2026-11-24 — esp-hal tier gaps listed in their own section (ADR 022): the `start` return value, `RestartFn`, the `open_records` argument, the chip check that is always on, no IPv6, no wall clock, no stack marks and the `ota-ddi` socket budget; the record store lock no longer masks interrupts across several flash commits.
-- 2026-11-24 — esp-hal C3 hardware run passed on one C3 Super Mini: `idf_c3_ddi` (1.88 MB image, 95 % of the 1.97 MB slot, 13 min 12 s) and `hal_c3_ddi` (1.08 MB, 55 %, 9 min 22 s, the gap is download time through the throttled proxy) each passed 20/20 of the B2 chain against hawkBit 1.2.0 behind the lab proxy at 20 KiB/s with identical steps and log patterns; every operator row was confirmed on the server, esp-hal free heap stayed at about 17 KB of the 72 KiB heap through downloads, and the `nvs` record store survived the mid-download reset and the rollback reboots (logs `bench/c3/logs/idf_c3_ddi-20261124-111948.log` and `bench/c3/logs/hal_c3_ddi-20261124-113326.log`); still owed are the esp-hal C6 run (`hal_c6_ddi`) and its bundle check, whether esp-radio touches `nvs` beyond this run (no corruption observed), and the cosmetic `[ota] nudge: polling now` line the esp-hal runtime logs for internal wakes without an MQTT nudge.
+<details><summary>Session log</summary>
+
+- 2026-11-20 — Doc created from the review of profile draft 0.1.0; scope cut to ESP-IDF first; aligned to draft 0.3.0. Result: decisions recorded.
+- 2026-11-21 — ESP-IDF DDI transport, persisted verdicts and loop guard, `ota-ddi` split, ADR 018 amendment. Result: `https://` refused until TLS.
+- 2026-11-22 — ESP-IDF DDI runtime, origin check to profile §2, feedback codes to §4, profile 0.4.0 sync. Result: host tests green.
+- 2026-11-22 — Portal identity and token provisioning (T10) on both tiers. Result: host tests and checks green, no hardware run.
+- 2026-11-22 — Bench checks `c3/ddi-*` and `c6/ddi-*` with operator recipes; a tampered copy exercises 1002. Result: dry run on loopback.
+- 2026-11-22 — Device-conformance host tests (T12), one per §7 device row. Result: all green.
+- 2026-11-23 — Lab hardware: `idf_c3_ddi` 20/20 on C3 and `idf_c6_ddi` 20/20 on C6. Result: pass.
+- 2026-11-23 — FR-B timing review: the post-boot `proceeding` is lost on any failure (bug 023). Result: open.
+- 2026-11-24 — esp-hal DDI client implemented (record store in `nvs`, hand-rolled HTTP transport, A-record DNS). Result: `https://` still refused.
+- 2026-11-24 — esp-hal C3 run: `idf_c3_ddi` and `hal_c3_ddi` each 20/20 behind the lab proxy at 20 KiB/s. Result: pass; C6 run owed.
+- 2026-11-24 — MQTT OTA wire deprecated in 0.8.0 and removed unreleased; `fetch_and_apply*` removed on both tiers. Result: no build accepts an MQTT OTA command.
+- 2026-11-24 — esp-hal C3 poll stall at `c3/ddi-hal` step 8 (log `bench/c3/logs/hal_c3_ddi-20261124-143202.log`), four Info diagnostics added. Result: cause not found.
+- 2026-11-24 — Post-removal bench: `c3/ddi-idf`, `c6/ddi-idf`, `c3/ddi-hal`, `c6/ddi-hal` each 20/20. Result: pass in four parallel rounds.
+- 2026-11-24 — External review of 9cbd443 and 5b95b3c: five findings fixed (esp-hal target, busy lease, `FlashKv` resync, erase checks, shared proxy). Result: verify and lint-docs pass.
+- 2026-11-24 — Review-fix bench: `c3/ddi-hal` and `c6/ddi-hal` each 20/20 in two rounds. Result: pass.
+- 2026-11-25 — Busy lease made transient; lost-record detection (`FlashKv::newer_record_lost`), esp-hal reports 1005. Result: four host tests, no hardware run.
+- 2026-11-25 — Second external review, four findings fixed: slot kept until reset after activation, header-last commits, `otadata` checked before any erase, bench stops only its own proxy. Result: host tests and checks green, no hardware run.
+- 2026-11-25 — Third external review, five findings fixed: no sector skipped on a write retry, lost-record finding stored until the 1005 verdict, proxy health path, two OTA slots required, README pin. Result: host tests and checks green, no hardware run.
+- 2026-11-25 — Fourth external review: a delivered 1005 verdict now also clears the stored finding; three items left as they are (recovery power-cut window, two proxy ports, README git ref). Result: host tests and checks green, no hardware run.
+- 2026-11-25 — Final review round: the worker drops its owed 1005 when a queued 1005 verdict is delivered. Result: host test added, checks green, no hardware run.
+
+</details>

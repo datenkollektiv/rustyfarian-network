@@ -256,6 +256,14 @@ The esp-hal tier has no DDI client (the gap recorded in the feature doc, ADR 022
 The MQTT OTA wire and runtime are removed in a later release after that deprecation, and no version is fixed here.
 The 2026-11-22 amendment (no MQTT OTA authority in a DDI release image) is unchanged by this decision.
 
+**2026-11-24 — MQTT OTA wire and runtime removed:**
+
+The MQTT OTA wire and runtime deprecated in 0.8.0 are removed in the release after 0.8.0, on the maintainer's decision of 2026-11-24.
+The removed items are the `ota-wire` and `ota-ddi-bench-mqtt-wire` features, `juggler::ota::runtime`, the wire parse types `OtaCommand`, `Manifest` and `OtaStatus` with their errors and limits, the ESP-IDF `ota::runtime` with `OtaRuntime` and `OtaSubmitter`, the esp-hal re-exports of them, and the `idf_c3_ota_runtime` example.
+`FailReason`, `RollbackReason`, `first_token_position`, the record store and the health policy stay in base `ota` or `ota-ddi`, and the serde impls on `FailReason` and `RollbackReason` are gated on `ota-ddi`.
+The compile guard and the `ReservedTopic` refusal went with the runtime, so no build of this library accepts an MQTT OTA command, and the 2026-11-22 rule holds by removal.
+The DDI client (`ota-ddi`, both tiers) is the only device-facing OTA wire.
+
 ## References
 
 - [ADR 015](015-esp-hal-provisioning.md) — esp-hal tier decision: no MQTT, no system-level resource management

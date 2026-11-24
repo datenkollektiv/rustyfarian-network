@@ -36,7 +36,7 @@ hal_dir="${3:-target/hal}"
 idf_dir="${4:-target/idf}"
 workspace_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Tier is the first '_' field of the name, chip the second; the map is ota-image.sh's, plus the chip id from the
+# Tier is the first '_' field of the name, chip the second; the map is the one below, plus the chip id from the
 # image header. The bare-metal tier has DDI examples for the C3 and the C6 only.
 tier=$(printf '%s' "$example" | cut -d_ -f1)
 chip=$(printf '%s' "$example" | cut -d_ -f2)

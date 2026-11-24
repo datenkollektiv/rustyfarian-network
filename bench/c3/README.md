@@ -15,11 +15,9 @@
 | `espnow-power-cycle` | `idf_c3_espnow_scout` | scout survives a coordinator power cycle | `idf_c6_espnow_coordinator`, `COORDINATOR_MAC` |
 | `espnow-soak` | `hal_c3_espnow_peer` | 30 min at 100 ms, failures below 1 %, rescans across channels | coordinator board, `ESPNOW_PEER_MAC` |
 | `espnow-peer-session` | `hal_c3_espnow_peer`, `idf_c3_espnow_peer` | `PeerSession` relinks after a coordinator power cycle | C6 coordinator (IDF or esp-hal), `ESPNOW_PEER_MAC` |
-| `ota` | `hal_c3_ota` | download, verify, swap, boot marked valid | `just bench-ota c3 ota …` |
-| `ota-rollback` | `hal_c3_ota` | unhealthy image rolls back, no retry | `just bench-ota c3 ota-rollback …` |
-| `ota-runtime` | `idf_c3_ota_runtime` | MQTT-triggered OTA rows P2, P7, P13, P14, P17 | local broker, six served images, see header |
-| `ddi` | `idf_c3_ddi` | DDI OTA against a lab server: forced update, `up_to_date` and chip gate (1007), cancel and reset mid-download, rollback (1004) and its sticky refusal, wrong sha256 (1002), each row probed on the server | lab DDI server (`DDI_MGMT_*`), local broker, seven bundles published with `just ddi-publish`, see header |
-| `ddi-hal` | `hal_c3_ddi` | the `ddi` chain step for step on the esp-hal tier, same patterns, only the example names differ | as `ddi`, with `hal_*` bundles |
+| `ddi-idf` | `idf_c3_ddi` | DDI OTA against a lab server: forced update, `up_to_date` and chip gate (1007), cancel and reset mid-download, rollback (1004) and its sticky refusal, wrong sha256 (1002), each row probed on the server | lab DDI server (`DDI_MGMT_*`), local broker, seven bundles published with `just ddi-publish`, see header |
+| `ddi-hal` | `hal_c3_ddi` | the `ddi-idf` chain step for step on the esp-hal tier, same patterns, only the example names differ | as `ddi-idf`, with `hal_*` bundles |
 
 The scenario checks and the default-scenario checks (`espnow-power-cycle`, `espnow-peer-session`, `espnow-soak`) need different `ESPNOW_SCENARIO` settings; see the headers.
 Holding BOOT through a reset enters download mode; press RST again without BOOT.
+The `ddi-idf` and `ddi-hal` checks of the C3 and the C6 can run at the same time because they share the lab proxy; the first run to end leaves it up for the other, and a run that died without its teardown leaves a file in `tmp/bench-ddi-proxy.users/`, so delete that directory; a proxy that was already running when the first run started is borrowed and never stopped by a run.

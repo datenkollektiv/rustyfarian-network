@@ -1,9 +1,9 @@
-//! The health policy driver shared by the MQTT and the DDI runtime: runs the policy on the app's main thread.
+//! The health policy driver of the DDI runtime: runs the policy on the app's main thread.
 //!
 //! One tier runs it on one thread, so it is plain sequential code (ADR 023 decision 3): `juggler` decides ([`SlotReads`], [`poll_decision`], [`after_unhealthy`], [`deadline_plan`]) and this file performs the steps (slot reads, sleeps, the app predicate, `mark_valid`, the attempt record, the rollback, the app's restart callback).
 //! It never touches a slot that is not pending verification: it returns before the poll loop for any other state.
 //!
-//! The settle step after the verdict is not here, because it differs: the MQTT runtime publishes `applied` and arms the reporter's completion retry, the DDI runtime signals the `ota-worker` thread, which delivers the success verdict `complete_attempt` already persisted.
+//! The settle step after the verdict is not here: the DDI runtime signals the `ota-worker` thread, which delivers the success verdict `complete_attempt` already persisted.
 
 use std::thread;
 use std::time::{Duration, Instant};

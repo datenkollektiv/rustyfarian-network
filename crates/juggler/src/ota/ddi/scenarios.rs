@@ -12,7 +12,7 @@
 //!
 //! | Row | Why not on the host | Covered by |
 //! |:--|:--|:--|
-//! | S01, S02, S09, S10, S11, S13, S17b (server side) | the action state, `installedDS` and `lastStatusCode` live on a real server | bench `c3/ddi` and `c6/ddi` (B2); the device side of each row is a test below |
+//! | S01, S02, S09, S10, S11, S13, S17b (server side) | the action state, `installedDS` and `lastStatusCode` live on a real server | bench `c3/ddi-idf` and `c6/ddi-idf` (B2); the device side of each row is a test below |
 //! | S15 | a broker restart and the re-subscription | the IDF `MqttBuilder::subscribe` re-sends on every connect; the nudge itself is `s15_and_sec_24` below |
 //! | SEC-25 part b | server-side nudge coalescing | the fleet server |
 //! | S-DEV-04 `read_bounded` | the server must see the connection closed early: a real socket | `ResponseBody` tests in `response.rs`; the cap itself is `s_dev_04` below |
@@ -1851,7 +1851,10 @@ enum Driver {
 }
 
 std::thread_local! {
+    // Both initializers are `const { .. }`; clippy on the ESP-IDF target still flags them (the false positive noted in `mqtt/mod.rs`), which fails the workspace `just clippy`.
+    #[allow(clippy::missing_const_for_thread_local)]
     static DRIVER: core::cell::Cell<Driver> = const { core::cell::Cell::new(Driver::Reference) };
+    #[allow(clippy::missing_const_for_thread_local)]
     static TRACE: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
 }
 

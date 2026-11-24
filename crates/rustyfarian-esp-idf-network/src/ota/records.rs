@@ -1,6 +1,6 @@
-//! The record store shared by every thread of an OTA runtime, and the pre-Wi-Fi hook that opens it.
+//! The record store shared by every thread of the DDI runtime, and the pre-Wi-Fi hook that opens it.
 //!
-//! Both the MQTT OTA runtime (`ota-wire` and `mqtt`) and the DDI runtime (`ota-ddi`) take their [`Records`] from [`open_records`]; the types are re-exported from `ota::runtime` and `ota::ddi`.
+//! The DDI runtime (`ota-ddi`) takes its [`Records`] from [`open_records`]; the types are re-exported from `ota::ddi`.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -12,7 +12,7 @@ use super::{note_boot_slot_idf, open_store, EspNvsKv};
 /// Called to restart the device.
 ///
 /// The app decides how: the worker calls it after a successful download, the health policy only for `DeadlineAction::NoteAndRestart`.
-/// It normally never returns; if it does the worker parks (the MQTT runtime answers every later command `busy`, the DDI runtime starts nothing more) and the health policy returns `HealthVerdict::RestartReturned`.
+/// It normally never returns; if it does the worker parks (the DDI runtime starts nothing more) and the health policy returns `HealthVerdict::RestartReturned`.
 pub type RestartFn = Arc<dyn Fn() + Send + Sync>;
 
 /// The record store, shared by every runtime thread behind one mutex.
@@ -31,7 +31,7 @@ impl Records {
     }
 }
 
-/// Hook 1 of both OTA runtimes, early in `main` before Wi-Fi: opens the record store and records the boot slot.
+/// Hook 1 of the DDI runtime, early in `main` before Wi-Fi: opens the record store and records the boot slot.
 ///
 /// A failure of the boot-slot note is only logged; boot reconciliation in the runtime's `start` is the gate.
 ///

@@ -65,15 +65,13 @@ just setup [esp|tools]     # idempotent: esp = espup toolchain + ldproxy + espfl
 just fmt                   # cargo fmt — modifies files
 just verify                # fmt-check + host lints + guard scripts + all host tests — offline, host-only, non-modifying
 just verify-idf            # ESP-IDF tier: workspace check + clippy, per-domain checks and lints (riscv32imac-esp-espidf)
-just verify-hal            # bare-metal tier: per-domain cross-checks and the no_std OTA wire check
+just verify-hal            # bare-metal tier: per-domain cross-checks and the no_std OTA DDI and flash-KV checks
 just ci                    # verify + deny + verify-idf + verify-hal
 just clippy-hal            # clippy the bare-metal crate on its own C3/C6/S3 targets, incl. the two ESP-NOW examples (not in the local gates; CI runs it as ci-clippy-hal)
 just clippy-provisioning-tests  # type-check the ESP-IDF provisioning unit tests (in verify-idf; they cannot run on host)
 just clippy-provisioning-mqtt-tests  # type-check the ESP-IDF provisioning tests with the mqtt feature (in verify-idf)
-just clippy-ota-pure       # lint the juggler ota-wire code and its host tests (in verify)
-just check-ota-mqtt-idf    # type-check the ESP-IDF OTA runtime and its example (in verify-idf)
-just clippy-ota-mqtt-idf   # lint the ESP-IDF OTA runtime; its glue cannot run host tests (in verify-idf)
-just check-ota-ddi-no-mqtt-runtime  # prove a wifi,mqtt,ota-ddi build excludes the MQTT OTA runtime (check, feature graph, expanded source; in verify-idf and ci-check)
+just clippy-ota-pure       # lint the juggler ota and ota-ddi code and their host tests (in verify)
+just check-ota-ddi-idf     # type-check the ESP-IDF DDI client, alone and with wifi and mqtt (in verify-idf and ci-check)
 just clippy-ota-ddi-mqtt-idf  # lint the ESP-IDF DDI runtime with wifi and mqtt (the nudge build); its glue cannot run host tests (in verify-idf)
 just test                  # all platform-independent unit tests (no ESP toolchain needed; in verify)
 just build-example <name>  # build a hardware example with auto-detected chip + target

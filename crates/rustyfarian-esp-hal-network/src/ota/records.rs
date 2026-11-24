@@ -105,6 +105,12 @@ pub fn open_records(flash: &'static SharedFlash) -> Result<Records, StoreError> 
         offset
     );
     let kv = FlashKv::open(flash, offset, size).map_err(StoreError::Kv)?;
+    if kv.recovered_from_corruption() {
+        log::warn!("[ota] records: a corrupt record was skipped; the newest intact one is in use");
+    }
+    if kv.newer_record_lost() {
+        log::warn!("[ota] records: a damaged record may have been newer than the ones in use; the next offered action is reported 1005");
+    }
     {
         let Ok(mut slot) = RECORDS.try_lock() else {
             return Err(already());

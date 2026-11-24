@@ -276,6 +276,7 @@ impl Core {
     async fn perform(&self, worker: &DdiWorker, request: DdiRequest) -> WorkerInput {
         let outcome = match request {
             DdiRequest::Poll => {
+                log::info!("[ota] DDI poll: request starting");
                 let outcome = outcome(self.transport.poll().await, "poll");
                 return WorkerInput::PollAnswered {
                     outcome,
@@ -547,7 +548,7 @@ fn log_event(event: WorkerEvent) {
             log::info!("[ota] nudge: polling now");
         }
         WorkerEvent::Nudge(Nudge::TooSoon) => {
-            log::debug!("[ota] nudge: too soon after the last poll; kept");
+            log::info!("[ota] nudge: too soon after the last poll; kept until 10 s have passed");
         }
         WorkerEvent::Nudge(Nudge::Throttled) => {
             log::info!("[ota] nudge not applied: a Retry-After wait is running");

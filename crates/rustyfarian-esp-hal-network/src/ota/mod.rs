@@ -1,7 +1,6 @@
 //! Bare-metal OTA driver for ESP32-C3/C6/ESP32.
 //!
-//! Wraps `esp_bootloader_esp_idf::OtaUpdater` and provides streaming
-//! firmware download with strict HTTP/1.1 GET over `embassy-net`.
+//! Wraps `esp_bootloader_esp_idf::OtaUpdater`: boot-slot control ([`EspHalOtaManager`]) with the base `ota` feature, and with `ota-ddi` the DDI client, which streams firmware over `embassy-net` with its own HTTP/1.1 exchange.
 //!
 //! All public APIs are experimental.
 //!
@@ -9,11 +8,11 @@
 //!
 //! The cooperative download deadline ([`Deadline`], [`ActivationPermit`]) and the read-error classifier ([`classify_read_error`]) are re-exported from `juggler::ota` as well.
 //!
-//! With the opt-in `ota-wire` feature (serde + `alloc`; the consumer must provide a global allocator), the OTA wire contract (`OtaCommand`, `Manifest`, `OtaStatus`, `FailReason`, `RollbackReason`, and their error types and size limits) is re-exported from `juggler::ota` as well.
-//! The persisted-record store (`OtaStore`, `OtaKv`, `reconcile_boot`, `note_boot_slot`, and their outcome and error types) is re-exported with `ota-wire` or `ota-ddi`.
+//! The reason codes ([`FailReason`], [`RollbackReason`]) are re-exported from `juggler::ota` as well.
+//! The persisted-record store (`OtaStore`, `OtaKv`, `reconcile_boot`, `note_boot_slot`, and their outcome and error types) is re-exported with `ota-ddi`.
 //! With `ota-ddi` the [`ddi`] module holds the async DDI transport (`DdiTransport`) and the DDI runtime (`DdiRuntime`, `DdiHandle`, `DdiRunner`, `DdiNudge`, `OtaFlags`) under the ESP-IDF tier's names.
-//! With `ota-ddi` this crate ships the `OtaKv` backend over raw flash (`FlashKv`), the shared flash handle (`SharedFlash`), the store opener (`open_records`) and the boot-fact reads (`read_hardware_facts`, `slot_evidence_line`, `note_boot_slot_hal`); with `ota-wire` alone a bare-metal consumer implements `OtaKv` itself.
-//! The consumer runtime's pure state machines are reachable as the re-exported [`runtime`] module with `ota-wire`; this crate ships no runtime glue (no MQTT on this tier, ADR 015), and the runtime's configuration and verdict types (`OtaSettings`, `OtaTimings`, `OtaStacks`, `DeadlineAction`, `HealthVerdict`, `ConfigError`) are re-exported flat.
+//! With `ota-ddi` this crate ships the `OtaKv` backend over raw flash (`FlashKv`), the shared flash handle (`SharedFlash`), the store opener (`open_records`) and the boot-fact reads (`read_hardware_facts`, `slot_evidence_line`, `note_boot_slot_hal`).
+//! The health verdict types (`DeadlineAction`, `HealthVerdict`) are re-exported flat.
 //!
 //! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
 //! hex helpers ([`bytes_to_hex`], [`hex_to_bytes`]), and the update decision
@@ -27,8 +26,9 @@
 //! [`ImageMetadata::parse`], compare [`Version`] via [`decide_update`]) needs
 //! only this crate and no separate `juggler` dependency.
 
-// Internal HTTP/1.1 GET client — implementation detail per ADR 011 §2.
+// Internal HTTP/1.1 exchange of the DDI client.
 // Module is private; no item in this module is part of the public API.
+#[cfg(any(feature = "ota-ddi", test))]
 mod http;
 
 mod cancel;
@@ -55,20 +55,13 @@ mod activation;
 pub use juggler::ota::{
     bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
     hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy, BootFacts,
-    CancelRequest, Deadline, ImageChip, ImageMetadata, OfferDecision, OtaError, OtaState,
-    ReconcileAction, SlotId, SlotState, StreamingVerifier, UpdateDecision, Version,
+    CancelRequest, Deadline, FailReason, ImageChip, ImageMetadata, OfferDecision, OtaError,
+    OtaState, ReconcileAction, RollbackReason, SlotId, SlotState, StreamingVerifier,
+    UpdateDecision, Version,
 };
 
-// The wire contract needs `alloc` + serde, so on this tier it is opt-in via `ota-wire`.
-#[cfg(any(feature = "ota-wire", test))]
-#[allow(deprecated)]
-pub use juggler::ota::{
-    CommandError, FailReason, Manifest, ManifestError, OtaCommand, OtaStatus, RollbackReason,
-    StatusError, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES,
-};
-
-// The persisted-record store, used by the MQTT wire's consumers and by the DDI client.
-#[cfg(any(feature = "ota-wire", feature = "ota-ddi", test))]
+// The persisted-record store, used by the DDI client.
+#[cfg(any(feature = "ota-ddi", test))]
 pub use juggler::ota::{
     note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition, slot_from_label,
     slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings, BusyRetry, BusyTally,
@@ -183,53 +176,41 @@ pub use records::{open_records, Records};
 // The health verdict types of the base `ota` feature (the policy is `juggler::ota::health`).
 pub use juggler::ota::{DeadlineAction, HealthVerdict};
 
-// The consumer runtime's pure state machines and configuration (feature `ota-wire`).
-#[cfg(any(feature = "ota-wire", test))]
-#[allow(deprecated)]
-pub use juggler::ota::runtime;
-#[cfg(any(feature = "ota-wire", test))]
-#[allow(deprecated)]
-pub use juggler::ota::{
-    ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
-};
-
 // One const per supported chip feature. The bare-metal OTA tier supports `esp32`, `esp32c3`,
 // `esp32c6` and `esp32s3`.
 // No chip feature is on for host checks and the `ota` stub build; the const is then absent on
-// purpose, so nothing can compare manifests against a made-up chip name.
+// purpose, so nothing can compare an image against a made-up chip name.
 // esp-hal itself rejects enabling two chips at once, so at most one of these exists.
 
 /// Experimental: API may change before 1.0.
 ///
-/// The chip this firmware runs on, in the spelling a manifest's `target` uses (`"esp32"`, `"esp32c3"`, `"esp32c6"`, `"esp32s3"`).
+/// The chip this firmware runs on, in the spelling [`ImageChip::from_target`] takes (`"esp32"`, `"esp32c3"`, `"esp32c6"`, `"esp32s3"`).
 ///
-/// Pass it to `Manifest::check_target` (needs the `ota-wire` feature).
 /// Selected by the crate's chip feature; absent when no chip feature is enabled.
 ///
 /// ```ignore
-/// use rustyfarian_esp_hal_network::ota::{Manifest, TARGET_CHIP};
+/// use rustyfarian_esp_hal_network::ota::{ImageChip, TARGET_CHIP};
 ///
-/// let manifest = Manifest::parse(body)?;
-/// manifest.check_target(TARGET_CHIP)?;
+/// let chip = ImageChip::from_target(TARGET_CHIP);
 /// ```
 #[cfg(feature = "esp32c3")]
 pub const TARGET_CHIP: &str = "esp32c3";
 
 /// Experimental: API may change before 1.0.
 ///
-/// The chip this firmware runs on (`"esp32c6"`); pass it to `Manifest::check_target`. Absent when no chip feature is enabled.
+/// The chip this firmware runs on (`"esp32c6"`); pass it to [`ImageChip::from_target`]. Absent when no chip feature is enabled.
 #[cfg(feature = "esp32c6")]
 pub const TARGET_CHIP: &str = "esp32c6";
 
 /// Experimental: API may change before 1.0.
 ///
-/// The chip this firmware runs on (`"esp32"`); pass it to `Manifest::check_target`. Absent when no chip feature is enabled.
+/// The chip this firmware runs on (`"esp32"`); pass it to [`ImageChip::from_target`]. Absent when no chip feature is enabled.
 #[cfg(feature = "esp32")]
 pub const TARGET_CHIP: &str = "esp32";
 
 /// Experimental: API may change before 1.0.
 ///
-/// The chip this firmware runs on (`"esp32s3"`); pass it to `Manifest::check_target`. Absent when no chip feature is enabled.
+/// The chip this firmware runs on (`"esp32s3"`); pass it to [`ImageChip::from_target`]. Absent when no chip feature is enabled.
 #[cfg(feature = "esp32s3")]
 pub const TARGET_CHIP: &str = "esp32s3";
 
@@ -239,16 +220,15 @@ pub const TARGET_CHIP: &str = "esp32s3";
 // Runs on the host via `just test-ota-hal` (`cargo test --no-default-features`,
 // which sets `cfg(test)` and so pulls this module in without the ESP deps).
 #[cfg(test)]
-#[allow(deprecated)]
 mod reexport_parity_guard {
     #[test]
     fn ota_public_surface_is_reexported_from_this_crate() {
         use crate::ota::{
             bytes_to_hex, check_content_length, classify_read_error, decide_offer, decide_update,
             hex_to_bytes, reconcile, ActivationPermit, Admission, AttemptRecord, BlockedBy,
-            BootFacts, CancelRequest, Deadline, ImageChip, ImageMetadata, OfferDecision, OtaError,
-            OtaState, ReconcileAction, SlotId, SlotState, StreamingVerifier, UpdateDecision,
-            Version,
+            BootFacts, CancelRequest, Deadline, FailReason, ImageChip, ImageMetadata,
+            OfferDecision, OtaError, OtaState, ReconcileAction, RollbackReason, SlotId, SlotState,
+            StreamingVerifier, UpdateDecision, Version,
         };
         use crate::ota::{
             note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition,
@@ -258,10 +238,6 @@ mod reexport_parity_guard {
             PendingReport, PendingReportView, ReasonNote, RefusalNote, RepairedRecord,
             ReportRecord, RollbackNoted, RollbackRequest, SettleOutcome, StoreError, StoredAttempt,
             UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
-        };
-        use crate::ota::{
-            CommandError, FailReason, Manifest, ManifestError, OtaCommand, OtaStatus,
-            RollbackReason, StatusError, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES,
         };
 
         struct NeverKv;
@@ -351,12 +327,6 @@ mod reexport_parity_guard {
         );
         assert_eq!(classify_read_error(true), OtaError::DownloadTimeout);
         assert_eq!(classify_read_error(false), OtaError::ServerUnreachable);
-        assert_exported::<OtaCommand>();
-        assert_exported::<CommandError>();
-        assert_exported::<Manifest>();
-        assert_exported::<ManifestError>();
-        assert_exported::<OtaStatus<'static>>();
-        assert_exported::<StatusError>();
         assert_exported::<FailReason>();
         assert_exported::<RollbackReason>();
         assert_exported::<BlockedBy>();
@@ -402,45 +372,10 @@ mod reexport_parity_guard {
         assert_exported::<SettleOutcome>();
         assert_exported::<StoreError>();
         assert_exported::<StoredAttempt>();
-        use crate::ota::runtime::{
-            decide_intake, poll_decision, HealthConfig, IntakeDecision, ManifestBody, PollStep,
-            ReportPace, ReporterConfig, Retention, SendResult,
-        };
-        use crate::ota::{
-            ConfigError, DeadlineAction, HealthVerdict, OtaSettings, OtaStacks, OtaTimings,
-            MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
-        };
+        use crate::ota::{DeadlineAction, HealthVerdict};
 
-        assert_exported::<ConfigError>();
         assert_exported::<DeadlineAction>();
-        assert_exported::<HealthVerdict>();
-        assert_exported::<OtaStacks>();
-        assert_exported::<Retention>();
-        assert_eq!(MIN_STACK_BYTES, 4096);
-        assert_eq!(MIN_WORKER_STACK_BYTES, 12288);
-        let settings = OtaSettings::new("dev/ota/command", "dev/ota/status", Version::new(1, 0, 0))
-            .expect("valid topics");
-        assert_eq!(settings.timings, OtaTimings::default());
-        assert_eq!(settings.stacks, OtaStacks::default());
-        assert!(matches!(
-            decide_intake(
-                OtaCommand::parse(br#"{"action":"repair"}"#),
-                false,
-                || true,
-                |_| SendResult::Sent
-            ),
-            IntakeDecision::Queued
-        ));
-        let health = HealthConfig::from(&settings.timings);
-        assert!(matches!(
-            poll_decision(&health, core::time::Duration::ZERO, false),
-            PollStep::Wait(_)
-        ));
         assert!(HealthVerdict::Applied.publishes_applied());
-        let reporter = ReporterConfig::from(&settings.timings);
-        assert!(ReportPace::new().due(core::time::Duration::ZERO));
-        assert!(reporter.retry > core::time::Duration::ZERO);
-        let _body = ManifestBody::new(core::time::Duration::from_secs(10));
 
         let mut store = OtaStore::open(NeverKv, || 1);
         assert_eq!(
@@ -453,24 +388,9 @@ mod reexport_parity_guard {
         assert_eq!(slot_from_label("ota_1"), Some(SlotId(1)));
         assert_eq!(slot_label(SlotId(0)), Some("ota_0"));
         assert_eq!(NVS_NAMESPACE, "ota");
-        assert_eq!(MAX_COMMAND_BYTES, 512);
-        assert_eq!(MAX_MANIFEST_BYTES, 1024);
-        assert!(matches!(
-            OtaCommand::parse(br#"{"manifest_url":"http://h/m.json"}"#),
-            Ok(OtaCommand::Update { .. })
-        ));
         assert_eq!(
-            OtaCommand::parse(b"{}").unwrap_err().reason(),
-            FailReason::CommandInvalid
-        );
-        assert_eq!(
-            OtaStatus::Failed {
-                reason: FailReason::from_offer(OfferDecision::Skip, Admission::Open)
-                    .expect("skip is a failure")
-            }
-            .to_json()
-            .expect("serializes"),
-            r#"{"status":"failed","reason":"up_to_date"}"#
+            FailReason::from_offer(OfferDecision::Skip, Admission::Open),
+            Some(FailReason::UpToDate)
         );
     }
 }

@@ -1,23 +1,6 @@
-//! Stack high-water marks, in bytes, shared by the OTA runtimes.
+//! Stack high-water marks, in bytes, of the DDI runtime's threads.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-
-/// The least free stack each MQTT OTA runtime thread has seen, in bytes; `None` until the thread has sampled once.
-///
-/// The health policy runs on the app's own thread and is not tracked here.
-/// The DDI runtime reports its own threads in `ota::ddi::DdiStackMarks`.
-#[cfg(all(feature = "ota-wire", feature = "mqtt"))]
-#[deprecated(
-    since = "0.8.0",
-    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StackMarks {
-    /// Least free bytes of the `ota-worker` thread.
-    pub worker_min_free_bytes: Option<u32>,
-    /// Least free bytes of the `ota-reporter` thread.
-    pub reporter_min_free_bytes: Option<u32>,
-}
 
 /// Free stack bytes at the all-time low of the calling task.
 ///

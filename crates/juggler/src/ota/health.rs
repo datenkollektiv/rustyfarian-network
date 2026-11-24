@@ -1,4 +1,4 @@
-//! The health policy of the running image as pure decisions, and the record upkeep that follows it (completion retry, repair), shared by the MQTT runtime (`ota-wire`) and the DDI runtime (`ota-ddi`).
+//! The health policy of the running image as pure decisions, and the record upkeep that follows it (completion retry, repair), used by the DDI runtime (`ota-ddi`).
 //!
 //! The policy decides when a freshly activated image proves itself healthy, and what happens when it does not.
 //! It never touches a slot that is not pending verification, so a normally booted image cannot restart itself because the broker happens to be down.
@@ -16,7 +16,7 @@ use crate::ota::persist::{
 };
 use crate::ota::{FailReason, RollbackReason, SlotId, Version};
 
-/// The timings of the health policy; the MQTT runtime builds it from its `OtaTimings` (`ota-wire`), the DDI runtime carries it in its settings.
+/// The timings of the health policy; the DDI runtime carries it in its settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthConfig {
     /// Time since boot before a healthy image is marked valid.
@@ -82,7 +82,7 @@ pub enum SlotReading {
 pub enum HealthVerdict {
     /// The image was marked valid and the attempt was recorded; `applied` is published.
     Applied,
-    /// The image was marked valid but the attempt could not be recorded within the bounded retries; `applied` is published anyway and the runtime keeps retrying the record in the background (the MQTT runtime on its reporter thread, the DDI runtime on its worker); see [`retry_completion`].
+    /// The image was marked valid but the attempt could not be recorded within the bounded retries; `applied` is published anyway and the runtime keeps retrying the record in the background (the DDI runtime on its worker); see [`retry_completion`].
     ///
     /// Until the record is cleared every offer answers `attempt_unresolved`.
     ApplyNotRecorded,
@@ -1443,5 +1443,233 @@ mod flow_tests {
                 "after Done: {input:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod upkeep_tests {
+    use super::*;
+    use crate::ota::persist::fault_kv::FaultKv;
+    use crate::ota::persist::{
+        reconcile_boot, BootDisposition, BootFault, BootWarnings, KvError, UpdateSlot,
+    };
+    use crate::ota::{SettleOutcome, SlotState};
+
+    const A: SlotId = SlotId(0);
+    const B: SlotId = SlotId(1);
+    const V1: Version = Version::new(1, 0, 0);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn store(kv: &FaultKv) -> OtaStore<FaultKv> {
+        OtaStore::open(kv.clone(), || 0xC0FF_EE00)
+    }
+
+    fn valid() -> HardwareFacts {
+        HardwareFacts {
+            running_slot: A,
+            running_state: SlotState::Valid,
+            update_slot: UpdateSlot::Present(B, SlotState::Unknown),
+        }
+    }
+
+    fn rolled_back_world(kv: &FaultKv) {
+        kv.put_u32("att_ctr", 5).put_u32("att_epoch", 1);
+        kv.put_u32("att_id", 5)
+            .put_u8("att_inv", 0)
+            .put_u8("att_boot", 1)
+            .put_u8("att_act", 1)
+            .put_str("att_ver", "2.0.0")
+            .put_str("att_slot", "ota_1");
+    }
+
+    fn boot_outcome(disposition: BootDisposition, released: bool) -> BootOutcome {
+        BootOutcome {
+            disposition,
+            action: None,
+            slot_released: released,
+            admission_open_at_boot: false,
+            refuse_mark_valid: false,
+            roll_back_now: false,
+            report_pending: false,
+            warnings: BootWarnings::default(),
+        }
+    }
+
+    #[test]
+    fn repair_all_loops_until_nothing_is_left() {
+        let kv = FaultKv::new();
+        kv.put_u32("att_ctr", 5).put_u32("att_epoch", 1);
+        kv.put_u32("att_id", 5)
+            .put_str("att_ver", "2.0.0")
+            .put_str("att_slot", "ota_1");
+        kv.put_u32("rq_id", 9).put_str("rq_from", "ota_0");
+        kv.put_str("rej_ver", "1.0.0");
+        kv.corrupt_with("att_ver", KvError::CODE_INVALID_VALUE);
+        kv.corrupt_with("rq_from", KvError::CODE_INVALID_VALUE);
+        kv.corrupt_with("rej_ver", KvError::CODE_INVALID_VALUE);
+        let mut s = store(&kv);
+        assert_eq!(repair_all(&mut s, 32), Ok(3));
+        assert_eq!(s.corrupt_present(), Ok(false));
+        assert_eq!(repair_all(&mut s, 32), Ok(0));
+    }
+
+    #[test]
+    fn repair_all_at_the_cap_is_failed_not_repaired() {
+        let make = || {
+            let kv = FaultKv::new();
+            kv.put_u32("att_ctr", 5).put_u32("att_epoch", 1);
+            kv.put_str("rej_ver", "1.0.0");
+            kv.put_u8("rb", 1);
+            kv.corrupt_with("rej_ver", KvError::CODE_INVALID_VALUE);
+            kv.corrupt_with("rb", KvError::CODE_INVALID_VALUE);
+            kv
+        };
+        let kv = make();
+        let mut s = store(&kv);
+        assert_eq!(repair_all(&mut s, 1), Err(RepairError::Capped));
+        assert_eq!(RepairError::Capped.reason(), FailReason::RepairFailed);
+        let kv = make();
+        let mut s = store(&kv);
+        assert_eq!(repair_all(&mut s, 2), Ok(2), "exactly the cap is fine");
+    }
+
+    #[test]
+    fn repair_all_reports_a_transient_error() {
+        let kv = FaultKv::new();
+        let mut s = store(&kv);
+        kv.reset_counters();
+        kv.fail_read_at(1);
+        assert!(matches!(repair_all(&mut s, 32), Err(RepairError::Store(_))));
+        assert_eq!(
+            RepairError::Store(StoreError::InvalidSlot).reason(),
+            FailReason::RepairFailed
+        );
+    }
+
+    #[test]
+    fn the_completion_backoff_doubles_to_the_cap_and_stops_on_success() {
+        let c = CompletionRetryConfig {
+            initial: secs(2),
+            cap: secs(10),
+        };
+        let b = CompletionBackoff::armed(&c, secs(100));
+        assert_eq!(b.wait(secs(100)), secs(2));
+        assert!(!b.due(secs(101)));
+        assert!(b.due(secs(102)));
+        let b = b.failed(&c, secs(102));
+        assert_eq!(b.wait(secs(102)), secs(4));
+        let b = b.failed(&c, secs(106)).failed(&c, secs(114));
+        assert_eq!(b.wait(secs(114)), secs(10), "capped");
+        assert_eq!(
+            completion_step(CompletionTry::StillFailing),
+            CompletionStep::Retry
+        );
+        assert_eq!(
+            completion_step(CompletionTry::Completed),
+            CompletionStep::Stop
+        );
+        assert_eq!(completion_step(CompletionTry::Gone), CompletionStep::Stop);
+    }
+
+    #[test]
+    fn runtime_flags_from_boot() {
+        let store_fault = BootFault::Store(StoreError::InvalidSlot);
+        let hw_fault = BootFault::Hardware(HardwareReadError::Busy);
+        let cases = [
+            (
+                BootDisposition::Settled(SettleOutcome::NoRequest),
+                true,
+                true,
+                false,
+            ),
+            (BootDisposition::AwaitHealthCheck, false, false, false),
+            (BootDisposition::RollBackNow, true, true, false),
+            (BootDisposition::ReportedRollback, true, true, false),
+            (BootDisposition::Deferred, false, false, false),
+            (
+                BootDisposition::Incomplete(StoreError::InvalidSlot),
+                true,
+                true,
+                false,
+            ),
+            (
+                BootDisposition::FailedClosed(store_fault),
+                true,
+                false,
+                true,
+            ),
+            (BootDisposition::FailedClosed(hw_fault), false, false, false),
+        ];
+        for (disposition, released, admit, suspect) in cases {
+            let outcome = boot_outcome(disposition.clone(), released);
+            let flags = RuntimeFlags::from_boot(&outcome);
+            assert_eq!(outcome.records_suspect(), suspect, "{disposition:?}");
+            assert_eq!(
+                flags,
+                RuntimeFlags {
+                    admission_open: admit,
+                    health_settled: admit,
+                    refuse_mark_valid: false,
+                    roll_back_now_at_boot: false,
+                    records_suspect: suspect,
+                },
+                "{disposition:?}"
+            );
+        }
+        let mut refused = boot_outcome(BootDisposition::RollBackNow, true);
+        refused.refuse_mark_valid = true;
+        refused.roll_back_now = true;
+        let flags = RuntimeFlags::from_boot(&refused);
+        assert!(!flags.admission_open && !flags.health_settled);
+        assert!(flags.refuse_mark_valid && flags.roll_back_now_at_boot);
+    }
+
+    #[test]
+    fn reconcile_boot_is_stable_when_re_run() {
+        let kv = FaultKv::new();
+        rolled_back_world(&kv);
+        let mut s = store(&kv);
+        let first = reconcile_boot(&mut s, Ok(valid()), Some(V1));
+        assert_eq!(first.disposition, BootDisposition::ReportedRollback);
+        let after_first = kv.snapshot();
+        let refreshed = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert!(!refreshed.records_suspect && !refreshed.refuse_mark_valid);
+        assert_eq!(kv.snapshot(), after_first);
+        kv.reset_counters();
+        let again = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert_eq!(again, refreshed);
+        assert_eq!(kv.commits(), 0, "from the second run on nothing is written");
+    }
+
+    #[test]
+    fn a_repair_clears_the_fail_closed_flags_it_caused() {
+        let kv = FaultKv::new();
+        rolled_back_world(&kv);
+        kv.corrupt_with("att_ver", KvError::CODE_INVALID_VALUE);
+        let mut s = store(&kv);
+        let boot = reconcile_boot(&mut s, Ok(valid()), Some(V1));
+        assert!(matches!(boot.disposition, BootDisposition::FailedClosed(_)));
+        assert!(boot.refuse_mark_valid);
+        let still = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert!(still.records_suspect && still.refuse_mark_valid);
+        assert_eq!(repair_all(&mut s, 32), Ok(1));
+        let fixed = refresh_after_repair(&mut s, Ok(valid()), Some(V1), false).unwrap();
+        assert!(!fixed.records_suspect);
+        assert!(
+            !fixed.refuse_mark_valid,
+            "the refusal came only from the fault"
+        );
+    }
+
+    #[test]
+    fn a_refusal_from_a_demanded_rollback_is_never_cleared() {
+        let kv = FaultKv::new();
+        let mut s = store(&kv);
+        let refreshed = refresh_after_repair(&mut s, Ok(valid()), Some(V1), true).unwrap();
+        assert!(refreshed.refuse_mark_valid);
+        assert!(!refreshed.records_suspect);
     }
 }
