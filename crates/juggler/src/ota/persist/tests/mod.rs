@@ -11,6 +11,8 @@ mod errors;
 mod fail_closed;
 mod failed_download;
 mod fault_kv_model;
+#[cfg(feature = "ota-flash-kv")]
+mod flash_kv;
 mod self_heal;
 mod sequences;
 mod stored_states;

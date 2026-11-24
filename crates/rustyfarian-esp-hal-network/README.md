@@ -20,6 +20,7 @@ Domain and chip features are **independently opt-in**; `default = []` means you 
 | `espnow`       | ESP-NOW driver `EspHalEspNow` (ADR 020)                   | Yes                | Implies `wifi` + `embassy`; `esp32c3`/`esp32c6` only. |
 | `lora`         | Synchronous LoRa radio stub (hardware driver in progress) | No                 | Non-async; blocking radio via embedded-hal.           |
 | `ota`          | Async over-the-air firmware update                        | Yes                | Requires `embassy` + `provisioning` unsupported.      |
+| `ota-ddi`      | DDI (hawkBit DDI v1) OTA client (ADR 027)                 | Yes                | No TLS yet: `http://` needs `ota-ddi-insecure-http`.  |
 | `provisioning` | Async SoftAP captive-portal provisioning                  | Yes                | Requires `wifi` + `embassy`; NVS storage (RISC-V).    |
 
 ### Dependency pins and MSRV
@@ -290,6 +291,9 @@ Design detail: [Wi-Fi suspend, resume and deep sleep](https://github.com/datenko
 | ESP-NOW receive queue  | 32 frames by default (`init_with_capacity` sets it); a frame at a full queue is dropped and counted in a warning | 10 frames, fixed by `esp-radio`; drops the oldest |
 | ESP-NOW `try_recv`     | Draws from the same queue as `receive`; a frame taken there is not seen by `receive`   | Returns `None`                                                   |
 | ESP-NOW stop           | `shutdown()` or drop                                                                   | `shutdown()` only; no `Drop`, because futures borrow the handle  |
+| DDI setup              | `DdiRuntime::start(records)` returns the handle and runs worker threads; records in NVS | `start(records, stack)` returns the handle and a `DdiRunner` for a firmware task; records in the `nvs` data partition |
+| DDI nudge              | `MqttBuilder::on_message` hands each topic to `DdiNudge::on_message`                   | The app subscribes `nudge.topic()` and feeds `on_message` from its `receive()` loop |
+| DDI gaps               | None of these                                                                          | No wall clock (feedback has no timestamps, `Retry-After` dates are ignored), no IPv6 server, `stack_high_water()` always `None` |
 
 ## Integration with juggler
 

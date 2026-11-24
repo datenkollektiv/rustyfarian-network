@@ -10,7 +10,9 @@
 //! The cooperative download deadline ([`Deadline`], [`ActivationPermit`]) and the read-error classifier ([`classify_read_error`]) are re-exported from `juggler::ota` as well.
 //!
 //! With the opt-in `ota-wire` feature (serde + `alloc`; the consumer must provide a global allocator), the OTA wire contract (`OtaCommand`, `Manifest`, `OtaStatus`, `FailReason`, `RollbackReason`, and their error types and size limits) is re-exported from `juggler::ota` as well.
-//! The persisted-record store (`OtaStore`, `OtaKv`, `reconcile_boot`, `note_boot_slot`, and their outcome and error types) is re-exported with `ota-wire` too; this crate ships no `OtaKv` backend; a bare-metal consumer implements `OtaKv` over its own flash storage.
+//! The persisted-record store (`OtaStore`, `OtaKv`, `reconcile_boot`, `note_boot_slot`, and their outcome and error types) is re-exported with `ota-wire` or `ota-ddi`.
+//! With `ota-ddi` the [`ddi`] module holds the async DDI transport (`DdiTransport`) and the DDI runtime (`DdiRuntime`, `DdiHandle`, `DdiRunner`, `DdiNudge`, `OtaFlags`) under the ESP-IDF tier's names.
+//! With `ota-ddi` this crate ships the `OtaKv` backend over raw flash (`FlashKv`), the shared flash handle (`SharedFlash`), the store opener (`open_records`) and the boot-fact reads (`read_hardware_facts`, `slot_evidence_line`, `note_boot_slot_hal`); with `ota-wire` alone a bare-metal consumer implements `OtaKv` itself.
 //! The consumer runtime's pure state machines are reachable as the re-exported [`runtime`] module with `ota-wire`; this crate ships no runtime glue (no MQTT on this tier, ADR 015), and the runtime's configuration and verdict types (`OtaSettings`, `OtaTimings`, `OtaStacks`, `DeadlineAction`, `HealthVerdict`, `ConfigError`) are re-exported flat.
 //!
 //! [`ImageMetadata`], [`Version`], [`OtaState`], [`StreamingVerifier`], the
@@ -61,15 +63,122 @@ pub use juggler::ota::{
 #[cfg(any(feature = "ota-wire", test))]
 #[allow(deprecated)]
 pub use juggler::ota::{
+    CommandError, FailReason, Manifest, ManifestError, OtaCommand, OtaStatus, RollbackReason,
+    StatusError, MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES,
+};
+
+// The persisted-record store, used by the MQTT wire's consumers and by the DDI client.
+#[cfg(any(feature = "ota-wire", feature = "ota-ddi", test))]
+pub use juggler::ota::{
     note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition, slot_from_label,
     slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings, BusyRetry, BusyTally,
-    CommandError, CorruptRecord, Delivery, FailReason, FailedDownload, HardwareFacts,
-    HardwareReadError, KvError, KvStr, Manifest, ManifestError, NoteBoot, NoteBootError,
-    OtaCommand, OtaKv, OtaStatus, OtaStore, PendingReport, PendingReportView, ReasonNote,
-    RefusalNote, RepairedRecord, ReportRecord, RollbackNoted, RollbackReason, RollbackRequest,
-    SettleOutcome, StatusError, StoreError, StoredAttempt, UpdateSlot, FACTORY_SLOT,
-    MAX_COMMAND_BYTES, MAX_MANIFEST_BYTES, NVS_NAMESPACE,
+    CorruptRecord, Delivery, FailedDownload, HardwareFacts, HardwareReadError, KvError, KvStr,
+    NoteBoot, NoteBootError, OtaKv, OtaStore, PendingReport, PendingReportView, ReasonNote,
+    RefusalNote, RepairedRecord, ReportRecord, RollbackNoted, RollbackRequest, SettleOutcome,
+    StoreError, StoredAttempt, UpdateSlot, FACTORY_SLOT, NVS_NAMESPACE,
 };
+
+// The NOR-flash backend of the record store (`juggler/ota-flash-kv`, enabled by `ota-ddi`).
+#[cfg(any(feature = "ota-ddi", test))]
+pub use juggler::ota::FlashKv;
+
+// The DDI client: the transport and the ESP-IDF tier's `ota::ddi` names (ADR 022).
+#[cfg(any(
+    test,
+    all(
+        feature = "ota-ddi",
+        any(
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32",
+            feature = "esp32s3"
+        )
+    )
+))]
+pub mod ddi;
+
+// The library-owned flags of the DDI runtime (`ddi::OtaFlags`).
+#[cfg(any(
+    test,
+    all(
+        feature = "ota-ddi",
+        any(
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32",
+            feature = "esp32s3"
+        )
+    )
+))]
+mod flags;
+
+// The shared flash handle, the record store opener and the boot-fact reads of the DDI client.
+#[cfg(any(
+    test,
+    all(
+        feature = "ota-ddi",
+        any(
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32",
+            feature = "esp32s3"
+        )
+    )
+))]
+mod boot_facts;
+#[cfg(any(
+    test,
+    all(
+        feature = "ota-ddi",
+        any(
+            feature = "esp32c3",
+            feature = "esp32c6",
+            feature = "esp32",
+            feature = "esp32s3"
+        )
+    )
+))]
+mod flash;
+#[cfg(all(
+    feature = "ota-ddi",
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
+))]
+mod records;
+#[cfg(all(
+    feature = "ota-ddi",
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
+))]
+pub use boot_facts::{note_boot_slot_hal, read_hardware_facts, slot_evidence_line};
+#[cfg(all(
+    feature = "ota-ddi",
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
+))]
+pub use flash::{SharedFlash, SharedFlashTaken};
+#[cfg(all(
+    feature = "ota-ddi",
+    any(
+        feature = "esp32c3",
+        feature = "esp32c6",
+        feature = "esp32",
+        feature = "esp32s3"
+    )
+))]
+pub use records::{open_records, Records};
 
 // The health verdict types of the base `ota` feature (the policy is `juggler::ota::health`).
 pub use juggler::ota::{DeadlineAction, HealthVerdict};

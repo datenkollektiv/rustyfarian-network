@@ -180,6 +180,12 @@ check-ota-wire-pure:
 check-ota-ddi-pure:
     cargo check -p juggler --no-default-features --features ota-ddi --target {{ hal_c3_target }} -Zbuild-std=core,alloc
 
+# check the NOR-flash OTA record backend is no_std clean: core only alone, core + alloc with the DDI client (no ESP-IDF required)
+[group('build')]
+check-ota-flash-kv-pure:
+    cargo check -p juggler --no-default-features --features ota-flash-kv --target {{ hal_c3_target }} -Zbuild-std=core
+    cargo check -p juggler --no-default-features --features ota-ddi,ota-flash-kv --target {{ hal_c3_target }} -Zbuild-std=core,alloc
+
 # check the pure provisioning feature (no ESP-IDF required)
 [group('build')]
 check-provisioning-pure:
@@ -203,11 +209,13 @@ clippy-ota-pure:
     cargo clippy -p juggler --features ota --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-wire --all-targets --target {{ host_target }} -- -D warnings
     cargo clippy -p juggler --features ota-ddi --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features ota-flash-kv --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features ota-ddi,ota-flash-kv --all-targets --target {{ host_target }} -- -D warnings
 
 # lint all pure juggler code incl. the ESP-NOW scan machine, with every host-testable feature
 [group('build')]
 clippy-pure:
-    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,ota-ddi,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
+    cargo clippy -p juggler --features mock,std,provisioning,flash-store,ota-wire,ota-ddi,ota-flash-kv,espnow,embassy --all-targets --target {{ host_target }} -- -D warnings
 
 # check the esp-idf ota runtime (features wifi,mqtt,ota-wire) and its hardware example
 [group('build')]
@@ -309,6 +317,33 @@ check-ota-hal-embassy:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota,wifi,esp32c3,unstable,rt,embassy --example hal_c3_ota --target-dir {{ hal_dir }}
 
+# check the esp-hal DDI client (ota-ddi, ota-ddi-insecure-http; with wifi+mqtt also on ESP32-S3) and the hal_c3_ddi / hal_c6_ddi examples on ESP32-C6 and ESP32-C3, and that ota-ddi + ota-wire fails without the bench opt-in
+[group('build')]
+check-ota-ddi-hal:
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi-insecure-http,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi-insecure-http,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c6,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32s3,unstable,rt,embassy --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c3,unstable,rt,embassy --example hal_c3_ddi --target-dir {{ hal_dir }}
+    cargo check -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c6,unstable,rt,embassy --example hal_c6_ddi --target-dir {{ hal_dir }}
+    scripts/check-ota-ddi-hal-guard.sh {{ hal_c3_target }} {{ hal_dir }}
+
+# lint the esp-hal DDI client on ESP32-C6, ESP32-C3 (no atomic read-modify-write) and ESP32-S3 (Xtensa)
+[group('build')]
+clippy-ota-ddi-hal:
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi-insecure-http,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features ota-ddi,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c6,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_s3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32s3,unstable,rt,embassy -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c3,unstable,rt,embassy --example hal_c3_ddi -- -D warnings
+    cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,mqtt,ota-ddi-insecure-http,esp32c6,unstable,rt,embassy --example hal_c6_ddi -- -D warnings
+
 # run the bare-metal network crate's host tests (HTTP parser, provisioning substrate, OTA, provisioning)
 [group('test & lint')]
 test-hal:
@@ -348,19 +383,20 @@ check-espnow-hal:
     cargo check -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features espnow,esp32c3,unstable,rt,embassy --target-dir {{ hal_dir }}
 
 [group('build')]
-check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-provisioning-hal-embassy check-mqtt-hal-embassy check-espnow-hal
+check-hal: check-wifi-hal-embassy check-lora-hal check-ota-hal-embassy check-ota-ddi-hal check-provisioning-hal-embassy check-mqtt-hal-embassy check-espnow-hal
 
 # check juggler compiles without the `std` feature (ADR 014 §2 no_std surface)
 [group('build')]
 check-network-pure-no-std:
     cargo check -p juggler --no-default-features
     cargo check -p juggler --no-default-features --features flash-store
+    cargo check -p juggler --no-default-features --features ota-flash-kv
 
 # Lints all six domains (wifi, mqtt, espnow, lora, ota, provisioning) on both RISC-V targets, plus the Xtensa targets that support them.
 # `-Zbuild-std=core,alloc` overrides the workspace [unstable] build-std default.
 [doc('run clippy on the esp-hal network crate (bare-metal targets: ESP32-C6, ESP32-C3, ESP32-S3, ESP32)')]
 [group('build')]
-clippy-hal:
+clippy-hal: clippy-ota-ddi-hal
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c6,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c3_target }} -p rustyfarian-esp-hal-network --no-default-features --features wifi,esp32c3,unstable,rt,embassy -- -D warnings
     cargo clippy -Zbuild-std=core,alloc --target {{ hal_c6_target }} -p rustyfarian-esp-hal-network --no-default-features --features lora,esp32c6,rt -- -D warnings
@@ -483,6 +519,7 @@ test-ota:
     cargo test --target {{ host_target }} -p juggler --features ota
     cargo test --target {{ host_target }} -p juggler --features ota-wire
     cargo test --target {{ host_target }} -p juggler --features ota-ddi
+    cargo test --target {{ host_target }} -p juggler --features ota-ddi,ota-flash-kv ota::persist::
 
 # run platform-independent provisioning unit tests (host toolchain, no ESP-IDF needed)
 [group('test & lint')]
@@ -724,7 +761,7 @@ clean-idf:
 clean-hal:
     cargo clean --target-dir {{ hal_dir }}
 
-# check that provisioning library logs never interpolate credential field names
+# check that provisioning and bare-metal DDI logs (library and examples) never interpolate credential field names
 [group('maintenance')]
 check-no-credential-logging:
     scripts/check-no-credential-logging.sh
@@ -747,7 +784,7 @@ critical-path action="render" *args:
 ota-image version example="idf_c3_ota_runtime":
     scripts/ota-image.sh "{{ version }}" "{{ example }}" "{{ hal_dir }}" "{{ idf_dir }}"
 
-# build a DDI example with FIRMWARE_VERSION=version and write the fleet's release bundle (<name>.bin, .bin.sha256, .bin.version, .bin.chip) to tmp/ddi-bundle/
+# build a DDI example (idf_* or hal_{c3,c6}_*) with FIRMWARE_VERSION=version and write the fleet's release bundle (<name>.bin, .bin.sha256, .bin.version, .bin.chip) to tmp/ddi-bundle/
 [group('ota')]
 ddi-bundle example version:
     scripts/ddi-bundle.sh "{{ example }}" "{{ version }}" "{{ hal_dir }}" "{{ idf_dir }}"
@@ -988,7 +1025,7 @@ verify-idf: check check-ota-pure clippy check-idf clippy-provisioning-tests clip
 
 # bare-metal esp-hal device checks (needs the ESP toolchain for -Zbuild-std)
 [group('ci')]
-verify-hal: check-hal check-ota-wire-pure check-ota-ddi-pure
+verify-hal: check-hal check-ota-wire-pure check-ota-ddi-pure check-ota-flash-kv-pure
 
 # CI-equivalent: verify, deny, then the device gates
 [group('ci')]

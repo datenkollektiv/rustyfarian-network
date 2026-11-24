@@ -139,8 +139,8 @@ check_version() {
 
 check_example() {
     case "$1" in
-        idf_*_*) ;;
-        *) die "example must be idf_{c3|c6|esp32|esp32s3}_{feature}, got \"$1\"" ;;
+        idf_*_* | hal_c3_* | hal_c6_*) ;;
+        *) die "example must be idf_{c3|c6|esp32|esp32s3}_{feature} or hal_{c3|c6}_{feature}, got \"$1\"" ;;
     esac
 }
 

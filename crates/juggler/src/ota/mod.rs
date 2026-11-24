@@ -51,6 +51,8 @@ pub use error::{classify_read_error, OtaError};
 pub use health::{DeadlineAction, HealthVerdict};
 pub use log_text::{TextForLog, UrlForLog};
 pub use metadata::ImageMetadata;
+#[cfg(feature = "ota-flash-kv")]
+pub use persist::FlashKv;
 pub use persist::{
     note_boot_slot, read_with_busy_retry, reconcile_boot, slot_for_partition, slot_from_label,
     slot_label, BootDisposition, BootFault, BootOutcome, BootWarnings, BusyRetry, BusyTally,

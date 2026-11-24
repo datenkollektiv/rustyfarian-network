@@ -15,6 +15,7 @@
 //! | `ota` | `ota` (incl. `ota::persist`, `ota::health`, `FailReason`, `RollbackReason`) | `heapless`, `sha2` |
 //! | `ota-wire` | `ota::wire` (command, manifest, status), `ota::runtime` | `serde`, `serde_json` (implies `ota`, needs `alloc`) |
 //! | `ota-ddi` | `ota::ddi` | `serde`, `serde_json`, `zeroize` (implies `ota`, needs `alloc`) |
+//! | `ota-flash-kv` | `ota::persist::FlashKv` | `embedded-storage` (implies `ota`, no `alloc`) |
 //! | `provisioning` | `provisioning` | `heapless`, `zeroize` (implies wifi+mqtt) |
 //! | `flash-store` | `provisioning::flash_store` | `embedded-storage` (implies `provisioning`) |
 //! | `embassy` | `espnow::EmbassyClock` | `embassy-time` (no time driver, ADR 021) |
@@ -57,6 +58,11 @@
 //!   `ota::ddi::DdiToken`. Requires `serde`, `serde_json` (no default
 //!   features, `alloc`) and `zeroize`; implies `ota`. Independent of
 //!   `ota-wire`; the two share only `ota::wire::FailReason`.
+//!
+//! - **`ota-flash-kv`** — `ota::persist::FlashKv`, the record store's backend
+//!   over raw NOR flash (`embedded-storage`): an append-only, CRC-checked
+//!   snapshot log that survives a power cut at any write or erase step, for a
+//!   platform without NVS (the esp-hal tier). Implies `ota`; no `alloc`.
 //!
 //! - **`provisioning`** — SoftAP captive-portal form parsing, field validation,
 //!   and provisioning state machine. **This is a meta-feature that enables

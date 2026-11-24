@@ -3,15 +3,16 @@
 //! The policy decides when a freshly activated image proves itself healthy, and what happens when it does not.
 //! It never touches a slot that is not pending verification, so a normally booted image cannot restart itself because the broker happens to be down.
 //!
-//! One tier runs it, on one thread (the app's main thread), so it is flat logic (ADR 023 decision 3): the driver reads the slot, sleeps, asks the app predicate, marks valid, records the attempt, rolls back or restarts in plain sequential code, and asks these functions only for the decisions.
+//! The ESP-IDF driver runs it on one thread (the app's main thread) as flat logic (ADR 023 decision 3): it reads the slot, sleeps, asks the app predicate, marks valid, records the attempt, rolls back or restarts in plain sequential code, and asks these functions only for the decisions.
 //! [`SlotReads::busy`] and [`SlotReads::failed`] decide whether an unreadable slot is retried or ends the policy, [`poll_decision`] and [`after_unhealthy`] decide whether to evaluate, wait or give up at the deadline, and [`deadline_plan`] says what the deadline does.
+//! [`HealthFlow`] composes the same decisions in the same order as an action machine (rung 3) for a tier that runs the policy as an async task (esp-hal), where flat blocking code does not fit (ADR 023 decision 2).
 //! Elapsed time is measured from the boot instant the app captured at the very start of `main`, not from Wi-Fi association.
 
 use core::time::Duration;
 
 use crate::ota::persist::{
     reconcile_boot, BootDisposition, BootOutcome, HardwareFacts, HardwareReadError, OtaKv,
-    OtaStore, StoreError,
+    OtaStore, ReasonNote, StoreError,
 };
 use crate::ota::{FailReason, RollbackReason, SlotId, Version};
 
@@ -482,6 +483,277 @@ pub fn completion_step(result: CompletionTry) -> CompletionStep {
     }
 }
 
+/// Experimental: API may change before 1.0.
+///
+/// The input to [`HealthFlow::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthInput {
+    /// Starts the policy; the first input.
+    Start,
+    /// The answer to [`HealthAction::ReadSlot`]: one read of the running slot.
+    Slot(SlotReading),
+    /// The wait of a [`HealthAction::Wait`] ended.
+    Waited,
+    /// The answer of the app predicate to [`HealthAction::AskHealthy`].
+    Healthy(bool),
+    /// The answer to [`HealthAction::MarkValid`]: whether the running image was marked valid.
+    MarkedValid(bool),
+    /// The rollback of [`HealthAction::Rollback`] returned: whether it reported success.
+    RolledBack(bool),
+    /// The app's restart callback of [`HealthAction::Restart`] returned.
+    RestartReturned,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// What the tier must do next for the health policy ([`HealthFlow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthAction {
+    /// Read the running slot once, then answer with [`HealthInput::Slot`].
+    ReadSlot,
+    /// Wait this long, then answer with [`HealthInput::Waited`].
+    Wait(Duration),
+    /// Ask the app predicate, then answer with [`HealthInput::Healthy`].
+    AskHealthy,
+    /// Mark the running image valid, then answer with [`HealthInput::MarkedValid`].
+    MarkValid,
+    /// Roll back to the other slot; answer with [`HealthInput::RolledBack`] if the call returns.
+    Rollback,
+    /// Call the app's restart callback; answer with [`HealthInput::RestartReturned`] if it returns.
+    Restart,
+    /// The policy ended with this verdict; the tier settles it and feeds no further input.
+    Done(HealthVerdict),
+    /// The input did not answer the pending action; nothing changed (ADR 023 decision 5).
+    Ignored,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// What a [`HealthFlow`] step did that a tier logs, taken with [`HealthFlow::take_note`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthNote {
+    /// A failed slot read fell on the warning cadence: this many failed reads so far.
+    SlotUnreadable(u32),
+    /// Recording the completed attempt failed; it is tried again within `complete_attempts`.
+    CompleteFailed(StoreError),
+    /// The rollback reason was recorded (`written`), or an earlier reason of this boot was kept.
+    RollbackNoted {
+        /// The reason of the deadline plan.
+        reason: RollbackReason,
+        /// `false` when an earlier reason was kept.
+        written: bool,
+    },
+    /// The rollback reason could not be recorded.
+    RollbackNotNoted {
+        /// The reason of the deadline plan.
+        reason: RollbackReason,
+        /// The store error.
+        error: StoreError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthPhase {
+    Idle,
+    ReadingSlot,
+    SlotWait,
+    Asking,
+    Marking,
+    Waiting,
+    CompleteWait,
+    Restarting,
+    RollingBack,
+    RollbackWait,
+    Done,
+}
+
+/// Experimental: API may change before 1.0.
+///
+/// The health policy of the running image as an action machine (ADR 023 rung 3), composed from the pure decisions above in the order the ESP-IDF driver runs them.
+///
+/// The same policy runs on a thread (ESP-IDF) and as a task (esp-hal), so it is a machine here rather than one tier's sequential code (ADR 023 decision 2).
+/// The tier performs each [`HealthAction`] and feeds the result back as a [`HealthInput`], with `elapsed`, the time since the app's boot instant, and the tier's `refuse_mark_valid` flag read at each call.
+/// The machine reads no clock; it calls the store for the two records it owns, [`OtaStore::complete_attempt`] and [`OtaStore::note_rollback`].
+///
+/// The order:
+/// - [`HealthAction::ReadSlot`] until the slot is known: a busy or failed read is retried every `slot_retry` ([`SlotReads`]), and gives up with [`HealthVerdict::SlotUnreadable`] only after `slot_min_attempts` reads and the failure deadline;
+/// - a slot that is not pending verification ends with [`HealthVerdict::NothingToVerify`], touching nothing;
+/// - a pending slot is decided by [`poll_decision`]: once the dwell has passed and nothing refuses, [`HealthAction::AskHealthy`] then [`HealthAction::MarkValid`], then `complete_attempt` with `complete_attempts` tries `complete_retry` apart ([`HealthVerdict::Applied`] or [`HealthVerdict::ApplyNotRecorded`]); otherwise [`after_unhealthy`] waits `poll_interval`;
+/// - at the failure deadline the reason of [`deadline_plan`] is noted, then [`HealthAction::Restart`] or [`HealthAction::Rollback`] with `rollback_attempts` tries `rollback_retry` apart.
+///
+/// An input that does not answer the pending action returns [`HealthAction::Ignored`] and changes nothing.
+#[derive(Debug, Clone)]
+pub struct HealthFlow {
+    cfg: HealthConfig,
+    running: Version,
+    phase: HealthPhase,
+    reads: SlotReads,
+    slot: SlotId,
+    tries: u32,
+    note: Option<HealthNote>,
+}
+
+impl HealthFlow {
+    /// A policy with `cfg` for the running image `running`; nothing happens before [`HealthInput::Start`].
+    pub fn new(cfg: HealthConfig, running: Version) -> Self {
+        Self {
+            cfg,
+            running,
+            phase: HealthPhase::Idle,
+            reads: SlotReads::default(),
+            slot: SlotId(0),
+            tries: 0,
+            note: None,
+        }
+    }
+
+    /// What the last step did that a tier logs, if anything; cleared by the call.
+    pub fn take_note(&mut self) -> Option<HealthNote> {
+        self.note.take()
+    }
+
+    /// Advances the policy; `elapsed` is the time since the app's boot instant and `refuse_mark_valid` the tier's refusal flag now.
+    pub fn poll<K: OtaKv>(
+        &mut self,
+        store: &mut OtaStore<K>,
+        input: HealthInput,
+        elapsed: Duration,
+        refuse_mark_valid: bool,
+    ) -> HealthAction {
+        match (self.phase, input) {
+            (HealthPhase::Idle, HealthInput::Start)
+            | (HealthPhase::SlotWait, HealthInput::Waited) => {
+                self.phase = HealthPhase::ReadingSlot;
+                HealthAction::ReadSlot
+            }
+            (HealthPhase::ReadingSlot, HealthInput::Slot(reading)) => match reading {
+                SlotReading::PendingVerify(slot) => {
+                    self.slot = slot;
+                    self.decide(store, elapsed, refuse_mark_valid)
+                }
+                SlotReading::NotPending => self.finish(HealthVerdict::NothingToVerify),
+                SlotReading::Busy => {
+                    let retry = self.reads.busy(&self.cfg, elapsed);
+                    self.slot_retry(retry)
+                }
+                SlotReading::Failed => {
+                    let retry = self.reads.failed(&self.cfg, elapsed);
+                    self.slot_retry(retry)
+                }
+            },
+            (HealthPhase::Waiting, HealthInput::Waited) => {
+                self.decide(store, elapsed, refuse_mark_valid)
+            }
+            (HealthPhase::Asking, HealthInput::Healthy(true)) => {
+                self.phase = HealthPhase::Marking;
+                HealthAction::MarkValid
+            }
+            (HealthPhase::Asking, HealthInput::Healthy(false))
+            | (HealthPhase::Marking, HealthInput::MarkedValid(false)) => {
+                self.step(store, after_unhealthy(&self.cfg, elapsed))
+            }
+            (HealthPhase::Marking, HealthInput::MarkedValid(true)) => {
+                self.tries = 0;
+                self.complete(store)
+            }
+            (HealthPhase::CompleteWait, HealthInput::Waited) => self.complete(store),
+            (HealthPhase::Restarting, HealthInput::RestartReturned) => {
+                self.finish(HealthVerdict::RestartReturned)
+            }
+            (HealthPhase::RollingBack, HealthInput::RolledBack(true)) => {
+                self.finish(HealthVerdict::DeadlineRolledBack)
+            }
+            (HealthPhase::RollingBack, HealthInput::RolledBack(false)) => {
+                self.tries = self.tries.saturating_add(1);
+                if self.tries >= self.cfg.rollback_attempts {
+                    return self.finish(HealthVerdict::DeadlineRollbackFailed);
+                }
+                self.phase = HealthPhase::RollbackWait;
+                HealthAction::Wait(self.cfg.rollback_retry)
+            }
+            (HealthPhase::RollbackWait, HealthInput::Waited) => {
+                self.phase = HealthPhase::RollingBack;
+                HealthAction::Rollback
+            }
+            _ => HealthAction::Ignored,
+        }
+    }
+
+    fn decide<K: OtaKv>(
+        &mut self,
+        store: &mut OtaStore<K>,
+        elapsed: Duration,
+        refuse_mark_valid: bool,
+    ) -> HealthAction {
+        let step = poll_decision(&self.cfg, elapsed, refuse_mark_valid);
+        self.step(store, step)
+    }
+
+    fn step<K: OtaKv>(&mut self, store: &mut OtaStore<K>, step: PollStep) -> HealthAction {
+        match step {
+            PollStep::Evaluate => {
+                self.phase = HealthPhase::Asking;
+                HealthAction::AskHealthy
+            }
+            PollStep::Wait(pause) => {
+                self.phase = HealthPhase::Waiting;
+                HealthAction::Wait(pause)
+            }
+            PollStep::Deadline => self.at_deadline(store),
+        }
+    }
+
+    fn slot_retry(&mut self, retry: SlotRetry) -> HealthAction {
+        match retry {
+            SlotRetry::Sleep { pause, warn } => {
+                self.note = warn.map(HealthNote::SlotUnreadable);
+                self.phase = HealthPhase::SlotWait;
+                HealthAction::Wait(pause)
+            }
+            SlotRetry::GiveUp => self.finish(HealthVerdict::SlotUnreadable),
+        }
+    }
+
+    fn complete<K: OtaKv>(&mut self, store: &mut OtaStore<K>) -> HealthAction {
+        match store.complete_attempt(self.running) {
+            Ok(()) => self.finish(HealthVerdict::Applied),
+            Err(e) => {
+                self.note = Some(HealthNote::CompleteFailed(e));
+                self.tries = self.tries.saturating_add(1);
+                if self.tries >= self.cfg.complete_attempts {
+                    return self.finish(HealthVerdict::ApplyNotRecorded);
+                }
+                self.phase = HealthPhase::CompleteWait;
+                HealthAction::Wait(self.cfg.complete_retry)
+            }
+        }
+    }
+
+    fn at_deadline<K: OtaKv>(&mut self, store: &mut OtaStore<K>) -> HealthAction {
+        let plan = deadline_plan(&self.cfg);
+        let reason = plan.reason;
+        self.note = Some(match store.note_rollback(reason, self.slot) {
+            Ok(note) => HealthNote::RollbackNoted {
+                reason,
+                written: matches!(note, ReasonNote::Written(_)),
+            },
+            Err(error) => HealthNote::RollbackNotNoted { reason, error },
+        });
+        if plan.restart {
+            self.phase = HealthPhase::Restarting;
+            return HealthAction::Restart;
+        }
+        self.tries = 0;
+        self.phase = HealthPhase::RollingBack;
+        HealthAction::Rollback
+    }
+
+    fn finish(&mut self, verdict: HealthVerdict) -> HealthAction {
+        self.phase = HealthPhase::Done;
+        HealthAction::Done(verdict)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +1110,338 @@ mod tests {
             refresh_after_repair(&mut s, running_a(), running, false).expect("hardware read");
         assert!(!refreshed.records_suspect);
         assert!(repair_report_owed(repaired, refreshed.records_suspect));
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+    use crate::ota::persist::fault_kv::FaultKv;
+
+    const SLOT: SlotId = SlotId(1);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn running() -> Version {
+        Version::new(1, 1, 0)
+    }
+
+    fn store() -> (FaultKv, OtaStore<FaultKv>) {
+        let kv = FaultKv::new();
+        let s = OtaStore::open(kv.clone(), || 7);
+        (kv, s)
+    }
+
+    fn flow() -> HealthFlow {
+        HealthFlow::new(HealthConfig::default(), running())
+    }
+
+    /// Feeds `input` at `t` seconds since boot, with no refusal.
+    fn at(
+        f: &mut HealthFlow,
+        s: &mut OtaStore<FaultKv>,
+        input: HealthInput,
+        t: u64,
+    ) -> HealthAction {
+        f.poll(s, input, secs(t), false)
+    }
+
+    /// Starts the flow at `t` and answers the first read with a pending slot.
+    fn pending_at(f: &mut HealthFlow, s: &mut OtaStore<FaultKv>, t: u64) -> HealthAction {
+        assert_eq!(at(f, s, HealthInput::Start, t), HealthAction::ReadSlot);
+        at(f, s, HealthInput::Slot(SlotReading::PendingVerify(SLOT)), t)
+    }
+
+    #[test]
+    fn a_slot_that_is_not_pending_ends_at_once_and_touches_nothing() {
+        let (kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Start, 0),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            at(
+                &mut f,
+                &mut s,
+                HealthInput::Slot(SlotReading::NotPending),
+                0
+            ),
+            HealthAction::Done(HealthVerdict::NothingToVerify)
+        );
+        assert_eq!(kv.commits(), 0);
+    }
+
+    #[test]
+    fn a_healthy_pending_image_is_marked_valid_after_the_dwell_and_recorded() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(pending_at(&mut f, &mut s, 0), HealthAction::Wait(secs(1)));
+        for t in 1..30 {
+            assert_eq!(
+                at(&mut f, &mut s, HealthInput::Waited, t),
+                HealthAction::Wait(secs(1)),
+                "{t} s: the dwell has not passed"
+            );
+        }
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 30),
+            HealthAction::AskHealthy
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(true), 30),
+            HealthAction::MarkValid
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::MarkedValid(true), 30),
+            HealthAction::Done(HealthVerdict::Applied)
+        );
+    }
+
+    #[test]
+    fn a_refused_image_is_never_asked_and_meets_the_deadline() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(
+            f.poll(&mut s, HealthInput::Start, secs(40), true),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            f.poll(
+                &mut s,
+                HealthInput::Slot(SlotReading::PendingVerify(SLOT)),
+                secs(40),
+                true
+            ),
+            HealthAction::Wait(secs(1))
+        );
+        assert_eq!(
+            f.poll(&mut s, HealthInput::Waited, secs(120), true),
+            HealthAction::Rollback
+        );
+        assert_eq!(
+            f.take_note(),
+            Some(HealthNote::RollbackNoted {
+                reason: RollbackReason::HealthDeadline,
+                written: true
+            })
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_answer_or_a_failed_mark_valid_waits_then_rolls_back_with_bounded_tries() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(pending_at(&mut f, &mut s, 30), HealthAction::AskHealthy);
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(false), 30),
+            HealthAction::Wait(secs(1))
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 31),
+            HealthAction::AskHealthy
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(true), 31),
+            HealthAction::MarkValid
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::MarkedValid(false), 31),
+            HealthAction::Wait(secs(1))
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 120),
+            HealthAction::AskHealthy
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(false), 120),
+            HealthAction::Rollback
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::RolledBack(false), 120),
+            HealthAction::Wait(secs(5))
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 125),
+            HealthAction::Rollback
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::RolledBack(false), 125),
+            HealthAction::Wait(secs(5))
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 130),
+            HealthAction::Rollback
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::RolledBack(false), 130),
+            HealthAction::Done(HealthVerdict::DeadlineRollbackFailed)
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_returns_success_ends_the_policy() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(pending_at(&mut f, &mut s, 120), HealthAction::AskHealthy);
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(false), 120),
+            HealthAction::Rollback
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::RolledBack(true), 120),
+            HealthAction::Done(HealthVerdict::DeadlineRolledBack)
+        );
+    }
+
+    #[test]
+    fn note_and_restart_calls_the_restart_callback_after_noting() {
+        let (_kv, mut s) = store();
+        let cfg = HealthConfig {
+            deadline_action: DeadlineAction::NoteAndRestart(RollbackReason::Unhealthy),
+            ..HealthConfig::default()
+        };
+        let mut f = HealthFlow::new(cfg, running());
+        assert_eq!(pending_at(&mut f, &mut s, 120), HealthAction::AskHealthy);
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Healthy(false), 120),
+            HealthAction::Restart
+        );
+        assert_eq!(
+            f.take_note(),
+            Some(HealthNote::RollbackNoted {
+                reason: RollbackReason::Unhealthy,
+                written: true
+            })
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::RestartReturned, 121),
+            HealthAction::Done(HealthVerdict::RestartReturned)
+        );
+    }
+
+    #[test]
+    fn a_failing_completion_is_retried_then_ends_apply_not_recorded() {
+        let (kv, mut s) = store();
+        kv.corrupt("rej_ver");
+        let mut f = flow();
+        assert_eq!(pending_at(&mut f, &mut s, 30), HealthAction::AskHealthy);
+        at(&mut f, &mut s, HealthInput::Healthy(true), 30);
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::MarkedValid(true), 30),
+            HealthAction::Wait(secs(1))
+        );
+        assert!(matches!(f.take_note(), Some(HealthNote::CompleteFailed(_))));
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 31),
+            HealthAction::Wait(secs(1))
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 32),
+            HealthAction::Done(HealthVerdict::ApplyNotRecorded)
+        );
+
+        let (kv, mut s) = store();
+        kv.corrupt("rej_ver");
+        let mut f = flow();
+        pending_at(&mut f, &mut s, 30);
+        at(&mut f, &mut s, HealthInput::Healthy(true), 30);
+        at(&mut f, &mut s, HealthInput::MarkedValid(true), 30);
+        kv.revive();
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 31),
+            HealthAction::Done(HealthVerdict::Applied),
+            "a later try succeeds"
+        );
+    }
+
+    #[test]
+    fn unreadable_slot_reads_retry_warn_and_give_up_after_the_deadline() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Start, 0),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Slot(SlotReading::Failed), 0),
+            HealthAction::Wait(Duration::from_millis(200))
+        );
+        assert_eq!(f.take_note(), Some(HealthNote::SlotUnreadable(1)));
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 0),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Slot(SlotReading::Busy), 0),
+            HealthAction::Wait(Duration::from_millis(200))
+        );
+        assert_eq!(f.take_note(), None, "a busy read never warns");
+        for _ in 0..3 {
+            at(&mut f, &mut s, HealthInput::Waited, 200);
+            at(&mut f, &mut s, HealthInput::Slot(SlotReading::Failed), 200);
+        }
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 200),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Slot(SlotReading::Failed), 200),
+            HealthAction::Done(HealthVerdict::SlotUnreadable)
+        );
+    }
+
+    #[test]
+    fn out_of_phase_input_is_ignored_and_changes_nothing() {
+        let (_kv, mut s) = store();
+        let mut f = flow();
+        for input in [
+            HealthInput::Waited,
+            HealthInput::Healthy(true),
+            HealthInput::MarkedValid(true),
+            HealthInput::RolledBack(true),
+            HealthInput::RestartReturned,
+            HealthInput::Slot(SlotReading::NotPending),
+        ] {
+            assert_eq!(
+                at(&mut f, &mut s, input, 0),
+                HealthAction::Ignored,
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Start, 0),
+            HealthAction::ReadSlot
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Start, 0),
+            HealthAction::Ignored
+        );
+        assert_eq!(
+            at(&mut f, &mut s, HealthInput::Waited, 0),
+            HealthAction::Ignored
+        );
+        assert_eq!(
+            at(
+                &mut f,
+                &mut s,
+                HealthInput::Slot(SlotReading::NotPending),
+                0
+            ),
+            HealthAction::Done(HealthVerdict::NothingToVerify)
+        );
+        for input in [
+            HealthInput::Start,
+            HealthInput::Waited,
+            HealthInput::Healthy(true),
+        ] {
+            assert_eq!(
+                at(&mut f, &mut s, input, 1),
+                HealthAction::Ignored,
+                "after Done: {input:?}"
+            );
+        }
     }
 }

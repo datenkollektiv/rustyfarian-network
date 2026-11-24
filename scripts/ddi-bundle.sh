@@ -2,7 +2,8 @@
 set -euo pipefail
 # ddi-bundle.sh — build a DDI example with FIRMWARE_VERSION compiled in and write the fleet's release bundle
 # Usage: scripts/ddi-bundle.sh <example> <version> [hal_dir [idf_dir]]
-#   example: idf_{c3|c6|esp32|esp32s3}_{feature}, e.g. idf_c3_ddi (the DDI runtime is ESP-IDF only)
+#   example: idf_{c3|c6|esp32|esp32s3}_{feature}, e.g. idf_c3_ddi, or hal_{c3|c6}_{feature}, e.g. hal_c3_ddi
+#            (the bare-metal DDI runtime has examples for the C3 and the C6 only)
 #   version: MAJOR.MINOR.PATCH, decimal, no leading zeros, each component at most 65535
 #
 # Writes the bundle to tmp/ddi-bundle/ under the workspace root. The directory is git-ignored, and the
@@ -10,7 +11,7 @@ set -euo pipefail
 #   <name>.bin           app image from the OTA layout (partitions.ota.csv), name = <example>-<controller id>-v<version>
 #   <name>.bin.sha256    64 lowercase hex characters, the sha256 of <name>.bin
 #   <name>.bin.version   the version
-#   <name>.bin.chip      the ESP-IDF target name, e.g. esp32c3
+#   <name>.bin.chip      the chip name, e.g. esp32c3 (the same on both tiers)
 # Before the sidecars are written, the header is checked the way the fleet server checks an ingest:
 # byte 0 must be 0xE9 (ESP app-image magic) and the little-endian u16 at offset 12 must be the chip id.
 # These four files seed the lab DDI server.
@@ -21,7 +22,7 @@ set -euo pipefail
 # so a bundle never holds an image without a DDI client or one that refuses to start.
 
 usage() {
-    printf 'Usage: %s <example> <version> [hal_dir [idf_dir]]\n  example: idf_{c3|c6|esp32|esp32s3}_{feature}, e.g. idf_c3_ddi\n  version: MAJOR.MINOR.PATCH, no leading zeros, each component at most 65535, e.g. 1.0.0\n' "$0" >&2
+    printf 'Usage: %s <example> <version> [hal_dir [idf_dir]]\n  example: idf_{c3|c6|esp32|esp32s3}_{feature}, e.g. idf_c3_ddi, or hal_{c3|c6}_{feature}, e.g. hal_c3_ddi\n  version: MAJOR.MINOR.PATCH, no leading zeros, each component at most 65535, e.g. 1.0.0\n' "$0" >&2
 }
 
 if [ $# -lt 2 ]; then
@@ -35,24 +36,41 @@ hal_dir="${3:-target/hal}"
 idf_dir="${4:-target/idf}"
 workspace_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-case "$example" in
-    idf_*) ;;
-    *)
-        printf 'Error: example must start with "idf_" (the DDI runtime is ESP-IDF only), got "%s".\n' "$example" >&2
-        usage
-        exit 1
-        ;;
-esac
-
-# Chip is the second '_' field of the name; the map is ota-image.sh's, plus the chip id from the image header
+# Tier is the first '_' field of the name, chip the second; the map is ota-image.sh's, plus the chip id from the
+# image header. The bare-metal tier has DDI examples for the C3 and the C6 only.
+tier=$(printf '%s' "$example" | cut -d_ -f1)
 chip=$(printf '%s' "$example" | cut -d_ -f2)
-case "$chip" in
-    c3)      mcu="esp32c3";  target="riscv32imc-esp-espidf";  chip_id=5  ;;
-    c6)      mcu="esp32c6";  target="riscv32imac-esp-espidf"; chip_id=13 ;;
-    esp32)   mcu="esp32";    target="xtensa-esp32-espidf";    chip_id=0  ;;
-    esp32s3) mcu="esp32s3";  target="xtensa-esp32s3-espidf";  chip_id=9  ;;
+case "$tier" in
+    idf)
+        crate="rustyfarian-esp-idf-network"
+        build_dir="$idf_dir"
+        case "$chip" in
+            c3)      mcu="esp32c3";  target="riscv32imc-esp-espidf";  chip_id=5  ;;
+            c6)      mcu="esp32c6";  target="riscv32imac-esp-espidf"; chip_id=13 ;;
+            esp32)   mcu="esp32";    target="xtensa-esp32-espidf";    chip_id=0  ;;
+            esp32s3) mcu="esp32s3";  target="xtensa-esp32s3-espidf";  chip_id=9  ;;
+            *)
+                printf 'Error: unknown chip "%s" in example "%s". Name must follow idf_{c3|c6|esp32|esp32s3}_{feature}.\n' "$chip" "$example" >&2
+                usage
+                exit 1
+                ;;
+        esac
+        ;;
+    hal)
+        crate="rustyfarian-esp-hal-network"
+        build_dir="$hal_dir"
+        case "$chip" in
+            c3)      mcu="esp32c3";  target="riscv32imc-unknown-none-elf";  chip_id=5  ;;
+            c6)      mcu="esp32c6";  target="riscv32imac-unknown-none-elf"; chip_id=13 ;;
+            *)
+                printf 'Error: unknown chip "%s" in example "%s". Name must follow hal_{c3|c6}_{feature}.\n' "$chip" "$example" >&2
+                usage
+                exit 1
+                ;;
+        esac
+        ;;
     *)
-        printf 'Error: unknown chip "%s" in example "%s". Name must follow idf_{c3|c6|esp32|esp32s3}_{feature}.\n' "$chip" "$example" >&2
+        printf 'Error: example must start with "idf_" or "hal_", got "%s".\n' "$example" >&2
         usage
         exit 1
         ;;
@@ -79,7 +97,7 @@ features=$(awk -v ex="$example" '
     /^\[/ { inex = 0 }
     inex && $0 == "name = \"" ex "\"" { found = 1 }
     inex && found && /^required-features = / { print; exit }
-' "$workspace_root/crates/rustyfarian-esp-idf-network/Cargo.toml")
+' "$workspace_root/crates/$crate/Cargo.toml")
 if ! printf '%s' "$features" | grep -q '"ota-ddi'; then
     printf 'Error: example "%s" does not require the ota-ddi feature; a DDI bundle needs the DDI client.\n' "$example" >&2
     exit 1
@@ -124,7 +142,7 @@ fi
 export FIRMWARE_VERSION="$version"
 "$(dirname "$0")/build-example.sh" "$example" "$hal_dir" "$idf_dir"
 
-elf="$idf_dir/$target/release/examples/$example"
+elf="$build_dir/$target/release/examples/$example"
 if [ ! -f "$elf" ]; then
     printf 'Error: %s not found after the build.\n' "$elf" >&2
     exit 1

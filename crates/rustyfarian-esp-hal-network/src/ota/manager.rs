@@ -27,16 +27,28 @@ use juggler::ota::{
 
 use super::activation::{self, Entry, OtadataSectors};
 use super::cancel::OtaCancel;
+#[cfg(feature = "ota-ddi")]
+use super::ddi::plan::DdiGate;
+#[cfg(feature = "ota-ddi")]
+use super::ddi::resolve::{resolve, ResolveError};
+#[cfg(feature = "ota-ddi")]
+use super::flash::SharedFlash;
 use super::http::async_client::fetch_get;
+#[cfg(feature = "ota-ddi")]
+use super::http::async_client::send_and_read_head;
+#[cfg(feature = "ota-ddi")]
+use super::http::ddi::{download_headers, request_head, Method, ACCEPT_FIRMWARE};
 use super::http::parse_url;
+#[cfg(feature = "ota-ddi")]
+use juggler::ota::ddi::{CheckedUrl, RetryAfter};
 
 /// Converts an `embassy_time` duration (microsecond-exact) to `core`.
-fn to_core(d: Duration) -> CoreDuration {
+pub(crate) fn to_core(d: Duration) -> CoreDuration {
     CoreDuration::from_micros(d.as_micros())
 }
 
 /// Converts a `core` duration to `embassy_time`, saturating at the maximum.
-fn to_embassy(d: CoreDuration) -> Duration {
+pub(crate) fn to_embassy(d: CoreDuration) -> Duration {
     // Capped well below `u64::MAX` so `Instant::now() + d` in `with_timeout`
     // cannot overflow.
     let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
@@ -68,10 +80,55 @@ enum Sink<'r, 'a, 'd> {
     ReadModifyWrite(&'r mut FlashRegion<'a, 'd>),
     /// Erased once by the caller; needs word-aligned, contiguous writes.
     Nor(NorFlashRegion<'r, 'a, 'd>),
+    /// The firmware's [`SharedFlash`], borrowed for one write at a time; erased once by the
+    /// caller, written at `base` plus the image offset (absolute flash offsets).
+    #[cfg(feature = "ota-ddi")]
+    Shared {
+        flash: &'static SharedFlash,
+        base: u32,
+    },
+}
+
+/// The flash an [`EspHalOtaManager`] works on.
+enum FlashHandle<'d> {
+    /// Owned since [`EspHalOtaManager::new`]; a download borrows it from start to end.
+    Owned(FlashStorage<'d>),
+    /// The firmware's [`SharedFlash`] ([`EspHalOtaManager::new_shared`]), borrowed for one flash
+    /// operation at a time and never across an `.await`.
+    #[cfg(feature = "ota-ddi")]
+    Shared(&'static SharedFlash),
+}
+
+/// What a download fetches.
+enum Source<'s> {
+    /// The URL of a public `fetch_and_apply*` call: a plain GET to an IPv4 literal.
+    Plain(&'s str),
+    /// A DDI artifact ([`EspHalOtaManager::fetch_ddi`]).
+    #[cfg(feature = "ota-ddi")]
+    Ddi(DdiFetch<'s>),
+}
+
+/// One DDI artifact fetch, the crate-private seam of the DDI transport's `download`.
+///
+/// The [`DdiGate`] carries the artifact's size and the chip the image must name; both are required, so this seam cannot fetch without the chip check.
+#[cfg(feature = "ota-ddi")]
+pub(crate) struct DdiFetch<'a> {
+    /// The station stack, for the DNS lookup of the server name.
+    pub(crate) stack: embassy_net::Stack<'static>,
+    /// The artifact link, after the origin check.
+    pub(crate) url: &'a CheckedUrl,
+    /// The `Authorization` value; never logged.
+    pub(crate) authorization: &'a str,
+    /// The size and chip gates.
+    pub(crate) gate: DdiGate,
+    /// Filled with the `Retry-After` of a non-200 answer, for the retry policy.
+    pub(crate) retry_after: &'a mut Option<RetryAfter>,
 }
 
 /// Number of OTA app slots in the partition table.
-fn ota_app_count(table: &esp_bootloader_esp_idf::partitions::PartitionTable<'_>) -> usize {
+pub(super) fn ota_app_count(
+    table: &esp_bootloader_esp_idf::partitions::PartitionTable<'_>,
+) -> usize {
     table
         .iter()
         .filter(|p| {
@@ -213,6 +270,16 @@ fn write_chunk(
                 log::error!("Flash write failed: {:?}", e);
                 OtaError::FlashWriteFailed
             }),
+        #[cfg(feature = "ota-ddi")]
+        Sink::Shared { flash, base } => {
+            let mut nor: &SharedFlash = flash;
+            aligner
+                .push(offset, chunk, |at, data| nor.write(*base + at, data))
+                .map_err(|e| {
+                    log::error!("Flash write failed: {:?}", e);
+                    OtaError::FlashWriteFailed
+                })
+        }
     }
 }
 
@@ -229,6 +296,16 @@ fn flush_tail(
                 log::error!("OTA: final flash write failed: {:?}", e);
                 OtaError::FlashWriteFailed
             }),
+        #[cfg(feature = "ota-ddi")]
+        Sink::Shared { flash, base } => {
+            let mut nor: &SharedFlash = flash;
+            aligner
+                .finish(len, |at, data| nor.write(*base + at, data))
+                .map_err(|e| {
+                    log::error!("OTA: final flash write failed: {:?}", e);
+                    OtaError::FlashWriteFailed
+                })
+        }
         Sink::ReadModifyWrite(_) => Ok(()),
     }
 }
@@ -250,6 +327,300 @@ fn finish(
 fn unexpected(action: &DownloadAction) -> OtaError {
     log::error!("OTA: unexpected download step {:?}", action);
     OtaError::DownloadFailed { status: 0 }
+}
+
+/// One download in progress: its machine, cancel switch, image length, per-read timeout and clock.
+///
+/// Bundled so the streaming helpers take few arguments (the Xtensa LLVM backend has failed on
+/// functions with many, see `docs/project-lore.md` "Toolchain & Build").
+struct Run<'r, E: Fn() -> CoreDuration> {
+    machine: &'r mut DownloadMachine,
+    cancel: &'r OtaCancel,
+    len: u32,
+    timeout_secs: u64,
+    elapsed: &'r E,
+}
+
+/// Step 3 of a download, on both flash paths: streams the body into `sink` and returns the activation permit.
+///
+/// Each chunk feeds both the flash and the verifier. Each socket read waits at most `min(per-read
+/// timeout, remaining deadline)`; a timed-out wait is `DownloadTimeout`, a socket read error is
+/// `ServerUnreachable`.
+async fn stream_body<E: Fn() -> CoreDuration>(
+    run: &mut Run<'_, E>,
+    sink: &mut Sink<'_, '_, '_>,
+    aligner: &mut ChunkAligner,
+    socket: &mut TcpSocket<'_>,
+) -> Result<ActivationPermit, OtaError> {
+    let mut verifier = StreamingVerifier::new();
+    // Word-aligned so `write_nor` writes from this buffer directly; a
+    // misaligned slice would make it copy through its own 4 KiB sector
+    // buffer, on the stack, once per chunk.
+    let mut chunk_buf = ChunkBuf([0u8; CHUNK_LEN]);
+    let mut written: u32 = 0;
+    let mut input = DownloadInput::Prepared;
+    loop {
+        let action = match run.cancel.poll(run.machine, input, (run.elapsed)()) {
+            Ok(action) => action,
+            // Nothing on this tier needs undoing: the slot is simply
+            // never activated.
+            Err(e) => {
+                log::error!("OTA: download stopped: {} — boot slot unchanged", e);
+                break Err(e);
+            }
+        };
+        input = match action {
+            DownloadAction::Read { max, budget } => {
+                let to_read = (max as usize).min(CHUNK_LEN);
+                match with_timeout(to_embassy(budget), socket.read(&mut chunk_buf.0[..to_read]))
+                    .await
+                {
+                    Err(_) => {
+                        log::error!(
+                            "OTA: body chunk read timed out (per-read {}s or deadline)",
+                            run.timeout_secs
+                        );
+                        DownloadInput::ReadFailed(classify_read_error(true))
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("OTA: body chunk read failed: {:?}", e);
+                        DownloadInput::ReadFailed(classify_read_error(false))
+                    }
+                    Ok(Ok(n)) => DownloadInput::Read(n),
+                }
+            }
+            // The header the machine read before the erase goes first.
+            DownloadAction::WriteHeader(bytes) => {
+                verifier.update(&bytes);
+                match write_chunk(sink, aligner, written, &bytes) {
+                    Ok(()) => {
+                        written += IMAGE_HEADER_LEN as u32;
+                        DownloadInput::Written
+                    }
+                    Err(e) => DownloadInput::WriteFailed(e),
+                }
+            }
+            DownloadAction::Write { n } => {
+                let chunk = &chunk_buf.0[..n];
+                verifier.update(chunk);
+                match write_chunk(sink, aligner, written, chunk) {
+                    Ok(()) => {
+                        written += n as u32;
+                        DownloadInput::Written
+                    }
+                    Err(e) => DownloadInput::WriteFailed(e),
+                }
+            }
+            // Write the tail the aligner held back, padded with 0xFF
+            // inside the erased span, then hand over the digest.
+            DownloadAction::Finalize => match flush_tail(sink, aligner, run.len) {
+                Err(e) => DownloadInput::WriteFailed(e),
+                Ok(()) => {
+                    log::info!("OTA: download complete, verifying SHA-256");
+                    DownloadInput::Digest(
+                        core::mem::replace(&mut verifier, StreamingVerifier::new()).finalize(),
+                    )
+                }
+            },
+            // Nothing on this tier needs undoing: the slot is simply
+            // never activated, so the boot slot stays unchanged.
+            DownloadAction::Abort(e) => {
+                log::error!("OTA: download failed: {} — boot slot unchanged", e);
+                DownloadInput::Aborted
+            }
+            DownloadAction::Activate(permit) => break Ok(permit),
+            // The end of an aborted download.
+            DownloadAction::Done(Err(e)) => break Err(e),
+            other => break Err(unexpected(&other)),
+        };
+    }
+}
+
+/// Where a shared-flash download writes: the target slot, resolved once.
+#[cfg(feature = "ota-ddi")]
+struct Target {
+    /// Absolute flash offset of the target partition.
+    offset: u32,
+    /// Size of the target partition in bytes.
+    capacity: u32,
+    /// OTA app number of the target partition.
+    next_app: u8,
+    /// Whether the partition is encrypted (no plain `NorFlash` view).
+    encrypted: bool,
+}
+
+/// Resolves the slot `OtaUpdater::next_partition` names, under one short flash borrow.
+#[cfg(feature = "ota-ddi")]
+fn resolve_target(flash: &mut FlashStorage<'_>) -> Result<Target, OtaError> {
+    let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+    let (capacity, slot, encrypted) = {
+        let mut updater = OtaUpdater::new(&mut *flash, &mut pt_buf).map_err(|e| {
+            log::error!("OtaUpdater::new failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        let (mut region, slot) = updater.next_partition().map_err(|e| {
+            log::error!("next_partition failed: {:?}", e);
+            OtaError::PartitionNotFound
+        })?;
+        let encrypted = region.as_nor_flash().is_err();
+        (region.capacity() as u32, slot, encrypted)
+    };
+    let table = read_partition_table(flash, &mut pt_buf).map_err(|e| {
+        log::error!("OTA: could not read the partition table: {:?}", e);
+        OtaError::PartitionNotFound
+    })?;
+    let entry = table
+        .find_partition(PartitionType::App(slot))
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            log::error!("OTA: the target partition is missing from the table");
+            OtaError::PartitionNotFound
+        })?;
+    Ok(Target {
+        offset: entry.offset(),
+        capacity,
+        // As in the owned path: `Ota0 + n`, anything else wraps out of range for the plan.
+        next_app: (slot as u8).wrapping_sub(AppPartitionSubType::Ota0 as u8),
+        encrypted,
+    })
+}
+
+/// Steps 2 to 4 of a download on the [`SharedFlash`]: resolve the target, erase it sector by
+/// sector with a yield after each, stream the body, activate.
+///
+/// Every flash operation borrows the shared flash on its own; no borrow lives across an `.await`.
+#[cfg(feature = "ota-ddi")]
+async fn stream_shared<E: Fn() -> CoreDuration>(
+    shared: &'static SharedFlash,
+    socket: &mut TcpSocket<'_>,
+    mut run: Run<'_, E>,
+) -> Result<(), OtaError> {
+    let target = shared.with(resolve_target).unwrap_or_else(|| {
+        log::error!("OTA: the shared flash is busy");
+        Err(OtaError::PartitionNotFound)
+    });
+    let target = match target {
+        Ok(target) if target.encrypted => {
+            log::error!(
+                "OTA: the target partition is encrypted; the shared-flash path writes plain sectors only"
+            );
+            Err(OtaError::FlashWriteFailed)
+        }
+        other => other,
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(e) => {
+            return finish(
+                run.cancel,
+                run.machine,
+                DownloadInput::PrepareFailed(e),
+                (run.elapsed)(),
+            )
+        }
+    };
+
+    // 2a. Erase the image span (whole sectors, inside the partition, as in the owned path) one
+    //     sector per borrow, yielding to the executor after each.
+    let sector = FlashStorage::SECTOR_SIZE;
+    let erased_span = round_up(run.len, sector).min(target.capacity);
+    log::info!("OTA: erasing {} bytes of the target partition", erased_span);
+    let mut at = 0;
+    while at < erased_span {
+        let from = target.offset + at;
+        let mut nor: &SharedFlash = shared;
+        if let Err(e) = nor.erase(from, from + sector) {
+            log::error!("OTA: erase of the target partition failed: {:?}", e);
+            return finish(
+                run.cancel,
+                run.machine,
+                DownloadInput::PrepareFailed(OtaError::FlashWriteFailed),
+                (run.elapsed)(),
+            );
+        }
+        at += sector;
+        embassy_futures::yield_now().await;
+    }
+
+    // 3. Stream the body.
+    let mut sink = Sink::Shared {
+        flash: shared,
+        base: target.offset,
+    };
+    let mut aligner = ChunkAligner::new(<&SharedFlash as NorFlash>::WRITE_SIZE);
+    let permit = stream_body(&mut run, &mut sink, &mut aligner, socket).await?;
+
+    // 4. Activate the new slot, with nothing between the permit and this call.
+    log::info!("OTA: SHA-256 verified — activating next partition");
+    let result = shared
+        .with(|flash| {
+            let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+            activate(flash, &mut pt_buf, target.next_app, permit)
+        })
+        .unwrap_or_else(|| {
+            log::error!("OTA: the shared flash is busy; the boot slot is unchanged");
+            Err(OtaError::FlashWriteFailed)
+        });
+    if result.is_ok() {
+        log::info!("OTA: partition swap complete — reboot to apply");
+    }
+    finish(
+        run.cancel,
+        run.machine,
+        DownloadInput::Activated(result),
+        (run.elapsed)(),
+    )
+}
+
+/// Size in bytes of the inactive OTA partition, from a short-lived
+/// `OtaUpdater` (it only reads the partition table).
+pub(crate) fn update_capacity(flash: &mut FlashStorage<'_>) -> Result<u64, OtaError> {
+    let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+    let mut updater = OtaUpdater::new(flash, &mut pt_buf).map_err(|e| {
+        log::error!("OtaUpdater::new failed: {:?}", e);
+        OtaError::PartitionNotFound
+    })?;
+    let (region, _slot) = updater.next_partition().map_err(|e| {
+        log::error!("next_partition failed: {:?}", e);
+        OtaError::PartitionNotFound
+    })?;
+    // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
+    // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
+    Ok(region.capacity() as u64)
+}
+
+/// Reads both otadata entries and the OTA app slot count; `what` names the caller in logs.
+pub(super) fn read_otadata(
+    flash: &mut FlashStorage<'_>,
+    what: &str,
+) -> Result<([activation::Entry; 2], usize), OtaError> {
+    let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+    let table = read_partition_table(&mut *flash, &mut pt_buf).map_err(|e| {
+        log::error!("{}: could not read the partition table: {:?}", what, e);
+        OtaError::PartitionNotFound
+    })?;
+    let ota_count = ota_app_count(&table);
+    let otadata = table
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            log::error!("{}: found no otadata partition", what);
+            OtaError::PartitionNotFound
+        })?;
+    let mut region = otadata.as_flash_region(flash);
+    if region.capacity() < OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN {
+        log::error!("{}: otadata partition is too small", what);
+        return Err(OtaError::PartitionNotFound);
+    }
+    let mut otadata = Otadata(&mut region);
+    let entries = [otadata.read_entry(0), otadata.read_entry(1)];
+    let [Ok(first), Ok(second)] = entries else {
+        log::error!("{}: reading the otadata failed", what);
+        return Err(OtaError::PartitionNotFound);
+    };
+    Ok(([first, second], ota_count))
 }
 
 /// Experimental: API may change before 1.0.
@@ -318,7 +689,7 @@ pub struct OtaManagerConfig {
 /// ```
 pub struct EspHalOtaManager<'d> {
     config: OtaManagerConfig,
-    flash: FlashStorage<'d>,
+    flash: FlashHandle<'d>,
     deadline: Deadline,
     expected_chip: Option<ImageChip>,
 }
@@ -336,10 +707,58 @@ impl<'d> EspHalOtaManager<'d> {
     ) -> Result<Self, OtaError> {
         Ok(Self {
             config,
-            flash: FlashStorage::new(flash),
+            flash: FlashHandle::Owned(FlashStorage::new(flash)),
             deadline: Deadline::none(),
             expected_chip: None,
         })
+    }
+
+    /// Experimental: API may change before 1.0.
+    ///
+    /// Create a manager on the firmware's [`SharedFlash`], which the OTA record store and the boot-fact reads use as well.
+    ///
+    /// The manager borrows the flash for one operation at a time and never across an `.await`, so the store can commit between two chunks of a download.
+    /// The download erases the target sectors one by one and yields to the executor after each, so a long erase does not starve Wi-Fi and MQTT.
+    /// An encrypted target partition is refused with [`OtaError::FlashWriteFailed`] before anything is erased: this path writes plain sectors only.
+    /// Everything else behaves as with [`new`](Self::new).
+    ///
+    /// ```ignore
+    /// let flash = SharedFlash::new(peripherals.FLASH)?;
+    /// let mut manager = EspHalOtaManager::new_shared(OtaManagerConfig { timeout_secs: 30 }, flash)?;
+    /// ```
+    #[cfg(feature = "ota-ddi")]
+    pub fn new_shared(
+        config: OtaManagerConfig,
+        flash: &'static SharedFlash,
+    ) -> Result<Self, OtaError> {
+        Ok(Self {
+            config,
+            flash: FlashHandle::Shared(flash),
+            deadline: Deadline::none(),
+            expected_chip: None,
+        })
+    }
+
+    /// Runs `f` on the flash: the owned storage, or the shared one for this call only.
+    ///
+    /// `busy` is the error when the shared flash is already borrowed (a nested call).
+    #[cfg_attr(
+        not(feature = "ota-ddi"),
+        allow(unused_variables, reason = "only the shared flash can be busy")
+    )]
+    fn with_flash<R>(
+        &mut self,
+        busy: OtaError,
+        f: impl FnOnce(&mut FlashStorage<'_>) -> Result<R, OtaError>,
+    ) -> Result<R, OtaError> {
+        match &mut self.flash {
+            FlashHandle::Owned(flash) => f(flash),
+            #[cfg(feature = "ota-ddi")]
+            FlashHandle::Shared(shared) => shared.with(|flash| f(flash)).unwrap_or_else(|| {
+                log::error!("OTA: the shared flash is busy");
+                Err(busy)
+            }),
+        }
     }
 
     /// Experimental: API may change before 1.0.
@@ -480,7 +899,34 @@ impl<'d> EspHalOtaManager<'d> {
         expected_sha256: &[u8; 32],
         cancel: &OtaCancel,
     ) -> Result<(), OtaError> {
-        let result = self.stream(socket, url, expected_sha256, cancel).await;
+        self.run(socket, &mut Source::Plain(url), expected_sha256, cancel)
+            .await
+    }
+
+    /// The DDI artifact fetch behind the DDI transport's `download`: the same streaming download, verification and slot swap as [`fetch_and_apply_cancellable`](Self::fetch_and_apply_cancellable), with the token sent, the server name resolved, and redirects refused ([`OtaError::Redirect`]).
+    ///
+    /// The declared `Content-Length` must equal the gate's size ([`OtaError::SizeMismatch`]) and the image header must name its chip ([`OtaError::TargetMismatch`]), both before any flash is touched; a non-200 answer hands its `Retry-After` back.
+    #[cfg(feature = "ota-ddi")]
+    pub(crate) async fn fetch_ddi(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        fetch: DdiFetch<'_>,
+        expected_sha256: &[u8; 32],
+        cancel: &OtaCancel,
+    ) -> Result<(), OtaError> {
+        self.run(socket, &mut Source::Ddi(fetch), expected_sha256, cancel)
+            .await
+    }
+
+    /// [`stream`](Self::stream), with the socket aborted on error.
+    async fn run(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        source: &mut Source<'_>,
+        expected_sha256: &[u8; 32],
+        cancel: &OtaCancel,
+    ) -> Result<(), OtaError> {
+        let result = self.stream(socket, source, expected_sha256, cancel).await;
         if result.is_err() {
             socket.abort();
             let _ = with_timeout(ABORT_FLUSH_WAIT, socket.flush()).await;
@@ -492,17 +938,25 @@ impl<'d> EspHalOtaManager<'d> {
     async fn stream(
         &mut self,
         socket: &mut TcpSocket<'_>,
-        url: &str,
+        source: &mut Source<'_>,
         expected_sha256: &[u8; 32],
         cancel: &OtaCancel,
     ) -> Result<(), OtaError> {
         let start = Instant::now();
         let elapsed = || to_core(start.elapsed());
         let per_op = CoreDuration::from_secs(self.config.timeout_secs);
-        let mut machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
-        if let Some(chip) = self.expected_chip {
-            machine = machine.with_expected_chip(chip);
-        }
+        let mut machine = match source {
+            Source::Plain(_) => {
+                let machine = DownloadMachine::new(self.deadline, per_op, *expected_sha256);
+                match self.expected_chip {
+                    Some(chip) => machine.with_expected_chip(chip),
+                    None => machine,
+                }
+            }
+            // The DDI gates replace the manager's own chip setting: the chip check is never off.
+            #[cfg(feature = "ota-ddi")]
+            Source::Ddi(fetch) => fetch.gate.machine(self.deadline, per_op, *expected_sha256),
+        };
 
         // 1. Connect, read the headers and size the partition; nothing is
         //    prepared yet, so an error returns without an abort.
@@ -513,7 +967,11 @@ impl<'d> EspHalOtaManager<'d> {
                 .poll(&mut machine, input, elapsed())
                 .inspect_err(|e| log::error!("OTA: download stopped: {}", e))?;
             input = match action {
-                DownloadAction::Connect { budget } => self.connect(socket, url, budget).await,
+                DownloadAction::Connect { budget } => match source {
+                    Source::Plain(url) => self.connect(socket, url, budget).await,
+                    #[cfg(feature = "ota-ddi")]
+                    Source::Ddi(fetch) => self.connect_ddi(socket, fetch, budget).await,
+                },
                 // The image header, read before the partition is erased; the machine keeps it.
                 DownloadAction::ReadHeader { max, budget } => {
                     let to_read = (max as usize).min(IMAGE_HEADER_LEN);
@@ -541,18 +999,38 @@ impl<'d> EspHalOtaManager<'d> {
         };
         log::info!("OTA: downloading {} bytes", len);
 
+        let mut run = Run {
+            machine: &mut machine,
+            cancel,
+            len,
+            timeout_secs: self.config.timeout_secs,
+            elapsed: &elapsed,
+        };
+        #[cfg_attr(
+            not(feature = "ota-ddi"),
+            allow(
+                clippy::infallible_destructuring_match,
+                reason = "the shared-flash arm exists only with `ota-ddi`"
+            )
+        )]
+        let flash = match &mut self.flash {
+            FlashHandle::Owned(flash) => flash,
+            #[cfg(feature = "ota-ddi")]
+            FlashHandle::Shared(shared) => return stream_shared(shared, socket, run).await,
+        };
+
         // 2. Only now is the partition table read for writing.
         //    `OtaUpdater::new` reads it to locate ota_0/ota_1.
         let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = match OtaUpdater::new(&mut self.flash, &mut pt_buf) {
+        let mut updater = match OtaUpdater::new(flash, &mut pt_buf) {
             Ok(updater) => updater,
             Err(e) => {
                 log::error!("OtaUpdater::new failed: {:?}", e);
                 return finish(
-                    cancel,
-                    &mut machine,
+                    run.cancel,
+                    run.machine,
                     DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
-                    elapsed(),
+                    (run.elapsed)(),
                 );
             }
         };
@@ -573,10 +1051,10 @@ impl<'d> EspHalOtaManager<'d> {
                 Err(e) => {
                     log::error!("next_partition failed: {:?}", e);
                     return finish(
-                        cancel,
-                        &mut machine,
+                        run.cancel,
+                        run.machine,
                         DownloadInput::PrepareFailed(OtaError::PartitionNotFound),
-                        elapsed(),
+                        (run.elapsed)(),
                     );
                 }
             };
@@ -620,104 +1098,16 @@ impl<'d> EspHalOtaManager<'d> {
                 Ok(sink) => sink,
                 Err(e) => {
                     return finish(
-                        cancel,
-                        &mut machine,
+                        run.cancel,
+                        run.machine,
                         DownloadInput::PrepareFailed(e),
-                        elapsed(),
+                        (run.elapsed)(),
                     );
                 }
             };
 
-            // 3. Stream the body: each chunk feeds both the flash region and
-            //    the verifier. Each socket read waits at most `min(per-read
-            //    timeout, remaining deadline)`; a timed-out wait is
-            //    `DownloadTimeout`, a socket read error is `ServerUnreachable`.
-            let mut verifier = StreamingVerifier::new();
-            // Word-aligned so `write_nor` writes from this buffer directly; a
-            // misaligned slice would make it copy through its own 4 KiB sector
-            // buffer, on the stack, once per chunk.
-            let mut chunk_buf = ChunkBuf([0u8; CHUNK_LEN]);
-            let mut written: u32 = 0;
-            let mut input = DownloadInput::Prepared;
-            loop {
-                let action = match cancel.poll(&mut machine, input, elapsed()) {
-                    Ok(action) => action,
-                    // Nothing on this tier needs undoing: the slot is simply
-                    // never activated.
-                    Err(e) => {
-                        log::error!("OTA: download stopped: {} — boot slot unchanged", e);
-                        break Err(e);
-                    }
-                };
-                input = match action {
-                    DownloadAction::Read { max, budget } => {
-                        let to_read = (max as usize).min(CHUNK_LEN);
-                        match with_timeout(
-                            to_embassy(budget),
-                            socket.read(&mut chunk_buf.0[..to_read]),
-                        )
-                        .await
-                        {
-                            Err(_) => {
-                                log::error!(
-                                    "OTA: body chunk read timed out (per-read {}s or deadline)",
-                                    self.config.timeout_secs
-                                );
-                                DownloadInput::ReadFailed(classify_read_error(true))
-                            }
-                            Ok(Err(e)) => {
-                                log::error!("OTA: body chunk read failed: {:?}", e);
-                                DownloadInput::ReadFailed(classify_read_error(false))
-                            }
-                            Ok(Ok(n)) => DownloadInput::Read(n),
-                        }
-                    }
-                    // The header the machine read before the erase goes first.
-                    DownloadAction::WriteHeader(bytes) => {
-                        verifier.update(&bytes);
-                        match write_chunk(&mut sink, &mut aligner, written, &bytes) {
-                            Ok(()) => {
-                                written += IMAGE_HEADER_LEN as u32;
-                                DownloadInput::Written
-                            }
-                            Err(e) => DownloadInput::WriteFailed(e),
-                        }
-                    }
-                    DownloadAction::Write { n } => {
-                        let chunk = &chunk_buf.0[..n];
-                        verifier.update(chunk);
-                        match write_chunk(&mut sink, &mut aligner, written, chunk) {
-                            Ok(()) => {
-                                written += n as u32;
-                                DownloadInput::Written
-                            }
-                            Err(e) => DownloadInput::WriteFailed(e),
-                        }
-                    }
-                    // Write the tail the aligner held back, padded with 0xFF
-                    // inside the erased span, then hand over the digest.
-                    DownloadAction::Finalize => match flush_tail(&mut sink, &mut aligner, len) {
-                        Err(e) => DownloadInput::WriteFailed(e),
-                        Ok(()) => {
-                            log::info!("OTA: download complete, verifying SHA-256");
-                            DownloadInput::Digest(
-                                core::mem::replace(&mut verifier, StreamingVerifier::new())
-                                    .finalize(),
-                            )
-                        }
-                    },
-                    // Nothing on this tier needs undoing: the slot is simply
-                    // never activated, so the boot slot stays unchanged.
-                    DownloadAction::Abort(e) => {
-                        log::error!("OTA: download failed: {} — boot slot unchanged", e);
-                        DownloadInput::Aborted
-                    }
-                    DownloadAction::Activate(permit) => break Ok(permit),
-                    // The end of an aborted download.
-                    DownloadAction::Done(Err(e)) => break Err(e),
-                    other => break Err(unexpected(&other)),
-                };
-            }
+            // 3. Stream the body (see `stream_body`).
+            stream_body(&mut run, &mut sink, &mut aligner, socket).await
         };
 
         // 4. Activate the new slot, with nothing between the permit and this call.
@@ -731,15 +1121,15 @@ impl<'d> EspHalOtaManager<'d> {
                 // The updater only located the slots and has no `Drop`; its
                 // borrow of the flash and the table buffer ended with its
                 // last use above.
-                let result = activate(&mut self.flash, &mut pt_buf, next_app, permit);
+                let result = activate(flash, &mut pt_buf, next_app, permit);
                 if result.is_ok() {
                     log::info!("OTA: partition swap complete — reboot to apply");
                 }
                 finish(
-                    cancel,
-                    &mut machine,
+                    run.cancel,
+                    run.machine,
                     DownloadInput::Activated(result),
-                    elapsed(),
+                    (run.elapsed)(),
                 )
             }
             Err(e) => Err(e),
@@ -813,21 +1203,91 @@ impl<'d> EspHalOtaManager<'d> {
         }
     }
 
+    /// Performs [`DownloadAction::Connect`] for a DDI artifact: the name lookup, the connect, the GET with the `Authorization` header, the head, and the size of the inactive partition.
+    ///
+    /// All of it shares `budget`; the URL and the token are never logged.
+    #[cfg(feature = "ota-ddi")]
+    async fn connect_ddi(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        fetch: &mut DdiFetch<'_>,
+        budget: CoreDuration,
+    ) -> DownloadInput {
+        let parsed = match parse_url(fetch.url.as_str()) {
+            Ok(parsed) => parsed,
+            Err(e) => return DownloadInput::ConnectFailed(OtaError::from(e)),
+        };
+        let started = Instant::now();
+        let left = |budget: CoreDuration| budget.saturating_sub(to_core(started.elapsed()));
+        let address = match resolve(fetch.stack, parsed.host, budget).await {
+            Ok(address) => address,
+            Err(ResolveError::Timeout) => {
+                return DownloadInput::ConnectFailed(classify_read_error(true))
+            }
+            Err(ResolveError::Unreachable) => {
+                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable)
+            }
+        };
+        let endpoint = IpEndpoint::new(address, parsed.port);
+        match with_timeout(to_embassy(left(budget)), socket.connect(endpoint)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("OTA: DDI download connect to {} failed: {:?}", endpoint, e);
+                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
+            }
+            Err(_) => {
+                log::error!(
+                    "OTA: DDI download connect to {} timed out (per-op {}s or deadline)",
+                    endpoint,
+                    self.config.timeout_secs
+                );
+                return DownloadInput::ConnectFailed(classify_read_error(true));
+            }
+        }
+        let head = request_head(
+            Method::Get,
+            &parsed,
+            fetch.authorization,
+            ACCEPT_FIRMWARE,
+            0,
+        );
+        let response = with_timeout(
+            to_embassy(left(budget)),
+            send_and_read_head(socket, &[&head]),
+        )
+        .await;
+        drop(head);
+        let headers = match response {
+            Err(_) => {
+                log::error!(
+                    "OTA: DDI download header phase timed out (per-read {}s or deadline)",
+                    self.config.timeout_secs
+                );
+                return DownloadInput::ConnectFailed(classify_read_error(true));
+            }
+            Ok(Err(e)) => {
+                log::error!("OTA: DDI download response failed: {:?}", e);
+                return DownloadInput::ConnectFailed(OtaError::ServerUnreachable);
+            }
+            Ok(Ok(head)) => match download_headers(head, fetch.retry_after) {
+                Ok(headers) => headers,
+                Err(e) => return DownloadInput::ConnectFailed(e),
+            },
+        };
+        match self.partition_capacity() {
+            Ok(capacity) => DownloadInput::Headers {
+                content_length: headers.content_length,
+                chunked: headers.chunked,
+                capacity,
+            },
+            Err(e) => DownloadInput::ConnectFailed(e),
+        }
+    }
+
     /// Size in bytes of the inactive OTA partition, from a short-lived
     /// `OtaUpdater` (it only reads the partition table).
     fn partition_capacity(&mut self) -> Result<u64, OtaError> {
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let mut updater = OtaUpdater::new(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("OtaUpdater::new failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        let (region, _slot) = updater.next_partition().map_err(|e| {
-            log::error!("next_partition failed: {:?}", e);
-            OtaError::PartitionNotFound
-        })?;
-        // `capacity()` is an inherent `FlashRegion` method (the `embedded-storage`
-        // trait impls are opt-in since esp-bootloader-esp-idf 0.6).
-        Ok(region.capacity() as u64)
+        self.with_flash(OtaError::PartitionNotFound, update_capacity)
     }
 
     /// Experimental: API may change before 1.0.
@@ -840,7 +1300,9 @@ impl<'d> EspHalOtaManager<'d> {
     /// Sets the state of the otadata entry the bootloader selects (not the
     /// highest sequence, which can be an aborted entry after a rollback).
     pub fn mark_valid(&mut self) -> Result<(), OtaError> {
-        set_selected_state(&mut self.flash, activation::STATE_VALID, "mark_valid")
+        self.with_flash(OtaError::FlashWriteFailed, |flash| {
+            set_selected_state(flash, activation::STATE_VALID, "mark_valid")
+        })
     }
 
     /// Experimental: API may change before 1.0.
@@ -876,32 +1338,9 @@ impl<'d> EspHalOtaManager<'d> {
 
     /// Reads both otadata entries and the OTA app slot count; `what` names the caller in logs.
     fn read_otadata(&mut self, what: &str) -> Result<([activation::Entry; 2], usize), OtaError> {
-        let mut pt_buf = [0u8; PARTITION_TABLE_MAX_LEN];
-        let table = read_partition_table(&mut self.flash, &mut pt_buf).map_err(|e| {
-            log::error!("{}: could not read the partition table: {:?}", what, e);
-            OtaError::PartitionNotFound
-        })?;
-        let ota_count = ota_app_count(&table);
-        let otadata = table
-            .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
-            .ok()
-            .flatten()
-            .ok_or_else(|| {
-                log::error!("{}: found no otadata partition", what);
-                OtaError::PartitionNotFound
-            })?;
-        let mut region = otadata.as_flash_region(&mut self.flash);
-        if region.capacity() < OTADATA_SECTOR_OFFSETS[1] as usize + activation::ENTRY_LEN {
-            log::error!("{}: otadata partition is too small", what);
-            return Err(OtaError::PartitionNotFound);
-        }
-        let mut otadata = Otadata(&mut region);
-        let entries = [otadata.read_entry(0), otadata.read_entry(1)];
-        let [Ok(first), Ok(second)] = entries else {
-            log::error!("{}: reading the otadata failed", what);
-            return Err(OtaError::PartitionNotFound);
-        };
-        Ok(([first, second], ota_count))
+        self.with_flash(OtaError::PartitionNotFound, |flash| {
+            read_otadata(flash, what)
+        })
     }
 
     /// Experimental: API may change before 1.0.
@@ -914,6 +1353,8 @@ impl<'d> EspHalOtaManager<'d> {
     ///
     /// Sets the state of the otadata entry the bootloader selects.
     pub fn rollback(&mut self) -> Result<(), OtaError> {
-        set_selected_state(&mut self.flash, activation::STATE_INVALID, "rollback")
+        self.with_flash(OtaError::FlashWriteFailed, |flash| {
+            set_selected_state(flash, activation::STATE_INVALID, "rollback")
+        })
     }
 }
