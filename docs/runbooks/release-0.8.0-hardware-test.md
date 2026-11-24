@@ -1,10 +1,10 @@
 # Runbook: Release 0.8.0 Hardware Test
 
-This is the one hardware run before the release 0.8.0 tag.
+This is the hardware run for release 0.8.0; the C3 and C6 rows run after the tag on the remote bench (see Decisions).
 0.8.0 is the first release on ESP-IDF v6.1 and the first with the DDI OTA client ([ddi-client-v1](../features/ddi-client-v1.md)).
 The bench is the source of truth: the header of `bench/<board>/<check>.toml` holds the procedure, `bench/<board>/results.jsonl` the verdict of every run, and `bench/<board>/logs/` the serial log.
 This file lists the checks, the manual checks the bench has no file for, the items that cannot run yet, and the results.
-Only `c3/ddi` and `c6/ddi` have run locally; every other result remains `not run`.
+Only `c3/ddi` and `c6/ddi` have run locally; the ESP32-S3 and ESP32 classic rows are waived for 0.8.0, and every other result remains `not run`.
 Use only the `just` recipes named here or in the check headers.
 
 ## Scope
@@ -14,7 +14,7 @@ Use only the `just` recipes named here or in the check headers.
 - The esp-hal checks that run a changed code path are `c3/ota`, `c3/ota-rollback`, `s3/ota`, `s3/ota-rollback`, `s3/suspend`, `c6/provision` and `s3/provision`, plus the manual `C3 hal provisioning extras`.
 - `EspHalOtaManager` now aborts the socket on any error, but no bench check runs an error case, so the happy path re-run is the only evidence this run adds.
 - `suspend()` and `resume()` on esp-hal now return `Result`, and the provisioning response buffer grows from 6 KiB to 8 KiB with the new `ProvisioningError::InvalidDeviceName`.
-- The esp-hal disconnect line now names the reason (`[wifi] disconnected — reason 8 (ASSOC_LEAVE)`), but no check pins the reason text, so the esp-hal smoke and soak checks stand (see the last item of the new-in-0.8.0 list).
+- The esp-hal disconnect line now names the reason (`[wifi] disconnected — reason 8 (ASSOC_LEAVE)`), but no check pins the reason text, so the esp-hal smoke and soak checks on ESP32-S3 and ESP32 stand from 0.7.0 while the ones on ESP32-C3 and ESP32-C6 are re-run in this run (see Decisions and the last item of the new-in-0.8.0 list).
 - Every ESP-IDF-tier check needs one pass on v6.1, except the rows that the 2026-11-15 evidence covers.
 - The v6.1 evidence covers `s3/mqtt-lwt` (ESP-IDF, 5/5), `s3/mqtt-scenarios` (ESP-IDF, 5/5) and `s3/soak` (ESP-IDF, 3/3) for their unattended steps, so those are not repeated.
 - The attended router steps of `s3/mqtt-lwt` and `s3/mqtt-scenarios` stay owed on v6.1, as the evidence doc's open items say.
@@ -24,7 +24,7 @@ Use only the `just` recipes named here or in the check headers.
 - The lab DDI server is hawkBit 1.2.0 on the bench machine (maintainer decision 2026-11-23), started with `just hawkbit up`.
 - The device reaches the lab DDI server only through the lab proxy, started with `just ddi-proxy`.
 - TLS is not part of this run, and the DDI checks use the plain-HTTP lab opt-in (`ota-ddi-insecure-http`).
-- LoRa on the Heltec V3 is an open decision for 0.8.0, see Open decisions.
+- LoRa on the Heltec V3 is waived for 0.8.0, see Decisions.
 - After the run, record each result in the origin feature doc's session log: `docs/features/ddi-client-v1.md` for the DDI checks, `docs/features/wifi-portal-fallback-v1.md` for the portal item, and `docs/features/archive/esp-idf-v6-1-upgrade-v1.md` for the v6.1 rows.
 
 ## Prerequisites
@@ -48,9 +48,9 @@ A cell the code does not support is N/A, not a failure.
 
 | Chip                                        | ESP-IDF tier                                                                                                                                 | esp-hal tier                                                                                              |
 |:--------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------------------|
-| ESP32-C3 (Super Mini)                       | New: `c3/ddi`. Re-run on v6.1: `c3/mqtt`, `c3/reentry`, `c3/ota-runtime`, the ESP-NOW scout checks, the C3 portal prefill (manual).          | Stands from 0.7.0. Re-run: `c3/ota`, `c3/ota-rollback`, the C3 hal provisioning extras (manual).         |
-| ESP32-C6                                    | New: `c6/ddi`, the first run of the rollback-enabled OTA bootloader on C6. Re-run on v6.1: `c6/connect`, `c6/mqtt`.                          | Stands from 0.7.0. Re-run: `c6/provision`. ESP-NOW stands from 0.7.0.                                      |
-| ESP32-S3 (CrowPanel, Heltec V3)             | Re-run on v6.1: the attended steps of `s3/mqtt-lwt` and `s3/mqtt-scenarios`, and `s3/suspend`. OTA and provisioning N/A. LoRa: see Open decisions. | Stands from 0.7.0. Re-run: `s3/suspend`, `s3/ota`, `s3/ota-rollback`, `s3/provision`. ESP-NOW N/A.        |
+| ESP32-C3 (Super Mini)                       | New: `c3/ddi`. Re-run on v6.1: `c3/mqtt`, `c3/reentry`, `c3/ota-runtime`, the ESP-NOW scout checks, the C3 portal prefill (manual).          | Stands from 0.7.0 except the smoke and soak checks. Re-run: `c3/connect`, `c3/mqtt-lwt`, `c3/soak`, `c3/ota`, `c3/ota-rollback`, the C3 hal provisioning extras (manual).         |
+| ESP32-C6                                    | New: `c6/ddi`, the first run of the rollback-enabled OTA bootloader on C6. Re-run on v6.1: `c6/connect`, `c6/mqtt`.                          | Stands from 0.7.0 except the smoke and soak checks. Re-run: `c6/connect` (esp-hal twin), `c6/mqtt-lwt`, `c6/mqtt-scenarios`, `c6/soak`, `c6/provision`. ESP-NOW stands from 0.7.0.                                      |
+| ESP32-S3 (CrowPanel, Heltec V3)             | Re-run on v6.1: the attended steps of `s3/mqtt-lwt` and `s3/mqtt-scenarios`, and `s3/suspend`. OTA and provisioning N/A. LoRa: waived, see Decisions. | Stands from 0.7.0. Re-run: `s3/suspend`, `s3/ota`, `s3/ota-rollback`, `s3/provision`. ESP-NOW N/A.        |
 | ESP32 classic (WROOM DevKit or Feather V2)  | Re-run on v6.1: `esp32/mqtt`.                                                                                                                | Stands from 0.7.0 (`esp32/connect`, `esp32/mqtt-lwt`, `esp32/soak`). Provisioning and ESP-NOW N/A.         |
 
 ## Checks
@@ -78,6 +78,9 @@ Checks that stand from 0.7.0 are not listed here, see Scope.
 - `c3/espnow-peer-session` (ESP-IDF peer, re-run on v6.1): `PeerSession` relinks after a coordinator power cycle, and this half runs against `hal_c6_espnow_sta_coordinator`, as the 0.7.0 run did — `just run hal_c6_espnow_sta_coordinator` on the C6, then `ESPNOW_PEER_MAC="<mac>" just bench c3 espnow-peer-session --port <c3 port>`.
 - `c3/ota` (esp-hal, re-run for the esp-hal changes): the erase-once write path and the activation on real otadata, the happy path only — `just bench-ota c3 ota hal_c3_ota 1.0.0 2.0.0 <image server host>`, then `just bench-ota c3 ota hal_c3_ota 1.0.0 3.0.0 <image server host>` for the healthy update.
 - `c3/ota-rollback` (esp-hal, re-run for the esp-hal changes): the rollback and reset steps on real otadata — `just bench-ota c3 ota-rollback hal_c3_ota 1.0.0 2.0.0 <image server host>`, then the 3.0.0 step of `c3/ota`.
+- `c3/connect` (esp-hal, attended, re-run): Wi-Fi connect and reconnect after a router block on the esp-hal tier, the C3 matrix smoke — `just bench c3 connect --unattended --port <c3 port>`, then `just bench c3 connect --attended --port <c3 port>`.
+- `c3/mqtt-lwt` (esp-hal, attended, re-run): MQTT smoke with a router block on the esp-hal tier — `just bench c3 mqtt-lwt --unattended --port <c3 port>`, then `just bench c3 mqtt-lwt --attended --port <c3 port>`.
+- `c3/soak` (esp-hal, re-run): the 10-minute MQTT soak (T6) on the esp-hal tier, with the `heap free` trend within 1 KiB — `just bench c3 soak --unattended --port <c3 port>`.
 
 #### C3 portal prefill (manual, ESP-IDF, re-run on v6.1)
 
@@ -105,6 +108,9 @@ Not checked: the hal form prefill (gap 57), and a stalled client, because no `ju
 - `c6/ddi` (ESP-IDF, new): the twin of `c3/ddi` on the C6-DevKitC-1, with the same scenario chain — `just bench c6 ddi --port <c6 port>`.
   Flash `idf_c6_ddi` once with `just flash idf_c6_ddi` and watch one boot with `just monitor` before the full check, because the rollback-enabled OTA bootloader has not run on C6 hardware yet (header of `bench/c6/ddi.toml`).
 - `c6/provision` (esp-hal, re-run for the esp-hal changes): a record with two extras survives a USB power cut, with the 8 KiB response buffer and the identity rule in place — `just bench c6 provision --port <c6 port>`; the form is not checked (gap 57).
+- `c6/mqtt-lwt` (esp-hal, attended, re-run): MQTT smoke with a router block on the esp-hal tier — `just bench c6 mqtt-lwt --unattended --port <c6 port>`, then `just bench c6 mqtt-lwt --attended --port <c6 port>`.
+- `c6/mqtt-scenarios` (esp-hal, attended, re-run): esp-hal MQTT scenarios T1 to T5b, with the broker restart and the 3-minute router pause — `MQTT_HOST=<this machine> MQTT_PORT=1883 just bench c6 mqtt-scenarios --unattended --port <c6 port>`, then `MQTT_HOST=<this machine> MQTT_PORT=1883 just bench c6 mqtt-scenarios --attended --port <c6 port>`.
+- `c6/soak` (esp-hal, re-run): the 10-minute MQTT soak (T6) on the esp-hal tier, with the `heap free` trend within 1 KiB — `just bench c6 soak --unattended --port <c6 port>`.
 
 ### CrowPanel ESP32-S3
 
@@ -122,7 +128,7 @@ The four items below each name the example that exercises the code, and what is 
 
 - `c3/reentry` drives `idf_c3_provision_mqtt`, which now calls `WifiMqttBoot::load_with_fallback` first, so that check covers the re-entry path but no failed join.
 - Not runnable yet: needs a fault that makes joins fail with the credential or network-absent classification, because `just router block <mac>` blocks a client by MAC and the wrong-password case has no check.
-- Not runnable yet: the feature doc's open acceptance items are a host test of the timeout path and the rgb-clock acceptance on consumer hardware, and the maintainer's confirmations of the reason classes and of the threshold 0 are still open.
+- Not runnable yet: the feature doc's open acceptance items are a host test of the timeout path and the rgb-clock acceptance on consumer hardware (waived for the tag, see Decisions), and the maintainer's confirmations of the reason classes and of the threshold 0 are still open.
 
 #### (b) DDI identity rule and the `ddi_token` extra (both tiers)
 
@@ -140,7 +146,7 @@ The four items below each name the example that exercises the code, and what is 
 #### (d) Disconnect-reason vocabulary (`[wifi] disconnected — reason 8 (ASSOC_LEAVE)` on esp-hal)
 
 - No check reads the reason text, because the `[wifi] disconnected`, `[wifi] connect failed` and `[wifi] (disconnected|connect failed|reconnecting in)` patterns are prefix matches.
-- The esp-hal checks whose patterns read these lines are `c3/connect`, `c3/mqtt-lwt`, `c3/soak`, `c6/mqtt-lwt`, `c6/mqtt-scenarios`, `c6/soak`, `esp32/connect`, `esp32/mqtt-lwt`, `esp32/soak`, `s3/connect`, `s3/mqtt-lwt`, `s3/mqtt-scenarios` and `s3/soak`, and they stand on the prefix match.
+- The esp-hal checks whose patterns read these lines are `c3/connect`, `c3/mqtt-lwt`, `c3/soak`, `c6/mqtt-lwt`, `c6/mqtt-scenarios`, `c6/soak`, `esp32/connect`, `esp32/mqtt-lwt`, `esp32/soak`, `s3/connect`, `s3/mqtt-lwt`, `s3/mqtt-scenarios` and `s3/soak`, the `esp32` and `s3` ones stand on the prefix match, and the `c3` and `c6` ones are re-run in this run (2026-11-24).
 - The ESP-IDF checks `c3/mqtt`, `c6/mqtt` and `esp32/mqtt` read `[wifi] disconnected` as well, and they are owed on v6.1 anyway.
 - A check that pins the reason text would be new work, outside this run.
 
@@ -149,13 +155,18 @@ The four items below each name the example that exercises the code, and what is 
 - Not runnable yet: the soak needs a definition, meaning which example or boards, which Wi-Fi STA peer and ESP-NOW peer, how long, and the pass criterion, and 0.7.0 set no numeric threshold.
 - `idf_c6_espnow_coordinator` joins a Wi-Fi AP and runs ESP-NOW in the same firmware, so it is the closest candidate, but it has no STA peer of its own.
 
-## Open decisions
+## Decisions
 
-- LoRa on the Heltec V3 (bug 007 ask 4, the OTAA join of [ttn-otaa-validation](ttn-otaa-validation.md)): in or out of 0.8.0.
-- The esp-hal smoke and soak checks: stand from 0.7.0 as Scope assumes, or re-run, because the supervisor rename to `WiFiManager` touches every esp-hal example.
-- The definition of the C6 coexistence soak: which example, which peers, how long, and the pass criterion.
-- The 0.7.0-waived flows: a new check for each, or a second explicit waiver (see Carried from 0.7.0).
-- The rgb-clock acceptance of the portal fallback: consumer hardware, external to this bench.
+The maintainer made the decisions below on 2026-11-24, and none stays open for 0.8.0.
+
+- LoRa on the Heltec V3 (bug 007 ask 4, the OTAA join of [ttn-otaa-validation](ttn-otaa-validation.md)) is out of 0.8.0, waived, and carried to the next release (2026-11-24).
+- The esp-hal smoke and soak checks are re-run on ESP32-C3 and ESP32-C6 only, both attached to the bench laptop, while the ESP32-S3 and ESP32 classic esp-hal checks stand from 0.7.0 (2026-11-24).
+- The ESP-IDF v6.1 coexistence soak is waived for 0.8.0, and its definition becomes its own item for the next release (2026-11-24).
+- The 27 gaps carried from 0.7.0, the partly covered rows 45, 57, 58 and 68, and the two not-runnable 0.7.0 items are under a second blanket waiver, recorded per domain in Carried from 0.7.0 (2026-11-24).
+- The rgb-clock acceptance of the portal fallback is waived for the tag and moved to after the release (2026-11-24).
+- This run uses only ESP32-C3 and ESP32-C6, so every ESP32-S3 and ESP32 classic row (both tiers) is waived for 0.8.0 and marked `waived` in Results (2026-11-24).
+- The not-runnable New in 0.8.0 items (a) portal fallback, (b) DDI identity rule and `ddi_token` extra, and (c) tier-parity step 11 are waived for 0.8.0 (2026-11-24).
+- 0.8.0 is tagged before the C3 and C6 run so the DDI OTA client ships; the tag rests on the host and device gates and the local `c3/ddi` and `c6/ddi` passes, and every C3 and C6 row still `not run` runs after the tag on the remote bench (2026-11-24).
 
 ## Carried from 0.7.0
 
@@ -165,19 +176,19 @@ Each row needs a new check or an explicit waiver before the tag.
 
 | Domain       | Gaps                        | Decision for 0.8.0 |
 |:-------------|:----------------------------|:-------------------|
-| Wi-Fi        | 5, 6, 64, 75                | open               |
-| MQTT         | 18, 19, 34, 37, 38, 70, 71  | open               |
-| ESP-NOW      | 8, 9, 36, 69, 74, 76        | open               |
-| OTA          | 13, 15, 42, 72, 77          | open               |
-| Provisioning | 12, 27, 73                  | open               |
-| LoRa         | 22, 24                      | open               |
+| Wi-Fi        | 5, 6, 64, 75                | second waiver (maintainer, 2026-11-24), carried to the next release               |
+| MQTT         | 18, 19, 34, 37, 38, 70, 71  | second waiver (maintainer, 2026-11-24), carried to the next release               |
+| ESP-NOW      | 8, 9, 36, 69, 74, 76        | second waiver (maintainer, 2026-11-24), carried to the next release               |
+| OTA          | 13, 15, 42, 72, 77          | second waiver (maintainer, 2026-11-24), carried to the next release               |
+| Provisioning | 12, 27, 73                  | second waiver (maintainer, 2026-11-24), carried to the next release               |
+| LoRa         | 22, 24                      | second waiver (maintainer, 2026-11-24), carried to the next release               |
 
-Rows that 0.7.0 covered in part keep their open gaps: 45, 57, 58 and 68.
-The two 0.7.0 items that were not runnable yet, the two-thread QoS subscribe on `c6/mqtt` and the nine-subscription check on `c3/mqtt-lwt`, stay open.
+Rows that 0.7.0 covered in part keep their gaps: 45, 57, 58 and 68, and the second waiver covers them too.
+The two 0.7.0 items that were not runnable yet, the two-thread QoS subscribe on `c6/mqtt` and the nine-subscription check on `c3/mqtt-lwt`, are under the same waiver.
 
 ## Results
 
-Only `c3/ddi` and `c6/ddi` have recorded results; every other row is `not run`, and its Rev and Log cells stay empty until a run is recorded.
+Only `c3/ddi` and `c6/ddi` have recorded results; the ESP32-S3 and ESP32 classic rows are `waived` (see Decisions), every other row is `not run`, and its Rev and Log cells stay empty until a run is recorded.
 The esp-hal twins that run in the same command as an ESP-IDF row have their own row.
 The items under New in 0.8.0 that are not runnable yet have no row.
 
@@ -186,7 +197,7 @@ The items under New in 0.8.0 that are not runnable yet have no row.
 
 | Check (tier)                                        | Result   | Rev | Log |
 |:----------------------------------------------------|:---------|:----|:----|
-| `esp32/mqtt` (ESP-IDF)                              | not run  |     |     |
+| `esp32/mqtt` (ESP-IDF)                              | waived   |     |     |
 | `c3/ddi` (ESP-IDF)                                  | PASS 20/20 | `d579e64+dirty` | `bench/c3/logs/idf_c3_ddi-20261123-223247.log` |
 | `c3/mqtt` (ESP-IDF)                                 | not run  |     |     |
 | `c3/reentry` (ESP-IDF)                              | not run  |     |     |
@@ -202,19 +213,25 @@ The items under New in 0.8.0 that are not runnable yet have no row.
 | `c3/ota` (esp-hal)                                  | not run  |     |     |
 | `c3/ota-rollback` (esp-hal)                         | not run  |     |     |
 | C3 hal provisioning extras (manual, esp-hal)        | not run  |     |     |
+| `c3/connect` (esp-hal, attended)                    | not run  |     |     |
+| `c3/mqtt-lwt` (esp-hal, attended)                   | not run  |     |     |
+| `c3/soak` (esp-hal)                                 | not run  |     |     |
 | `c6/connect` (esp-hal twin)                         | not run  |     |     |
 | `c6/connect` (ESP-IDF)                              | not run  |     |     |
 | `c6/mqtt` (ESP-IDF)                                 | not run  |     |     |
 | `c6/ddi` (ESP-IDF)                                  | PASS 20/20 | `d579e64+dirty` | `bench/c6/logs/idf_c6_ddi-20261123-221515.log` |
 | `c6/provision` (esp-hal)                            | not run  |     |     |
-| `s3/mqtt-lwt` (esp-hal twin, attended)              | not run  |     |     |
-| `s3/mqtt-lwt` (ESP-IDF, attended)                   | not run  |     |     |
-| `s3/mqtt-scenarios` (esp-hal twin, attended)        | not run  |     |     |
-| `s3/mqtt-scenarios` (ESP-IDF, attended)             | not run  |     |     |
-| `s3/suspend` (esp-hal)                              | not run  |     |     |
-| `s3/suspend` (ESP-IDF)                              | not run  |     |     |
-| `s3/ota` (esp-hal)                                  | not run  |     |     |
-| `s3/ota-rollback` (esp-hal)                         | not run  |     |     |
-| `s3/provision` (esp-hal)                            | not run  |     |     |
+| `c6/mqtt-lwt` (esp-hal, attended)                   | not run  |     |     |
+| `c6/mqtt-scenarios` (esp-hal, attended)             | not run  |     |     |
+| `c6/soak` (esp-hal)                                 | not run  |     |     |
+| `s3/mqtt-lwt` (esp-hal twin, attended)              | waived   |     |     |
+| `s3/mqtt-lwt` (ESP-IDF, attended)                   | waived   |     |     |
+| `s3/mqtt-scenarios` (esp-hal twin, attended)        | waived   |     |     |
+| `s3/mqtt-scenarios` (ESP-IDF, attended)             | waived   |     |     |
+| `s3/suspend` (esp-hal)                              | waived   |     |     |
+| `s3/suspend` (ESP-IDF)                              | waived   |     |     |
+| `s3/ota` (esp-hal)                                  | waived   |     |     |
+| `s3/ota-rollback` (esp-hal)                         | waived   |     |     |
+| `s3/provision` (esp-hal)                            | waived   |     |     |
 
 </details>
