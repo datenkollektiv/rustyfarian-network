@@ -14,6 +14,8 @@
 //! | [`report`] | when and how the `rolled_back` report is published and marked delivered, and the background completion retry |
 //! | [`fetch`] | the size and total-time limits of the manifest body |
 
+#![allow(deprecated)]
+
 pub mod config;
 pub mod fetch;
 pub mod intake;

@@ -22,6 +22,8 @@
 //!
 //! `Manifest::parse` validates the URL, so a manifest with a bad URL reports `manifest_invalid` even when its target is also wrong; the target is only checked afterwards.
 
+#![allow(deprecated)]
+
 #[cfg(feature = "ota-wire")]
 mod command;
 #[cfg(feature = "ota-wire")]

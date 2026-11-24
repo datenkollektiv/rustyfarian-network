@@ -155,7 +155,7 @@ The ADR 011 reasons for keeping the MQTT wire's HTTP internal and plain still ho
 
 ### Neutral
 
-- The ADR 018 amendment for the feature split and the MQTT wire deprecation is a separate decision.
+- The feature split and the MQTT wire deprecation are separate decisions, recorded in the ADR 018 amendments of 2026-11-21 and 2026-11-24.
 
 ## References
 

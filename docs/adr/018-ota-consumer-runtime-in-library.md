@@ -230,7 +230,7 @@ The DDI path paces its terminal feedback itself through `juggler::ota::ddi::Verd
 The MQTT reporter keeps its pacing in the MQTT runtime.
 An MQTT OTA consumer that enabled `ota` with `mqtt` adds `ota-wire`.
 
-The MQTT OTA wire and runtime (`ota-wire`) are deprecated once the DDI client works over HTTPS, and the deprecation waits for TLS on the DDI transport.
+The MQTT OTA wire and runtime (`ota-wire`) are deprecated once the DDI client works over HTTPS, and the deprecation waits for TLS on the DDI transport. (superseded by the 2026-11-24 amendment)
 The deprecation points consumers at the DDI client.
 The MQTT OTA wire and runtime are removed in a later release after that deprecation, and no date or version is fixed here.
 
@@ -243,6 +243,18 @@ An image made solely for the bench may enable it, and it then takes MQTT OTA com
 `--all-features` and the docs.rs feature list carry the opt-in, so neither breaks.
 `just check-ota-ddi-no-mqtt-runtime` also checks that the guard fires without the opt-in and that the opt-in builds.
 A device publishes nothing and takes no command under `rustyfarian/ota/#`, the fleet's nudge topics, so `juggler::ota::OtaSettings::validate` refuses an MQTT OTA command or status topic that filter matches (`ConfigError::ReservedTopic`).
+
+**2026-11-24 — MQTT OTA wire deprecated in 0.8.0, ahead of TLS:**
+
+The MQTT OTA wire and runtime (`ota-wire`) are deprecated in release 0.8.0 with `#[deprecated(since = "0.8.0")]`.
+The deprecated items are `juggler::ota::wire` (the MQTT parse types), `juggler::ota::runtime`, the ESP-IDF `ota::runtime` with `OtaRuntime` and `OtaSubmitter`, and the esp-hal re-exports of them.
+The deprecation points consumers at the DDI client (`ota-ddi`, ESP-IDF tier), and it does not wait for TLS on the DDI transport, which supersedes the 2026-11-21 statement that it would.
+The maintainer decided this on 2026-11-24, because the project wants to get rid of the MQTT OTA wire as soon as possible.
+
+Until TLS lands, the 0.8.0 DDI client is a plain-HTTP lab opt-in only: `https://` is refused with `TlsUnavailable`, so there is no production-ready replacement on the ESP-IDF tier yet.
+The esp-hal tier has no DDI client (the gap recorded in the feature doc, ADR 022), so esp-hal consumers receive the deprecation without a same-tier replacement.
+The MQTT OTA wire and runtime are removed in a later release after that deprecation, and no version is fixed here.
+The 2026-11-22 amendment (no MQTT OTA authority in a DDI release image) is unchanged by this decision.
 
 ## References
 

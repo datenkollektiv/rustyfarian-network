@@ -23,6 +23,9 @@
 //!
 //! Hardware test procedure: [`docs/runbooks/ota-hardware-test.md`](../../../docs/runbooks/ota-hardware-test.md)
 
+// This example demonstrates the MQTT OTA runtime, deprecated since 0.8.0.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

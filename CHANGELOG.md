@@ -176,6 +176,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rustyfarian-esp-hal-network` `AsyncWifiHandle::wait_for_ip`: use `WiFiManager::wait_connected` and `WiFiManager::ip`.
 - `rustyfarian-esp-hal-network` `MqttHandle::publish_with`: use `MqttHandle::publish`, the name the ESP-IDF tier shares.
 - `juggler::mqtt::connection_wait_iterations`: remains deprecated and is retained until its announced 1.0 removal although its only consumer, `MqttManager`, is removed in 0.8.0; both tiers' builders use `MqttClient::wait_connected`.
+- The MQTT OTA wire and runtime behind `ota-wire` (`juggler::ota` `OtaCommand`, `Manifest`, `OtaStatus`, their errors and size limits, the `ota::runtime` module and its settings types, and `rustyfarian-esp-idf-network` `ota::runtime` and `StackMarks`) are deprecated and will be removed in a later release: use the DDI client (`ota-ddi`) on the ESP-IDF tier, while `rustyfarian-esp-hal-network` has no DDI client yet (ADR 022 gap).
 
 ### Removed
 

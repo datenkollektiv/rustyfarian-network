@@ -60,6 +60,10 @@ mod health_driver;
 #[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
 mod records;
 #[cfg(all(feature = "ota-wire", feature = "mqtt"))]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub mod runtime;
 #[cfg(any(all(feature = "ota-wire", feature = "mqtt"), feature = "ota-ddi"))]
 mod stack;
@@ -75,6 +79,7 @@ pub use juggler::ota::{DeadlineAction, HealthVerdict};
 // The MQTT runtime's configuration types, flat like the rest of the `juggler::ota` surface.
 // The state machines stay under `juggler::ota::runtime`; this crate's own `runtime` module is the glue.
 #[cfg(feature = "ota-wire")]
+#[allow(deprecated)]
 pub use juggler::ota::{
     ConfigError, OtaSettings, OtaStacks, OtaTimings, MIN_STACK_BYTES, MIN_WORKER_STACK_BYTES,
 };
@@ -99,6 +104,7 @@ pub use juggler::ota::{
 
 // The MQTT OTA wire contract (ADR 018 amendment 2026-11-21): a DDI build leaves it out.
 #[cfg(feature = "ota-wire")]
+#[allow(deprecated)]
 pub use juggler::ota::{
     CommandError, Manifest, ManifestError, OtaCommand, OtaStatus, StatusError, MAX_COMMAND_BYTES,
     MAX_MANIFEST_BYTES,
@@ -140,6 +146,7 @@ target_chip! {
 }
 
 #[cfg(all(test, feature = "ota-wire"))]
+#[allow(deprecated)]
 mod target_chip_guard {
     use super::{Manifest, TARGET_CHIP};
 

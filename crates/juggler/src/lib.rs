@@ -97,6 +97,8 @@
 //! - `provisioning::*` exports [`ProvisioningState`](provisioning::ProvisioningState), [`SchemaProfile`](provisioning::SchemaProfile), etc.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// The libtest harness is generated at the crate root, so it reads the tests of the deprecated MQTT OTA runtime (0.8.0) from outside the deprecated module.
+#![cfg_attr(test, allow(deprecated))]
 
 // alloc is needed in tests (provisioning + espnow mocks use alloc::format! etc.)
 // and by the `ota-wire` and `ota-ddi` JSON types (String, serde_json).

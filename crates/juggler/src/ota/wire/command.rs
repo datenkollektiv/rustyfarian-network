@@ -14,6 +14,10 @@ use crate::ota::Version;
 ///
 /// Largest accepted command payload in bytes.
 /// A larger payload is rejected before any parsing.
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub const MAX_COMMAND_BYTES: usize = 512;
 
 /// The flat wire shape; kept private so dispatch never goes through an untagged enum
@@ -48,6 +52,10 @@ struct RawCommand {
 /// assert_eq!(cmd, OtaCommand::Rollback { from: juggler::ota::Version::new(1, 0, 0) });
 /// ```
 #[derive(Clone, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub enum OtaCommand {
     /// Fetch the manifest at `manifest_url` and update if it is acceptable.
     Update {
@@ -90,6 +98,10 @@ impl fmt::Debug for OtaCommand {
 /// Why a command was rejected.
 /// Carries no payload text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(
+    since = "0.8.0",
+    note = "the MQTT OTA wire is deprecated and will be removed in a later release; use the DDI client (`ota-ddi`, ESP-IDF tier; esp-hal has no DDI client yet, ADR 022 gap)"
+)]
 pub enum CommandError {
     /// The payload exceeds [`MAX_COMMAND_BYTES`].
     TooLarge,
