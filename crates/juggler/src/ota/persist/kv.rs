@@ -15,6 +15,14 @@ impl KvError {
     pub const CODE_TYPE_MISMATCH: i32 = -0x7001;
     /// A value was over-long or not ASCII.
     pub const CODE_INVALID_VALUE: i32 = -0x7002;
+    /// A flash read, write or erase failed (the NOR-flash backend, `FlashKv`).
+    pub const CODE_FLASH: i32 = -0x7003;
+    /// The store has no room for another key, or its sequence counter is exhausted (`FlashKv`).
+    pub const CODE_STORE_FULL: i32 = -0x7004;
+    /// The flash region of the store is too small, misaligned, outside the flash or missing (`FlashKv`).
+    pub const CODE_GEOMETRY: i32 = -0x7005;
+    /// The store is already open: a platform allows one store per boot.
+    pub const CODE_ALREADY_OPEN: i32 = -0x7006;
 
     /// Creates an error with `code`.
     pub const fn new(code: i32) -> Self {
@@ -54,6 +62,10 @@ impl core::fmt::Display for KvError {
         match self.code {
             Self::CODE_TYPE_MISMATCH => f.write_str("OTA store key has an unexpected type"),
             Self::CODE_INVALID_VALUE => f.write_str("OTA store value is over-long or not ASCII"),
+            Self::CODE_FLASH => f.write_str("OTA store flash access failed"),
+            Self::CODE_STORE_FULL => f.write_str("OTA store has no room for another key"),
+            Self::CODE_GEOMETRY => f.write_str("OTA store flash region is unusable"),
+            Self::CODE_ALREADY_OPEN => f.write_str("OTA store is already open"),
             code => write!(f, "OTA store backend error {code}"),
         }
     }

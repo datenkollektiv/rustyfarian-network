@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `rustyfarian-esp-hal-network` DDI (hawkBit) OTA client behind `ota-ddi` with the ESP-IDF tier's names as `async fn`, plain HTTP only under the `ota-ddi-insecure-http` lab opt-in until TLS lands ([ddi-client-v1](docs/features/ddi-client-v1.md)).
+- `juggler` `ota-flash-kv`: a power-loss-safe `FlashKv` record store over any `NorFlash`, which the bare-metal tier keeps in the `nvs` data partition.
+- `juggler` `DdiWorker`, `DownloadFlow` and `HealthFlow` machines, checked row by row against the reference DDI scenarios, plus `just ddi-bundle` support for `hal_c3_*` and `hal_c6_*` images.
+
+### Changed
+
+- The DDI transport types (`DdiTransportConfig`, `DdiTransportError`, `DdiStackMarks`) live in `juggler::ota::ddi` and stay re-exported at their `rustyfarian-esp-idf-network` paths.
+- `rustyfarian-esp-hal-network` `ota-ddi` turns on `embassy-net` DNS and raises `STA_SOCKET_COUNT`, so firmware that sizes `StackResources` by hand must use the constant.
+
 ## [0.8.0] - 2026-11-24
 
 ### Added

@@ -1,7 +1,7 @@
 //! Persisted OTA records: the attempt, the rollback report, the operator-rollback request, the refused version and the DDI action record.
 //!
 //! All record semantics, write ordering and boot orchestration live here as pure generic code over the key-level [`OtaKv`] trait, so the crash-consistency rules are host-tested with fault injection.
-//! A platform crate supplies only the key-value backend (on ESP-IDF, NVS).
+//! A platform crate supplies only the key-value backend (on ESP-IDF, NVS; on esp-hal, `FlashKv` over raw NOR flash, feature `ota-flash-kv`).
 //! This module never reboots, never marks an image valid and never publishes.
 //!
 //! # Layout of namespace [`NVS_NAMESPACE`]
@@ -47,6 +47,8 @@
 
 pub mod boot;
 mod ddi;
+#[cfg(feature = "ota-flash-kv")]
+pub mod flash_kv;
 pub mod keys;
 pub mod kv;
 pub mod store;
@@ -59,6 +61,8 @@ pub use boot::{
     BootWarnings, BusyRetry, BusyTally, HardwareFacts, HardwareReadError, NoteBoot, NoteBootError,
     UpdateSlot,
 };
+#[cfg(feature = "ota-flash-kv")]
+pub use flash_kv::FlashKv;
 pub use keys::{slot_for_partition, slot_from_label, slot_label, FACTORY_SLOT};
 pub use kv::{KvError, KvStr, OtaKv};
 pub use store::{

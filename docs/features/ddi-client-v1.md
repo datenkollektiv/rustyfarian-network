@@ -12,7 +12,7 @@ This is the single feature doc for the work, and it is transient: it is archived
 Today the library's OTA consumer runtime speaks the MQTT wire (ADR 018), and both tiers download with internal HTTP GET clients that are not a public API (the hand-rolled esp-hal client of ADR 011 decision 2, `EspHttpConnection` on ESP-IDF).
 The fleet needs a device-facing HTTP polling client with TLS, origin-bound credentials and fail-closed update rules.
 Neither tier has that today: the ESP-IDF tier has a downloader but no DDI transport, and the esp-hal tier has no TLS, no DNS on the OTA path and no OTA runtime.
-This first round targets the ESP-IDF tier; esp-hal follows in a later round.
+The first round targeted the ESP-IDF tier; the esp-hal round followed on 2026-11-24, with its tier gaps listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022).
 
 ## Decisions
 
@@ -24,12 +24,26 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 |:--|:--|:--|
 | A sans-IO DDI state machine in `juggler`, plus a credential-bound DDI transport per tier (ESP-IDF in this round) | Host-tested logic, with time and random values as inputs as `DownloadMachine` does (`crates/juggler/src/ota/download.rs:1-6`) | Generic GET, POST and PUT primitives with caller-supplied headers |
 | No generic HTTP API is exported | `README.md:35-37` keeps general-purpose HTTP clients out of scope, and binding the token to the configured origin removes the leak path | Exporting a reusable HTTP client |
-| ESP-IDF only in the first round; the esp-hal gap is recorded here (ADR 022): no TLS stack, IPv4 literals only on the OTA path (`crates/rustyfarian-esp-hal-network/src/ota/manager.rs:646-657`), a 256 B request buffer (`crates/rustyfarian-esp-hal-network/src/ota/http.rs:395`), no OTA runtime, none of the `ota::ddi` runtime types of this round (`DdiNudge` included), and no `OtaKv` backend for the record store (the DDI action record is tier-neutral juggler code, but esp-hal persists nothing without a backend) | The fleet devices run ESP-IDF, and the esp-hal gap is a separate body of work; the juggler machine is tier-neutral, so esp-hal reuses it later | Both tiers in the first release (decided first, revised the same day) |
+| ESP-IDF first; the esp-hal DDI client was implemented on 2026-11-24 (`ota-ddi`, `hal_c3_ddi`, `hal_c6_ddi`) and its named gaps are recorded here (ADR 022): no TLS (`https://` is refused with `TlsUnavailable`, and `http://` works only under `ota-ddi-insecure-http`), no wall clock, no IPv6 (a bracketed host is `ServerUnreachable`), A-record DNS on the DDI path only (the public `fetch_and_apply*` path still takes IPv4 literals and keeps its 256 B request buffer, `crates/rustyfarian-esp-hal-network/src/ota/manager.rs:1153-1158` and `crates/rustyfarian-esp-hal-network/src/ota/http.rs:395`), `stack_high_water` always None, and records in the `nvs` data partition through juggler `FlashKv`; the API differences are listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022); no esp-hal hardware run has happened yet | The fleet devices run ESP-IDF, and the esp-hal gap was a separate body of work; the juggler machines are tier-neutral, so esp-hal reuses them (done 2026-11-24) | Both tiers in the first release (decided first, revised the same day) |
 | The MQTT OTA wire and runtime (ADR 018) move behind their own feature, are deprecated once the DDI client ships, and are then removed | DDI replaces it; two device-facing OTA wires would otherwise stay supported in parallel | Keep the MQTT wire long term |
 | Feature split: `ota` keeps download, flash, record store and decisions; the MQTT runtime (`ota-wire`) and the DDI runtime (`ota-ddi`) each get a feature; the DDI path paces its terminal feedback itself (`VerdictSender`), and the MQTT reporter keeps its pacing in the MQTT runtime (ADR 018 amendment 2026-11-21) | A DDI build must not link the MQTT command intake (`OtaSubmitter::handle` and `submit` are public today) | Keep one runtime feature |
 | No MQTT OTA authority in a DDI release image: on the IDF tier `ota-ddi` with `ota-wire` is a compile error unless the bench-only `ota-ddi-bench-mqtt-wire` opt-in is enabled, and `OtaSettings` refuses an MQTT OTA command or status topic that `rustyfarian/ota/#` matches (profile 0.4.0 §1, ADR 018 amendment 2026-11-22) | A release image must not accept an install, rollback or repair command over MQTT, and a device never publishes under the fleet's nudge topics | Trust the firmware's feature list |
 | DDI client in 0.8.0 under the plain-HTTP lab opt-in; TLS in 0.8.0 or the next minor; not documented as ready outside a lab before TLS | Lets the fleet start on the wire while TLS lands | 0.8.0 waits for TLS; DDI in 0.9.0 |
 | New ADR 027 for the DDI transport scope, superseding ADR 011 decision 2 for this purpose; ADR 018 amendment for the feature split and deprecation | Records the decisions where the project keeps architecture rules | Leave the scope in this feature doc only |
+
+### esp-hal tier gaps (ADR 022)
+
+The esp-hal round keeps the ESP-IDF names as `async fn`; these differences go beyond the error type, and consumer code that targets both tiers must allow for them.
+
+- `DdiRuntime::start(records, stack)` also takes the station `Stack` and returns `(DdiHandle, DdiRunner)`; the firmware spawns `DdiRunner::run`, where the ESP-IDF `start(records)` returns `DdiHandle` and starts its own threads.
+- `RestartFn` is a plain `fn()`, where the ESP-IDF tier takes `Arc<dyn Fn() + Send + Sync>`, so a capturing closure does not compile on esp-hal (the ESP32-C3 has no `Arc` there).
+- `open_records` takes the `&'static SharedFlash` from `SharedFlash::new(peripherals.FLASH)`, where the ESP-IDF tier takes an `EspDefaultNvsPartition`.
+- The DDI download always checks the image header's chip against `TARGET_CHIP`, whatever `with_expected_chip` says, because the bare-metal slot activation does not read the header.
+- No IPv6 server address: a bracketed host is `ServerUnreachable`.
+- No wall clock: feedback carries no timestamp, and a `Retry-After` date is ignored (a delay in seconds still applies).
+- `DdiHandle::stack_high_water` always returns `None` for both marks, since the worker and the download share the firmware's one task.
+- `ota-ddi` turns on `embassy-net` DNS and raises `wifi::STA_SOCKET_COUNT`, so firmware that sizes `StackResources` by hand must use the constant.
+- No TLS, as on the ESP-IDF tier: `https://` is refused with `TlsUnavailable`, and `http://` works only under `ota-ddi-insecure-http`.
 
 ### Transport and security
 
@@ -115,7 +129,7 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 - The fleet DDI profile is frozen at 0.4.0 (2026-11-21); the fleet relays every MINOR bump here, and decisions here follow it.
 - The profile version bumps MINOR whenever its §1–§6, its §7 pass criteria or its declared divergences change; the freeze keeps the number.
 - Rollout evidence may claim HTTPS only after every token and MQTT password used over plaintext has been rotated.
-- Tier parity (ADR 022): the same API names and arguments on both tiers, with only the error type differing; the esp-hal gap of this round is recorded in the Scope table.
+- Tier parity (ADR 022): the same API names and arguments on both tiers, with only the error type differing; the esp-hal gaps are recorded in the Scope table and under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022).
 - The first round's DDI transport is blocking on ESP-IDF; the esp-hal round lands the same names and arguments as `async fn` and revisits the blocking choice (ADR 027).
 - No reusable, exported HTTP client (`README.md:35-37`).
 - Image signature verification is out of scope (device-repo work); sha256 detects corruption only.
@@ -125,8 +139,8 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 
 ## Open Questions
 
-- [ ] esp-hal round: TLS stack choice, DNS on the OTA path, and when it starts.
-- [ ] esp-hal round: does the bare-metal slot activation check the image header's chip id; if not, the profile makes the early header check a MUST on that tier.
+- [ ] esp-hal round: TLS stack choice and when it starts; DNS is answered for the DDI path (A-record lookup through `Stack::dns_query`, IPv4 literals used as is, IPv6 refused), while the public `fetch_and_apply*` path still takes IPv4 literals only.
+- [x] esp-hal round: the bare-metal slot activation does not check the image header's chip id, so the DDI download always forces the chip check (`ImageChip::from_target(TARGET_CHIP)`, a mismatch is refused before any flash write), which meets the early header check on that tier.
 - [ ] Heap headroom with one HTTPS and one MQTTS session on C3 and C6 (hardware measurement).
 - [ ] Worker and reporter stack defaults under TLS (after measurement).
 - [x] Name and wire code of the clock-not-set error: no wire code of its own (profile 0.4.0 §1, §4: nothing is sent before retrieval, 1001 inside an action); the name is the library's choice when S2 lands, after T14 makes `OtaError` `#[non_exhaustive]`.
@@ -172,6 +186,8 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 - [x] Early image-header chip check on the download machine (both tiers, `with_expected_chip`)
 - [x] IDF DDI transport
 - [x] IDF DDI runtime (`ota::ddi` worker, download thread, health hook, nudge)
+- [x] esp-hal DDI client (`ota-ddi`, `hal_c3_ddi`, `hal_c6_ddi`), implemented 2026-11-24 with the gaps listed under [esp-hal tier gaps](#esp-hal-tier-gaps-adr-022)
+- [ ] esp-hal hardware runs: `hal_c6_ddi` on the bench (`c3/ddi-hal` passed 20/20 on 2026-11-24), and a `hal_c3_ota` rerun for the shared-flash write path
 - [ ] TLS round (S1 to S4): HTTPS with the compiled-in CA, the clock gate, `mqtts://` for the nudge, stack and heap measured on C3 and C6; accepted per the HTTPS acceptance row
 - [x] MQTT OTA wire and runtime deprecated in 0.8.0 (2026-11-24 maintainer decision, ahead of TLS; ADR 018 amendment 2026-11-24)
 - [ ] MQTT OTA wire and runtime removed in a later release (no version fixed)
@@ -201,3 +217,6 @@ Decisions are grouped into themed tables, and each one was decided by the mainta
 - 2026-11-23 — Local lab hardware passed on both boards: C3 Super Mini `idf_c3_ddi` 20/20 and C6 DevKitC-1 `idf_c6_ddi` 20/20, with the proxy `Host` listener-port fix and a 180 s tampered-step timeout on both boards.
 - 2026-11-23 — FR-B follow-up timing review: the post-boot `proceeding` is sent once and lost on any failure (bug 023); open questions added for the download-deadline bound against T and the RAM-only 1005 marker; a State item added for the bench token reject pattern.
 - 2026-11-24 — MQTT OTA wire and runtime deprecated in 0.8.0 ahead of TLS (maintainer decision, ADR 018 amendment 2026-11-24); removal version left open.
+- 2026-11-24 — esp-hal DDI client implemented, uncommitted (slices S1 to S5 of the esp-hal round): juggler `FlashKv` record store in the `nvs` partition, a shared flash handle for the OTA manager and the record store, a hand-rolled DDI HTTP transport with A-record DNS, juggler `DdiWorker`, `DownloadFlow` and `HealthFlow` machines checked against every scenario row, and the hal runtime under the IDF names; `https://` is still refused until the TLS round, and the `hal_c3_ddi` bench run has since passed (see the hardware entry below), so the `hal_c6_ddi` bench run and its bundle check, and a `hal_c3_ota` rerun for the shared-flash write path, are owed.
+- 2026-11-24 — esp-hal tier gaps listed in their own section (ADR 022): the `start` return value, `RestartFn`, the `open_records` argument, the chip check that is always on, no IPv6, no wall clock, no stack marks and the `ota-ddi` socket budget; the record store lock no longer masks interrupts across several flash commits.
+- 2026-11-24 — esp-hal C3 hardware run passed on one C3 Super Mini: `idf_c3_ddi` (1.88 MB image, 95 % of the 1.97 MB slot, 13 min 12 s) and `hal_c3_ddi` (1.08 MB, 55 %, 9 min 22 s, the gap is download time through the throttled proxy) each passed 20/20 of the B2 chain against hawkBit 1.2.0 behind the lab proxy at 20 KiB/s with identical steps and log patterns; every operator row was confirmed on the server, esp-hal free heap stayed at about 17 KB of the 72 KiB heap through downloads, and the `nvs` record store survived the mid-download reset and the rollback reboots (logs `bench/c3/logs/idf_c3_ddi-20261124-111948.log` and `bench/c3/logs/hal_c3_ddi-20261124-113326.log`); still owed are the esp-hal C6 run (`hal_c6_ddi`) and its bundle check, whether esp-radio touches `nvs` beyond this run (no corruption observed), and the cosmetic `[ota] nudge: polling now` line the esp-hal runtime logs for internal wakes without an MQTT nudge.

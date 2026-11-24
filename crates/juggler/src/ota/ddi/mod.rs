@@ -8,12 +8,16 @@
 //! [`admit_retrieved`] is the admission step after [`PollAction::RetrieveDeployment`]: document validity, skip, chip and version gates in the profile's order, ending in a [`DeploymentVerdict`].
 //! [`VerdictSender`] delivers the persisted terminal verdict (30 s pacing, the 200/404/410 rule, the consecutive-401 rule), [`CancelMachine`] answers a `cancelAction` on the cancel path, and [`FeedbackPost`] builds every feedback, the `proceeding` progress included.
 //! [`decide_download_retry`] is the retry policy of a failed artifact download: transient errors back off ([`download_retry_backoff`]) inside one deadline, the rest are final.
+//! [`DdiTransportConfig`], [`DdiTransportError`] (with [`DdiTransportError::into_outcome`]), [`check_scheme`] and [`DdiStackMarks`] are the parts both tiers' `DdiTransport` and runtime share.
+//! [`DdiWorker`] composes those machines in the order of the ESP-IDF `ota-worker` thread (ADR 023 rung 3, decision 2: one composition for a thread and for an async task), [`DownloadFlow`] the retry, give-up and settle flow of one download, and [`plan_boot`], [`repair_at_boot`] and [`after_repair`] the flat boot sequence of a runtime's start; the health policy machine is [`HealthFlow`](crate::ota::health::HealthFlow).
 //! [`DdiSettings`] is the platform-neutral configuration of a tier's DDI runtime (stacks, timings, the board name), [`WALL_CLOCK_FLOOR_SECS`] the rule that decides when a wall clock counts as set and [`nudge_topic`] the exact MQTT topic of the nudge.
 //!
 //! Enabled by the `ota-ddi` feature (implies `ota`, needs `alloc`).
 
 mod admission;
+mod boot;
 mod cancel;
+mod download_flow;
 mod endpoint;
 mod feedback;
 mod poller;
@@ -24,12 +28,21 @@ mod scenarios;
 mod schedule;
 mod settings;
 mod token;
+mod transport;
 pub mod wire;
+mod worker;
 
 pub use admission::{
     admit_deployment, admit_retrieved, AdmissionFacts, AdmittedOffer, DeploymentVerdict, Refusal,
 };
+pub use boot::{
+    after_repair, plan_boot, repair_at_boot, unbound_report_blocks, AfterRepair, BootPlan,
+    BOOT_REPAIR_PASSES,
+};
 pub use cancel::{CancelInput, CancelMachine, CancelResult, CancelStep, CancelTarget};
+pub use download_flow::{
+    settle_failed, DownloadEnd, DownloadFlow, DownloadFlowAction, DownloadFlowInput, SettleNote,
+};
 pub use endpoint::{
     CheckedUrl, ControllerId, DdiEndpoint, EndpointError, Scheme, UrlRefusal,
     CONTROLLER_ID_MAX_LEN, CONTROLLER_ID_MIN_LEN, MAX_BASE_URL_BYTES,
@@ -60,4 +73,12 @@ pub use settings::{
 };
 pub use token::{
     DdiToken, DdiTokenError, Secret, AUTHORIZATION_MAX_LEN, TOKEN_MAX_LEN, TOKEN_MIN_LEN,
+};
+pub use transport::{
+    check_scheme, DdiStackMarks, DdiTransportConfig, DdiTransportError, DEFAULT_DEADLINE,
+    DEFAULT_TIMEOUT,
+};
+pub use worker::{
+    DdiRequest, DdiWorker, Stamp, Wake, WorkerAction, WorkerConfig, WorkerEvent, WorkerInput,
+    COMPLETION_RETRY_CAP,
 };

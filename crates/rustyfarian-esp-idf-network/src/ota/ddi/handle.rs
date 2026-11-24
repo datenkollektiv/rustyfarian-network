@@ -81,19 +81,7 @@ impl From<DdiTransportError> for DdiRuntimeError {
     }
 }
 
-/// Experimental: API may change before 1.0.
-///
-/// The least free stack bytes the DDI runtime threads have seen, in bytes; `None` until the thread has sampled once.
-///
-/// The health policy runs on the app's own thread and is not tracked here.
-/// The `ota-download` thread is sampled when a download ends, and exists only while an attempt does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DdiStackMarks {
-    /// Least free bytes of the `ota-worker` thread.
-    pub worker_min_free_bytes: Option<u32>,
-    /// Least free bytes of the `ota-download` threads.
-    pub download_min_free_bytes: Option<u32>,
-}
+pub use juggler::ota::ddi::DdiStackMarks;
 
 /// What the runtime threads and the handle share besides the flags: the stack marks and the completion-retry request.
 #[derive(Debug)]

@@ -25,6 +25,9 @@
 //! | `espnow` | ESP-NOW driver (implies `wifi` + `embassy`; `esp32c3`, `esp32c6`) |
 //! | `lora` | LoRa radio stub |
 //! | `ota` | OTA manager (implies `embassy`) |
+//! | `ota-ddi` | DDI OTA client: record store over raw flash, shared flash handle (implies `ota`; the firmware brings the global allocator) |
+//! | `ota-ddi-insecure-http` | Lab opt-in: plain `http://` for the DDI client (implies `ota-ddi`) |
+//! | `ota-ddi-bench-mqtt-wire` | Bench-only: `ota-ddi` next to `ota-wire` (implies both) |
 //! | `provisioning` | SoftAP captive portal (implies `wifi` + `embassy`) |
 //! | `embassy` | Async executor + embassy-net stack |
 //! | `esp32c3` | Target chip ESP32-C3 |
@@ -37,9 +40,27 @@
 
 #![no_std]
 
+// The DDI client's JSON codec allocates; the firmware provides the global allocator (ADR 021).
+#[cfg(any(feature = "ota-ddi", test))]
+extern crate alloc;
+
 // ── Belt-and-braces compile-time guard ──────────────────────────────────────
 #[cfg(all(feature = "provisioning", not(feature = "wifi")))]
 compile_error!("the `provisioning` feature requires `wifi`");
+
+// A release image accepts no install, rollback or repair command over MQTT:
+// DDI is the only network path that installs an image (fleet DDI profile
+// 0.4.0 §1, ADR 018 amendment 2026-11-22), the same guard as on the ESP-IDF
+// tier. Only an image made solely for the bench may carry the MQTT OTA wire
+// next to the DDI client, and it says so with `ota-ddi-bench-mqtt-wire`.
+#[cfg(all(
+    feature = "ota-ddi",
+    feature = "ota-wire",
+    not(feature = "ota-ddi-bench-mqtt-wire")
+))]
+compile_error!(
+    "the `ota-ddi` and `ota-wire` features together build an image that accepts OTA commands over MQTT, which the fleet DDI profile forbids for a release image; drop `ota-wire`, or enable `ota-ddi-bench-mqtt-wire` for an image made solely for the bench (see docs/adr/018-ota-consumer-runtime-in-library.md)"
+);
 
 // ── Always-on re-exports ─────────────────────────────────────────────────────
 //

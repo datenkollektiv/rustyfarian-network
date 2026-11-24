@@ -42,6 +42,48 @@ impl OtaCancel {
         self.with(CancelGate::request)
     }
 
+    /// Whether a cancel was accepted and the download has not yet ended on it: polled between two attempts of a retried download.
+    #[cfg(any(feature = "ota-ddi", test))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the DDI runtime's download loop polls it")
+    )]
+    pub(crate) fn is_requested(&self) -> bool {
+        self.with(|gate| gate.is_requested())
+    }
+
+    /// A switch for a download that is tried again after a failed attempt: it stays open across attempts (`CancelGate::for_retries`), until [`close`](Self::close).
+    #[cfg(any(feature = "ota-ddi", test))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the DDI runtime's download loop creates it")
+    )]
+    pub(crate) const fn for_retries() -> Self {
+        Self(Mutex::new(Cell::new(CancelGate::for_retries())))
+    }
+
+    /// Re-arms the switch for the next download of a runtime that keeps one switch for all its downloads: the state of [`for_retries`](Self::for_retries) again.
+    ///
+    /// Only between two downloads: a cancel of the earlier one, accepted or not, is forgotten.
+    #[cfg(any(feature = "ota-ddi", test))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the DDI runtime re-arms it per download")
+    )]
+    pub(crate) fn rearm_for_retries(&self) {
+        self.with(|gate| *gate = CancelGate::for_retries());
+    }
+
+    /// Closes the switch for good, so a later cancel answers `TooLate`, and returns whether a cancel had been accepted before, in one step inside the critical section.
+    #[cfg(any(feature = "ota-ddi", test))]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the DDI runtime's download loop closes it")
+    )]
+    pub(crate) fn close(&self) -> bool {
+        self.with(CancelGate::close)
+    }
+
     /// One machine step inside the critical section the requester takes, so a cancel cannot fall between the check and the permit.
     ///
     /// The step is pure and short; no I/O runs with interrupts masked.
@@ -98,6 +140,48 @@ mod tests {
             action,
             Ok(DownloadAction::Done(Err(OtaError::Cancelled)))
         ));
+        assert_eq!(cancel.cancel(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn a_retried_download_stays_cancellable_until_closed() {
+        let cancel = OtaCancel::for_retries();
+        let mut machine = DownloadMachine::new(Deadline::none(), Duration::from_secs(1), [0; 32]);
+        assert!(cancel
+            .poll(&mut machine, DownloadInput::Begin, Duration::ZERO)
+            .is_ok());
+        let failed = cancel.poll(
+            &mut machine,
+            DownloadInput::ConnectFailed(OtaError::ServerUnreachable),
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            failed,
+            Ok(DownloadAction::Done(Err(OtaError::ServerUnreachable)))
+        ));
+        assert!(!cancel.is_requested());
+        assert_eq!(cancel.cancel(), CancelRequest::Accepted);
+        assert!(cancel.is_requested());
+        assert!(cancel.close());
+        assert_eq!(cancel.cancel(), CancelRequest::TooLate);
+    }
+
+    #[test]
+    fn a_closed_switch_is_cancellable_again_after_a_rearm() {
+        let cancel = OtaCancel::for_retries();
+        assert_eq!(cancel.cancel(), CancelRequest::Accepted);
+        assert!(cancel.close());
+        assert_eq!(cancel.cancel(), CancelRequest::TooLate);
+        cancel.rearm_for_retries();
+        assert!(!cancel.is_requested());
+        assert_eq!(cancel.cancel(), CancelRequest::Accepted);
+        assert!(cancel.is_requested());
+    }
+
+    #[test]
+    fn closing_an_untouched_retry_switch_reports_no_cancel() {
+        let cancel = OtaCancel::for_retries();
+        assert!(!cancel.close());
         assert_eq!(cancel.cancel(), CancelRequest::TooLate);
     }
 }

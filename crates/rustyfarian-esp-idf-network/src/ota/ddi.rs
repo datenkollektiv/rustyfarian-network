@@ -72,7 +72,6 @@
 //!
 //! The esp-hal tier has no DDI transport, no DDI runtime and no `DdiNudge` yet (ADR 022 gap); it will land the same names as `async fn`.
 
-use std::fmt;
 #[cfg(feature = "ota-ddi-insecure-http")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -92,6 +91,9 @@ pub use juggler::ota::ddi::wire::{
 pub use juggler::ota::ddi::{
     BodyFailure, CheckedUrl, DdiEndpoint, DdiResponse, DdiToken, DdiTokenError, RequestOutcome,
     RetryAfter, UrlRefusal, MAX_REQUEST_BYTES,
+};
+pub use juggler::ota::ddi::{
+    DdiTransportConfig, DdiTransportError, DEFAULT_DEADLINE, DEFAULT_TIMEOUT,
 };
 
 use super::downloader::{is_read_timeout, set_wait, FirmwareResponse, HTTP_RX_BUFFER_SIZE};
@@ -115,16 +117,6 @@ pub use nudge::DdiNudge;
 pub use crate::ota::flags::OtaFlags;
 pub use crate::ota::records::{open_records, Records, RestartFn};
 
-/// Experimental: API may change before 1.0.
-///
-/// Default wait of one network operation (connect, header read, body read) of a [`DdiTransport`] request.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Experimental: API may change before 1.0.
-///
-/// Default total time of one [`DdiTransport`] request, from the connect to the last body byte.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
-
 /// Transmit buffer of the HTTP client, in bytes.
 ///
 /// `esp_http_client` writes the request line into it whole, so it must hold `GET`, a link of up to 512 bytes (the codec's `MAX_HREF_BYTES`) and `HTTP/1.1`.
@@ -139,189 +131,6 @@ const WRITE_CHUNK: usize = 1024;
 /// Set once the plain-HTTP WARN has been logged; statics reset on every boot.
 #[cfg(feature = "ota-ddi-insecure-http")]
 static INSECURE_HTTP_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Experimental: API may change before 1.0.
-///
-/// What a [`DdiTransport`] is built from: the server, the device and its token.
-///
-/// `Debug` prints the base URL through `UrlForLog` (no userinfo, query or fragment) and the token as `DdiToken(Secret(<redacted>))`.
-pub struct DdiTransportConfig {
-    /// The DDI base URL including the tenant path, for example `https://ddi.example/DEFAULT`; the controller resource is `<base_url>/controller/v1/<controller_id>`.
-    pub base_url: String,
-    /// The controller id, the device id rule `^[a-z0-9][a-z0-9-]{2,19}$`.
-    pub controller_id: String,
-    /// The per-device target token, sent as `Authorization: TargetToken <token>`.
-    pub token: DdiToken,
-    /// The wait of one network operation of a request; [`DdiTransport::download`] uses the session's timeout instead.
-    pub timeout: Duration,
-    /// The total time of one request; [`DdiTransport::download`] uses the session's deadline instead.
-    pub deadline: Duration,
-}
-
-impl DdiTransportConfig {
-    /// Experimental: API may change before 1.0.
-    ///
-    /// A configuration with the [`DEFAULT_TIMEOUT`] and the [`DEFAULT_DEADLINE`].
-    pub fn new(
-        base_url: impl Into<String>,
-        controller_id: impl Into<String>,
-        token: DdiToken,
-    ) -> Self {
-        Self {
-            base_url: base_url.into(),
-            controller_id: controller_id.into(),
-            token,
-            timeout: DEFAULT_TIMEOUT,
-            deadline: DEFAULT_DEADLINE,
-        }
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// Overrides the wait of one network operation.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Experimental: API may change before 1.0.
-    ///
-    /// Overrides the total time of one request.
-    #[must_use]
-    pub fn with_deadline(mut self, deadline: Duration) -> Self {
-        self.deadline = deadline;
-        self
-    }
-}
-
-impl fmt::Debug for DdiTransportConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DdiTransportConfig")
-            .field("base_url", &format_args!("{}", UrlForLog(&self.base_url)))
-            .field("controller_id", &self.controller_id)
-            .field("token", &self.token)
-            .field("timeout", &self.timeout)
-            .field("deadline", &self.deadline)
-            .finish()
-    }
-}
-
-/// Experimental: API may change before 1.0.
-///
-/// Why a [`DdiTransport`] could not be built or a request failed.
-/// Carries no URL, header or token text.
-/// The enum is `#[non_exhaustive]`: the TLS round adds variants, so a `match` outside this crate needs a wildcard arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum DdiTransportError {
-    /// The base URL failed the origin check of [`DdiEndpoint::check_base_url`] for this case; [`DdiTransport::new`] also logs it as a WARN, never the URL.
-    InvalidBaseUrl(UrlRefusal),
-    /// The controller id does not match `^[a-z0-9][a-z0-9-]{2,19}$`.
-    InvalidControllerId,
-    /// An `http://` base URL in a build without the `ota-ddi-insecure-http` feature.
-    InsecureHttp,
-    /// An `https://` base URL: TLS for the DDI transport has not landed yet.
-    TlsUnavailable,
-    /// A server link that failed the origin check (fleet DDI profile §2): outside the configured scheme, host and port, or not of the accepted URL shape; no request was made, and the case was logged as a WARN.
-    ForeignOrigin,
-    /// The server answered with this 3xx status; redirects are never followed.
-    Redirect {
-        /// The 3xx status.
-        status: u16,
-    },
-    /// The feedback could not be encoded within the codec's limits.
-    Feedback(FeedbackError),
-    /// The request body exceeds [`MAX_REQUEST_BYTES`].
-    RequestTooLarge,
-    /// The status and headers arrived, the whole body did not.
-    Body {
-        /// The HTTP status, never a redirect.
-        status: u16,
-        /// The `Retry-After` header value, when present and within its bounds.
-        retry_after: Option<RetryAfter>,
-        /// Why the body was not read whole.
-        failure: BodyFailure,
-    },
-    /// The connect, the request or the header fetch timed out, or the request deadline passed, before a status arrived.
-    Timeout,
-    /// The connection, the request or the response failed before a status arrived.
-    ServerUnreachable,
-}
-
-impl fmt::Display for DdiTransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DdiTransportError::InvalidBaseUrl(case) => write!(f, "DDI base URL refused: {case}"),
-            DdiTransportError::InvalidControllerId => f.write_str("DDI controller id invalid"),
-            DdiTransportError::InsecureHttp => {
-                f.write_str("DDI over plain HTTP needs the ota-ddi-insecure-http feature")
-            }
-            DdiTransportError::TlsUnavailable => f.write_str("DDI over HTTPS is not available yet"),
-            DdiTransportError::ForeignOrigin => f.write_str("DDI link refused by the origin check"),
-            DdiTransportError::Redirect { status } => {
-                write!(f, "DDI request redirected with status {status}")
-            }
-            DdiTransportError::Feedback(e) => fmt::Display::fmt(e, f),
-            DdiTransportError::RequestTooLarge => f.write_str("DDI request body too large"),
-            DdiTransportError::Body {
-                status, failure, ..
-            } => write!(f, "DDI response {status}: {failure}"),
-            DdiTransportError::Timeout => f.write_str("DDI request timed out"),
-            DdiTransportError::ServerUnreachable => f.write_str("DDI server unreachable"),
-        }
-    }
-}
-
-impl std::error::Error for DdiTransportError {}
-
-impl DdiTransportError {
-    /// Experimental: API may change before 1.0.
-    ///
-    /// The tier-neutral form of a failed request that the DDI machine takes (`juggler::ota::ddi::RequestOutcome`), the one place this tier maps its errors onto it.
-    ///
-    /// `None` for an error raised before any request was sent: a construction error ([`DdiTransport::new`]), a feedback that could not be encoded or a request body over [`MAX_REQUEST_BYTES`].
-    /// A successful request is `RequestOutcome::Response`.
-    ///
-    /// ```
-    /// use rustyfarian_esp_idf_network::ota::ddi::{DdiTransportError, RequestOutcome};
-    ///
-    /// assert_eq!(DdiTransportError::Timeout.into_outcome(), Some(RequestOutcome::Timeout));
-    /// assert_eq!(DdiTransportError::RequestTooLarge.into_outcome(), None);
-    /// ```
-    pub fn into_outcome(self) -> Option<RequestOutcome> {
-        match self {
-            DdiTransportError::Body {
-                status,
-                retry_after,
-                failure,
-            } => Some(RequestOutcome::BodyFailed {
-                status,
-                retry_after,
-                failure,
-            }),
-            DdiTransportError::Timeout => Some(RequestOutcome::Timeout),
-            DdiTransportError::ServerUnreachable => Some(RequestOutcome::Unreachable),
-            DdiTransportError::Redirect { status } => Some(RequestOutcome::Redirect { status }),
-            DdiTransportError::ForeignOrigin => Some(RequestOutcome::ForeignOrigin),
-            DdiTransportError::InvalidBaseUrl(_)
-            | DdiTransportError::InvalidControllerId
-            | DdiTransportError::InsecureHttp
-            | DdiTransportError::TlsUnavailable
-            | DdiTransportError::Feedback(_)
-            | DdiTransportError::RequestTooLarge => None,
-        }
-    }
-}
-
-impl From<EndpointError> for DdiTransportError {
-    fn from(e: EndpointError) -> Self {
-        match e {
-            EndpointError::InvalidBaseUrl(case) => DdiTransportError::InvalidBaseUrl(case),
-            EndpointError::InvalidControllerId => DdiTransportError::InvalidControllerId,
-        }
-    }
-}
 
 /// Experimental: API may change before 1.0.
 ///

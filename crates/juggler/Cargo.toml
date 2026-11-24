@@ -32,6 +32,10 @@ ota-wire = ["ota", "dep:serde", "dep:serde_json"]
 # Needs alloc. Separate from `ota-wire` (the MQTT wire); both share `ota::wire::FailReason`.
 # `zeroize` scrubs the target token (`ota::ddi::DdiToken`) on drop.
 ota-ddi = ["ota", "dep:serde", "dep:serde_json", "dep:zeroize"]
+# The NOR-flash backend of the OTA record store (`ota::persist::FlashKv`): an append-only,
+# CRC-checked snapshot log over `embedded-storage`, for a platform without NVS (the esp-hal tier).
+# no_std, no alloc.
+ota-flash-kv = ["ota", "dep:embedded-storage"]
 # `lora` is not implied: a Wi-Fi + MQTT device must not pull lorawan-device.
 # Enable `lora` alongside for `LoraFields::to_lora_config`.
 provisioning = ["wifi", "mqtt", "dep:heapless", "dep:zeroize"]

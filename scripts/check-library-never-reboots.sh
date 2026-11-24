@@ -53,11 +53,11 @@ if find crates/rustyfarian-esp-idf-network/src/ota crates/juggler/src/ota/persis
 fi
 
 runtime_dirs=""
-for dir in crates/juggler/src/ota/runtime crates/juggler/src/ota/health.rs crates/rustyfarian-esp-idf-network/src/ota/runtime crates/rustyfarian-esp-idf-network/src/ota/ddi crates/rustyfarian-esp-idf-network/src/ota/health_driver.rs; do
+for dir in crates/juggler/src/ota/runtime crates/juggler/src/ota/health.rs crates/juggler/src/ota/ddi/worker.rs crates/juggler/src/ota/ddi/download_flow.rs crates/juggler/src/ota/ddi/boot.rs crates/rustyfarian-esp-idf-network/src/ota/runtime crates/rustyfarian-esp-idf-network/src/ota/ddi crates/rustyfarian-esp-idf-network/src/ota/health_driver.rs crates/rustyfarian-esp-hal-network/src/ota/ddi crates/rustyfarian-esp-hal-network/src/ota/ddi.rs crates/rustyfarian-esp-hal-network/src/ota/flags.rs; do
   if [ -e "$dir" ]; then runtime_dirs="$runtime_dirs $dir"; fi
 done
 if [ -n "$runtime_dirs" ]; then
-  grep -rHnE 'esp_restart|reset::restart|\brestart\(|esp_ota_|mark_running_slot|set_boot_slot|initiate_update' $runtime_dirs > tmp/ota-runtime-reboots.txt 2>&1 || true
+  grep -rHnE 'esp_restart|reset::restart|software_reset|\brestart\(|esp_ota_|mark_running_slot|set_boot_slot|initiate_update' $runtime_dirs > tmp/ota-runtime-reboots.txt 2>&1 || true
   if [ -s tmp/ota-runtime-reboots.txt ]; then
     cat tmp/ota-runtime-reboots.txt
     echo "ERROR: Found a restart, boot-slot or update-start call in the OTA runtime; restarts go through the app's restart callback"

@@ -67,16 +67,21 @@ pub use juggler::wifi::{
 /// invariant is enforced at the source rather than via parallel comments
 /// in the example and the driver.
 ///
-/// With the `mqtt` feature `embassy-net/dns` is on, and `embassy-net` then adds
+/// With the `mqtt` or `ota-ddi` feature `embassy-net/dns` is on, and `embassy-net` then adds
 /// one permanent DNS socket to every stack, so the count is one higher; the
 /// spare slot stays free.
-pub const SUBSTRATE_SOCKET_COUNT: usize = 4 + cfg!(feature = "mqtt") as usize;
+pub const SUBSTRATE_SOCKET_COUNT: usize =
+    4 + cfg!(any(feature = "mqtt", feature = "ota-ddi")) as usize;
 
 /// `embassy-net` `StackResources<N>` size for the station stack.
 ///
 /// DHCP, one TCP and one UDP socket, plus the permanent DNS socket that
-/// `embassy-net` adds when the `mqtt` feature enables its `dns` feature.
-pub const STA_SOCKET_COUNT: usize = 3 + cfg!(feature = "mqtt") as usize;
+/// `embassy-net` adds when the `mqtt` or `ota-ddi` feature enables its `dns` feature,
+/// plus, with `ota-ddi`, the two TCP sockets the DDI transport opens at once (a
+/// request and an artifact download).
+pub const STA_SOCKET_COUNT: usize = 3
+    + cfg!(any(feature = "mqtt", feature = "ota-ddi")) as usize
+    + 2 * cfg!(feature = "ota-ddi") as usize;
 
 pub use pennant::{NoLed, SimpleLed, StatusLed};
 

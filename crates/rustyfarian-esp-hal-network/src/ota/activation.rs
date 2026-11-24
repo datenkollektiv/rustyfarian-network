@@ -31,6 +31,10 @@ const ERASED: u32 = 0xFFFF_FFFF;
 /// `esp_ota_img_states_t` `ESP_OTA_IMG_NEW`.
 const STATE_NEW: u32 = 0x0;
 
+/// `esp_ota_img_states_t` `ESP_OTA_IMG_PENDING_VERIFY`.
+#[cfg(any(feature = "ota-ddi", test))]
+const STATE_PENDING_VERIFY: u32 = 0x1;
+
 /// `esp_ota_img_states_t` `ESP_OTA_IMG_VALID`.
 pub(super) const STATE_VALID: u32 = 0x2;
 
@@ -212,6 +216,108 @@ pub(super) fn plan_activation(
     Ok(Plan {
         sector,
         entry: encode_entry(seq, STATE_NEW),
+    })
+}
+
+/// What the boot-fact reader read: both otadata entries, the number of OTA app slots, and the OTA
+/// app number of the partition that is running (`None` for a factory or any other non-OTA app).
+#[cfg(any(feature = "ota-ddi", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OtadataRead {
+    pub sectors: [Entry; 2],
+    pub ota_count: usize,
+    pub running_app: Option<u8>,
+}
+
+/// The slot id of OTA app `app`: `ota_0` and `ota_1` by index, any other app `FACTORY_SLOT`, as
+/// `slot_for_partition` maps labels on the ESP-IDF tier (v1 assumes two OTA slots).
+#[cfg(any(feature = "ota-ddi", test))]
+fn slot_of_app(app: u8) -> juggler::ota::SlotId {
+    if app < 2 {
+        juggler::ota::SlotId(app)
+    } else {
+        juggler::ota::FACTORY_SLOT
+    }
+}
+
+/// The state ESP-IDF's `esp_ota_get_state_partition` reports for OTA app `app`, mapped like
+/// esp-idf-svc 0.53 `EspOta::get_state`: the first entry (sector 0 first) with an intact CRC whose
+/// sequence selects `app`, whatever its state; `Unknown` without one.
+#[cfg(any(feature = "ota-ddi", test))]
+fn app_state(sectors: &[Entry; 2], ota_count: usize, app: u8) -> juggler::ota::SlotState {
+    use juggler::ota::SlotState;
+    let Some(n) = u32::try_from(ota_count)
+        .ok()
+        .filter(|n| (1..=16).contains(n))
+    else {
+        return SlotState::Unknown;
+    };
+    for entry in sectors {
+        let seq = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        let state = u32::from_le_bytes([entry[24], entry[25], entry[26], entry[27]]);
+        let crc = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+        if seq != ERASED
+            && crc == crc32(&seq.to_le_bytes())
+            && seq.wrapping_sub(1) % n == u32::from(app)
+        {
+            return match state {
+                STATE_NEW | STATE_PENDING_VERIFY => SlotState::PendingVerify,
+                STATE_VALID => SlotState::Valid,
+                STATE_INVALID | STATE_ABORTED => SlotState::Invalid,
+                _ => SlotState::Unknown,
+            };
+        }
+    }
+    SlotState::Unknown
+}
+
+/// The OTA app ESP-IDF's `esp_ota_get_next_update_partition(NULL)` names: the one after the
+/// running OTA app, `ota_0` from a factory image, none without OTA apps or when the only one runs.
+#[cfg(any(feature = "ota-ddi", test))]
+fn next_update_app(running_app: Option<u8>, ota_count: usize) -> Option<u8> {
+    if ota_count == 0 || ota_count > 16 {
+        return None;
+    }
+    let next = match running_app {
+        None => 0,
+        Some(app) => ((usize::from(app) + 1) % ota_count) as u8,
+    };
+    (Some(next) != running_app).then_some(next)
+}
+
+/// The hardware facts of boot reconciliation from one otadata read, the shape the ESP-IDF tier
+/// reads from `EspOta` (running slot and state, update slot and state).
+///
+/// A failed read (`Err` with the reader's code) is [`HardwareReadError::Read`]; this tier has no
+/// handle that can be busy, so the result is never `Busy`.
+/// Unlike the ESP-IDF tier, which reports `Unknown` states when only the otadata is unreadable,
+/// an unreadable otadata fails the whole read here: boot reconciliation then fails closed.
+///
+/// [`HardwareReadError::Read`]: juggler::ota::HardwareReadError::Read
+#[cfg(any(feature = "ota-ddi", test))]
+pub(super) fn hardware_facts(
+    read: Result<OtadataRead, i32>,
+) -> Result<juggler::ota::HardwareFacts, juggler::ota::HardwareReadError> {
+    use juggler::ota::{HardwareFacts, HardwareReadError, SlotState, UpdateSlot, FACTORY_SLOT};
+    let read = read.map_err(HardwareReadError::Read)?;
+    let update_slot = match next_update_app(read.running_app, read.ota_count) {
+        Some(app) => UpdateSlot::Present(
+            slot_of_app(app),
+            app_state(&read.sectors, read.ota_count, app),
+        ),
+        None => UpdateSlot::Absent,
+    };
+    Ok(match read.running_app {
+        Some(app) => HardwareFacts {
+            running_slot: slot_of_app(app),
+            running_state: app_state(&read.sectors, read.ota_count, app),
+            update_slot,
+        },
+        None => HardwareFacts {
+            running_slot: FACTORY_SLOT,
+            running_state: SlotState::Unknown,
+            update_slot,
+        },
     })
 }
 
@@ -407,6 +513,175 @@ mod tests {
         255, 255, 255, 255, 1, 0, 0, 0, 17, 80, 74, 237,
     ];
     const ERASED_ENTRY: Entry = [0xFF; ENTRY_LEN];
+
+    mod hardware_facts {
+        use super::super::{hardware_facts, OtadataRead, STATE_ABORTED, STATE_INVALID};
+        use super::*;
+        use juggler::ota::{
+            HardwareFacts, HardwareReadError, SlotId, SlotState, UpdateSlot, FACTORY_SLOT,
+        };
+
+        fn read(sectors: [Entry; 2], running_app: Option<u8>) -> Result<OtadataRead, i32> {
+            Ok(OtadataRead {
+                sectors,
+                ota_count: 2,
+                running_app,
+            })
+        }
+
+        fn facts(
+            running: SlotId,
+            state: SlotState,
+            update: UpdateSlot,
+        ) -> Result<HardwareFacts, HardwareReadError> {
+            Ok(HardwareFacts {
+                running_slot: running,
+                running_state: state,
+                update_slot: update,
+            })
+        }
+
+        #[test]
+        fn a_valid_ota_0_with_an_untouched_ota_1() {
+            assert_eq!(
+                hardware_facts(read([COUNT_1_VALID, ERASED_ENTRY], Some(0))),
+                facts(
+                    SlotId(0),
+                    SlotState::Valid,
+                    UpdateSlot::Present(SlotId(1), SlotState::Unknown)
+                )
+            );
+        }
+
+        #[test]
+        fn a_valid_ota_1_with_the_previous_valid_ota_0() {
+            let sectors = [COUNT_1_VALID, encode_entry(2, STATE_VALID)];
+            assert_eq!(
+                hardware_facts(read(sectors, Some(1))),
+                facts(
+                    SlotId(1),
+                    SlotState::Valid,
+                    UpdateSlot::Present(SlotId(0), SlotState::Valid)
+                )
+            );
+        }
+
+        #[test]
+        fn a_new_or_pending_image_reads_pending_verify() {
+            for second in [COUNT_2_NEW, encode_entry(2, 1)] {
+                assert_eq!(
+                    hardware_facts(read([COUNT_1_VALID, second], Some(1))),
+                    facts(
+                        SlotId(1),
+                        SlotState::PendingVerify,
+                        UpdateSlot::Present(SlotId(0), SlotState::Valid)
+                    )
+                );
+            }
+            // `ota_0` again (sequence 3) while `ota_1` keeps its old valid entry.
+            assert_eq!(
+                hardware_facts(read(
+                    [COUNT_3_PENDING, encode_entry(2, STATE_VALID)],
+                    Some(0)
+                )),
+                facts(
+                    SlotId(0),
+                    SlotState::PendingVerify,
+                    UpdateSlot::Present(SlotId(1), SlotState::Valid)
+                )
+            );
+        }
+
+        #[test]
+        fn the_other_slot_rolled_back_reads_invalid() {
+            for dead in [STATE_ABORTED, STATE_INVALID] {
+                let sectors = [COUNT_1_VALID, encode_entry(2, dead)];
+                assert_eq!(
+                    hardware_facts(read(sectors, Some(0))),
+                    facts(
+                        SlotId(0),
+                        SlotState::Valid,
+                        UpdateSlot::Present(SlotId(1), SlotState::Invalid)
+                    )
+                );
+            }
+        }
+
+        #[test]
+        fn a_factory_image_runs_with_ota_0_as_the_update_slot() {
+            assert_eq!(
+                hardware_facts(read([ERASED_ENTRY, ERASED_ENTRY], None)),
+                facts(
+                    FACTORY_SLOT,
+                    SlotState::Unknown,
+                    UpdateSlot::Present(SlotId(0), SlotState::Unknown)
+                )
+            );
+        }
+
+        #[test]
+        fn a_torn_entry_is_not_a_state() {
+            let mut torn = COUNT_2_NEW;
+            torn[28] ^= 0xFF;
+            assert_eq!(
+                hardware_facts(read([COUNT_1_VALID, torn], Some(1))),
+                facts(
+                    SlotId(1),
+                    SlotState::Unknown,
+                    UpdateSlot::Present(SlotId(0), SlotState::Valid)
+                )
+            );
+        }
+
+        #[test]
+        fn without_a_second_ota_slot_there_is_no_update_slot() {
+            let one = Ok(OtadataRead {
+                sectors: [COUNT_1_VALID, ERASED_ENTRY],
+                ota_count: 1,
+                running_app: Some(0),
+            });
+            assert_eq!(
+                hardware_facts(one),
+                facts(SlotId(0), SlotState::Valid, UpdateSlot::Absent)
+            );
+            let none = Ok(OtadataRead {
+                sectors: [ERASED_ENTRY, ERASED_ENTRY],
+                ota_count: 0,
+                running_app: None,
+            });
+            assert_eq!(
+                hardware_facts(none),
+                facts(FACTORY_SLOT, SlotState::Unknown, UpdateSlot::Absent)
+            );
+        }
+
+        #[test]
+        fn a_third_ota_slot_maps_like_the_esp_idf_labels() {
+            let three = Ok(OtadataRead {
+                sectors: [encode_entry(3, STATE_VALID), ERASED_ENTRY],
+                ota_count: 3,
+                running_app: Some(2),
+            });
+            assert_eq!(
+                hardware_facts(three),
+                facts(
+                    FACTORY_SLOT,
+                    SlotState::Valid,
+                    UpdateSlot::Present(SlotId(0), SlotState::Unknown)
+                )
+            );
+        }
+
+        #[test]
+        fn unreadable_otadata_fails_and_is_never_busy() {
+            for code in [-1, 0x105, i32::MIN] {
+                assert_eq!(
+                    hardware_facts(Err(code)),
+                    Err(HardwareReadError::Read(code))
+                );
+            }
+        }
+    }
 
     #[test]
     fn entries_match_the_crates_golden_bytes() {

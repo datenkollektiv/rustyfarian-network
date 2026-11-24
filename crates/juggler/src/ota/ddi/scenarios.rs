@@ -61,10 +61,16 @@ use crate::ota::ddi::{
     RetryAfter, SendOutcome, UrlRefusal, VerdictSender, VerdictStep, WorkOutcome,
     WALL_CLOCK_FLOOR_SECS,
 };
+use crate::ota::ddi::{
+    after_repair, plan_boot, repair_at_boot, DdiRequest, DdiSettings, DdiWorker, DownloadFlow,
+    DownloadFlowAction, DownloadFlowInput, SettleNote, Stamp, Wake, WorkerAction, WorkerConfig,
+    WorkerEvent, WorkerInput,
+};
 use crate::ota::download::{CancelGate, DownloadAction, DownloadInput, DownloadMachine, ImageChip};
 use crate::ota::health::{
     deadline_plan, poll_decision, refresh_after_repair, repair_all, repair_report_owed,
-    HealthConfig, PollStep, RuntimeFlags,
+    HealthAction, HealthConfig, HealthFlow, HealthInput, HealthNote, HealthVerdict, PollStep,
+    RuntimeFlags, SlotReading,
 };
 use crate::ota::persist::fault_kv::FaultKv;
 use crate::ota::persist::keys::STAGE_CLOSED;
@@ -284,6 +290,18 @@ struct Server {
     queues: BTreeMap<Kind, VecDeque<Reply>>,
     standing: BTreeMap<Kind, Reply>,
     requests: Vec<Req>,
+}
+
+/// The differential trace keeps every request the device made, in order.
+impl Drop for Server {
+    fn drop(&mut self) {
+        for r in &self.requests {
+            record(format!(
+                "request {:?} {} t={:?} {}",
+                r.kind, r.url, r.t, r.body
+            ));
+        }
+    }
 }
 
 impl Server {
@@ -761,6 +779,8 @@ struct InFlight {
     last_error: Option<OtaError>,
     /// The wait the failed attempt's `Retry-After` asked for.
     retry_after: Option<Duration>,
+    /// The failed attempt's `Retry-After` as the transport captured it; the machine driver reads it against the wall clock itself.
+    retry_after_raw: Option<RetryAfter>,
 }
 
 const CHUNK: usize = 1024;
@@ -874,6 +894,17 @@ struct Device {
     cancel_at_giveup: bool,
     /// Every failed attempt the retry policy sent back to a back-off: when it failed and why.
     download_retries: Vec<(Duration, OtaError)>,
+    /// Which composition drives the machines (see [`differential`]).
+    driver: Driver,
+    /// The machine driver's worker, rebuilt at each boot; started at the first poll cycle.
+    worker: Option<DdiWorker>,
+    worker_started: bool,
+    /// The machine driver's health policy, started when it is first due.
+    health: Option<HealthFlow>,
+    /// The machine driver's download flow of the live download.
+    flow: Option<DownloadFlow>,
+    /// Wake-ups the machine driver keeps for the worker until its next sleep.
+    wake: Wake,
 }
 
 impl Device {
@@ -952,6 +983,12 @@ impl Device {
             cancel_after_failure: false,
             cancel_at_giveup: false,
             download_retries: Vec::new(),
+            driver: DRIVER.get(),
+            worker: None,
+            worker_started: false,
+            health: None,
+            flow: None,
+            wake: Wake::default(),
         }
     }
 
@@ -1026,6 +1063,10 @@ impl Device {
         self.store = OtaStore::open(self.kv.clone(), || 1);
         let running_slot = self.running_slot;
         let _ = note_boot_slot(&mut self.store, || Ok(running_slot));
+        if self.driver == Driver::Machines {
+            self.boot_machines();
+            return;
+        }
         let hw = self.hardware();
         let running = self.running();
         let outcome = reconcile_boot(&mut self.store, Ok(hw), Some(running));
@@ -1098,6 +1139,7 @@ impl Device {
     /// The MQTT nudge arrives; its payload never reaches the machine, because `PollMachine::nudge` takes none.
     fn nudge(&mut self) {
         self.nudge_pending = true;
+        self.wake.nudge = true;
         if let Some(at) = self.next_poll_at {
             if at > self.now {
                 self.next_poll_at = Some(self.now);
@@ -1161,6 +1203,10 @@ impl Device {
     // ── the health policy ────────────────────────────────────────────────────────
 
     fn health_step(&mut self, srv: &mut Server) {
+        if self.driver == Driver::Machines {
+            self.health_step_machines(srv);
+            return;
+        }
         if self.slots[idx(self.running_slot)].state != SlotState::PendingVerify {
             // The IDF driver answers `NothingToVerify` at once for a slot that is not pending: nothing is marked.
             self.settle_health(Event::HealthNothingToVerify);
@@ -1217,7 +1263,15 @@ impl Device {
     // ── the poll loop ────────────────────────────────────────────────────────────
 
     fn poll_cycle(&mut self, srv: &mut Server) {
+        if self.driver == Driver::Machines {
+            self.poll_cycle_machines(srv);
+            return;
+        }
         let epoch = self.epoch;
+        // As the IDF worker's `sleep_until`: a poll that is due anyway serves a kept nudge, which is cleared.
+        if self.poller.next_poll_at().is_some_and(|at| at <= self.now) {
+            self.nudge_pending = false;
+        }
         let mut input = PollInput::Tick;
         loop {
             let answered = matches!(input, PollInput::Answered(_));
@@ -1422,6 +1476,18 @@ impl Device {
     // ── the download thread ──────────────────────────────────────────────────────
 
     fn start_download(&mut self, srv: &mut Server, offer: AdmittedOffer, target: SlotId) {
+        if self.driver == Driver::Machines {
+            let mut flow = DownloadFlow::new(offer.action.clone(), &self.settings());
+            let at = self.stamp();
+            let first = flow.poll(&mut self.store, DownloadFlowInput::Start, at);
+            assert_eq!(
+                first,
+                DownloadFlowAction::Attempt {
+                    remaining: FIRMWARE_DEADLINE
+                }
+            );
+            self.flow = Some(flow);
+        }
         self.begin_attempt(srv, offer, target, self.now, 1, CancelGate::for_retries());
     }
 
@@ -1450,6 +1516,7 @@ impl Device {
             .into_string();
         let reply = srv.request(Kind::E8, &url, "", self.now);
         let mut retry_after = None;
+        let mut retry_after_raw = None;
         let (input, bytes) = match reply {
             Reply::Status {
                 status: 200,
@@ -1473,9 +1540,8 @@ impl Device {
                 retry_after: text,
                 ..
             } => {
-                retry_after = text
-                    .and_then(RetryAfter::capture)
-                    .and_then(|r| r.delay(self.wall()));
+                retry_after_raw = text.and_then(RetryAfter::capture);
+                retry_after = retry_after_raw.clone().and_then(|r| r.delay(self.wall()));
                 (
                     DownloadInput::ConnectFailed(OtaError::DownloadFailed { status }),
                     Vec::new(),
@@ -1505,6 +1571,7 @@ impl Device {
             waiting: false,
             last_error: None,
             retry_after,
+            retry_after_raw,
         });
         self.download_step(srv);
     }
@@ -1514,6 +1581,10 @@ impl Device {
         let Some(mut d) = self.download.take() else {
             return;
         };
+        if d.waiting && self.driver == Driver::Machines {
+            self.wait_ended_machines(srv, d);
+            return;
+        }
         if d.waiting {
             let over = self.now.saturating_sub(d.first_started) >= FIRMWARE_DEADLINE;
             if d.gate.is_requested() {
@@ -1581,6 +1652,10 @@ impl Device {
                     slot.state = SlotState::PendingVerify;
                     self.boot_slot = d.target;
                     DownloadInput::Activated(Ok(()))
+                }
+                DownloadAction::Done(result) if self.driver == Driver::Machines => {
+                    self.attempt_ended_machines(srv, d, result);
+                    return;
                 }
                 DownloadAction::Done(Ok(())) => {
                     assert_eq!(self.store.mark_boot_selected(), Ok(()));
@@ -1760,6 +1835,509 @@ impl Device {
                 }
                 CancelStep::Ignored => panic!("the cancel machine ignored its input"),
             };
+        }
+    }
+}
+
+// ── SCENARIO-HARNESS-MACHINES ────────────────────────────────────────────────────
+
+/// Which composition a [`Device`] runs; [`differential`] runs every row under both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    /// The IDF-order reference above: the device composes the sans-IO machines itself, in the order of the ESP-IDF worker, download thread, health driver and boot.
+    Reference,
+    /// The juggler compositions a tier drives: [`DdiWorker`], [`DownloadFlow`], [`HealthFlow`] and the boot plan functions ([`plan_boot`], [`repair_at_boot`], [`after_repair`]).
+    Machines,
+}
+
+std::thread_local! {
+    static DRIVER: core::cell::Cell<Driver> = const { core::cell::Cell::new(Driver::Reference) };
+    static TRACE: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Appends one line to the differential trace of the running row.
+fn record(line: String) {
+    TRACE.with(|t| t.borrow_mut().push(line));
+}
+
+/// Runs one row under both drivers and asserts the same trace: every request in order with its time, URL and body (feedback codes and details included), the persisted records at the end, and the device's observations.
+fn differential(row: impl Fn()) {
+    let reference = run_as(Driver::Reference, &row);
+    let machines = run_as(Driver::Machines, &row);
+    if reference != machines {
+        std::eprintln!("reference trace:\n{}", reference.join("\n"));
+        std::eprintln!("machines trace:\n{}", machines.join("\n"));
+    }
+    for (i, (r, m)) in reference.iter().zip(&machines).enumerate() {
+        assert_eq!(
+            r, m,
+            "trace line {i}: the machines differ from the IDF-order reference"
+        );
+    }
+    assert_eq!(
+        reference.len(),
+        machines.len(),
+        "the machines' trace is {} lines, the reference's {}",
+        machines.len(),
+        reference.len()
+    );
+}
+
+fn run_as(driver: Driver, row: &impl Fn()) -> Vec<String> {
+    DRIVER.set(driver);
+    TRACE.take();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(row));
+    DRIVER.set(Driver::Reference);
+    if let Err(e) = result {
+        let msg = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        panic!("{driver:?} driver: {msg}");
+    }
+    TRACE.take()
+}
+
+/// The differential trace keeps the persisted records and what the device observed.
+impl Drop for Device {
+    fn drop(&mut self) {
+        record(format!("store {:?}", self.kv.snapshot()));
+        record(format!("events {:?}", self.events));
+        record(format!("boots {:?}", self.boots));
+        record(format!("admissions {:?}", self.admissions));
+        record(format!("poll verdicts {:?}", self.poll_verdicts));
+        record(format!("cancels {:?}", self.cancel_results));
+        record(format!("download errors {:?}", self.download_errors));
+        record(format!("download retries {:?}", self.download_retries));
+        record(format!(
+            "slots {:?} running {:?} boot {:?}",
+            self.slots, self.running_slot, self.boot_slot
+        ));
+    }
+}
+
+impl Device {
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            now: self.now,
+            wall_millis: self.ts(),
+            random: 0,
+        }
+    }
+
+    /// The runtime settings the machines are built from: the device's version, floor and board, and the default timings the reference spells out as constants.
+    fn settings(&self) -> DdiSettings {
+        let mut settings = DdiSettings::new(self.running(), BOARD).expect("settings");
+        settings.floor = self.floor;
+        assert_eq!(settings.timings.firmware_deadline, FIRMWARE_DEADLINE);
+        assert_eq!(settings.timings.restart_grace, RESTART_GRACE);
+        assert_eq!(
+            Duration::from_secs(settings.timings.firmware_timeout_secs),
+            PER_OP
+        );
+        assert_eq!(settings.timings.health, self.health_cfg);
+        settings
+    }
+
+    /// The boot of the machine driver: the flat boot plan, then a fresh worker that starts at the first poll cycle (where it sends the post-boot `proceeding`, at the same time as the reference does it here).
+    fn boot_machines(&mut self) {
+        let hw = self.hardware();
+        let running = self.running();
+        let plan = plan_boot(&mut self.store, Ok(hw), running);
+        self.boots.push(format!("{:?}", plan.outcome.disposition));
+        let mut flags = plan.flags;
+        let mut report_owed = false;
+        if plan.needs_repair() {
+            let repaired = repair_at_boot(&mut self.store);
+            let hw = self.hardware();
+            report_owed =
+                after_repair(&mut self.store, repaired, Ok(hw), running, &mut flags).report_owed;
+        }
+        assert!(
+            !flags.roll_back_now_at_boot,
+            "the fake device does not model a rollback demanded at boot"
+        );
+        self.flags = flags;
+        let config = WorkerConfig::new(
+            &self.settings(),
+            self.chip.clone(),
+            SLOT_CAPACITY,
+            &flags,
+            report_owed,
+        );
+        self.worker = Some(DdiWorker::new(self.endpoint.clone(), config));
+        self.worker_started = false;
+        self.health = None;
+        self.flow = None;
+        self.wake = Wake::default();
+        self.download = None;
+        self.restart_at = None;
+        self.nudge_pending = false;
+        self.boot_at = self.now;
+        self.next_poll_at = Some(self.now);
+        self.health_at = if flags.health_settled {
+            None
+        } else {
+            Some(self.now + self.health_cfg.healthy_dwell)
+        };
+        self.events.push((self.now, Event::Boot));
+    }
+
+    /// The worker until it sleeps: each action is performed against the fake server and the fake hardware.
+    fn poll_cycle_machines(&mut self, srv: &mut Server) {
+        let epoch = self.epoch;
+        let mut input = if self.worker_started {
+            WorkerInput::Woken(core::mem::take(&mut self.wake))
+        } else {
+            self.worker_started = true;
+            WorkerInput::Start {
+                health_settled: self.flags.health_settled,
+            }
+        };
+        loop {
+            let at = self.stamp();
+            let worker = self.worker.as_mut().expect("a worker after boot");
+            // The reference reads the floor live, and S-DEV-09 case f raises it mid-life.
+            worker.config_mut().floor = self.floor;
+            let action = worker.poll(&mut self.store, input, at);
+            let events = worker.drain_events();
+            self.observe(events);
+            input = match action {
+                WorkerAction::Send(request) => match self.perform(srv, request) {
+                    Some(input) => input,
+                    None => return,
+                },
+                WorkerAction::ReadHardware(_) => WorkerInput::Hardware(Ok(self.hardware())),
+                WorkerAction::SetFlags {
+                    records_suspect,
+                    refuse_mark_valid,
+                } => {
+                    self.flags.records_suspect = records_suspect;
+                    self.flags.refuse_mark_valid = refuse_mark_valid;
+                    WorkerInput::FlagsSet
+                }
+                WorkerAction::StartDownload(offer) => {
+                    if self.crash == CrashPoint::AfterFirstProceeding {
+                        self.crash = CrashPoint::None;
+                        self.crash(srv);
+                        return;
+                    }
+                    let target = other(self.running_slot);
+                    self.start_download(srv, offer, target);
+                    WorkerInput::DownloadStarted(true)
+                }
+                WorkerAction::CheckDownload => {
+                    WorkerInput::DownloadRunning(self.download.is_some())
+                }
+                WorkerAction::RequestStop => {
+                    WorkerInput::StopRequested(match self.download.as_mut() {
+                        Some(d) => d.gate.request(),
+                        None => CancelRequest::TooLate,
+                    })
+                }
+                WorkerAction::AwaitDownload => {
+                    self.finish_download(srv);
+                    WorkerInput::DownloadEnded
+                }
+                WorkerAction::Sleep { until } => {
+                    // A kept wake-up is handed over at once, as the tier's wake signal would end the sleep.
+                    self.next_poll_at = match until {
+                        Some(_) if self.wake.any() => Some(self.now),
+                        until => until,
+                    };
+                    return;
+                }
+                WorkerAction::Ignored => panic!("the worker ignored its input"),
+            };
+            if self.epoch != epoch {
+                return;
+            }
+        }
+    }
+
+    /// One request of the worker, through the same fake transport as the reference; `None` when a crash point cut the device.
+    fn perform(&mut self, srv: &mut Server, request: DdiRequest) -> Option<WorkerInput> {
+        let outcome = match &request {
+            DdiRequest::Poll => {
+                let url = self.endpoint.poll_url().to_string();
+                let outcome = self.request(srv, Kind::E1, &url, "");
+                return Some(WorkerInput::PollAnswered {
+                    outcome,
+                    admission_open: self.flags.admission_open,
+                });
+            }
+            DdiRequest::ConfigData => {
+                let body = self
+                    .worker
+                    .as_ref()
+                    .expect("a worker")
+                    .config_data()
+                    .encode();
+                let url = self.endpoint.config_data_url();
+                self.request(srv, Kind::E6, &url, &body)
+            }
+            DdiRequest::Deployment(href) => match self.endpoint.check_href(href) {
+                Ok(url) => self.request(srv, Kind::E2, url.as_str(), ""),
+                Err(_) => RequestOutcome::ForeignOrigin,
+            },
+            DdiRequest::CancelAction(href) => match self.endpoint.check_href(href) {
+                Ok(url) => self.request(srv, Kind::E4, url.as_str(), ""),
+                Err(_) => RequestOutcome::ForeignOrigin,
+            },
+            DdiRequest::Feedback(_) | DdiRequest::Verdict { .. } => {
+                let verdict = matches!(request, DdiRequest::Verdict { .. });
+                if verdict && self.crash == CrashPoint::BeforeVerdictSend {
+                    self.crash = CrashPoint::None;
+                    self.crash(srv);
+                    return None;
+                }
+                let post = request.feedback().expect("a feedback request");
+                let kind = match post.path {
+                    FeedbackPath::Deployment => Kind::E3,
+                    FeedbackPath::Cancel => Kind::E5,
+                };
+                let url = post.url(&self.endpoint);
+                let body = post.feedback().encode().expect("a feedback encodes");
+                let outcome = self.request(srv, kind, &url, &body);
+                if verdict && self.crash == CrashPoint::AfterVerdictSend {
+                    self.crash = CrashPoint::None;
+                    self.crash(srv);
+                    return None;
+                }
+                outcome
+            }
+        };
+        Some(WorkerInput::Answered(outcome))
+    }
+
+    /// The worker's events, mapped to what the reference records; an internal error fails the row.
+    fn observe(&mut self, events: Vec<WorkerEvent>) {
+        for event in events {
+            match event {
+                WorkerEvent::PollAnswered(verdict) => self.poll_verdicts.push(verdict),
+                WorkerEvent::NotRetrieved(t) => {
+                    self.admissions.push(format!("not_retrieved {t:?}"))
+                }
+                WorkerEvent::Unreportable(reason) => {
+                    self.admissions.push(format!("unreportable {reason}"));
+                }
+                WorkerEvent::Deferred(action) => self.admissions.push(format!("deferred {action}")),
+                WorkerEvent::Refused(refusal) => {
+                    let case = refusal
+                        .url_case
+                        .map(|c| format!(" {}", c.name()))
+                        .unwrap_or_default();
+                    self.admissions.push(format!(
+                        "refused {} {} {}{case}",
+                        refusal.action,
+                        refusal.code.as_u16(),
+                        refusal.reason
+                    ));
+                }
+                WorkerEvent::Admitted { action, .. } => {
+                    self.admissions.push(format!("admitted {action}"));
+                }
+                WorkerEvent::PendingVerify(action) => {
+                    self.admissions.push(format!("pending_verify {action}"));
+                }
+                WorkerEvent::ActionClosed(action) => {
+                    self.admissions.push(format!("closed {action}"))
+                }
+                WorkerEvent::OfferBlocked(action) => {
+                    self.admissions.push(format!("blocked {action}"));
+                }
+                WorkerEvent::CancelEnded(result) => self.cancel_results.push(result),
+                WorkerEvent::AttemptNotBegun { error, .. } => {
+                    panic!("attempt not begun: {error:?}")
+                }
+                WorkerEvent::VerdictPersisted { note: Err(e), .. }
+                    if e != StoreError::VerdictPending =>
+                {
+                    panic!("verdict not persisted: {e:?}")
+                }
+                WorkerEvent::PollIgnored
+                | WorkerEvent::CancelIgnored
+                | WorkerEvent::VerdictAnswerIgnored
+                | WorkerEvent::VerdictInFlight => panic!("internal error: {event:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The health policy of the machine driver: the flow is started when the reference would first look at the slot (after the dwell) and stepped at each of its waits.
+    fn health_step_machines(&mut self, srv: &mut Server) {
+        let elapsed = self.now.saturating_sub(self.boot_at);
+        let mut input = if self.health.is_some() {
+            HealthInput::Waited
+        } else {
+            self.health = Some(HealthFlow::new(self.health_cfg, self.running()));
+            HealthInput::Start
+        };
+        loop {
+            let refuse = self.flags.refuse_mark_valid;
+            let health = self.health.as_mut().expect("a health flow");
+            let action = health.poll(&mut self.store, input, elapsed, refuse);
+            let note = health.take_note();
+            assert!(
+                !matches!(
+                    note,
+                    Some(HealthNote::CompleteFailed(_) | HealthNote::RollbackNotNoted { .. })
+                ),
+                "{note:?}"
+            );
+            let running = self.running_slot;
+            input = match action {
+                HealthAction::ReadSlot => HealthInput::Slot(
+                    if self.slots[idx(running)].state == SlotState::PendingVerify {
+                        SlotReading::PendingVerify(running)
+                    } else {
+                        SlotReading::NotPending
+                    },
+                ),
+                HealthAction::Wait(pause) => {
+                    self.health_at = Some(self.now + pause);
+                    return;
+                }
+                HealthAction::AskHealthy => {
+                    HealthInput::Healthy(self.slots[idx(running)].image.is_some_and(|i| i.healthy))
+                }
+                HealthAction::MarkValid => {
+                    self.slots[idx(running)].state = SlotState::Valid;
+                    HealthInput::MarkedValid(true)
+                }
+                HealthAction::Done(verdict) => {
+                    self.settle_health_machines(verdict);
+                    return;
+                }
+                HealthAction::Rollback => {
+                    self.slots[idx(running)].state = SlotState::Invalid;
+                    self.boot_slot = other(running);
+                    self.health_at = None;
+                    self.events.push((self.now, Event::HealthDeadline));
+                    self.reboot(srv);
+                    return;
+                }
+                other => panic!("the fake device does not model {other:?}"),
+            };
+        }
+    }
+
+    /// The tier's settle of a health verdict: the flags, then the worker's wake-up.
+    fn settle_health_machines(&mut self, verdict: HealthVerdict) {
+        let event = match verdict {
+            HealthVerdict::Applied => Event::HealthApplied,
+            HealthVerdict::NothingToVerify => Event::HealthNothingToVerify,
+            other => panic!("the fake device does not model {other:?}"),
+        };
+        if verdict.opens_admission() {
+            self.flags.admission_open = true;
+        }
+        self.flags.health_settled = true;
+        self.health_at = None;
+        self.wake.health = Some(verdict);
+        self.events.push((self.now, event));
+        if let Some(at) = self.next_poll_at {
+            self.next_poll_at = Some(at.min(self.now));
+        }
+    }
+
+    fn flow_poll(&mut self, input: DownloadFlowInput) -> DownloadFlowAction {
+        let at = self.stamp();
+        self.flow
+            .as_mut()
+            .expect("a download flow")
+            .poll(&mut self.store, input, at)
+    }
+
+    /// An attempt ended: the flow decides between the restart, a wait and the give-up.
+    fn attempt_ended_machines(
+        &mut self,
+        srv: &mut Server,
+        mut d: InFlight,
+        result: Result<(), OtaError>,
+    ) {
+        if result.is_err() && self.cancel_after_failure {
+            assert_eq!(d.gate.request(), CancelRequest::Accepted);
+        }
+        let input = DownloadFlowInput::AttemptEnded {
+            result,
+            retry_after: d.retry_after_raw.clone(),
+        };
+        match self.flow_poll(input) {
+            DownloadFlowAction::Selected {
+                recorded,
+                proceeding,
+            } => {
+                assert_eq!(recorded, Ok(()));
+                let url = proceeding.url(&self.endpoint);
+                let body = proceeding.feedback().encode().expect("proceeding encodes");
+                let outcome = self.request(srv, Kind::E3, &url, &body);
+                let next = self.flow_poll(DownloadFlowInput::Answered(outcome));
+                let DownloadFlowAction::RestartAt(at) = next else {
+                    panic!("{next:?}");
+                };
+                self.restart_at = Some(at);
+            }
+            DownloadFlowAction::Wait { until, error, .. } => {
+                self.download_retries.push((self.now, error));
+                d.waiting = true;
+                d.last_error = Some(error);
+                d.due = until;
+                self.download = Some(d);
+            }
+            DownloadFlowAction::Close => self.close_machines(&mut d.gate),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The wait between two attempts ended: the next attempt, or the give-up.
+    fn wait_ended_machines(&mut self, srv: &mut Server, mut d: InFlight) {
+        let cancel_requested = d.gate.is_requested();
+        match self.flow_poll(DownloadFlowInput::WaitEnded { cancel_requested }) {
+            DownloadFlowAction::Attempt { remaining } => {
+                assert_eq!(
+                    remaining,
+                    FIRMWARE_DEADLINE.saturating_sub(self.now.saturating_sub(d.first_started))
+                );
+                self.begin_attempt(
+                    srv,
+                    d.offer,
+                    d.target,
+                    d.first_started,
+                    d.attempts + 1,
+                    d.gate,
+                );
+            }
+            DownloadFlowAction::Close => {
+                if !cancel_requested && self.cancel_at_giveup {
+                    assert_eq!(d.gate.request(), CancelRequest::Accepted);
+                }
+                self.close_machines(&mut d.gate);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The give-up: the switch closes, the flow settles the attempt, and the worker gets the ended-download wake-up.
+    fn close_machines(&mut self, gate: &mut CancelGate) {
+        let cancel_first = gate.close();
+        let read = self.flow_poll(DownloadFlowInput::Closed { cancel_first });
+        assert!(
+            matches!(read, DownloadFlowAction::ReadHardware(_)),
+            "{read:?}"
+        );
+        let hw = self.hardware();
+        let ended = self.flow_poll(DownloadFlowInput::Hardware(Ok(hw)));
+        let DownloadFlowAction::Ended(end) = ended else {
+            panic!("{ended:?}");
+        };
+        assert!(matches!(end.settled, SettleNote::Settled(_)), "{end:?}");
+        self.flow = None;
+        self.download_errors.push(end.reason);
+        self.wake.download_ended = true;
+        if let Some(at) = self.next_poll_at {
+            self.next_poll_at = Some(at.min(self.now));
         }
     }
 }
@@ -2002,300 +2580,322 @@ fn boots(d: &Device) -> usize {
 /// S01: a forced assignment is downloaded, verified, booted and reported `closed` + `success` after the reboot.
 #[test]
 fn s01_forced_assignment_installs_and_reports_success() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
 
-    expect_success(&srv, None);
-    assert_eq!(d.running(), v("1.1.0"));
-    assert_eq!(d.admissions, ["admitted 1"]);
-    assert_eq!(boots(&d), 2, "the install reboots once");
-    let terminal_t = srv.terminals()[0].t;
-    assert_eq!(srv.of(Kind::E3)[0].execution(), "proceeding");
-    assert!(
-        srv.of(Kind::E8)[0].t <= terminal_t,
-        "the download precedes the terminal"
-    );
-    assert!(
-        srv.of(Kind::E3)
+        expect_success(&srv, None);
+        assert_eq!(d.running(), v("1.1.0"));
+        assert_eq!(d.admissions, ["admitted 1"]);
+        assert_eq!(boots(&d), 2, "the install reboots once");
+        let terminal_t = srv.terminals()[0].t;
+        assert_eq!(srv.of(Kind::E3)[0].execution(), "proceeding");
+        assert!(
+            srv.of(Kind::E8)[0].t <= terminal_t,
+            "the download precedes the terminal"
+        );
+        assert!(
+            srv.of(Kind::E3)
+                .iter()
+                .all(|r| r.is_terminal() || r.t <= terminal_t),
+            "every progress report precedes the terminal"
+        );
+        let reboot_t = d
+            .events
             .iter()
-            .all(|r| r.is_terminal() || r.t <= terminal_t),
-        "every progress report precedes the terminal"
-    );
-    let reboot_t = d
-        .events
-        .iter()
-        .filter(|(_, e)| *e == Event::Boot)
-        .nth(1)
-        .map(|(t, _)| *t);
-    assert!(
-        reboot_t.is_some_and(|t| t <= terminal_t),
-        "the reboot precedes the terminal"
-    );
-    assert_eq!(
-        config_versions(&srv),
-        ["1.0.0", "1.1.0"],
-        "one configData per boot"
-    );
+            .filter(|(_, e)| *e == Event::Boot)
+            .nth(1)
+            .map(|(t, _)| *t);
+        assert!(
+            reboot_t.is_some_and(|t| t <= terminal_t),
+            "the reboot precedes the terminal"
+        );
+        assert_eq!(
+            config_versions(&srv),
+            ["1.0.0", "1.1.0"],
+            "one configData per boot"
+        );
+    });
 }
 
 /// S02: `attempt` handling is applied like `forced`.
 #[test]
 fn s02_soft_assignment_is_applied_like_forced() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0").handling("attempt", "attempt"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0").handling("attempt", "attempt"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
 
-    expect_success(&srv, None);
-    assert_eq!(d.running(), v("1.1.0"));
+        expect_success(&srv, None);
+        assert_eq!(d.running(), v("1.1.0"));
+    });
 }
 
 /// S09: an image that never turns healthy is rolled back at the failure deadline, and the old image reports
 /// `closed` + `failure` + 1004 with `rolled_back` first; the version stays remembered.
 #[test]
 fn s09_self_rollback_reports_1004_rolled_back() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0").unhealthy("1.1.0");
-    d.run_for(&mut srv, secs(400));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0").unhealthy("1.1.0");
+        d.run_for(&mut srv, secs(400));
 
-    expect_rolled_back(&srv);
-    assert_eq!(d.running(), v("1.0.0"));
-    assert!(d.events.iter().any(|(_, e)| *e == Event::HealthDeadline));
-    assert!(
-        d.boots
-            .last()
-            .is_some_and(|b| b.contains("ReportedRollback")),
-        "{:?}",
-        d.boots
-    );
-    assert_eq!(
-        srv.terminals()[0].details(),
-        ["rolled_back", "health_deadline"]
-    );
-    assert_eq!(d.store.refused(), Ok(Some(v("1.1.0"))));
+        expect_rolled_back(&srv);
+        assert_eq!(d.running(), v("1.0.0"));
+        assert!(d.events.iter().any(|(_, e)| *e == Event::HealthDeadline));
+        assert!(
+            d.boots
+                .last()
+                .is_some_and(|b| b.contains("ReportedRollback")),
+            "{:?}",
+            d.boots
+        );
+        assert_eq!(
+            srv.terminals()[0].details(),
+            ["rolled_back", "health_deadline"]
+        );
+        assert_eq!(d.store.refused(), Ok(Some(v("1.1.0"))));
+    });
 }
 
 /// S17b: a digest that does not match the bytes ends the download after the transfer with 1002
 /// `checksum_mismatch`, before any activation; the device keeps running the old image.
 #[test]
 fn s17b_digest_mismatch_reports_1002_checksum_mismatch() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0").wrong_sha256());
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0").wrong_sha256());
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
 
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].code(), Some(1002));
-    assert_eq!(terminals[0].details(), ["checksum_mismatch"]);
-    assert_eq!(srv.count(Kind::E8), 1);
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(boots(&d), 1, "no reboot");
-    assert_eq!(d.download_errors, [OtaError::ChecksumMismatch]);
-    assert!(
-        d.download_retries.is_empty(),
-        "a final error is not retried"
-    );
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].code(), Some(1002));
+        assert_eq!(terminals[0].details(), ["checksum_mismatch"]);
+        assert_eq!(srv.count(Kind::E8), 1);
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(boots(&d), 1, "no reboot");
+        assert_eq!(d.download_errors, [OtaError::ChecksumMismatch]);
+        assert!(
+            d.download_retries.is_empty(),
+            "a final error is not retried"
+        );
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-01: a transient download error (a 503, then a connection that cannot be made) is retried after the back-off inside the one
 /// deadline; the install then completes with `closed` + `success` and no 1001.
 #[test]
 fn s_dl_01_transient_download_errors_are_retried_then_the_install_succeeds() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E8, &[status(503, ""), Reply::Unreachable]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E8, &[status(503, ""), Reply::Unreachable]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
 
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].finished(), "success", "{}", terminals[0].body);
-    assert_eq!(terminals[0].code(), None);
-    assert_eq!(srv.count(Kind::E8), 3, "two failed attempts and the third");
-    assert_eq!(
-        d.download_retries,
-        [
-            (secs(0), OtaError::DownloadFailed { status: 503 }),
-            (secs(5), OtaError::ServerUnreachable)
-        ],
-        "back-off 5 s, then 10 s"
-    );
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(attempts, [secs(0), secs(5), secs(15)]);
-    assert!(
-        d.download_errors.is_empty(),
-        "no attempt was settled failed"
-    );
-    assert_eq!(d.running(), v("1.1.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].finished(), "success", "{}", terminals[0].body);
+        assert_eq!(terminals[0].code(), None);
+        assert_eq!(srv.count(Kind::E8), 3, "two failed attempts and the third");
+        assert_eq!(
+            d.download_retries,
+            [
+                (secs(0), OtaError::DownloadFailed { status: 503 }),
+                (secs(5), OtaError::ServerUnreachable)
+            ],
+            "back-off 5 s, then 10 s"
+        );
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(attempts, [secs(0), secs(5), secs(15)]);
+        assert!(
+            d.download_errors.is_empty(),
+            "no attempt was settled failed"
+        );
+        assert_eq!(d.running(), v("1.1.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-02: a transient error that lasts is retried until the 300 s deadline passes (the last wait is clamped to the time left), then
 /// it is settled once as 1001 with the last error as its reason; the verdict is not sent before that.
 #[test]
 fn s_dl_02_a_transient_error_until_the_deadline_is_one_terminal_1001() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.on(Kind::E8, status(503, ""));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(400));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.on(Kind::E8, status(503, ""));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(400));
 
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].code(), Some(1001));
-    assert_eq!(terminals[0].details(), ["download_failed"]);
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].code(), Some(1001));
+        assert_eq!(terminals[0].details(), ["download_failed"]);
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(
         attempts,
         [0, 5, 15, 35, 75, 135, 195, 255].map(secs),
         "5 s doubling to 60 s; the last wait is clamped to 45 s and ends at the deadline, with no attempt after it"
     );
-    assert!(
-        terminals[0].t >= secs(300),
-        "no verdict before the deadline passes"
-    );
-    assert_eq!(d.download_retries.len(), 8);
-    assert_eq!(
-        d.download_errors,
-        [OtaError::DownloadFailed { status: 503 }],
-        "settled once"
-    );
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        assert!(
+            terminals[0].t >= secs(300),
+            "no verdict before the deadline passes"
+        );
+        assert_eq!(d.download_retries.len(), 8);
+        assert_eq!(
+            d.download_errors,
+            [OtaError::DownloadFailed { status: 503 }],
+            "settled once"
+        );
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-03: a final error (an artifact 404, a digest mismatch) is settled at once: one request, no retry, 1001 or 1002.
 #[test]
 fn s_dl_03_a_final_download_error_is_not_retried() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.on(Kind::E8, status(404, ""));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.on(Kind::E8, status(404, ""));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
 
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].code(), Some(1001));
-    assert_eq!(srv.count(Kind::E8), 1);
-    assert!(d.download_retries.is_empty());
-    assert_eq!(
-        d.download_errors,
-        [OtaError::DownloadFailed { status: 404 }]
-    );
-    assert!(
-        terminals[0].t < secs(60),
-        "settled at once, not after a back-off"
-    );
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].code(), Some(1001));
+        assert_eq!(srv.count(Kind::E8), 1);
+        assert!(d.download_retries.is_empty());
+        assert_eq!(
+            d.download_errors,
+            [OtaError::DownloadFailed { status: 404 }]
+        );
+        assert!(
+            terminals[0].t < secs(60),
+            "settled at once, not after a back-off"
+        );
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-04: a cancel that arrives during the back-off between two attempts ends the download at once, acknowledged, with no verdict.
 #[test]
 fn s_dl_04_cancel_during_the_retry_back_off_is_acknowledged() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.on(Kind::E8, status(503, ""));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(8));
-    assert!(
-        d.download.as_ref().is_some_and(|x| x.waiting),
-        "in the back-off"
-    );
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.on(Kind::E8, status(503, ""));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(8));
+        assert!(
+            d.download.as_ref().is_some_and(|x| x.waiting),
+            "in the back-off"
+        );
 
-    srv.cancel("1");
-    d.nudge();
-    d.run_for(&mut srv, secs(60));
+        srv.cancel("1");
+        d.nudge();
+        d.run_for(&mut srv, secs(60));
 
-    assert_eq!(d.cancel_results, [Some(CancelResult::Acknowledged)]);
-    assert_eq!(d.download_errors, [OtaError::Cancelled]);
-    assert_eq!(srv.count(Kind::E8), 2, "no attempt after the cancel");
-    assert!(
-        srv.terminals().is_empty(),
-        "a cancelled attempt reports no verdict"
-    );
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        assert_eq!(d.cancel_results, [Some(CancelResult::Acknowledged)]);
+        assert_eq!(d.download_errors, [OtaError::Cancelled]);
+        assert_eq!(srv.count(Kind::E8), 2, "no attempt after the cancel");
+        assert!(
+            srv.terminals().is_empty(),
+            "a cancelled attempt reports no verdict"
+        );
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-05: a cancel that lands right after a failed attempt, before the retry decision, stays accepted: the download ends cancelled, makes no later attempt and reports no verdict.
 #[test]
 fn s_dl_05_cancel_between_a_failed_attempt_and_the_retry_is_acknowledged() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.on(Kind::E8, status(503, ""));
-    let mut d = Device::new("1.0.0");
-    d.cancel_after_failure = true;
-    d.run_for(&mut srv, secs(6));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.on(Kind::E8, status(503, ""));
+        let mut d = Device::new("1.0.0");
+        d.cancel_after_failure = true;
+        d.run_for(&mut srv, secs(6));
 
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(attempts[0], secs(0));
-    assert_eq!(
-        d.download_retries.len(),
-        1,
-        "the retry was decided, then the cancel ended the wait"
-    );
-    assert_eq!(d.download_errors, [OtaError::Cancelled]);
-    assert!(
-        srv.terminals().is_empty(),
-        "a cancelled attempt reports no verdict"
-    );
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(attempts[0], secs(0));
+        assert_eq!(
+            d.download_retries.len(),
+            1,
+            "the retry was decided, then the cancel ended the wait"
+        );
+        assert_eq!(d.download_errors, [OtaError::Cancelled]);
+        assert!(
+            srv.terminals().is_empty(),
+            "a cancelled attempt reports no verdict"
+        );
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-06: a cancel that lands at the final give-up (the deadline has passed after the last wait) wins over the 1001: nothing is reported.
 #[test]
 fn s_dl_06_cancel_at_the_deadline_give_up_is_acknowledged() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.on(Kind::E8, status(503, ""));
-    let mut d = Device::new("1.0.0");
-    d.cancel_at_giveup = true;
-    d.run_for(&mut srv, secs(300));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.on(Kind::E8, status(503, ""));
+        let mut d = Device::new("1.0.0");
+        d.cancel_at_giveup = true;
+        d.run_for(&mut srv, secs(300));
 
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(
-        attempts[..8],
-        [0, 5, 15, 35, 75, 135, 195, 255].map(secs),
-        "no attempt at the deadline"
-    );
-    assert_eq!(d.download_errors, [OtaError::Cancelled]);
-    assert!(
-        srv.terminals().is_empty(),
-        "no 1001 after an accepted cancel"
-    );
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(
+            attempts[..8],
+            [0, 5, 15, 35, 75, 135, 195, 255].map(secs),
+            "no attempt at the deadline"
+        );
+        assert_eq!(d.download_errors, [OtaError::Cancelled]);
+        assert!(
+            srv.terminals().is_empty(),
+            "no 1001 after an accepted cancel"
+        );
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DL-07: a 429 with `Retry-After: 120` delays the next attempt to 120 s or later, and a 413 is retried after the plain back-off.
 #[test]
 fn s_dl_07_retry_after_sets_the_wait_and_a_413_is_retried() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E8, &[status_retry_after(429, "120")]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(300));
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(attempts, [secs(0), secs(120)]);
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].finished(), "success", "{}", terminals[0].body);
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E8, &[status_retry_after(429, "120")]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(300));
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(attempts, [secs(0), secs(120)]);
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].finished(), "success", "{}", terminals[0].body);
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E8, &[status(413, "")]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(120));
-    let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
-    assert_eq!(attempts, [secs(0), secs(5)]);
-    assert!(d.download_errors.is_empty());
-    assert_eq!(d.running(), v("1.1.0"));
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E8, &[status(413, "")]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(120));
+        let attempts: Vec<Duration> = srv.of(Kind::E8).iter().map(|r| r.t).collect();
+        assert_eq!(attempts, [secs(0), secs(5)]);
+        assert!(d.download_errors.is_empty());
+        assert_eq!(d.running(), v("1.1.0"));
+    });
 }
 
 // ── case tables ──────────────────────────────────────────────────────────────────
@@ -2355,75 +2955,79 @@ fn hex_of(doc: &Doc) -> String {
 /// attempt is cleared without a verdict and the old image keeps running.
 #[test]
 fn s10_cancel_during_the_download_is_acknowledged() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0").download_rate(100);
-    d.run_for(&mut srv, secs(2));
-    assert!(d.download.is_some(), "the download is in flight");
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0").download_rate(100);
+        d.run_for(&mut srv, secs(2));
+        assert!(d.download.is_some(), "the download is in flight");
 
-    srv.cancel("1");
-    d.nudge();
-    d.run_for(&mut srv, secs(60));
+        srv.cancel("1");
+        d.nudge();
+        d.run_for(&mut srv, secs(60));
 
-    assert_eq!(srv.count(Kind::E4), 1);
-    let answers = srv.of(Kind::E5);
-    assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
-    assert_eq!(
-        (
-            answers[0].execution().as_str(),
-            answers[0].finished().as_str()
-        ),
-        ("closed", "success")
-    );
-    assert_eq!(
-        srv.of(Kind::E4)[0].t,
-        secs(10),
-        "the nudge waits exactly 10 s after the last poll"
-    );
-    assert_eq!(d.cancel_results, [Some(CancelResult::Acknowledged)]);
-    assert_eq!(d.download_errors, [OtaError::Cancelled]);
-    assert!(
-        srv.terminals().is_empty(),
-        "a cancelled attempt reports no verdict"
-    );
-    assert!(!d.kv.has("att_ver"), "the attempt is cleared");
-    assert_eq!(d.running(), v("1.0.0"));
-    assert_eq!(boots(&d), 1);
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        assert_eq!(srv.count(Kind::E4), 1);
+        let answers = srv.of(Kind::E5);
+        assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
+        assert_eq!(
+            (
+                answers[0].execution().as_str(),
+                answers[0].finished().as_str()
+            ),
+            ("closed", "success")
+        );
+        assert_eq!(
+            srv.of(Kind::E4)[0].t,
+            secs(10),
+            "the nudge waits exactly 10 s after the last poll"
+        );
+        assert_eq!(d.cancel_results, [Some(CancelResult::Acknowledged)]);
+        assert_eq!(d.download_errors, [OtaError::Cancelled]);
+        assert!(
+            srv.terminals().is_empty(),
+            "a cancelled attempt reports no verdict"
+        );
+        assert!(!d.kv.has("att_ver"), "the attempt is cleared");
+        assert_eq!(d.running(), v("1.0.0"));
+        assert_eq!(boots(&d), 1);
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S11: a cancel that arrives after the activation (here at the first poll of the new image, after the restart)
 /// is rejected on the cancel path, and the install completes.
 #[test]
 fn s11_cancel_after_activation_is_rejected_and_the_install_completes() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, Duration::from_millis(500));
-    assert_eq!(
-        d.boot_slot, SLOT_B,
-        "the new slot is selected, the restart is pending"
-    );
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, Duration::from_millis(500));
+        assert_eq!(
+            d.boot_slot, SLOT_B,
+            "the new slot is selected, the restart is pending"
+        );
 
-    srv.cancel("1");
-    d.run_for(&mut srv, secs(120));
+        srv.cancel("1");
+        d.run_for(&mut srv, secs(120));
 
-    assert_eq!(srv.count(Kind::E4), 1);
-    let answers = srv.of(Kind::E5);
-    assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
-    assert_eq!(
-        (
-            answers[0].execution().as_str(),
-            answers[0].finished().as_str()
-        ),
-        ("rejected", "none")
-    );
-    assert_eq!(d.cancel_results, [Some(CancelResult::Rejected)]);
-    let terminals = srv.terminals();
-    assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-    assert_eq!(terminals[0].finished(), "success");
-    assert_eq!(d.running(), v("1.1.0"));
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        assert_eq!(srv.count(Kind::E4), 1);
+        let answers = srv.of(Kind::E5);
+        assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
+        assert_eq!(
+            (
+                answers[0].execution().as_str(),
+                answers[0].finished().as_str()
+            ),
+            ("rejected", "none")
+        );
+        assert_eq!(d.cancel_results, [Some(CancelResult::Rejected)]);
+        let terminals = srv.terminals();
+        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+        assert_eq!(terminals[0].finished(), "success");
+        assert_eq!(d.running(), v("1.1.0"));
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S13: a power cut right after the first `proceeding` clears the interrupted attempt at the next boot, and the
@@ -2431,74 +3035,80 @@ fn s11_cancel_after_activation_is_rejected_and_the_install_completes() {
 /// retrieved again (F3): this client resumes nothing from a copy of the document.
 #[test]
 fn s13_restart_mid_action_completes_the_action_once() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0").crash_at(CrashPoint::AfterFirstProceeding);
-    d.run_for(&mut srv, secs(200));
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0").crash_at(CrashPoint::AfterFirstProceeding);
+        d.run_for(&mut srv, secs(200));
 
-    expect_success(&srv, None);
-    assert_eq!(boots(&d), 3, "the crash and the install reboot");
-    assert!(d.events.iter().any(|(_, e)| *e == Event::Crash));
-    assert!(
-        d.boots[1].starts_with("Settled("),
-        "the interrupted attempt is cleared, not awaited: {:?}",
-        d.boots
-    );
-    assert_eq!(
-        e2_actions(&srv),
-        ["1", "1"],
-        "F3: the interrupted attempt is offered and retrieved again"
-    );
-    assert_eq!(d.running(), v("1.1.0"));
+        expect_success(&srv, None);
+        assert_eq!(boots(&d), 3, "the crash and the install reboot");
+        assert!(d.events.iter().any(|(_, e)| *e == Event::Crash));
+        assert!(
+            d.boots[1].starts_with("Settled("),
+            "the interrupted attempt is cleared, not awaited: {:?}",
+            d.boots
+        );
+        assert_eq!(
+            e2_actions(&srv),
+            ["1", "1"],
+            "F3: the interrupted attempt is offered and retrieved again"
+        );
+        assert_eq!(d.running(), v("1.1.0"));
+    });
 }
 
 /// S15 and SEC-24: a nudge makes one ordinary authenticated poll at once; the nudge carries no payload into
 /// the machine (`PollMachine::nudge` takes only the time), so a hostile payload cannot name a URL.
 #[test]
 fn s15_and_sec_24_a_nudge_polls_at_once_and_carries_no_payload() {
-    let mut srv = Server::new();
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(15));
-    assert_eq!(srv.count(Kind::E1), 1);
+    differential(|| {
+        let mut srv = Server::new();
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(15));
+        assert_eq!(srv.count(Kind::E1), 1);
 
-    d.nudge();
-    d.run_until(&mut srv, secs(16));
+        d.nudge();
+        d.run_until(&mut srv, secs(16));
 
-    let polls = srv.of(Kind::E1);
-    assert_eq!(polls.len(), 2, "the nudge polls at once");
-    assert_eq!(polls[1].t, secs(15));
-    assert_eq!(
-        polls[1].url,
-        d.endpoint.poll_url(),
-        "an ordinary poll of the configured base"
-    );
-    expect_silent(&srv);
+        let polls = srv.of(Kind::E1);
+        assert_eq!(polls.len(), 2, "the nudge polls at once");
+        assert_eq!(polls[1].t, secs(15));
+        assert_eq!(
+            polls[1].url,
+            d.endpoint.poll_url(),
+            "an ordinary poll of the configured base"
+        );
+        expect_silent(&srv);
+    });
 }
 
 /// SEC-25 (device part): a burst of nudges is debounced to one poll per 10 s.
 #[test]
 fn sec_25_a_burst_of_nudges_is_debounced_to_one_poll_per_10_s() {
-    let mut srv = Server::new();
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(20));
-    for i in 0..100u64 {
-        d.run_until(&mut srv, secs(20) + Duration::from_millis(i * 10));
-        d.nudge();
-    }
-    d.run_until(&mut srv, secs(60));
+    differential(|| {
+        let mut srv = Server::new();
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(20));
+        for i in 0..100u64 {
+            d.run_until(&mut srv, secs(20) + Duration::from_millis(i * 10));
+            d.nudge();
+        }
+        d.run_until(&mut srv, secs(60));
 
-    let polls = srv.of(Kind::E1);
-    let times: Vec<Duration> = polls.iter().map(|p| p.t).collect();
-    assert_eq!(times, [secs(0), secs(20), secs(30), secs(60)]);
-    let in_window = times
-        .iter()
-        .filter(|t| **t >= secs(20) && **t < secs(30))
-        .count();
-    assert_eq!(in_window, 1);
-    assert!(
-        polls.iter().any(|p| p.t >= secs(30)),
-        "the kept nudge polls once the 10 s have passed"
-    );
+        let polls = srv.of(Kind::E1);
+        let times: Vec<Duration> = polls.iter().map(|p| p.t).collect();
+        assert_eq!(times, [secs(0), secs(20), secs(30), secs(60)]);
+        let in_window = times
+            .iter()
+            .filter(|t| **t >= secs(20) && **t < secs(30))
+            .count();
+        assert_eq!(in_window, 1);
+        assert!(
+            polls.iter().any(|p| p.t >= secs(30)),
+            "the kept nudge polls once the 10 s have passed"
+        );
+    });
 }
 
 // ── device reference rows ────────────────────────────────────────────────────────
@@ -2507,245 +3117,251 @@ fn sec_25_a_burst_of_nudges_is_debounced_to_one_poll_per_10_s() {
 /// digest compares case-insensitively.
 #[test]
 fn s_dev_01_install_order_and_config_data_per_boot() {
-    for (name, upper) in [("lower_case_sha256", false), ("upper_case_sha256", true)] {
-        let mut doc = Doc::new("1", "1.0.0");
-        if upper {
-            let text = hex_of(&doc).to_uppercase();
-            doc = doc.sha256_text(&text);
-        }
-        let (srv, d) = run_case("0.0.0", &doc, same);
-        check(name, || {
-            expect_success(&srv, None);
-            let terminal_t = srv.terminals()[0].t;
-            assert_eq!(srv.of(Kind::E3)[0].execution(), "proceeding");
-            assert!(srv.of(Kind::E8)[0].t <= terminal_t);
-            assert!(srv
-                .of(Kind::E3)
-                .iter()
-                .all(|r| r.is_terminal() || r.t <= terminal_t));
-            assert_eq!(boots(&d), 2);
-            let puts = srv.of(Kind::E6);
-            assert_eq!(puts.len(), 2, "one configData per boot");
-            for p in &puts {
-                config_check(p, CHIP, BOARD, None);
+    differential(|| {
+        for (name, upper) in [("lower_case_sha256", false), ("upper_case_sha256", true)] {
+            let mut doc = Doc::new("1", "1.0.0");
+            if upper {
+                let text = hex_of(&doc).to_uppercase();
+                doc = doc.sha256_text(&text);
             }
-            assert_eq!(config_versions(&srv), ["0.0.0", "1.0.0"]);
-        });
-    }
+            let (srv, d) = run_case("0.0.0", &doc, same);
+            check(name, || {
+                expect_success(&srv, None);
+                let terminal_t = srv.terminals()[0].t;
+                assert_eq!(srv.of(Kind::E3)[0].execution(), "proceeding");
+                assert!(srv.of(Kind::E8)[0].t <= terminal_t);
+                assert!(srv
+                    .of(Kind::E3)
+                    .iter()
+                    .all(|r| r.is_terminal() || r.t <= terminal_t));
+                assert_eq!(boots(&d), 2);
+                let puts = srv.of(Kind::E6);
+                assert_eq!(puts.len(), 2, "one configData per boot");
+                for p in &puts {
+                    config_check(p, CHIP, BOARD, None);
+                }
+                assert_eq!(config_versions(&srv), ["0.0.0", "1.0.0"]);
+            });
+        }
+    });
 }
 
 /// S-DEV-02: the document rules of §3a refuse a defective document with 1006 before any download, and accept
 /// the edge cases; an accepted document of the running version ends 1007 `up_to_date`.
 #[test]
 fn s_dev_02_document_rules_refuse_1006_before_any_download() {
-    let base = Doc::new("1", "1.0.0");
-    let sha = hex_of(&base);
-    let dup = |list: &mut Value| {
-        let list = list.as_array_mut().expect("an array");
-        let first = list[0].clone();
-        list.push(first);
-    };
-    let refused: Vec<(&str, Doc)> = vec![
-        (
-            "chunks_0",
-            base.clone().edit(|v| v["deployment"]["chunks"] = json!([])),
-        ),
-        (
-            "chunks_2",
-            base.clone().edit(|v| dup(&mut v["deployment"]["chunks"])),
-        ),
-        (
-            "artifacts_0",
-            base.clone()
-                .edit(|v| v["deployment"]["chunks"][0]["artifacts"] = json!([])),
-        ),
-        (
-            "artifacts_2",
-            base.clone()
-                .edit(|v| dup(&mut v["deployment"]["chunks"][0]["artifacts"])),
-        ),
-        (
-            "size_missing",
-            base.clone().edit(|v| {
-                v["deployment"]["chunks"][0]["artifacts"][0]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("size");
-            }),
-        ),
-        ("size_string", base.clone().size(json!("4096"))),
-        ("size_negative", base.clone().size(json!(-1))),
-        (
-            "sha256_missing",
-            base.clone().edit(|v| {
-                v["deployment"]["chunks"][0]["artifacts"][0]["hashes"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("sha256");
-            }),
-        ),
-        ("sha256_63_chars", base.clone().sha256_text(&sha[..63])),
-        ("sha256_non_hex", base.clone().sha256_text(&"g".repeat(64))),
-        (
-            "sha256_number",
-            base.clone().edit(|v| {
-                v["deployment"]["chunks"][0]["artifacts"][0]["hashes"]["sha256"] = json!(12345)
-            }),
-        ),
-        (
-            "only_download_link",
-            base.clone().edit(|v| {
-                let href = v["deployment"]["chunks"][0]["artifacts"][0]["_links"]["download-http"]
-                    ["href"]
-                    .clone();
-                v["deployment"]["chunks"][0]["artifacts"][0]["_links"] =
-                    json!({"download": {"href": href}});
-            }),
-        ),
-        (
-            "size_above_slot",
-            base.clone().size(json!(SLOT_CAPACITY + 1)),
-        ),
-        ("encrypted", base.clone().encrypted()),
-        ("download_maybe", base.clone().handling("maybe", "forced")),
-        (
-            "update_number",
-            base.clone().edit(|v| v["deployment"]["update"] = json!(7)),
-        ),
-        ("version_two_parts", base.clone().version("1.0")),
-        ("version_leading_zero", base.clone().version("01.0.0")),
-        ("version_pre_release", base.clone().version("1.0.0-rc1")),
-        ("version_above_65535", base.clone().version("1.0.65536")),
-        ("version_plus_sign", base.clone().version("+1.0.0")),
-        ("version_trailing_newline", base.clone().version("1.0.0\n")),
-        ("not_json", base.clone().raw(b"this is not json")),
-        ("json_array", base.clone().raw(b"[1, 2]")),
-        ("no_deployment", base.clone().raw(br#"{"id":"1"}"#)),
-    ];
-    for (name, doc) in &refused {
-        let (srv, _) = run_case("1.0.0", doc, same);
-        check(name, || verdict(&srv, INV));
-    }
+    differential(|| {
+        let base = Doc::new("1", "1.0.0");
+        let sha = hex_of(&base);
+        let dup = |list: &mut Value| {
+            let list = list.as_array_mut().expect("an array");
+            let first = list[0].clone();
+            list.push(first);
+        };
+        let refused: Vec<(&str, Doc)> = vec![
+            (
+                "chunks_0",
+                base.clone().edit(|v| v["deployment"]["chunks"] = json!([])),
+            ),
+            (
+                "chunks_2",
+                base.clone().edit(|v| dup(&mut v["deployment"]["chunks"])),
+            ),
+            (
+                "artifacts_0",
+                base.clone()
+                    .edit(|v| v["deployment"]["chunks"][0]["artifacts"] = json!([])),
+            ),
+            (
+                "artifacts_2",
+                base.clone()
+                    .edit(|v| dup(&mut v["deployment"]["chunks"][0]["artifacts"])),
+            ),
+            (
+                "size_missing",
+                base.clone().edit(|v| {
+                    v["deployment"]["chunks"][0]["artifacts"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("size");
+                }),
+            ),
+            ("size_string", base.clone().size(json!("4096"))),
+            ("size_negative", base.clone().size(json!(-1))),
+            (
+                "sha256_missing",
+                base.clone().edit(|v| {
+                    v["deployment"]["chunks"][0]["artifacts"][0]["hashes"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("sha256");
+                }),
+            ),
+            ("sha256_63_chars", base.clone().sha256_text(&sha[..63])),
+            ("sha256_non_hex", base.clone().sha256_text(&"g".repeat(64))),
+            (
+                "sha256_number",
+                base.clone().edit(|v| {
+                    v["deployment"]["chunks"][0]["artifacts"][0]["hashes"]["sha256"] = json!(12345)
+                }),
+            ),
+            (
+                "only_download_link",
+                base.clone().edit(|v| {
+                    let href = v["deployment"]["chunks"][0]["artifacts"][0]["_links"]
+                        ["download-http"]["href"]
+                        .clone();
+                    v["deployment"]["chunks"][0]["artifacts"][0]["_links"] =
+                        json!({"download": {"href": href}});
+                }),
+            ),
+            (
+                "size_above_slot",
+                base.clone().size(json!(SLOT_CAPACITY + 1)),
+            ),
+            ("encrypted", base.clone().encrypted()),
+            ("download_maybe", base.clone().handling("maybe", "forced")),
+            (
+                "update_number",
+                base.clone().edit(|v| v["deployment"]["update"] = json!(7)),
+            ),
+            ("version_two_parts", base.clone().version("1.0")),
+            ("version_leading_zero", base.clone().version("01.0.0")),
+            ("version_pre_release", base.clone().version("1.0.0-rc1")),
+            ("version_above_65535", base.clone().version("1.0.65536")),
+            ("version_plus_sign", base.clone().version("+1.0.0")),
+            ("version_trailing_newline", base.clone().version("1.0.0\n")),
+            ("not_json", base.clone().raw(b"this is not json")),
+            ("json_array", base.clone().raw(b"[1, 2]")),
+            ("no_deployment", base.clone().raw(br#"{"id":"1"}"#)),
+        ];
+        for (name, doc) in &refused {
+            let (srv, _) = run_case("1.0.0", doc, same);
+            check(name, || verdict(&srv, INV));
+        }
 
-    let accepted: Vec<(&str, &str, Doc)> = vec![
-        ("baseline_valid", "1.0.0", base.clone()),
-        ("version_0_0_0", "0.0.0", base.clone().version("0.0.0")),
-        (
-            "version_65535_each",
-            "65535.65535.65535",
-            base.clone().version("65535.65535.65535"),
-        ),
-        (
-            "size_equals_slot",
-            "1.0.0",
-            base.clone().size(json!(SLOT_CAPACITY)),
-        ),
-        (
-            "sha256_upper_case",
-            "1.0.0",
-            base.clone().sha256_text(&sha.to_uppercase()),
-        ),
-        ("document_4_kib", "1.0.0", base.clone().padded_to(4096)),
-    ];
-    for (name, running, doc) in &accepted {
-        let (srv, _) = run_case(running, doc, same);
-        check(name, || verdict(&srv, UTD));
-    }
+        let accepted: Vec<(&str, &str, Doc)> = vec![
+            ("baseline_valid", "1.0.0", base.clone()),
+            ("version_0_0_0", "0.0.0", base.clone().version("0.0.0")),
+            (
+                "version_65535_each",
+                "65535.65535.65535",
+                base.clone().version("65535.65535.65535"),
+            ),
+            (
+                "size_equals_slot",
+                "1.0.0",
+                base.clone().size(json!(SLOT_CAPACITY)),
+            ),
+            (
+                "sha256_upper_case",
+                "1.0.0",
+                base.clone().sha256_text(&sha.to_uppercase()),
+            ),
+            ("document_4_kib", "1.0.0", base.clone().padded_to(4096)),
+        ];
+        for (name, running, doc) in &accepted {
+            let (srv, _) = run_case(running, doc, same);
+            check(name, || verdict(&srv, UTD));
+        }
+    });
 }
 
 /// S-DEV-03: `chip` exactly once with the right grammar, `downgrade` at most once with exactly `allowed`,
 /// keys case-sensitive, other keys ignored.
 #[test]
 fn s_dev_03_metadata_rules() {
-    let base = Doc::new("1", "1.0.0");
-    let long32 = "a".repeat(32);
-    let long33 = "a".repeat(33);
-    let invalid: Vec<(&str, Doc)> = vec![
-        ("chip_missing", base.clone().metadata(&[])),
-        ("chip_twice_same", base.clone().add_metadata("chip", CHIP)),
-        (
-            "chip_twice_different",
-            base.clone().add_metadata("chip", OTHER_CHIP),
-        ),
-        ("chip_empty", base.clone().metadata(&[("chip", "")])),
-        (
-            "chip_upper_case",
-            base.clone().metadata(&[("chip", "ESP32C3")]),
-        ),
-        (
-            "chip_with_dash",
-            base.clone().metadata(&[("chip", "esp32-c3")]),
-        ),
-        ("chip_33_chars", base.clone().metadata(&[("chip", &long33)])),
-        ("only_Chip_key", base.clone().metadata(&[("Chip", CHIP)])),
-        ("downgrade_twice", base.clone().marker().marker()),
-        (
-            "downgrade_Allowed",
-            base.clone().add_metadata("downgrade", "Allowed"),
-        ),
-        (
-            "downgrade_ALLOWED",
-            base.clone().add_metadata("downgrade", "ALLOWED"),
-        ),
-        (
-            "downgrade_true",
-            base.clone().add_metadata("downgrade", "true"),
-        ),
-        (
-            "downgrade_empty",
-            base.clone().add_metadata("downgrade", ""),
-        ),
-        (
-            "metadata_key_absent",
-            base.clone().edit(|v| {
-                v["deployment"]["chunks"][0]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("metadata");
-            }),
-        ),
-    ];
-    for (name, doc) in &invalid {
-        let (srv, _) = run_case("1.0.0", doc, same);
-        check(name, || verdict(&srv, INV));
-    }
+    differential(|| {
+        let base = Doc::new("1", "1.0.0");
+        let long32 = "a".repeat(32);
+        let long33 = "a".repeat(33);
+        let invalid: Vec<(&str, Doc)> = vec![
+            ("chip_missing", base.clone().metadata(&[])),
+            ("chip_twice_same", base.clone().add_metadata("chip", CHIP)),
+            (
+                "chip_twice_different",
+                base.clone().add_metadata("chip", OTHER_CHIP),
+            ),
+            ("chip_empty", base.clone().metadata(&[("chip", "")])),
+            (
+                "chip_upper_case",
+                base.clone().metadata(&[("chip", "ESP32C3")]),
+            ),
+            (
+                "chip_with_dash",
+                base.clone().metadata(&[("chip", "esp32-c3")]),
+            ),
+            ("chip_33_chars", base.clone().metadata(&[("chip", &long33)])),
+            ("only_Chip_key", base.clone().metadata(&[("Chip", CHIP)])),
+            ("downgrade_twice", base.clone().marker().marker()),
+            (
+                "downgrade_Allowed",
+                base.clone().add_metadata("downgrade", "Allowed"),
+            ),
+            (
+                "downgrade_ALLOWED",
+                base.clone().add_metadata("downgrade", "ALLOWED"),
+            ),
+            (
+                "downgrade_true",
+                base.clone().add_metadata("downgrade", "true"),
+            ),
+            (
+                "downgrade_empty",
+                base.clone().add_metadata("downgrade", ""),
+            ),
+            (
+                "metadata_key_absent",
+                base.clone().edit(|v| {
+                    v["deployment"]["chunks"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("metadata");
+                }),
+            ),
+        ];
+        for (name, doc) in &invalid {
+            let (srv, _) = run_case("1.0.0", doc, same);
+            check(name, || verdict(&srv, INV));
+        }
 
-    let valid: Vec<(&str, &str, Doc, Expect)> = vec![
-        (
-            "ignored_Chip_key",
-            "1.0.0",
-            base.clone().add_metadata("Chip", OTHER_CHIP),
-            UTD,
-        ),
-        (
-            "ignored_unknown_key",
-            "1.0.0",
-            base.clone().add_metadata("foo", "x"),
-            UTD,
-        ),
-        (
-            "chip_32_chars",
-            "1.0.0",
-            base.clone().metadata(&[("chip", &long32)]),
-            TMM,
-        ),
-        (
-            "Downgrade_key_is_not_the_marker",
-            "2.0.0",
-            base.clone().add_metadata("Downgrade", "allowed"),
-            Expect::Refuse(1007, "downgrade"),
-        ),
-        (
-            "downgrade_marker_control",
-            "2.0.0",
-            base.clone().marker(),
-            Expect::Success(Some("downgrade")),
-        ),
-    ];
-    for (name, running, doc, expect) in &valid {
-        let (srv, _) = run_case(running, doc, same);
-        check(name, || verdict(&srv, *expect));
-    }
+        let valid: Vec<(&str, &str, Doc, Expect)> = vec![
+            (
+                "ignored_Chip_key",
+                "1.0.0",
+                base.clone().add_metadata("Chip", OTHER_CHIP),
+                UTD,
+            ),
+            (
+                "ignored_unknown_key",
+                "1.0.0",
+                base.clone().add_metadata("foo", "x"),
+                UTD,
+            ),
+            (
+                "chip_32_chars",
+                "1.0.0",
+                base.clone().metadata(&[("chip", &long32)]),
+                TMM,
+            ),
+            (
+                "Downgrade_key_is_not_the_marker",
+                "2.0.0",
+                base.clone().add_metadata("Downgrade", "allowed"),
+                Expect::Refuse(1007, "downgrade"),
+            ),
+            (
+                "downgrade_marker_control",
+                "2.0.0",
+                base.clone().marker(),
+                Expect::Success(Some("downgrade")),
+            ),
+        ];
+        for (name, running, doc, expect) in &valid {
+            let (srv, _) = run_case(running, doc, same);
+            check(name, || verdict(&srv, *expect));
+        }
+    });
 }
 
 /// S-DEV-04: a document of 8192 bytes is read, one of 8193 is refused 1006; an over-cap poll answer is never
@@ -2753,49 +3369,51 @@ fn s_dev_03_metadata_rules() {
 /// (`ResponseBody`), not judged here.
 #[test]
 fn s_dev_04_document_cap_8192_accepted_8193_refused() {
-    let base = Doc::new("1", "1.0.0");
-    let (srv, _) = run_case("1.0.0", &base.clone().padded_to(8192), same);
-    check("document_8192_bytes", || verdict(&srv, UTD));
-    let (srv, _) = run_case("1.0.0", &base.clone().padded_to(8193), same);
-    check("document_8193_bytes", || verdict(&srv, INV));
+    differential(|| {
+        let base = Doc::new("1", "1.0.0");
+        let (srv, _) = run_case("1.0.0", &base.clone().padded_to(8192), same);
+        check("document_8192_bytes", || verdict(&srv, UTD));
+        let (srv, _) = run_case("1.0.0", &base.clone().padded_to(8193), same);
+        check("document_8193_bytes", || verdict(&srv, INV));
 
-    let big = vec![b' '; 65536];
-    let mut srv = Server::new();
-    srv.offer(&base);
-    srv.on(
-        Kind::E2,
-        Reply::Status {
-            status: 200,
-            body: big.clone(),
-            retry_after: None,
-            declared_len: None,
-        },
-    );
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(60));
-    check("document_stream", || verdict(&srv, INV));
-
-    let mut srv = Server::new();
-    srv.offer(&base);
-    srv.on(
-        Kind::E1,
-        Reply::Status {
-            status: 200,
-            body: big,
-            retry_after: None,
-            declared_len: None,
-        },
-    );
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(40 * 60));
-    check("poll_answer_stream", || {
-        verdict(&srv, Expect::Silent);
-        let polls: Vec<Duration> = srv.of(Kind::E1).iter().map(|p| p.t).take(4).collect();
-        assert_eq!(
-            polls,
-            [secs(0), secs(300), secs(900), secs(2100)],
-            "polling continues with the back-off from the default interval"
+        let big = vec![b' '; 65536];
+        let mut srv = Server::new();
+        srv.offer(&base);
+        srv.on(
+            Kind::E2,
+            Reply::Status {
+                status: 200,
+                body: big.clone(),
+                retry_after: None,
+                declared_len: None,
+            },
         );
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(60));
+        check("document_stream", || verdict(&srv, INV));
+
+        let mut srv = Server::new();
+        srv.offer(&base);
+        srv.on(
+            Kind::E1,
+            Reply::Status {
+                status: 200,
+                body: big,
+                retry_after: None,
+                declared_len: None,
+            },
+        );
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(40 * 60));
+        check("poll_answer_stream", || {
+            verdict(&srv, Expect::Silent);
+            let polls: Vec<Duration> = srv.of(Kind::E1).iter().map(|p| p.t).take(4).collect();
+            assert_eq!(
+                polls,
+                [secs(0), secs(300), secs(900), secs(2100)],
+                "polling continues with the back-off from the default interval"
+            );
+        });
     });
 }
 
@@ -2803,76 +3421,78 @@ fn s_dev_04_document_cap_8192_accepted_8193_refused() {
 /// chip and version gates come after the deferral, the document rules before it.
 #[test]
 fn s_dev_05_skip_defers_after_validity_and_before_the_gates() {
-    let deferred: Vec<(&str, &str, Doc, Expect)> = vec![
-        (
-            "update_skip",
-            "0.0.0",
-            Doc::new("1", "1.0.0").handling("forced", "skip"),
-            Expect::Success(None),
-        ),
-        (
-            "download_skip",
-            "0.0.0",
-            Doc::new("1", "1.0.0").handling("skip", "forced"),
-            Expect::Success(None),
-        ),
-        (
-            "both_skip",
-            "0.0.0",
-            Doc::new("1", "1.0.0").handling("skip", "skip"),
-            Expect::Success(None),
-        ),
-        (
-            "skip_and_chip_mismatch",
-            "0.0.0",
-            Doc::new("1", "1.0.0")
-                .handling("forced", "skip")
-                .metadata(&[("chip", OTHER_CHIP)]),
-            TMM,
-        ),
-        (
-            "skip_and_older_version",
-            "2.0.0",
-            Doc::new("1", "1.0.0").handling("forced", "skip"),
-            Expect::Refuse(1007, "downgrade"),
-        ),
-    ];
-    for (name, running, doc, expect) in &deferred {
-        let mut srv = Server::new();
-        srv.offer(doc);
-        let mut d = Device::new(running);
-        d.run_for(&mut srv, secs(100));
-        check(name, || expect_deferred(&srv));
-        let flipped = doc.clone().handling("forced", "forced");
-        srv.set_doc(&flipped);
-        d.run_for(&mut srv, secs(200));
-        check(name, || verdict(&srv, *expect));
-    }
+    differential(|| {
+        let deferred: Vec<(&str, &str, Doc, Expect)> = vec![
+            (
+                "update_skip",
+                "0.0.0",
+                Doc::new("1", "1.0.0").handling("forced", "skip"),
+                Expect::Success(None),
+            ),
+            (
+                "download_skip",
+                "0.0.0",
+                Doc::new("1", "1.0.0").handling("skip", "forced"),
+                Expect::Success(None),
+            ),
+            (
+                "both_skip",
+                "0.0.0",
+                Doc::new("1", "1.0.0").handling("skip", "skip"),
+                Expect::Success(None),
+            ),
+            (
+                "skip_and_chip_mismatch",
+                "0.0.0",
+                Doc::new("1", "1.0.0")
+                    .handling("forced", "skip")
+                    .metadata(&[("chip", OTHER_CHIP)]),
+                TMM,
+            ),
+            (
+                "skip_and_older_version",
+                "2.0.0",
+                Doc::new("1", "1.0.0").handling("forced", "skip"),
+                Expect::Refuse(1007, "downgrade"),
+            ),
+        ];
+        for (name, running, doc, expect) in &deferred {
+            let mut srv = Server::new();
+            srv.offer(doc);
+            let mut d = Device::new(running);
+            d.run_for(&mut srv, secs(100));
+            check(name, || expect_deferred(&srv));
+            let flipped = doc.clone().handling("forced", "forced");
+            srv.set_doc(&flipped);
+            d.run_for(&mut srv, secs(200));
+            check(name, || verdict(&srv, *expect));
+        }
 
-    let invalid: Vec<(&str, Doc)> = vec![
-        (
-            "invalid_no_chip_and_skip",
-            Doc::new("1", "1.0.0")
-                .handling("forced", "skip")
-                .metadata(&[]),
-        ),
-        (
-            "invalid_encrypted_and_skip",
-            Doc::new("1", "1.0.0")
-                .handling("forced", "skip")
-                .encrypted(),
-        ),
-        (
-            "invalid_8193_bytes_and_skip",
-            Doc::new("1", "1.0.0")
-                .handling("forced", "skip")
-                .padded_to(8193),
-        ),
-    ];
-    for (name, doc) in &invalid {
-        let (srv, _) = run_case("0.0.0", doc, same);
-        check(name, || verdict(&srv, INV));
-    }
+        let invalid: Vec<(&str, Doc)> = vec![
+            (
+                "invalid_no_chip_and_skip",
+                Doc::new("1", "1.0.0")
+                    .handling("forced", "skip")
+                    .metadata(&[]),
+            ),
+            (
+                "invalid_encrypted_and_skip",
+                Doc::new("1", "1.0.0")
+                    .handling("forced", "skip")
+                    .encrypted(),
+            ),
+            (
+                "invalid_8193_bytes_and_skip",
+                Doc::new("1", "1.0.0")
+                    .handling("forced", "skip")
+                    .padded_to(8193),
+            ),
+        ];
+        for (name, doc) in &invalid {
+            let (srv, _) = run_case("0.0.0", doc, same);
+            check(name, || verdict(&srv, INV));
+        }
+    });
 }
 
 fn position(srv: &Server, kind: Kind, nth: usize) -> Option<usize> {
@@ -2888,70 +3508,72 @@ fn position(srv: &Server, kind: Kind, nth: usize) -> Option<usize> {
 /// whatever the link says, with the fixed keys; a refused PUT is not retried in the same boot.
 #[test]
 fn s_dev_06_config_data_once_per_boot_from_the_base() {
-    let mut srv = Server::new();
-    srv.config_link = ConfigLink::Never;
-    srv.queue(Kind::E1, &[status(503, "")]);
-    let mut d = Device::new("1.2.3");
-    d.run_for(&mut srv, secs(20 * 60));
-    check("first_poll_503_no_link", || {
-        assert!(srv.count(Kind::E1) >= 2, "polls {}", srv.count(Kind::E1));
-        assert_eq!(srv.count(Kind::E6), 1);
-        assert!(
-            position(&srv, Kind::E6, 0) > position(&srv, Kind::E1, 1),
-            "the PUT follows the first 200 poll"
-        );
-        config_check(srv.of(Kind::E6)[0], CHIP, BOARD, Some("1.2.3"));
-    });
-
-    for (name, href) in [
-        (
-            "foreign_origin_link",
-            format!("{FOREIGN}/controller/v1/{DEVICE_ID}/configData"),
-        ),
-        (
-            "same_origin_other_path_link",
-            format!("{}/trap/configData", root()),
-        ),
-    ] {
+    differential(|| {
         let mut srv = Server::new();
-        srv.links_override = Some(json!({"configData": {"href": href}}));
+        srv.config_link = ConfigLink::Never;
+        srv.queue(Kind::E1, &[status(503, "")]);
+        let mut d = Device::new("1.2.3");
+        d.run_for(&mut srv, secs(20 * 60));
+        check("first_poll_503_no_link", || {
+            assert!(srv.count(Kind::E1) >= 2, "polls {}", srv.count(Kind::E1));
+            assert_eq!(srv.count(Kind::E6), 1);
+            assert!(
+                position(&srv, Kind::E6, 0) > position(&srv, Kind::E1, 1),
+                "the PUT follows the first 200 poll"
+            );
+            config_check(srv.of(Kind::E6)[0], CHIP, BOARD, Some("1.2.3"));
+        });
+
+        for (name, href) in [
+            (
+                "foreign_origin_link",
+                format!("{FOREIGN}/controller/v1/{DEVICE_ID}/configData"),
+            ),
+            (
+                "same_origin_other_path_link",
+                format!("{}/trap/configData", root()),
+            ),
+        ] {
+            let mut srv = Server::new();
+            srv.links_override = Some(json!({"configData": {"href": href}}));
+            let mut d = Device::new("1.2.3");
+            d.run_for(&mut srv, secs(90));
+            check(name, || {
+                assert_eq!(srv.count(Kind::E6), 1);
+                config_check(srv.of(Kind::E6)[0], CHIP, BOARD, Some("1.2.3"));
+                assert!(
+                    srv.requests
+                        .iter()
+                        .all(|r| !r.url.starts_with(FOREIGN) && !r.url.contains("/trap/")),
+                    "the link was followed"
+                );
+                assert_eq!(srv.of(Kind::E6)[0].url, d.endpoint.config_data_url());
+            });
+        }
+
+        let mut srv = Server::new();
+        srv.on(Kind::E6, status(400, ""));
         let mut d = Device::new("1.2.3");
         d.run_for(&mut srv, secs(90));
-        check(name, || {
-            assert_eq!(srv.count(Kind::E6), 1);
-            config_check(srv.of(Kind::E6)[0], CHIP, BOARD, Some("1.2.3"));
+        check("answered_400", || {
+            assert_eq!(srv.count(Kind::E6), 1, "no retry in the same boot");
             assert!(
-                srv.requests
-                    .iter()
-                    .all(|r| !r.url.starts_with(FOREIGN) && !r.url.contains("/trap/")),
-                "the link was followed"
+                srv.count(Kind::E1) >= 3,
+                "polling continues: {}",
+                srv.count(Kind::E1)
             );
-            assert_eq!(srv.of(Kind::E6)[0].url, d.endpoint.config_data_url());
         });
-    }
 
-    let mut srv = Server::new();
-    srv.on(Kind::E6, status(400, ""));
-    let mut d = Device::new("1.2.3");
-    d.run_for(&mut srv, secs(90));
-    check("answered_400", || {
-        assert_eq!(srv.count(Kind::E6), 1, "no retry in the same boot");
-        assert!(
-            srv.count(Kind::E1) >= 3,
-            "polling continues: {}",
-            srv.count(Kind::E1)
-        );
-    });
-
-    let (mut srv, mut d) = run_case("0.0.0", &Doc::new("1", "1.0.0"), same);
-    d.reboot(&mut srv);
-    d.run_for(&mut srv, secs(60));
-    check("install_then_restart", || {
-        expect_success(&srv, None);
-        for p in srv.of(Kind::E6) {
-            config_check(p, CHIP, BOARD, None);
-        }
-        assert_eq!(config_versions(&srv), ["0.0.0", "1.0.0", "1.0.0"]);
+        let (mut srv, mut d) = run_case("0.0.0", &Doc::new("1", "1.0.0"), same);
+        d.reboot(&mut srv);
+        d.run_for(&mut srv, secs(60));
+        check("install_then_restart", || {
+            expect_success(&srv, None);
+            for p in srv.of(Kind::E6) {
+                config_check(p, CHIP, BOARD, None);
+            }
+            assert_eq!(config_versions(&srv), ["0.0.0", "1.0.0", "1.0.0"]);
+        });
     });
 }
 
@@ -2959,52 +3581,54 @@ fn s_dev_06_config_data_once_per_boot_from_the_base() {
 /// and the marker does not lift it.
 #[test]
 fn s_dev_07_chip_gate_refuses_before_the_version_gate() {
-    let c3 = |running: &str| Device::new(running);
-    let c6 = |running: &str| Device::for_chip(running, OTHER_CHIP, ImageChip::Esp32C6);
+    differential(|| {
+        let c3 = |running: &str| Device::new(running);
+        let c6 = |running: &str| Device::for_chip(running, OTHER_CHIP, ImageChip::Esp32C6);
 
-    let (srv, _) = run_case(
-        "0.0.0",
-        &Doc::new("1", "1.0.0").metadata(&[("chip", OTHER_CHIP)]),
-        same,
-    );
-    check("build_c3_document_c6", || verdict(&srv, TMM));
+        let (srv, _) = run_case(
+            "0.0.0",
+            &Doc::new("1", "1.0.0").metadata(&[("chip", OTHER_CHIP)]),
+            same,
+        );
+        check("build_c3_document_c6", || verdict(&srv, TMM));
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    let mut d = c6("0.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("build_c6_document_c3", || verdict(&srv, TMM));
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        let mut d = c6("0.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("build_c6_document_c3", || verdict(&srv, TMM));
 
-    let (srv, _) = run_case(
-        "2.0.0",
-        &Doc::new("1", "1.0.0")
-            .metadata(&[("chip", OTHER_CHIP)])
-            .marker(),
-        same,
-    );
-    check("marker_does_not_override", || verdict(&srv, TMM));
+        let (srv, _) = run_case(
+            "2.0.0",
+            &Doc::new("1", "1.0.0")
+                .metadata(&[("chip", OTHER_CHIP)])
+                .marker(),
+            same,
+        );
+        check("marker_does_not_override", || verdict(&srv, TMM));
 
-    let (srv, _) = run_case(
-        "1.0.0",
-        &Doc::new("1", "1.0.0").metadata(&[("chip", OTHER_CHIP)]),
-        same,
-    );
-    check("chip_gate_before_version_gate", || verdict(&srv, TMM));
+        let (srv, _) = run_case(
+            "1.0.0",
+            &Doc::new("1", "1.0.0").metadata(&[("chip", OTHER_CHIP)]),
+            same,
+        );
+        check("chip_gate_before_version_gate", || verdict(&srv, TMM));
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    let mut d = c3("0.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("build_c3_document_c3", || {
-        verdict(&srv, Expect::Success(None))
-    });
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        let mut d = c3("0.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("build_c3_document_c3", || {
+            verdict(&srv, Expect::Success(None))
+        });
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::for_chip("1", "1.0.0", ImageChip::Esp32C6, OTHER_CHIP));
-    let mut d = c6("0.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("build_c6_document_c6", || {
-        verdict(&srv, Expect::Success(None))
+        let mut srv = Server::new();
+        srv.offer(&Doc::for_chip("1", "1.0.0", ImageChip::Esp32C6, OTHER_CHIP));
+        let mut d = c6("0.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("build_c6_document_c6", || {
+            verdict(&srv, Expect::Success(None))
+        });
     });
 }
 
@@ -3021,108 +3645,110 @@ type VersionCase = (
 /// S-DEV-08: numeric version order, the `downgrade=allowed` marker and the device floor.
 #[test]
 fn s_dev_08_version_gate_order_marker_and_floor() {
-    let cases: Vec<VersionCase> = vec![
-        (
-            "older_offer",
-            "2.0.0",
-            "1.0.0",
-            false,
-            None,
-            Expect::Refuse(1007, "downgrade"),
-        ),
-        ("same_version", "1.0.0", "1.0.0", false, None, UTD),
-        (
-            "minor_10_is_newer_than_9",
-            "1.9.0",
-            "1.10.0",
-            false,
-            None,
-            Expect::Success(None),
-        ),
-        (
-            "minor_9_is_older_than_10",
-            "1.10.0",
-            "1.9.0",
-            false,
-            None,
-            Expect::Refuse(1007, "downgrade"),
-        ),
-        (
-            "marker_older_offer",
-            "2.0.0",
-            "1.0.0",
-            true,
-            None,
-            Expect::Success(Some("downgrade")),
-        ),
-        (
-            "marker_same_version",
-            "1.0.0",
-            "1.0.0",
-            true,
-            None,
-            Expect::Success(Some("downgrade")),
-        ),
-        (
-            "marker_newer_offer_does_not_decide",
-            "1.0.0",
-            "2.0.0",
-            true,
-            None,
-            Expect::Success(None),
-        ),
-        (
-            "below_floor",
-            "1.0.0",
-            "1.4.0",
-            false,
-            Some("1.5.0"),
-            Expect::Refuse(1007, "below_floor"),
-        ),
-        (
-            "below_floor_with_marker",
-            "1.0.0",
-            "1.4.0",
-            true,
-            Some("1.5.0"),
-            Expect::Refuse(1007, "below_floor"),
-        ),
-        (
-            "below_floor_over_downgrade",
-            "2.0.0",
-            "1.4.0",
-            false,
-            Some("1.5.0"),
-            Expect::Refuse(1007, "below_floor"),
-        ),
-        (
-            "marker_above_floor_installs",
-            "2.0.0",
-            "1.6.0",
-            true,
-            Some("1.5.0"),
-            Expect::Success(Some("downgrade")),
-        ),
-        (
-            "equal_to_floor_installs",
-            "1.0.0",
-            "1.5.0",
-            false,
-            Some("1.5.0"),
-            Expect::Success(None),
-        ),
-    ];
-    for (name, running, offered, marker, floor, expect) in cases {
-        let mut doc = Doc::new("1", offered);
-        if marker {
-            doc = doc.marker();
+    differential(|| {
+        let cases: Vec<VersionCase> = vec![
+            (
+                "older_offer",
+                "2.0.0",
+                "1.0.0",
+                false,
+                None,
+                Expect::Refuse(1007, "downgrade"),
+            ),
+            ("same_version", "1.0.0", "1.0.0", false, None, UTD),
+            (
+                "minor_10_is_newer_than_9",
+                "1.9.0",
+                "1.10.0",
+                false,
+                None,
+                Expect::Success(None),
+            ),
+            (
+                "minor_9_is_older_than_10",
+                "1.10.0",
+                "1.9.0",
+                false,
+                None,
+                Expect::Refuse(1007, "downgrade"),
+            ),
+            (
+                "marker_older_offer",
+                "2.0.0",
+                "1.0.0",
+                true,
+                None,
+                Expect::Success(Some("downgrade")),
+            ),
+            (
+                "marker_same_version",
+                "1.0.0",
+                "1.0.0",
+                true,
+                None,
+                Expect::Success(Some("downgrade")),
+            ),
+            (
+                "marker_newer_offer_does_not_decide",
+                "1.0.0",
+                "2.0.0",
+                true,
+                None,
+                Expect::Success(None),
+            ),
+            (
+                "below_floor",
+                "1.0.0",
+                "1.4.0",
+                false,
+                Some("1.5.0"),
+                Expect::Refuse(1007, "below_floor"),
+            ),
+            (
+                "below_floor_with_marker",
+                "1.0.0",
+                "1.4.0",
+                true,
+                Some("1.5.0"),
+                Expect::Refuse(1007, "below_floor"),
+            ),
+            (
+                "below_floor_over_downgrade",
+                "2.0.0",
+                "1.4.0",
+                false,
+                Some("1.5.0"),
+                Expect::Refuse(1007, "below_floor"),
+            ),
+            (
+                "marker_above_floor_installs",
+                "2.0.0",
+                "1.6.0",
+                true,
+                Some("1.5.0"),
+                Expect::Success(Some("downgrade")),
+            ),
+            (
+                "equal_to_floor_installs",
+                "1.0.0",
+                "1.5.0",
+                false,
+                Some("1.5.0"),
+                Expect::Success(None),
+            ),
+        ];
+        for (name, running, offered, marker, floor, expect) in cases {
+            let mut doc = Doc::new("1", offered);
+            if marker {
+                doc = doc.marker();
+            }
+            let (srv, _) = run_case(running, &doc, |d| match floor {
+                Some(f) => d.floor(f),
+                None => d,
+            });
+            check(name, || verdict(&srv, expect));
         }
-        let (srv, _) = run_case(running, &doc, |d| match floor {
-            Some(f) => d.floor(f),
-            None => d,
-        });
-        check(name, || verdict(&srv, expect));
-    }
+    });
 }
 
 /// S-DEV-09: a rollback is reported 1004 and remembered; the remembered version is refused
@@ -3130,64 +3756,66 @@ fn s_dev_08_version_gate_order_marker_and_floor() {
 /// (and still remembered), cleared by a healthy install of another version, and `below_floor` wins.
 #[test]
 fn s_dev_09_rollback_record_across_restarts() {
-    fn rolled_back_life() -> (Server, Device) {
-        let mut srv = Server::new();
-        srv.offer(&Doc::new("1", "1.1.0"));
-        let mut d = Device::new("1.0.0").unhealthy("1.1.0");
-        d.run_for(&mut srv, secs(400));
-        expect_rolled_back(&srv);
-        (srv, d)
-    }
+    differential(|| {
+        fn rolled_back_life() -> (Server, Device) {
+            let mut srv = Server::new();
+            srv.offer(&Doc::new("1", "1.1.0"));
+            let mut d = Device::new("1.0.0").unhealthy("1.1.0");
+            d.run_for(&mut srv, secs(400));
+            expect_rolled_back(&srv);
+            (srv, d)
+        }
 
-    let (mut srv, mut d) = rolled_back_life();
-    d.unhealthy.clear();
-    srv.offer(&Doc::new("2", "1.1.0"));
-    srv.offer(&Doc::new("3", "1.1.0").marker());
-    srv.offer(&Doc::new("4", "1.1.0"));
-    d.run_for(&mut srv, secs(600));
-    check("a", || {
-        assert_eq!(
+        let (mut srv, mut d) = rolled_back_life();
+        d.unhealthy.clear();
+        srv.offer(&Doc::new("2", "1.1.0"));
+        srv.offer(&Doc::new("3", "1.1.0").marker());
+        srv.offer(&Doc::new("4", "1.1.0"));
+        d.run_for(&mut srv, secs(600));
+        check("a", || {
+            assert_eq!(
             outcome(&srv),
             "1004 rolled_back; 1007 previously_rolled_back; success previously_rolled_back; 1007 previously_rolled_back"
         );
-        assert_eq!(srv.count(Kind::E8), 2);
-        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
-    });
+            assert_eq!(srv.count(Kind::E8), 2);
+            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        });
 
-    let (mut srv, mut d) = rolled_back_life();
-    d.unhealthy.clear();
-    srv.offer(&Doc::new("2", "1.2.0"));
-    srv.offer(&Doc::new("3", "1.1.0"));
-    d.run_for(&mut srv, secs(600));
-    check("b", || {
-        assert_eq!(outcome(&srv), "1004 rolled_back; success; 1007 downgrade");
-        assert_eq!(srv.count(Kind::E8), 2);
-        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
-    });
+        let (mut srv, mut d) = rolled_back_life();
+        d.unhealthy.clear();
+        srv.offer(&Doc::new("2", "1.2.0"));
+        srv.offer(&Doc::new("3", "1.1.0"));
+        d.run_for(&mut srv, secs(600));
+        check("b", || {
+            assert_eq!(outcome(&srv), "1004 rolled_back; success; 1007 downgrade");
+            assert_eq!(srv.count(Kind::E8), 2);
+            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        });
 
-    let (mut srv, mut d) = rolled_back_life();
-    d.unhealthy.clear();
-    d.reflash(&mut srv, "1.2.0");
-    srv.offer(&Doc::new("2", "1.1.0"));
-    srv.offer(&Doc::new("3", "1.1.0").marker());
-    d.run_for(&mut srv, secs(600));
-    check("c", || {
-        assert_eq!(
-            outcome(&srv),
-            "1004 rolled_back; 1007 previously_rolled_back; success previously_rolled_back"
-        );
-        assert_eq!(srv.count(Kind::E8), 2);
-        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
-    });
+        let (mut srv, mut d) = rolled_back_life();
+        d.unhealthy.clear();
+        d.reflash(&mut srv, "1.2.0");
+        srv.offer(&Doc::new("2", "1.1.0"));
+        srv.offer(&Doc::new("3", "1.1.0").marker());
+        d.run_for(&mut srv, secs(600));
+        check("c", || {
+            assert_eq!(
+                outcome(&srv),
+                "1004 rolled_back; 1007 previously_rolled_back; success previously_rolled_back"
+            );
+            assert_eq!(srv.count(Kind::E8), 2);
+            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        });
 
-    let (mut srv, mut d) = rolled_back_life();
-    d.floor = Some(v("1.2.0"));
-    srv.offer(&Doc::new("2", "1.1.0"));
-    d.run_for(&mut srv, secs(300));
-    check("f", || {
-        assert_eq!(outcome(&srv), "1004 rolled_back; 1007 below_floor");
-        assert_eq!(srv.count(Kind::E8), 1);
-        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let (mut srv, mut d) = rolled_back_life();
+        d.floor = Some(v("1.2.0"));
+        srv.offer(&Doc::new("2", "1.1.0"));
+        d.run_for(&mut srv, secs(300));
+        check("f", || {
+            assert_eq!(outcome(&srv), "1004 rolled_back; 1007 below_floor");
+            assert_eq!(srv.count(Kind::E8), 1);
+            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        });
     });
 }
 
@@ -3196,39 +3824,42 @@ fn s_dev_09_rollback_record_across_restarts() {
 /// then handles the next offer normally (F5).
 #[test]
 fn s_dev_10_unreadable_records_report_1005_without_retrieval() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    srv.offer(&Doc::new("2", "1.0.0"));
-    let mut d = Device::new("1.0.0");
-    d.kv.put_str("att_ver", "9.9.9")
-        .put_str("att_slot", "bogus");
-    d.run_for(&mut srv, secs(120));
-    check("unreadable_records", || {
-        let terminals = srv.terminals();
-        assert_eq!(terminals.len(), 2, "{:?}", bodies(&terminals));
-        assert_eq!(terminals[0].action.as_deref(), Some("1"));
-        assert_eq!(terminals[0].code(), Some(1005));
-        assert_eq!(terminals[0].details(), ["records_unreadable"]);
-        assert!(
-            position(&srv, Kind::E2, 0).is_none_or(|e2| e2 > position(&srv, Kind::E3, 0).unwrap()),
-            "nothing retrieved before the 1005"
-        );
-        assert_eq!(srv.count(Kind::E8), 0);
-        assert_eq!(terminals[1].action.as_deref(), Some("2"));
-        assert_eq!(
-            terminals[1].code(),
-            Some(1007),
-            "F5: the next offer is handled normally"
-        );
-        assert_eq!(e2_actions(&srv), ["2"]);
-        assert!(!d.kv.has("att_slot"), "the corrupt attempt was repaired");
-        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
-    });
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        srv.offer(&Doc::new("2", "1.0.0"));
+        let mut d = Device::new("1.0.0");
+        d.kv.put_str("att_ver", "9.9.9")
+            .put_str("att_slot", "bogus");
+        d.run_for(&mut srv, secs(120));
+        check("unreadable_records", || {
+            let terminals = srv.terminals();
+            assert_eq!(terminals.len(), 2, "{:?}", bodies(&terminals));
+            assert_eq!(terminals[0].action.as_deref(), Some("1"));
+            assert_eq!(terminals[0].code(), Some(1005));
+            assert_eq!(terminals[0].details(), ["records_unreadable"]);
+            assert!(
+                position(&srv, Kind::E2, 0)
+                    .is_none_or(|e2| e2 > position(&srv, Kind::E3, 0).unwrap()),
+                "nothing retrieved before the 1005"
+            );
+            assert_eq!(srv.count(Kind::E8), 0);
+            assert_eq!(terminals[1].action.as_deref(), Some("2"));
+            assert_eq!(
+                terminals[1].code(),
+                Some(1007),
+                "F5: the next offer is handled normally"
+            );
+            assert_eq!(e2_actions(&srv), ["2"]);
+            assert!(!d.kv.has("att_slot"), "the corrupt attempt was repaired");
+            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        });
 
-    let (srv, _) = run_case("1.0.0", &Doc::new("1", "1.0.0"), same);
-    check("control", || {
-        verdict(&srv, UTD);
-        assert_eq!(srv.count(Kind::E2), 1);
+        let (srv, _) = run_case("1.0.0", &Doc::new("1", "1.0.0"), same);
+        check("control", || {
+            verdict(&srv, UTD);
+            assert_eq!(srv.count(Kind::E2), 1);
+        });
     });
 }
 
@@ -3236,141 +3867,145 @@ fn s_dev_10_unreadable_records_report_1005_without_retrieval() {
 /// retried with the same status, and the next action follows once the report is answered.
 #[test]
 fn s_dev_11_not_yet_while_a_terminal_report_is_pending() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    srv.offer(&Doc::new("2", "1.0.0"));
-    srv.on(Kind::E3, status(503, ""));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(100));
-    assert!(
-        srv.of(Kind::E3)
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        srv.offer(&Doc::new("2", "1.0.0"));
+        srv.on(Kind::E3, status(503, ""));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(100));
+        assert!(
+            srv.of(Kind::E3)
+                .iter()
+                .filter(|r| r.action.as_deref() == Some("1"))
+                .count()
+                >= 2
+        );
+
+        srv.close_offer("1");
+        let deferred_before = d
+            .poll_verdicts
             .iter()
-            .filter(|r| r.action.as_deref() == Some("1"))
+            .filter(|p| matches!(p, PollVerdict::OfferDeferred))
+            .count();
+        d.run_for(&mut srv, secs(70));
+        let mark = srv.mark();
+        let not_yet = d
+            .poll_verdicts
+            .iter()
+            .filter(|p| matches!(p, PollVerdict::OfferDeferred))
             .count()
-            >= 2
-    );
+            - deferred_before;
+        assert!(not_yet >= 2, "not yet: {not_yet}");
 
-    srv.close_offer("1");
-    let deferred_before = d
-        .poll_verdicts
-        .iter()
-        .filter(|p| matches!(p, PollVerdict::OfferDeferred))
-        .count();
-    d.run_for(&mut srv, secs(70));
-    let mark = srv.mark();
-    let not_yet = d
-        .poll_verdicts
-        .iter()
-        .filter(|p| matches!(p, PollVerdict::OfferDeferred))
-        .count()
-        - deferred_before;
-    assert!(not_yet >= 2, "not yet: {not_yet}");
+        srv.clear_standing(Kind::E3);
+        d.run_for(&mut srv, secs(100));
 
-    srv.clear_standing(Kind::E3);
-    d.run_for(&mut srv, secs(100));
-
-    let before: Vec<&Req> = srv.requests.iter().take(mark).collect();
-    let e2_before: Vec<&str> = before
-        .iter()
-        .filter(|r| r.kind == Kind::E2)
-        .filter_map(|r| r.action.as_deref())
-        .collect();
-    assert_eq!(e2_before, ["1"]);
-    let e2_after: Vec<&str> = srv
-        .since(mark)
-        .iter()
-        .filter(|r| r.kind == Kind::E2)
-        .filter_map(|r| r.action.as_deref())
-        .collect();
-    assert_eq!(e2_after, ["2"]);
-    let action1: Vec<&Req> = srv
-        .terminals()
-        .into_iter()
-        .filter(|r| r.action.as_deref() == Some("1"))
-        .collect();
-    assert!(action1.len() >= 3, "{:?}", bodies(&action1));
-    assert!(same_status(&action1), "{:?}", bodies(&action1));
-    assert_eq!(
-        (action1[0].code(), action1[0].detail0().as_str()),
-        (Some(1007), "up_to_date")
-    );
-    let action2: Vec<&Req> = srv
-        .terminals()
-        .into_iter()
-        .filter(|r| r.action.as_deref() == Some("2"))
-        .collect();
-    assert_eq!(action2.len(), 1, "{:?}", bodies(&action2));
-    assert_eq!(
-        (action2[0].code(), action2[0].detail0().as_str()),
-        (Some(1007), "up_to_date")
-    );
-    assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+        let before: Vec<&Req> = srv.requests.iter().take(mark).collect();
+        let e2_before: Vec<&str> = before
+            .iter()
+            .filter(|r| r.kind == Kind::E2)
+            .filter_map(|r| r.action.as_deref())
+            .collect();
+        assert_eq!(e2_before, ["1"]);
+        let e2_after: Vec<&str> = srv
+            .since(mark)
+            .iter()
+            .filter(|r| r.kind == Kind::E2)
+            .filter_map(|r| r.action.as_deref())
+            .collect();
+        assert_eq!(e2_after, ["2"]);
+        let action1: Vec<&Req> = srv
+            .terminals()
+            .into_iter()
+            .filter(|r| r.action.as_deref() == Some("1"))
+            .collect();
+        assert!(action1.len() >= 3, "{:?}", bodies(&action1));
+        assert!(same_status(&action1), "{:?}", bodies(&action1));
+        assert_eq!(
+            (action1[0].code(), action1[0].detail0().as_str()),
+            (Some(1007), "up_to_date")
+        );
+        let action2: Vec<&Req> = srv
+            .terminals()
+            .into_iter()
+            .filter(|r| r.action.as_deref() == Some("2"))
+            .collect();
+        assert_eq!(action2.len(), 1, "{:?}", bodies(&action2));
+        assert_eq!(
+            (action2[0].code(), action2[0].detail0().as_str()),
+            (Some(1007), "up_to_date")
+        );
+        assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+    });
 }
 
 /// S-DEV-12: a closed action id is never applied or reported again, in the same life and after a restart; a
 /// sticky offer of it is retrieved again by this client and refused at application (F3).
 #[test]
 fn s_dev_12_loop_guard_never_reapplies_a_closed_action() {
-    let mut srv = Server::new();
-    // The marker admits the running version, so the sticky re-offer reaches `begin_ddi_attempt`, where the guard holds.
-    srv.offer_sticky(&Doc::new("1", "1.0.0").marker());
-    srv.offer(&Doc::new("2", "1.0.0"));
-    let mut d = Device::new("0.0.0");
-    d.run_for(&mut srv, secs(300));
-    check("same_process_after_install", || {
-        expect_success(&srv, None);
-        assert!(
-            srv.count(Kind::E2) >= 2,
-            "F3: the sticky offer is retrieved again"
-        );
-        assert!(
-            d.admissions.iter().any(|a| a == "closed 1"),
-            "the closed action is refused at application: {:?}",
-            d.admissions
-        );
-        assert_eq!(
-            d.kv.u8_of("ddi_stage"),
-            Some(3),
-            "the action is closed in the records"
-        );
-    });
-    srv.close_offer("1");
-    d.run_for(&mut srv, secs(60));
-    check("same_process_after_install_withdrawn", || {
-        assert_eq!(outcome(&srv), "success; 1007 up_to_date");
-        assert_eq!(e2_actions(&srv).iter().filter(|a| *a == "2").count(), 1);
-    });
+    differential(|| {
+        let mut srv = Server::new();
+        // The marker admits the running version, so the sticky re-offer reaches `begin_ddi_attempt`, where the guard holds.
+        srv.offer_sticky(&Doc::new("1", "1.0.0").marker());
+        srv.offer(&Doc::new("2", "1.0.0"));
+        let mut d = Device::new("0.0.0");
+        d.run_for(&mut srv, secs(300));
+        check("same_process_after_install", || {
+            expect_success(&srv, None);
+            assert!(
+                srv.count(Kind::E2) >= 2,
+                "F3: the sticky offer is retrieved again"
+            );
+            assert!(
+                d.admissions.iter().any(|a| a == "closed 1"),
+                "the closed action is refused at application: {:?}",
+                d.admissions
+            );
+            assert_eq!(
+                d.kv.u8_of("ddi_stage"),
+                Some(3),
+                "the action is closed in the records"
+            );
+        });
+        srv.close_offer("1");
+        d.run_for(&mut srv, secs(60));
+        check("same_process_after_install_withdrawn", || {
+            assert_eq!(outcome(&srv), "success; 1007 up_to_date");
+            assert_eq!(e2_actions(&srv).iter().filter(|a| *a == "2").count(), 1);
+        });
 
-    let mut srv = Server::new();
-    srv.offer_sticky(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(300));
-    check("same_process_after_refusal", || {
+        let mut srv = Server::new();
+        srv.offer_sticky(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(300));
+        check("same_process_after_refusal", || {
+            expect_refusal(&srv, 1007, "up_to_date", 1);
+            assert!(srv.count(Kind::E2) >= 2, "F3");
+        });
+
+        let mut srv = Server::new();
+        srv.offer_sticky(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("0.0.0");
+        d.run_for(&mut srv, secs(120));
+        expect_success(&srv, None);
+        d.reboot(&mut srv);
+        d.run_for(&mut srv, secs(120));
+        check("after_restart_after_install", || {
+            expect_success(&srv, None);
+            assert_eq!(srv.count(Kind::E8), 1);
+        });
+
+        let mut srv = Server::new();
+        srv.offer_sticky(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(60));
         expect_refusal(&srv, 1007, "up_to_date", 1);
-        assert!(srv.count(Kind::E2) >= 2, "F3");
-    });
-
-    let mut srv = Server::new();
-    srv.offer_sticky(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("0.0.0");
-    d.run_for(&mut srv, secs(120));
-    expect_success(&srv, None);
-    d.reboot(&mut srv);
-    d.run_for(&mut srv, secs(120));
-    check("after_restart_after_install", || {
-        expect_success(&srv, None);
-        assert_eq!(srv.count(Kind::E8), 1);
-    });
-
-    let mut srv = Server::new();
-    srv.offer_sticky(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(60));
-    expect_refusal(&srv, 1007, "up_to_date", 1);
-    d.reboot(&mut srv);
-    d.run_for(&mut srv, secs(120));
-    check("after_restart_after_refusal", || {
-        expect_refusal(&srv, 1007, "up_to_date", 1)
+        d.reboot(&mut srv);
+        d.run_for(&mut srv, secs(120));
+        check("after_restart_after_refusal", || {
+            expect_refusal(&srv, 1007, "up_to_date", 1)
+        });
     });
 }
 
@@ -3378,108 +4013,112 @@ fn s_dev_12_loop_guard_never_reapplies_a_closed_action() {
 /// 410; every other answer, a throttle with `Retry-After` and a lost connection keep it pending.
 #[test]
 fn s_dev_13_terminal_feedback_retried_until_200_404_410() {
-    for (name, reply) in [
-        ("200", status(200, "")),
-        ("404", status(404, "")),
-        ("410", status(410, "")),
-    ] {
-        let mut srv = Server::new();
-        srv.offer(&Doc::new("1", "1.0.0"));
-        srv.on(Kind::E3, reply);
-        let mut d = Device::new("1.0.0");
-        d.run_for(&mut srv, secs(600));
-        check(name, || {
-            expect_refusal(&srv, 1007, "up_to_date", 1);
-            assert_eq!(srv.count(Kind::E2), 1);
-        });
-    }
-
-    let keep: Vec<(&str, Reply)> = vec![
-        ("400", status(400, "")),
-        ("401", status(401, "")),
-        ("413", status(413, "")),
-        ("429_retry_after_2", status_retry_after(429, "2")),
-        ("429_retry_after_120", status_retry_after(429, "120")),
-        ("500", status(500, "")),
-        ("503", status(503, "")),
-        ("dropped", Reply::Unreachable),
-    ];
-    for (name, reply) in keep {
-        let mut srv = Server::new();
-        srv.offer(&Doc::new("1", "1.0.0"));
-        srv.on(Kind::E3, reply);
-        let mut d = Device::new("1.0.0");
-        // Nudges every 10 s keep the polls closer than the sender's 30 s pacing, so only that pacing spaces the sends.
-        for t in 1..30u64 {
-            d.run_until(&mut srv, secs(t * 10));
-            d.nudge();
+    differential(|| {
+        for (name, reply) in [
+            ("200", status(200, "")),
+            ("404", status(404, "")),
+            ("410", status(410, "")),
+        ] {
+            let mut srv = Server::new();
+            srv.offer(&Doc::new("1", "1.0.0"));
+            srv.on(Kind::E3, reply);
+            let mut d = Device::new("1.0.0");
+            d.run_for(&mut srv, secs(600));
+            check(name, || {
+                expect_refusal(&srv, 1007, "up_to_date", 1);
+                assert_eq!(srv.count(Kind::E2), 1);
+            });
         }
-        d.run_until(&mut srv, secs(300));
-        let attempts = srv.count(Kind::E3);
-        srv.clear_standing(Kind::E3);
-        d.run_for(&mut srv, secs(120));
-        let answered_at = srv.count(Kind::E3);
-        d.run_for(&mut srv, secs(600));
-        check(name, || {
-            assert!(attempts >= 3, "attempts before the 200: {attempts}");
-            assert_eq!(answered_at, attempts + 1, "one send after the switch");
-            assert_eq!(srv.count(Kind::E3), answered_at, "no send after the 200");
-            expect_refusal(&srv, 1007, "up_to_date", answered_at);
-            let sends = srv.of(Kind::E3);
-            assert!(
-                gaps_at_least(&sends, secs(30)),
-                "pacing {:?}",
-                sends.iter().map(|r| r.t).collect::<Vec<_>>()
-            );
-            assert!(same_status(&sends));
-            if name == "429_retry_after_120" {
+
+        let keep: Vec<(&str, Reply)> = vec![
+            ("400", status(400, "")),
+            ("401", status(401, "")),
+            ("413", status(413, "")),
+            ("429_retry_after_2", status_retry_after(429, "2")),
+            ("429_retry_after_120", status_retry_after(429, "120")),
+            ("500", status(500, "")),
+            ("503", status(503, "")),
+            ("dropped", Reply::Unreachable),
+        ];
+        for (name, reply) in keep {
+            let mut srv = Server::new();
+            srv.offer(&Doc::new("1", "1.0.0"));
+            srv.on(Kind::E3, reply);
+            let mut d = Device::new("1.0.0");
+            // Nudges every 10 s keep the polls closer than the sender's 30 s pacing, so only that pacing spaces the sends.
+            for t in 1..30u64 {
+                d.run_until(&mut srv, secs(t * 10));
+                d.nudge();
+            }
+            d.run_until(&mut srv, secs(300));
+            let attempts = srv.count(Kind::E3);
+            srv.clear_standing(Kind::E3);
+            d.run_for(&mut srv, secs(120));
+            let answered_at = srv.count(Kind::E3);
+            d.run_for(&mut srv, secs(600));
+            check(name, || {
+                assert!(attempts >= 3, "attempts before the 200: {attempts}");
+                assert_eq!(answered_at, attempts + 1, "one send after the switch");
+                assert_eq!(srv.count(Kind::E3), answered_at, "no send after the 200");
+                expect_refusal(&srv, 1007, "up_to_date", answered_at);
+                let sends = srv.of(Kind::E3);
                 assert!(
-                    gaps_at_least(&sends, secs(120)),
-                    "Retry-After honoured: {:?}",
+                    gaps_at_least(&sends, secs(30)),
+                    "pacing {:?}",
                     sends.iter().map(|r| r.t).collect::<Vec<_>>()
                 );
-            }
-            assert_eq!(srv.count(Kind::E2), 1);
-        });
-    }
+                assert!(same_status(&sends));
+                if name == "429_retry_after_120" {
+                    assert!(
+                        gaps_at_least(&sends, secs(120)),
+                        "Retry-After honoured: {:?}",
+                        sends.iter().map(|r| r.t).collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(srv.count(Kind::E2), 1);
+            });
+        }
+    });
 }
 
 /// S-DEV-14: the terminal report is persisted before its first send and survives a power cut before and after
 /// that send; the next life sends it (after its first accepted poll, F4) and never re-evaluates the offer.
 #[test]
 fn s_dev_14_terminal_feedback_persisted_before_the_first_send() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("1.0.0").crash_at(CrashPoint::BeforeVerdictSend);
-    d.run_for(&mut srv, secs(200));
-    check("cut_before_first_send", || {
-        assert!(d.events.iter().any(|(_, e)| *e == Event::Crash));
-        let first_send = position(&srv, Kind::E3, 0).expect("a send");
-        let next_life_poll = position(&srv, Kind::E1, 1).expect("the next life's poll");
-        assert!(
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("1.0.0").crash_at(CrashPoint::BeforeVerdictSend);
+        d.run_for(&mut srv, secs(200));
+        check("cut_before_first_send", || {
+            assert!(d.events.iter().any(|(_, e)| *e == Event::Crash));
+            let first_send = position(&srv, Kind::E3, 0).expect("a send");
+            let next_life_poll = position(&srv, Kind::E1, 1).expect("the next life's poll");
+            assert!(
             first_send > next_life_poll,
             "no send before the cut; the stored report goes out after the next life's first accepted poll (F4)"
         );
-        expect_refusal(&srv, 1007, "up_to_date", 1);
-        assert_eq!(srv.count(Kind::E2), 1, "no re-evaluation after the restart");
-        assert_eq!(d.kv.u8_of("ddi_stage"), Some(STAGE_CLOSED));
-    });
+            expect_refusal(&srv, 1007, "up_to_date", 1);
+            assert_eq!(srv.count(Kind::E2), 1, "no re-evaluation after the restart");
+            assert_eq!(d.kv.u8_of("ddi_stage"), Some(STAGE_CLOSED));
+        });
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("1.0.0").crash_at(CrashPoint::AfterVerdictSend);
-    d.run_for(&mut srv, secs(200));
-    check("cut_after_first_send", || {
-        let sends = srv.of(Kind::E3);
-        assert_eq!(sends.len(), 2, "{:?}", bodies(&sends));
-        assert!(
-            position(&srv, Kind::E3, 1) > position(&srv, Kind::E1, 1),
-            "the resend follows the next life's first poll (F4)"
-        );
-        assert!(same_status(&sends));
-        expect_refusal(&srv, 1007, "up_to_date", 2);
-        assert_eq!(srv.count(Kind::E2), 1);
-        assert_eq!(d.kv.u8_of("ddi_stage"), Some(STAGE_CLOSED));
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("1.0.0").crash_at(CrashPoint::AfterVerdictSend);
+        d.run_for(&mut srv, secs(200));
+        check("cut_after_first_send", || {
+            let sends = srv.of(Kind::E3);
+            assert_eq!(sends.len(), 2, "{:?}", bodies(&sends));
+            assert!(
+                position(&srv, Kind::E3, 1) > position(&srv, Kind::E1, 1),
+                "the resend follows the next life's first poll (F4)"
+            );
+            assert!(same_status(&sends));
+            expect_refusal(&srv, 1007, "up_to_date", 2);
+            assert_eq!(srv.count(Kind::E2), 1);
+            assert_eq!(d.kv.u8_of("ddi_stage"), Some(STAGE_CLOSED));
+        });
     });
 }
 
@@ -3488,55 +4127,57 @@ fn s_dev_14_terminal_feedback_persisted_before_the_first_send() {
 /// refused answer is sent again.
 #[test]
 fn s_dev_15_cancel_path_only() {
-    let both = json!({
-        "cancelAction": {"href": format!("{}/cancelAction/1", root())},
-        "deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", root())}
-    });
+    differential(|| {
+        let both = json!({
+            "cancelAction": {"href": format!("{}/cancelAction/1", root())},
+            "deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", root())}
+        });
 
-    let mut srv = Server::new();
-    srv.links_override = Some(both.clone());
-    srv.cancel("1").offer(&Doc::new("1", "1.0.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(29));
-    check("acknowledged", || {
-        expect_cancel(&srv, true, 1, 1);
-    });
+        let mut srv = Server::new();
+        srv.links_override = Some(both.clone());
+        srv.cancel("1").offer(&Doc::new("1", "1.0.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(29));
+        check("acknowledged", || {
+            expect_cancel(&srv, true, 1, 1);
+        });
 
-    let mut srv = Server::new();
-    srv.links_override = Some(both.clone());
-    srv.cancel("1").offer(&Doc::new("1", "1.0.0"));
-    srv.queue(Kind::E5, &[status(503, "")]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(45));
-    check("acknowledged_answer_503_once", || {
-        expect_cancel(&srv, true, 2, 2);
-        assert!(same_status(&srv.of(Kind::E5)));
-    });
+        let mut srv = Server::new();
+        srv.links_override = Some(both.clone());
+        srv.cancel("1").offer(&Doc::new("1", "1.0.0"));
+        srv.queue(Kind::E5, &[status(503, "")]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(45));
+        check("acknowledged_answer_503_once", || {
+            expect_cancel(&srv, true, 2, 2);
+            assert!(same_status(&srv.of(Kind::E5)));
+        });
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, Duration::from_millis(500));
-    srv.links_override = Some(both);
-    srv.cancel("1");
-    d.run_for(&mut srv, secs(20));
-    check("rejected", || {
-        assert_eq!(srv.count(Kind::E4), 1);
-        assert_eq!(
-            e2_actions(&srv),
-            ["1"],
-            "the document was retrieved once, before the cancel"
-        );
-        let answers = srv.of(Kind::E5);
-        assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
-        assert_eq!(
-            (
-                answers[0].execution().as_str(),
-                answers[0].finished().as_str()
-            ),
-            ("rejected", "none")
-        );
-        assert_eq!(d.cancel_results, [Some(CancelResult::Rejected)]);
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, Duration::from_millis(500));
+        srv.links_override = Some(both);
+        srv.cancel("1");
+        d.run_for(&mut srv, secs(20));
+        check("rejected", || {
+            assert_eq!(srv.count(Kind::E4), 1);
+            assert_eq!(
+                e2_actions(&srv),
+                ["1"],
+                "the document was retrieved once, before the cancel"
+            );
+            let answers = srv.of(Kind::E5);
+            assert_eq!(answers.len(), 1, "{:?}", bodies(&answers));
+            assert_eq!(
+                (
+                    answers[0].execution().as_str(),
+                    answers[0].finished().as_str()
+                ),
+                ("rejected", "none")
+            );
+            assert_eq!(d.cancel_results, [Some(CancelResult::Rejected)]);
+        });
     });
 }
 
@@ -3550,129 +4191,134 @@ fn https_root() -> String {
 /// the controller-id grammar and the per-case names are the unit tests of `endpoint.rs`.
 #[test]
 fn s_orig_01_a_refused_base_url_never_connects() {
-    let id = ControllerId::parse(DEVICE_ID).expect("controller id");
-    let cases = [
-        (
-            "userinfo",
-            "http://u@127.0.0.1:38080/DEFAULT",
-            UrlRefusal::ForbiddenChar,
-        ),
-        (
-            "percent_path",
-            "http://127.0.0.1:38080/DEFAULT/%2e",
-            UrlRefusal::ForbiddenChar,
-        ),
-        (
-            "trailing_dot_host",
-            "http://127.0.0.1.:38080/DEFAULT",
-            UrlRefusal::Host,
-        ),
-        ("port_zero", "http://127.0.0.1:0/DEFAULT", UrlRefusal::Port),
-        (
-            "port_plus",
-            "http://127.0.0.1:+38080/DEFAULT",
-            UrlRefusal::Port,
-        ),
-        (
-            "ftp_scheme",
-            "ftp://127.0.0.1:38080/DEFAULT",
-            UrlRefusal::Scheme,
-        ),
-    ];
-    for (name, base, want) in cases {
-        check(name, || match DdiEndpoint::new(base, &id) {
-            Err(EndpointError::InvalidBaseUrl(case)) => assert_eq!(case, want),
-            other => panic!("accepted or another error: {other:?}"),
-        });
-    }
-    let control = DdiEndpoint::new(BASE, &id).expect("the plain base");
-    assert_eq!(
-        control.poll_url(),
-        format!("http://127.0.0.1:38080/DEFAULT/controller/v1/{DEVICE_ID}")
-    );
+    differential(|| {
+        let id = ControllerId::parse(DEVICE_ID).expect("controller id");
+        let cases = [
+            (
+                "userinfo",
+                "http://u@127.0.0.1:38080/DEFAULT",
+                UrlRefusal::ForbiddenChar,
+            ),
+            (
+                "percent_path",
+                "http://127.0.0.1:38080/DEFAULT/%2e",
+                UrlRefusal::ForbiddenChar,
+            ),
+            (
+                "trailing_dot_host",
+                "http://127.0.0.1.:38080/DEFAULT",
+                UrlRefusal::Host,
+            ),
+            ("port_zero", "http://127.0.0.1:0/DEFAULT", UrlRefusal::Port),
+            (
+                "port_plus",
+                "http://127.0.0.1:+38080/DEFAULT",
+                UrlRefusal::Port,
+            ),
+            (
+                "ftp_scheme",
+                "ftp://127.0.0.1:38080/DEFAULT",
+                UrlRefusal::Scheme,
+            ),
+        ];
+        for (name, base, want) in cases {
+            check(name, || match DdiEndpoint::new(base, &id) {
+                Err(EndpointError::InvalidBaseUrl(case)) => assert_eq!(case, want),
+                other => panic!("accepted or another error: {other:?}"),
+            });
+        }
+        let control = DdiEndpoint::new(BASE, &id).expect("the plain base");
+        assert_eq!(
+            control.poll_url(),
+            format!("http://127.0.0.1:38080/DEFAULT/controller/v1/{DEVICE_ID}")
+        );
+    });
 }
 
 /// S-ORIG-02: one foreign or refused link among `deploymentBase`, `cancelAction` and `configData` makes the
 /// device act on none of that poll's links; `configData` still goes to the base; good links recover.
 #[test]
 fn s_orig_02_a_refused_poll_link_gates_the_whole_poll() {
-    let good_deployment = format!("{}/deploymentBase/1?c=1", root());
-    let cases: Vec<(&str, Value, UrlRefusal)> = vec![
-        (
-            "foreign_deployment",
-            json!({"deploymentBase": {"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/deploymentBase/1?c=1")}}),
-            UrlRefusal::Origin,
-        ),
-        (
-            "foreign_config_next_to_good_deployment",
-            json!({"deploymentBase": {"href": good_deployment}, "configData": {"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/configData")}}),
-            UrlRefusal::Origin,
-        ),
-        (
-            "userinfo_cancel_next_to_good_deployment",
-            json!({"cancelAction": {"href": format!("http://u@127.0.0.1:38080/DEFAULT/controller/v1/{DEVICE_ID}/cancelAction/1")}, "deploymentBase": {"href": good_deployment}}),
-            UrlRefusal::ForbiddenChar,
-        ),
-        (
-            "percent_trap_deployment",
-            json!({"deploymentBase": {"href": format!("{}/trap/%2e%2e/deploymentBase/1", root())}}),
-            UrlRefusal::ForbiddenChar,
-        ),
-        (
-            "localhost_trap_deployment",
-            json!({"deploymentBase": {"href": format!("http://localhost:38080/DEFAULT/controller/v1/{DEVICE_ID}/deploymentBase/1?c=1")}}),
-            UrlRefusal::Origin,
-        ),
-        (
-            "https_trap_deployment_on_http_base",
-            json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root().replace(":38443", ":38080"))}}),
-            UrlRefusal::Origin,
-        ),
-    ];
-    for (name, links, want) in cases {
-        let mut srv = Server::new();
-        srv.offer(&Doc::new("1", "1.1.0"));
-        srv.links_override = Some(links);
-        let mut d = Device::new("1.0.0");
-        d.run_for(&mut srv, secs(100));
-        check(name, || {
-            assert!(
-                srv.requests
+    differential(|| {
+        let good_deployment = format!("{}/deploymentBase/1?c=1", root());
+        let cases: Vec<(&str, Value, UrlRefusal)> = vec![
+            (
+                "foreign_deployment",
+                json!({"deploymentBase": {"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/deploymentBase/1?c=1")}}),
+                UrlRefusal::Origin,
+            ),
+            (
+                "foreign_config_next_to_good_deployment",
+                json!({"deploymentBase": {"href": good_deployment}, "configData": {"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/configData")}}),
+                UrlRefusal::Origin,
+            ),
+            (
+                "userinfo_cancel_next_to_good_deployment",
+                json!({"cancelAction": {"href": format!("http://u@127.0.0.1:38080/DEFAULT/controller/v1/{DEVICE_ID}/cancelAction/1")}, "deploymentBase": {"href": good_deployment}}),
+                UrlRefusal::ForbiddenChar,
+            ),
+            (
+                "percent_trap_deployment",
+                json!({"deploymentBase": {"href": format!("{}/trap/%2e%2e/deploymentBase/1", root())}}),
+                UrlRefusal::ForbiddenChar,
+            ),
+            (
+                "localhost_trap_deployment",
+                json!({"deploymentBase": {"href": format!("http://localhost:38080/DEFAULT/controller/v1/{DEVICE_ID}/deploymentBase/1?c=1")}}),
+                UrlRefusal::Origin,
+            ),
+            (
+                "https_trap_deployment_on_http_base",
+                json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root().replace(":38443", ":38080"))}}),
+                UrlRefusal::Origin,
+            ),
+        ];
+        for (name, links, want) in cases {
+            let mut srv = Server::new();
+            srv.offer(&Doc::new("1", "1.1.0"));
+            srv.links_override = Some(links);
+            let mut d = Device::new("1.0.0");
+            d.run_for(&mut srv, secs(100));
+            check(name, || {
+                assert!(
+                    srv.requests
+                        .iter()
+                        .all(|r| matches!(r.kind, Kind::E1 | Kind::E6)),
+                    "{:?}",
+                    srv.requests.iter().map(|r| r.kind).collect::<Vec<_>>()
+                );
+                assert!(srv.requests.iter().all(|r| !r.url.starts_with(FOREIGN)
+                    && !r.url.contains("/trap/")
+                    && !r.url.contains("localhost")));
+                let refusals: Vec<&PollVerdict> = d
+                    .poll_verdicts
                     .iter()
-                    .all(|r| matches!(r.kind, Kind::E1 | Kind::E6)),
-                "{:?}",
-                srv.requests.iter().map(|r| r.kind).collect::<Vec<_>>()
-            );
-            assert!(srv.requests.iter().all(|r| !r.url.starts_with(FOREIGN)
-                && !r.url.contains("/trap/")
-                && !r.url.contains("localhost")));
-            let refusals: Vec<&PollVerdict> = d
-                .poll_verdicts
-                .iter()
-                .filter(|p| matches!(p, PollVerdict::LinksRefused(_)))
-                .collect();
-            assert!(refusals.len() >= 2, "{:?}", d.poll_verdicts);
-            assert_eq!(srv.count(Kind::E6), 1, "configData still goes to the base");
-            assert_eq!(srv.of(Kind::E6)[0].url, d.endpoint.config_data_url());
-            assert!(
-                refusals
-                    .iter()
-                    .all(|p| **p == PollVerdict::LinksRefused(want)),
-                "{refusals:?}"
-            );
-            assert!(srv.count(Kind::E1) >= 2);
-        });
-        srv.links_override = None;
-        d.run_for(&mut srv, secs(200));
-        check(name, || expect_success(&srv, None));
-    }
+                    .filter(|p| matches!(p, PollVerdict::LinksRefused(_)))
+                    .collect();
+                assert!(refusals.len() >= 2, "{:?}", d.poll_verdicts);
+                assert_eq!(srv.count(Kind::E6), 1, "configData still goes to the base");
+                assert_eq!(srv.of(Kind::E6)[0].url, d.endpoint.config_data_url());
+                assert!(
+                    refusals
+                        .iter()
+                        .all(|p| **p == PollVerdict::LinksRefused(want)),
+                    "{refusals:?}"
+                );
+                assert!(srv.count(Kind::E1) >= 2);
+            });
+            srv.links_override = None;
+            d.run_for(&mut srv, secs(200));
+            check(name, || expect_success(&srv, None));
+        }
+    });
 }
 
 /// S-ORIG-03: a foreign or refused artifact link is refused 1006 `foreign_origin` before any download and
 /// before the `skip` deferral, with one terminal and no `proceeding`; other links of the artifact are ignored.
 #[test]
 fn s_orig_03_artifact_link_off_origin_is_1006_foreign_origin() {
-    let cases: Vec<(&str, Doc, &str)> = vec![
+    differential(|| {
+        let cases: Vec<(&str, Doc, &str)> = vec![
         ("foreign_listener", Doc::new("1", "1.1.0").href(&format!("{FOREIGN}/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin")), "origin"),
         ("userinfo", Doc::new("1", "1.1.0").href(&format!("http://u@127.0.0.1:38080/DEFAULT/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin")), "forbidden_char"),
         ("percent_trap", Doc::new("1", "1.1.0").href(&format!("{}/trap/%2e%2e/image.bin", root())), "forbidden_char"),
@@ -3680,62 +4326,65 @@ fn s_orig_03_artifact_link_off_origin_is_1006_foreign_origin() {
         ("localhost", Doc::new("1", "1.1.0").href(&format!("http://localhost:38080/DEFAULT/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin")), "origin"),
         ("foreign_with_update_skip", Doc::new("1", "1.1.0").handling("forced", "skip").href(&format!("{FOREIGN}/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin")), "origin"),
     ];
-    for (name, doc, case) in cases {
-        let (srv, d) = run_case("1.0.0", &doc, same);
-        check(name, || {
-            expect_refusal(&srv, 1006, "foreign_origin", 1);
-            assert_eq!(srv.count(Kind::E3), 1, "no progress before the refusal");
-            assert_eq!(
-                d.admissions,
-                [format!("refused 1 1006 foreign_origin {case}")]
-            );
-        });
-    }
+        for (name, doc, case) in cases {
+            let (srv, d) = run_case("1.0.0", &doc, same);
+            check(name, || {
+                expect_refusal(&srv, 1006, "foreign_origin", 1);
+                assert_eq!(srv.count(Kind::E3), 1, "no progress before the refusal");
+                assert_eq!(
+                    d.admissions,
+                    [format!("refused 1 1006 foreign_origin {case}")]
+                );
+            });
+        }
 
-    let control = Doc::new("1", "1.1.0").edit(|v| {
+        let control = Doc::new("1", "1.1.0").edit(|v| {
         let links = &mut v["deployment"]["chunks"][0]["artifacts"][0]["_links"];
         links["md5sum-http"] = json!({"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin.MD5SUM")});
         links["download"] = json!({"href": format!("{FOREIGN}/controller/v1/{DEVICE_ID}/softwaremodules/1/artifacts/image-1.bin")});
     });
-    let (srv, _) = run_case("1.0.0", &control, same);
-    check("good_link_foreign_others", || {
-        expect_success(&srv, None);
-        assert!(srv.requests.iter().all(|r| !r.url.starts_with(FOREIGN)));
+        let (srv, _) = run_case("1.0.0", &control, same);
+        check("good_link_foreign_others", || {
+            expect_success(&srv, None);
+            assert!(srv.requests.iter().all(|r| !r.url.starts_with(FOREIGN)));
+        });
     });
 }
 
 /// S-ORIG-04: a 3xx on the document or the artifact is never followed and refused 1006 `redirect`.
 #[test]
 fn s_orig_04_redirects_on_document_and_artifact_are_1006_redirect() {
-    let cases = [
-        ("E2_302", Kind::E2, 302, 0),
-        ("E2_308", Kind::E2, 308, 0),
-        ("E8_307", Kind::E8, 307, 1),
-        ("E8_301", Kind::E8, 301, 1),
-    ];
-    for (name, kind, status, artifact_requests) in cases {
-        let mut srv = Server::new();
-        srv.offer(&Doc::new("1", "1.1.0"));
-        srv.queue(kind, &[Reply::Redirect(status)]);
-        let mut d = Device::new("1.0.0");
-        d.run_for(&mut srv, secs(120));
-        check(name, || {
-            let terminals = srv.terminals();
-            assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-            assert_eq!(
-                (terminals[0].finished().as_str(), terminals[0].code()),
-                ("failure", Some(1006))
-            );
-            assert_eq!(terminals[0].detail0(), "redirect");
-            assert_eq!(srv.count(Kind::E8), artifact_requests);
-            assert!(srv
-                .requests
-                .iter()
-                .all(|r| !r.url.starts_with(FOREIGN) && !r.url.contains("/trap/")));
-            assert_eq!(feedback_problems(&srv), Vec::<String>::new());
-            assert_eq!(d.running(), v("1.0.0"));
-        });
-    }
+    differential(|| {
+        let cases = [
+            ("E2_302", Kind::E2, 302, 0),
+            ("E2_308", Kind::E2, 308, 0),
+            ("E8_307", Kind::E8, 307, 1),
+            ("E8_301", Kind::E8, 301, 1),
+        ];
+        for (name, kind, status, artifact_requests) in cases {
+            let mut srv = Server::new();
+            srv.offer(&Doc::new("1", "1.1.0"));
+            srv.queue(kind, &[Reply::Redirect(status)]);
+            let mut d = Device::new("1.0.0");
+            d.run_for(&mut srv, secs(120));
+            check(name, || {
+                let terminals = srv.terminals();
+                assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+                assert_eq!(
+                    (terminals[0].finished().as_str(), terminals[0].code()),
+                    ("failure", Some(1006))
+                );
+                assert_eq!(terminals[0].detail0(), "redirect");
+                assert_eq!(srv.count(Kind::E8), artifact_requests);
+                assert!(srv
+                    .requests
+                    .iter()
+                    .all(|r| !r.url.starts_with(FOREIGN) && !r.url.contains("/trap/")));
+                assert_eq!(feedback_problems(&srv), Vec::<String>::new());
+                assert_eq!(d.running(), v("1.0.0"));
+            });
+        }
+    });
 }
 
 /// S-ORIG-05: a 3xx anywhere else is never followed and treated as a transient failure: the poll backs off,
@@ -3743,75 +4392,77 @@ fn s_orig_04_redirects_on_document_and_artifact_are_1006_redirect() {
 /// retried, and the cancel document is retrieved again at the next poll.
 #[test]
 fn s_orig_05_redirects_elsewhere_are_transient() {
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E1, &[Reply::Redirect(302), Reply::Redirect(302)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(40 * 60));
-    check("poll_302_twice", || {
-        expect_success(&srv, None);
-        let polls: Vec<Duration> = srv.of(Kind::E1).iter().map(|p| p.t).take(3).collect();
-        assert_eq!(
-            polls,
-            [secs(0), secs(300), secs(900)],
-            "two back-offs from the default interval"
-        );
-    });
+    differential(|| {
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E1, &[Reply::Redirect(302), Reply::Redirect(302)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(40 * 60));
+        check("poll_302_twice", || {
+            expect_success(&srv, None);
+            let polls: Vec<Duration> = srv.of(Kind::E1).iter().map(|p| p.t).take(3).collect();
+            assert_eq!(
+                polls,
+                [secs(0), secs(300), secs(900)],
+                "two back-offs from the default interval"
+            );
+        });
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E3, &[Reply::Redirect(302)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("progress_302_once", || expect_success(&srv, None));
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E3, &[Reply::Redirect(302)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("progress_302_once", || expect_success(&srv, None));
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E6, &[Reply::Redirect(302)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("config_302_once", || {
-        expect_success(&srv, None);
-        let first_put = position(&srv, Kind::E6, 0).unwrap();
-        let puts_before = srv
-            .requests
-            .iter()
-            .take(position(&srv, Kind::E8, 0).unwrap())
-            .filter(|r| r.kind == Kind::E6)
-            .count();
-        assert_eq!(
-            puts_before, 1,
-            "no retry in the same boot (first PUT at {first_put})"
-        );
-    });
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E6, &[Reply::Redirect(302)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("config_302_once", || {
+            expect_success(&srv, None);
+            let first_put = position(&srv, Kind::E6, 0).unwrap();
+            let puts_before = srv
+                .requests
+                .iter()
+                .take(position(&srv, Kind::E8, 0).unwrap())
+                .filter(|r| r.kind == Kind::E6)
+                .count();
+            assert_eq!(
+                puts_before, 1,
+                "no retry in the same boot (first PUT at {first_put})"
+            );
+        });
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    srv.queue(Kind::E3, &[Reply::Redirect(302), Reply::Redirect(302)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("terminal_302_twice", || {
-        expect_refusal(&srv, 1007, "up_to_date", 3);
-        assert!(same_status(&srv.of(Kind::E3)));
-    });
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        srv.queue(Kind::E3, &[Reply::Redirect(302), Reply::Redirect(302)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("terminal_302_twice", || {
+            expect_refusal(&srv, 1007, "up_to_date", 3);
+            assert!(same_status(&srv.of(Kind::E3)));
+        });
 
-    let mut srv = Server::new();
-    srv.cancel("1");
-    srv.queue(Kind::E4, &[Reply::Redirect(303)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("cancel_303_once", || {
-        expect_cancel(&srv, true, 2, 1);
-    });
+        let mut srv = Server::new();
+        srv.cancel("1");
+        srv.queue(Kind::E4, &[Reply::Redirect(303)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("cancel_303_once", || {
+            expect_cancel(&srv, true, 2, 1);
+        });
 
-    let mut srv = Server::new();
-    srv.cancel("1");
-    srv.queue(Kind::E5, &[Reply::Redirect(307)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(200));
-    check("ack_307_once", || {
-        expect_cancel(&srv, true, 2, 2);
-        assert!(same_status(&srv.of(Kind::E5)));
+        let mut srv = Server::new();
+        srv.cancel("1");
+        srv.queue(Kind::E5, &[Reply::Redirect(307)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(200));
+        check("ack_307_once", || {
+            expect_cancel(&srv, true, 2, 2);
+            assert!(same_status(&srv.of(Kind::E5)));
+        });
     });
 }
 
@@ -3821,85 +4472,91 @@ fn s_orig_05_redirects_elsewhere_are_transient() {
 /// redirect to `http://` are refused; nothing is requested over http. The TLS failures are the TLS round.
 #[test]
 fn s_hyg_02_http_links_on_an_https_base_are_refused() {
-    let https_base = "https://127.0.0.1:38443/DEFAULT";
-    let http_trap = format!("http://127.0.0.1:38443/DEFAULT/controller/v1/{DEVICE_ID}");
+    differential(|| {
+        let https_base = "https://127.0.0.1:38443/DEFAULT";
+        let http_trap = format!("http://127.0.0.1:38443/DEFAULT/controller/v1/{DEVICE_ID}");
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.links_override =
-        Some(json!({"deploymentBase": {"href": format!("{http_trap}/trap/deploymentBase/1")}}));
-    let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
-    d.run_for(&mut srv, secs(100));
-    check("http_poll_link", || {
-        expect_silent(&srv);
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.links_override =
+            Some(json!({"deploymentBase": {"href": format!("{http_trap}/trap/deploymentBase/1")}}));
+        let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
+        d.run_for(&mut srv, secs(100));
+        check("http_poll_link", || {
+            expect_silent(&srv);
+            assert!(
+                d.poll_verdicts
+                    .iter()
+                    .all(|p| *p == PollVerdict::LinksRefused(UrlRefusal::Origin)),
+                "{:?}",
+                d.poll_verdicts
+            );
+        });
+
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0").href(&format!("{http_trap}/trap/image.bin")));
+        srv.links_override = Some(
+            json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root())}}),
+        );
+        let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
+        d.run_for(&mut srv, secs(100));
+        check("http_download_link", || {
+            expect_refusal(&srv, 1006, "foreign_origin", 1)
+        });
+
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.links_override = Some(
+            json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root())}}),
+        );
+        srv.queue(Kind::E2, &[Reply::Redirect(302)]);
+        let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
+        d.run_for(&mut srv, secs(100));
+        check("redirect_on_the_document", || {
+            expect_refusal(&srv, 1006, "redirect", 1);
+            assert_eq!(srv.count(Kind::E8), 0);
+        });
         assert!(
-            d.poll_verdicts
-                .iter()
-                .all(|p| *p == PollVerdict::LinksRefused(UrlRefusal::Origin)),
-            "{:?}",
-            d.poll_verdicts
+            srv.requests.iter().all(|r| r.url.starts_with("https://")),
+            "a request over http"
         );
     });
-
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0").href(&format!("{http_trap}/trap/image.bin")));
-    srv.links_override =
-        Some(json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root())}}));
-    let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
-    d.run_for(&mut srv, secs(100));
-    check("http_download_link", || {
-        expect_refusal(&srv, 1006, "foreign_origin", 1)
-    });
-
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.links_override =
-        Some(json!({"deploymentBase": {"href": format!("{}/deploymentBase/1?c=1", https_root())}}));
-    srv.queue(Kind::E2, &[Reply::Redirect(302)]);
-    let mut d = Device::with_base(https_base, "1.0.0", CHIP, ImageChip::Esp32C3);
-    d.run_for(&mut srv, secs(100));
-    check("redirect_on_the_document", || {
-        expect_refusal(&srv, 1006, "redirect", 1);
-        assert_eq!(srv.count(Kind::E8), 0);
-    });
-    assert!(
-        srv.requests.iter().all(|r| r.url.starts_with("https://")),
-        "a request over http"
-    );
 }
 
 /// S-HYG-04 (the request part): answers that echo the credential, a 401, a 500, a redirect (never followed) and a
 /// dropped connection neither stop the device nor change what it sends; the redirect is never followed.
 #[test]
 fn s_hyg_04_answers_that_echo_the_credential_do_not_stop_the_device() {
-    let token = "0123456789abcdef0123456789abcdef";
-    let echo =
-        |status_code: u16| status(status_code, &format!("Authorization: TargetToken {token}"));
-    let bad_polls = [
-        echo(401),
-        status(500, token),
-        Reply::Redirect(302),
-        Reply::Unreachable,
-    ];
+    differential(|| {
+        let token = "0123456789abcdef0123456789abcdef";
+        let echo =
+            |status_code: u16| status(status_code, &format!("Authorization: TargetToken {token}"));
+        let bad_polls = [
+            echo(401),
+            status(500, token),
+            Reply::Redirect(302),
+            Reply::Unreachable,
+        ];
 
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.1.0"));
-    srv.queue(Kind::E1, &bad_polls);
-    srv.queue(Kind::E3, &[echo(400)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(90 * 60));
-    check("deployment_paths", || {
-        expect_success(&srv, None);
-        assert!(srv.count(Kind::E1) >= 5);
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.1.0"));
+        srv.queue(Kind::E1, &bad_polls);
+        srv.queue(Kind::E3, &[echo(400)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(90 * 60));
+        check("deployment_paths", || {
+            expect_success(&srv, None);
+            assert!(srv.count(Kind::E1) >= 5);
+        });
+
+        let mut srv = Server::new();
+        srv.cancel("1");
+        srv.queue(Kind::E1, &bad_polls);
+        srv.queue(Kind::E5, &[status(503, token)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(90 * 60));
+        check("cancel_paths", || expect_cancel(&srv, true, 2, 2));
     });
-
-    let mut srv = Server::new();
-    srv.cancel("1");
-    srv.queue(Kind::E1, &bad_polls);
-    srv.queue(Kind::E5, &[status(503, token)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(90 * 60));
-    check("cancel_paths", || expect_cancel(&srv, true, 2, 2));
 }
 
 /// Every body the device sent is free of the server's marker, in either case.
@@ -3925,156 +4582,159 @@ fn no_echo(srv: &Server) {
 /// `size_mismatch`, F6); a `stopId` that is no action id is an invalid cancel document (F6).
 #[test]
 fn s_hyg_05_no_echo_of_server_values() {
-    let mut srv = Server::new();
-    let doc = Doc::new("1", "1.1.0").edit(|v| {
-        v[MARKER] = json!(MARKER);
-        let chunk = &mut v["deployment"]["chunks"][0];
-        chunk["name"] = json!(MARKER);
-        chunk["part"] = json!(MARKER);
-        chunk["metadata"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"key": MARKER, "value": MARKER}));
-        let artifact = &mut chunk["artifacts"][0];
-        artifact["filename"] = json!(MARKER);
-        artifact["hashes"]["md5"] = json!(MARKER);
-        artifact["_links"]["md5sum-http"] = json!({"href": format!("{}/trap/{MARKER}", root())});
-    });
-    srv.offer(&doc);
-    srv.queue(
-        Kind::E1,
-        &[
-            Reply::Unreachable,
-            ok(r#"{"config":{"polling":{"sleep":"00:00:30"}},"_links":{}}"#),
-        ],
-    );
-    srv.poll_extra = json!({MARKER: MARKER});
-    srv.links_extra = json!({
-        MARKER: {"href": format!("{BASE}/{MARKER}")},
-        "installedBase": {"href": format!("{}/installedBase/{MARKER}", root())}
-    });
-    srv.queue(Kind::E3, &[status(400, MARKER)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(40 * 60));
-    check("marker_everywhere", || {
-        expect_success(&srv, None);
-        no_echo(&srv);
-        assert!(srv
-            .requests
-            .iter()
-            .all(|r| !r.url.contains("/trap/") && !r.url.contains(MARKER)));
-    });
-
-    let (srv, _) = run_case("1.0.0", &Doc::new("1", "1.1.0").version(MARKER), same);
-    check("marker_version", || {
-        verdict(&srv, INV);
-        no_echo(&srv);
-    });
-    let (srv, _) = run_case(
-        "1.0.0",
-        &Doc::new("1", "1.1.0").handling(MARKER, "forced"),
-        same,
-    );
-    check("marker_download_value", || {
-        verdict(&srv, INV);
-        no_echo(&srv);
-    });
-
-    let mut srv = Server::new();
-    srv.offer(&Doc::new("1", "1.0.0"));
-    srv.queue(Kind::E3, &[status(400, MARKER)]);
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(100));
-    check("marker_in_terminal_answer", || {
-        expect_refusal(&srv, 1007, "up_to_date", 2);
-        assert!(
-            same_status(&srv.of(Kind::E3)),
-            "the resend repeats the report"
+    differential(|| {
+        let mut srv = Server::new();
+        let doc = Doc::new("1", "1.1.0").edit(|v| {
+            v[MARKER] = json!(MARKER);
+            let chunk = &mut v["deployment"]["chunks"][0];
+            chunk["name"] = json!(MARKER);
+            chunk["part"] = json!(MARKER);
+            chunk["metadata"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"key": MARKER, "value": MARKER}));
+            let artifact = &mut chunk["artifacts"][0];
+            artifact["filename"] = json!(MARKER);
+            artifact["hashes"]["md5"] = json!(MARKER);
+            artifact["_links"]["md5sum-http"] =
+                json!({"href": format!("{}/trap/{MARKER}", root())});
+        });
+        srv.offer(&doc);
+        srv.queue(
+            Kind::E1,
+            &[
+                Reply::Unreachable,
+                ok(r#"{"config":{"polling":{"sleep":"00:00:30"}},"_links":{}}"#),
+            ],
         );
-        no_echo(&srv);
-    });
+        srv.poll_extra = json!({MARKER: MARKER});
+        srv.links_extra = json!({
+            MARKER: {"href": format!("{BASE}/{MARKER}")},
+            "installedBase": {"href": format!("{}/installedBase/{MARKER}", root())}
+        });
+        srv.queue(Kind::E3, &[status(400, MARKER)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(40 * 60));
+        check("marker_everywhere", || {
+            expect_success(&srv, None);
+            no_echo(&srv);
+            assert!(srv
+                .requests
+                .iter()
+                .all(|r| !r.url.contains("/trap/") && !r.url.contains(MARKER)));
+        });
 
-    let mut srv = Server::new();
-    let doc = Doc::new("1", "1.1.0");
-    let short: Vec<u8> = doc.artifact[..100].to_vec();
-    srv.offer(&doc);
-    srv.on(
-        Kind::E8,
-        Reply::Status {
-            status: 200,
-            body: short,
-            retry_after: None,
-            declared_len: Some(164),
-        },
-    );
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(400));
-    check("short_artifact_body_fixture", || {
-        let terminals = srv.terminals();
-        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-        assert_eq!(terminals[0].code(), Some(1001));
-        assert_eq!(
+        let (srv, _) = run_case("1.0.0", &Doc::new("1", "1.1.0").version(MARKER), same);
+        check("marker_version", || {
+            verdict(&srv, INV);
+            no_echo(&srv);
+        });
+        let (srv, _) = run_case(
+            "1.0.0",
+            &Doc::new("1", "1.1.0").handling(MARKER, "forced"),
+            same,
+        );
+        check("marker_download_value", || {
+            verdict(&srv, INV);
+            no_echo(&srv);
+        });
+
+        let mut srv = Server::new();
+        srv.offer(&Doc::new("1", "1.0.0"));
+        srv.queue(Kind::E3, &[status(400, MARKER)]);
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(100));
+        check("marker_in_terminal_answer", || {
+            expect_refusal(&srv, 1007, "up_to_date", 2);
+            assert!(
+                same_status(&srv.of(Kind::E3)),
+                "the resend repeats the report"
+            );
+            no_echo(&srv);
+        });
+
+        let mut srv = Server::new();
+        let doc = Doc::new("1", "1.1.0");
+        let short: Vec<u8> = doc.artifact[..100].to_vec();
+        srv.offer(&doc);
+        srv.on(
+            Kind::E8,
+            Reply::Status {
+                status: 200,
+                body: short,
+                retry_after: None,
+                declared_len: Some(164),
+            },
+        );
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(400));
+        check("short_artifact_body_fixture", || {
+            let terminals = srv.terminals();
+            assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+            assert_eq!(terminals[0].code(), Some(1001));
+            assert_eq!(
             terminals[0].details(),
             ["size_mismatch"],
             "F6: the Content-Length differs from the declared size, refused before any byte; the harness expects download_failed"
         );
-        assert_eq!(
-            srv.count(Kind::E8),
-            8,
-            "one attempt at 0, 5, 15, 35, 75, 135, 195 and 255 s, none at the 300 s deadline"
-        );
-        assert_eq!(d.running(), v("1.0.0"));
-        no_echo(&srv);
-    });
+            assert_eq!(
+                srv.count(Kind::E8),
+                8,
+                "one attempt at 0, 5, 15, 35, 75, 135, 195 and 255 s, none at the 300 s deadline"
+            );
+            assert_eq!(d.running(), v("1.0.0"));
+            no_echo(&srv);
+        });
 
-    // The same body under the declared size: the stream ends early, which is `download_failed`.
-    let mut srv = Server::new();
-    let doc = Doc::new("1", "1.1.0");
-    let short: Vec<u8> = doc.artifact[..100].to_vec();
-    srv.offer(&doc);
-    srv.on(
-        Kind::E8,
-        Reply::Status {
-            status: 200,
-            body: short,
-            retry_after: None,
-            declared_len: Some(ARTIFACT_LEN as u64),
-        },
-    );
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(400));
-    check("short_artifact_body", || {
-        let terminals = srv.terminals();
-        assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
-        assert_eq!(terminals[0].code(), Some(1001));
-        assert_eq!(terminals[0].details(), ["download_failed"]);
-        assert_eq!(d.download_errors, [OtaError::DownloadFailed { status: 0 }]);
-        assert_eq!(d.running(), v("1.0.0"));
-        no_echo(&srv);
-    });
+        // The same body under the declared size: the stream ends early, which is `download_failed`.
+        let mut srv = Server::new();
+        let doc = Doc::new("1", "1.1.0");
+        let short: Vec<u8> = doc.artifact[..100].to_vec();
+        srv.offer(&doc);
+        srv.on(
+            Kind::E8,
+            Reply::Status {
+                status: 200,
+                body: short,
+                retry_after: None,
+                declared_len: Some(ARTIFACT_LEN as u64),
+            },
+        );
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(400));
+        check("short_artifact_body", || {
+            let terminals = srv.terminals();
+            assert_eq!(terminals.len(), 1, "{:?}", bodies(&terminals));
+            assert_eq!(terminals[0].code(), Some(1001));
+            assert_eq!(terminals[0].details(), ["download_failed"]);
+            assert_eq!(d.download_errors, [OtaError::DownloadFailed { status: 0 }]);
+            assert_eq!(d.running(), v("1.0.0"));
+            no_echo(&srv);
+        });
 
-    let mut srv = Server::new();
-    srv.cancel_with_body(
-        "1",
-        format!(r#"{{"id":"1","cancelAction":{{"stopId":"{MARKER}"}}}}"#).as_bytes(),
-    );
-    let mut d = Device::new("1.0.0");
-    d.run_for(&mut srv, secs(100));
-    check("marker_stop_id", || {
-        assert!(srv.count(Kind::E4) >= 1);
-        assert_eq!(
-            srv.count(Kind::E5),
-            0,
-            "F6: the harness expects an acknowledgement"
+        let mut srv = Server::new();
+        srv.cancel_with_body(
+            "1",
+            format!(r#"{{"id":"1","cancelAction":{{"stopId":"{MARKER}"}}}}"#).as_bytes(),
         );
-        assert!(
-            matches!(
-                d.cancel_results.first(),
-                Some(Some(CancelResult::Invalid(_)))
-            ),
-            "{:?}",
-            d.cancel_results
-        );
-        assert!(srv.requests.iter().all(|r| !r.body.contains(MARKER)));
+        let mut d = Device::new("1.0.0");
+        d.run_for(&mut srv, secs(100));
+        check("marker_stop_id", || {
+            assert!(srv.count(Kind::E4) >= 1);
+            assert_eq!(
+                srv.count(Kind::E5),
+                0,
+                "F6: the harness expects an acknowledgement"
+            );
+            assert!(
+                matches!(
+                    d.cancel_results.first(),
+                    Some(Some(CancelResult::Invalid(_)))
+                ),
+                "{:?}",
+                d.cancel_results
+            );
+            assert!(srv.requests.iter().all(|r| !r.body.contains(MARKER)));
+        });
     });
 }
